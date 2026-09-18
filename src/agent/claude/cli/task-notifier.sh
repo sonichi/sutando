@@ -230,9 +230,12 @@ print(ciw._composer_text(sys.stdin.read()) or "")
 
 # Staged = the composer holds EXACTLY our prompt (not merely our marker as a
 # substring -- interleaved owner text would still match that) AND changed since baseline.
+# Whitespace is ignored on both sides: the input box word-wraps at the pane width and
+# indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
 prompt_is_staged() {
   local tail="$1" baseline="$2" prompt="$3"
-  [ "$(composer_text "$tail")" = "$prompt" ] && [ "$tail" != "$baseline" ]
+  [ "$(composer_text "$tail" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ] \
+    && [ "$tail" != "$baseline" ]
 }
 
 # No marker in a capture whose retained history (#{history_size}, else the RAW row

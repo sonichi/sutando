@@ -71,8 +71,10 @@ class FakeTmuxHarness(unittest.TestCase):
     # What `show-options -g history-limit` reports -- the global default, which real
     # tmux lets drift away from an existing pane's limit. None = same as the pane.
     GLOBAL_HISTORY_LIMIT = None
-    # Columns at which a `-l` paste wraps onto new rows (0 = one row), like a real pane.
+    # Columns at which a `-l` paste wraps onto new rows (0 = one row), like a real pane;
+    # "chars" cuts anywhere, "word" is the input box's own word wrap + 2-space indent.
     WRAP_COLS = 0
+    WRAP_STYLE = "chars"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -135,9 +137,9 @@ PANE="{self.pane_file}"
 # replacing the CLI's hint on an empty row); wrapped rows follow that row, and
 # whatever renders below it (a box border, the status footer) stays below.
 append_typed() {{
-  python3 - "$PANE" "$1" {self.WRAP_COLS} <<'PYEOF'
-import re, sys
-path, text, wrap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+  python3 - "$PANE" "$1" {self.WRAP_COLS} "{self.WRAP_STYLE}" <<'PYEOF'
+import re, sys, textwrap
+path, text, wrap, style = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 lines = open(path).read().split("\\n")
 if lines and lines[-1] == "": lines.pop()
 idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("❯")), None)
@@ -146,7 +148,14 @@ if idx is None:
 row = lines[idx]
 row = "❯ " if re.match(r'^❯ *$|^❯ Try "', row) else row
 new = row + text
-rows = [new[i:i + wrap] for i in range(0, len(new), wrap)] if wrap > 0 else [new]
+if wrap <= 0:
+    rows = [new]
+elif style == "word":
+    # The real input box: wrap at word boundaries, continuation rows indented two spaces.
+    rows = textwrap.wrap(new, width=wrap, subsequent_indent="  ", break_long_words=True,
+                         break_on_hyphens=False)
+else:
+    rows = [new[i:i + wrap] for i in range(0, len(new), wrap)]
 lines[idx:idx + 1] = rows
 open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
@@ -749,6 +758,45 @@ class PlaceholderComposerTests(FakeTmuxHarness):
         log = self.sendkeys_log_text()
         self.assertIn("TYPE Sutando task ready: task-hint.txt", log)
         self.assertIn("ENTER", log, "the CLI's own hint text was read as an owner draft")
+
+
+class LiveWordWrapTests(FakeTmuxHarness):
+    """Found by the live witness: the input box word-wraps at the pane width
+    and indents continuation rows by two spaces, so the dewrapped capture
+    reads `task,  and write` where the prompt says `task, and write`. Exact
+    equality then fails every time on a 120-column pane and the notifier
+    refuses its own successful paste."""
+
+    WRAP_COLS = 120
+    WRAP_STYLE = "word"
+
+    def test_word_wrapped_paste_still_stages_and_submits(self):
+        self.pane_file.write_text(PlaceholderComposerTests.LIVE_PANE)
+        self.write_task("task-wrap.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-wrap.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-wrap.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pane = self.pane_file.read_text()
+        self.assertRegex(pane, r"\n  \S", "fixture precondition: an indented continuation row exists")
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("TYPE Sutando task ready: task-wrap.txt"), 1)
+        self.assertIn("ENTER", log, "a word-wrapped paste must compare equal to the prompt")
+
+    def test_owner_text_still_breaks_whitespace_insensitive_equality(self):
+        self.interleaved_owner_flag.write_text("1")
+        self.write_task("task-wrapmix.txt")
+        result = self.run_event("task-wrapmix.txt", timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
 
 
 class MainLoopWiringTest(FakeTmuxHarness):
