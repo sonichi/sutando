@@ -625,9 +625,8 @@ class EventDispatchTests(FakeTmuxHarness):
                        "the submitted text staying in scrollback is the exact case this pins")
 
     def test_a_novel_prompt_under_an_old_idle_footer_is_not_typed_into(self):
-        # An unforeseen confirmation shares the window with a stale idle footer
-        # and a blank bottom composer; with no status file to veto it, the
-        # pane read alone must refuse.
+        # An unforeseen confirmation shares the window with a stale idle footer and
+        # a blank bottom composer; the pane read alone must refuse.
         self.status_file.unlink()
         self.write_task("task-novel.txt")
         self.pane_file.write_text("\n".join([
