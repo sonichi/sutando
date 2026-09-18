@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 CHECK_DIR_NAME = "voice-room-checks"
 REQUEST_SUFFIX = ".request.json"
@@ -25,6 +25,8 @@ VERDICT_SUFFIX = ".verdict.json"
 # Verdict lifetime, shared with the task bridge's reader: a member who leaves
 # is re-read within this window, and navigation never waits on the gateway twice.
 VERDICT_TTL_S = 60
+# Live entries a long-running bridge keeps: expired ones go on every write.
+CACHE_MAX_ENTRIES = 256
 _MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 
@@ -77,7 +79,8 @@ class RoomMembershipVerifier:
     def __init__(self, check_dir: Path, members: MembersFn,
                  agent_mxid: Callable[[], str], owner_mxid: Callable[[], str],
                  log: Callable[[str], None] = print, ttl_s: float = VERDICT_TTL_S,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 cache_max: int = CACHE_MAX_ENTRIES) -> None:
         self.check_dir = Path(check_dir)
         self._members = members
         self._agent_mxid = agent_mxid
@@ -85,7 +88,10 @@ class RoomMembershipVerifier:
         self._log = log
         self._ttl_s = ttl_s
         self._clock = clock
-        self._cache: Dict[str, dict] = {}
+        self._cache_max = max(1, cache_max)
+        # Keyed on everything the verdict depends on: a re-enrolled agent or a
+        # re-bound owner must never be answered from the previous identity's read.
+        self._cache: Dict[Tuple[str, str, str], dict] = {}
         self._lock = threading.Lock()
 
     def _identity(self, reader: Callable[[], str]) -> str:
@@ -109,17 +115,28 @@ class RoomMembershipVerifier:
     def verdict(self, room_id: str) -> dict:
         """The cached verdict while fresh, else one new gateway read."""
         now = self._clock()
-        with self._lock:
-            cached = self._cache.get(room_id)
-            if cached and now - cached["checked_at"] < self._ttl_s:
-                return dict(cached)
         agent = self._identity(self._agent_mxid)
         owner = self._identity(self._owner_mxid) if agent else ""
+        key = (room_id, agent, owner)
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached and now - cached["checked_at"] < self._ttl_s:
+                return dict(cached)
         members = self._read_members(room_id) if agent and owner else None
         out = membership_verdict(room_id, members, agent, owner, now=now)
         with self._lock:
-            self._cache[room_id] = dict(out)
+            self._evict(now)
+            self._cache[key] = dict(out)
         return out
+
+    def _evict(self, now: float) -> None:
+        """Drop expired entries, then the oldest beyond the cap (caller holds the lock)."""
+        for key in [k for k, v in self._cache.items() if now - v["checked_at"] >= self._ttl_s]:
+            del self._cache[key]
+        overflow = len(self._cache) - (self._cache_max - 1)
+        if overflow > 0:
+            for key, _ in sorted(self._cache.items(), key=lambda kv: kv[1]["checked_at"])[:overflow]:
+                del self._cache[key]
 
     def verified(self, room_id: str) -> bool:
         return bool(self.verdict(room_id).get("verified"))

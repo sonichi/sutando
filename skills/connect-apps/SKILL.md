@@ -151,8 +151,10 @@ Reply where you were asked. The precheck line (Step 2) says it as `reply_to=room
 
 - **Anything you did, found or wrote on the web or in a public app** (post to Slack, create a Linear
   issue, search YouTube, summarize a public page, web research, listings, shopping, summaries, code):
-  reply in the room they asked in, like any reply, however personal the topic. An apartment search
-  asked in a shared room is answered in that room.
+  reply in the room they asked in, like any reply, when that room is the audience: the room asked
+  for it, or the owner asked for it to be posted there. An apartment search asked by a shared room
+  is answered in that room; one the owner asked for themselves goes to the owner's DM, with nothing
+  in the room unless the room was waiting for it (CLAUDE.md "Where replies go").
 - **The DM exception is a closed list: data read from the owner's connected accounts or device**
   (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
   health or financial records): only in the owner's DM. From a shared room, find your DM with the
@@ -393,7 +395,9 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
   confirmed as the owner's DM; that list is closed. Web research, listings, shopping, summaries and
-  code go where they were asked. A moved answer leaves one line in the room: "I sent it to you in our DM."
+  code go where they were asked when that room is the audience; what the owner asked for themselves
+  goes to the DM. A moved answer the room was waiting for leaves one line in the room: "I sent it to
+  you in our DM."
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
   on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.

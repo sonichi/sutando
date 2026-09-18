@@ -24,8 +24,9 @@ preference is written to `user_profile.md` and kept.
 
 **Blockers, stated plainly.** When you cannot finish because of a quota, a missing capability, a
 site that blocks you or a permission you lack, say exactly that in one line, name what unblocks it,
-and stop. No silent retries, no wording that implies success. If several requests are pending, say
-how many are ahead of this one.
+and stop the work that depends on the blocker; work that does not depend on it proceeds, and the
+reply says which part was not done. No silent retries, no wording that implies success. If several
+requests are pending, say how many are ahead of this one.
 
 ## Architecture rules
 
@@ -277,9 +278,9 @@ python3 skills/task-progress/scripts/notify.py \
 Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread. An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
-pending, the first line to that task's conversation names the position: "Got it. 2 ahead of this
-one, working in order." One line per task, in its own conversation, voice included; never narrate
-the queue anywhere else.
+pending, the first line to that task's conversation names the position: one ahead, "Got it, right
+after the one I'm on."; more, "Got it, N in line before this one." One line per task, in its own
+conversation, voice included; never narrate the queue anywhere else.
 
 Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
 
@@ -320,16 +321,24 @@ Tasks arrive from multiple channels via the same file bridge:
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
-- To send files in replies, include `[file: /path/to/file]` in the result text
 
 ### Where replies go
 
-Reply where you were asked: a task with `channel_id`/`source_room_id` is answered in that room,
-threaded to `source_message_id`. Web research, listings, shopping, summaries, code: always in the
-room, however personal the topic. The DM exception is a closed list: data read from the owner's
-connected accounts or device (mail, calendar events, contacts, message history, files from
-Drive/Dropbox/Notion, credentials, health or financial records). When you move an answer, post it
-in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.
+Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is
+answered in that room, threaded to `source_message_id`. Two tests apply:
+
+- **Audience.** In a room with other people (anything but the owner's own DM), post only what they
+  are meant to read: a reply to their message, what the owner asked to be posted there, or work the
+  room asked for. What the owner asked for themselves (research, findings, errands, agent
+  debugging, anything about the owner the others would not know) goes to the owner's DM even when
+  asked in the room or by voice while docked in it; nothing goes in the room unless it was waiting
+  for it.
+- **Data origin, on top.** Data read from the owner's connected accounts or device
+  (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
+  health or financial records) goes to the DM whatever the audience.
+
+When you move an answer the room was waiting for, post it in the DM and exactly one line in the
+room: 'I sent it to you in our DM.' Never move silently.
 
 **Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones. Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
 - `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.

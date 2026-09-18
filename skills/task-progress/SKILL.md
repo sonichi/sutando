@@ -119,13 +119,14 @@ The same script posts the update in that room:
 ```bash
 python3 skills/task-progress/scripts/notify.py \
   --source ag2space --channel-id '!room:server' \
-  --message "On it. 2 ahead of this one, working in order."
+  --message "Got it, 2 in line before this one."
 ```
 
 Any `--source` other than slack/discord/telegram is sent through the remote gateway
 (`channels/<source>/.env` under `$CLAUDE_CONFIG_DIR`, `REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`), the
 transport the AG2 Space task bridge itself uses. The room the task came from is the only room this
-posts to; a queue position ("N ahead of this one") is one line, in that task's own conversation.
+posts to; a queue position ("Got it, right after the one I'm on." / "Got it, N in line before this
+one.") is one line, in that task's own conversation.
 
 ## Supported channels
 

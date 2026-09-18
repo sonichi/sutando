@@ -18,14 +18,19 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 ROUTING = (
-    "Reply where you were asked: a task with `channel_id`/`source_room_id` is answered in that room, "
-    "threaded to `source_message_id`.",
-    "Web research, listings, shopping, summaries, code: always in the room, however personal the topic.",
-    "The DM exception is a closed list: data read from the owner's connected accounts or device "
-    "(mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials, "
-    "health or financial records).",
+    "Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is "
+    "answered in that room, threaded to `source_message_id`.",
+    "In a room with other people (anything but the owner's own DM), post only what they are meant to "
+    "read: a reply to their message, what the owner asked to be posted there, or work the room asked for.",
+    "goes to the owner's DM even when asked in the room or by voice while docked in it; nothing goes in "
+    "the room unless it was waiting for it.",
+    "Data read from the owner's connected accounts or device (mail, calendar events, contacts, message "
+    "history, files from Drive/Dropbox/Notion, credentials, health or financial records) goes to the DM "
+    "whatever the audience.",
     "post it in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.",
 )
+# The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
+ROUTING_GONE = ("however personal the topic",)
 LANGUAGE = (
     "Reply in the language your owner wrote in.",
     "When you deliberately answer in English (a quoted error, a code identifier, a term with no good translation), say so in one clause.",
@@ -33,7 +38,9 @@ LANGUAGE = (
 )
 BLOCKERS = (
     "When you cannot finish because of a quota, a missing capability, a site that blocks you or a "
-    "permission you lack, say exactly that in one line, name what unblocks it, and stop.",
+    "permission you lack, say exactly that in one line, name what unblocks it, and stop the work that "
+    "depends on the blocker; work that does not depend on it proceeds, and the reply says which part "
+    "was not done.",
     "No silent retries, no wording that implies success.",
     "If several requests are pending, say how many are ahead of this one.",
 )
@@ -44,7 +51,8 @@ SKILLS_FIRST = (
 )
 QUEUE = (
     "When the `QUEUE:` line (or `activity.py queue`) says more than one task is pending, the first line to "
-    "that task's conversation names the position: \"Got it. 2 ahead of this one, working in order.\"",
+    "that task's conversation names the position: one ahead, \"Got it, right after the one I'm on.\"; "
+    "more, \"Got it, N in line before this one.\"",
     "One line per task, in its own conversation, voice included; never narrate the queue anywhere else.",
     "`QUEUE: <n> pending after this`",
     "--source ag2space --channel-id <room>",
@@ -58,6 +66,8 @@ class ConductRulesArePinned(unittest.TestCase):
                                  ("skills-before-refusing", SKILLS_FIRST), ("queue", QUEUE)):
             for sentence in sentences:
                 self.assertIn(_norm(sentence), s, f"{name}: the {group} rule lost: {sentence[:60]!r}")
+        for gone in ROUTING_GONE:
+            self.assertNotIn(gone, s, f"{name}: the origin-only routing sentence must not survive: {gone!r}")
         self.assertIn("### Where replies go", s, f"{name}: the routing rule is a Task bridge subsection")
         self.assertLess(s.index("## Operating Style"), s.index("Reply in the language your owner wrote in."),
                         f"{name}: language and blockers live under Operating Style")
@@ -75,7 +85,9 @@ class ConductRulesArePinned(unittest.TestCase):
         d = (REPO / "skills" / "connect-apps" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("The DM exception is a closed list: data read from the owner's connected accounts or device", d)
         self.assertIn("web research, listings, shopping, summaries, code", d)
-        self.assertIn("however personal the topic", d)
+        self.assertNotIn("however personal the topic", d)
+        self.assertIn("when that room is the audience", d)
+        self.assertIn("one the owner asked for themselves goes to the owner's DM", d)
         self.assertIn('"I sent it to you in our DM." Never move silently.', d)
         self.assertIn("reply_to=room|dm", d)
         rules = d.split("## Rules")[1]

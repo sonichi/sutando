@@ -121,6 +121,37 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(gw.reads, 2)
         self.assertEqual(v.verdict(ROOM)["reason"], "owner not joined")
 
+    def test_cache_is_keyed_on_room_agent_and_owner(self):
+        gw = FakeGateway({ROOM: [AGENT, OWNER]})
+        v = self.make(gw)
+        self.assertTrue(v.verified(ROOM))
+        gw.owner = "@other:example.org"  # the owner binding changed under a fresh cache entry
+        self.assertFalse(v.verified(ROOM), "a new owner identity is never answered from the old read")
+        self.assertEqual(v.verdict(ROOM)["reason"], "owner not joined")
+        self.assertEqual(gw.reads, 2)
+        gw.agent = "@reenrolled:example.org"
+        self.assertFalse(v.verified(ROOM))
+        self.assertEqual(gw.reads, 3, "a re-enrolled agent reads again too")
+        self.assertEqual(set(v._cache), {(ROOM, AGENT, OWNER), (ROOM, AGENT, "@other:example.org"),
+                                         (ROOM, "@reenrolled:example.org", "@other:example.org")})
+
+    def test_expired_entries_are_evicted_on_write_and_the_map_is_capped(self):
+        gw = FakeGateway({f"!r{i}:example.org": [AGENT, OWNER] for i in range(10)})
+        v = self.make(gw)
+        v._cache_max = 4
+        for i in range(3):
+            v.verified(f"!r{i}:example.org")
+        self.assertEqual(len(v._cache), 3)
+        self.now[0] += vrm.VERDICT_TTL_S
+        v.verified("!r3:example.org")
+        self.assertEqual(set(k[0] for k in v._cache), {"!r3:example.org"}, "expired entries leave on the next write")
+        for i in range(4, 10):
+            self.now[0] += 1
+            v.verified(f"!r{i}:example.org")
+        self.assertEqual(len(v._cache), 4, "never more than the cap")
+        self.assertEqual(set(k[0] for k in v._cache), {f"!r{i}:example.org" for i in range(6, 10)}, "the oldest go first")
+        self.assertEqual(vrm.RoomMembershipVerifier(self.tmp, gw.members, gw.agent_mxid, gw.owner_mxid, cache_max=0)._cache_max, 1)
+
     def test_forged_room_is_refused_and_a_refusal_is_cached_too(self):
         gw = FakeGateway({ROOM: [AGENT, OWNER]})
         v = self.make(gw)
