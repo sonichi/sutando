@@ -12,6 +12,7 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+import errno
 import re
 import subprocess
 import sys
@@ -103,7 +104,7 @@ else:
         holder_of(wsl, "task-hhh")
         looped = "returned instead of raising"
     except OSError as exc:
-        looped = None if exc.errno == 62 else f"wrong errno {exc.errno}"
+        looped = None if exc.errno == errno.ELOOP else f"wrong errno {exc.errno}"
     check(looped is None, "a recipient whose stat fails with ELOOP propagates, not skipped as absent")
     _loop.unlink()
     check(holder_of(wsl, "task-hhh") is None, "control: with that entry gone the same tree is simply unheld")
