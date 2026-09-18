@@ -52,6 +52,11 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 # and `start-server` on a serverless socket is a no-op — so unset before any tmux.
 unset SUTANDO_CORE_MODEL
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# The external task notifier runs beside the core in its own tmux session,
+# under the runtime-agnostic supervisor (parameterised by SUTANDO_NOTIFIER_SCRIPT).
+WATCHER_SESSION="${SESSION}-watcher"
+NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
+NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 # A pool worker runs THIS launcher under its own session/instance env; the
 # owner-facing surfaces (remote control, Chrome) stay with the canonical core.
 WORKER_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
@@ -608,6 +613,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
   if tmux_session_exists || core_claude_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
@@ -697,6 +703,41 @@ apply_tmux_defaults() {
 # can never suppress this one. Socket only, not socket + out path: the desktop
 # launcher (launch-sutando.sh) starts the same watcher inside tmux with its own
 # workspace spelling for --out, and matching on that path let both run.
+watcher_session_exists() {
+  tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null
+}
+
+# Standby delivery path: pastes a queued task into the core pane only when the
+# pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
+ensure_task_notifier() {
+  local expected_version active_version version_files
+  [ -z "$WORKER_INSTANCE" ] || return 0   # the notifier serves the core alone
+  version_files=(
+    "$NOTIFIER_SUPERVISOR"
+    "$NOTIFIER_SCRIPT"
+    "$REPO/src/core-input-watch.py"
+    "$REPO/src/delivery/task_dispatch.py"
+  )
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')"
+  if watcher_session_exists; then
+    active_version="$(
+      tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
+        SUTANDO_NOTIFIER_VERSION 2>/dev/null \
+        | sed -n 's/^SUTANDO_NOTIFIER_VERSION=//p' || true
+    )"
+    [ "$active_version" = "$expected_version" ] && return 0
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  fi
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER_SCRIPT")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
+  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
+    "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
+}
+
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
   [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
@@ -749,6 +790,7 @@ ensure_core_monitor() {
 if tmux_core_session_running; then
   apply_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
+  ensure_task_notifier
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -804,6 +846,7 @@ if tmux_session_exists; then
   tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
   ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
+  ensure_task_notifier
   # child lives; poll before opening intake, same bound as the fresh-start path.
   for _ in $(seq 1 25); do
     tmux_core_session_running && break
@@ -912,6 +955,7 @@ if [ -t 1 ]; then
   fi
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  ensure_task_notifier   # the supervisor needs the core session to exist first
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
@@ -938,6 +982,7 @@ else
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
+  ensure_task_notifier
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."

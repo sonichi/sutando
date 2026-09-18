@@ -9992,8 +9992,12 @@ def _command_runs_script(command: str, expected: Path) -> bool:
 
 
 def _probe_codex_task_notifier(target: dict) -> dict:
+    return _probe_task_notifier(target, name="codex-task-notifier",
+                                expected=_expected_codex_notifier_entrypoint())
+
+
+def _probe_task_notifier(target: dict, *, name: str, expected: Path) -> dict:
     """Inspect the exact managed notifier tmux session for one healthy pane."""
-    name = "codex-task-notifier"
     socket_path = target["socket"]
     watcher_session = f"{target['session']}-watcher"
     exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
@@ -10034,7 +10038,6 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             "status": "warn",
             "detail": f"managed tmux session {watcher_session!r} has a dead pane",
         }
-    expected = _expected_codex_notifier_entrypoint()
     if not _command_runs_script(command, expected):
         return {
             "name": name,
@@ -10219,6 +10222,49 @@ def check_codex_task_notifier() -> dict:
             ),
         }
     return _probe_codex_task_notifier(target)
+
+
+def _claude_runtime_selected() -> bool:
+    try:
+        return resolve_core_runtime(REPO_DIR) == "claude"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_claude_notifier_target(heartbeat: "dict | None" = None) -> "dict | None":
+    """Socket + session of the live Claude core, from its own heartbeat record."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    session = heartbeat.get("session")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(session, str) or not session:
+        return None
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def check_claude_task_notifier() -> dict:
+    """The Claude core's standby notifier lives in `<session>-watcher`, like Codex's."""
+    name = "claude-task-notifier"
+    if not _claude_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "Claude runtime not selected — notifier not expected"}
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {"name": name, "status": "ok",
+                "detail": "no fresh local core heartbeat — notifier not expected"}
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return {"name": name, "status": "warn",
+                "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
+    supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    return _probe_task_notifier(target, name=name, expected=supervisor)
 
 
 def fix_codex_task_notifier() -> str:
@@ -13048,6 +13094,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
+    checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
