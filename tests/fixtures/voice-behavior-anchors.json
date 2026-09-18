@@ -550,7 +550,7 @@
    "params": {
     "dm_on_timeout": "If true, send a Discord DM to the owner when this task hits its timeout. Default false (silent UI-only timeout, per Susan PR #578). Use only for tasks the user has explicitly flagged as critical. The Chi-override to default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged a timeout DM that shouldn't have gone through.",
     "task": "Full description of the task to perform",
-    "timeout_minutes": "Per-task timeout in minutes. Default 10. Pass a larger value (e.g. 30) for multi-step jobs like rendering, batch encoding, or long research. Pass 0 for no timeout — use sparingly, only when the user explicitly asks for a long autonomous job that may legitimately take hours."
+    "timeout_minutes": "Per-task timeout in minutes. Default 60. Lower it (e.g. 5) only when a late answer is worse than no answer, so the user is told it failed instead of waiting. Pass 0 for no timeout — use sparingly, only when the user explicitly asks for a long autonomous job that may legitimately take hours."
    }
   }
  ],
