@@ -223,6 +223,19 @@ def channel_label(headers: dict) -> str:
     return f"{name} ({cid})" if name else (cid or "DM")
 
 
+PREVIEW_CHARS = 100
+# The bridge appends its sandbox block AFTER the ask; the parsed body carries both.
+_SYSTEM_BLOCK_RE = re.compile(r"^===\s*SUTANDO SYSTEM INSTRUCTIONS\b", re.M)
+
+
+def preview(body: str) -> str:
+    """The `task:` value as the recovery DM shows it: the ask up to the bridge's
+    system-instructions block, whitespace collapsed, first PREVIEW_CHARS chars."""
+    m = _SYSTEM_BLOCK_RE.search(body)
+    ask = body[:m.start()] if m else body
+    return " ".join(ask.split())[:PREVIEW_CHARS]
+
+
 def classify_task(path: Path, workspace: Path, now: float) -> dict:
     text = path.read_text(errors="replace")
     # Shape-union parser: this pass classifies files from every writer and
@@ -241,6 +254,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         "access_tier": tier,
         "channel_id": headers.get("channel_id") or headers.get("chat_id") or "",
         "label": channel_label(headers),
+        "preview": preview(parsed.body),
         "age_s": age_s,
         "age_from": age_from,
         "import": False,
