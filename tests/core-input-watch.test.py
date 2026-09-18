@@ -484,6 +484,43 @@ class TestComposerIsEmpty(unittest.TestCase):
         self.assertTrue(_mod._composer_is_empty(pane))
 
 
+class TestComposerText(unittest.TestCase):
+    """_composer_text: the composer's dewrapped content for EXACT-equality
+    staging checks (task-notifier.sh, #4307 round 3) -- distinct from
+    _composer_is_empty, which only asks whether it's blank."""
+
+    def test_empty_composer_returns_empty_string(self):
+        self.assertEqual(_mod._composer_text(_IDLE), "")
+
+    def test_single_line_draft_is_returned_verbatim(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertEqual(_mod._composer_text(draft), "owner draft")
+
+    def test_no_prompt_line_at_all_returns_none(self):
+        self.assertIsNone(_mod._composer_text("no prompt line here\njust text"))
+
+    def test_wrapped_rows_are_dewrapped_with_no_separator(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n" + "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_footer_interleaved_before_the_typed_row_is_stripped(self):
+        # The exact shape a naively-appending test stub produces: the footer
+        # line sits BETWEEN the bare ❯ marker and the later typed-text row.
+        pane = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\nSutando task ready: task-x.txt"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_interleaved_owner_text_survives_in_the_result(self):
+        # The exact-equality caller depends on this NOT silently dropping
+        # owner text -- a mix must compare unequal to the bare prompt.
+        pane = _IDLE.replace("❯ ", "❯ Sutando task ready: task-x.txt OWNERTEXT")
+        self.assertEqual(_mod._composer_text(pane),
+                          "Sutando task ready: task-x.txt OWNERTEXT")
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertEqual(_mod._composer_text(pane), "")
+
+
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 

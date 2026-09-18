@@ -13,17 +13,18 @@ else
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
-# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR (its
-# SUTANDO_WORKSPACE_DIR override, honored here too, so both agree on the
-# same directory under a test override) -- a task claimed must-handle by a
-# required task-event handler must never reach this unrestricted live core,
-# whichever unrelated task's wake triggered the rescan.
+# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR (honors the
+# same SUTANDO_WORKSPACE_DIR override, so both agree under a test override).
 CLAIMS_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}/state/task-event-handler-claims"
 CORE_STATUS_STALE_SEC=90
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+  echo "task-notifier: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -31,8 +32,36 @@ CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # composer and no result has appeared. See deliver_prompt.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
 SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
+# A queued task with nothing left to re-trigger it (composer busy, staging
+# failed) would otherwise wait forever for an unrelated wake. See the main loop.
+RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
 watcher_pid=""
 event_dir=""
+
+# A FRESH per-candidate probe, not a claims-dir file's existence, so a
+# required handler that hasn't published its claim yet still blocks dispatch.
+probe_optional_task_handler() {
+  local filename="$1" rc
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
+  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
+  "$SUTANDO_TASK_EVENT_HANDLER" \
+    --runtime claude \
+    --workspace "$(dirname "$TASKS_DIR")" \
+    --task-file "$TASKS_DIR/$filename" \
+    --results-dir "$RESULTS_DIR" \
+    --repo "$REPO" \
+    --probe >/dev/null
+  rc=$?
+  if [ "$rc" -eq 4 ]; then
+    # Required Team handlers are watcher-owned and must never reach the live core.
+    return 0
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    echo "task-notifier: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
+    return 3
+  fi
+  return "$rc"
+}
 
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
@@ -61,11 +90,30 @@ log_notifier() {
 # Completion detection and the priority-ordered pick are
 # src/delivery/task_dispatch.py's contract, shared with Codex and agy.
 has_result() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$1"
+  local filename="$1"
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
+  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+  return 0
 }
 
+# Priority/completion/live-claims come from task_dispatch; each candidate
+# also gets a fresh probe here, since a claims-dir snapshot can't see a claim not yet published.
 next_pending_task() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR"
+  local candidate
+  while IFS= read -r candidate; do
+    if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
+        && probe_optional_task_handler "$candidate"; then
+      # Its required handler hasn't claimed it yet; leave it durable on disk
+      # and let that handler's own claim or fallback receipt wake us.
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(
+    "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
+      --claims-dir "$CLAIMS_DIR"
+  )
+  return 1
 }
 
 # "esc to interrupt" covers any in-flight turn; core-input-watch.py's gate
@@ -93,8 +141,7 @@ sys.exit(0 if ciw._is_idle_ready(sys.stdin.read()) else 1)
 }
 
 # Delegates to core-input-watch.py's _composer_is_empty -- idle-ready and an
-# unsent owner draft in the composer are not mutually exclusive; typing over
-# one would submit a mix of the draft and our prompt, or clobber the draft.
+# unsent owner draft are not mutually exclusive; typing over one mixes both.
 core_pane_composer_is_empty() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
@@ -147,28 +194,23 @@ capture_tail() {
     | sed '/^[[:space:]]*$/d' | tail -20
 }
 
-# The tail suffix from the LAST ❯ prompt line onward -- the live composer.
-# A stale copy of our own marker sitting in OLDER scrollback (above the
-# current composer, e.g. an already-submitted prior attempt) must never be
-# mistaken for freshly-staged content. No ❯ line at all returns the whole
-# tail (conservative fallback). Mirrors core-input-watch.py's
-# _composer_from_tail -- kept local in bash since it operates on a tail this
-# script already captured, not on a live pane read.
-composer_from_tail() {
-  awk '
-    /^[[:space:]]*❯/ { start = NR }
-    { line[NR] = $0 }
-    END { for (i = (start ? start : 1); i <= NR; i++) print line[i] }
-  ' <<<"$1"
+# Delegates to core-input-watch.py's _composer_text (dewrapped, footer/gate
+# lines stripped) so exact-equality never sees the status bar or a stale marker.
+composer_text() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
+ciw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ciw)
+print(ciw._composer_text(sys.stdin.read()) or "")
+' "$REPO/src/core-input-watch.py"
 }
 
-# Staged = OUR marker is in the LIVE COMPOSER (not merely somewhere in the
-# tail — a stale copy already in scrollback above the composer must not
-# count) AND the tail changed since $2, a baseline from before this
-# episode's send-keys.
+# Staged = the composer holds EXACTLY our prompt (not merely our marker as a
+# substring -- interleaved owner text would still match that) AND changed since baseline.
 prompt_is_staged() {
-  local tail="$1" baseline="$2"
-  composer_from_tail "$tail" | grep -Fq "Sutando task ready: $3" && [ "$tail" != "$baseline" ]
+  local tail="$1" baseline="$2" prompt="$3"
+  [ "$(composer_text "$tail")" = "$prompt" ] && [ "$tail" != "$baseline" ]
 }
 
 # Type + verify staged, then C-m + verify submitted; both halves retry.
@@ -181,9 +223,8 @@ deliver_prompt() {
     return 1
   fi
   while :; do
-    # Require an empty composer before typing -- idle-ready and an unsent
-    # owner draft are not mutually exclusive; typing over one mixes our
-    # prompt into theirs. Re-checked on every retype, not just the first.
+    # Require an empty composer before typing (re-checked every retype, not
+    # just the first) -- idle-ready and an unsent draft are not exclusive.
     if ! core_pane_composer_is_empty; then
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
@@ -192,25 +233,25 @@ deliver_prompt() {
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_tail="$(capture_tail)"
-    if prompt_is_staged "$staged_tail" "$baseline" "$filename"; then staged=1; break; fi
+    if prompt_is_staged "$staged_tail" "$baseline" "$prompt"; then staged=1; break; fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
     sleep "$POLL_INTERVAL"
   done
-  # Nothing observably staged: never press Enter blind into a live session --
-  # that would submit whatever the composer actually holds, ours or not.
+  # Nothing observably staged: never press Enter blind into a live session.
+  # Enter never sent -> the caller must leave this queued, not wait on a result.
   if [ "$staged" != 1 ]; then
     log_notifier "prompt for $filename never verifiably staged after $((type_tries + 1)) attempts; not pressing Enter (failing closed)"
-    return 0
+    return 1
   fi
   [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
-  # Re-verify the exact composer content immediately before THIS Enter too --
-  # same discipline the retry loop below already applies to every later one.
+  # Re-verify the exact composer content immediately before THIS Enter too;
+  # Enter is still unsent here, so this is not-yet-submitted, not a submission.
   if [ "$(capture_tail)" != "$staged_tail" ]; then
     log_notifier "pane changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
-    return 0
+    return 1
   fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
   while :; do
@@ -277,15 +318,32 @@ mkfifo "$event_dir/events"
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
-while IFS= read -r event; do
-  case "$event" in
-    "TASK_FILE: "*)
-      # A wake signal, not queue order -- once idle, re-scan and pick by
-      # priority so every task stays durable on disk until then.
-      next_pending_task >/dev/null || continue
-      wait_for_core_idle || exit 1
-      filename="$(next_pending_task)" || continue
-      submit_task "$filename"
-      ;;
-  esac
+# A wake signal, not queue order -- once idle, re-scan and pick by priority
+# so every task stays durable on disk until then.
+attempt_highest_pending() {
+  local filename
+  next_pending_task >/dev/null || return 0
+  wait_for_core_idle || exit 1
+  filename="$(next_pending_task)" || return 0
+  submit_task "$filename"
+}
+
+# `read || rc=$?`, NOT `if read; then ...; fi; rc=$?` -- the latter's own
+# exit status is 0 whenever the then-branch never ran, erasing read's real one.
+while :; do
+  event="" rc=0
+  IFS= read -r -t "$RETRY_POLL_SEC" event || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    case "$event" in
+      "TASK_FILE: "*) attempt_highest_pending ;;
+    esac
+    continue
+  fi
+  # macOS's own /bin/bash (3.2) returns 1 for a read TIMEOUT too, same as EOF
+  # (unlike a modern bash's >128) -- ask if the watcher's alive instead.
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    attempt_highest_pending  # a queued task has no other trigger; retry it
+    continue
+  fi
+  break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"

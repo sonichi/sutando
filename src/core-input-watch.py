@@ -138,6 +138,8 @@ _AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
+#: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
+_BORDER_LINE = re.compile(r"^[\s─-╿]+$")
 
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
@@ -251,6 +253,32 @@ def _composer_is_empty(pane: str) -> bool:
         if _PROMPT_LINE.match(ln):
             return not ln.strip().lstrip("❯").strip()
     return False
+
+
+def _composer_text(pane: str) -> "str | None":
+    """The composer's full typed content, dewrapped, or None with no ❯ line.
+
+    From the bottommost ❯ line to the end, dropping any footer/gate line
+    (`_IDLE`/`_SIGNATURES` never legitimately appear in typed text, whichever
+    side of the composer they render on) before joining wrapped rows with no
+    separator — a caller comparing this for exact equality must see only
+    what was actually typed, never the status bar around it.
+    """
+    lines = [ln for ln in pane.splitlines() if ln.strip()]
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _PROMPT_LINE.match(lines[i]):
+            start = i
+            break
+    if start is None:
+        return None
+    block = [ln for ln in lines[start:]
+              if not (_IDLE.search(ln) or _BORDER_LINE.match(ln)
+                      or any(rx.search(ln) for _, rx in _SIGNATURES))]
+    if not block:
+        return ""
+    block[0] = block[0].lstrip().lstrip("❯").lstrip()
+    return "".join(block)
 
 
 def refused_turn(pane: str):
