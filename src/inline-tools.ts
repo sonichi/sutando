@@ -15,6 +15,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { parseToolClaims, registerToolClaims } from './tool_claims.js';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname, delimiter } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -1314,7 +1315,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const dirName of dirs) {
 			const manifestPath = join(skillsDir, dirName, 'manifest.json');
 			if (!existsSync(manifestPath)) continue;
-			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string; access_tier?: string };
+			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string; access_tier?: string; claims?: unknown };
 			try {
 				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 			} catch (err) {
@@ -1337,6 +1338,13 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 				if (Array.isArray(mod.tools)) {
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
+					// Validated against the names that just loaded, so a claim can only ever
+					// name a tool the model can actually call on this host.
+					const claims = parseToolClaims(manifest.claims, mod.tools.map((x: ToolDefinition) => x.name));
+					if (claims.length) {
+						registerToolClaims(claims);
+						console.log(`[skill-loader] ${manifest.name || dirName} claims ${claims.length} request shape(s): ${claims.map(c => c.tool).join(', ')}`);
+					}
 				}
 				if (typeof mod.setup === 'function') {
 					// DISCOVERY, not registration: a skill in N roots hits this line N times

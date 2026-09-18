@@ -18,6 +18,7 @@ import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { claimFor } from './tool_claims.js';
 import {
 	emitTaskProcessed,
 	selectBackend,
@@ -407,6 +408,11 @@ export const workTool: ToolDefinition = {
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
+
+		// A loaded tool may declare this request shape as its own; refuse and name it rather
+		// than spawning a background task the tool would beat. Core names no tool here.
+		const claim = claimFor(task);
+		if (claim) return { status: 'rejected', message: claim.message };
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
