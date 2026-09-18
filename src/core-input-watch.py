@@ -156,6 +156,9 @@ _TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
+# The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
+# on the first typed character, so it is never a draft. Plain capture loses its dimming.
+_COMPOSER_PLACEHOLDER = re.compile(r'^\s*❯\s*Try "[^"\n]*"\s*$')
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40
 
@@ -251,7 +254,7 @@ def _composer_is_empty(pane: str) -> bool:
     """
     for ln in reversed([ln for ln in pane.splitlines() if ln.strip()]):
         if _PROMPT_LINE.match(ln):
-            return not ln.strip().lstrip("❯").strip()
+            return bool(_COMPOSER_PLACEHOLDER.match(ln)) or not ln.strip().lstrip("❯").strip()
     return False
 
 
@@ -278,7 +281,7 @@ def _composer_text(pane: str) -> "str | None":
     while len(block) > 1 and (_IDLE.search(block[-1]) or _BORDER_LINE.match(block[-1])):
         block.pop()
     block = [ln for ln in block if not _BORDER_LINE.match(ln)]
-    if not block:
+    if not block or (len(block) == 1 and _COMPOSER_PLACEHOLDER.match(block[0])):
         return ""
     block[0] = block[0].lstrip().lstrip("❯").lstrip()
     return "".join(block)

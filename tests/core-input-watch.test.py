@@ -546,6 +546,25 @@ class TestComposerText(unittest.TestCase):
         pane = "❯ stale text\n" + _IDLE
         self.assertEqual(_mod._composer_text(pane), "")
 
+    # Captured live from Claude Code v2.1.275 on an idle, never-typed-in pane:
+    # the empty composer renders a hint, and a plain capture loses its dimming.
+    LIVE_PLACEHOLDER_PANE = (
+        "                                            ● high · /effort\n"
+        "────────────────────────────────────────────────────────────────\n"
+        '❯ Try "refactor <filepath>"\n'
+        "────────────────────────────────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+    def test_live_placeholder_hint_is_an_empty_composer(self):
+        self.assertEqual(_mod._composer_text(self.LIVE_PLACEHOLDER_PANE), "")
+        self.assertTrue(_mod._composer_is_empty(self.LIVE_PLACEHOLDER_PANE))
+
+    def test_a_draft_that_starts_like_the_hint_is_still_a_draft(self):
+        pane = self.LIVE_PLACEHOLDER_PANE.replace('❯ Try "refactor <filepath>"',
+                                                  '❯ Try "refactor <filepath>" on main')
+        self.assertFalse(_mod._composer_is_empty(pane))
+        self.assertEqual(_mod._composer_text(pane), 'Try "refactor <filepath>" on main')
+
 
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""

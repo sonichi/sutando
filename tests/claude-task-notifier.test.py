@@ -131,22 +131,25 @@ cmd="$1"; shift
 PANE="{self.pane_file}"
 # Typed rows land ABOVE the status footer, as in a real pane; the footer is
 # always the last row. A text is wrapped at WRAP_COLS like a real terminal.
+# Text lands ON the bottommost composer row (a real pane types at the cursor,
+# replacing the CLI's hint on an empty row); wrapped rows follow that row, and
+# whatever renders below it (a box border, the status footer) stays below.
 append_typed() {{
-  local text="$1" footer=""
-  if tail -n 1 "$PANE" | grep -q 'bypass permissions on'; then
-    footer="$(tail -n 1 "$PANE")"
-    sed -i '' -e '$d' "$PANE"
-  fi
-  # Text lands ON the bare composer row (a real pane types at the cursor).
-  if tail -n 1 "$PANE" | grep -Eq '^❯ *$'; then
-    sed -i '' -e '$d' "$PANE"; text="❯ $text"
-  fi
-  if [ "{self.WRAP_COLS}" -gt 0 ]; then
-    printf '%s\\n' "$text" | fold -w {self.WRAP_COLS} >> "$PANE"
-  else
-    printf '%s\\n' "$text" >> "$PANE"
-  fi
-  [ -n "$footer" ] && printf '%s\\n' "$footer" >> "$PANE"
+  python3 - "$PANE" "$1" {self.WRAP_COLS} <<'PYEOF'
+import re, sys
+path, text, wrap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+lines = open(path).read().split("\\n")
+if lines and lines[-1] == "": lines.pop()
+idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("❯")), None)
+if idx is None:
+    lines.append("❯ "); idx = len(lines) - 1
+row = lines[idx]
+row = "❯ " if re.match(r'^❯ *$|^❯ Try "', row) else row
+new = row + text
+rows = [new[i:i + wrap] for i in range(0, len(new), wrap)] if wrap > 0 else [new]
+lines[idx:idx + 1] = rows
+open(path, "w").write("\\n".join(lines) + "\\n")
+PYEOF
 }}
 go_busy() {{ sed -i '' -e '$d' "$PANE"; printf '%s\\n' "{BUSY_STATUS}" >> "$PANE"; }}
 total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
@@ -713,6 +716,39 @@ class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
                          "the owner's row was discarded and the mix passed as our prompt")
         self.assertIn("permission to continue", self.pane_file.read_text(),
                       "fixture precondition: the owner row is really in the pane")
+
+
+class PlaceholderComposerTests(FakeTmuxHarness):
+    """Found by the isolated live witness, not by any fake: Claude Code
+    v2.1.275 renders a hint in the EMPTY composer, and a plain capture loses
+    the dimming that distinguishes it from typed text. Read as a draft, the
+    notifier refused every task on a genuinely idle pane."""
+
+    LIVE_PANE = (
+        "                                            ● high · /effort\n"
+        "────────────────────────────────────────────────────────────────\n"
+        '❯ Try "refactor <filepath>"\n'
+        "────────────────────────────────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+    def test_hint_in_an_empty_composer_does_not_block_dispatch(self):
+        self.pane_file.write_text(self.LIVE_PANE)
+        self.write_task("task-hint.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-hint.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-hint.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertIn("TYPE Sutando task ready: task-hint.txt", log)
+        self.assertIn("ENTER", log, "the CLI's own hint text was read as an owner draft")
 
 
 class MainLoopWiringTest(FakeTmuxHarness):
