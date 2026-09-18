@@ -1074,5 +1074,17 @@ class FourCasesFold(unittest.TestCase):
         self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
 
 
+
+class BannerPrefix(unittest.TestCase):
+    def test_the_clis_retry_banner_is_the_retry_family_under_its_result_prefix(self):
+        # Claude Code renders errors under "⎿"; the prefix must not hide the banner
+        # from either family's line-start anchor.
+        for line in ("Connection error. Retrying…",
+                     "  ⎿  Connection error. Retrying in 2 seconds…"):
+            self.assertIn("connection-error", w.matched_patterns([line]), line)
+            self.assertEqual([], w.matched_abnormal([line]), line)
+        self.assertIn("api-error", w.matched_abnormal(["  ⎿  API Error: 529 Overloaded"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -701,25 +701,32 @@ class EventDispatchTests(FakeTmuxHarness):
                          "an abnormal pane must not be typed into")
         self.assertIn("did not become healthy", result.stderr)
 
-    def test_a_stale_error_high_in_scrollback_does_not_hold(self):
-        # The error was hours ago; the pane has moved on to an idle prompt. Deliver.
-        self.write_task("task-old.txt")
-        history = "\n".join(f"⏺ line {i}" for i in range(30))
-        self.pane_file.write_text("API Error: 529 Overloaded\n" + history + "\n" + IDLE_FOOTER + "\n")
+    def test_the_clis_connection_error_retry_banner_holds_the_task(self):
+        # The retry family, under the CLI's own result prefix: nothing is being served.
+        self.write_task("task-retry.txt")
+        self.pane_file.write_text("  ⎿  Connection error. Retrying in 2 seconds…\n" + IDLE_FOOTER + "\n")
+        result = self.run_event("task-retry.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "",
+                         "a retrying pane must not be typed into")
+
+    def test_prose_about_a_connection_error_on_screen_does_not_hold(self):
+        # The banner families are line-anchored; a transcript discussing errors is not one.
+        self.write_task("task-prose.txt")
+        self.pane_file.write_text("⏺ I once saw a Connection error. Retrying was the fix.\n" + IDLE_FOOTER + "\n")
         import threading
         def _finish():
             for _ in range(50):
                 if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-old.txt")
+                    self.write_result("task-prose.txt")
                     return
                 time.sleep(0.1)
         t = threading.Thread(target=_finish)
         t.start()
-        result = self.run_event("task-old.txt")
+        result = self.run_event("task-prose.txt")
         t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-old.txt", self.sendkeys_log_text(),
-                      "an error that scrolled off the live tail must not hold delivery")
+        self.assertIn("TYPE Sutando task ready: task-prose.txt", self.sendkeys_log_text())
 
     def test_the_queued_messages_composer_is_not_a_draft(self):
         # A line already queued behind the turn leaves this hint in the composer;
@@ -780,6 +787,57 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-g.txt", self.sendkeys_log_text(),
                       "a missing status file must not hold a task on an idle pane")
+
+
+class SmallViewportTests(FakeTmuxHarness):
+    """A 3-row pane: only the composer and footer are on screen. What scrolled
+    off is history, whatever the scrollback capture still retains of it."""
+
+    PANE_HEIGHT = 3
+
+    def test_a_stale_error_high_in_scrollback_does_not_hold(self):
+        # The error was hours ago; the pane has moved on to an idle prompt. Deliver.
+        self.write_task("task-old.txt")
+        history = "\n".join(f"⏺ line {i}" for i in range(6))
+        self.pane_file.write_text("API Error: 529 Overloaded\n" + history + "\n" + IDLE_FOOTER + "\n")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-old.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-old.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-old.txt", self.sendkeys_log_text(),
+                      "an error that scrolled off the live tail must not hold delivery")
+
+
+    def test_a_visible_error_banner_holds_even_in_a_small_pane(self):
+        # The banner is on screen, right above the composer: that is the live shape.
+        self.write_task("task-vis.txt")
+        self.pane_file.write_text("API Error: 529 Overloaded\n" + IDLE_FOOTER + "\n")
+        result = self.run_event("task-vis.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "")
+
+
+class RePickTests(FakeTmuxHarness):
+    def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
+        # First pass types and submits; no result ever appears. The re-pick after
+        # the completion timeout must see the line in the pane and wait, not queue it twice.
+        self.write_task("task-dup.txt")
+        first = self.run_event("task-dup.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1)
+        second = self.run_event("task-dup.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1,
+                         "the same task was typed a second time while its line was still in the pane")
+        self.assertIn("already in the pane", second.stderr)
 
 
 class TallComposerScrollbackTests(FakeTmuxHarness):
