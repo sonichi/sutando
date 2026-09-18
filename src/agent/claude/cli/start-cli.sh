@@ -42,6 +42,8 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   . "$REPO/scripts/python-binary.sh"
   PY="$(resolve_python "$REPO")"
 fi
+# shellcheck source=skill-manifest-config.sh
+[ -r "$REPO/src/skill-manifest-config.sh" ] && . "$REPO/src/skill-manifest-config.sh"
 
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
@@ -184,6 +186,19 @@ fi
 # the override because tmux may use an older server environment.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+fi
+# Any installed skill's manifest.json "config" block, forwarded like every var
+# above; an already-set var always wins, so a caller's value is never overridden.
+if declare -F skill_manifest_config_pending >/dev/null; then
+  while IFS='=' read -r _mck _mcv; do
+    [ -n "$_mck" ] || continue
+    if [ -n "${!_mck:-}" ]; then
+      CORE_ENV_ARGS+=(-e "$_mck=${!_mck}")
+    else
+      export "$_mck=$_mcv"
+      CORE_ENV_ARGS+=(-e "$_mck=$_mcv")
+    fi
+  done < <(skill_manifest_config_pending "$REPO" "$PY")
 fi
 # Route the core through the credential proxy when one is live (quota
 # telemetry, #2211/#2288). startup.sh exports ANTHROPIC_BASE_URL for cores
