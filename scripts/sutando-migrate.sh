@@ -1673,17 +1673,28 @@ commit_source() {
     fi
 }
 
-# Is the installer's OWN archive-hook command shape (current or legacy
-# Desktop form) registered in this settings file -- never a bare substring,
-# which a foreign hook merely naming the script would also match.
+# Is THIS INSTALL's own archive-hook command (exact script+dest path, not any
+# script by that name) or, when $4=1, the path-less legacy Desktop form here.
+# $4 defaults on -- the deprecated Desktop shape is a real prior-consent form
+# at its own historical locations, but never at a location this fix newly
+# added checking (it holds only whatever the legacy sweep is about to remove).
 _settings_has_archive_hook() {
-    [ -f "$1" ] || return 1
-    # Every pattern via -e -- BSD grep (macOS default) treats a bare pattern
-    # mixed with -e as a filename, not a fourth alternative.
-    jq -r '(.hooks.PreCompact // [])[] .hooks[]? .command // empty' "$1" 2>/dev/null \
-        | grep -Eq -e "^bash '[^']*/archive-transcript\.sh' '[^']*logs/conversations/[^']*'\$" \
-                   -e "^cp \"\\\$TRANSCRIPT_PATH\" \"\\\$HOME/Desktop/sutando-conversations/" \
-                   -e "^bash '[^']*/archive-transcript\.sh' \"\\\$HOME/Desktop/sutando-conversations/\"\$"
+    local settings_file="$1" script_path="${2:-}" dest_path="${3:-}" legacy_desktop_ok="${4:-1}" cmds want
+    [ -f "$settings_file" ] || return 1
+    cmds="$(jq -r '(.hooks.PreCompact // [])[] .hooks[]? .command // empty' "$settings_file" 2>/dev/null)"
+    if [ -n "$script_path" ] && [ -n "$dest_path" ]; then
+        want="bash $(shq "$script_path") $(shq "${dest_path%/}/")"
+        printf '%s\n' "$cmds" | grep -Fxq -- "$want" && return 0
+    fi
+    [ "$legacy_desktop_ok" = "1" ] || return 1
+    printf '%s\n' "$cmds" | grep -Eq -e "^cp \"\\\$TRANSCRIPT_PATH\" \"\\\$HOME/Desktop/sutando-conversations/" \
+                                      -e "^bash '[^']*/archive-transcript\.sh' \"\\\$HOME/Desktop/sutando-conversations/\"\$"
+}
+
+# Single-quote for embedding in a stored shell command -- must match
+# install-claude-hooks.sh's own shq() exactly, or the exact-match above misses.
+shq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 commit_main() {
@@ -1863,6 +1874,12 @@ commit_main() {
         local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _new_settings="${_new_ccd}/settings.json"
         local _old_settings="$HOME/.claude/settings.json"
+        # The real pre-move project-level location (install-claude-hooks.sh's
+        # own LEGACY_PROJECT_SETTINGS) -- distinct from $_old_settings above.
+        local _legacy_project_settings="$REPO_DIR/.claude/settings.json"
+        local _archive_ws; _archive_ws="$(bash "$(dirname "$0")/sutando-config.sh" workspace 2>/dev/null || true)"
+        local _archive_script="$REPO_DIR/src/archive-transcript.sh"
+        local _archive_dest="${_archive_ws}/logs/conversations"
         if [ -x "$_hook_helper" ] || [ -f "$_hook_helper" ]; then
             if [ -n "$_new_ccd" ]; then
                 echo
@@ -1870,14 +1887,12 @@ commit_main() {
                 # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
-                    # Default-off transcript archiving unless already opted in
-                    # (health-check's --fix policy) -- migration must not silently
-                    # enable it. Anchored to the installer's own emitted shape, not
-                    # a bare substring: an unrelated hook/comment merely mentioning
-                    # "archive-transcript.sh" (a foreign decoy) must not count as
-                    # consent (keweichen, round 16).
-                    if _settings_has_archive_hook "$_new_settings" \
-                       || _settings_has_archive_hook "$_old_settings"; then
+                    # Default-off transcript archiving unless already opted in --
+                    # anchored to THIS install's exact script+dest path, checked
+                    # at every location a prior opt-in could actually live.
+                    if _settings_has_archive_hook "$_new_settings" "$_archive_script" "$_archive_dest" \
+                       || _settings_has_archive_hook "$_old_settings" "$_archive_script" "$_archive_dest" \
+                       || _settings_has_archive_hook "$_legacy_project_settings" "$_archive_script" "$_archive_dest" 0; then
                         _archive_opted_in=1
                     fi
                     # `local _hb_rc=$?` after a failing command aborts under `set -e`
