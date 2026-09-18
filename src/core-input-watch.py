@@ -210,7 +210,11 @@ def classify(pane: str):
     # mid-session "Do you want to proceed? / Allow this action" prompt rendered
     # above the footer was hidden — a false negative on a MAIN escalation case. The
     # footer itself matches none of the signatures, so idle still suppresses.)
-    if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES):
+    # The footer vouches only for itself: a hint on any OTHER line is a live
+    # prompt sharing the window with an old footer, and must not be suppressed.
+    beyond_footer = "\n".join(ln for ln in tail.splitlines() if not _IDLE.search(ln))
+    if (_IDLE.search(tail) and not _AWAIT_HINT.search(beyond_footer)
+            and not any(rx.search(tail) for _, rx in _SIGNATURES)):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
@@ -239,7 +243,7 @@ def _is_idle_ready(pane: str) -> bool:
     no-affordance pane (mid-processing / blank / frozen); that must NOT be read as
     idle. Mirrors classify()'s idle-footer suppression."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
-    return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
+    return bool(_IDLE.search(tail)) and classify(pane) is None
 
 
 def _composer_is_empty(pane: str) -> bool:

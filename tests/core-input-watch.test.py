@@ -464,6 +464,31 @@ class TestRefusedTurn(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
 
 
+class TestNovelPromptBesideAnOldFooter(unittest.TestCase):
+    """An unforeseen confirmation rendered under an idle footer that is still
+    in the 14-line window. The footer vouches only for itself: the prompt is
+    live, so this is `unknown`, not idle, and never idle-ready."""
+
+    PANE = "\n".join([
+        "❯",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        "Overwrite the existing config file?",
+        "Enter to confirm · Esc to cancel",
+        "❯",
+    ])
+
+    def test_classify_surfaces_it_as_unknown(self):
+        kind, _ = _mod.classify(self.PANE)
+        self.assertEqual(kind, "unknown")
+
+    def test_it_is_not_idle_ready(self):
+        self.assertFalse(_mod._is_idle_ready(self.PANE))
+
+    def test_a_plain_idle_footer_is_still_idle(self):
+        self.assertIsNone(_mod.classify(_IDLE))
+        self.assertTrue(_mod._is_idle_ready(_IDLE))
+
+
 class TestComposerIsEmpty(unittest.TestCase):
     """_composer_is_empty: distinct from _is_idle_ready -- an idle-ready
     footer and an unsent owner draft in the composer are not mutually

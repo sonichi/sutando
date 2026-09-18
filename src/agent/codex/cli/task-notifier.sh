@@ -24,7 +24,6 @@ TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-f
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
-CORE_STATUS_STALE_SEC=90
 # Submit verification: re-press C-m while the prompt is still staged in the
 # composer and no result has appeared. See submit_and_confirm.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
@@ -32,7 +31,6 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 COMPOSER_READY_TIMEOUT="${SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT:-30}"
 # Poll the composer at the caller's cadence; the default is human-scale.
 COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 watcher_pid=""
@@ -137,19 +135,10 @@ core_pane_is_idle_ready() {
     "esc to interrupt|trust the files in this folder|Do you trust|Bypass Permissions mode|Yes, I accept|Select login method|Paste code here|Browser didn.?t open|Press Enter to continue|❯[[:space:]]*[0-9]+\\.|Do you want to (proceed|allow)|Allow this action|permission to"
 }
 
+# The pane is the only witness; the core's own status file is a self-report that
+# is stale or absent in exactly the moments this path serves. POSITIVE idle only.
 core_is_idle() {
-  local now status_ts
-  [ -f "$CORE_STATUS_FILE" ] || return 1
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && ! core_pane_is_busy && return 0
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
-    || return 1
-  status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
-    | head -1)"
-  [ -n "$status_ts" ] || return 1
-  now="$(date +%s)"
-  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ] \
-    && core_pane_is_idle_ready
+  core_pane_is_idle_ready
 }
 
 wait_for_core_idle() {
