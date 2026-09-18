@@ -530,10 +530,36 @@ class TestComposerText(unittest.TestCase):
                 "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
         self.assertEqual(_mod._composer_text(pane), "notes for agents in prod")
 
-    def test_interior_border_row_is_still_dropped(self):
-        pane = "❯ Sutando task rea\n──────────\ndy: task-x.txt\n" + \
+    def test_the_box_rule_between_composer_and_footer_is_stripped(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n──────────\n" + \
                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
         self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_an_owner_continuation_row_reading_for_agents_survives_the_footer_strip(self):
+        # Popping the real footer must not re-classify the row it exposes:
+        # "for agents" matches the idle regex but here it is what was typed.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_for_agents_row_survives_with_no_box_rule_between_it_and_the_footer(self):
+        # With nothing structural between them, popping the footer exposes the
+        # owner row directly; a strip that loops on the idle regex eats it.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_an_owner_row_of_box_characters_survives(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "────\n"
+                "more owner text\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txt────more owner text")
 
     def test_interleaved_owner_text_survives_in_the_result(self):
         # The exact-equality caller depends on this NOT silently dropping

@@ -261,13 +261,14 @@ def _composer_is_empty(pane: str) -> bool:
 def _composer_text(pane: str) -> "str | None":
     """The composer's full typed content, dewrapped, or None with no ❯ line.
 
-    From the bottommost ❯ line to the end. Only the status bar legitimately
-    renders below an editable composer (a gate replaces it, and the idle/busy
-    checks refuse before anyone compares text), so only TRAILING status rows
-    are stripped and the ❯ row itself never is. Every other row is typed text
-    — including one that merely resembles gate or footer wording; dropping it
-    would let a mixed composer compare equal to the bare prompt. Border rows
-    are structural anywhere. Wrapped rows are joined with no separator.
+    From the bottommost ❯ line to the end. Below an editable composer the
+    pane renders exactly one structural footer — the box rule and ONE status
+    row (a gate replaces the composer; the idle/busy checks refuse before
+    anyone compares text). So the strip is structural, not classifying:
+    trailing box rules, at most one status row, trailing box rules again.
+    Nothing exposed by that strip is re-classified — an owner row that reads
+    "for agents" or "────" is typed text and stays, else a mixed composer
+    would compare equal to the bare prompt. Wrapped rows join with no separator.
     """
     lines = [ln for ln in pane.splitlines() if ln.strip()]
     start = None
@@ -278,9 +279,14 @@ def _composer_text(pane: str) -> "str | None":
     if start is None:
         return None
     block = lines[start:]
-    while len(block) > 1 and (_IDLE.search(block[-1]) or _BORDER_LINE.match(block[-1])):
+
+    def _pop_borders():
+        while len(block) > 1 and _BORDER_LINE.match(block[-1]):
+            block.pop()
+    _pop_borders()
+    if len(block) > 1 and _IDLE.search(block[-1]):
         block.pop()
-    block = [ln for ln in block if not _BORDER_LINE.match(ln)]
+    _pop_borders()
     if not block or (len(block) == 1 and _COMPOSER_PLACEHOLDER.match(block[0])):
         return ""
     block[0] = block[0].lstrip().lstrip("❯").lstrip()

@@ -112,6 +112,8 @@ class FakeTmuxHarness(unittest.TestCase):
         self.capture_count = self.root / "capture-count.txt"
         # Holds N: on the Nth capture the footer flips to BUSY (consumed once).
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
+        # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
+        self.gate_on_capture_flag = self.root / "gate-on-capture.flag"
         # Holds a row of owner text that lands under our paste (consumed once).
         self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
         self._write_fake_tmux()
@@ -161,6 +163,21 @@ open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
 }}
 go_busy() {{ sed -i '' -e '$d' "$PANE"; printf '%s\\n' "{BUSY_STATUS}" >> "$PANE"; }}
+# An owner CONTINUATION row: its own line under the composer text, above
+# whatever structural rows (box rule, status footer) trail the composer.
+append_owner_row() {{
+  python3 - "$PANE" "$1" <<'PYEOF'
+import re, sys
+path, text = sys.argv[1], sys.argv[2]
+lines = open(path).read().split("\\n")
+if lines and lines[-1] == "": lines.pop()
+tail = []
+if lines and "bypass permissions on" in lines[-1]: tail.insert(0, lines.pop())
+while lines and re.match(r"^[\\s─-╿]+$", lines[-1]): tail.insert(0, lines.pop())
+lines.append(text)
+open(path, "w").write("\\n".join(lines + tail) + "\\n")
+PYEOF
+}}
 total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
 history_size() {{
   local t; t="$(total_rows)"; local h=$(( t - {self.PANE_HEIGHT} ))
@@ -178,6 +195,10 @@ case "$cmd" in
     # between the idle gate and the paste), modeled as the footer flipping.
     if [ -f "{self.busy_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.busy_on_capture_flag}")" ]; then
       rm -f "{self.busy_on_capture_flag}"; go_busy
+    fi
+    # Consumed once: on the Nth capture a trust gate has REPLACED the idle pane.
+    if [ -f "{self.gate_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.gate_on_capture_flag}")" ]; then
+      rm -f "{self.gate_on_capture_flag}"; printf '%s\\n' "{TRUST_GATE_PANE}" > "$PANE"
     fi
     scrollback=0
     for a in "$@"; do
@@ -225,7 +246,7 @@ case "$cmd" in
         append_typed "$text"
         # Consumed once: an owner row lands on its own line under our paste.
         if [ -f "{self.extra_owner_row_flag}" ]; then
-          append_typed "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
+          append_owner_row "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
         fi
       fi
     else
@@ -694,17 +715,29 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         # Fresh harness state for the real run, same fake, same read order.
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
-        # CAPTURES@n is the count AT the paste; capture n is the baseline read,
-        # so the read immediately before it is the pre-paste busy check.
-        self.busy_on_capture_flag.write_text(str(n - 1))
+        # CAPTURES@n is the count AT the paste: capture n IS the last read
+        # before it (the baseline), and that read must be the one judged.
+        self.busy_on_capture_flag.write_text(str(n))
         self.write_task("task-race.txt")
         result = self.run_event("task-race.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.sendkeys_log_text()
         self.assertNotIn("TYPE", log, "pasted into a pane that had just gone busy")
         self.assertNotIn("ENTER", log, "sent Enter into a live turn")
-        self.assertIn("went busy before the paste",
+        self.assertIn("not idle-ready at the paste",
                       (self.logs_dir / "claude-task-notifier.log").read_text())
+
+    def test_a_gate_replacing_idle_on_the_baseline_read_blocks_the_paste(self):
+        # Not-busy is not idle: a trust gate has no "esc to interrupt" and
+        # would pass a busy-only check, then receive the task as its answer.
+        n = self._captures_before_first_paste()
+        self.sendkeys_log.write_text(""); self.capture_count.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.gate_on_capture_flag.write_text(str(n))
+        self.write_task("task-gate-race.txt")
+        result = self.run_event("task-gate-race.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TYPE", self.sendkeys_log_text(), "pasted the task into a trust gate")
 
 
 class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
@@ -724,6 +757,23 @@ class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
         self.assertNotIn("ENTER", log,
                          "the owner's row was discarded and the mix passed as our prompt")
         self.assertIn("permission to continue", self.pane_file.read_text(),
+                      "fixture precondition: the owner row is really in the pane")
+
+
+class OwnerRowReadingForAgentsTests(FakeTmuxHarness):
+    """The footer strip must not re-classify what it exposes: once the real
+    status row is gone, an owner row reading `for agents` is trailing and
+    matches the idle regex -- it is typed text and the mix must be refused."""
+
+    def test_owner_continuation_row_matching_the_footer_words_is_never_submitted(self):
+        self.extra_owner_row_flag.write_text("for agents")
+        self.write_task("task-agents.txt")
+        result = self.run_event("task-agents.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertIn("TYPE Sutando task ready: task-agents.txt", log)
+        self.assertNotIn("ENTER", log, "the owner's `for agents` row was stripped as a footer")
+        self.assertIn("for agents\n", self.pane_file.read_text(),
                       "fixture precondition: the owner row is really in the pane")
 
 
@@ -1009,6 +1059,52 @@ esac
             result.stdout.strip(), "task-unrelated2.txt",
             "a required task with no claim file YET must still be skipped, on the "
             f"strength of a fresh probe alone; got {result.stdout!r}, stderr={result.stderr!r}")
+
+
+    def test_separate_task_inbox_still_probes_the_canonical_workspace(self):
+        # A separate task inbox is a supported layout; probed against the inbox's
+        # parent instead of the canonical workspace, the handler says "optional".
+        canonical = self.root / "workspace"
+        inbox = self.root / "deliveries" / "tasks"
+        inbox.mkdir(parents=True)
+        seen = self.root / "handler-saw.txt"
+        handler = self.bin / "fake-handler-ws.sh"
+        handler.write_text(f'''#!/bin/bash
+ws=""; file=""
+while [ $# -gt 0 ]; do
+  case "$1" in --workspace) ws="$2"; shift ;; --task-file) file="$2"; shift ;; esac
+  shift
+done
+printf '%s\\n' "$ws" >> "{seen}"
+case "$file" in
+  */task-protected.txt) [ "$ws" = "{canonical}" ] && exit 4; exit 3 ;;
+  *) exit 3 ;;
+esac
+''')
+        handler.chmod(0o755)
+        (inbox / "task-protected.txt").write_text("task: say OK\n")
+        time.sleep(0.05)
+        (inbox / "task-unrelated3.txt").write_text("task: say OK\n")
+        functions_only = []
+        for line in NOTIFIER.read_text().splitlines():
+            if line.startswith('if [ "${1:-}" = "--event" ]'):
+                break
+            functions_only.append(line)
+        probe_script = NOTIFIER.parent / ".probe-test-separate-inbox.sh"
+        probe_script.write_text("\n".join(functions_only) + "\nnext_pending_task\n")
+        probe_script.chmod(0o755)
+        self.addCleanup(probe_script.unlink, missing_ok=True)
+        env = self._env({"SUTANDO_TASK_EVENT_HANDLER": str(handler),
+                          "SUTANDO_WORKSPACE_DIR": str(canonical),
+                          "SUTANDO_TASKS_DIR": str(inbox)})
+        result = subprocess.run(["/bin/bash", str(probe_script)],
+                                 env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(canonical), seen.read_text(),
+                      "the probe must name the canonical workspace, not the inbox's parent")
+        self.assertNotIn(str(inbox.parent) + "\n", seen.read_text())
+        self.assertEqual(result.stdout.strip(), "task-unrelated3.txt",
+                         f"protected task leaked to the core; got {result.stdout!r}")
 
 
 if __name__ == "__main__":

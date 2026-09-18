@@ -11,17 +11,19 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
-# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR (honors the
-# same SUTANDO_WORKSPACE_DIR override, so both agree under a test override).
-CLAIMS_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}/state/task-event-handler-claims"
+# ONE canonical workspace root for everything workspace-owned (claims, receipts,
+# status, the handler probe): a separate task inbox must never redefine it.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$WORKSPACE_DIR/state/core-status.json}"
+# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
+CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 CORE_STATUS_STALE_SEC=90
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
-TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
@@ -49,7 +51,7 @@ probe_optional_task_handler() {
   [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
   "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime claude \
-    --workspace "$(dirname "$TASKS_DIR")" \
+    --workspace "$WORKSPACE_DIR" \
     --task-file "$TASKS_DIR/$filename" \
     --results-dir "$RESULTS_DIR" \
     --repo "$REPO" \
@@ -85,7 +87,7 @@ trap 'exit 0' HUP INT TERM
 
 log_notifier() {
   local msg="task-notifier: $*" dir
-  dir="$(dirname "$TASKS_DIR")/logs"
+  dir="$WORKSPACE_DIR/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/claude-task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
 }
@@ -119,43 +121,45 @@ next_pending_task() {
   return 1
 }
 
-# "esc to interrupt" covers any in-flight turn; core-input-watch.py's gate
-# signatures don't (a running turn isn't a gate), so this stays local.
+# Every pane predicate has a TEXT form so one snapshot can be judged for busy,
+# idle-ready and composer-empty at once -- three separate reads are three races.
+# "esc to interrupt" covers any in-flight turn; the gate signatures don't.
+pane_text_is_busy() {
+  printf '%s\n' "$1" | tail -12 | grep -Fq 'esc to interrupt'
+}
+
+# core-input-watch.py owns Claude's pane-state patterns; $2 names the predicate.
+pane_text_ciw() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
+ciw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ciw)
+sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
+' "$REPO/src/core-input-watch.py" "$2"
+}
+
+pane_text_is_idle_ready() {
+  [ -n "$1" ] || return 1
+  pane_text_is_busy "$1" && return 1
+  pane_text_ciw "$1" _is_idle_ready
+}
+
+pane_text_composer_is_empty() {
+  [ -n "$1" ] || return 1
+  pane_text_ciw "$1" _composer_is_empty
+}
+
 core_pane_is_busy() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
-  printf '%s\n' "$pane" | tail -12 | grep -Fq 'esc to interrupt'
+  pane_text_is_busy "$pane"
 }
 
-# Delegates gate/idle-footer classification to core-input-watch.py's
-# _is_idle_ready, the shared owner of Claude's pane-state patterns.
 core_pane_is_idle_ready() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
-  [ -n "$pane" ] || return 1
-  core_pane_is_busy && return 1
-  printf '%s' "$pane" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
-ciw = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ciw)
-sys.exit(0 if ciw._is_idle_ready(sys.stdin.read()) else 1)
-' "$REPO/src/core-input-watch.py"
-}
-
-# Delegates to core-input-watch.py's _composer_is_empty; reads scrollback via
-# capture_tail() because a tall unstaged draft hides its marker from the viewport.
-core_pane_composer_is_empty() {
-  local pane
-  pane="$(capture_tail)"
-  [ -n "$pane" ] || return 1
-  printf '%s' "$pane" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
-ciw = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ciw)
-sys.exit(0 if ciw._composer_is_empty(sys.stdin.read()) else 1)
-' "$REPO/src/core-input-watch.py"
+  pane_text_is_idle_ready "$pane"
 }
 
 # Trust core-status.json, pane only to catch a stale/wrong self-report.
@@ -240,9 +244,20 @@ prompt_is_staged() {
 
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
 # count -- blank rows occupy history too) is at the cap: the env var alone cannot fix it.
+# A visible empty marker is a marker; "no marker at all" is the only truncation shape.
+composer_has_marker() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
+ciw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ciw)
+sys.exit(0 if ciw._composer_text(sys.stdin.read()) is not None else 1)
+' "$REPO/src/core-input-watch.py"
+}
+
 capture_may_be_truncated() {
   local raw="$1" cap used
-  [ -n "$(composer_text "$raw")" ] && return 1
+  composer_has_marker "$raw" && return 1
   cap="$(effective_scrollback_lines)"
   used="$(pane_history_field history_size)"
   [ -n "$used" ] || used="$(printf '%s\n' "$raw" | grep -c '')"
@@ -260,26 +275,26 @@ warn_if_capture_truncated() {
 # A core that stays non-idle is a hard gate -- give up rather than type over a live turn.
 deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0
-  local baseline staged_tail staged_raw=""
+  local baseline baseline_raw staged_tail staged_raw=""
   if ! wait_for_core_idle; then
     log_notifier "core did not become idle for $filename; leaving it queued"
     return 1
   fi
   while :; do
-    # Require an empty composer before typing (re-checked every retype, not
-    # just the first) -- idle-ready and an unsent draft are not exclusive.
-    if ! core_pane_composer_is_empty; then
-      warn_if_capture_truncated "$(capture_raw)" "$filename"
+    # ONE snapshot is the last read before the paste and is judged whole:
+    # positively idle-ready (a gate or a turn fails it) and composer empty
+    # (re-checked every retype). Any later read would be a new race.
+    baseline_raw="$(capture_raw)"
+    baseline="$(printf '%s\n' "$baseline_raw" | sed '/^[[:space:]]*$/d')"
+    if ! pane_text_is_idle_ready "$baseline_raw"; then
+      log_notifier "core is not idle-ready at the paste for $filename (busy or a gate); leaving it queued (failing closed)"
+      return 1
+    fi
+    if ! pane_text_composer_is_empty "$baseline_raw"; then
+      warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
     fi
-    # The idle gate above is not a lease: a turn can start between it and
-    # this paste, so re-check busy immediately before every keystroke we send.
-    if core_pane_is_busy; then
-      log_notifier "core went busy before the paste for $filename; leaving it queued (failing closed)"
-      return 1
-    fi
-    baseline="$(capture_tail)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
