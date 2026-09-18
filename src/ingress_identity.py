@@ -11,13 +11,30 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from ag2_sparrow.identity import ingress_task_id
+# Reserved grammar separators, escaped inside a component so the id stays
+# injective; '%' escapes itself so decoding is unambiguous.
+_RESERVED = "%@#+~:"
+
+
+def escape_component(raw: str) -> str:
+    """Injective: printable ASCII passes; reserved, whitespace, path separators
+    and every non-ASCII char become fixed-width uppercase %XX per UTF-8 byte."""
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("identity component must be a non-empty string")
+    out = []
+    for ch in raw:
+        if 0x21 <= ord(ch) <= 0x7E and ch not in _RESERVED and ch not in "/\\":
+            out.append(ch)
+        else:
+            out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
+    return "".join(out)
 
 
 def provider_task_id(instance_label: str, provider_event_id: str) -> str:
-    """Injective ingress id for one provider event on one receiving instance.
-    Same event replayed -> same id, across restarts and hosts."""
-    return ingress_task_id(instance_label, provider_event_id).value
+    """Injective ingress id for one provider event on one receiving instance:
+    task-<instance>~<event>, the ag2space shape generalized. Same event
+    replayed -> same id, across restarts and hosts."""
+    return f"task-{escape_component(instance_label)}~{escape_component(provider_event_id)}"
 
 
 def already_admitted(task_id: str, tasks_dir: Path, results_dir: Path,
