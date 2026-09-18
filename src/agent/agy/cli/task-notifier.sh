@@ -117,11 +117,15 @@ pane_capture() {
 # `capture-pane -p` returns the pane's fixed row count regardless of typed
 # content, so a line-count offset can't isolate new lines — diff the TEXT.
 prompt_is_staged() {
-  local filename="$1" baseline="$2" current added
+  local filename="$1" baseline="$2" current added joined
   current="$(pane_capture)"
   [ "$current" = "$baseline" ] && return 1
   added="$(diff <(printf '%s' "$baseline") <(printf '%s' "$current") 2>/dev/null || true)"
-  printf '%s\n' "$added" | grep '^>' | grep -Fq "Sutando task ready: $filename"
+  # A long marker can hard-wrap across several `>` lines in a narrow pane;
+  # join them before matching, since any single line can miss a split marker.
+  joined="$(printf '%s\n' "$added" | sed -n 's/^> //p' | tr -d '\n')"
+  case "$joined" in *"Sutando task ready: $filename"*) return 0 ;; esac
+  return 1
 }
 
 # Type + poll for staged (a one-shot check retyped a still-landing paste
@@ -187,6 +191,10 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
+# RESULTS_DIR may be DERIVED, never an env var itself — bind it + a distinct
+# instance id explicitly, so the watcher agrees and its sentinel can't collide.
+export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
+export SUTANDO_INSTANCE_ID="${SUTANDO_INSTANCE_ID:-agy-task-notifier}"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 "$NOTIFIER_PY" -c \

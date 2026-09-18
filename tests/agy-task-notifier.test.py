@@ -63,16 +63,19 @@ class FakeTmuxHarness(unittest.TestCase):
         self.sendkeys_log = self.root / "send-keys.log"
         self.sendkeys_log.write_text("")
         self.swallow_flag = self.root / "swallow-next-paste.flag"
+        self.pane_width = None  # None = no wrap; a subclass/test may set a column count
         self._write_fake_tmux()
 
     def _write_fake_tmux(self):
-        # capture-pane renders pane.txt (history) + composer.txt (unsubmitted
-        # input) padded to a FIXED row count, like a real tmux pane; -l concatenates.
+        # Renders pane.txt+composer.txt padded to a FIXED row count; pane_width,
+        # when set, hard-wraps the composer like a real narrow terminal (`fold`).
         script = self.bin / "tmux"
+        pane_width = self.pane_width if self.pane_width else 0
         script.write_text(f'''#!/bin/bash
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
 FIXED_ROWS=12
+PANE_WIDTH={pane_width}
 case "$cmd" in
   has-session)
     [ -f "{self.session_flag}" ] && exit 0
@@ -82,6 +85,9 @@ case "$cmd" in
     hist=""
     [ -f "{self.pane_file}" ] && hist="$(cat "{self.pane_file}")"
     composer="$(cat "{self.composer_file}" 2>/dev/null)"
+    if [ "$PANE_WIDTH" -gt 0 ] && [ -n "$composer" ]; then
+      composer="$(printf '%s' "$composer" | fold -w "$PANE_WIDTH")"
+    fi
     if [ -n "$hist" ]; then
       combined="$hist"$'\\n'"$composer"
     else
@@ -199,6 +205,30 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("ENTER", log)
         pane = self.pane_file.read_text()
         self.assertIn("Sutando task ready: task-b.txt", pane)
+
+    def test_long_filename_wrapped_across_pane_rows_still_stages_once(self):
+        # A long filename can hard-wrap the marker line across two physical
+        # pane rows in a narrow terminal; staging must still detect it.
+        self.pane_width = 80
+        self._write_fake_tmux()
+        filename = "task-cron-sutando-life-kewei-overview-hourly-screenshot-1787587200.txt"
+        self.write_task(filename)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result(filename)
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event(filename)
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        type_calls = log.count(f"TYPE Sutando task ready: {filename}")
+        self.assertEqual(type_calls, 1,
+                          f"expected exactly one type attempt, got {type_calls}:\n{log}")
 
     def test_busy_pane_blocks_dispatch_until_idle(self):
         self.write_task("task-c.txt")
@@ -335,6 +365,58 @@ class MainLoopWiringTest(FakeTmuxHarness):
             deadline = time.time() + 10
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_spawned_watcher_gets_a_distinct_sentinel_not_the_canonical_one(self):
+        # Without a bound instance id the agy watcher's sentinel collides with
+        # a canonical watcher's on the same host (both resolve to the bare name).
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        env = self._env()
+        # This session's own ambient identity env vars would otherwise make the
+        # sentinel non-canonical on their own, confounding the check below.
+        for var in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
+            env.pop(var, None)
+        state_dir = self.tasks_dir.parent / "state"
+        canonical_sentinel = state_dir / "watch-tasks-stream.pid"
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=env,
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline and not state_dir.exists():
+                time.sleep(0.2)
+            sentinels = []
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                sentinels = list(state_dir.glob("watch-tasks-stream*.pid"))
+                if sentinels:
+                    break
+                time.sleep(0.2)
+            self.assertTrue(sentinels, "watcher never wrote a sentinel")
+            self.assertNotEqual(
+                sentinels, [canonical_sentinel],
+                "agy watcher's only sentinel is the bare canonical name — "
+                "it would collide with a real canonical watcher on this host")
         finally:
             if proc.poll() is None:
                 try:
