@@ -156,6 +156,22 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok", result)
         self.assertIn("sutando-core-watcher", result["detail"])
 
+    def test_a_runtime_resolver_error_reads_as_not_selected(self):
+        with mock.patch.object(hc, "resolve_core_runtime", side_effect=RuntimeError("no config")):
+            self.assertFalse(hc._claude_runtime_selected())
+
+    def test_target_reads_the_fresh_record_when_none_is_passed(self):
+        with mock.patch.object(hc, "_fresh_local_core_record", return_value=None):
+            self.assertIsNone(hc._local_claude_notifier_target())
+
+    def test_a_record_missing_its_socket_or_session_yields_no_target(self):
+        tmux = FakeTmux()
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux):
+            self.assertIsNone(hc._local_claude_notifier_target({"session": "sutando-core"}))
+            self.assertIsNone(hc._local_claude_notifier_target({"socket": "/tmp/t.sock"}))
+            self.assertIsNone(hc._local_claude_notifier_target({"socket": "", "session": ""}))
+        self.assertEqual(tmux.calls, [], "no tmux call without a complete record")
+
     def test_probe_is_registered_in_the_check_list(self):
         source = (REPO / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_claude_task_notifier())", source)
