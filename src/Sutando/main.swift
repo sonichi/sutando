@@ -1811,6 +1811,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // via voice-processing IO unit fails to initialize the output node on
         // this hardware (-10875). Re-enable once that's resolved.
         httpToggle(endpoint: "toggle")
+        openWebUI()
     }
 
     @objc func toggleMute() {

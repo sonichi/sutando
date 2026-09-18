@@ -8732,12 +8732,26 @@ def check_proactive_quarantine() -> dict:
                 "detail": "no quarantined proactive bodies (undelivered/ absent)"}
     now = time.time()
     try:
-        entries = list(quarantine.iterdir())
+        top = list(quarantine.iterdir())
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
     kept: list[tuple[str, int, int]] = []
     unreadable = 0
+    # Explicit walk, not `rglob`: rglob swallows an unreadable subdirectory,
+    # and a dropped body is the one failure this probe exists to prevent.
+    entries: list[Path] = []
+    pending = list(top)
+    while pending:
+        item = pending.pop()
+        try:
+            if item.is_dir():
+                pending.extend(item.iterdir())
+                continue
+        except OSError:
+            unreadable += 1
+            continue
+        entries.append(item)
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
         # unreadable entry must not decide the answer for the directory.
@@ -8762,7 +8776,9 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age), int(arrived)))
+        # Relative to the quarantine root: two subdirectories can hold the
+        # same filename, and this label is what a reader opens.
+        kept.append((str(path.relative_to(quarantine)), int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:

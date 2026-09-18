@@ -95,6 +95,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
+- **`ingress_identity.py`** — Provider-event ingress admission — the shared policy behind Slice 3.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
@@ -173,6 +174,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
@@ -181,6 +183,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -270,6 +273,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
+- **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
 
 ## `src/agent/codex/cli/`
 
