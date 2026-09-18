@@ -531,10 +531,10 @@ echo "$$" > "$PID_FILE"
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md): an
 # mtime refreshed by a CHILD, so it stops the instant this watcher does.
 WATCHER_BEAT_PID=""
-__beat_script="$__REPO_ROOT/skills/worker-pool/scripts/pool_beat.py"
-if [ -f "$__beat_script" ]; then
-  # Optional: a host without the pool skill keeps a watcher that beats nothing.
-  "$SUTANDO_PY_BIN" "$__beat_script" --workspace "$WORKSPACE_DIR" \
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
       --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" >/dev/null 2>&1 &
   WATCHER_BEAT_PID=$!
 fi

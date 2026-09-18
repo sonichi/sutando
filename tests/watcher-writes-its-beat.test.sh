@@ -19,6 +19,11 @@ BEAT="$WORKSPACE_DIR/state/watchers/core.alive"
 
 check "beat is absent before the watcher starts" '[ ! -f "$BEAT" ]'
 
+# INJECTED: the core must not locate the skill itself, so the test hands it the
+# path exactly as a spawner would (tests/ may name the skill; src/ may not).
+export SUTANDO_WATCHER_BEAT="$REPO/skills/worker-pool/scripts/pool_beat.py"
+check "the injected beat script exists" '[ -f "$SUTANDO_WATCHER_BEAT" ]'
+
 # Explicit tasks dir: without it the watcher resolves a DIFFERENT workspace and the
 # test silently measures nothing.
 
@@ -50,6 +55,21 @@ _leaked="$(pgrep -f "pool_beat.py --workspace $WORKSPACE_DIR" 2>/dev/null | wc -
 check "no pool_beat child survived the watcher (leaked=$_leaked)" '[ "$_leaked" -eq 0 ]'
 
 WATCHER_PID=""
+
+# ...and with the variable UNSET the core writes no beat at all, which is what
+# keeps a host without the pool skill unaffected.
+SB2="$(mktemp -d)"
+export WORKSPACE_DIR="$SB2/ws"
+mkdir -p "$WORKSPACE_DIR/tasks" "$WORKSPACE_DIR/state"
+unset SUTANDO_WATCHER_BEAT
+python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
+W2=$!
+sleep 3
+check "no beat when SUTANDO_WATCHER_BEAT is unset" '[ ! -d "$WORKSPACE_DIR/state/watchers" ]'
+check "the watcher itself still runs unaffected" 'kill -0 "$W2" 2>/dev/null'
+kill -TERM "-$W2" 2>/dev/null; sleep 0.5; rm -rf "$SB2"
+
 echo ""
-if [ "$fails" -eq 0 ]; then echo "ALL PASS — watcher writes its beat (8 checks)"; else echo "$fails FAILURE(S)"; fi
+if [ "$fails" -eq 0 ]; then echo "ALL PASS — watcher writes its beat (11 checks)"; else echo "$fails FAILURE(S)"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
