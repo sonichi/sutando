@@ -18,6 +18,10 @@ EFFORTS='  1. Low
   4. Extra high
   5. More reasoning…'
 COMPOSER="${TMUX_PANE_TEXT:-$(printf '\033[1m›\033[0m \033[2mImprove documentation in @filename\033[0m\n  gpt-5.5 xhigh fast\n')}"
+# A real pane echoes a staged paste at the composer until its Enter; a composer that is
+# always empty would let a sender's pre-Enter re-read pass on a pane that never took the text.
+STAGED="$(awk '/ -l /{sub(/.* -l /,""); s=$0; staged=1; next} / Enter$/||/ C-m$/{staged=0} END{if (staged) print s}' "$TMUX_LOG")"
+[ -n "$STAGED" ] && [ -z "${TMUX_PANE_TEXT:-}" ] && COMPOSER="$(printf '\033[1m›\033[0m %s\n  gpt-5.5 xhigh fast\n' "$STAGED")"
 # Keys after the LAST "/model" send, minus that send's own Enter, are the picker drive.
 picks="$(awk '/-l \/model$/{p=""; seen=1; skip=1; next} seen && /( -l [0-9]| Enter| Escape)$/{ if (skip && / Enter$/) {skip=0; next}; sub(/.* -l /,""); sub(/.* /,""); p=p $0 "\n"} END{printf "%s", p}' "$TMUX_LOG")"
 model_of() { printf '%s\n' "$ROWS" | sed 's/›/ /' | awk -v d="$1" '$1==d"."{print $2; exit}'; }
