@@ -45,6 +45,7 @@ from delivery.task_dispatch import (  # noqa: E402
     has_ready_result,
     next_pending_task,
     pending_candidates,
+    worker_holds,
 )
 
 CLI = REPO / "src" / "delivery" / "task_dispatch.py"
@@ -497,6 +498,45 @@ class PendingCandidatesTest(unittest.TestCase):
         (self.claims_dir / "task-a.txt").write_text("")
         self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-a.txt"])
 
+    def _hold_for_worker(self, task_id, suffix, worker="worker-1"):
+        folder = Path(self.tmp.name) / "deliveries" / worker
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{task_id}{suffix}").write_text("")
+        return folder.parent
+
+    def test_a_worker_held_task_is_held_back_under_every_sentinel_suffix(self):
+        # The router's hand-off leaves the task in tasks/; each sentinel spelling
+        # (fresh, accepted, claimed) must keep it out of the core's pick.
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                for f in self.tasks_dir.glob("*"):
+                    f.unlink()
+                self._write_task("task-held.txt", priority="urgent")
+                self._write_task("task-free.txt")
+                deliveries = self._hold_for_worker("task-held", suffix)
+                self.assertTrue(worker_holds(deliveries, "task-held.txt"))
+                self.assertFalse(worker_holds(deliveries, "task-free.txt"))
+                self.assertEqual(
+                    list(pending_candidates(self.tasks_dir, self.results_dir,
+                                            deliveries_dir=deliveries)),
+                    ["task-free.txt"])
+                self.assertEqual(
+                    next_pending_task(self.tasks_dir, self.results_dir, deliveries_dir=deliveries),
+                    "task-free.txt")
+                for f in (deliveries / "worker-1").glob("*"):
+                    f.unlink()
+
+    def test_without_a_deliveries_dir_worker_holds_are_not_consulted(self):
+        self._write_task("task-held.txt")
+        self._hold_for_worker("task-held", ".claimed")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-held.txt"])
+
+    def test_worker_holds_is_false_for_an_absent_deliveries_root_or_a_bad_name(self):
+        self.assertFalse(worker_holds(Path(self.tmp.name) / "nope", "task-a.txt"))
+        deliveries = self._hold_for_worker("task-a", ".txt")
+        self.assertFalse(worker_holds(deliveries, "../task-a.txt"))
+        self.assertFalse(worker_holds(deliveries, ""))
+
     def test_a_directory_matching_the_glob_is_skipped_not_yielded(self):
         (self.tasks_dir / "task-a.txt").mkdir()
         self._write_task("task-b.txt")
@@ -617,6 +657,42 @@ class MainDispatchTest(unittest.TestCase):
         rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir),
                                "--claims-dir", str(self.claims_dir))
         self.assertEqual((rc, out), (1, ""))
+
+    def test_pending_and_next_honour_deliveries_dir_in_either_option_order(self):
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w").mkdir(parents=True)
+        (deliveries / "w" / "task-a.accepted").write_text("")
+        for argv in (["--deliveries-dir", str(deliveries)],
+                     ["--claims-dir", str(self.claims_dir), "--deliveries-dir", str(deliveries)],
+                     ["--deliveries-dir", str(deliveries), "--claims-dir", str(self.claims_dir)]):
+            for cmd in ("pending-candidates", "next-pending"):
+                with self.subTest(cmd=cmd, argv=argv):
+                    rc, out, _ = self._run(cmd, str(self.tasks_dir), str(self.results_dir), *argv)
+                    self.assertEqual((rc, out), (1, ""))
+        # Control: the same task is picked when the option is absent.
+        rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir))
+        self.assertEqual((rc, out), (0, "task-a.txt\n"))
+
+    def test_worker_holds_command_both_outcomes_and_usage(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w").mkdir(parents=True)
+        self.assertEqual(self._run("worker-holds", str(deliveries), "task-a.txt")[0], 1)
+        (deliveries / "w" / "task-a.claimed").write_text("")
+        self.assertEqual(self._run("worker-holds", str(deliveries), "task-a.txt")[0], 0)
+        rc, _, err = self._run("worker-holds", str(deliveries), "task-a.txt", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_a_repeated_or_dangling_dir_option_is_a_usage_error(self):
+        d = str(self.claims_dir)
+        for extra in (["--deliveries-dir"], ["--deliveries-dir", ""],
+                      ["--claims-dir", d, "--claims-dir", d],
+                      ["--deliveries-dir", d, "--deliveries-dir", d]):
+            with self.subTest(extra=extra):
+                rc, _, err = self._run("next-pending", str(self.tasks_dir), str(self.results_dir), *extra)
+                self.assertEqual(rc, 2)
+                self.assertIn("usage:", err)
 
     def test_malformed_claims_option_is_a_usage_error(self):
         for extra in (["--claims-dir"], ["--claims-dir", ""], ["--bogus", "x"], ["stray"]):

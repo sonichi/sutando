@@ -21,6 +21,8 @@ WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+# The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
+DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Durable at-most-once record of a submitted prompt, per core incarnation.
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
@@ -121,7 +123,7 @@ next_pending_task() {
     return 0
   done < <(
     "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
-      --claims-dir "$CLAIMS_DIR"
+      --claims-dir "$CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR"
   )
   return 1
 }
@@ -426,7 +428,7 @@ staged_prompt_is_ambiguous() {
   while IFS= read -r other; do
     [ "$other" = "$filename" ] && continue
     prompt_is_staged "$raw" "$(task_prompt "$other")" && return 0
-  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" 2>/dev/null || true)
+  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR" 2>/dev/null || true)
   return 1
 }
 

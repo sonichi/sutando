@@ -496,6 +496,60 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_worker_held_task_is_never_typed_into_the_core(self):
+        # A router hand-off sentinel under deliveries/<worker>/ leaves the file in
+        # tasks/; the pick must skip it whichever unrelated task woke the scan.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        held = self.tasks_dir.parent / "deliveries" / "worker-1"
+        held.mkdir(parents=True, exist_ok=True)
+        self.write_task("task-held.txt")
+        (held / "task-held.claimed").write_text("")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(
+                self._wait_for_fswatch_attach(),
+                "fswatch never attached to the watched tasks dir",
+            )
+            self.write_task("task-unrelated.txt")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-unrelated.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("main loop never dispatched the unrelated task file:\n"
+                          + self.sendkeys_log_text())
+            self.assertNotIn(
+                "Sutando task ready: task-held.txt", self.sendkeys_log_text(),
+                "a worker-held task must never be typed into the live core")
+            self.write_result("task-unrelated.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
     def test_required_task_still_unclaimed_is_skipped_on_a_fresh_probe(self):
         # The pre-claim race: no CLAIMS_DIR entry yet, but a fresh probe must
         # still skip it -- direct against next_pending_task, per the note below.

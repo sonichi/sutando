@@ -103,17 +103,41 @@ def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
     return find_ready_result_for_filename(results_dir, filename) is not None
 
 
+_WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
+def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
+    """True iff some worker's own `deliveries/<worker>/` folder holds a sentinel for this task.
+
+    The pool router hands a task to a worker by writing `<id>.txt` there (the
+    worker renames it `.accepted` / `.claimed`); the task file itself stays in
+    `tasks/`, so a queue reader that never looks here re-delivers it to the core.
+    """
+    if not filename or "/" in filename or ".." in filename:
+        return False
+    task_id = _task_id_for_filename(filename)
+    root = Path(deliveries_dir)
+    try:
+        folders = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return False
+    return any((d / f"{task_id}{suffix}").exists() for d in folders for suffix in _WORKER_HOLD_SUFFIXES)
+
+
 def pending_candidates(
     tasks_dir: "Path | str",
     results_dir: "Path | str",
     *,
     claims_dir: "Path | str | None" = None,
+    deliveries_dir: "Path | str | None" = None,
 ) -> Iterator[str]:
     """Task filenames without a ready result, priority-sorted (mtime FIFO within a tier).
 
-    A name under `claims_dir` is held by a watcher-owned handler and skipped.
-    Only regular files are yielded, never a name that carries a path separator
-    or traversal sentinel, whatever the sort step handed back.
+    A name under `claims_dir` is held by a watcher-owned handler and skipped; a
+    task with a worker sentinel under `deliveries_dir` (`worker_holds`) was routed
+    away from the core and is skipped. Only regular files are yielded, never a
+    name that carries a path separator or traversal sentinel, whatever the sort
+    step handed back.
     """
     claims = Path(claims_dir) if claims_dir else None
     for task in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt")):
@@ -126,6 +150,8 @@ def pending_candidates(
             continue
         if claims is not None and (claims / name).is_file():
             continue
+        if deliveries_dir and worker_holds(deliveries_dir, name):
+            continue
         yield name
 
 
@@ -134,9 +160,11 @@ def next_pending_task(
     results_dir: "Path | str",
     *,
     claims_dir: "Path | str | None" = None,
+    deliveries_dir: "Path | str | None" = None,
 ) -> str | None:
     """First entry of `pending_candidates`, or None."""
-    for name in pending_candidates(tasks_dir, results_dir, claims_dir=claims_dir):
+    for name in pending_candidates(tasks_dir, results_dir, claims_dir=claims_dir,
+                                   deliveries_dir=deliveries_dir):
         return name
     return None
 
@@ -204,21 +232,30 @@ def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR]\n"
-    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR]\n"
+    "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
+    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
+    "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0/1\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
 )
 
 
-def _parse_claims_dir(rest: list[str]) -> "str | None":
-    """`[--claims-dir DIR]` after the two positional dirs; anything else is a usage error."""
-    if not rest:
-        return None
-    if len(rest) == 2 and rest[0] == "--claims-dir" and rest[1]:
-        return rest[1]
-    raise ValueError(_USAGE)
+_DIR_OPTIONS = {"--claims-dir": "claims_dir", "--deliveries-dir": "deliveries_dir"}
+
+
+def _parse_dir_options(rest: list[str]) -> dict:
+    """`[--claims-dir DIR] [--deliveries-dir DIR]` after the two positional dirs, each at
+    most once; anything else is a usage error."""
+    opts: dict = {}
+    i = 0
+    while i < len(rest):
+        key = _DIR_OPTIONS.get(rest[i])
+        if key is None or key in opts or i + 1 >= len(rest) or not rest[i + 1]:
+            raise ValueError(_USAGE)
+        opts[key] = rest[i + 1]
+        i += 2
+    return opts
 
 
 def _main(argv: list[str]) -> int:
@@ -260,20 +297,25 @@ def _main(argv: list[str]) -> int:
             # Cannot decide is its own answer: 1 would read as "not in flight".
             print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
             return 2
+    if cmd == "worker-holds":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if worker_holds(first, second) else 1
     if cmd not in ("pending-candidates", "next-pending"):
         print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)
         return 2
     try:
-        claims_dir = _parse_claims_dir(rest)
+        opts = _parse_dir_options(rest)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if cmd == "pending-candidates":
-        names = list(pending_candidates(first, second, claims_dir=claims_dir))
+        names = list(pending_candidates(first, second, **opts))
         for name in names:
             print(name)
         return 0 if names else 1
-    name = next_pending_task(first, second, claims_dir=claims_dir)
+    name = next_pending_task(first, second, **opts)
     if name is None:
         return 1
     print(name)

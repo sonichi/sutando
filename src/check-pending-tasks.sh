@@ -53,16 +53,11 @@ sentinel_task_id() {
 }
 
 claimed_by_a_worker() {
-  # True if some worker's own deliveries/ folder holds a sentinel for this
-  # task id — the router already routed it away from the core.
-  local task_id="$1" d
-  for d in "$DELIVERIES_DIR"/*/; do
-    [ -d "$d" ] || continue
-    if [ -e "${d}${task_id}.txt" ] || [ -e "${d}${task_id}.accepted" ] || [ -e "${d}${task_id}.claimed" ]; then
-      return 0
-    fi
-  done
-  return 1
+  # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
+  # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
+  local task_id="$1"
+  [ -n "$PYBIN" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1
 }
 
 # A delivered result is claimed out of results/ within about a second
