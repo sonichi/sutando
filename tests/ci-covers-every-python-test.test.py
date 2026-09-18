@@ -81,6 +81,28 @@ def _yaml_dquote_unescape(body: str) -> str:
     return "".join(out)
 
 
+def _quote_close_split(value: str, q: str) -> "tuple[bool, str]":
+    """(closed, text before the matching close), honouring the quote
+    style's own escape — `''` inside single quotes is a literal quote,
+    `\\X` inside double quotes escapes X (a literal `"` included)."""
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if q == "'" and ch == "'":
+            if i + 1 < len(value) and value[i + 1] == "'":
+                i += 2
+                continue
+            return True, value[:i]
+        if q == '"':
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                return True, value[:i]
+        i += 1
+    return False, value
+
+
 def _yaml_scalar(value: str) -> str:
     """A wholly YAML-quoted `run:` value, unwrapped.
 
@@ -142,8 +164,13 @@ def _run_bodies(text: str) -> list[str]:
     The scalar TYPE (`|` literal vs `>` folded) was captured and discarded
     (round 28, qingyun-wu): every block scalar was dedented line-per-line
     regardless of indicator, so a folded `run: >-` was read as literal
-    multi-line shell -- see `_fold_scalar`. Reset alongside the rest."""
+    multi-line shell -- see `_fold_scalar`. Reset alongside the rest.
+    A quoted FLOW scalar left open across a line break (round 30,
+    keweichen) is folded the same way -- adjacent lines join with a
+    single space -- rather than read line-per-line, which named neither
+    physical line as the command Bash actually runs."""
     out, indent, indicator, scalar, block = [], None, None, None, []
+    quote_char, quote_parts = None, []
 
     def _flush():
         cut = indent + indicator if indicator is not None else None
@@ -155,6 +182,13 @@ def _run_bodies(text: str) -> list[str]:
         block.clear()
 
     for ln in text.splitlines():
+        if quote_char is not None:
+            closed, before = _quote_close_split(ln.strip(), quote_char)
+            quote_parts.append(before)
+            if closed:
+                out.append(_yaml_scalar(quote_char + " ".join(quote_parts) + quote_char))
+                quote_char, quote_parts = None, []
+            continue
         stripped = ln.strip()
         m = re.match(r"-?\s*run:\s*([|>])?([+-]?)(\d*)([+-]?)\s*(.*)$", stripped)
         if m and re.search(r"(^|\s)run:", stripped):
@@ -165,8 +199,15 @@ def _run_bodies(text: str) -> list[str]:
             scalar = m.group(1)
             digits = m.group(3)
             indicator = int(digits) if digits else None
-            if m.group(5):
-                out.append(_yaml_scalar(m.group(5)))
+            val = m.group(5)
+            if val and val[0] in "\"'":
+                closed, before = _quote_close_split(val[1:], val[0])
+                if closed:
+                    out.append(_yaml_scalar(val[0] + before + val[0]))
+                else:
+                    quote_char, quote_parts = val[0], [before]
+            elif val:
+                out.append(_yaml_scalar(val))
             continue
         if indent is not None:
             if stripped and (len(ln) - len(ln.lstrip())) <= indent:
@@ -908,6 +949,23 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         on this one (unfolded, unescaped) line."""
         wf = "steps:\n  - run: 'echo setup\\npython3 packages/x/test_live.py'\n"
         self.assertEqual(_named_in(wf), set())
+
+    def test_a_multiline_quoted_flow_scalar_folds_and_decodes(self):
+        """keweichen round 30 [P2 blocker]: a double-quoted `run:` value left
+        open across a line break folds like real YAML, not two separate
+        physical-line reads -- neither of which named the real command."""
+        wf = 'steps:\n  - run: "python3\n      packages/x/test_live.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+        self.assertEqual(
+            orphans_in({"packages/x/test_live.py"}, set(), _named_in(wf)), [])
+
+    def test_a_single_quoted_multiline_flow_scalar_also_folds(self):
+        wf = "steps:\n  - run: 'python3\n      packages/x/test_live.py'\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
+
+    def test_a_multiline_flow_scalar_still_decodes_its_own_escape(self):
+        wf = 'steps:\n  - run: "python3\\tpackages/x/test_live.py\n      "\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_live.py"})
 
     def test_heredoc_nested_in_arithmetic_command_substitution_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 25: a real heredoc inside a `$(...)` nested

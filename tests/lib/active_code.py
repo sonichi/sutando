@@ -316,6 +316,100 @@ def _strip_heredoc_bodies(text: str) -> str:
     return "\n".join(out)
 
 
+_FUNC_START_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s*\{\s*(.*)$")
+
+
+def _brace_delta(line: str) -> int:
+    """Net `{`/`}` depth change, quote- and `${...}`-aware — neither a quoted
+    brace nor a parameter-expansion one opens or closes a function block."""
+    masked = unquoted(line)
+    delta, i, n = 0, 0, len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == "$" and i + 1 < n and masked[i + 1] == "{":
+            i += 2
+            continue
+        if ch == "{":
+            delta += 1
+        elif ch == "}":
+            delta -= 1
+        i += 1
+    return delta
+
+
+def _function_bodies(text: str) -> list[tuple[str, int, int]]:
+    """(name, first_body_line, last_body_line) for every multi-line
+    `name() { ... }` definition — 0-based inclusive indices into
+    `text.split("\\n")`, excluding the opening/closing brace lines
+    themselves. A one-liner (`name() { cmd; }`) has no line to hide."""
+    lines = text.split("\n")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        m = _FUNC_START_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        depth = 1 + _brace_delta(m.group(2))
+        if depth <= 0:
+            i += 1
+            continue
+        start = i + 1
+        j = start
+        while j < n and depth > 0:
+            depth += _brace_delta(lines[j])
+            j += 1
+        if j - 2 >= start:
+            out.append((m.group(1), start, j - 2))
+        i = j
+    return out
+
+
+def _segment_calls(seg: str, name: str) -> bool:
+    toks = _command_tokens(seg)
+    return bool(toks) and toks[0] == name
+
+
+def _strip_unreachable_function_bodies(text: str) -> str:
+    """A defined-but-never-CALLED function's body must not credit an
+    invocation: `foo() { bash discover.sh; }` with no call to `foo`
+    anywhere never runs discover.sh (round 30, keweichen — the delegation
+    guard credited exactly this shape). Reachability is transitive: a body
+    called from an already-reachable function counts too, not just the
+    top-level flow outside every function."""
+    lines = text.split("\n")
+    funcs = _function_bodies(text)
+    if not funcs:
+        return text
+    in_body = [False] * len(lines)
+    for _, start, end in funcs:
+        for k in range(start, end + 1):
+            in_body[k] = True
+    top_level = "\n".join(ln for idx, ln in enumerate(lines) if not in_body[idx])
+
+    def called_in(name: str, hay: str) -> bool:
+        return any(_segment_calls(seg, name) for seg in _segments(hay))
+
+    reachable = {name for name, _, _ in funcs if called_in(name, top_level)}
+    changed = True
+    while changed:
+        changed = False
+        for caller, cstart, cend in funcs:
+            if caller not in reachable:
+                continue
+            body = "\n".join(lines[cstart:cend + 1])
+            for callee, _, _ in funcs:
+                if callee not in reachable and called_in(callee, body):
+                    reachable.add(callee)
+                    changed = True
+
+    for name, start, end in funcs:
+        if name in reachable:
+            continue
+        for k in range(start, end + 1):
+            lines[k] = ""
+    return "\n".join(lines)
+
+
 def program_invokes(text: str, name: str) -> bool:
     """invokes() over a WHOLE program, so AND-OR state survives line breaks.
 
@@ -323,7 +417,7 @@ def program_invokes(text: str, name: str) -> bool:
     the lines one at a time credited that command (measured: both real
     consumers did, and Bash returned 0 with the planted test never run)."""
     return any(_segment_invokes(seg, name)
-               for seg in _segments(_strip_heredoc_bodies(text)))
+               for seg in _segments(_strip_unreachable_function_bodies(_strip_heredoc_bodies(text))))
 
 
 def python_args(line: str) -> list[str]:
@@ -347,9 +441,10 @@ def python_args(line: str) -> list[str]:
 
 
 def program_python_args(text: str) -> list[str]:
-    """python_args() over a WHOLE program; see program_invokes()."""
+    """python_args() over a WHOLE program; see program_invokes() — same
+    unreachable-function-body exclusion, so an uncalled helper's `python3 x.py` isn't credited either."""
     out = []
-    for seg in _segments(_strip_heredoc_bodies(text)):
+    for seg in _segments(_strip_unreachable_function_bodies(_strip_heredoc_bodies(text))):
         a = _segment_python_arg(seg)
         if a:
             out.append(a)

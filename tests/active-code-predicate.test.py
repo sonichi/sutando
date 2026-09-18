@@ -366,6 +366,42 @@ class MultiLinePrograms(unittest.TestCase):
                          program_python_args("python3 x/a.py; false && python3 x/b.py"))
 
 
+class FunctionScopedInvocations(unittest.TestCase):
+    """keweichen's [P2 blocker] on #4202 round 30: `program_invokes()` credited
+    a helper call sitting inside a function DEFINITION that nothing ever
+    calls -- neither runs unless something invokes the function."""
+
+    def test_a_call_inside_an_uncalled_function_is_not_credited(self):
+        self.assertFalse(program_invokes(
+            f"discover() {{\n  bash scripts/{NAME} > files\n}}\n"
+            f"printf '%s\\n' tests/only.test.py > files\n", NAME))
+
+    def test_the_same_call_is_credited_once_the_function_is_invoked(self):
+        self.assertTrue(program_invokes(
+            f"discover() {{\n  bash scripts/{NAME} > files\n}}\ndiscover\n", NAME))
+
+    def test_a_plain_top_level_call_is_unaffected(self):
+        self.assertTrue(program_invokes(f"bash scripts/{NAME} > files\n", NAME))
+
+    def test_reachability_is_transitive_through_a_called_function(self):
+        self.assertTrue(program_invokes(
+            f"inner() {{\n  bash scripts/{NAME}\n}}\nouter() {{\n  inner\n}}\nouter\n", NAME))
+
+    def test_a_dead_transitive_chain_stays_uncredited(self):
+        self.assertFalse(program_invokes(
+            f"inner() {{\n  bash scripts/{NAME}\n}}\nouter() {{\n  inner\n}}\n", NAME))
+
+    def test_a_one_liner_function_has_no_body_lines_to_strip(self):
+        """`name() { cmd; }` closes on its own line -- the new stripper must
+        find no multi-line body there and leave it untouched either way."""
+        from active_code import _function_bodies
+        self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"), [])
+
+    def test_an_uncalled_function_does_not_hide_an_unrelated_top_level_call(self):
+        self.assertTrue(program_invokes(
+            f"discover() {{\n  echo dead\n}}\nbash scripts/{NAME}\n", NAME))
+
+
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier
     round: `true && python3 x.py` and `false || python3 x.py` both really
