@@ -21,6 +21,7 @@ chains `unanswered-tasks.py && core-status.sh idle`.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -61,9 +62,18 @@ def _unanswered_reason(results: Path, task_id: str, tasks: Path | None = None) -
     return dedup_soundness.dedup_problem(results, task_id, tasks, src_dir=_SRC)
 
 
+_POOL_SCRIPTS = _SRC.parent / "skills" / "worker-pool" / "scripts"
+
+
 def _holder(workspace: Path, task_id: str) -> str | None:
-    """Delegated to src/worker_delivery.py — the core must not re-answer this."""
-    sys.path.insert(0, str(_SRC))
+    """Delegated to the worker-pool skill's worker_delivery.py. The skill is
+    optional: without it there is no router, so nobody can hold a task."""
+    try:
+        os.stat(_POOL_SCRIPTS / "worker_delivery.py")
+    except FileNotFoundError:
+        return None
+    # Any other stat failure propagates: an unreadable skill is not an absent one.
+    sys.path.insert(0, str(_POOL_SCRIPTS))
     from worker_delivery import holder_of  # noqa: E402
     return holder_of(workspace, task_id)
 

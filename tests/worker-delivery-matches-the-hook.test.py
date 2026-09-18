@@ -2,7 +2,7 @@
 """The core must not report a task the router already delegated.
 
 Two guards answer "is this still the core's to report?" — the Stop hook in
-shell (it must run without an interpreter) and src/worker_delivery.py for
+shell (it must run without an interpreter) and skills/worker-pool/scripts/worker_delivery.py for
 Python callers. This suite pins the behaviour AND pins the two to the same
 sentinel suffix set, because the failure mode is silent: the copy nobody
 re-reads is the one that hands a worker's task back to the core.
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
 from worker_delivery import SENTINEL_SUFFIXES, _is_dir, holder_of  # noqa: E402
 
 FAILED: list[str] = []
