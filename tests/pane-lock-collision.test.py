@@ -149,6 +149,9 @@ def _notifier_repo(td: Path) -> Path:
         "scripts/python-binary.sh",
         "scripts/tmux-pane-lock.sh",
         "scripts/tmux-pane-lock.bash",
+        # tmux-pane-lock.bash delegates the acquisition here; without it every
+        # take fails and the notifier looks like it declined rather than could not.
+        "src/tmux_pane_lock.py",
     ):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)

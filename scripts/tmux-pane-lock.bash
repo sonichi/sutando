@@ -11,19 +11,10 @@ pane_lock_take() {
   _py="$(bash "$_dir/sutando-config.sh" python-bin)"
   [ -x "$_py" ] || { echo "pane_lock_take: python interpreter not found ($_py) — cannot lock, not sending" >&2; return 7; }
   eval "exec $_fd>\"\$_lock\"" 2>/dev/null || { echo "pane_lock_take: could not open the pane lock ($_lock)" >&2; return 7; }
-  "$_py" - "$_fd" "$_to" <<'PYEOF' || { eval "exec $_fd>&-"; return 1; }
-import fcntl, sys, time
-fd, to = int(sys.argv[1]), sys.argv[2]
-if not to:
-    fcntl.flock(fd, fcntl.LOCK_EX); sys.exit(0)
-deadline = time.time() + float(to)
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); sys.exit(0)
-    except OSError:
-        if time.time() >= deadline: sys.exit(1)
-        time.sleep(0.05)
-PYEOF
+  # src/tmux_pane_lock.py owns the acquisition; this file owns only the fd plumbing,
+  # which cannot move -- a shell transaction must hold the lock in its own shell.
+  "$_py" "$_dir/../src/tmux_pane_lock.py" --flock-fd "$_fd" --timeout "$_to" \
+    || { eval "exec $_fd>&-"; return 1; }
   return 0
 }
 

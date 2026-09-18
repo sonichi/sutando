@@ -28,6 +28,26 @@ def lock_path(sock: str, session: str, repo: Optional[Path] = None) -> Optional[
     return path if r.returncode == 0 and path else None
 
 
+def flock_fd(fd: int, timeout: Optional[float] = None) -> bool:
+    """Take LOCK_EX on an ALREADY-OPEN fd. timeout None waits; a number deadlines.
+
+    The one acquisition for every pane writer: scripts/tmux-pane-lock.bash calls this
+    via the CLI below on a caller-chosen fd, so shell and Python cannot drift apart.
+    """
+    if timeout is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 @contextmanager
 def pane_lock(sock: str, session: str, timeout: float = DEFAULT_TIMEOUT,
               repo: Optional[Path] = None) -> Iterator[bool]:
@@ -47,16 +67,7 @@ def pane_lock(sock: str, session: str, timeout: float = DEFAULT_TIMEOUT,
         return
     held = False
     try:
-        deadline = time.time() + max(0.0, timeout)
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held = True
-                break
-            except OSError:
-                if time.time() >= deadline:
-                    break
-                time.sleep(0.05)
+        held = flock_fd(fd, timeout)
         yield held
     finally:
         if held:
@@ -68,3 +79,15 @@ def pane_lock(sock: str, session: str, timeout: float = DEFAULT_TIMEOUT,
             os.close(fd)
         except OSError:
             pass
+
+
+if __name__ == "__main__":
+    # Flock an fd this process INHERITED, so a shell transaction keeps the lock after
+    # we exit: flock lives on the open file description, which survives across exec.
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--flock-fd", type=int, required=True)
+    ap.add_argument("--timeout", default="")
+    a = ap.parse_args()
+    to = float(a.timeout) if str(a.timeout).strip() else None
+    raise SystemExit(0 if flock_fd(a.flock_fd, to) else 1)
