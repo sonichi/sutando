@@ -768,7 +768,7 @@ ensure_task_notifier() {
   # The launcher-resolved interpreter or nothing: a bare PATH python3 on a Mac
   # without the developer tools is the CLT stub, and the supervisor would run it every second.
   if [ -z "$PY" ]; then
-    echo "  ⚠ task notifier not started: no runnable python3 (scripts/python-binary.sh); the health probe will report it missing" >&2
+    echo "  ⚠ task notifier not started: no runnable Python interpreter (scripts/python-binary.sh); the health probe will report it missing" >&2
     return 0
   fi
   notifier_py="$PY"
