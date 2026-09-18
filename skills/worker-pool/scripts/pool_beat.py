@@ -19,7 +19,7 @@ this file.
 
     beat_path(workspace, "worker", wid)   -> Path
     touch(path)                            -> None
-    classify(path, now, stale_s=90)        -> "live" | "stale" | "absent"
+    classify(path, now, stale_s=90)        -> "live"|"stale"|"absent"|"unknown"
     run_forever(path, interval=30)         -> never returns
 """
 from __future__ import annotations
@@ -40,6 +40,9 @@ KINDS = {"worker": "workers", "watcher": "watchers"}
 LIVE = "live"
 STALE = "stale"
 ABSENT = "absent"
+#: Unreadable. NOT stale: `stale` is the value a reaper acts on, and an EACCES
+#: on one beat file must never read as "this worker died".
+UNKNOWN = "unknown"
 
 
 def beat_path(workspace, kind: str, ident: str) -> Path:
@@ -63,14 +66,17 @@ def touch(path) -> None:
 
 
 def classify(path, now: float, *, stale_s: float = STALE_AFTER_S) -> str:
-    """live / stale / absent for one beat file. A future mtime is a clock fault."""
+    """live / stale / absent / unknown. A future mtime is a clock fault.
+
+    `unknown` is unreadable, and is NOT folded into `stale` — a caller that
+    reaps on `stale` would otherwise reap a live worker on one EACCES.
+    """
     try:
         mtime = Path(path).stat().st_mtime
     except (FileNotFoundError, NotADirectoryError):
         return ABSENT
     except OSError:
-        # Unreadable is not absent and not fresh; the caller must not act on it.
-        return STALE
+        return UNKNOWN
     age = now - mtime
     if age < 0:
         return STALE

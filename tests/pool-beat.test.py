@@ -101,7 +101,15 @@ _a = pathlib.Path(SB) / "loop_a"
 _b = pathlib.Path(SB) / "loop_b"
 os.symlink(_b, _a)
 os.symlink(_a, _b)
-check("an unreadable beat is stale, never absent", pb.classify(_a, NOW), pb.STALE)
+check("an unreadable beat is UNKNOWN, never absent", pb.classify(_a, NOW), pb.UNKNOWN)
+
+# @yixuan-ag2's discriminator on #4421: the docstring told the caller not to act on
+# an unreadable beat while handing back a value identical to a genuine stale one.
+os.utime(p, (NOW - 500, NOW - 500))
+check("unreadable is DISTINGUISHABLE from genuinely stale",
+      pb.classify(_a, NOW) != pb.classify(p, NOW), True)
+check("...and the genuinely stale one still reads stale", pb.classify(p, NOW), pb.STALE)
+check("unknown is not live either", pb.classify(_a, NOW) != pb.LIVE, True)
 
 # --- run_forever refreshes, it does not just create ----------------------
 
@@ -166,7 +174,7 @@ except SystemExit:
     _bad = "refused"
 check("the CLI refuses an unknown --kind", _bad, "refused")
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (32 checks)")
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (35 checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)
