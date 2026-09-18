@@ -1086,5 +1086,41 @@ class BannerPrefix(unittest.TestCase):
         self.assertIn("api-error", w.matched_abnormal(["  ⎿  API Error: 529 Overloaded"]))
 
 
+class LiveRetryBanner(unittest.TestCase):
+    """The CLI's own retry line, judged whole; prose that mentions a retry is not one."""
+
+    LIVE = (
+        "  ⎿  Connection error. Retrying in 2 seconds…",
+        '  ⎿  API Error (529 {"type":"overloaded_error"}) · Retrying in 1 seconds… (attempt 1/10)',
+        "Rate limit reached. Retrying in 30s (attempt 2 of 5)",
+        "Retrying…",
+        "Reconnecting…",
+    )
+    PROSE = (
+        "  ⎿  Connection error. Retrying was the fix.",       # the tool-result prefix, then prose
+        "⏺ I once saw a Connection error. Retrying was the fix.",
+        "  Connection error handling is covered by tests.",   # a wrapped sentence's second row
+        "⎿  Read 3 files; retrying the build later",
+        "Retrying in 2 seconds is what the docs recommend.",
+    )
+
+    def test_each_live_banner_matches(self):
+        for line in self.LIVE:
+            self.assertEqual(1, len(w.live_retry_banner_lines(line)), line)
+
+    def test_prose_about_a_retry_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_retry_banner_lines(line), line)
+
+    def test_a_banner_is_found_inside_a_full_pane(self):
+        pane = "⏺ working\n" + self.LIVE[0] + "\n❯ \n"
+        self.assertEqual(1, len(w.live_retry_banner_lines(pane)))
+
+    def test_the_retry_family_keyword_check_is_wider_than_the_banner(self):
+        # RETRY_PATTERNS is telemetry over any text; the banner grammar must be strictly narrower.
+        for line in self.PROSE:
+            self.assertTrue(w.matched_patterns([line]) or "retry" not in line.lower(), line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
