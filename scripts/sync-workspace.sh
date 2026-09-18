@@ -568,6 +568,8 @@ _compose_exclude_content() {
     echo "*.alive"
     echo "*.sentinel"
     echo "*.pid"
+    # Writer-lock sidecars (<file>.lock) are transient like the rest of this list.
+    echo "*.lock"
     # Secret material — name-pattern deny (M3). The deny list above caught
     # transient state + .env*; it did NOT cover SSH private keys or
     # cert/key material, which would be carried if they ever landed in a
@@ -983,6 +985,10 @@ mode, src, dst = sys.argv[1:4]
 expected = sys.argv[4] if len(sys.argv) > 4 else None
 with open(src, "rb") as f:
     data = f.read()
+# An appender opens its OWN descriptor, so a lock on this one excludes nobody:
+# <dst>.lock is the contract both sides take (src/current_track.py:locked).
+writer_lock = open(dst + ".lock", "a+")
+fcntl.flock(writer_lock.fileno(), fcntl.LOCK_EX)
 fd = os.open(dst, os.O_RDWR | os.O_CREAT, 0o644)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1016,6 +1022,7 @@ try:
         sys.exit(3 if partial else 1)
 finally:
     os.close(fd)
+    writer_lock.close()          # close releases the flock
 PY
     }
     # fsync a path AND its directory: a rename is only durable once the parent
