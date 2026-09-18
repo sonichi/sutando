@@ -584,6 +584,89 @@ class FunctionScopedInvocations(unittest.TestCase):
                 f"outer\n")
         self.assertTrue(program_invokes(text, NAME))
 
+    def test_a_dead_and_a_live_identically_worded_call_are_not_conflated(self):
+        """kewei-red-ag2space round 34 follow-up: a dead `discover` call
+        (inside `if false`) and a later live one, worded identically, must
+        not have the live segment's credit misattributed to the dead line
+        -- that would resolve against the WRONG point in the program and
+        credit whichever definition preceded the dead line instead of the
+        one active when the real call actually runs. One-liner definitions
+        on purpose: a multi-line definition's own bare closing `}` becomes
+        an extra top-level segment that happens to reabsorb the
+        misalignment, masking exactly this defect."""
+        text = (f"discover() {{ bash scripts/{NAME}; }}\n"
+                f"if false; then\n  discover\nfi\n"
+                f"discover() {{ printf DECOY; }}\n  discover\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_second_call_to_the_same_function_re_resolves_under_a_later_redefinition(self):
+        """kewei-red-ag2space round 34 follow-up: deduping reachable spans
+        by (start, end) alone skipped re-processing a function's body on a
+        SECOND call, so a redefinition landing between the two calls never
+        got explored -- the second call must still resolve independently."""
+        text = ("inner() { printf DECOY; }\n"
+                "outer() { inner; }\n"
+                "outer\n"
+                f"inner() {{ bash scripts/{NAME}; }}\n"
+                "outer\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_split_opener_brace_line_can_carry_body_content_too(self):
+        """kewei-red-ag2space round 34 follow-up: `name()\\n{ :; helper`
+        (content sharing the split opener's OWN brace line, closed by a
+        bare `}` with no body line between) vanished from
+        `_function_bodies` entirely -- only a BARE `{`-only line was
+        recognized as the split form's brace line."""
+        text = f"discover()\n{{ :; bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_an_escaped_semicolon_does_not_open_a_manufactured_command_start(self):
+        """kewei-red-ag2space round 34: exact fixture. `\\;` is a LITERAL
+        semicolon (an argument), never a separator -- treating it as one
+        put the reserved-word check at a manufactured command-start right
+        before the literal `}` argument that followed, closing the
+        function one line early. Direct Bash: exits 0, prints only TOP,
+        never runs the helper."""
+        text = ("discover() {\n"
+                "  printf x \\; } more\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace(
+            "}\nprintf TOP\n", "}\ndiscover\nprintf TOP\n"), NAME))
+
+    def test_a_compact_close_semicolon_still_decrements_depth(self):
+        """kewei-red-ag2space round 34: `}` immediately followed by `;`
+        (no space, `};`) is still a valid, structural close -- Bash really
+        runs the command after it. The token-boundary check required
+        whitespace (or string-edge) on both sides, missing an adjacent
+        operator character as an equally valid boundary."""
+        text = ("outer() {\n"
+                f"  {{ printf nested; }}; bash scripts/{NAME}\n"
+                "}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_compact_open_semicolon_still_increments_depth(self):
+        """Mirror of the above: `{` immediately preceded by `;` (no space,
+        `;{`) is an equally valid open -- confirmed by direct execution."""
+        text = ("outer() {\n"
+                f"  printf x;{{ bash scripts/{NAME}; }}\n"
+                "}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_leading_bare_brace_token_is_a_group_opener_not_the_command(self):
+        """kewei-red-ag2space round 34 follow-up: a command-group's own
+        `{ helper` segment tokenized "{" as the command, never "helper" --
+        the group opener must be peeled like `env`/`bash` are. Spaced on
+        both sides so brace-depth counting alone (already correct here)
+        isn't what's under test -- only the token-peel is."""
+        text = f"outer() {{\n  {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("outer\n", "printf ok\n"), NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier

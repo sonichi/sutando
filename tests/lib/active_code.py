@@ -76,7 +76,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _command_tokens(seg: str) -> list[str]:
-    """`seg`'s tokens with a leading env/VAR=/`!` prefix peeled off.
+    """`seg`'s tokens with a leading env/VAR=/`!`/`{` prefix peeled off.
 
     `FOO=1 cmd` runs `cmd`; `BAD-NAME=1 cmd` is not a valid assignment (a
     hyphen can't start a shell identifier), so bash tries to RUN it and
@@ -88,7 +88,10 @@ def _command_tokens(seg: str) -> list[str]:
     `'!' cmd`, `\\! cmd`, `env ! cmd` and `X=1 ! cmd` all try to RUN a
     program literally named `!` and fail with 127 on both Bash 3.2 and 5.2
     (keweichen round 15) -- shlex already erased the quoting/escaping by the
-    time tokens exist, so this checks the untokenized text first."""
+    time tokens exist, so this checks the untokenized text first. A leading
+    bare `{` (a command-GROUP opener, e.g. `;{ helper; }`) is the group's
+    own first command's real command word (kewei-red-ag2space round 34
+    follow-up: `{ bash helper` tokenized as calling "{", never "bash")."""
     stripped = seg.lstrip()
     leading_bang = stripped == "!" or stripped[:2] in ("! ", "!\t")
     import shlex
@@ -104,6 +107,8 @@ def _command_tokens(seg: str) -> list[str]:
         if _IDENT_RE.match(toks[0]):
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
+            toks = toks[1:]; changed = True
+        elif toks[0] == "{" and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif toks[0] == "timeout" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -324,7 +329,9 @@ _FUNC_START_SPLIT_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\
 # distinct from the two forms above (which both require `()`).
 _FUNC_START_KEYWORD_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*\{\s*(.*)$")
 _FUNC_START_KEYWORD_SPLIT_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*$")
-_BRACE_ONLY_RE = re.compile(r"^\s*\{\s*$")
+# A split opener's `{` line, which may ALSO carry body content after it
+# (`name()\n{ :; helper`) -- group(1) is that content, empty when bare.
+_BRACE_LINE_RE = re.compile(r"^\s*\{\s*(.*)$")
 _CLOSE_ONLY_RE = re.compile(r"^\s*\}\s*$")
 _CMD_SEP = frozenset(";&|")
 
@@ -335,28 +342,36 @@ def _brace_delta(line: str) -> int:
     open or close a function block, so the whole span is skipped as a unit,
     not just its opener (round 30b, keweichen: `echo ${x}` left the closer
     uncounted, so its `}` alone closed an unrelated function block early).
-    A backslash-escaped brace (`\\{`/`\\}`, e.g. `${x:-\\}}`'s literal
-    default) is inert everywhere -- round 33, keweichen: unescaped, that
-    `\\}` read as the expansion's OWN closer, so the REAL closer fell
-    through to the outer counter and closed an unrelated function early.
-    A bare `{`/`}` is a reserved word ONLY in COMMAND-START position, as
-    its own whitespace-delimited token -- round 33, keweichen:
-    `echo hi } more` is `}` as a plain ARGUMENT to echo (never reached as
-    a command), but counting every brace character regardless of position
-    closed the enclosing function one line early."""
+    Any backslash-escaped character (not just `\\{`/`\\}`) is two literal
+    chars everywhere -- kewei-red-ag2space round 34: an escaped `\\;`
+    inside a command was still read as an UNESCAPED separator, so the
+    literal `}` argument right after it landed at a manufactured
+    command-start and counted as structural (round 33's narrower
+    `\\{`/`\\}`-only check missed this; any escaped separator has the
+    same failure shape). `{`/`}` is a reserved word ONLY in COMMAND-START
+    position as its own TOKEN -- bounded by whitespace, string edges, OR
+    another operator (`;`/`&`/`|`), never by an ordinary word character on
+    either side (round 33: `echo hi } more`'s `}` is a plain argument;
+    round 34: a compact `};` or `;{` glued to its neighbor with no space
+    -- both valid Bash, confirmed by direct execution -- was missing its
+    boundary check and read as non-structural)."""
     masked = unquoted(line)
     delta, i, n = 0, 0, len(masked)
     at_cmd_start = True  # the start of a physical line is itself command-start
+
+    def boundary(pos: int) -> bool:
+        return pos < 0 or pos >= n or masked[pos].isspace() or masked[pos] in _CMD_SEP
+
     while i < n:
         ch = masked[i]
-        if ch == "\\" and i + 1 < n and masked[i + 1] in "{}":
+        if ch == "\\" and i + 1 < n:
             i += 2
             at_cmd_start = False
             continue
         if ch == "$" and i + 1 < n and masked[i + 1] == "{":
             depth, i = 1, i + 2
             while i < n and depth > 0:
-                if masked[i] == "\\" and i + 1 < n and masked[i + 1] in "{}":
+                if masked[i] == "\\" and i + 1 < n:
                     i += 2
                     continue
                 if masked[i] == "{":
@@ -367,7 +382,7 @@ def _brace_delta(line: str) -> int:
             at_cmd_start = False
             continue
         if ch in "{}":
-            is_token = (i == 0 or masked[i - 1].isspace()) and (i + 1 == n or masked[i + 1].isspace())
+            is_token = boundary(i - 1) and boundary(i + 1)
             if at_cmd_start and is_token:
                 delta += 1 if ch == "{" else -1
             at_cmd_start = False
@@ -405,26 +420,36 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
     opening line) has no separate line to exclude, so its span is that
     single line and `sig_lines` is empty (round 33, keweichen: treating it
     as having "no line to hide" left its own line out of every function's
-    tracked span entirely, crediting an uncalled one-liner as top-level)."""
+    tracked span entirely, crediting an uncalled one-liner as top-level).
+
+    The split spelling's own opener line (`{` on its own next line) can
+    ALSO carry body content, same as the single-line form (round 34
+    follow-up, kewei-red-ag2space: `name()\\n{ :; helper` closed by a bare
+    `}` with no line between vanished entirely -- only a bare `{`-only
+    line was recognized as that form's opener at all)."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
         m = _FUNC_START_RE.match(lines[i]) or _FUNC_START_KEYWORD_RE.match(lines[i])
         if m:
-            rest, brace_line, anchor, sig_lines = m.group(2), i, i, (i,)
+            rest, brace_line, anchor, name_line = m.group(2), i, i, None
         else:
             m = _FUNC_START_SPLIT_RE.match(lines[i]) or _FUNC_START_KEYWORD_SPLIT_RE.match(lines[i])
-            if m and i + 1 < n and _BRACE_ONLY_RE.match(lines[i + 1]):
-                rest, brace_line, anchor, sig_lines = "", i + 1, i, (i, i + 1)
+            m2 = _BRACE_LINE_RE.match(lines[i + 1]) if m and i + 1 < n else None
+            if m2:
+                rest, brace_line, anchor, name_line = m2.group(1), i + 1, i, i
             else:
                 i += 1
                 continue
+        has_rest = bool(rest.strip())
+        # The name-only line (split form) is always pure declaration; the
+        # opener line joins it only when the opener itself carries no body.
+        sig_lines = ((name_line,) if name_line is not None else ()) + (() if has_rest else (brace_line,))
         depth = 1 + _brace_delta(rest)
         if depth <= 0:
-            out.append((m.group(1), anchor, (), brace_line, brace_line))
+            out.append((m.group(1), anchor, sig_lines, brace_line, brace_line))
             i = brace_line + 1
             continue
-        has_rest = bool(rest.strip())
         j = brace_line + 1
         while j < n and depth > 0:
             depth += _brace_delta(lines[j])
@@ -481,7 +506,18 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     only when it also survives the SAME multi-line AND-OR/if dead-branch
     state the whole candidate region would see, not just its own isolated
     text -- a per-line check alone can't tell `false &&\n  discover` or
-    `if false; then\n  discover\nfi` from an unconditional call."""
+    `if false; then\n  discover\nfi` from an unconditional call.
+
+    A function body reachable from two DIFFERENT call sites can resolve
+    its OWN internal calls differently at each one, if a name it uses was
+    redefined in between (round 34 follow-up, kewei-red-ag2space: deduping
+    a queued span by span alone, ignoring which call site reached it,
+    skipped re-exploring a second call after such a redefinition -- the
+    invocation environment that call actually ran under was never
+    visited). Traversal state is keyed on (span, at_line) for that reason;
+    the final kept set still keys on span alone, since a span reachable
+    under ANY context is real regardless of how many others also reach
+    it."""
     lines = text.split("\n")
     funcs = _function_bodies(text)
     if not funcs:
@@ -520,21 +556,28 @@ def _strip_unreachable_function_bodies(text: str) -> str:
         Lines outside `idxs` are blanked, not omitted, so a gap (an
         excluded function body sitting between two candidates) can't
         shift adjacency; a blank line is a no-op to the AND-OR/if scanner,
-        exactly like a line that was never there."""
+        exactly like a line that was never there.
+
+        Liveness is checked by INCREMENTAL truncation, one candidate line
+        at a time, never by matching filtered segment TEXT back to a line
+        (kewei-red-ag2space round 34 follow-up: an identically-worded dead
+        occurrence earlier in the scan consumed the one live segment a
+        LATER, genuinely-live occurrence produced, crediting the wrong
+        line's call). `_raw_segments`/`_filter_dead_branches` scan strictly
+        left to right with no lookahead, so truncating the region right
+        after `idx` can only ever APPEND segments to what an identical
+        truncation ending one line earlier already produced -- the new
+        ones, if any, are unambiguously `idx`'s own."""
         if not idxs:
             return []
         idx_set = set(idxs)
-        region = [lines[k] if k in idx_set else "" for k in range(len(lines))]
-        live = _segments("\n".join(region))
-        live_pos, out = 0, []
-        for idx in idxs:
-            own = _segments(lines[idx])
-            matched = []
-            for seg in own:
-                if live_pos < len(live) and live[live_pos] == seg:
-                    matched.append(seg)
-                    live_pos += 1
-            if any(_segment_calls(seg, name) for seg in matched):
+        out, prev_len = [], 0
+        for idx in sorted(idxs):
+            region = [lines[k] if k in idx_set and k <= idx else "" for k in range(idx + 1)]
+            live = _segments("\n".join(region))
+            new = live[prev_len:]
+            prev_len = len(live)
+            if any(_segment_calls(seg, name) for seg in new):
                 out.append(idx)
         return out
 
@@ -547,25 +590,32 @@ def _strip_unreachable_function_bodies(text: str) -> str:
                 best = (start, end)
         return best
 
-    # `at_line` is the call site that reached each queued function, not
-    # the nested call's own body-line position (see the docstring above).
+    # `at_line` is the call site that reached each queued function; `visited`
+    # keys on (span, at_line), not span alone (see the docstring above).
     reachable: set[tuple[int, int]] = set()
+    visited: set[tuple[int, int, int]] = set()
     queue: list[tuple[int, int, int]] = []
+
+    def enqueue(span, at_line):
+        reachable.add(span)
+        key = (span[0], span[1], at_line)
+        if key not in visited:
+            visited.add(key)
+            queue.append(key)
+
     for name in by_name:
         for idx in called_on(name, top_level_idx):
             span = resolve(name, idx)
-            if span and span not in reachable:
-                reachable.add(span)
-                queue.append((span[0], span[1], idx))
+            if span:
+                enqueue(span, idx)
     while queue:
         cstart, cend, at_line = queue.pop()
         body_idx = list(range(cstart, cend + 1))
         for name in by_name:
             for idx in called_on(name, body_idx):
                 span = resolve(name, at_line)
-                if span and span not in reachable:
-                    reachable.add(span)
-                    queue.append((span[0], span[1], at_line))
+                if span:
+                    enqueue(span, at_line)
 
     for _, _, _, start, end in funcs:
         if (start, end) in reachable:
