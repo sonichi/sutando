@@ -8,7 +8,9 @@ answers in its own transcript, the terminal shows the reply, and only the queue
 disagrees. Measured five times in one session, caught every time by re-listing
 by hand and never by recall.
 
-Exit 1 when a task older than --min-age-sec has no result, 0 otherwise.
+Exit 1 when a task older than --min-age-sec has no result AND no worker holds
+it, 0 otherwise. A task the router delegated is that worker's to answer, so
+counting it here reports the core as owing work it must not do.
 """
 from __future__ import annotations
 
@@ -53,6 +55,13 @@ def _unanswered_reason(results: Path, task_id: str, tasks: Path | None = None) -
     return dedup_soundness.dedup_problem(results, task_id, tasks, src_dir=_SRC)
 
 
+def _holder(workspace: Path, task_id: str) -> str | None:
+    """Delegated to src/worker_delivery.py — the core must not re-answer this."""
+    sys.path.insert(0, str(_SRC))
+    from worker_delivery import holder_of  # noqa: E402
+    return holder_of(workspace, task_id)
+
+
 def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) -> list[tuple[str, float, str]]:
     _markers()  # resolve up front: an empty queue must not silently skip the guard
     now = time.time() if now is None else now
@@ -64,6 +73,13 @@ def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) ->
         age = now - f.stat().st_mtime
         if age < min_age_sec:
             continue  # still plausibly in flight
+        holder = _holder(workspace, f.stem)
+        if holder is not None:
+            # Not the core's to report: the router made it that worker's. Said
+            # on stderr so a genuinely stuck holder stays visible to a human.
+            print(f"unanswered-tasks: {f.stem} held by {holder} ({age/60:.0f}m) — not the core's to answer",
+                  file=sys.stderr)
+            continue
         reason = _unanswered_reason(results, f.stem, tasks)
         if reason is not None:
             out.append((f.stem, age, reason))
