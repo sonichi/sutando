@@ -174,6 +174,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
@@ -272,6 +273,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
+- **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
 
 ## `src/agent/codex/cli/`
 
