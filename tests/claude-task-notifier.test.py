@@ -386,15 +386,26 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-stale.txt", self.sendkeys_log_text())
 
-    def test_fresh_running_status_blocks_dispatch(self):
-        # A fresh "running" self-report is trusted outright, without
-        # consulting the pane, and must not dispatch before it times out.
+    def test_a_fresh_running_self_report_does_not_block_an_idle_pane(self):
+        # The status file is the core's own report; a killed turn leaves it
+        # "running" while the pane shows the idle prompt. The pane decides.
         self.write_task("task-fresh.txt")
         self.write_status("running", ts=time.time())
-        result = self.run_event("task-fresh.txt", timeout=15)
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-fresh.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-fresh.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                          "a fresh 'running' self-report must block dispatch")
+        self.assertIn("TYPE Sutando task ready: task-fresh.txt", self.sendkeys_log_text(),
+                      "a self-reported 'running' must not outrank an idle pane")
 
     def test_idle_status_but_busy_pane_blocks_dispatch_until_idle(self):
         # status.json says "idle" but the pane shows an in-flight turn: the
@@ -614,14 +625,25 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("Sutando task ready: task-h.txt", self.pane_file.read_text(),
                        "the submitted text staying in scrollback is the exact case this pins")
 
-    def test_no_status_file_blocks_dispatch(self):
-        # No self-report at all yet (e.g. before the core's first status
-        # write): must not guess idle from the pane alone.
+    def test_no_status_file_does_not_block_an_idle_pane(self):
+        # A fresh install or a core that never wrote its status has no file;
+        # the pane alone shows whether a task can be typed.
         self.status_file.unlink()
         self.write_task("task-g.txt")
-        result = self.run_event("task-g.txt", timeout=8)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-g.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-g.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "")
+        self.assertIn("TYPE Sutando task ready: task-g.txt", self.sendkeys_log_text(),
+                      "a missing status file must not hold a task on an idle pane")
 
 
 class TallComposerScrollbackTests(FakeTmuxHarness):

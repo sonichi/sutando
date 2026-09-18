@@ -12,13 +12,11 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 # ONE canonical workspace root for everything workspace-owned (claims, receipts,
-# status, the handler probe): a separate task inbox must never redefine it.
+# the handler probe): a separate task inbox must never redefine it.
 WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$WORKSPACE_DIR/state/core-status.json}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-CORE_STATUS_STALE_SEC=90
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -162,21 +160,10 @@ core_pane_is_idle_ready() {
   pane_text_is_idle_ready "$pane"
 }
 
-# Trust core-status.json, pane only to catch a stale/wrong self-report.
-# Both branches require POSITIVE idle-readiness -- "not busy" alone admits a gate.
+# The pane is the only witness; the core's own status file is a self-report that
+# is stale or absent in exactly the moments this path serves. POSITIVE idle only.
 core_is_idle() {
-  local now status_ts
-  [ -f "$CORE_STATUS_FILE" ] || return 1
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && core_pane_is_idle_ready && return 0
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
-    || return 1
-  status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
-    | head -1)"
-  [ -n "$status_ts" ] || return 1
-  now="$(date +%s)"
-  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ] \
-    && core_pane_is_idle_ready
+  core_pane_is_idle_ready
 }
 
 wait_for_core_idle() {
