@@ -325,6 +325,8 @@ _FUNC_START_SPLIT_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\
 _FUNC_START_KEYWORD_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*\{\s*(.*)$")
 _FUNC_START_KEYWORD_SPLIT_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*$")
 _BRACE_ONLY_RE = re.compile(r"^\s*\{\s*$")
+_CLOSE_ONLY_RE = re.compile(r"^\s*\}\s*$")
+_CMD_SEP = frozenset(";&|")
 
 
 def _brace_delta(line: str) -> int:
@@ -336,13 +338,20 @@ def _brace_delta(line: str) -> int:
     A backslash-escaped brace (`\\{`/`\\}`, e.g. `${x:-\\}}`'s literal
     default) is inert everywhere -- round 33, keweichen: unescaped, that
     `\\}` read as the expansion's OWN closer, so the REAL closer fell
-    through to the outer counter and closed an unrelated function early."""
+    through to the outer counter and closed an unrelated function early.
+    A bare `{`/`}` is a reserved word ONLY in COMMAND-START position, as
+    its own whitespace-delimited token -- round 33, keweichen:
+    `echo hi } more` is `}` as a plain ARGUMENT to echo (never reached as
+    a command), but counting every brace character regardless of position
+    closed the enclosing function one line early."""
     masked = unquoted(line)
     delta, i, n = 0, 0, len(masked)
+    at_cmd_start = True  # the start of a physical line is itself command-start
     while i < n:
         ch = masked[i]
         if ch == "\\" and i + 1 < n and masked[i + 1] in "{}":
             i += 2
+            at_cmd_start = False
             continue
         if ch == "$" and i + 1 < n and masked[i + 1] == "{":
             depth, i = 1, i + 2
@@ -355,41 +364,64 @@ def _brace_delta(line: str) -> int:
                 elif masked[i] == "}":
                     depth -= 1
                 i += 1
+            at_cmd_start = False
             continue
-        if ch == "{":
-            delta += 1
-        elif ch == "}":
-            delta -= 1
+        if ch in "{}":
+            is_token = (i == 0 or masked[i - 1].isspace()) and (i + 1 == n or masked[i + 1].isspace())
+            if at_cmd_start and is_token:
+                delta += 1 if ch == "{" else -1
+            at_cmd_start = False
+            i += 1
+            continue
+        if ch in _CMD_SEP:
+            at_cmd_start = True
+            i += 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        at_cmd_start = False
         i += 1
     return delta
 
 
-def _function_bodies(text: str) -> list[tuple[str, int, int]]:
-    """(name, first_body_line, last_body_line) for every `name() { ... }`
-    or `function name { ... }` definition (either spelling, `{` on the
-    same line or its own next line) — 0-based inclusive indices into
-    `text.split("\\n")`. Multi-line spans exclude the opening/closing
-    brace lines; a one-liner (`name() { cmd; }`, closed on its own
+def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, int]]:
+    """(name, anchor, sig_lines, first_body_line, last_body_line) for every
+    `name() { ... }` or `function name { ... }` definition (either
+    spelling, `{` on the same line or its own next line) — 0-based
+    indices into `text.split("\\n")`. `anchor` is the definition's own
+    first line, for ordering redefinitions against call sites. `sig_lines`
+    are the pure declaration line(s) (`name() {` or `name()` + `{`) that
+    must never be scanned as call text -- round 33, keweichen: `discover ()
+    {` (a space before the parens) tokenizes its OWN line as a bare call to
+    "discover", which the no-space spelling only avoided by tokenization
+    luck (`discover()` glues into one token that can't equal the name).
+
+    Multi-line spans exclude a clean closing-brace-only line, but INCLUDE
+    it when real content shares that line (round 33, keweichen: `bash
+    helper.sh; }` put the last command on the same line as the closer,
+    outside every recorded span, so an uncalled function's last command
+    read as top-level). A one-liner (`name() { cmd; }`, closed on its own
     opening line) has no separate line to exclude, so its span is that
-    single line — round 33, keweichen: treating a one-liner as having
-    "no line to hide" left its own line out of every function's `in_body`
-    set entirely, crediting an uncalled one-liner's command as top-level."""
+    single line and `sig_lines` is empty (round 33, keweichen: treating it
+    as having "no line to hide" left its own line out of every function's
+    tracked span entirely, crediting an uncalled one-liner as top-level)."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
         m = _FUNC_START_RE.match(lines[i]) or _FUNC_START_KEYWORD_RE.match(lines[i])
         if m:
-            rest, brace_line = m.group(2), i
+            rest, brace_line, anchor, sig_lines = m.group(2), i, i, (i,)
         else:
             m = _FUNC_START_SPLIT_RE.match(lines[i]) or _FUNC_START_KEYWORD_SPLIT_RE.match(lines[i])
             if m and i + 1 < n and _BRACE_ONLY_RE.match(lines[i + 1]):
-                rest, brace_line = "", i + 1
+                rest, brace_line, anchor, sig_lines = "", i + 1, i, (i, i + 1)
             else:
                 i += 1
                 continue
         depth = 1 + _brace_delta(rest)
         if depth <= 0:
-            out.append((m.group(1), brace_line, brace_line))
+            out.append((m.group(1), anchor, (), brace_line, brace_line))
             i = brace_line + 1
             continue
         start = brace_line + 1
@@ -397,8 +429,10 @@ def _function_bodies(text: str) -> list[tuple[str, int, int]]:
         while j < n and depth > 0:
             depth += _brace_delta(lines[j])
             j += 1
-        if j - 2 >= start:
-            out.append((m.group(1), start, j - 2))
+        close_line = j - 1
+        end = close_line - 1 if _CLOSE_ONLY_RE.match(lines[close_line]) else close_line
+        if end >= start:
+            out.append((m.group(1), anchor, sig_lines, start, end))
         i = j
     return out
 
@@ -416,44 +450,68 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     called from an already-reachable function counts too, not just the
     top-level flow outside every function.
 
-    A repeated NAME keeps only its LAST definition live — Bash redefinition
-    is last-wins, so an earlier same-named definition never executes no
-    matter what calls it (round 33, keweichen: tracking reachability by
-    name alone kept BOTH a real helper-calling definition and a later
-    decoy shadow "reachable", crediting the dead first one's call)."""
+    A call resolves to whichever definition of that NAME was already
+    ANCHORED (its own first line) before the call's own line -- Bash
+    redefinition is last-wins only AT THAT POINT in execution, never
+    globally (round 33, keweichen: a decoy defined AFTER a real call still
+    "won" under a single global last-definition rule, and the inverse --
+    a helper defined and called BEFORE a later decoy -- wrongly lost credit
+    for a call that had already run). A call before every definition of
+    that name resolves to nothing, matching a real `command not found`."""
     lines = text.split("\n")
     funcs = _function_bodies(text)
     if not funcs:
         return text
-    in_body = [False] * len(lines)
-    for _, start, end in funcs:
+
+    # Every signature/body line is off-limits for call-scanning regardless
+    # of reachability -- a declaration is never a call (see `discover ()`).
+    excluded = [False] * len(lines)
+    for _, _, sig_lines, start, end in funcs:
+        for k in sig_lines:
+            excluded[k] = True
         for k in range(start, end + 1):
-            in_body[k] = True
-    top_level = "\n".join(ln for idx, ln in enumerate(lines) if not in_body[idx])
+            excluded[k] = True
+    top_level_idx = [idx for idx in range(len(lines)) if not excluded[idx]]
 
-    def called_in(name: str, hay: str) -> bool:
-        return any(_segment_calls(seg, name) for seg in _segments(hay))
+    by_name: dict[str, list[tuple[int, int, int]]] = {}
+    for name, anchor, _, start, end in funcs:
+        by_name.setdefault(name, []).append((anchor, start, end))
+    for spans in by_name.values():
+        spans.sort()
 
-    last_by_name = {}
-    for name, start, end in funcs:
-        last_by_name[name] = (start, end)
+    def called_on(name: str, idxs: list[int]) -> list[int]:
+        """Line indices among `idxs` whose own line calls `name`."""
+        return [idx for idx in idxs if any(_segment_calls(seg, name) for seg in _segments(lines[idx]))]
 
-    reachable = {name for name, (start, end) in last_by_name.items()
-                 if called_in(name, top_level)}
-    changed = True
-    while changed:
-        changed = False
-        for caller, (cstart, cend) in last_by_name.items():
-            if caller not in reachable:
-                continue
-            body = "\n".join(lines[cstart:cend + 1])
-            for callee in last_by_name:
-                if callee not in reachable and called_in(callee, body):
-                    reachable.add(callee)
-                    changed = True
+    def resolve(name: str, at_line: int) -> "tuple[int, int] | None":
+        """The (start, end) of `name`'s definition active at `at_line` --
+        the latest anchor strictly before it -- or None if none precedes."""
+        best = None
+        for anchor, start, end in by_name.get(name, ()):
+            if anchor < at_line:
+                best = (start, end)
+        return best
 
-    for name, start, end in funcs:
-        if name in reachable and (start, end) == last_by_name[name]:
+    reachable: set[tuple[int, int]] = set()
+    queue: list[tuple[int, int]] = []
+    for name in by_name:
+        for idx in called_on(name, top_level_idx):
+            span = resolve(name, idx)
+            if span and span not in reachable:
+                reachable.add(span)
+                queue.append(span)
+    while queue:
+        cstart, cend = queue.pop()
+        body_idx = list(range(cstart, cend + 1))
+        for name in by_name:
+            for idx in called_on(name, body_idx):
+                span = resolve(name, idx)
+                if span and span not in reachable:
+                    reachable.add(span)
+                    queue.append(span)
+
+    for _, _, _, start, end in funcs:
+        if (start, end) in reachable:
             continue
         for k in range(start, end + 1):
             lines[k] = ""

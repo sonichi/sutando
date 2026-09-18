@@ -398,7 +398,7 @@ class FunctionScopedInvocations(unittest.TestCase):
         command then read as unconditional top-level code and got credited."""
         from active_code import _function_bodies
         self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"),
-                          [("discover", 0, 0)])
+                          [("discover", 0, (), 0, 0)])
         self.assertFalse(program_invokes(
             f"discover() {{ bash scripts/{NAME}; echo done; }}\nprintf ok\n", NAME))
 
@@ -468,6 +468,58 @@ class FunctionScopedInvocations(unittest.TestCase):
         text = (f"discover() {{\n  printf '%s\\n' tests/only.test.py\n}}\n"
                 f"discover() {{\n  bash scripts/{NAME}\n}}\ndiscover\n")
         self.assertTrue(program_invokes(text, NAME))
+
+    def test_space_before_parens_is_still_a_definition_not_a_call(self):
+        """kewei-red-ag2space round 33 (#4391 follow-up): `discover ()` with
+        a space tokenizes its OWN declaration line as a bare call to
+        "discover" -- `discover()` (no space) only avoided this by luck,
+        since the glued token can't equal the bare name."""
+        text = f"discover () {{\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_redefinition_is_last_wins_only_as_of_the_call_not_globally(self):
+        """A decoy defined BEFORE the call and a real helper defined AFTER
+        it: at runtime the call reaches the decoy, since the helper doesn't
+        exist yet. A single global "last definition" wrongly credited the
+        helper regardless of where the call sits relative to it."""
+        text = (f"discover() {{ printf decoy; }}\n"
+                f"discover\n"
+                f"discover() {{\n  bash scripts/{NAME}\n}}\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_call_between_two_definitions_reaches_the_earlier_one(self):
+        """Mirror of the above: the helper is defined and called BEFORE a
+        later decoy redefinition. The call already reached the helper --
+        a later shadow can't retroactively un-run it."""
+        text = (f"discover() {{\n  bash scripts/{NAME}\n}}\n"
+                f"discover\n"
+                f"discover() {{ printf decoy; }}\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_call_before_any_definition_invokes_nothing(self):
+        """Calling a name before it has been defined at all is a real Bash
+        `command not found` -- it must never resolve to a LATER definition
+        of the same name."""
+        text = f"discover\ndiscover() {{\n  bash scripts/{NAME}\n}}\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_command_sharing_the_closing_brace_line_is_still_tracked(self):
+        """`cmd; }` puts the last real command on the SAME line as the
+        closer -- that line sat outside every recorded span, so an
+        uncalled function's last command read as unconditional top-level."""
+        text = f"dead() {{\n  echo hi\n  bash scripts/{NAME}; }}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "dead\n", NAME))
+
+    def test_a_brace_word_outside_command_position_is_not_structural(self):
+        """`echo hi } more` is `}` as a plain ARGUMENT to echo -- Bash never
+        reaches it as the reserved word, but counting every brace character
+        regardless of position closed the function one line early and let
+        the real helper call after it read as top-level."""
+        text = f"dead() {{\n  echo hi }} more\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "dead\n", NAME))
 
 
 class LiteralConstantAndOrChains(unittest.TestCase):
