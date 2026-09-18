@@ -152,11 +152,19 @@ class AssignmentAttribution(unittest.TestCase):
 
     def test_delivered_without_record_refuses_and_says_so(self):
         """THE GUARD. A delivery sentinel proves this was a worker's task, so
-        returning nothing silently would relay it as if the core produced it."""
+        returning nothing silently would relay it as if the core produced it.
+
+        This used to assert the payload was built WITHOUT metadata — i.e. that
+        the result still went out, unattributed. That was the standing blocker,
+        so the assertion is now that nothing is built at all: _doc() drives
+        publish, and publish is never reached."""
         tid = "task-5566778899001122"
         self._sentinel(W1, tid)
-        doc = self._doc(tid)
-        self.assertNotIn("metadata", doc)
+        self.seen.clear()
+        self.assertFalse(
+            self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!"))
+        self.assertNotIn("payload", self.seen,
+                         "a refused result must not reach publish at all")
         self.assertTrue(
             any("refusing to stamp" in m for m in self.logs),
             f"expected a loud refusal, got {self.logs}",
@@ -334,6 +342,101 @@ class AssignmentAttribution(unittest.TestCase):
                        pool_delivery.ACCEPTED_SUFFIX,
                        pool_delivery.LEGACY_ACCEPTED_SUFFIX):
             self.assertIn(suffix, self.mod._DELIVERY_SUFFIXES)
+
+    # --- the refusal is ENFORCED, not merely logged ----------------------
+
+    def _counting_core(self):
+        """A core that RECORDS publish/deliver instead of aborting, so a test
+        can assert the calls did not happen. The class-level _Backend raises on
+        publish, which cannot distinguish "skipped" from "reached"."""
+        calls = {"publish": 0, "deliver": 0}
+        mod = self.mod
+
+        class _Res:
+            # ATTEMPTED + CONFIRMED is the real happy path: the caller checks
+            # TERMINAL/NOT_CLAIMED first, then res.outcome.
+            status = mod.DrainStatus.ATTEMPTED
+            outcome = mod.CoreDeliveryOutcome.CONFIRMED
+
+        class _Backend:
+            def publish(_s, tid, payload):
+                calls["publish"] += 1
+                return True
+
+            def attempts(_s, tid):
+                return 1
+
+        class _Core:
+            backend = _Backend()
+            provider = object()
+            worker = "test"
+
+            def deliver_one(_s, tid, payload):
+                calls["deliver"] += 1
+                return _Res()
+
+        self.mod._delivery_core = lambda: _Core()
+        return calls
+
+    def test_refused_result_is_neither_published_nor_delivered(self):
+        """THE STANDING BLOCKER. A delivery sentinel with no record means a
+        worker owned this task and nothing recorded who; publishing it relays a
+        worker's reply as the core's own. The log alone never stopped it."""
+        tid = "task-5566778899001133"
+        self._sentinel(W1, tid)
+        calls = self._counting_core()
+        ok = self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!")
+        self.assertFalse(ok, "a withheld result must not report confirmed")
+        self.assertEqual(calls, {"publish": 0, "deliver": 0},
+                         f"refused result still reached the wire: {calls}")
+        self.assertTrue(any("withholding" in m for m in self.logs),
+                        f"expected the refusal to say it withheld, got {self.logs}")
+
+    def test_ordinary_core_result_still_publishes_and_delivers(self):
+        """THE CONTROL that keeps the guard honest: same call, no sentinel, so
+        an ordinary core-routed result must still go out unchanged. Without
+        this, refusing everything would pass the test above."""
+        tid = "task-5566778899001134"
+        calls = self._counting_core()
+        ok = self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!")
+        self.assertTrue(ok)
+        self.assertEqual(calls, {"publish": 1, "deliver": 1})
+
+    def test_an_attributed_worker_result_still_publishes(self):
+        """Second control: a worker result that IS recorded is not withheld —
+        the refusal keys on missing attribution, not on being a worker's."""
+        tid = "task-5566778899001135"
+        self._assign(tid, W1)
+        self._sentinel(W1, tid)
+        calls = self._counting_core()
+        self.assertTrue(self.mod._deliver_result_payload(tid, f"broker-{tid}", "x"))
+        self.assertEqual(calls, {"publish": 1, "deliver": 1})
+
+    def test_refused_result_with_a_file_is_quarantined(self):
+        """With a result file in hand the refusal must terminate, not retry
+        forever — same quarantine the outbox's own terminal arm uses."""
+        tid = "task-5566778899001136"
+        self._sentinel(W1, tid)
+        self._counting_core()
+        seen = {}
+        self.mod._quarantine_undelivered = lambda rf, t, why: seen.update(
+            {"file": rf, "tid": t, "why": why})
+        rf = Path(self.workspace) / f"{tid}.txt"
+        rf.write_text("done!")
+        self.assertFalse(
+            self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!",
+                                             result_file=rf))
+        self.assertEqual(seen.get("tid"), tid)
+        self.assertIn("attribution refused", seen.get("why", ""))
+
+    def test_attribution_reports_refusal_separately_from_no_worker(self):
+        """The pair exists because "" alone cannot separate these two."""
+        refused_tid = "task-5566778899001137"
+        self._sentinel(W1, refused_tid)
+        self.assertEqual(self.mod._attribution(refused_tid), ("", True))
+        self.assertEqual(self.mod._attribution("task-5566778899001138"), ("", False))
+        # the thin wrapper flattens both to "" — which is why senders must not use it
+        self.assertEqual(self.mod._result_worker(refused_tid), "")
 
     def test_traversal_is_refused(self):
         self.assertEqual(self.mod._assigned_worker("../../etc/passwd"), "")

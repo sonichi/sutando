@@ -4024,25 +4024,32 @@ def _delivery_recipient(task_id: str) -> str:
     return claimants.pop() if len(claimants) == 1 else ""
 
 
-def _result_worker(task_id: str) -> str:
-    """Attribution for one result: assignment truth first, completion residue
-    only as the migration fallback.
+def _attribution(task_id: str) -> tuple[str, bool]:
+    """`(worker, refused)` for one result: assignment truth first, completion
+    residue only as the migration fallback.
 
     A task routed before assignment records existed has none, so residue still
     answers for it; once no such task is in flight the residue arm can go. A
     result with residue but no assignment record is precisely the anomaly the
     assignment store exists to surface — an author nobody recorded at routing
     time — so it is logged rather than passed over.
+
+    `refused` is the second outcome, and it is why this returns a pair: a
+    worker's result with no attribution and an ordinary core result BOTH have
+    no worker id, so a bare "" cannot tell a caller to withhold one and send
+    the other. Refused means the sentinel proves a worker owned the task while
+    nothing recorded who — publishing it would relay a worker's reply as the
+    core's own.
     """
     assigned = _assigned_worker(task_id)
     if assigned:
-        return assigned
+        return assigned, False
     residue = _worker_of(task_id)
     if residue:
         _log(f"attribution: {task_id} has no assignment record; using "
              f"completion residue ({residue}). Assignment-time recording "
              f"did not run for this task.")
-        return residue
+        return residue, False
     # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
     # so silence here would relay it as if the core had produced it.
     delivered = _delivery_recipient(task_id)
@@ -4051,7 +4058,15 @@ def _result_worker(task_id: str) -> str:
              f"assignment record and no completion residue - refusing to stamp "
              f"rather than attribute it to the core. The record is written under "
              f"the same lock as the sentinel, so this is an invariant violation.")
-    return ""
+        return "", True
+    return "", False
+
+
+def _result_worker(task_id: str) -> str:
+    """The worker id alone, for callers that only label and never withhold.
+    A refusal reads as "" here, so anything deciding whether to SEND must use
+    _attribution() instead."""
+    return _attribution(task_id)[0]
 
 
 def _worker_of(task_id: str) -> str:
@@ -4092,7 +4107,18 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _result_worker(tid)
+    worker, refused = _attribution(tid)
+    if refused:
+        # ENFORCED, not just logged: this is a worker's reply that nothing
+        # recorded, so sending it would publish it as the core's own.
+        why = ("attribution refused: delivered to a worker but no assignment "
+               "record and no completion residue - withholding rather than "
+               "publishing an unattributed result as the core's own")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} - not published, not delivered")
+        return False
     if worker:
         doc["metadata"] = {"worker_id": worker}
     payload = json.dumps(doc).encode("utf-8")
