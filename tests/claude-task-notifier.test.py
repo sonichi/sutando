@@ -4,12 +4,12 @@
 standby path, matching Codex/agy's shape.
 
 Hermetic: a stub `tmux` on PATH stands in for the real binary. Pane content
-and core-status.json are plain files the test controls directly, so
-status-file/pane gating and staging verification are deterministic rather
-than timing-races against a real TUI. `--event <filename>` drives one
-dispatch directly (exercises has_result, idle-gating via both
-core-status.json and the pane, staging-retry, submit-confirm-retry) without
-needing the fswatch-driven main loop.
+is a plain file the test controls directly, so pane gating and staging
+verification are deterministic rather than timing-races against a real TUI.
+core-status.json is written too, only to prove it is never read. `--event
+<filename>` drives one dispatch directly (exercises has_result, the pane
+gate, staging-retry, submit-confirm-retry) without needing the fswatch-driven
+main loop.
 
 core_pane_is_idle_ready() delegates gate/idle-footer classification to the
 REAL src/core-input-watch.py (not a stub) — that module already owns Claude's
@@ -366,9 +366,8 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("Sutando task ready: task-b.txt", pane)
         self.assertIn("follow CLAUDE.md", log)
 
-    def test_stale_running_status_falls_back_to_pane(self):
-        # status.json says "running" but is stale (>90s): the notifier must
-        # fall back to the pane's own idle-ready read rather than trust it.
+    def test_a_stale_running_self_report_does_not_block_an_idle_pane(self):
+        # The status file is never read; a stale "running" is as irrelevant as a fresh one.
         self.write_task("task-stale.txt")
         self.write_status("running", ts=time.time() - 200)
         self.pane_file.write_text(IDLE_FOOTER + "\n")
@@ -386,15 +385,26 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-stale.txt", self.sendkeys_log_text())
 
-    def test_fresh_running_status_blocks_dispatch(self):
-        # A fresh "running" self-report is trusted outright, without
-        # consulting the pane, and must not dispatch before it times out.
+    def test_a_fresh_running_self_report_does_not_block_an_idle_pane(self):
+        # The status file is the core's own report; a killed turn leaves it
+        # "running" while the pane shows the idle prompt. The pane decides.
         self.write_task("task-fresh.txt")
         self.write_status("running", ts=time.time())
-        result = self.run_event("task-fresh.txt", timeout=15)
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-fresh.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-fresh.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                          "a fresh 'running' self-report must block dispatch")
+        self.assertIn("TYPE Sutando task ready: task-fresh.txt", self.sendkeys_log_text(),
+                      "a self-reported 'running' must not outrank an idle pane")
 
     def test_idle_status_but_busy_pane_blocks_dispatch_until_idle(self):
         # status.json says "idle" but the pane shows an in-flight turn: the
@@ -614,14 +624,38 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("Sutando task ready: task-h.txt", self.pane_file.read_text(),
                        "the submitted text staying in scrollback is the exact case this pins")
 
-    def test_no_status_file_blocks_dispatch(self):
-        # No self-report at all yet (e.g. before the core's first status
-        # write): must not guess idle from the pane alone.
+    def test_a_novel_prompt_under_an_old_idle_footer_is_not_typed_into(self):
+        # An unforeseen confirmation shares the window with a stale idle footer and
+        # a blank bottom composer; the pane read alone must refuse.
+        self.status_file.unlink()
+        self.write_task("task-novel.txt")
+        self.pane_file.write_text("\n".join([
+            "❯", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "Overwrite the existing config file?", "Enter to confirm · Esc to cancel", "❯", ""]))
+        result = self.run_event("task-novel.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "",
+                         "a live prompt must never receive the task as its answer")
+
+    def test_no_status_file_does_not_block_an_idle_pane(self):
+        # A fresh install or a core that never wrote its status has no file;
+        # the pane alone shows whether a task can be typed.
         self.status_file.unlink()
         self.write_task("task-g.txt")
-        result = self.run_event("task-g.txt", timeout=8)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-g.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-g.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "")
+        self.assertIn("TYPE Sutando task ready: task-g.txt", self.sendkeys_log_text(),
+                      "a missing status file must not hold a task on an idle pane")
 
 
 class TallComposerScrollbackTests(FakeTmuxHarness):
@@ -899,6 +933,56 @@ class MainLoopWiringTest(FakeTmuxHarness):
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(0.2)
         finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_a_busy_core_keeps_the_notifier_alive_until_the_session_is_gone(self):
+        # A pending task on a core that stays busy past the ready timeout is
+        # a wait, not a death: only a vanished session ends the process.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        self.pane_file.write_text(BUSY_FOOTER + "\n")
+        self.write_task("task-busy.txt")
+        err = open(self.root / "notifier.stderr", "w")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env({"SUTANDO_NOTIFIER_CORE_READY_TIMEOUT": "1",
+                           "SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
+            cwd=str(self.root),
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+            log = (self.root / "notifier.stderr").read_text()
+            self.assertIn("core did not become idle within 1s", log)
+            self.assertIsNone(proc.poll(),
+                              "a busy core made the notifier exit instead of waiting:\n" + log)
+            self.assertNotIn("TYPE", self.sendkeys_log_text(),
+                             "nothing may be typed into a busy core")
+            self.session_flag.unlink()
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+            self.assertEqual(proc.poll(), 1,
+                             "a vanished session must still end the notifier with status 1")
+        finally:
+            err.close()
             if proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)

@@ -964,6 +964,10 @@ exit 0
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
+  exit 0
+fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
   exit 0
@@ -1044,6 +1048,10 @@ exit 0
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
+  exit 0
+fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
 fi
@@ -1092,6 +1100,10 @@ exit 0
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
+  exit 0
+fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
@@ -1146,7 +1158,8 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
-  [ -f "$BUSY_MARKER" ] && printf '◦ Working (2m • esc to interrupt)\\n'
+  if [ -f "$BUSY_MARKER" ]; then printf '◦ Working (2m • esc to interrupt)\\n'
+  else printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'; fi
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
