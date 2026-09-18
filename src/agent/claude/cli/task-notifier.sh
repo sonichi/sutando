@@ -122,8 +122,8 @@ next_pending_task() {
 # Every pane predicate has a TEXT form so one snapshot can be judged for healthy
 # and composer-empty at once -- two separate reads are two races.
 
-# cli_wedge.py owns the abnormal banners: a retry parked on an error, a limit,
-# a login prompt, a compaction. An in-flight turn is not one of them.
+# cli_wedge.py owns the banners, both families: parked (a limit, a login prompt,
+# a compaction, an API error) and retrying, each anchored to a line start. Prose is neither.
 pane_text_is_abnormal() {
   printf '%s' "$1" | "$NOTIFIER_PY" -c '
 import importlib.util, sys
@@ -131,7 +131,10 @@ spec = importlib.util.spec_from_file_location("cli_wedge", sys.argv[1])
 wedge = importlib.util.module_from_spec(spec)
 sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
 spec.loader.exec_module(wedge)
-sys.exit(0 if wedge.matched_abnormal([sys.stdin.read()]) else 1)
+text = sys.stdin.read()
+lines = [wedge._BANNER_DECOR.sub("", ln) for ln in text.splitlines()]
+retrying = any(rx.match(ln) for _, rx in wedge.RETRY_PATTERNS for ln in lines)
+sys.exit(0 if (wedge.matched_abnormal([text]) or retrying) else 1)
 ' "$REPO/src/cli_wedge.py"
 }
 
@@ -150,8 +153,7 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # gate signature, no abnormal banner. A running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  # A live banner sits at the bottom; an old error higher up the scrollback is history.
-  pane_text_is_abnormal "$(printf '%s\n' "$1" | sed '/^[[:space:]]*$/d' | tail -14)" && return 1
+  pane_text_is_abnormal "$1" && return 1
   pane_text_ciw "$1" _is_idle_ready
 }
 
@@ -219,6 +221,12 @@ capture_raw_esc() {
   tmux -S "$TMUX_SOCKET" capture-pane -p -e -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
 }
 
+# The visible screen only: a banner is live when it is on screen, and an error
+# that scrolled off is history however small the pane.
+capture_view_esc() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -t "$SESSION:0" 2>/dev/null
+}
+
 strip_sgr() {
   LC_ALL=C sed $'s#\x1b\\[[0-9;?]*[ -/]*[@-~]##g'
 }
@@ -242,6 +250,16 @@ print(ciw._composer_text(sys.stdin.read()) or "")
 prompt_is_staged() {
   local raw="$1" prompt="$2"
   [ "$(composer_text "$raw" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ]
+}
+
+# Our prompt anywhere in the capture: delivered and still on record, so a re-pick
+# after the completion timeout must wait, not queue it a second time.
+pane_shows_prompt() {
+  local raw="$1" prompt="$2"
+  case "$(printf '%s' "$raw" | tr -d '[:space:]')" in
+    *"$(printf '%s' "$prompt" | tr -d '[:space:]')"*) return 0 ;;
+  esac
+  return 1
 }
 
 # The composer still carries our prompt at all (exactly, or with owner text
@@ -297,7 +315,7 @@ deliver_prompt() {
     # ONE snapshot is the last read before the paste and is judged whole:
     # healthy (an abnormal banner or a gate fails it) and composer empty
     # (re-checked every retype). Any later read would be a new race.
-    baseline_esc="$(capture_raw_esc)"
+    baseline_esc="$(capture_view_esc)"
     baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
     if ! pane_text_is_healthy "$baseline_raw"; then
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
@@ -372,7 +390,11 @@ submit_task() {
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
-  deliver_prompt "$filename" "$prompt" || return 0
+  if pane_shows_prompt "$(capture_raw)" "$prompt"; then
+    log_notifier "prompt for $filename is already in the pane; awaiting its result, not re-typing"
+  else
+    deliver_prompt "$filename" "$prompt" || return 0
+  fi
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
