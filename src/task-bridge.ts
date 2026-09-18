@@ -267,11 +267,11 @@ export function _isVoiceTask(taskId: string): boolean {
 	return _headerIsVoice(headerLines);
 }
 
-/** The voice verdict over header lines: `source: voice` is the key. A
- *  room-bound voice task carries the room id in `channel_id`, so that field no
- *  longer identifies voice; `media_form: live_stream` never does (the phone
- *  skill stamps it too). The `channel_id: local-voice` literal stays for files
- *  archived before rooms. */
+/** The voice verdict over header lines.
+ *  `source: voice` is the key. A room-bound voice task carries the room id in
+ *  `channel_id`, so that field no longer identifies voice; `media_form:
+ *  live_stream` never does (the phone skill stamps it too). The
+ *  `channel_id: local-voice` literal stays for files archived before rooms. */
 function _headerIsVoice(headerLines: string[]): boolean {
 	return headerLines.some(l => l.startsWith('source: voice') || l.startsWith('channel_id: local-voice'));
 }
