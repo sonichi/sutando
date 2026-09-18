@@ -58,7 +58,7 @@ function assertMacOS() {
 	}
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, bindSessionContextFrame, sessionRoomNotice } from './task-bridge.js';
-import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame } from './web-voice-transport.js';
+import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './web-voice-transport.js';
 import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations } from './voice-navigate.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -1101,6 +1101,20 @@ async function main() {
 		});
 	}
 
+	// What the attached client can answer, from its `session.context` frame
+	// (every desktop sends one per attach and per room change; an older one
+	// sends it without `capabilities`, which reads as none). Cleared when the
+	// client goes, so a later, older client never inherits a newer one's list.
+	let clientCapabilities: ReadonlySet<string> = new Set();
+	function recordClientCapabilities(message: Record<string, unknown>): void {
+		const caps = parseSessionContextCapabilities(message);
+		if (!caps) return;
+		const next = new Set(caps);
+		const same = next.size === clientCapabilities.size && [...next].every((c) => clientCapabilities.has(c));
+		clientCapabilities = next;
+		if (!same) console.log(`${ts()} [SessionRoom] client capabilities: ${caps.length ? caps.join(', ') : 'none'}`);
+	}
+
 	const healthPersistence = createHealthPersistence();
 	const audioHealth = createAudioHealthLedger({
 		sessionId: SESSION_ID,
@@ -1133,6 +1147,7 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
+			recordClientCapabilities(message);
 			void handleSessionContextFrame(message);
 			resolveUiNavigated(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
@@ -1146,6 +1161,7 @@ async function main() {
 			// client announces its own (or none, and tasks fall back to the DM).
 			if (getVoiceSessionRoom()) console.log(`${ts()} [SessionRoom] client gone — room released`);
 			setVoiceSessionRoom(null);
+			clientCapabilities = new Set();
 			failPendingNavigations();
 			voiceRecoveryCoordinator?.handleClientDisconnected();
 		},
@@ -1290,9 +1306,13 @@ async function main() {
 
 	sessionRef = session;
 	// navigate_ui talks to the attached desktop over the session's own client
-	// frame path; with no real client attached the tool answers `unsupported`.
+	// frame path. Attached alone is not enough: every desktop connects, only
+	// one that announced `ui.navigate` in session.context answers the frame,
+	// so the tool checks `supports` before sending and an older desktop hears
+	// "update it" at once instead of a six-second timeout.
 	installVoiceNavigateClient({
 		attached: () => Boolean(session.clientConnected),
+		supports: (capability) => clientCapabilities.has(capability),
 		send: (frame) => session.sendJsonToClient(frame),
 	});
 
