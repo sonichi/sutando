@@ -29,6 +29,7 @@ case " $* " in
     n=$(( $(cat "$TMUX_LOG.n" 2>/dev/null || echo 0) + 1 )); printf %s "$n" > "$TMUX_LOG.n"
     if [ "$n" -ge 2 ] && [ -n "${TMUX_PANE_TEXT_AFTER+x}" ]; then printf '%b' "$TMUX_PANE_TEXT_AFTER"
     else printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}"; fi ;;
+  *" display-message "*) printf '%s\n' "${TMUX_PANE_WIDTH:-80}";;
   *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";;
 esac
 exit 0
@@ -69,6 +70,7 @@ rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39m\033[38;5;246mmerge 4269\0
 rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39mmerge\033[38;5;246m 4269\033[39m\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && grep -q "pending text (merge)" "$T/err" && ! grep -q send-keys "$TMUX_LOG" && ok "C11 claude: typed text survives, only the ghost completion is dropped" || fail "C11" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39m\033[38;5;208mdeploy\033[39m\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && grep -q "pending text (deploy)" "$T/err" && ! grep -q send-keys "$TMUX_LOG" && ok "C15 claude: a 256-colour-CUBE draft (208) is real input, not ghost — only 232-255 is grey" || fail "C15" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='\033[38;5;246m❯\302\240\033[39m\033[38;5;255mghost tail\033[39m\n' run probe hello --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "C16 claude: 255 is still the grey ramp → ghost (upper-edge control for C15)" || fail "C16" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_PANE_WIDTH=24 TMUX_PANE_TEXT='\033[1m\342\200\272\033[0m \033[2mAsk Codex to do anythi\ning in @filename\033[0m\n' TMUX_PANE_TEXT_AFTER='\342\200\272 hello\n' run probe hello --socket "$T/s.sock" --runtime codex --refuse-if-pending); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "C17 codex: a dim placeholder WRAPPED on a narrow pane is still ghost (empty composer, not pending)" || fail "C17" "rc=$rc $(cat "$T/err")"
 rc=$(run probe x --socket "$T/s.sock" --runtime bogus); [ "$rc" = 2 ] && ! grep -q -- "capture-pane\|send-keys" "$TMUX_LOG" && ok "C6 unknown --runtime → 2 before any tmux call" || fail "C6 bogus runtime" "rc=$rc"
 # the runtime is chosen by --runtime only: an ambient RUNTIME variable (callers that pass no flag inherit whatever
 # the environment holds) must not switch the glyph, or a Claude draft reads as empty and gets written into

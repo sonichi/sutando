@@ -54,18 +54,20 @@ for i,l in enumerate(lines):
 if last_i<0:
     print(""); raise SystemExit
 l=lines[last_i]; idx=l.find(glyph)
-r=SGR.sub("",GHOST.sub("",l[idx+len(glyph):]))
-if r[:1] in (" ", "\u00a0"): r=r[1:]
-parts=[r.rstrip()]
+raw=[l[idx+len(glyph):]]
 if W>0:
     prev_full=len(SGR.sub("",l))>=W
     for nxt in lines[last_i+1:]:
         if not prev_full: break
         plain=SGR.sub("",nxt)
         if plain.lstrip(" \t").startswith(glyph): break
-        parts.append(plain.rstrip())
+        raw.append(nxt)
         prev_full=len(plain)>=W
-print("".join(parts).rstrip())' "$RUNTIME" "$WIDTH"
+# A ghost run opened on the prompt row stays open across the wrap and its continuation
+# rows carry no SGR, so join the RAW rows and strip once -- per-row stripping keeps the tail.
+r=SGR.sub("",GHOST.sub("","".join(raw)))
+if r[:1] in (" ", "\u00a0"): r=r[1:]
+print(r.rstrip())' "$RUNTIME" "$WIDTH"
 }
 # Everything BELOW the current prompt line, stripped of colour -- a fingerprint of what the
 # rest of the pane shows. A stale prompt line matching the staged payload proves nothing if
