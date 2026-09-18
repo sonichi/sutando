@@ -648,9 +648,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // loop every 300s, not an incident. Skip only on a runtime we positively
         // recognise as non-Claude; an unresolvable one keeps the historical path,
         // where the send-side --refuse-if-pending still guards an unsent draft.
-        if let rt = SutandoConfig.resolveCoreRuntime(repoRoot: repoRoot), rt != "claude" {
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not typing into a pane whose parser is unknown")
             return
         }
+        if rt != "claude" { return }
 
         switch watcherProcessSeen() {
         case .some(true): return  // watcher alive
@@ -693,7 +695,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // draft is not recoverable. Nil runtime keeps the refuse-on-any-pending
         // policy, which is the safe read on either pane.
         let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher",
-                              runtime: SutandoConfig.resolveCoreRuntime(repoRoot: repoRoot),
+                              runtime: sessionCoreRuntime(),
                               refuseIfPending: true)
         if rc == 5 {
             logToFile("watcher dead; core pane carries unsent text — not sending 'watcher' this tick")
@@ -869,6 +871,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         _ = errPipe.fileHandleForReading.readDataToEndOfFile()
         if proc.terminationStatus != 0 { return nil }
         return String(data: outData, encoding: .utf8)
+    }
+
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
     }
 
     /// True if Claude Code in the sutando-core tmux pane has any running

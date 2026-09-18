@@ -12,8 +12,8 @@ ok(){ echo "  ok   $1"; }; fail(){ echo "  FAIL $1 — $2"; fails=$((fails+1)); 
 
 # --- wiring pins -----------------------------------------------------------
 CALL="$(grep -A3 'line: "watcher"' "$F")"
-printf '%s' "$CALL" | grep -q 'runtime: SutandoConfig.resolveCoreRuntime' \
-  && ok "1 recovery send resolves the session runtime" || fail "1" "no resolveCoreRuntime at the watcher call"
+printf '%s' "$CALL" | grep -q 'runtime: sessionCoreRuntime()' \
+  && ok "1 recovery send resolves the SESSION runtime" || fail "1" "watcher call does not use sessionCoreRuntime()"
 printf '%s' "$CALL" | grep -q 'refuseIfPending: true' \
   && ok "2 ...and refuses a pane with unsent text" || fail "2" "refuseIfPending not passed"
 printf '%s' "$CALL" | grep -q 'skipIfQueued: "watcher"' \
@@ -25,6 +25,11 @@ grep -q 'if let r = runtime { args += \["--runtime", r\] }' "$F" \
 grep -q 'static func resolveCoreRuntime' "$C" && grep -q 'SUTANDO_CORE_RUNTIME' "$C" \
   && grep -q 'loadConfig(repoRoot: explicitRoot)' "$C" \
   && ok "5 runtime resolves from the shared config loader + env override" || fail "5" "resolver missing or bypasses loadConfig"
+# The SESSION outranks config: start-cli.sh exports the runtime into the session,
+# so a one-command Codex trial leaves config saying claude.
+grep -q 'show-environment' "$C" && grep -q 'static func sessionCoreRuntime' "$C" \
+  && grep -q 'SutandoConfig.sessionCoreRuntime(socket:' "$F" \
+  && ok "5b session runtime resolves in SutandoConfig; the app is a thin caller" || fail "5b" "session read missing or duplicated in the app"
 grep -q 'supportedCoreRuntimes: Set<String> = \["claude", "codex"\]' "$C" \
   && ok "6 supported set matches sutando_config.py" || fail "6" "supported runtimes drifted"
 
@@ -59,6 +64,29 @@ rc=$(TMUX_PANE_TEXT='────\n❯ \n────\n' TMUX_PANE_TEXT_AFTER='�
 rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m half typed\n' TMUX_PANE_TEXT_AFTER='› watcher\n' run sutando-core watcher --socket "$T/s.sock" --skip-if-queued watcher)
 [ "$rc" = 0 ] && sent && ok "11 control: the pre-fix argv DOES overwrite the draft (defect is real)" || fail "11" "control did not reproduce; rc=$rc"
 
+# --- the round-2 defect: config and session disagree ------------------------
+# `SUTANDO_CORE_RUNTIME=codex bash src/agent/start-cli.sh --restart` (docs/codex-core.md)
+# leaves config at claude. Resolving from config emits --runtime claude and submits the draft.
+mkdir -p "$T/sess"; cat > "$T/sess/tmux" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" show-environment "*) printf 'SUTANDO_CORE_RUNTIME=%s\n' "${SESSION_RUNTIME:--SUTANDO_CORE_RUNTIME}" ;;
+esac
+exit 0
+SH
+chmod +x "$T/sess/tmux"
+SESSION_RUNTIME=codex PATH="$T/sess:$PATH" tmux -S x show-environment -t =sutando-core SUTANDO_CORE_RUNTIME \
+  | grep -q 'SUTANDO_CORE_RUNTIME=codex' \
+  && ok "15 shim: a codex session answers show-environment with codex" || fail "15" "shim wrong"
+# The behaviour that matters: with the session saying codex, the argv the app now emits
+# refuses the draft. Pinned through the REAL sender, not a source grep.
+rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m half typed\n' run sutando-core watcher --socket "$T/s.sock" --skip-if-queued watcher --runtime codex --refuse-if-pending)
+[ "$rc" = 5 ] && ! sent \
+  && ok "16 session=codex + config=claude → draft refused, nothing sent" || fail "16" "rc=$rc sent=$(sent && echo yes || echo no)"
+# An unresolved runtime must NOT fall through to the Claude parser.
+grep -A3 'guard let rt = sessionCoreRuntime() else {' "$F" | grep -q 'return' \
+  && ok "17 unresolved runtime skips the watchdog instead of defaulting to Claude" || fail "17" "unresolved still continues"
+
 # --- the watchdog does not run at all on a non-Claude core ------------------
 # Both halves are Claude-only: the probe looks for watch-tasks-stream.sh and the
 # remedy is a word only the Claude CLI parses as a restart prompt. On a Codex core
@@ -67,7 +95,7 @@ rc=$(TMUX_PANE_TEXT='\033[1m›\033[0m half typed\n' TMUX_PANE_TEXT_AFTER='› w
 BODY="$(awk '/^    func checkWatcher\(\) \{/,/^    func cliIsWorking/' "$F")"
 printf '%s' "$BODY" | grep -q 'resolveCoreRuntime' \
   && ok "12 checkWatcher consults the core runtime" || fail "12" "no runtime gate in checkWatcher"
-GATE_LINE=$(printf '%s\n' "$BODY" | grep -n 'resolveCoreRuntime' | head -1 | cut -d: -f1)
+GATE_LINE=$(printf '%s\n' "$BODY" | grep -n 'sessionCoreRuntime()' | head -1 | cut -d: -f1)
 PGREP_LINE=$(printf '%s\n' "$BODY" | grep -n 'watcherProcessSeen()' | head -1 | cut -d: -f1)
 [ -n "$GATE_LINE" ] && [ -n "$PGREP_LINE" ] && [ "$GATE_LINE" -lt "$PGREP_LINE" ] \
   && ok "13 ...and returns BEFORE probing for the Claude-only watcher" \
