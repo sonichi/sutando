@@ -685,8 +685,8 @@ class QueuedWithoutACount(unittest.TestCase):
             self.assertIsNone(t.queue)
 
     def test_an_unreadable_tasks_dir_is_a_plain_queued_not_a_zero(self):
-        if os.geteuid() == 0:
-            self.skipTest("root reads any directory: chmod cannot make tasks/ unreadable")
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d)
             (ws / "tasks").mkdir()

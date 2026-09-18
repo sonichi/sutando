@@ -154,8 +154,8 @@ class Unreadable(Base):
 
     @contextlib.contextmanager
     def denied(self, mode=0):
-        if os.geteuid() == 0:
-            self.skipTest("root reads any directory: chmod cannot make tasks/ unreadable")
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
         d = self.ws / "tasks"
         d.chmod(mode)
         try:

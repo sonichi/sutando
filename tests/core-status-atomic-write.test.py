@@ -128,8 +128,8 @@ check(run_idle.returncode == 0 and rec_idle.get("status") == "idle" and "pending
       "idle carries pending too")
 
 print("5. an unreadable tasks/ still writes the status, carries no pending, and leaves the snapshot alone")
-if os.geteuid() == 0:
-    print("  skip: root reads any directory, chmod cannot make tasks/ unreadable")
+if os.name != "posix" or os.geteuid() == 0:
+    print("  skip: chmod cannot make tasks/ unreadable here: not POSIX, or root")
 else:
     snap_path = ws4 / "state" / "task-queue.json"
     snap_before = snap_path.read_bytes()

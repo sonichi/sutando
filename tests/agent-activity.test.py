@@ -176,8 +176,8 @@ class WriterCli(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue()), {"depth": 2, "position": 0})
 
     def test_queue_on_an_unreadable_tasks_dir_prints_no_count_and_exits_1(self):
-        if os.geteuid() == 0:
-            self.skipTest("root reads any directory: chmod cannot make tasks/ unreadable")
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
         (self.ws / "tasks").mkdir()
         p = self.ws / "tasks" / "task-a.txt"
         p.write_text("id: task-a\nchannel_id: !r:s\ntask: hi\n")
