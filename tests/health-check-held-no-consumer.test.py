@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
@@ -99,21 +100,25 @@ def _unreadable(results):
     held = results / "held-no-consumer"
     held.mkdir()
     _touch(held / "parked.no-push-transport.txt")
-    # Readable but not executable: iterdir lists the name, stat on the child
-    # raises EACCES. Root ignores mode bits, so skip rather than assert there.
-    held.chmod(0o400)
 
 
-if os.geteuid() != 0:
-    _root = Path(tempfile.mkdtemp())
-    (_root / "results").mkdir()
-    _unreadable(_root / "results")
-    hc.WORKSPACE_DIR = _root
+_root = Path(tempfile.mkdtemp())
+(_root / "results").mkdir()
+_unreadable(_root / "results")
+hc.WORKSPACE_DIR = _root
+_blocked = _root / "results" / "held-no-consumer" / "parked.no-push-transport.txt"
+_real_stat = Path.stat
+
+
+def _stat_unless_blocked(path, *args, **kwargs):
+    if path == _blocked:
+        raise PermissionError("denied")
+    return _real_stat(path, *args, **kwargs)
+
+
+with mock.patch.object(Path, "stat", autospec=True, side_effect=_stat_unless_blocked):
     _res = hc.check_held_no_consumer()
-    (_root / "results" / "held-no-consumer").chmod(0o700)
-    check("unreadable", _res, "warn", ("coverage is partial, not clean",))
-else:
-    print("note: running as root — unreadable arm skipped, mode bits do not apply")
+check("unreadable", _res, "warn", ("coverage is partial, not clean",))
 
 # With days in the tuple these three all score 0, so each prints "(0d)" and the
 # "oldest" is whatever iterdir yielded first.
@@ -140,19 +145,15 @@ def _unlistable(results):
     held = results / "held-no-consumer"
     held.mkdir()
     _touch(held / "parked.no-push-transport.txt")
-    held.chmod(0o000)          # exists, not listable: iterdir() itself raises
 
 
-if os.geteuid() != 0:
-    _r2 = Path(tempfile.mkdtemp())
-    (_r2 / "results").mkdir()
-    _unlistable(_r2 / "results")
-    hc.WORKSPACE_DIR = _r2
+_r2 = Path(tempfile.mkdtemp())
+(_r2 / "results").mkdir()
+_unlistable(_r2 / "results")
+hc.WORKSPACE_DIR = _r2
+with mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
     _res2 = hc.check_held_no_consumer()
-    (_r2 / "results" / "held-no-consumer").chmod(0o700)
-    check("unlistable-dir", _res2, "warn", ("could not scan results/held-no-consumer/",))
-else:
-    print("note: running as root — unlistable arm skipped, mode bits do not apply")
+check("unlistable-dir", _res2, "warn", ("could not scan results/held-no-consumer/",))
 
 
 def _nested_dir(results):

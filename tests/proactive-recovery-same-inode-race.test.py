@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
 spec = importlib.util.spec_from_file_location("pr", REPO / "src" / "proactive_recovery.py")
 pr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pr)

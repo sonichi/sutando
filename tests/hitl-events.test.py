@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -53,6 +54,15 @@ class IngestTests(unittest.TestCase):
         kinds = [(a.id, a.kind) for a in req.actions]
         self.assertIn(("1", "tui_select"), kinds)
         self.assertEqual(req.actions[-1].id, JUMP_ACTION_ID)
+
+    def test_requirement_device_keeps_session_and_socket_and_leaves_host_to_the_wire(self):
+        self.drop("core-2-g1", event())
+        ingest(self.mgr, self.ws)
+        [req] = self.mgr.active()
+        self.assertEqual(req.device, {"id": "core-2", "name": "core-2", "socket": "/tmp/s.sock"})
+        import hitl.schema as SCHEMA
+        with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
+            self.assertEqual(req.to_wire()["device"]["host"], "Chis-MacBook-Pro")
 
     def test_reingest_is_idempotent(self):
         self.drop("core-2-g1", event())

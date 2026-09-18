@@ -68,6 +68,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/file_lock.py",
+            "src/delivery/__init__.py",
+            "src/delivery/readiness.py",
+            "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
@@ -220,7 +224,7 @@ exit 0
                                   check=True, text=False).stdout.decode().split()
         return f"{checksum[0]}-{checksum[1]}"
 
-    def run_launcher(self, *args, env_extra=None):
+    def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         # A suite run from inside a core would otherwise inherit the marker
@@ -243,7 +247,7 @@ exit 0
         })
         env.update(env_extra or {})
         result = subprocess.run(
-            ["/bin/bash", str(self.root / "src/agent/start-cli.sh"), *args],
+            ["/bin/bash", str(self.root / launcher), *args],
             cwd=self.root, env=env, capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -343,6 +347,42 @@ exit 0
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+    def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
+        """There is no Codex worker mode. Through the dispatcher's --runtime and
+        directly, an instance launch is refused, and none of the core's durable
+        records or managed processes is touched."""
+        worker = {"SUTANDO_INSTANCE_ID": "a" * 32,
+                  "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
+                  "SUTANDO_TASKS_DIR": str(Path(self.tmp.name) / "never-read")}
+        for entry, args in (("src/agent/start-cli.sh", ("--runtime", "codex")),
+                            ("src/agent/codex/cli/start-cli.sh", ())):
+            with self.subTest(entry=entry):
+                result = self.run_launcher(*args, env_extra=worker, launcher=entry)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("SUTANDO_INSTANCE_ID", result.stderr)
+                self.assertIn("Codex workers are unsupported", result.stderr)
+        state = self.root / "workspace" / "state"
+        self.assertFalse((state / "core-runtime.json").exists(),
+                         "a worker wrote the core's runtime record")
+        self.assertFalse((state / "session-starts.log").exists(),
+                         "a worker appended the core's launch log")
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("new-session", calls, calls)
+        self.assertNotIn("kill-session", calls, calls)
+        for name in ("scheduler.log", "heartbeat.log", "monitor.log", "install.log"):
+            self.assertFalse((Path(self.tmp.name) / name).exists(), f"{name} was written")
+
+    def test_a_core_launch_still_writes_its_runtime_record(self):
+        """The other polarity: with no instance id the same launch is the core's,
+        and the records the worker test proves untouched are written."""
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.root / "workspace" / "state"
+        runtime = json.loads((state / "core-runtime.json").read_text())
+        self.assertEqual(runtime["session"], "sutando-core")
+        self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
+        self.assertIn("new-session -d -s sutando-core", self.log.read_text())
+
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
         config = workspace / "hosts" / "test-host" / "crons.json"
@@ -770,6 +810,55 @@ exit 0
         calls = self.log.read_text() if self.log.exists() else ""
         self.assertNotIn("send-keys", calls)
 
+    def test_notifier_does_not_replay_task_with_archived_result_behind_empty_live_placeholder(self):
+        # The placeholder is the first path that exists; the delivered body is archived.
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive" / "2026-07"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done.txt").write_text("already delivered\n")
+        (workspace / "results" / "task-done.txt").write_text("")
+        # The core session reports alive, so a replay would reach send-keys;
+        # the default stub answers has-session with exit 1 and would hide one.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
+    def test_notifier_does_not_replay_task_with_archived_result_behind_whitespace_live_placeholder(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(exist_ok=True)
+        archive = workspace / "results" / "archive"
+        archive.mkdir(parents=True)
+        (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
+        (archive / "task-done-1784690000.txt").write_text("already delivered\n")
+        (workspace / "results" / "task-done.txt").write_text("   \n\n")
+        # The core session reports alive, so a replay would reach send-keys;
+        # the default stub answers has-session with exit 1 and would hide one.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("send-keys", calls)
+
     def test_notifier_does_not_replay_task_with_gateway_archived_result(self):
         workspace = self.root / "workspace"
         (workspace / "tasks").mkdir(exist_ok=True)
@@ -876,7 +965,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
   exit 0
 fi
 if [ "${1:-}" = send-keys ]; then
@@ -956,7 +1045,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
 fi
 exit 0
 ''')
@@ -1007,7 +1096,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
-  (sleep 0.12; touch "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
+  (sleep 0.12; printf 'done\\n' > "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
@@ -1065,7 +1154,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
-  touch "$SUTANDO_RESULTS_DIR/$name"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/$name"
 fi
 exit 0
 ''')
@@ -1120,7 +1209,7 @@ if [ "${1:-}" = capture-pane ]; then
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
 fi
 exit 0
 ''')

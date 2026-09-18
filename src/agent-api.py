@@ -29,7 +29,17 @@ Twilio setup:
   Set webhook URL in Twilio console to https://<your-tunnel>/twilio/voice (calls)
   and https://<your-tunnel>/twilio/sms (messages).
 
+  The tunnel must also forward /twilio/transcription: handle_twilio_voice sets it
+  as the voicemail transcribeCallback, so an allowlist without it records messages
+  whose transcripts never arrive. Forward ONLY those three. A whole-port tunnel
+  publishes every endpoint above, and a proxy that connects from localhost defeats the
+  AGENT_API_BIND=127.0.0.1 default that is otherwise the only thing in front of
+  POST /task -- check_auth() returns True unconditionally when SUTANDO_API_TOKEN
+  is unset, which is the default.
+
 Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <token>).
+Without it POST /task is unauthenticated and the bind is the sole protection, so
+set the token BEFORE exposing this port by any route.
 For remote access: use ngrok or SSH tunnel.
 """
 
@@ -47,6 +57,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
@@ -108,6 +119,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -129,6 +141,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
+import pending_questions_triage as pq_triage  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
@@ -478,8 +491,61 @@ def _active_task_rows() -> list[dict]:
     return task_workstreams.enrich_task_rows(WORKSPACE_DIR, rows)
 
 
-def _pending_question_rows() -> list[dict]:
-    """Return open questions without parser-only splice offsets."""
+# How many referenced PRs one queue render will probe, and how long a verdict is
+# reused. Bounded so triaging a long queue cannot turn into an unbounded gh fan-out.
+PQ_REF_PROBE_LIMIT = 12
+PQ_REF_PROBE_TTL = 120
+PQ_REF_PROBE_TIMEOUT = 5
+
+_pq_ref_cache: dict = {}
+_pq_ref_cache_lock = threading.Lock()
+
+
+def _dismissed_questions_path() -> Path:
+    return Path(personal_path("dismissed-questions.json", WORKSPACE_DIR))
+
+
+def _probe_ref_states(refs: list) -> dict:
+    """Live state of the PRs a question references, as `(repo, number)` pairs.
+
+    Failure is silent on purpose: an unreachable gh must leave the queue exactly as
+    it was, never mark a question resolved and never drop it.
+    """
+    states: dict = {}
+    now = time.time()
+    stale: list = []
+    with _pq_ref_cache_lock:
+        for ref in refs:
+            hit = _pq_ref_cache.get(ref)
+            if hit and now - hit[0] < PQ_REF_PROBE_TTL:
+                if hit[1]:
+                    states[ref] = hit[1]
+            else:
+                stale.append(ref)
+    for ref in stale[:PQ_REF_PROBE_LIMIT]:
+        state = None
+        try:
+            probe = subprocess.run(
+                ["gh", "pr", "view", str(ref[1]), "--repo", ref[0], "--json", "state"],
+                capture_output=True, text=True, timeout=PQ_REF_PROBE_TIMEOUT,
+            )
+            if probe.returncode == 0:
+                state = (json.loads(probe.stdout) or {}).get("state") or None
+        except Exception:
+            state = None
+        with _pq_ref_cache_lock:
+            _pq_ref_cache[ref] = (time.time(), state)
+        if state:
+            states[ref] = state
+    return states
+
+
+def _pending_question_rows(recheck: bool = False) -> list[dict]:
+    """Open questions, dismissed ones removed, ordered for the triage queue.
+
+    `recheck` probes the referenced PRs first, so a question whose blocker has since
+    merged is labelled at the moment it is shown rather than carried for weeks.
+    """
     pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
     if not pending_file.exists():
         return []
@@ -487,13 +553,38 @@ def _pending_question_rows() -> list[dict]:
         {key: value for key, value in question.items() if key not in ("start", "end")}
         for question in parse_pending_questions(pending_file.read_text())
     ]
-    # Oldest first. An undated heading cannot be ranked by age and must sort LAST,
-    # never default to 0 — that would put it ahead of everything genuinely waiting.
-    rows.sort(key=lambda row: (row["age_days"] is None, -(row["age_days"] or 0)))
-    return rows
+    rows = pq_triage.without_dismissed(
+        rows, pq_triage.load_dismissed(_dismissed_questions_path())
+    )
+    ref_states = {}
+    if recheck:
+        wanted: list = []
+        for row in rows:
+            refs = pq_triage.extract_refs(row.get("text"), row.get("detail"))
+            # Only references that carry their own repo are looked up; a bare number
+            # in this multi-repo file would resolve against the wrong repository.
+            for ref in pq_triage.probeable(refs):
+                if ref not in wanted:
+                    wanted.append(ref)
+        ref_states = _probe_ref_states(wanted)
+    pq_triage.apply_recheck(rows, ref_states)
+    return pq_triage.rank(rows)
 
 
-def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+def _questions_queue_payload() -> dict:
+    """Triage queue, re-checked live at the moment it is asked for."""
+    return {"questions": _pending_question_rows(recheck=True)}
+
+
+def dismiss_question(qid: str) -> tuple:
+    """Dismiss `qid` permanently. Returns an (status, body) pair for the route."""
+    if not qid:
+        return 400, {"error": "id required"}
+    pq_triage.dismiss(_dismissed_questions_path(), qid)
+    return 200, {"ok": True, "id": qid}
+
+
+def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
     return {
         "tasks": _active_task_rows(),
@@ -922,9 +1013,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "snapshot_hash": inference.snapshot_hash,
             }
             self.send_private_json(200, payload)
+        elif path == "/questions/queue":
+            if not self.check_auth():
+                return
+            self.send_json(200, _questions_queue_payload())
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+            watcher_pids, probe_ok = probe_pids("watch-tasks", timeout=3.0)
+            watcher_ok = bool(watcher_pids) if probe_ok else None
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:
@@ -1352,6 +1448,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.send_json(404, {"error": f"question {qid} not found or already answered"})
                 else:
                     self.send_json(404, {"error": "no pending questions"})
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+            return
+
+        if path == "/question/dismiss":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length))
+                self.send_json(*dismiss_question(str(data.get("id", "")).strip()))
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
             return

@@ -25,7 +25,10 @@ bash "$SKILL_DIR/scripts/screen-capture.sh"
 Returns path to PNG screenshot. Use the Read tool on the path to view it.
 
 ### Calendar
-Prefer the `google-calendar` skill if installed. Fallback to macOS Calendar:
+Prefer the Superpower Station connector (`composio_find` / `composio_exec`); when the owner's calendar
+app isn't connected, follow the `connect-apps` skill instead of falling back here. macOS Calendar is a
+fallback only when the Station tools aren't available, and an empty result from it is not an answer
+(the owner's real calendar may live in Google): say you couldn't read their calendar.
 ```bash
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 7          # next 7 days, JSON
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text     # today, plain text

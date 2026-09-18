@@ -48,6 +48,34 @@ import members as _members # noqa: E402
 import events as _events   # noqa: E402
 
 
+def _record_say(res):
+    """Note a successful `say` in the turn ledger, so the Stop hook can see it.
+
+    `say` writes nothing to disk, so a turn that replies this way left no record
+    anywhere and read as silence to `src/check-pending-tasks.sh`.
+
+    RECORDS ON `ok`, NOT ON AN EVENT ID. `receipt.classify` returns CONFIRMED (an
+    id came back) and UNCONFIRMED (HTTP 200, no id) — both `ok: true` — and the
+    repo already chose fail-open for the missing id there, on the grounds that the
+    message probably landed. Requiring an id here would adopt the opposite policy
+    two files apart, and its failure lands on a Stop GATE: the agent would be
+    refused a turn ending it had already earned, with no action left that clears
+    it. `ok: false` (refused, gated, transport error) never records.
+
+    Never raises: this is bookkeeping after a message that already went out, and
+    the whole skill must keep working on an install where `src/` is not reachable.
+    """
+    try:
+        if not (isinstance(res, dict) and res.get("ok")):
+            return
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+        sys.path.insert(0, os.path.join(repo, "src"))
+        import turn_ledger  # noqa: PLC0415 — optional, and only on the send path
+        turn_ledger.record_send("room", res.get("room_id") or "")
+    except Exception:
+        pass
+
+
 def _strict_rc(res, strict):
     """Default stays 0 on a failed op: callers batch these and read `ok`.
     --strict is for shell callers, where exit 0 reads as delivered."""
@@ -281,6 +309,7 @@ def _main(argv):
         if a.worker:
             _kw["worker"] = a.worker
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
+        _record_say(res)
     elif a.cmd == "grant":
         import grant as _grant
         try:
