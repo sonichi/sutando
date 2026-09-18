@@ -27,6 +27,12 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
+    task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
+    task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1
+    task_dispatch.py inflight-clear <inflight_dir> <filename>
+
+`inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
+ready result, keyed to the core incarnation, because terminal history is a lossy record.
 
 `find-ready` exists because "does a ready result exist" and "read what it says" must resolve
 to the SAME file: a caller that re-derives the live path after `has-result` says yes can be
@@ -34,6 +40,7 @@ answering about an archived body while reading an untouched live placeholder ins
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -49,6 +56,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
     "pending_candidates", "next_pending_task",
+    "mark_inflight", "inflight_is_live", "clear_inflight",
 ]
 
 
@@ -132,11 +140,59 @@ def next_pending_task(
     return None
 
 
+def _inflight_path(inflight_dir: "Path | str", filename: str) -> Path:
+    if not filename or "/" in filename or ".." in filename:
+        raise ValueError(f"not a task filename: {filename!r}")
+    return Path(inflight_dir) / filename
+
+
+def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -> None:
+    """Record that `filename`'s prompt was submitted to the core incarnation `incarnation`.
+
+    Terminal history is a lossy record of what was submitted: the prompt scrolls
+    out of a small pane and a re-pick after the completion timeout types it again.
+    This file is the durable at-most-once record, per core incarnation (a pane pid
+    or session stamp); the notifier clears it when a result is ready.
+    """
+    path = _inflight_path(inflight_dir, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(incarnation.strip() + "\n")
+    os.replace(tmp, path)
+
+
+def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str) -> bool:
+    """True while a marker for `filename` names the CURRENT core incarnation.
+
+    A marker from an earlier incarnation is stale (that core is gone and its
+    turn with it) and is removed. An unreadable current incarnation ("") keeps
+    any marker live: not knowing which core is running is not evidence the
+    prompt was never submitted.
+    """
+    path = _inflight_path(inflight_dir, filename)
+    try:
+        recorded = path.read_text().strip()
+    except FileNotFoundError:
+        return False
+    current = incarnation.strip()
+    if current and recorded and recorded != current:
+        path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
+    _inflight_path(inflight_dir, filename).unlink(missing_ok=True)
+
+
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR]\n"
-    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR]"
+    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR]\n"
+    "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
+    "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
+    "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
 )
 
 
@@ -168,6 +224,22 @@ def _main(argv: list[str]) -> int:
             return 1
         print(found)
         return 0
+    if cmd in ("inflight-mark", "inflight-live", "inflight-clear"):
+        want = 0 if cmd == "inflight-clear" else 1
+        if len(rest) != want:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            if cmd == "inflight-mark":
+                mark_inflight(first, second, rest[0])
+                return 0
+            if cmd == "inflight-live":
+                return 0 if inflight_is_live(first, second, rest[0]) else 1
+            clear_inflight(first, second)
+            return 0
+        except ValueError as exc:
+            print(f"task_dispatch.py: {exc}", file=sys.stderr)
+            return 2
     if cmd not in ("pending-candidates", "next-pending"):
         print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)
         return 2

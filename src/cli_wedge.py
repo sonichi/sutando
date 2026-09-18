@@ -161,6 +161,30 @@ def raw_state_id(frame: str) -> str:
 # Excludes '>' '*' '-' '\u2022' \u2014 those double as markdown syntax in the agent's own prose.
 _BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u23bf\u28c0-\u28ff]+")
 
+# The CLI's own retry line, whole: an optional cause, then "Retrying[ in N s]\u2026[ (attempt i/n)]"
+# and nothing after it. Prose that mentions a retry has words after the verb and never matches.
+_RETRY_CAUSE = r"(?:API Error|Connection (?:error|reset|refused)|Rate ?limit(?:ed)?|Overloaded|(?:Request )?timed out|5\d\d|429)"
+LIVE_RETRY_BANNER = re.compile(
+    r"^(?:" + _RETRY_CAUSE + r"[^\n]{0,200}?\s*)?"
+    r"Retrying(?: in \d+(?:\.\d+)?\s*(?:s|secs?|seconds?))?\s*(?:\.{3}|\u2026)?\s*(?:\(attempt \d+(?: of |/)\d+\))?\s*$"
+    r"|^Reconnecting(?:\.{3}|\u2026)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def live_retry_banner_lines(text: str) -> list:
+    """Lines that ARE a live retry banner (decor stripped, judged whole).
+
+    Callers pass a capture with wrapped rows joined (tmux `-J`); a soft-wrap
+    boundary is not a line start, so wrapped prose cannot present as a banner.
+    """
+    hits = []
+    for ln in text.splitlines():
+        stripped = _BANNER_DECOR.sub("", ln).rstrip()
+        if stripped and LIVE_RETRY_BANNER.match(stripped):
+            hits.append(stripped)
+    return hits
+
 
 def matched_abnormal(frames: list) -> list:
     """abnormal-family names in `frames` — credits, login, compaction, waiting.
