@@ -21,6 +21,8 @@ WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+# Durable at-most-once record of a submitted prompt, per core incarnation.
+INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -100,6 +102,7 @@ has_result() {
   local filename="$1"
   "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
   rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
   return 0
 }
 
@@ -127,7 +130,8 @@ next_pending_task() {
 # and composer-empty at once -- two separate reads are two races.
 
 # cli_wedge.py owns the banners, both families: parked (a limit, a login prompt,
-# a compaction, an API error) and retrying, each anchored to a line start. Prose is neither.
+# a compaction, an API error) and the live retry line, each judged as a whole line
+# of a wrap-joined capture. Prose about either is neither.
 pane_text_is_abnormal() {
   printf '%s' "$1" | "$NOTIFIER_PY" -c '
 import importlib.util, sys
@@ -136,9 +140,7 @@ wedge = importlib.util.module_from_spec(spec)
 sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
 spec.loader.exec_module(wedge)
 text = sys.stdin.read()
-lines = [wedge._BANNER_DECOR.sub("", ln) for ln in text.splitlines()]
-retrying = any(rx.match(ln) for _, rx in wedge.RETRY_PATTERNS for ln in lines)
-sys.exit(0 if (wedge.matched_abnormal([text]) or retrying) else 1)
+sys.exit(0 if (wedge.matched_abnormal([text]) or wedge.live_retry_banner_lines(text)) else 1)
 ' "$REPO/src/cli_wedge.py"
 }
 
@@ -168,7 +170,7 @@ pane_text_composer_is_empty() {
 
 core_pane_is_healthy() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$TARGET" 2>/dev/null)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -J -t "$TARGET" 2>/dev/null)" || return 1
   pane_text_is_healthy "$pane"
 }
 
@@ -213,7 +215,7 @@ effective_scrollback_lines() {
 # Scrollback (-S), not just the visible screen: a wrapped prompt taller than
 # the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_raw() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -J -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 capture_tail() {
@@ -223,13 +225,13 @@ capture_tail() {
 # One read serves both baseline checks: the escapes (-e) tell the CLI's dim ghost
 # text from a typed draft, and the same capture stripped of them is the plain text.
 capture_raw_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 # The visible screen only: a banner is live when it is on screen, and an error
 # that scrolled off is history however small the pane.
 capture_view_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -t "$TARGET" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -t "$TARGET" 2>/dev/null
 }
 
 strip_sgr() {
@@ -255,16 +257,6 @@ print(ciw._composer_text(sys.stdin.read()) or "")
 prompt_is_staged() {
   local raw="$1" prompt="$2"
   [ "$(composer_text "$raw" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ]
-}
-
-# Our prompt anywhere in the capture: delivered and still on record, so a re-pick
-# after the completion timeout must wait, not queue it a second time.
-pane_shows_prompt() {
-  local raw="$1" prompt="$2"
-  case "$(printf '%s' "$raw" | tr -d '[:space:]')" in
-    *"$(printf '%s' "$prompt" | tr -d '[:space:]')"*) return 0 ;;
-  esac
-  return 1
 }
 
 # The composer still carries our prompt at all (exactly, or with owner text
@@ -310,7 +302,7 @@ warn_if_capture_truncated() {
 # A running turn is not a gate: the line queues behind it, as the Monitor
 # tool's own notification does. Only an unhealthy pane or a draft holds.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0
+  local filename="$1" prompt="$2" type_tries=0 staged=0
   local baseline_esc baseline_raw staged_raw=""
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
@@ -355,14 +347,33 @@ deliver_prompt() {
     log_notifier "composer changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
     return 1
   fi
+  press_enter_and_confirm "$filename" "$prompt"
+}
+
+# Which core is running: a marker from another incarnation is stale, and the
+# turn it recorded died with that core.
+core_incarnation() {
+  pane_history_field pane_pid
+}
+
+# C-m, then confirm the prompt LEFT the composer (submitted, or queued behind a
+# running turn); re-press while it is still exactly ours. Records the in-flight marker
+# on confirmation; an unconfirmed submit leaves the prompt staged for the next pick.
+press_enter_and_confirm() {
+  local filename="$1" prompt="$2" attempt=0 waited
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
       # Confirmed when the prompt has LEFT the composer: submitted, or queued
       # behind a running turn. A busy footer proves nothing about our line.
-      if has_result "$filename" || ! composer_holds_prompt "$(capture_raw)" "$prompt"; then
+      if has_result "$filename"; then
+        return 0
+      fi
+      if ! composer_holds_prompt "$(capture_raw)" "$prompt"; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
+        "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$INFLIGHT_DIR" "$filename" "$(core_incarnation)" \
+          || log_notifier "could not record the in-flight marker for $filename"
         return 0
       fi
       sleep 1
@@ -370,33 +381,63 @@ deliver_prompt() {
     done
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SUBMIT_RETRIES" ]; then
-      log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged (core may need attention)"
-      return 0
+      log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged, the next pick resumes it (core may need attention)"
+      return 1
     fi
     # Re-press only while the composer is STILL exactly our prompt -- with
     # owner text mixed in, this Enter would not be ours.
     if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
       log_notifier "composer changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
-      return 0
+      return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   done
 }
 
+task_prompt() {
+  printf 'Sutando task ready: %s. Read %s/%s, follow CLAUDE.md, complete the task, and write the result to %s/%s.' \
+    "$1" "$TASKS_DIR" "$1" "$RESULTS_DIR" "$1"
+}
+
+# Whitespace is not identity in a wrapped composer: when another pending task's
+# prompt also reads as staged, the composer cannot say whose it is.
+staged_prompt_is_ambiguous() {
+  local raw="$1" filename="$2" other
+  while IFS= read -r other; do
+    [ "$other" = "$filename" ] && continue
+    prompt_is_staged "$raw" "$(task_prompt "$other")" && return 0
+  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" 2>/dev/null || true)
+  return 1
+}
+
 submit_task() {
-  local filename="$1" prompt started
+  local filename="$1" prompt started raw
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow CLAUDE.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  prompt="$(task_prompt "$filename")"
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
-  if pane_shows_prompt "$(capture_raw)" "$prompt"; then
-    log_notifier "prompt for $filename is already in the pane; awaiting its result, not re-typing"
+  # A capture can fail (the pane is gone); the liveness wait below is what decides that.
+  raw="$(capture_raw)" || raw=""
+  if "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$(core_incarnation)"; then
+    log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
+  elif prompt_is_staged "$raw" "$prompt"; then
+    # Typed but never confirmed sent (a swallowed Enter, a restart between the
+    # paste and C-m): the composer is exactly ours, so resume at the Enter.
+    if staged_prompt_is_ambiguous "$raw" "$filename"; then
+      log_notifier "composer holds a prompt that reads as $filename's and another pending task's; leaving it queued (failing closed, core may need attention)"
+      return 0
+    fi
+    log_notifier "prompt for $filename is staged but unsent; resuming its submission"
+    press_enter_and_confirm "$filename" "$prompt" || return 0
+  elif composer_holds_prompt "$raw" "$prompt"; then
+    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
+    return 0
   else
     deliver_prompt "$filename" "$prompt" || return 0
   fi

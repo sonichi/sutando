@@ -122,6 +122,10 @@ class FakeTmuxHarness(unittest.TestCase):
         self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
+
+        # The pane's #{pane_pid}: the core incarnation an in-flight marker is keyed to.
+        self.pane_pid_file = self.root / "pane-pid.txt"
+        self.inflight_dir = self.state_dir / "task-notifier-inflight"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -241,6 +245,8 @@ case "$cmd" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
       *pane_id*) [ -f "{self.pane_gone_flag}" ] && exit 1; echo "%1" ;;
+
+      *pane_pid*) cat "{self.pane_pid_file}" 2>/dev/null || echo 4242 ;;
       *) echo "" ;;
     esac
     exit 0
@@ -734,6 +740,36 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-prose.txt", self.sendkeys_log_text())
 
+    def test_prose_under_the_tool_result_prefix_does_not_hold(self):
+        # `⎿` is also the ordinary tool-result prefix; a whole-line grammar tells the banner from it.
+        self.write_task("task-prose2.txt")
+        self.pane_file.write_text("  ⎿  Connection error. Retrying was the fix.\n" + IDLE_FOOTER + "\n")
+        t = self._finish_on("task-prose2.txt", lambda log: "ENTER" in log)
+        result = self.run_event("task-prose2.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-prose2.txt", self.sendkeys_log_text())
+
+    def test_a_wrapped_sentence_starting_with_a_retry_word_does_not_hold(self):
+        self.write_task("task-prose3.txt")
+        self.pane_file.write_text("⏺ I verified the docs that say\n  Connection error handling is covered by tests.\n" + IDLE_FOOTER + "\n")
+        t = self._finish_on("task-prose3.txt", lambda log: "ENTER" in log)
+        result = self.run_event("task-prose3.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-prose3.txt", self.sendkeys_log_text())
+
+    def _finish_on(self, name, predicate):
+        import threading
+        def _run():
+            for _ in range(100):
+                if predicate(self.sendkeys_log_text()):
+                    self.write_result(name)
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_run); t.start()
+        return t
+
     def test_the_queued_messages_composer_is_not_a_draft(self):
         # A line already queued behind the turn leaves this hint in the composer;
         # the next task must still go in, on top of the queue.
@@ -843,7 +879,107 @@ class RePickTests(FakeTmuxHarness):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1,
                          "the same task was typed a second time while its line was still in the pane")
-        self.assertIn("already in the pane", second.stderr)
+        self.assertIn("awaiting its result", second.stderr)
+        self.assertTrue((self.inflight_dir / "task-dup.txt").is_file(), "no in-flight marker after a confirmed submit")
+
+    def _finish_on(self, name, predicate):
+        import threading
+        def _run():
+            for _ in range(100):
+                if predicate(self.sendkeys_log_text()):
+                    self.write_result(name)
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_run); t.start()
+        return t
+
+    def test_a_staged_but_unsent_prompt_is_resumed_at_the_enter_not_retyped(self):
+        # Every C-m swallowed: the prompt stays in the composer, no marker. The next
+        # pick must press Enter on it, not wait on a submit that never happened.
+        self.write_task("task-swal.txt")
+        self.swallow_enter_flag.write_text("1")
+        first = self.run_event("task-swal.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1",
+                                                          "SUTANDO_NOTIFIER_SUBMIT_RETRIES": "2"}, timeout=20)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("NOT confirmed", first.stderr)
+        self.assertFalse((self.inflight_dir / "task-swal.txt").exists(), "an unconfirmed submit must not be marked in flight")
+        enters = self.sendkeys_log_text().count("ENTER")
+        self.swallow_enter_flag.unlink()
+        t = self._finish_on("task-swal.txt", lambda log: log.count("ENTER") > enters)
+        second = self.run_event("task-swal.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "5"}, timeout=20)
+        t.join(timeout=5)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("staged but unsent; resuming", second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1, "a staged prompt was typed a second time")
+        self.assertGreater(self.sendkeys_log_text().count("ENTER"), enters, "the resume never pressed Enter")
+
+    def test_a_restart_between_the_paste_and_the_enter_resumes_at_the_enter(self):
+        # The composer already holds exactly our prompt and nothing was ever pressed.
+        self.write_task("task-mid.txt")
+        prompt = (f"Sutando task ready: task-mid.txt. Read {self.tasks_dir}/task-mid.txt, follow CLAUDE.md, "
+                  f"complete the task, and write the result to {self.results_dir}/task-mid.txt.")
+        self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        t = self._finish_on("task-mid.txt", lambda log: "ENTER" in log)
+        result = self.run_event("task-mid.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TYPE", self.sendkeys_log_text(), "typed over a composer that already held the prompt")
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1)
+
+    def test_a_prompt_evicted_from_a_tiny_history_is_still_not_typed_again(self):
+        # Terminal history is lossy; the marker is the record. Runs under a 2-row
+        # history so the submitted prompt is gone from every capture by the re-pick.
+        self.write_task("task-evict.txt")
+        first = self.run_event("task-evict.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1)
+        self.pane_file.write_text("\n".join(f"⏺ output row {i}" for i in range(40)) + "\n" + IDLE_FOOTER + "\n")
+        second = self.run_event("task-evict.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1,
+                         "the prompt was typed again after history evicted it")
+        self.assertIn("already submitted to this core", second.stderr)
+
+    def test_a_marker_from_a_previous_core_incarnation_does_not_hold_the_task(self):
+        # The core restarted: its turn died with it, so the marker is stale and the task goes in.
+        self.write_task("task-inc.txt")
+        first = self.run_event("task-inc.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.pane_pid_file.write_text("9999\n")
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        t = self._finish_on("task-inc.txt", lambda log: log.count("ENTER") >= 2)
+        second = self.run_event("task-inc.txt")
+        t.join(timeout=5)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "a stale marker held the task after a core restart")
+
+    def test_a_staged_prompt_two_pending_tasks_could_own_is_not_resumed(self):
+        # `task-a b.txt` sits typed-unsent while `task-ab.txt` is also pending: the
+        # composer cannot say whose line it is, so neither pick presses Enter.
+        self.write_task("task-a b.txt")
+        self.write_task("task-ab.txt")
+        prompt = (f"Sutando task ready: task-a b.txt. Read {self.tasks_dir}/task-a b.txt, follow CLAUDE.md, "
+                  f"complete the task, and write the result to {self.results_dir}/task-a b.txt.")
+        self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        result = self.run_event("task-ab.txt", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "", "an ambiguous staged prompt was submitted")
+        self.assertIn("another pending task", result.stderr)
+
+    def test_filenames_differing_only_in_whitespace_are_distinct_tasks(self):
+        # `task-a b.txt` completing must not suppress `task-ab.txt`: identity is the
+        # marker's filename, never whitespace-stripped pane text.
+        self.write_task("task-a b.txt")
+        t = self._finish_on("task-a b.txt", lambda log: "ENTER" in log)
+        first = self.run_event("task-a b.txt")
+        t.join(timeout=5)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.write_task("task-ab.txt")
+        t = self._finish_on("task-ab.txt", lambda log: log.count("ENTER") >= 2)
+        second = self.run_event("task-ab.txt")
+        t.join(timeout=5)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "the second task was taken for the first")
 
 
 class TargetTests(FakeTmuxHarness):
