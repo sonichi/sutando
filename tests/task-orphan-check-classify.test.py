@@ -567,6 +567,53 @@ class TestOrdinaryTasks(ClassifyBase):
         self.assertEqual(row["verdict"], "orphan")
 
 
+SYSTEM_BLOCK = ("\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
+                "This task is from a designated COLLABORATOR in this channel.\n"
+                "===END SUTANDO SYSTEM INSTRUCTIONS===\n")
+
+
+class TestPreview(ClassifyBase):
+    """Step 3b's preview is the `task:` value, never the file header — the 2026-09-18
+    boot previewed 28 orphans as `id: task-… envelope_hmac: v1:…` because the prose sliced
+    the body after a system block it assumed sat at the FRONT; the bridges append it AFTER."""
+
+    def test_bridge_task_last_shape_previews_the_ask_not_the_header(self):
+        # The real discord-bridge shape: headers first, task: last, block appended after it.
+        self.ws.task("task-1789710723796.txt",
+                     "id: task-1789710723796\nenvelope_hmac: v1:07b3005\naccess_tier: team\n"
+                     f"timestamp: {iso(NOW - 900)}\nsource: discord\nchannel_id: 149041\n"
+                     "channel_name: bot2bot\nuser_id: 1534339818753097728\ncollaborator: true\n"
+                     "priority: low\ntask: [Discord @echo act iv blue#9143] done: sonichi/sutando#4339 "
+                     "is MERGE-READY: john-the-dev approved at 6ba7b3c5 (05:44Z), qingyun-wu approved "
+                     "same head, CI 20-of-20 / CLA green.\n" + SYSTEM_BLOCK)
+        row = self.one()
+        self.assertTrue(row["preview"].startswith("[Discord @echo act iv blue#9143] done:"), row)
+        self.assertNotIn("id: task-", row["preview"])
+        self.assertNotIn("envelope_hmac", row["preview"])
+        self.assertNotIn("SYSTEM INSTRUCTIONS", row["preview"])
+        self.assertEqual(len(row["preview"]), self.mod.PREVIEW_CHARS)
+
+    def test_task_mid_import_shape_previews_the_ask(self):
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text())
+        row = self.one()
+        self.assertTrue(row["preview"].startswith("Run the import-claude-context skill"), row)
+        self.assertNotIn("channel_id", row["preview"])
+
+    def test_multi_line_ask_without_a_block_is_collapsed_and_capped(self):
+        ask = "first line\n\n  second line   with   spaces\n" + "x" * 300 + "\n"
+        self.ws.task("task-1.txt", chat_task_text("task-1", NOW - 400).replace(
+            "task: Hi — I'm all set up, say hello.\n", "task: " + ask))
+        row = self.one()
+        self.assertTrue(row["preview"].startswith("first line second line with spaces x"), row)
+        self.assertEqual(len(row["preview"]), self.mod.PREVIEW_CHARS)
+
+    def test_preview_helper_matches_the_parent_prose_only_where_the_block_leads(self):
+        # A block that precedes `task:` never reaches the parsed body at all.
+        self.assertEqual(self.mod.preview("hello there" + SYSTEM_BLOCK), "hello there")
+        self.assertEqual(self.mod.preview("plain ask"), "plain ask")
+        self.assertEqual(self.mod.preview(""), "")
+
+
 class TestAgeSources(ClassifyBase):
     def test_bad_timestamp_falls_back_to_epoch_ms_in_id(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text().replace(iso(NOW - 379), "yesterday"))
