@@ -182,3 +182,29 @@ describe('applySessionContextFrame — last frame wins, a DM frame clears, notic
 		assert.equal(sessionRoomNotice('entered', null), null);
 	});
 });
+
+// The room notice must never be spoken. Realtime text input is answered out
+// loud (every room switch said "Working on it.", owner 2026-09-18); an open
+// clientContent turn is read and left unanswered until the user speaks.
+import { injectSilentContext } from '../src/browser-tools.js';
+
+describe('room notices go in silently', () => {
+	it('injectSilentContext sends an open turn (turnComplete=false) and reports when it cannot', () => {
+		const sent: Array<{ turns: unknown; turnComplete: unknown }> = [];
+		const session = { transport: { sendContent: (turns: unknown, turnComplete: unknown) => sent.push({ turns, turnComplete }) } };
+		assert.equal(injectSilentContext(session, '[System: hi]'), true);
+		assert.deepEqual(sent, [{ turns: [{ role: 'user', text: '[System: hi]' }], turnComplete: false }]);
+		assert.equal(injectSilentContext({ transport: { session: { sendRealtimeInput: () => {} } } }, 'x'), false,
+			'realtime input is never used for a notice: it would be answered aloud');
+	});
+
+	it('the session.context handler uses the silent path and the notice asks for no reply', () => {
+		const src = readFileSync(join(process.cwd(), 'src', 'voice-agent.ts'), 'utf8');
+		const start = src.indexOf('function handleSessionContextFrame');
+		const body = src.slice(start, src.indexOf('\n\t}\n', start));
+		assert.ok(start > 0 && body.includes('injectSilentContext(session, line)'), 'notice goes through injectSilentContext');
+		assert.ok(!body.includes('injectText('), 'no realtime-text fallback for the notice');
+		assert.match(sessionRoomNotice('entered', { id: '!r:x', name: 'Ops' })!, /No reply is needed\.$/);
+		assert.match(sessionRoomNotice('left', null)!, /No reply is needed\.$/);
+	});
+});
