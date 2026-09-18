@@ -90,8 +90,15 @@ hostile '{"config": {"PATH": "/tmp/evil", "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib
 check $? "a manifest cannot set PATH"
 ! echo "$hout" | grep -q "DYLD_INSERT_LIBRARIES"
 check $? "a manifest cannot set a loader-injection variable"
-echo "$hout" | grep -qx -- "ZZ_OK=1"
 check $? "an ordinary key alongside a protected one still lands"
+
+# Apple's suffix-less exported-function form: rejected by prefix, not by IDENT.
+hostile '{"config": {"__BASH_FUNC_cd": "() { echo pwned; }", "ZZ_AFTER_FUNC": "1"}}'
+! echo "$hout" | grep -q "__BASH_FUNC_cd"
+check $? "a manifest cannot set an exported-bash-function variable"
+echo "$hout" | grep -qx -- "ZZ_AFTER_FUNC=1"
+check $? "an ordinary key alongside it still lands"
+echo "$hout" | grep -qx -- "ZZ_OK=1"
 
 # Duplicate keys across skills resolve deterministically to one record.
 rm -rf "$TMP/repo/skills"

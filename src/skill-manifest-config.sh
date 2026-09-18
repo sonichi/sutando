@@ -18,9 +18,11 @@ import json, re, sys
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Exec-hijack vectors and loader injection: a skill must never set these,
-# whatever it declares. Mirrors backend-supervisor.mjs scrubShellStartupEnv.
+# whatever it declares. Modelled on the desktop supervisor scrubber, which
+# lives in another repository, so the two lists are maintained separately and
+# no CI here can observe drift between them.
 PROTECTED = {"PATH", "IFS", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "HOME", "SHELL"}
-PROTECTED_PREFIX = ("LD_", "DYLD_", "BASH_FUNC_")
+PROTECTED_PREFIX = ("LD_", "DYLD_", "BASH_FUNC_", "__BASH_FUNC")
 
 try:
     cfg = json.load(open(sys.argv[1])).get("config") or {}
