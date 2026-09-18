@@ -28,13 +28,12 @@ fi
 
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
-DELIVERIES_DIR="$WORKSPACE/deliveries"
 
 # Worker-pool awareness (sonichi/sutando#4281, #4338). An optional router,
 # injected at the adapter edge (never named here — see
 # docs/architecture-boundaries.md "Optional adapter capabilities"), delegates
-# a task by writing a SENTINEL into deliveries/<recipient>/<task-id>{.txt,.accepted,
-# .claimed} — the payload itself never leaves tasks/, by design (the
+# a task by writing a SENTINEL into deliveries/<recipient>/<task-id><stage> (the
+# stage suffixes are the skill's grammar) — the payload never leaves tasks/ (the
 # recipient reads it from there via the inbox resolver). Two different
 # sessions read this state, and each asks a different question:
 #   - the core asks "is this still mine to report?" — no, once ANY worker
@@ -43,26 +42,22 @@ DELIVERIES_DIR="$WORKSPACE/deliveries"
 #   - a worker (SUTANDO_INSTANCE_ID set) asks "do I still owe a reply?" —
 #     answered from its OWN deliveries folder only, never the core's tasks/
 #     queue, which is not this session's to report on.
-sentinel_task_id() {
-  case "$1" in
-    *.accepted) printf '%s' "${1%.accepted}" ;;
-    *.claimed)  printf '%s' "${1%.claimed}" ;;
-    *.txt)      printf '%s' "${1%.txt}" ;;
-    *)          return 1 ;;
-  esac
-}
+# Both answers come from the worker-pool skill's worker_delivery.py, so the
+# sentinel grammar is spelled there and never here. No skill → no router →
+# nobody holds anything, which is the same answer a pool-less install always had.
+WORKER_DELIVERY_CLI="${SUTANDO_WORKER_DELIVERY_CLI:-$REPO_DIR/skills/worker-pool/scripts/worker_delivery.py}"
 
 claimed_by_a_worker() {
-  # True if some worker's own deliveries/ folder holds a sentinel for this
-  # task id — the router already routed it away from the core.
-  local task_id="$1" d
-  for d in "$DELIVERIES_DIR"/*/; do
-    [ -d "$d" ] || continue
-    if [ -e "${d}${task_id}.txt" ] || [ -e "${d}${task_id}.accepted" ] || [ -e "${d}${task_id}.claimed" ]; then
-      return 0
-    fi
-  done
-  return 1
+  # rc 0 = some worker holds this task id (the router routed it away from the
+  # core); 1 = nobody does; 2 = cannot decide, reported below rather than skipped.
+  [ -n "$PYBIN" ] && [ -f "$WORKER_DELIVERY_CLI" ] || return 1
+  "$PYBIN" "$WORKER_DELIVERY_CLI" holder-of "$WORKSPACE" "$1" >/dev/null 2>&1
+}
+
+owned_task_ids() {
+  # Worker mode: the task ids whose sentinel sits in THIS instance's folder.
+  [ -n "$PYBIN" ] && [ -f "$WORKER_DELIVERY_CLI" ] || return 0
+  "$PYBIN" "$WORKER_DELIVERY_CLI" owned "$WORKSPACE" "$1" 2>/dev/null
 }
 
 # A delivered result is claimed out of results/ within about a second
@@ -92,9 +87,7 @@ shopt -s nullglob 2>/dev/null
 
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
-  for f in "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.txt "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.accepted "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.claimed; do
-    SNAME=$(basename "$f")
-    TASK_ID="$(sentinel_task_id "$SNAME")" || continue
+  for TASK_ID in $(owned_task_ids "$SUTANDO_INSTANCE_ID"); do
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
       UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---

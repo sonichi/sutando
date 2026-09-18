@@ -13,7 +13,9 @@ Exit: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import errno
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -192,12 +194,103 @@ else:
 
 print("the two guards agree on the suffix set")
 hook = (ROOT / "src" / "check-pending-tasks.sh").read_text(encoding="utf-8")
-m = re.search(r"sentinel_task_id\(\)\s*\{(.*?)\n\}", hook, re.S)
-check(m is not None, "the hook still defines sentinel_task_id()")
-if m:
-    hook_suffixes = set(re.findall(r"\*(\.[a-z]+)\)", m.group(1)))
-    check(hook_suffixes == set(SENTINEL_SUFFIXES),
-          f"hook {sorted(hook_suffixes)} == module {sorted(SENTINEL_SUFFIXES)}")
+check("worker_delivery.py" in hook and "holder-of" in hook and " owned " in hook,
+      "the hook delegates both questions to worker_delivery.py's CLI")
+for suffix in SENTINEL_SUFFIXES:
+    if suffix == ".txt":
+        continue  # also the task-file extension; the queue glob legitimately names it
+    check(suffix not in hook, f"the hook no longer spells the sentinel stage {suffix} itself")
+
+
+def _hook_repo(module_patch: str = "") -> Path:
+    """A throwaway repo: the real src/ (symlinked — pool_delivery imports from it),
+    a copied hook in its own dir, a stub config resolver pointing at a private
+    workspace, and a COPY of the pool skill's scripts that may be mutated."""
+    repo = Path(tempfile.mkdtemp()) / "repo"
+    repo.mkdir()
+    os.symlink(ROOT / "src", repo / "src")
+    (repo / "hook").mkdir()
+    (repo / "scripts").mkdir()
+    shutil.copy(ROOT / "src" / "check-pending-tasks.sh", repo / "hook" / "check-pending-tasks.sh")
+    shutil.copytree(ROOT / "skills" / "worker-pool" / "scripts", repo / "skills" / "worker-pool" / "scripts",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    if module_patch:
+        wd = repo / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"
+        wd.write_text(wd.read_text().replace(
+            "SENTINEL_SUFFIXES = (PENDING_SUFFIX, ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX)",
+            module_patch), encoding="utf-8")
+    (repo / "scripts" / "sutando-config.sh").write_text(
+        '#!/bin/bash\ncase "$1" in workspace) printf %s "$(dirname "$0")/../workspace";;'
+        ' python-bin) printf %s "' + sys.executable + '";; *) exit 1;; esac\n', encoding="utf-8")
+    for d in ("tasks", "results", "deliveries"):
+        (repo / "workspace" / d).mkdir(parents=True)
+    return repo
+
+
+def _hook_reports(repo: Path, env_extra: dict | None = None) -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+    env.update(env_extra or {})
+    r = subprocess.run(["bash", str(repo / "hook" / "check-pending-tasks.sh")],
+                       capture_output=True, text=True, env=env, timeout=60)
+    return r.stdout
+
+
+print("the hook follows the module, not its own spelling")
+repo = _hook_repo()
+(repo / "workspace" / "tasks" / "task-held.txt").write_text("id: task-held\ntask: x\n", encoding="utf-8")
+(repo / "workspace" / "deliveries" / "w1").mkdir()
+(repo / "workspace" / "deliveries" / "w1" / "task-held.txt").write_text("", encoding="utf-8")
+out = _hook_reports(repo)
+check("task-held" not in out, "core mode: a task with a real sentinel is not reported")
+(repo / "workspace" / "tasks" / "task-free.txt").write_text("id: task-free\ntask: y\n", encoding="utf-8")
+out = _hook_reports(repo)
+check("task-free" in out and "task-held" not in out, "control: the unheld neighbour IS reported")
+
+repo2 = _hook_repo('SENTINEL_SUFFIXES = (PENDING_SUFFIX, ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, ".held")')
+(repo2 / "workspace" / "tasks" / "task-new.txt").write_text("id: task-new\ntask: z\n", encoding="utf-8")
+(repo2 / "workspace" / "deliveries" / "w1").mkdir()
+(repo2 / "workspace" / "deliveries" / "w1" / "task-new.held").write_text("", encoding="utf-8")
+check("task-new" not in _hook_reports(repo2),
+      "a suffix the MODULE learns is honoured by the hook with no bash change (mutated copy)")
+repo3 = _hook_repo()
+(repo3 / "workspace" / "tasks" / "task-new.txt").write_text("id: task-new\ntask: z\n", encoding="utf-8")
+(repo3 / "workspace" / "deliveries" / "w1").mkdir()
+(repo3 / "workspace" / "deliveries" / "w1" / "task-new.held").write_text("", encoding="utf-8")
+check("task-new" in _hook_reports(repo3), "control: with the real module, .held is not a sentinel and the task is reported")
+
+print("worker mode reads its own folder through the same CLI")
+repo4 = _hook_repo()
+(repo4 / "workspace" / "deliveries" / "me").mkdir()
+(repo4 / "workspace" / "deliveries" / "me" / "task-mine.accepted").write_text("", encoding="utf-8")
+(repo4 / "workspace" / "tasks" / "task-mine.txt").write_text("id: task-mine\ntask: q\n", encoding="utf-8")
+out = _hook_reports(repo4, {"SUTANDO_INSTANCE_ID": "me"})
+check("task-mine" in out, "worker mode: an accepted sentinel in MY folder is my unanswered task")
+out = _hook_reports(repo4, {"SUTANDO_INSTANCE_ID": "someone-else"})
+check("task-mine" not in out, "control: another instance's folder is not mine to report")
+
+print("the CLI's three exits")
+ws9 = _ws()
+_task(ws9, "task-cli")
+r = subprocess.run([sys.executable, str(ROOT / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"),
+                    "holder-of", str(ws9), "task-cli"], capture_output=True, text=True)
+check(r.returncode == 1 and r.stdout == "", "holder-of: nobody holds it → rc 1, nothing printed")
+(ws9 / "deliveries" / "w7").mkdir()
+(ws9 / "deliveries" / "w7" / "task-cli.claimed").write_text("", encoding="utf-8")
+r = subprocess.run([sys.executable, str(ROOT / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"),
+                    "holder-of", str(ws9), "task-cli"], capture_output=True, text=True)
+check(r.returncode == 0 and r.stdout.strip() == "w7", "holder-of: held → rc 0, holder on stdout")
+r = subprocess.run([sys.executable, str(ROOT / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"),
+                    "owned", str(ws9), "w7"], capture_output=True, text=True)
+check(r.returncode == 0 and r.stdout.split() == ["task-cli"], "owned: lists the folder's task ids")
+_bad = ws9 / "deliveries" / "loop"
+_os.symlink(_bad, _bad)
+r = subprocess.run([sys.executable, str(ROOT / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"),
+                    "holder-of", str(ws9), "task-cli"], capture_output=True, text=True)
+check(r.returncode == 2 and "cannot read deliveries/" in r.stderr, "holder-of: an unreadable tree → rc 2, never 1")
+_bad.unlink()
+r = subprocess.run([sys.executable, str(ROOT / "skills" / "worker-pool" / "scripts" / "worker_delivery.py"),
+                    "frobnicate", str(ws9), "x"], capture_output=True, text=True)
+check(r.returncode == 2 and "usage" in r.stderr, "an unknown verb is rc 2 with usage")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)

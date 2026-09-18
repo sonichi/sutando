@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX
+from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX, parse_sentinel
 
 #: The router's stages, spelled once in pool_delivery; a new stage is added there.
 SENTINEL_SUFFIXES = (PENDING_SUFFIX, ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX)
@@ -70,3 +70,47 @@ def holder_of(workspace: Path, task_id: str) -> str | None:
             if _sentinel_present(recipient / f"{task_id}{suffix}"):
                 return recipient.name
     return None
+
+
+def owned_task_ids(workspace: Path, recipient: str) -> list[str]:
+    """Task ids whose sentinel sits in ONE recipient's folder — the worker-side
+    question. Absent folder → []; any other listing failure propagates."""
+    folder = Path(workspace) / "deliveries" / recipient
+    try:
+        names = sorted(p.name for p in folder.iterdir())
+    except FileNotFoundError:
+        return []
+    out = []
+    for name in names:
+        parsed = parse_sentinel(name)
+        if parsed is not None and parsed[0] not in out:
+            out.append(parsed[0])
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`holder-of WS TASK_ID` → holder on stdout, rc 0 held / 1 not held / 2 cannot decide.
+    `owned WS RECIPIENT` → one task id per line, rc 0 / 2 cannot decide.
+    The Stop hook calls these so bash never spells the sentinel grammar itself."""
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 3 or argv[0] not in ("holder-of", "owned"):
+        print("usage: worker_delivery.py holder-of <workspace> <task-id> | owned <workspace> <recipient>",
+              file=sys.stderr)
+        return 2
+    try:
+        if argv[0] == "holder-of":
+            holder = holder_of(Path(argv[1]), argv[2])
+            if holder is None:
+                return 1
+            print(holder)
+            return 0
+        for task_id in owned_task_ids(Path(argv[1]), argv[2]):
+            print(task_id)
+        return 0
+    except OSError as exc:
+        print(f"worker_delivery.py: {argv[0]}: cannot read deliveries/ ({exc})", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
