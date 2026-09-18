@@ -65,14 +65,6 @@ claimed_by_a_worker() {
   return 1
 }
 
-# Readiness is owned by src/delivery/readiness.py, the same policy every
-# delivery consumer uses; a local re-implementation drifts from what will
-# actually be sent.
-is_ready_result() {
-  [ -f "$1" ] || return 1
-  SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$1" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'
-}
-
 # A delivered result is claimed out of results/ within about a second
 # (proactive-loop's own documented poller latency) — by the time this hook
 # next runs, `results/<id>.txt` is routinely already gone even though the
@@ -82,18 +74,17 @@ is_ready_result() {
 # concept but nothing in the current production path calls the writer, so gating
 # on it would report every task as unfinished instead.
 #
-# The archiver (src/task_archive.py:archive_file) writes into a LOCAL-calendar
-# month bucket — results/archive/<YYYY-MM>/<id>.txt, no suffix — never the
-# flat results/archive/<id>-<ts>.txt shape a caller might expect; the flat
-# glob below stays only for whatever legacy files still carry that shape.
+# "Ready result, live or in any archive layout" is owned by
+# src/delivery/task_dispatch.py:has_ready_result (sonichi/sutando#4317) — the
+# same policy every task-notifier now shares. A local re-implementation here
+# drifted twice already (missed the month-bucket layout, then the
+# archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
+# own test suite pins), which is exactly the duplicated-policy failure mode
+# the shared owner exists to close off.
 already_delivered() {
-  local task_id="$1" hit
-  is_ready_result "$RESULTS_DIR/$task_id.txt" && return 0
-  for hit in "$RESULTS_DIR/archive/$task_id.txt" "$RESULTS_DIR/archive/$task_id"-*.txt \
-             "$RESULTS_DIR/archive"/*/"$task_id.txt"; do
-    [ -e "$hit" ] && return 0
-  done
-  return 1
+  local task_id="$1"
+  [ -n "$PYBIN" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" >/dev/null 2>&1
 }
 
 UNPROCESSED=""

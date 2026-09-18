@@ -143,7 +143,7 @@ rm -f "$WS/results/$PROBE.txt"
 #    folder, must not be told the task is still open just because
 #    results/<id>.txt itself is gone.
 mkdir -p "$WS/results/archive"
-: > "$WS/results/archive/$PROBE-1789600000.txt"
+printf 'done\n' > "$WS/results/archive/$PROBE-1789600000.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
@@ -153,7 +153,7 @@ esac
 rm -f "$WS/results/archive/$PROBE-1789600000.txt"
 record_delivery
 
-# 8. THE REAL ARCHIVE SHAPE (john-the-dev's #4339 review, 2026-09-17):
+# 8. THE MONTH-BUCKET ARCHIVE SHAPE (john-the-dev's #4339 review, 2026-09-17):
 #    src/task_archive.py:archive_file() never writes case 7's flat
 #    <id>-<ts>.txt shape — it writes into a LOCAL-calendar month bucket,
 #    results/archive/<YYYY-MM>/<id>.txt, no suffix. That is one directory
@@ -164,14 +164,48 @@ record_delivery
 #    caller) — same stale-sentinel setup as case 7, real archive shape.
 MONTH="$("$PYBIN" -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m'))")"
 mkdir -p "$WS/results/archive/$MONTH"
-: > "$WS/results/archive/$MONTH/$PROBE.txt"
+printf 'done\n' > "$WS/results/archive/$MONTH/$PROBE.txt"
 record_delivery
 OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
 case "$OUT" in
-  '{}') ok "worker's block clears once its result is archived in the real month-bucket shape" ;;
-  *) bad "worker's block clears once its result is archived in the real month-bucket shape" "got: ${OUT:0:160}" ;;
+  '{}') ok "worker's block clears once its result is archived in the month-bucket shape" ;;
+  *) bad "worker's block clears once its result is archived in the month-bucket shape" "got: ${OUT:0:160}" ;;
 esac
-rm -f "$WS/results/archive/$MONTH/$PROBE.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
+rm -f "$WS/results/archive/$MONTH/$PROBE.txt"
+record_delivery
+
+# 9. THE DAILY-RETENTION ARCHIVE SHAPE (qingyun-wu's #4339 review, 2026-09-18):
+#    src/archive-stale-results.py (startup retention, run from startup.sh)
+#    moves stale results to archive-<YYYY-MM-DD>/<id>.txt -- a SIBLING of
+#    results/archive/, not a child of it. A third, independent layout this
+#    hook must also recognize as delivered.
+TODAY="$("$PYBIN" -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d'))")"
+mkdir -p "$WS/results/archive-$TODAY"
+printf 'done\n' > "$WS/results/archive-$TODAY/$PROBE.txt"
+record_delivery
+OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "worker's block clears once its result is archived in the daily-retention shape" ;;
+  *) bad "worker's block clears once its result is archived in the daily-retention shape" "got: ${OUT:0:160}" ;;
+esac
+rm -f "$WS/results/archive-$TODAY/$PROBE.txt"
+record_delivery
+
+# 10. THE PREFIX-COLLISION CONTROL (qingyun-wu's #4339 review, 2026-09-18):
+#     a naive `<task_id>-*.txt` glob (this hook's own pre-#4317 attempt) reads
+#     a DIFFERENT task's archived flat result as this task's, whenever one
+#     task id is a dash-prefix of another (e.g. task ids that themselves
+#     contain a literal "-<n>" segment, as several producers in this repo
+#     emit). Proves the fix delegates to id-aware matching, not substring glob.
+OTHER="${PROBE}-2"
+printf 'other tasks result, not mine\n' > "$WS/results/archive/$OTHER-1789600001.txt"
+record_delivery
+OUT="$(SUTANDO_INSTANCE_ID="$WORKER" bash "$HOOK" 2>&1)"
+case "$OUT" in
+  *'"decision":"block"'*) ok "a sibling task's archived result does not falsely clear this task's block" ;;
+  *) bad "a sibling task's archived result does not falsely clear this task's block" "got: ${OUT:0:160}" ;;
+esac
+rm -f "$WS/results/archive/$OTHER-1789600001.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
 record_delivery
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
