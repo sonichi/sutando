@@ -1854,10 +1854,21 @@ commit_main() {
                 # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
+                    # Default-off transcript archiving unless already opted in
+                    # (health-check's --fix policy) -- migration must not silently enable it.
+                    local _archive_opted_in=0
+                    if grep -q 'archive-transcript\.sh' "$_new_settings" 2>/dev/null \
+                       || grep -q 'archive-transcript\.sh' "$_old_settings" 2>/dev/null; then
+                        _archive_opted_in=1
+                    fi
                     # `local _hb_rc=$?` after a failing command aborts under `set -e`
                     # before the assignment runs -- `|| _hb_rc=$?` keeps it successful.
                     local _hb_rc=0
-                    bash "$_primary_installer" || _hb_rc=$?
+                    if [ "$_archive_opted_in" = "1" ]; then
+                        bash "$_primary_installer" || _hb_rc=$?
+                    else
+                        SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$_primary_installer" || _hb_rc=$?
+                    fi
                     if [ "$_hb_rc" -ne 0 ]; then
                         echo "  hook install: primary installer failed (rc=$_hb_rc) — re-run manually: bash src/install-claude-hooks.sh" >&2
                         _hook_bridge_failed=1
