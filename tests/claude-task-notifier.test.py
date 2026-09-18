@@ -133,6 +133,9 @@ class FakeTmuxHarness(unittest.TestCase):
         # after-Enter variant arms it at the moment C-m lands.
         self.fail_next_capture_flag = self.root / "fail-next-capture.flag"
         self.fail_capture_after_enter_flag = self.root / "fail-capture-after-enter.flag"
+
+        # The core pane is gone (its window may live on with a replacement).
+        self.pane_gone_flag = self.root / "pane-gone.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -207,6 +210,8 @@ case "$cmd" in
     exit 1
     ;;
   capture-pane)
+    # A vanished pane cannot be captured; the window it was in may live on.
+    [ -f "{self.pane_gone_flag}" ] && exit 1
     n=$(( $(cat "{self.capture_count}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{self.capture_count}"
     if [ -f "{self.fail_next_capture_flag}" ]; then rm -f "{self.fail_next_capture_flag}"; exit 1; fi
     # Consumed once: the pane goes BUSY on the Nth capture (a turn starting
@@ -255,13 +260,18 @@ case "$cmd" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
       *pane_pid*) cat "{self.pane_pid_file}" 2>/dev/null || echo 4242 ;;
+
+      *pane_id*)
+        if [ -f "{self.pane_gone_flag}" ]; then echo ""; exit 0; fi
+        case "$*" in *"-t %"*) echo "$*" | sed -n 's/.*-t \\(%[0-9][0-9]*\\).*/\\1/p' ;; *) echo "%1" ;; esac ;;
       *) echo "" ;;
     esac
     exit 0
     ;;
   send-keys)
-    # args: -t SESSION[:0] [-l -- TEXT | C-m]
-    shift 2  # -t SESSION
+    # args: -t TARGET [-l -- TEXT | C-m]; the target is recorded so a test can pin it
+    printf 'TARGET %s\\n' "$2" >> "{self.sendkeys_log}"
+    shift 2  # -t TARGET
     if [ "${{1:-}}" = -l ]; then
       shift 2  # -l --
       text="$1"
@@ -866,29 +876,50 @@ class SmallViewportTests(FakeTmuxHarness):
         self.write_task("task-old.txt")
         history = "\n".join(f"⏺ line {i}" for i in range(6))
         self.pane_file.write_text("API Error: 529 Overloaded\n" + history + "\n" + IDLE_FOOTER + "\n")
+
+
+class TargetTests(FakeTmuxHarness):
+    """Every capture and keystroke goes to the declared target, and a vanished
+    pane ends the wait at once rather than at the ready timeout."""
+
+    def _deliver(self, env):
+        self.write_task("task-t.txt")
         import threading
         def _finish():
             for _ in range(50):
                 if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-old.txt")
+                    self.write_result("task-t.txt")
                     return
                 time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-old.txt")
+        t = threading.Thread(target=_finish); t.start()
+        result = self.run_event("task-t.txt", env_extra=env)
         t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-old.txt", self.sendkeys_log_text(),
-                      "an error that scrolled off the live tail must not hold delivery")
 
+    def test_the_notifier_addresses_the_declared_window(self):
+        self._deliver({"SUTANDO_TMUX_WINDOW": "3"})
+        log = self.sendkeys_log_text()
+        self.assertIn("TARGET sutando-core-test:3", log)
+        self.assertNotIn("TARGET sutando-core-test:0", log, "a keystroke went to window 0")
 
-    def test_a_visible_error_banner_holds_even_in_a_small_pane(self):
-        # The banner is on screen, right above the composer: that is the live shape.
-        self.write_task("task-vis.txt")
-        self.pane_file.write_text("API Error: 529 Overloaded\n" + IDLE_FOOTER + "\n")
-        result = self.run_event("task-vis.txt", timeout=8)
+    def test_the_notifier_addresses_the_declared_pane_over_the_window(self):
+        self._deliver({"SUTANDO_TMUX_WINDOW": "3", "SUTANDO_TMUX_PANE": "%7"})
+        log = self.sendkeys_log_text()
+        self.assertIn("TARGET %7", log)
+        self.assertNotIn("TARGET sutando-core-test", log, "a keystroke went to a window instead of the pane")
+
+    def test_a_vanished_pane_ends_the_wait_at_once(self):
+        # The session (and even the window) may live on; the pane is what matters.
+        # Real tmux answers a dead pane with rc 0 and a BLANK id, which the fake models.
+        self.pane_gone_flag.write_text("1")
+        self.pane_file.write_text(BUSY_FOOTER + "\n")
+        self.write_task("task-gone.txt")
+        started = time.time()
+        result = self.run_event("task-gone.txt", env_extra={"SUTANDO_TMUX_PANE": "%7"}, timeout=8)
+        elapsed = time.time() - started
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "")
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertLess(elapsed, 3, f"waited {elapsed:.1f}s for a pane that no longer exists")
 
 
 class TallComposerScrollbackTests(FakeTmuxHarness):
