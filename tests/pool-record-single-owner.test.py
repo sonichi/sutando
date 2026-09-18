@@ -16,6 +16,7 @@ import re
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -102,6 +103,42 @@ class TheGrammarIsBounded(unittest.TestCase):
             if isinstance(bad, str):
                 with self.assertRaises(ValueError):
                     pool_record.require_recipient(bad)
+
+    def test_an_unknown_stage_is_refused(self):
+        with self.assertRaises(ValueError):
+            pool_record.record_path("/ws", "worker-a", "task-1", "done")
+        for stage in pool_record.STAGES:
+            self.assertTrue(str(pool_record.record_path(
+                "/ws", "worker-a", "task-1", stage)).endswith("." + stage))
+
+    def test_an_absent_record_reads_absent_and_an_unreadable_one_raises(self):
+        root = Path(tempfile.mkdtemp())
+        self.assertIs(pool_record.read_record_state(root / "nope"),
+                      pool_record.RecordState.ABSENT)
+        d = root / "sub"
+        d.mkdir()
+        self.assertIs(pool_record.read_record_state(d),
+                      pool_record.RecordState.MALFORMED)
+
+    def test_an_entry_that_cannot_be_typed_is_left_for_the_record_probe(self):
+        """is_dir() failing does not PROVE the entry is not a recipient, so it
+        stays in the list and the record probe decides (and fails closed)."""
+        class _Entry:
+            name = "worker-a"
+
+            def is_dir(self, follow_symlinks=True):
+                raise PermissionError("denied")
+
+        class _Scan:
+            def __enter__(self):
+                return iter([_Entry()])
+
+            def __exit__(self, *a):
+                return False
+
+        with unittest.mock.patch.object(pool_record.os, "scandir",
+                                        return_value=_Scan()):
+            self.assertEqual(pool_record.iter_recipients("/ws"), ["worker-a"])
 
     def test_a_non_directory_entry_is_not_a_recipient(self):
         root = Path(tempfile.mkdtemp()) / "workers"
