@@ -30,13 +30,14 @@ untouched.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import time
 import urllib.request
 import uuid
+
+from .file_lock import lock_fd, unlock_fd
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
 # The `answer` keyword is OPTIONAL: live human acceptance (2026-07-26) showed
@@ -130,12 +131,12 @@ class ActionStore:
         return os.path.join(self.dir, action_id + ".lock")
 
     def transition_lock(self, action_id: str):
-        """flock-guarded critical section shared by EVERY writer of an action
+        """Lock-guarded critical section shared by EVERY writer of an action
         file (this resolver AND the hook's timeout path — same protocol, same
         lock file). Serializes read→check→write so exactly one terminal
         transition can win (review: CAS race between resolver and expiry)."""
         lock_file = open(self._lock_path(action_id), "a+")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_fd(lock_file.fileno())
         return lock_file
 
     def update(self, rec: dict) -> None:
@@ -150,11 +151,12 @@ class ActionStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        dfd = os.open(self.dir, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":
+            dfd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
 
     def resolve(self, action_id: str, answers: dict, resolved_by: str) -> bool:
         """Write a decision iff the action is still pending (terminal states
@@ -178,8 +180,10 @@ class ActionStore:
             self.update(rec)
             return True
         finally:
-            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
-            lk.close()
+            try:
+                unlock_fd(lk.fileno())
+            finally:
+                lk.close()
 
 
 class CardPoster:
@@ -297,8 +301,10 @@ class CardPoster:
                               f"terminal state during card post — card stamp "
                               f"skipped (no resurrect)")
             finally:
-                fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
-                lk.close()
+                try:
+                    unlock_fd(lk.fileno())
+                finally:
+                    lk.close()
         return posted
 
 

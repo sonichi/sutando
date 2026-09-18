@@ -94,7 +94,7 @@ class Writer(unittest.TestCase):
         # Rotation used to replace the inode while another writer held it, losing that writer's row.
         # Eight processes x 30 rows, live window 25: every row lands exactly once, done rows included.
         import multiprocessing as mp
-        with mp.get_context("fork").Pool(8) as pool:
+        with mp.get_context("spawn" if os.name == "nt" else "fork").Pool(8) as pool:
             pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
             pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         live = card.log_path(self.ws).read_text().splitlines()
@@ -549,7 +549,7 @@ class Hook(unittest.TestCase):
         import multiprocessing as mp
         self.log(*[{"ts": i, "room": "!r:s", "task": {"id": f"task-c{i:06d}", "text": "x"}, "line": "a"} for i in range(8)])
         ws = str(self.ws)
-        with mp.get_context("fork").Pool(8) as pool:
+        with mp.get_context("spawn" if os.name == "nt" else "fork").Pool(8) as pool:
             pool.starmap(_bind_in_process, [(ws, f"task-c{i:06d}", f"S{i}") for i in range(8)])
             pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         binds = hook.load_json(self.p["bind"], {})

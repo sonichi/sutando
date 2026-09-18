@@ -39,25 +39,36 @@ C="<this skill's directory>/scripts/connectors.py"
 python3 "$C" find "google calendar"            # exact catalog app: {"match": {...} | null, "suggestions": [...]}
 python3 "$C" status googlecalendar --room '<room id>'   # connected? plus the room's pending and resumed waits
 python3 "$C" status                            # every connection: id, toolkit, name, status, accountLabel
-python3 "$C" await googlecalendar --room '<room id>' --reply-to '<source_message_id>' \
-  --task '<task id>' --owner '<owner mxid>' --request-file - <<'SUTANDO_REQUEST'
+python3 "$C" card googlecalendar --room '<room id>' --reply-to '<source_message_id>' \
+  --task '<task id>' --owner-from-task --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
 SUTANDO_REQUEST
-python3 "$C" await youtube --room '<shared room id>' --reply-to '<source_message_id>' \
-  --task '<task id>' --owner '<owner mxid>' --private \
+# the owner's DM: checks the catalog and the connections, arms the wait, prints "message" to post
+python3 "$C" card youtube --room '<shared room id>' --reply-to '<source_message_id>' \
+  --task '<task id>' --owner-from-task --private \
   --line "YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on." \
   --line "Once that's done I'll pull up your latest videos." --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
 SUTANDO_REQUEST
-python3 "$C" await linear --room '<room id>' --reply-to '<source_message_id>' \
-  --task '<task id>' --owner '<owner mxid>' --switch --request-file - <<'SUTANDO_REQUEST'
+# a room with other people: writes the private card under the owner's message; nothing to post
+python3 "$C" card linear --room '<room id>' --reply-to '<source_message_id>' \
+  --task '<task id>' --owner-from-task --switch --request-file - <<'SUTANDO_REQUEST'
 <the owner request, verbatim>
 SUTANDO_REQUEST
+# a Switch account card (add --private in a room with other people)
 python3 "$C" note '<wait id>' "YouTube is connected. On it." [--status connected]   # a private-card line
 python3 "$C" claim '<room id>'                 # before answering in a room that may have a wait
 python3 "$C" verify-account '<wait id>'        # a resume: is the wait's AG2 Cloud account the one in use now?
 python3 "$C" rearm                             # restart dead waiters (startup + proactive loop run it)
 ```
+
+`card` is `status` + `await` in one process: the catalog check for each slug, one connections read,
+one account read, then the wait (merged with the room's pending waits for the same apps and account,
+exactly as `await`). `--owner-from-task` takes the owner from the task file's `user_id`, so you never
+call `ag2.whoami` for it. `--line` is optional: the first line is the intro (the text above the card
+in the DM, the first line of a private card); without it a plain default is used. `await` (same
+arguments, `--owner '<owner mxid>'` required, no catalog or connections check, no message) still
+exists for the same wait; `card` is the one to use.
 
 Pass the owner's words only through the quoted heredoc above, never inside a quoted `--request`
 argument: their text (an apostrophe, a quote) must never become shell. `--line` and `note` text is
@@ -65,9 +76,16 @@ yours, not the owner's: plain sentences, no quotes from their message.
 
 | exit | meaning |
 |---|---|
-| 0 | done: a match, all apps connected, a wait recorded, a wait claimed, the account verified |
+| 0 | done: a match, all apps connected, a wait recorded (or `card` found every app connected), a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
 | 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+
+`card` prints everything `await` prints plus `mode` (`dm` or `private`), `apps` (each with
+`connected`), `all_connected`, and for `mode: dm` a `message` object (`body`, `extra_content`,
+`reply_to`, `operation_id`) to pass verbatim to `room.action.execute` / `room.message.send`. It is
+`null` for a private card and when no wait was made. `find`, `status` and `card` read the
+connections and the catalog through a 30-second cache; `claim`, `verify-account`, the switch
+baseline and the waiter always read the cloud.
 
 `--switch` (step 3c) records which connections of the apps are active right now; the wait is ready
 only once each app has an active connection that wasn't, so the old account never answers. A switch
@@ -90,7 +108,7 @@ A card and a wait only when **all** of these hold for the task:
 - `access_tier: owner`, and no `collaborator: true` header;
 - `source: ag2space` (a message in AG2 Space; its room is `channel_id` / `source_room_id`).
 
-`await` checks the same on the task file and refuses anything else with `not_owner_task`.
+`card` and `await` check the same on the task file and refuse anything else with `not_owner_task`.
 Everything else (cron, a proactive-loop pass, voice, phone, Slack, Discord, Telegram, local chat, a
 collaborator or any non-owner) gets text only when an app isn't connected: "Google Calendar isn't
 connected yet; connect it in AG2 Space." No card, no wait. A non-owner never gets the owner's
@@ -98,8 +116,10 @@ connected-app data either.
 
 ## Step 1: are the Station tools loaded?
 
-`composio_find` is loaded when `mcp__sutando-station__composio_find` is in your tool list, or, when
-you have ToolSearch, `select:mcp__sutando-station__composio_find` returns it. If it is not:
+`mcp__sutando-station__composio_find` is normally in your tool list: call it directly, without a
+ToolSearch first. Only when it is not listed, and you have ToolSearch, try
+`select:mcp__sutando-station__composio_find` once (the fallback, not the first step). If neither
+finds it:
 
 - Some other `mcp__sutando-station__*` tool is there (`station_find`, a cloud tool; ToolSearch
   `sutando-station`): connected apps aren't enabled on this AG2 Cloud. Say "Connected apps aren't
@@ -115,13 +135,15 @@ Never restart the engine yourself.
 
 ## Which kind of room
 
-Everything below depends on whether the task's room is the owner's DM with you. A room counts as
-that DM only when you can confirm it:
+Everything below depends on whether the task's room is the owner's DM with you. Read it from the
+task file, in this order, and stop at the first that answers:
 
-1. The task's `room_member_count` is exactly `2`; or
-2. `room.inspect` on the room returns `safe_metadata.joined_member_count` of exactly `2`.
+1. The task's `channel_kind` header: `dm` means the DM, `room` means **shared**.
+2. No `channel_kind`: `room_member_count` of exactly `2` means the DM.
+3. Neither: `room.inspect` on the room; `safe_metadata.joined_member_count` of exactly `2` means the DM.
 
-A missing, unparseable or larger count, or a failed `room.inspect`, means **shared**.
+A missing, unparseable or larger count, or a failed `room.inspect`, means **shared**. The precheck
+line (Step 2) repeats the verdict as `room_kind=dm|room|unknown`; `unknown` means go to item 3.
 
 ## Where the answer may go
 
@@ -137,8 +159,18 @@ never posted in a shared room: it goes on the private card (step 3b).
 
 ## Step 2: find the apps
 
-Call `composio_find` with `apps` naming every app the request needs and `query` set to the request.
-For each app:
+When you first touched the task file, the connect-apps precheck hook may have added a line to your
+context: `connect-apps precheck: needs_connect=<slugs>; connected=<slugs>; room_kind=…; run: …`.
+It is read from the task's words and a 30-second cache of the owner's connections, so:
+
+- `needs_connect=` names every app the request needs (and `connected=` the rest): skip
+  `composio_find` and go straight to step 3 with those slugs (the `run:` hint is the `card` call,
+  with the room, `--reply-to` and `--task` filled in; you add the request heredoc).
+- Anything else (`mentions=` with `connected=unknown`, an app the request needs that the line does
+  not name, a `needs_connect=none`, no line at all): call `composio_find` **once**, with `apps`
+  naming every app the request needs and `query` set to the request.
+
+For each app the request needs:
 
 - `connected: true` and the owner wants a different account for it ("switch my Linear account", "use
   my other Gmail", "reconnect Notion"): step 3c.
@@ -162,29 +194,23 @@ there is no such app, so say so.
 
 For a task whose room is the owner's DM (see "Which kind of room"). From a shared room, go to 3b.
 
-1. **Which room.** The task's room.
-2. **A card already waiting?** `python3 "$C" status <slugs> --room '<room>'`. When
-   `pending_waits` already lists these apps, skip the intro and the card (items 4 and 5): send "The
-   Connect card above still works: tap Connect and I'll pick it up as soon as it's connected." and go
-   on to step 4, which folds this request into that wait.
-3. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
-4. **Intro.** `room.action.execute` with action `room.message.send`, `operation_id`
-   `<task id>:connect-intro`, and `reply_to` the task's `source_message_id` when the action accepts it:
-   "Your Google Calendar isn't connected yet, so I can't peek at your schedule. Want to hook it up?"
-   (adapt to the app and the request).
-5. **Card.** Same action, `operation_id` `<task id>:connect-card`:
-
-   ```json
-   {
-     "body": "Connect Google Calendar: tap Connect on the card, or open AG2 Space → Marketplace.",
-     "extra_content": {
-       "space.ag2.connector": {"version": 1, "for": "<owner_id>", "toolkits": [{"slug": "googlecalendar"}]}
-     }
-   }
-   ```
-
-   Several apps: ONE card listing each slug (at most 5), body "Connect Linear and Google Meet: ...".
-   If the action is not offered or fails, fall back to the text line from step 0 and skip step 4.
+1. **One call.** Run `card` exactly as in the Tools block: every missing slug (at most 5), `--room`
+   the task's room, `--reply-to` the task's `source_message_id`, `--task` the task's id,
+   `--owner-from-task`, the owner's request in the quoted heredoc, and optionally one `--line` with
+   your intro, adapted to the app and the request ("Your Google Calendar isn't connected yet, so I
+   can't peek at your schedule. Want to hook it up?"). No `status`, no `ag2.whoami`, no separate
+   intro message: `card` checks for a wait already in the room and folds this request into it.
+2. **Post the message.** On exit 0 with a `wait_id` and a `message`: ONE `room.action.execute` with
+   action `room.message.send` and the printed `message` object verbatim (`body`, `extra_content`,
+   `reply_to`, `operation_id`). The body is your intro above the card; `extra_content` is the card
+   itself, listing each app. `"reused": true` means this task already posted that card: the same
+   `operation_id` makes the post a no-op, so posting again is harmless, or say "The Connect card
+   above still works: tap Connect and I'll pick it up as soon as it's connected." A non-empty
+   `superseded` means an earlier card for these apps is already in the room; the new message is
+   still right (it lists everything the merged wait waits for).
+   If the action is not offered or fails, fall back to the text line from step 0; the wait stays
+   armed either way.
+3. Go to step 4.
 
 ## Step 3b: a private card, in a room with other people
 
@@ -194,16 +220,14 @@ message, no "I sent you a card in our DM", no outro.
 1. **No `source_message_id`** on the task: a private card has nowhere to show. Send the owner's DM
    (found and confirmed as in "Where the answer may go") the text line from step 0, post nothing in
    the shared room, write the result `[no-send]`, and stop. No confirmed DM: result `[no-send]`.
-2. **A card already waiting?** `python3 "$C" status <slugs> --room '<task room>'`. When
-   `private_cards` lists one for these apps with `status: waiting`, run `note <its id> "The Connect
-   card on your earlier message still works: tap Connect and I'll carry on."` and go on to step 4:
-   `await` folds this request into that wait, and the new card points at it.
-3. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
-4. Go to step 4 with `--private`, `--room` the task's room, `--reply-to` the task's
-   `source_message_id`, and two `--line`s in your voice, adapted to the app and the request: the
-   intro ("YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on.") and
-   the outro ("Once that's done I'll pull up your latest videos."). The desktop client draws the card
-   and the lines under the owner's message.
+2. **One call.** Run `card --private` exactly as in the Tools block: `--room` the task's room,
+   `--reply-to` the task's `source_message_id`, `--task`, `--owner-from-task`, the request in the
+   heredoc, and two `--line`s in your voice, adapted to the app and the request: the intro
+   ("YouTube isn't connected yet, so I can't do that. Connect it here and I'll carry on.") and the
+   outro ("Once that's done I'll pull up your latest videos."). The desktop client draws the card
+   and the lines under the owner's message. A card already waiting for these apps in the room is
+   folded in by `card` itself: the old card points at the new one, so no `status` or `note` first.
+3. Go to step 4 (`mode: private`, `message: null`).
 
 ## Step 3c: switch an app to another account
 
@@ -214,19 +238,20 @@ AG2 Space: Settings → Integrations."
 1. **The request.** When the owner asked something that needs the other account ("check my work Gmail
    instead"), that is the request to redo. When they only asked to switch, the request is their
    switch message itself; the resume then only says "<App> is now signed in as <label>".
-2. **Owner id.** Call `ag2.whoami` and use `runtime.owner_id` (never `actor.id`).
-3. **In the owner's DM** (see "Which kind of room"): run `await <slugs> --switch` FIRST, as in step 4
-   (the quoted heredoc, `--room`, `--reply-to`, `--task`, `--owner`). It records the account in use
-   before the card exists, so a sign-in that lands right after the card is still seen as the switch.
-   Only on exit 0 with a `wait_id`, send the card with `room.action.execute` / `room.message.send`,
-   `operation_id` `<task id>:switch-card`, `reply_to` the task's `source_message_id`:
+2. **In the owner's DM** (see "Which kind of room"): run `card <slugs> --switch` as in the Tools
+   block (the quoted heredoc, `--room`, `--reply-to`, `--task`, `--owner-from-task`, optionally
+   `--line "<intro>"`). It records the account in use before any card exists, so a sign-in that lands
+   right after the card is still seen as the switch, and only then prints the `message`. On exit 0
+   with a `wait_id`, post that `message` with ONE `room.action.execute` / `room.message.send` (its
+   `operation_id` is `<task id>:switch-card`, its `extra_content` carries `"mode": "switch"`):
 
    ```json
    {
-     "body": "Switch your Linear account: tap Switch account on the card, or open Settings → Integrations.",
+     "body": "<your intro>\n\nSwitch your Linear account: tap Switch account on the card, or open Settings → Integrations.",
      "extra_content": {
        "space.ag2.connector": {"version": 1, "for": "<owner_id>", "toolkits": [{"slug": "linear"}], "mode": "switch"}
-     }
+     },
+     "reply_to": "<source_message_id>", "operation_id": "<task id>:switch-card"
    }
    ```
 
@@ -234,8 +259,8 @@ AG2 Space: Settings → Integrations."
    `"reused": true` means that switch card is already waiting: say "The Switch account card above still
    works." instead of sending another. Any exit 2: no card; say "You can switch your Linear account in
    Settings → Integrations; tell me once it's done."
-4. **In a room with other people:** no messages about it in the room. With a `source_message_id`, run
-   `await <slugs> --private --switch --line "<intro>" --line "<outro>"` (for example "Tap Switch account
+3. **In a room with other people:** no messages about it in the room. With a `source_message_id`, run
+   `card <slugs> --private --switch --line "<intro>" --line "<outro>"` (for example "Tap Switch account
    to sign Linear in with your other account." and "Once that's done I'll carry on."), then write the
    result `[no-send]`. Without one, handle it as step 3b item 1.
 
@@ -255,19 +280,21 @@ card with `note`, never in the room.
 - **"Disconnect <app>"**: no action and no card. Say "You can disconnect <App> in Settings →
   Integrations." You never disconnect an app yourself.
 
-## Step 4: hand off and close
+## Step 4: the result
 
-Run `await` exactly as in the Tools block: the owner's request goes in the quoted heredoc, `--room` is
-the task's room, `--owner` is `runtime.owner_id`, `--reply-to` is the task's `source_message_id`,
-and from step 3b add `--private` and the two `--line`s.
+The `card` call from step 3 already armed the wait; read its output:
 
-- **Exit 0 with a `wait_id`:** in the DM (3a), write the task result now: "Once that's done I'll be
-  able to check what's coming up for you." (adapted to the app). From 3b the outro is already on the
-  private card: write the result `[no-send]`. The task is closed; do not wait inside it. (`superseded` lists earlier waits this one absorbed;
-  `"waiter_pid": null` means the waiter could not start, and the next `rearm` starts it.)
-- **Exit 0 with `"wait_id": null`:** an earlier wait was handled meanwhile: `resumed` names the task
-  answering its request or posting its note. An entry whose `task` is this task's id, or whose `request` is
-  this request: result `[no-send]`. Otherwise answer it now (step 2), the apps are connected.
+- **Exit 0 with a `wait_id`:** in the DM (3a), after posting the `message`, write the task result
+  now: "Once that's done I'll be able to check what's coming up for you." (adapted to the app). From
+  3b the outro is already on the private card: write the result `[no-send]`. The task is closed; do
+  not wait inside it. (`superseded` lists earlier waits this one absorbed; `"waiter_pid": null`
+  means the waiter could not start, and the next `rearm` starts it.)
+- **Exit 0 with `"all_connected": true`:** every app is connected after all (the precheck or
+  `composio_find` was stale): no card, no wait; answer the request now as in step 2.
+- **Exit 0 with `"wait_id": null`** and `resumed`: an earlier wait was handled meanwhile: `resumed`
+  names the task answering its request or posting its note. An entry whose `task` is this task's id,
+  or whose `request` is this request: result `[no-send]`. Otherwise answer it now (step 2), the apps
+  are connected.
 - **Exit 2 with `too_many_apps`:** this task already waits in this room for other apps, and one wait
   holds at most 5. That wait stays armed and answers its request once its apps connect (`status
   --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,

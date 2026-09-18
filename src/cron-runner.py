@@ -33,7 +33,6 @@ never a backlog storm.
 from __future__ import annotations
 
 import calendar
-import fcntl
 import functools
 import json
 import os
@@ -59,6 +58,7 @@ sys.path.insert(0, str(SRC_DIR))
 # (same guard the channel bridges apply). Belt-and-suspenders with `task:` being
 # last: confine_user_content() neutralizes forged fields even in a multi-line body.
 from task_body_guard import confine_user_content  # noqa: E402
+from file_lock import lock_fd, unlock_fd  # noqa: E402
 import cron_task_id  # noqa: E402
 
 try:
@@ -399,11 +399,11 @@ def _state_lock(state_file: Path) -> Iterator[None]:
     lock_path = state_file.parent / (state_file.name + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        lock_fd(handle.fileno())
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            unlock_fd(handle.fileno())
 
 
 def _atomic_write_text(path: Path, body: str) -> None:

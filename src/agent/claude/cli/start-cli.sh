@@ -42,6 +42,8 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   . "$REPO/scripts/python-binary.sh"
   PY="$(resolve_python "$REPO")"
 fi
+# shellcheck source=skill-manifest-config.sh
+[ -r "$REPO/src/skill-manifest-config.sh" ] && . "$REPO/src/skill-manifest-config.sh"
 
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
@@ -184,6 +186,39 @@ fi
 # the override because tmux may use an older server environment.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+fi
+# Any installed skill's manifest.json "config" block, forwarded like every var
+# above. Set-ness wins, not non-emptiness: an explicit empty value (a product
+# deployment disabling a feature) must not be re-filled from a manifest.
+# Records are NUL-framed and the key is validated by the emitter; re-checked
+# here so a bad key can never reach `export` under `set -e`.
+if declare -F skill_manifest_config_pending >/dev/null; then
+  _mc_seen=" "
+  while IFS= read -r -d '' _mcrec; do
+    _mck=${_mcrec%%=*}
+    _mcv=${_mcrec#*=}
+    [ -n "$_mck" ] || continue
+    case "$_mck" in
+      [!A-Za-z_]* | *[!A-Za-z0-9_]*) continue ;;
+    esac
+    case "$_mc_seen" in
+      *" $_mck "*)
+        # Every other rejection in this path reports itself; a duplicate must
+        # too, or the losing skill's value vanishes by glob order alone.
+        printf 'skill-manifest-config: %s declared by more than one skill; keeping the first\n' \
+          "$_mck" >&2
+        continue
+        ;;
+    esac
+    _mc_seen="$_mc_seen$_mck "
+    if [ "${!_mck+x}" = x ]; then
+      CORE_ENV_ARGS+=(-e "$_mck=${!_mck}")
+    else
+      export "$_mck=$_mcv"
+      CORE_ENV_ARGS+=(-e "$_mck=$_mcv")
+    fi
+  done < <(skill_manifest_config_pending "$REPO" "$PY")
+  unset _mc_seen _mcrec
 fi
 # Route the core through the credential proxy when one is live (quota
 # telemetry, #2211/#2288). startup.sh exports ANTHROPIC_BASE_URL for cores

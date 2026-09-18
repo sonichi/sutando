@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import weakref
 from pathlib import Path
@@ -125,6 +126,7 @@ from access_store import (  # noqa: E402  — single locked writer for access.js
     discord_access_backup_file,
 )
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
@@ -201,8 +203,8 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     # reports resolved while still visible to queue-health.
     _empty_result_polls.pop(task_id, None)
     channel = pending_replies.pop(task_id, None)  # stop re-polling it
-    _atomic_write_pending_replies(
-        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_admitted_ms.pop(task_id, None)
+    save_pending_replies()
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
@@ -663,10 +665,10 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
         urllib.request.urlopen(req, timeout=2).read()
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
-INBOX_DIR = Path("/tmp/discord-inbox")
+INBOX_DIR = Path("/tmp/discord-inbox") if os.name == "posix" else Path(tempfile.gettempdir()) / "discord-inbox"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-INBOX_DIR.mkdir(exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:
@@ -2564,6 +2566,9 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# task_id -> epoch_ms admitted. The ager keys on THIS, never on id shape
+# (provider-derived ids carry no parseable epoch — john-the-dev, #3316).
+pending_admitted_ms: dict = {}
 # Track source message id per pending task so the result-sender can default
 # reply_to_id to the triggering message (visually threads the reply). Lives
 # in memory only — crash-recovery isn't critical; missing entry just means
@@ -3058,33 +3063,13 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
 
 
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
-    """True iff `sender_id` is listed under the SERVING channel's `collaborators`
-    array in access.json.
-
-    A collaborator is a team-tier sender the owner has designated for
-    substantive engagement in ONE specific channel (see the `team-collaborator`
-    rulebook). Scope is strictly per-channel: membership in some OTHER channel's
-    `collaborators` does NOT carry over — the check keys on the serving channel
-    only. Fail-closed: any malformed config or missing key yields False.
-
-    Pure + side-effect-free so it can be unit-tested directly (the caller lives
-    inside the async Discord handler, which is not independently exercisable).
-    """
-    try:
-        serving_cfg = (access_data.get("groups", {}) or {}).get(str(serving_channel_id), {})
-        if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", []) or []):
-            return True
-    except Exception:
-        pass
-    return False
+    from discord_access import resolve_is_collaborator as resolve
+    return resolve(access_data, sender_id, serving_channel_id)
 
 
 def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
-    """Collaborator status for a TEAM sender, however that tier was reached.
-    Global-allowlist members resolved to team by the tierMap are eligible too."""
-    if access_tier != "team":
-        return False
-    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+    from discord_access import resolve_team_collaborator as resolve
+    return resolve(access_data, access_tier, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3918,9 +3903,20 @@ async def _handle_discord_message(message, force=False):
     if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
-    # Write as task
+    # Write as task. The id derives from the provider event (injective), so a
+    # replayed event maps to the same file — skipped, never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _inst = getattr(getattr(client, "user", None), "id", None)
+    if _inst and getattr(message, "id", None):
+        task_id = provider_task_id(f"dc{_inst}", str(message.id))
+        # Every month partition: an event archived before a rollover is still admitted.
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return
+    else:  # pragma: no cover — client identity absent (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
     # Intercept vault commands before any disk write.
@@ -3997,7 +3993,6 @@ async def _handle_discord_message(message, force=False):
         )
     else:
         codex_prompt_text = user_task_text
-
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):
@@ -4308,6 +4303,7 @@ async def _handle_discord_message(message, force=False):
         # now does a mention-gate admission earn its audit row.
         _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
+    pending_admitted_ms[task_id] = int(time.time() * 1000)
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
@@ -4835,9 +4831,12 @@ def _atomic_write_pending_replies(data: dict) -> None:
         pass
 
 def save_pending_replies():
-    """Persist pending_replies channel IDs to disk for crash recovery."""
+    """Persist pending_replies channel ids + admitted_at for crash recovery."""
     try:
-        data = {k: str(v.id) for k, v in pending_replies.items()}
+        now_ms = int(time.time() * 1000)
+        data = {k: {"ch": str(v.id),
+                    "at": pending_admitted_ms.setdefault(k, now_ms)}
+                for k, v in pending_replies.items()}
         _atomic_write_pending_replies(data)
     except Exception:
         pass
@@ -4853,24 +4852,36 @@ def load_pending_replies_from_disk():
     try:
         if not PENDING_REPLIES_FILE.exists():
             return {}
-        data = json.loads(PENDING_REPLIES_FILE.read_text())
+        raw = json.loads(PENDING_REPLIES_FILE.read_text())
         now_ms = int(time.time() * 1000)
         max_age_ms = 7 * 86400 * 1000
         aged_out = []
-        for task_id in list(data.keys()):
-            try:
-                # task_id format: "task-<epoch_ms>"
-                ts_ms = int(task_id.split("-")[1])
-                if now_ms - ts_ms > max_age_ms:
-                    aged_out.append(task_id)
-                    del data[task_id]
-            except (ValueError, IndexError):
-                # Malformed task_id — leave it; cap protects the simple case
-                pass
+        data = {}
+        rewrite = False
+        for task_id, val in raw.items():
+            if isinstance(val, dict):
+                at, ch = val.get("at"), val.get("ch")
+            else:
+                # Legacy string: parseable task-<epoch_ms> keeps its clock;
+                # any other shape starts NOW — bounded, never immortal (#3316).
+                ch = str(val)
+                try:
+                    at = int(task_id.split("-")[1])
+                except (ValueError, IndexError):
+                    at = now_ms
+                rewrite = True
+            if not isinstance(at, int):
+                at, rewrite = now_ms, True
+            if now_ms - at > max_age_ms:
+                aged_out.append(task_id)
+                continue
+            data[task_id] = {"ch": ch, "at": at}
+            pending_admitted_ms[task_id] = at
         if aged_out:
             print(f"  [recovery] aged out {len(aged_out)} pending_replies > 7d", flush=True)
+        if aged_out or rewrite:
             _atomic_write_pending_replies(data)
-        return data
+        return {k: v["ch"] for k, v in data.items()}
     except Exception:
         pass
     return {}
@@ -5022,6 +5033,7 @@ async def poll_results():
                                          if not _target else ("report", None))
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
+                                pending_admitted_ms[_pl] = int(time.time() * 1000)
                                 save_pending_replies()
                             elif _act == "report" and not _target:
                                 # Cross-channel carries a None payload and is
@@ -5057,6 +5069,7 @@ async def poll_results():
                                     (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
                                     # Route the re-answer back to THIS channel.
                                     pending_replies[_new_id] = channel
+                                    pending_admitted_ms[_new_id] = int(time.time() * 1000)
                                     save_pending_replies()
                                     print(
                                         f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "

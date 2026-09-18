@@ -68,10 +68,10 @@ BODY="$(awk '/^    func checkWatcher\(\) \{/,/^    func cliIsWorking/' "$F")"
 printf '%s' "$BODY" | grep -q 'resolveCoreRuntime' \
   && ok "12 checkWatcher consults the core runtime" || fail "12" "no runtime gate in checkWatcher"
 GATE_LINE=$(printf '%s\n' "$BODY" | grep -n 'resolveCoreRuntime' | head -1 | cut -d: -f1)
-PGREP_LINE=$(printf '%s\n' "$BODY" | grep -n '"watch-tasks"' | head -1 | cut -d: -f1)
+PGREP_LINE=$(printf '%s\n' "$BODY" | grep -n 'watcherProcessSeen()' | head -1 | cut -d: -f1)
 [ -n "$GATE_LINE" ] && [ -n "$PGREP_LINE" ] && [ "$GATE_LINE" -lt "$PGREP_LINE" ] \
   && ok "13 ...and returns BEFORE probing for the Claude-only watcher" \
-  || fail "13" "gate at ${GATE_LINE:-none} is not before the pgrep at ${PGREP_LINE:-none}"
+  || fail "13" "gate at ${GATE_LINE:-none} is not before the probe at ${PGREP_LINE:-none}"
 printf '%s' "$BODY" | grep -qE 'rt != "claude"' \
   && ok "14 ...skipping only a positively-identified non-Claude runtime" || fail "14" "gate does not key on a known runtime"
 
