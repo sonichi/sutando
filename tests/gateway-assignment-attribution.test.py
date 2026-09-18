@@ -39,6 +39,7 @@ _POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
 sys.path.insert(0, str(_POOL_SCRIPTS))
 import pool_attribution  # noqa: E402
 import pool_delivery  # noqa: E402
+import pool_roster  # noqa: E402
 
 W1 = "02e4302f00844397bac09533fc398248"
 W2 = "212e8040d38d48b5aadab0db295dc33a"
@@ -217,11 +218,24 @@ class AssignmentAttribution(unittest.TestCase):
 
     def test_unreadable_deliveries_root_is_refused(self):
         """An unreadable root is NO READING, not "never delivered" — the whole
-        point of the discriminator is that those differ."""
+        point of the discriminator is that those differ. Both yield "", so the
+        LOG is what makes them differ; without it this test asserted the very
+        conflation its docstring rejects."""
         tid = "task-8899001122334455"
         self._sentinel(W1, tid)
         with mock.patch.object(Path, "iterdir", side_effect=PermissionError("x")):
             self.assertEqual(self.mod._delivery_recipient(tid), "")
+        self.assertTrue(
+            any("BLIND" in m for m in self.logs),
+            f"an unreadable root must say so, got {self.logs}",
+        )
+
+    def test_never_delivered_is_silent_where_blind_is_loud(self):
+        """The other half of the discriminator: a genuinely undelivered task
+        must NOT log the blind anomaly, or the signal means nothing."""
+        self.assertEqual(
+            self.mod._delivery_recipient("task-8899001122334456"), "")
+        self.assertEqual([m for m in self.logs if "BLIND" in m], [])
 
     def test_another_tasks_sentinel_is_not_ours(self):
         """A populated recipient dir holding somebody else's sentinel must not
@@ -253,6 +267,73 @@ class AssignmentAttribution(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{tid}{pool_delivery.ACCEPTED_SUFFIX}").write_text("")
         self.assertEqual(self.mod._delivery_recipient(tid), W1)
+
+    def test_legacy_accepted_suffix_counts_too(self):
+        """Work accepted under the old sentinel name is still evidence of
+        delivery; the pool's own matcher still recognises it."""
+        tid = "task-3344556677889902"
+        d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}{pool_delivery.LEGACY_ACCEPTED_SUFFIX}").write_text("")
+        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+
+    def test_fan_out_to_two_recipients_claims_neither(self):
+        """Two claimants is not one answer. Asserted against the GUARD too, so
+        the multi-claimant arm cannot go quiet unnoticed."""
+        tid = "task-3344556677889903"
+        self._sentinel(W1, tid)
+        self._sentinel(W2, tid)
+        self.assertEqual(self.mod._delivery_recipient(tid), "")
+
+    # --- the core is a recipient, and that is not an anomaly -------------
+
+    def test_core_sentinel_is_not_a_worker_claim(self):
+        """BLOCKER 1. The router writes a sentinel for EVERY recipient but
+        records attribution only for workers, so "core sentinel, no record" is
+        the ordinary shape of a core-answered task — not the invariant
+        violation the guard exists to report."""
+        tid = "task-4455667788990011"
+        self._sentinel(pool_roster.CORE, tid)
+        self.assertEqual(self.mod._delivery_recipient(tid), "")
+
+    def test_core_routed_task_does_not_trip_the_guard(self):
+        """The same case through the real caller: ordinary core traffic must
+        not log a scary refusal, or every core reply would carry one."""
+        tid = "task-4455667788990012"
+        self._sentinel(pool_roster.CORE, tid)
+        doc = self._doc(tid)
+        self.assertNotIn("metadata", doc)
+        self.assertEqual(
+            [m for m in self.logs if "refusing to stamp" in m], [])
+
+    def test_a_worker_is_still_claimed_beside_a_core_sentinel(self):
+        """Control for the core filter: skipping core must not skip a real
+        worker delivered the same task."""
+        tid = "task-4455667788990013"
+        self._sentinel(pool_roster.CORE, tid)
+        self._sentinel(W1, tid)
+        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+
+    def test_a_stray_file_at_the_root_does_not_blind_the_guard(self):
+        """BLOCKER 2. Reading THROUGH a non-directory raises NotADirectoryError,
+        an OSError — treating that as a read failure turned the guard off for
+        every task on the host the moment one .DS_Store appeared."""
+        tid = "task-4455667788990014"
+        self._sentinel(W1, tid)
+        root = pool_delivery.deliveries_dir(Path(self.workspace), W1).parent
+        (root / ".DS_Store").write_text("")
+        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+        self.assertEqual([m for m in self.logs if "BLIND" in m], [])
+
+    def test_bridge_constants_cover_what_the_pool_writes(self):
+        """THE DRIFT GUARD the fixtures alone could not give: the fixtures only
+        ever build PENDING/ACCEPTED, so a suffix or recipient name the pool
+        recognises and this module does not would pass every other test here."""
+        self.assertEqual(self.mod._CORE_RECIPIENT, pool_roster.CORE)
+        for suffix in (pool_delivery.PENDING_SUFFIX,
+                       pool_delivery.ACCEPTED_SUFFIX,
+                       pool_delivery.LEGACY_ACCEPTED_SUFFIX):
+            self.assertIn(suffix, self.mod._DELIVERY_SUFFIXES)
 
     def test_traversal_is_refused(self):
         self.assertEqual(self.mod._assigned_worker("../../etc/passwd"), "")

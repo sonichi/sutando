@@ -3960,18 +3960,33 @@ def _assigned_worker(task_id: str) -> str:
     return value if _is_worker_id(value) else ""
 
 
+# The core is a delivery recipient like any worker, but the router records
+# attribution only for workers — so a core sentinel with no record is normal.
+_CORE_RECIPIENT = "core"
+_DELIVERY_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
 def _delivery_recipient(task_id: str) -> str:
     """Which worker this task was DELIVERED to, read from the pool's delivery
     sentinel. Used ONLY to tell "this was a worker's task" from "this was the
     core's" when attribution is missing — never as an attribution source.
 
-    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted}) is owned
-    by the pool's own delivery writer, an optional local skill this standalone
-    package cannot import or name; the test builds its fixtures through that
-    writer so a drift fails there instead of silently reading nothing.
+    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted,claimed})
+    is owned by the pool's own delivery writer, an optional local skill this
+    standalone package cannot import or name; the test builds its fixtures
+    through that writer so a drift fails there instead of silently reading
+    nothing, and asserts this module's recipient/suffix constants still cover
+    what that writer produces.
 
-    Fails closed like its siblings: unreadable, non-regular, or claimed by more
-    than one recipient yields "".
+    The core NEVER counts as a claimant: the router writes a sentinel for every
+    recipient but records attribution only for workers, so "core sentinel, no
+    record" is the ordinary shape of a task the core answered itself, not an
+    invariant violation.
+
+    Fails closed like its siblings: non-regular or claimed by more than one
+    recipient yields "". A genuine read error also yields "" but SAYS SO — an
+    unreadable tree is no reading, which is not the same fact as "never
+    delivered", and a silent "" would make those indistinguishable.
     """
     if not task_id or "/" in task_id or task_id in (".", ".."):
         return ""
@@ -3980,16 +3995,27 @@ def _delivery_recipient(task_id: str) -> str:
         recipients = sorted(p.name for p in root.iterdir())
     except FileNotFoundError:
         return ""
-    except OSError:
+    except OSError as exc:
+        _log(f"attribution: cannot read {root} ({type(exc).__name__}) - the "
+             f"delivery discriminator is BLIND for {task_id}, which is not the "
+             f"same as this task never having been delivered.")
         return ""
     claimants = set()
     for name in recipients:
-        for suffix in (".txt", ".accepted"):
+        if name == _CORE_RECIPIENT:
+            continue
+        for suffix in _DELIVERY_SUFFIXES:
             try:
                 st = os.lstat(root / name / f"{task_id}{suffix}")
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
+                # Reading through a stray file at the root raises
+                # NotADirectoryError: a non-recipient, not a read failure.
                 continue
-            except OSError:
+            except OSError as exc:
+                _log(f"attribution: cannot read delivery sentinel for "
+                     f"{task_id} under {name} ({type(exc).__name__}) - the "
+                     f"delivery discriminator is BLIND for this task, which is "
+                     f"not the same as it never having been delivered.")
                 return ""
             if not stat.S_ISREG(st.st_mode):
                 return ""
