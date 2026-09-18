@@ -192,5 +192,218 @@ class Contract(unittest.TestCase):
             self.assertIn(f"`{err}`", doc)
 
 
+import types
+
+
+class FakeImage:
+    """The slice of PIL.Image this script touches: open → size/resize/convert/save."""
+    saved = []
+
+    def __init__(self, size=(8192, 4096)):
+        self.size = size
+
+    def resize(self, size, resample=None):
+        return FakeImage(size)
+
+    def convert(self, mode):
+        return self
+
+    def save(self, target, fmt=None, quality=None, format=None):
+        blob = b"FAKE-" + (fmt or format or "PNG").encode()
+        if isinstance(target, (str, Path)):
+            Path(target).write_bytes(blob)
+        else:
+            target.write(blob)
+        FakeImage.saved.append((fmt or format, quality))
+
+
+def fake_pil():
+    image_mod = types.ModuleType("PIL.Image")
+    image_mod.open = lambda fh: FakeImage()
+    image_mod.LANCZOS = 1
+    pil = types.ModuleType("PIL")
+    pil.Image = image_mod
+    return {"PIL": pil, "PIL.Image": image_mod}
+
+
+class KeyAndEnv(Base):
+    def test_load_env_reads_only_gemini_keys_from_the_two_env_files(self):
+        home = self.ws / "home"; home.mkdir()
+        repo = self.ws / "repo"; (repo / "skills" / "image-generation").mkdir(parents=True)
+        (repo / ".env").write_text("# comment\n\nGEMINI_API_KEY='from-repo'\nOTHER=1\nnot a pair\n")
+        (home / ".env").write_text('GEMINI_VOICE_API_KEY="from-home"\nGEMINI_API_KEY=home-loses\n')
+        env = {"HOME": str(home), "GEMINI_API_KEY": "stale-shell"}
+        with mock.patch.object(gen, "SKILL_DIR", repo / "skills" / "image-generation"), \
+                mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GEMINI_VOICE_API_KEY", None)
+            os.environ.pop("OTHER", None)
+            for pt in self.patches:
+                pt.stop()
+            try:
+                gen.load_env()
+                self.assertEqual(os.environ["GEMINI_API_KEY"], "home-loses", "later file wins, quotes stripped")
+                self.assertEqual(os.environ["GEMINI_VOICE_API_KEY"], "from-home")
+                self.assertNotIn("OTHER", os.environ)
+                (repo / ".env").unlink(); (home / ".env").unlink()
+                gen.load_env()  # both files gone: nothing to read, nothing raised
+            finally:
+                for pt in self.patches:
+                    pt.start()
+
+    def test_resolve_key_prefers_the_resolver_then_the_env_chain(self):
+        for pt in self.patches:
+            pt.stop()
+        try:
+            got = types.SimpleNamespace(key="managed-k", source="managed")
+            fake = types.ModuleType("credential_resolver")
+            fake.resolve_credential = lambda cap: got if cap == "gemini-image" else None
+            with mock.patch.dict(sys.modules, {"credential_resolver": fake}):
+                self.assertEqual(gen.resolve_key(), ("managed-k", "managed"))
+            with mock.patch.dict(sys.modules, {"credential_resolver": None}), \
+                    mock.patch.dict(os.environ, {"GEMINI_VOICE_API_KEY": "voice-k"}, clear=False):
+                os.environ.pop("GEMINI_API_KEY", None)
+                self.assertEqual(gen.resolve_key(), ("voice-k", "env"))
+                os.environ["GEMINI_API_KEY"] = "text-k"
+                self.assertEqual(gen.resolve_key(), ("text-k", "env"), "the text key outranks the voice key")
+                os.environ.pop("GEMINI_API_KEY"); os.environ.pop("GEMINI_VOICE_API_KEY")
+                self.assertEqual(gen.resolve_key(), ("", "none"))
+        finally:
+            for pt in self.patches:
+                pt.start()
+
+    def test_manifest_config_and_media_dir_degrade_without_the_core_tree(self):
+        with mock.patch.object(gen, "SKILL_DIR", self.ws / "no-such-skill"):
+            self.assertIsNone(gen.manifest_config("IMAGE_MODEL"))
+        for pt in self.patches:
+            pt.stop()
+        try:
+            with_core = gen.media_dir()
+            self.assertEqual((with_core.parent.name, with_core.name), ("results", "media"), "the workspace's attachment allowlist")
+            with mock.patch.dict(sys.modules, {"workspace_default": None}):
+                self.assertEqual(gen.media_dir().name, "sutando-media")
+        finally:
+            for pt in self.patches:
+                pt.start()
+
+
+class InputsAndOutputs(Base):
+    def test_a_non_image_input_is_bad_input(self):
+        txt = self.ws / "notes.txt"; txt.write_text("hi")
+        self.assertIsNone(gen.read_input_image(str(txt)))
+        rc, line = self.run_main("--prompt", "x", "--input", str(txt), opener=self.opener(response()))
+        self.assertEqual((rc, line["error"]), (2, "bad_input"))
+
+    def test_a_large_input_is_downscaled_when_pillow_is_around(self):
+        FakeImage.saved.clear()
+        src = self.ws / "big.png"; src.write_bytes(PNG)
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, fake_pil()), contextlib.redirect_stderr(err):
+            data, mime = gen.read_input_image(str(src))
+        self.assertEqual((data, mime), (b"FAKE-PNG", "image/png"))
+        self.assertIn("Resized", err.getvalue())
+        self.assertIn("4096x2048", err.getvalue())
+
+    def test_http_error_without_a_json_body_reads_as_its_code(self):
+        err = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b"<html>oops</html>"))
+        self.assertEqual(gen.api_error_message(err), "HTTP 503")
+
+    def test_jpg_output_converts_with_pillow_and_falls_back_to_the_returned_format_without_it(self):
+        FakeImage.saved.clear()
+        parts = [{"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}}]
+        out = self.ws / "pic.jpg"
+        with mock.patch.dict(sys.modules, fake_pil()):
+            rc, line = self.run_main("--prompt", "x", "--output", str(out), "--quality", "70", opener=self.opener(response(parts)))
+        self.assertEqual((rc, line["path"]), (0, str(out.resolve())))
+        self.assertEqual(out.read_bytes(), b"FAKE-JPEG")
+        self.assertEqual(FakeImage.saved, [("JPEG", 70)])
+        out2 = self.ws / "pic2.webp"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            rc, line = self.run_main("--prompt", "x", "--output", str(out2), opener=self.opener(response(parts)))
+        self.assertEqual(Path(line["path"]).suffix, ".png", "no Pillow: the returned png keeps its own extension")
+        self.assertEqual(Path(line["path"]).read_bytes(), PNG)
+        out3 = self.ws / "pic3.bmp"
+        rc, line = self.run_main("--prompt", "x", "--output", str(out3), opener=self.opener(response(parts)))
+        self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
+
+
+class FakeGenai:
+    """The slice of google-genai the video path touches."""
+
+    def __init__(self, fail=None, polls=1):
+        self.fail = fail
+        self.polls = polls
+        self.calls = []
+        self.downloaded = []
+        outer = self
+
+        class _Op:
+            def __init__(self, done):
+                self.done = done
+                video = types.SimpleNamespace(video=types.SimpleNamespace(save=lambda path: Path(path).write_bytes(b"MP4")))
+                self.response = types.SimpleNamespace(generated_videos=[video])
+
+        class _Models:
+            def generate_videos(self, **kwargs):
+                outer.calls.append(kwargs)
+                if outer.fail:
+                    raise outer.fail
+                return _Op(done=outer.polls == 0)
+
+        class _Operations:
+            def get(self, op):
+                outer.polls -= 1
+                return _Op(done=outer.polls <= 0)
+
+        class _Files:
+            def download(self, file=None):
+                outer.downloaded.append(file)
+
+        class Client:
+            def __init__(self, api_key=None):
+                outer.calls.append(("client", api_key))
+                self.models, self.operations, self.files = _Models(), _Operations(), _Files()
+
+        genai = types.ModuleType("google.genai")
+        genai.Client = Client
+        gtypes = types.ModuleType("google.genai.types")
+        gtypes.Image = lambda image_bytes=None, mime_type=None: ("image", mime_type, len(image_bytes))
+        gtypes.GenerateVideosConfig = lambda aspect_ratio=None: ("config", aspect_ratio)
+        genai.types = gtypes
+        google = types.ModuleType("google")
+        google.genai = genai
+        self.modules = {"google": google, "google.genai": genai, "google.genai.types": gtypes}
+
+
+class Video(Base):
+    def test_a_video_is_generated_polled_downloaded_and_saved(self):
+        sdk = FakeGenai(polls=2)
+        out = self.ws / "clip.mp4"
+        with mock.patch.dict(sys.modules, sdk.modules), mock.patch.object(gen.time, "sleep", lambda s: None):
+            rc, line = self.run_main("--video", "--prompt", "a city", "--output", str(out), "--aspect", "9:16")
+        self.assertEqual((rc, line["ok"], line["path"], line["model"]), (0, True, str(out.resolve()), gen.DEFAULT_VIDEO_MODEL))
+        self.assertEqual(out.read_bytes(), b"MP4")
+        self.assertEqual(sdk.calls[0], ("client", "k-test"))
+        self.assertEqual(sdk.calls[1]["config"], ("config", "9:16"))
+        self.assertNotIn("image", sdk.calls[1])
+        self.assertEqual(len(sdk.downloaded), 1)
+
+    def test_a_reference_image_rides_along_and_a_missing_one_is_bad_input(self):
+        sdk = FakeGenai(polls=0)
+        src = self.ws / "ref.png"; src.write_bytes(PNG)
+        with mock.patch.dict(sys.modules, sdk.modules), mock.patch.dict(os.environ, {"VIDEO_MODEL": "veo-test"}):
+            rc, line = self.run_main("--video", "--prompt", "x", "--input", str(src), "--output", str(self.ws / "v.mp4"))
+        self.assertEqual((rc, line["model"]), (0, "veo-test"))
+        self.assertEqual(sdk.calls[1]["image"], ("image", "image/png", len(PNG)))
+        with mock.patch.dict(sys.modules, sdk.modules):
+            rc, line = self.run_main("--video", "--prompt", "x", "--input", str(self.ws / "nope.png"))
+        self.assertEqual((rc, line["error"]), (2, "bad_input"))
+
+    def test_every_sdk_failure_is_one_api_error(self):
+        sdk = FakeGenai(fail=RuntimeError("quota exceeded"))
+        with mock.patch.dict(sys.modules, sdk.modules):
+            rc, line = self.run_main("--video", "--prompt", "x", "--output", str(self.ws / "v.mp4"))
+        self.assertEqual((rc, line["error"], line["message"]), (1, "api_error", "quota exceeded"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

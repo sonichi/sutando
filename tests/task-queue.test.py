@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +113,39 @@ class Cli(Base):
         self.assertEqual((rc, out), (0, ""), "no task id: nothing printed, exit 0")
         rc, out, _ = self.run_main("nonsense")
         self.assertEqual((rc, out), (0, ""))
+
+
+class Tolerance(Base):
+    """Every reader degrades instead of raising: the dispatch path never fails on a count."""
+
+    def test_a_task_that_vanishes_mid_scan_still_counts(self):
+        real = self.task("task-1", age=1)
+        ghost = self.ws / "tasks" / "task-ghost.txt"
+        with unittest.mock.patch.object(tq, "sort_tasks_by_priority", lambda paths: list(paths) + [ghost]):
+            rows = tq.pending(self.ws)
+        self.assertEqual([r["id"] for r in rows], ["task-1", "task-ghost"])
+        ghost_row = rows[1]
+        self.assertEqual((ghost_row["source"], ghost_row["priority"], ghost_row["since"]), (None, "normal", 0))
+        self.assertEqual(rows[0]["since"], int(real.stat().st_mtime))
+
+    def test_source_of_an_unreadable_file_is_none(self):
+        self.assertIsNone(tq._source(self.ws / "tasks" / "absent.txt"))
+        p = self.ws / "tasks" / "task-src.txt"
+        p.write_text("id: task-src\ntask: hi\nsource: late\n")
+        self.assertIsNone(tq._source(p), "a source line below task: is body text")
+
+    def test_workspace_of_nothing_is_none(self):
+        self.assertIsNone(tq._workspace_of(None, None))
+        self.assertEqual(tq._workspace_of(None, str(self.ws)), self.ws)
+        self.assertEqual(tq._workspace_of(str(self.ws / "tasks" / "t.txt"), None), self.ws.resolve())
+
+    def test_an_unexpected_error_is_reported_on_stderr_and_still_exits_0(self):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(tq, "pending", side_effect=RuntimeError("disk on fire")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tq.main(["pending", "--workspace", str(self.ws)])
+        self.assertEqual((rc, out.getvalue()), (0, ""))
+        self.assertIn("task_queue: disk on fire", err.getvalue())
 
 
 if __name__ == "__main__":
