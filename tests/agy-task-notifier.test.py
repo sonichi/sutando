@@ -332,6 +332,18 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "")
 
+    def test_missing_results_dir_is_created_before_any_dispatch(self):
+        # agy publishes results ITSELF (the watcher only mkdirs TASKS_DIR), so
+        # a first-run RESULTS_DIR must exist before agy ever tries to write there.
+        fresh_results = self.root / "workspace" / "results-fresh"
+        self.assertFalse(fresh_results.exists())
+        self.session_flag.unlink()  # no session -> submit_task drops immediately
+        self.write_task("task-g.txt")
+        result = self.run_event("task-g.txt", env_extra={"SUTANDO_RESULTS_DIR": str(fresh_results)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(fresh_results.is_dir(),
+                         "RESULTS_DIR must be created at startup, not left for agy to hit ENOENT on")
+
 
 class MainLoopWiringTest(FakeTmuxHarness):
     """Proves the actual claim: a task file dropped on disk reaches the
@@ -417,6 +429,52 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 sentinels, [canonical_sentinel],
                 "agy watcher's only sentinel is the bare canonical name — "
                 "it would collide with a real canonical watcher on this host")
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_a_foreign_nonempty_inherited_instance_id_is_overridden_not_kept(self):
+        # A bare fallback (`${SUTANDO_INSTANCE_ID:-agy-task-notifier}`) misses a
+        # NON-empty inherited value; it must be replaced, never kept.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        env = self._env()
+        for var in ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
+            env.pop(var, None)
+        env["SUTANDO_INSTANCE_ID"] = "shared-worker"
+        state_dir = self.tasks_dir.parent / "state"
+        foreign_sentinel = state_dir / "watch-tasks-stream-local-agent+shared-worker.pid"
+        expected_sentinel = state_dir / "watch-tasks-stream-local-agent+agy-task-notifier.pid"
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=env,
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline and not expected_sentinel.exists() and not foreign_sentinel.exists():
+                time.sleep(0.2)
+            self.assertTrue(
+                expected_sentinel.exists(),
+                f"expected {expected_sentinel.name}, got: "
+                f"{[p.name for p in state_dir.glob('watch-tasks-stream*.pid')]}")
+            self.assertFalse(foreign_sentinel.exists(),
+                              "the inherited foreign instance id leaked into the sentinel name")
         finally:
             if proc.poll() is None:
                 try:
@@ -540,6 +598,27 @@ esac
                          "ensure_task_notifier never started the watcher session")
         log = self.tmux_log.read_text()
         self.assertIn("task-notifier.sh", log)
+
+    def test_watcher_launch_binds_instance_id_and_clears_unset_dirs(self):
+        # Omitting -e leaves whatever the tmux server's global env carries;
+        # the launcher must always pass -e, never gate it on local emptiness.
+        env = self._env()
+        env.pop("SUTANDO_TASKS_DIR", None)
+        env.pop("SUTANDO_RESULTS_DIR", None)
+        result = subprocess.run(
+            ["/bin/bash", str(self.LAUNCHER)], env=env, cwd=str(self.root),
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        watcher_lines = [ln for ln in self.tmux_log.read_text().splitlines()
+                         if "new-session" in ln and "task-notifier.sh" in ln]
+        self.assertEqual(len(watcher_lines), 1, self.tmux_log.read_text())
+        line = watcher_lines[0]
+        self.assertIn("SUTANDO_INSTANCE_ID=agy-task-notifier", line)
+        self.assertIn("-e SUTANDO_TASKS_DIR=", line,
+                       "TASKS_DIR must be explicitly bound (even empty), never omitted")
+        self.assertIn("-e SUTANDO_RESULTS_DIR=", line,
+                       "RESULTS_DIR must be explicitly bound (even empty), never omitted")
 
     def test_second_invocation_does_not_duplicate_the_watcher(self):
         first = self.run_launcher()
