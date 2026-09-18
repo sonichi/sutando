@@ -48,14 +48,13 @@ def _rows(roster: dict) -> dict:
 
 def bindings(roster: dict) -> dict:
     """The roster's room -> worker bindings in the broker's row shape, so a
-    picker can show which worker a room is pinned to. A binding is a worker id
-    or a one-member list, the two forms the roster accepts; a binding to a
+    picker can show which workers a room is pinned to. The binding value is
+    decoded by the roster's own reader, never destructured here; a binding to a
     retired worker is not advertised, since retired ids occur nowhere."""
     rows = _rows(roster)
     out = {}
     for room, bound in (roster.get("bindings") or {}).items():
-        members = [m for m in (bound if isinstance(bound, list) else [bound])
-                   if isinstance(m, str) and m]
+        members = [m for m in pr.members_of(bound) if isinstance(m, str) and m]
         members = [m for m in members if (rows.get(m) or {}).get("state") != "retired"]
         if members:
             out[str(room)] = {"instance": members[0], "instances": members, "pinned": True}
