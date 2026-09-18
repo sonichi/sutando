@@ -667,6 +667,52 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertTrue(program_invokes(text, NAME))
         self.assertFalse(program_invokes(text.replace("outer\n", "printf ok\n"), NAME))
 
+    def test_a_quoted_or_escaped_brace_is_a_real_command_name_not_a_group_opener(self):
+        """kewei-red-ag2space round 35: `'{'`/`\\{` are Bash attempts to run
+        a program literally named `{` (rc 127) -- shlex resolves both to
+        the identical bare token `{` the group-opener peel could not tell
+        apart from the real reserved word."""
+        self.assertFalse(program_invokes(f"'{{' bash scripts/{NAME}\n", NAME))
+        self.assertFalse(program_invokes(f"\\{{ bash scripts/{NAME}\n", NAME))
+        self.assertTrue(program_invokes(f"{{ bash scripts/{NAME}; }}\n", NAME))
+
+    def test_a_nested_multiline_function_is_gated_by_its_own_reachability(self):
+        """kewei-red-ag2space round 35: `outer` merely DEFINING a nested
+        `inner` (never calling it) must not credit inner's body -- outer
+        being reachable is not the same as inner being called."""
+        text = (f"outer() {{\n  inner() {{\n    bash scripts/{NAME}\n  }}\n}}\nouter\n")
+        self.assertFalse(program_invokes(text, NAME))
+        called = text.replace("  }\n}\nouter\n", "  }\n  inner\n}\nouter\n")
+        self.assertTrue(program_invokes(called, NAME))
+
+    def test_a_real_call_after_a_nested_definition_is_still_in_the_outer_span(self):
+        """kewei-red-ag2space round 35: a nested definition's own close
+        must not be mistaken for the ENCLOSING function's close -- content
+        AFTER the nested def (here, outer's real helper call) has to stay
+        inside outer's tracked span, or an uncalled outer still credits it
+        as unconditional top-level text. Direct Bash: prints only TOP."""
+        text = ("outer() {\n"
+                "  inner() {\n"
+                "    printf never\n"
+                "  }\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace("}\nprintf TOP\n", "}\nouter\nprintf TOP\n"), NAME))
+
+    def test_a_backslash_continued_line_is_not_a_fresh_command_start(self):
+        """kewei-red-ag2space round 35: the continued half of a
+        backslash-newline command is still mid-command, so its `}` is a
+        plain argument, never a line-start reserved word -- confirmed by
+        direct execution (prints only TOP, the helper never runs)."""
+        text = ("discover() {\n"
+                "  printf x \\\n"
+                "    } more\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace("}\nprintf TOP\n", "}\ndiscover\nprintf TOP\n"), NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier

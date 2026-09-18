@@ -88,12 +88,16 @@ def _command_tokens(seg: str) -> list[str]:
     `'!' cmd`, `\\! cmd`, `env ! cmd` and `X=1 ! cmd` all try to RUN a
     program literally named `!` and fail with 127 on both Bash 3.2 and 5.2
     (keweichen round 15) -- shlex already erased the quoting/escaping by the
-    time tokens exist, so this checks the untokenized text first. A leading
-    bare `{` (a command-GROUP opener, e.g. `;{ helper; }`) is the group's
-    own first command's real command word (kewei-red-ag2space round 34
-    follow-up: `{ bash helper` tokenized as calling "{", never "bash")."""
+    time tokens exist, so this checks the untokenized text first. Same rule
+    for a leading bare `{` (a command-GROUP opener, e.g. `;{ helper; }`) --
+    round 34 follow-up: `{ bash helper` tokenized as calling "{", never
+    "bash" -- but round 35, kewei-red-ag2space: a QUOTED/ESCAPED `'{'`/`\\{`
+    is a real Bash attempt to run a program literally named `{` (rc 127),
+    since shlex resolves both to the identical bare token `{` the first
+    fix could not tell apart from the reserved word."""
     stripped = seg.lstrip()
     leading_bang = stripped == "!" or stripped[:2] in ("! ", "!\t")
+    leading_brace = stripped[:1] == "{" and (len(stripped) == 1 or stripped[1] in " \t")
     import shlex
     try:
         toks = shlex.split(seg)
@@ -108,7 +112,7 @@ def _command_tokens(seg: str) -> list[str]:
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
-        elif toks[0] == "{" and len(toks) > 1:
+        elif toks[0] == "{" and leading_brace and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif toks[0] == "timeout" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -336,7 +340,21 @@ _CLOSE_ONLY_RE = re.compile(r"^\s*\}\s*$")
 _CMD_SEP = frozenset(";&|")
 
 
-def _brace_delta(line: str) -> int:
+def _line_continues(line: str) -> bool:
+    """True when `line` ends in a live (unquoted) backslash-newline
+    continuation -- an ODD trailing run of backslashes, since each PAIR
+    is one literal backslash and only a leftover single one escapes the
+    newline (round 35 follow-up, kewei-red-ag2space: the continued half
+    of `printf x \\\\n  } more` is one logical command, so its `}` is a
+    plain argument, never a fresh line's command-start)."""
+    masked = unquoted(line)
+    i = len(masked)
+    while i > 0 and masked[i - 1] == "\\":
+        i -= 1
+    return (len(masked) - i) % 2 == 1
+
+
+def _brace_delta(line: str, at_start: bool = True) -> int:
     """Net `{`/`}` depth change, quote- and `${...}`-aware — a parameter
     expansion's OWN braces (opener, any nested ones, and its closer) never
     open or close a function block, so the whole span is skipped as a unit,
@@ -354,10 +372,23 @@ def _brace_delta(line: str) -> int:
     either side (round 33: `echo hi } more`'s `}` is a plain argument;
     round 34: a compact `};` or `;{` glued to its neighbor with no space
     -- both valid Bash, confirmed by direct execution -- was missing its
-    boundary check and read as non-structural)."""
+    boundary check and read as non-structural). A same-line NESTED function
+    header (`inner() {`) opens unconditionally, never by command-start
+    position -- `NAME ()` is reserved function-definition syntax in Bash,
+    not an ordinary command whose surrounding text can disarm it (round 35
+    follow-up, kewei-red-ag2space: scanning for an OUTER function's own
+    close, the text "inner() " before the nested opener left command-start
+    state disabled with nothing to re-arm it, so the nested `{` went
+    uncounted and the nested function's OWN close was mistaken for the
+    outer's). `at_start` is False when the CALLER knows this line is a
+    backslash-newline continuation of the previous one, so its own start
+    is not a fresh command-start (see `_line_continues`)."""
     masked = unquoted(line)
+    m = _FUNC_START_RE.match(masked) or _FUNC_START_KEYWORD_RE.match(masked)
+    if m:
+        return 1 + _brace_delta(m.group(2))
     delta, i, n = 0, 0, len(masked)
-    at_cmd_start = True  # the start of a physical line is itself command-start
+    at_cmd_start = at_start  # a continuation line does not restart command position
 
     def boundary(pos: int) -> bool:
         return pos < 0 or pos >= n or masked[pos].isspace() or masked[pos] in _CMD_SEP
@@ -426,7 +457,17 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
     ALSO carry body content, same as the single-line form (round 34
     follow-up, kewei-red-ag2space: `name()\\n{ :; helper` closed by a bare
     `}` with no line between vanished entirely -- only a bare `{`-only
-    line was recognized as that form's opener at all)."""
+    line was recognized as that form's opener at all).
+
+    A NESTED definition inside a function's own body gets its own entry
+    too, offset back into this call's coordinates (round 35 follow-up,
+    kewei-red-ag2space: `outer` merely DEFINING `inner` without calling it
+    still credited inner's body, since nothing distinguished it from
+    outer's own unconditionally-kept text) -- reachability then gates it
+    by whether the NESTED name is itself called, exactly like a top-level
+    sibling. The recursive scan skips the enclosing opener's own
+    declaration line when that line also carries body content, or
+    re-feeding it would re-match the SAME definition and recurse forever."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
@@ -451,8 +492,10 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
             i = brace_line + 1
             continue
         j = brace_line + 1
+        cont = _line_continues(rest)
         while j < n and depth > 0:
-            depth += _brace_delta(lines[j])
+            depth += _brace_delta(lines[j], at_start=not cont)
+            cont = _line_continues(lines[j])
             j += 1
         close_line = j - 1
         end = close_line - 1 if _CLOSE_ONLY_RE.match(lines[close_line]) else close_line
@@ -461,6 +504,13 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
         start = brace_line if has_rest else brace_line + 1
         if end >= start:
             out.append((m.group(1), anchor, () if has_rest else sig_lines, start, end))
+            # Nested definitions get their own entry too (see docstring);
+            # skip a same-line opener's own text or it re-matches itself.
+            nested_from = start + 1 if has_rest else start
+            if nested_from <= end:
+                for nname, nanchor, nsig, nstart, nend in _function_bodies("\n".join(lines[nested_from:end + 1])):
+                    out.append((nname, nanchor + nested_from, tuple(s + nested_from for s in nsig),
+                                 nstart + nested_from, nend + nested_from))
         i = j
     return out
 
