@@ -172,9 +172,8 @@ def test_write_task_shell_quotes_channel_id_in_skill_instructions():
         context_cmd = context_line.split("`python3 ", 1)[1].split("`", 1)[0]
         context_args = shlex.split("python3 " + context_cmd)
         assert malicious_chan in context_args
-        # AG2 Space has no NOTIFY step (the broker's status glyph + the 🫡
-        # reaction already cover pickup/working) — CONTEXT-FIRST is the only
-        # step that embeds channel_id in a shell command.
+        # AG2 Space has no NOTIFY step; CONTEXT-FIRST is the only step
+        # embedding channel_id in a shell command.
         assert not any("--channel-id" in ln for ln in body.splitlines())
         print("PASS test_write_task_shell_quotes_channel_id_in_skill_instructions")
 
