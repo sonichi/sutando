@@ -320,6 +320,10 @@ _FUNC_START_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s
 # The `{` on its OWN line -- a valid spelling `_FUNC_START_RE` alone can't
 # see, since it anchors the `{` to the same line as `name()`.
 _FUNC_START_SPLIT_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s*$")
+# The `function` keyword with NO parens at all -- also valid Bash, and
+# distinct from the two forms above (which both require `()`).
+_FUNC_START_KEYWORD_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*\{\s*(.*)$")
+_FUNC_START_KEYWORD_SPLIT_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*$")
 _BRACE_ONLY_RE = re.compile(r"^\s*\{\s*$")
 
 
@@ -328,14 +332,24 @@ def _brace_delta(line: str) -> int:
     expansion's OWN braces (opener, any nested ones, and its closer) never
     open or close a function block, so the whole span is skipped as a unit,
     not just its opener (round 30b, keweichen: `echo ${x}` left the closer
-    uncounted, so its `}` alone closed an unrelated function block early)."""
+    uncounted, so its `}` alone closed an unrelated function block early).
+    A backslash-escaped brace (`\\{`/`\\}`, e.g. `${x:-\\}}`'s literal
+    default) is inert everywhere -- round 33, keweichen: unescaped, that
+    `\\}` read as the expansion's OWN closer, so the REAL closer fell
+    through to the outer counter and closed an unrelated function early."""
     masked = unquoted(line)
     delta, i, n = 0, 0, len(masked)
     while i < n:
         ch = masked[i]
+        if ch == "\\" and i + 1 < n and masked[i + 1] in "{}":
+            i += 2
+            continue
         if ch == "$" and i + 1 < n and masked[i + 1] == "{":
             depth, i = 1, i + 2
             while i < n and depth > 0:
+                if masked[i] == "\\" and i + 1 < n and masked[i + 1] in "{}":
+                    i += 2
+                    continue
                 if masked[i] == "{":
                     depth += 1
                 elif masked[i] == "}":
@@ -351,19 +365,23 @@ def _brace_delta(line: str) -> int:
 
 
 def _function_bodies(text: str) -> list[tuple[str, int, int]]:
-    """(name, first_body_line, last_body_line) for every multi-line
-    `name() { ... }` definition, `{` on the same line OR its own next
-    line — 0-based inclusive indices into `text.split("\\n")`, excluding
-    the opening/closing brace lines themselves. A one-liner
-    (`name() { cmd; }`) has no line to hide."""
+    """(name, first_body_line, last_body_line) for every `name() { ... }`
+    or `function name { ... }` definition (either spelling, `{` on the
+    same line or its own next line) — 0-based inclusive indices into
+    `text.split("\\n")`. Multi-line spans exclude the opening/closing
+    brace lines; a one-liner (`name() { cmd; }`, closed on its own
+    opening line) has no separate line to exclude, so its span is that
+    single line — round 33, keweichen: treating a one-liner as having
+    "no line to hide" left its own line out of every function's `in_body`
+    set entirely, crediting an uncalled one-liner's command as top-level."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
-        m = _FUNC_START_RE.match(lines[i])
+        m = _FUNC_START_RE.match(lines[i]) or _FUNC_START_KEYWORD_RE.match(lines[i])
         if m:
             rest, brace_line = m.group(2), i
         else:
-            m = _FUNC_START_SPLIT_RE.match(lines[i])
+            m = _FUNC_START_SPLIT_RE.match(lines[i]) or _FUNC_START_KEYWORD_SPLIT_RE.match(lines[i])
             if m and i + 1 < n and _BRACE_ONLY_RE.match(lines[i + 1]):
                 rest, brace_line = "", i + 1
             else:
@@ -371,6 +389,7 @@ def _function_bodies(text: str) -> list[tuple[str, int, int]]:
                 continue
         depth = 1 + _brace_delta(rest)
         if depth <= 0:
+            out.append((m.group(1), brace_line, brace_line))
             i = brace_line + 1
             continue
         start = brace_line + 1
@@ -395,7 +414,13 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     anywhere never runs discover.sh (round 30, keweichen — the delegation
     guard credited exactly this shape). Reachability is transitive: a body
     called from an already-reachable function counts too, not just the
-    top-level flow outside every function."""
+    top-level flow outside every function.
+
+    A repeated NAME keeps only its LAST definition live — Bash redefinition
+    is last-wins, so an earlier same-named definition never executes no
+    matter what calls it (round 33, keweichen: tracking reachability by
+    name alone kept BOTH a real helper-calling definition and a later
+    decoy shadow "reachable", crediting the dead first one's call)."""
     lines = text.split("\n")
     funcs = _function_bodies(text)
     if not funcs:
@@ -409,21 +434,26 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     def called_in(name: str, hay: str) -> bool:
         return any(_segment_calls(seg, name) for seg in _segments(hay))
 
-    reachable = {name for name, _, _ in funcs if called_in(name, top_level)}
+    last_by_name = {}
+    for name, start, end in funcs:
+        last_by_name[name] = (start, end)
+
+    reachable = {name for name, (start, end) in last_by_name.items()
+                 if called_in(name, top_level)}
     changed = True
     while changed:
         changed = False
-        for caller, cstart, cend in funcs:
+        for caller, (cstart, cend) in last_by_name.items():
             if caller not in reachable:
                 continue
             body = "\n".join(lines[cstart:cend + 1])
-            for callee, _, _ in funcs:
+            for callee in last_by_name:
                 if callee not in reachable and called_in(callee, body):
                     reachable.add(callee)
                     changed = True
 
     for name, start, end in funcs:
-        if name in reachable:
+        if name in reachable and (start, end) == last_by_name[name]:
             continue
         for k in range(start, end + 1):
             lines[k] = ""

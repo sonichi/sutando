@@ -391,11 +391,16 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertFalse(program_invokes(
             f"inner() {{\n  bash scripts/{NAME}\n}}\nouter() {{\n  inner\n}}\n", NAME))
 
-    def test_a_one_liner_function_has_no_body_lines_to_strip(self):
-        """`name() { cmd; }` closes on its own line -- the new stripper must
-        find no multi-line body there and leave it untouched either way."""
+    def test_a_one_liner_function_is_tracked_as_its_own_single_line_body(self):
+        """round 33, keweichen: `name() { cmd; }` closes on its own line, so
+        the earlier stripper found no separate body line and left this
+        line out of every function's in_body set -- an UNCALLED one-liner's
+        command then read as unconditional top-level code and got credited."""
         from active_code import _function_bodies
-        self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"), [])
+        self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"),
+                          [("discover", 0, 0)])
+        self.assertFalse(program_invokes(
+            f"discover() {{ bash scripts/{NAME}; echo done; }}\nprintf ok\n", NAME))
 
     def test_an_uncalled_function_does_not_hide_an_unrelated_top_level_call(self):
         self.assertTrue(program_invokes(
@@ -426,6 +431,42 @@ class FunctionScopedInvocations(unittest.TestCase):
 
     def test_split_brace_function_keyword_form(self):
         text = f"function discover()\n{{\n  bash scripts/{NAME}\n}}\ndiscover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_bare_function_keyword_with_no_parens_is_recognized(self):
+        """kewei-red-ag2space round 33: `function name { ... }` (no `()` at
+        all) is valid Bash that neither existing FUNC_START regex sees."""
+        text = f"function discover {{\n  bash scripts/{NAME} > files\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_bare_function_keyword_split_brace_is_recognized(self):
+        text = f"function discover\n{{\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_escaped_closing_brace_in_a_default_value_does_not_close_early(self):
+        """kewei-red-ag2space round 33: `${x:-\\}}`'s escaped `}` is a
+        LITERAL default-value character, not the expansion's own closer --
+        misreading it let the real closer fall through to the outer counter
+        and close the function block one line early."""
+        text = "discover() {\n  echo ${x:-\\}}\n  bash scripts/" + NAME + "\n}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_shadowed_definition_keeps_only_the_last_ones_reachability(self):
+        """kewei-red-ag2space round 33: Bash redefinition is last-wins -- an
+        earlier same-named definition never executes, whatever calls the
+        name. Tracking reachability by name alone kept a dead first
+        definition's helper call "reachable" once the decoy shadow ran."""
+        text = (f"discover() {{\n  bash scripts/{NAME}\n}}\n"
+                f"discover() {{\n  printf '%s\\n' tests/only.test.py\n}}\ndiscover\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_shadowed_definition_the_last_ones_own_call_still_credits(self):
+        """Control for the above: when the LAST definition is the one that
+        calls the helper, it must still be credited once invoked."""
+        text = (f"discover() {{\n  printf '%s\\n' tests/only.test.py\n}}\n"
+                f"discover() {{\n  bash scripts/{NAME}\n}}\ndiscover\n")
         self.assertTrue(program_invokes(text, NAME))
 
 
