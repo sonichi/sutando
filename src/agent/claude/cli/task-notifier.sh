@@ -207,6 +207,16 @@ capture_tail() {
   capture_raw | sed '/^[[:space:]]*$/d'
 }
 
+# One read serves both baseline checks: the escapes (-e) tell the CLI's dim ghost
+# text from a typed draft, and the same capture stripped of them is the plain text.
+capture_raw_esc() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
+}
+
+strip_sgr() {
+  LC_ALL=C sed $'s#\x1b\\[[0-9;?]*[ -/]*[@-~]##g'
+}
+
 # Delegates to core-input-watch.py's _composer_text (dewrapped, footer/gate
 # lines stripped) so exact-equality never sees the status bar or a stale marker.
 composer_text() {
@@ -271,13 +281,14 @@ deliver_prompt() {
     # ONE snapshot is the last read before the paste and is judged whole:
     # positively idle-ready (a gate or a turn fails it) and composer empty
     # (re-checked every retype). Any later read would be a new race.
-    baseline_raw="$(capture_raw)"
+    baseline_esc="$(capture_raw_esc)"
+    baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
     baseline="$(printf '%s\n' "$baseline_raw" | sed '/^[[:space:]]*$/d')"
     if ! pane_text_is_idle_ready "$baseline_raw"; then
       log_notifier "core is not idle-ready at the paste for $filename (busy or a gate); leaving it queued (failing closed)"
       return 1
     fi
-    if ! pane_text_composer_is_empty "$baseline_raw"; then
+    if ! pane_text_composer_is_empty "$baseline_esc"; then
       warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1

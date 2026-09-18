@@ -90,6 +90,8 @@ class FakeTmuxHarness(unittest.TestCase):
             d.mkdir(parents=True)
         self.pane_file = self.root / "pane.txt"
         self.pane_file.write_text(IDLE_FOOTER + "\n")
+        # Non-empty = the CLI is showing this ghost text in an empty composer.
+        self.ghost_file = self.root / "ghost.txt"
         self.status_file = self.state_dir / "core-status.json"
         self.write_status("idle")
         self.session_flag = self.root / "session.flag"
@@ -200,15 +202,27 @@ case "$cmd" in
     if [ -f "{self.gate_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.gate_on_capture_flag}")" ]; then
       rm -f "{self.gate_on_capture_flag}"; printf '%s\\n' "{TRUST_GATE_PANE}" > "$PANE"
     fi
-    scrollback=0
+    scrollback=0; esc=0
     for a in "$@"; do
       [ "$a" = -S ] && scrollback=1
+      [ "$a" = -e ] && esc=1
     done
     if [ "$scrollback" = 1 ]; then
-      tail -n $(( {self.PANE_HEIGHT} + $(history_size) )) "$PANE" 2>/dev/null
+      out="$(tail -n $(( {self.PANE_HEIGHT} + $(history_size) )) "$PANE" 2>/dev/null)"
     else
-      tail -n {self.PANE_HEIGHT} "$PANE" 2>/dev/null
+      out="$(tail -n {self.PANE_HEIGHT} "$PANE" 2>/dev/null)"
     fi
+    # Ghost text renders only into an EMPTY composer and vanishes on the first
+    # typed character; a plain capture loses its dimming, -e keeps it.
+    if [ -s "{self.ghost_file}" ]; then
+      g="$(cat "{self.ghost_file}")"
+      if [ "$esc" = 1 ]; then
+        out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ $(printf '\\033')[2m${{g}}$(printf '\\033')[0m/")"
+      else
+        out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
+      fi
+    fi
+    printf '%s\\n' "$out"
     exit 0
     ;;
   show-options)
@@ -521,6 +535,30 @@ class EventDispatchTests(FakeTmuxHarness):
                           "an unsent owner draft in the composer must never be typed over")
         self.assertFalse((self.results_dir / "task-m.txt").exists(),
                           "a task blocked on a draft composer must stay queued, not consumed")
+
+    def test_ghost_text_suggestion_is_not_a_draft(self):
+        # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
+        # capture shows it as typed, and every re-pick would stall on it.
+        self.ghost_file.write_text("yes")
+        self.write_task("task-g.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-g.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-g.txt")
+        t.join()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("composer not empty", result.stderr,
+                         "ghost text must not read as an unsent draft")
+        self.assertIn("TYPE", self.sendkeys_log_text(),
+                      "the paste must proceed over ghost text")
+        self.assertIn("ENTER", self.sendkeys_log_text(),
+                      "the prompt must stage and submit once the ghost text is gone")
 
     def test_pane_change_after_enter_blocks_a_second_press(self):
         # After the first C-m, the pane changing to something other than
