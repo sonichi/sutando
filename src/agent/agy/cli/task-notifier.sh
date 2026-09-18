@@ -6,13 +6,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 TMUX_SOCKET="${SUTANDO_AGY_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}}"
 SESSION="${SUTANDO_AGY_TMUX_SESSION:-sutando-agy}"
-# agy is not selected in place of the running Claude/Codex core (see
-# src/agent/agy/README.md) — its watcher runs ALONGSIDE the canonical one, not
-# instead of it. Defaulting to the shared workspace/tasks + results dirs would
-# put two independent watchers on the same queue, so every task (including an
-# irreversible one) gets processed twice. Default to a separately-owned agy
-# inbox instead; an explicit SUTANDO_TASKS_DIR/SUTANDO_RESULTS_DIR override
-# (as every test here uses) still works exactly as before.
+# agy's watcher runs ALONGSIDE the canonical one, not instead of it — sharing
+# workspace/tasks+results would let two watchers double-process every task.
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
   TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
 else
@@ -27,6 +22,9 @@ elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   RESULTS_DIR="$(dirname "$TASKS_DIR")/results-agy"
 fi
+# agy publishes its result HERE (not the watcher, which only owns TASKS_DIR),
+# so an absent results dir must fail at startup, not deep inside a dispatch.
+mkdir -p "$RESULTS_DIR" || { echo "agy-task-notifier: cannot create results dir $RESULTS_DIR" >&2; exit 1; }
 POLL_INTERVAL="${SUTANDO_AGY_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_AGY_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -73,8 +71,7 @@ log_notifier() {
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 
 # Completion-detection and priority-selection are owned by
-# src/delivery/task_dispatch.py — see its header for why the bash copy this
-# used to be was a defect, not just a duplicate (sonichi#4303 review).
+# src/delivery/task_dispatch.py, not duplicated here.
 has_result() {
   "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$1"
 }
@@ -191,10 +188,10 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
-# RESULTS_DIR may be DERIVED, never an env var itself — bind it + a distinct
-# instance id explicitly, so the watcher agrees and its sentinel can't collide.
+# Bind RESULTS_DIR (never an env var itself) and FORCE the instance id —
+# never fall back on it, or an inherited tmux-global value collides here.
 export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
-export SUTANDO_INSTANCE_ID="${SUTANDO_INSTANCE_ID:-agy-task-notifier}"
+export SUTANDO_INSTANCE_ID="agy-task-notifier"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 "$NOTIFIER_PY" -c \
