@@ -364,6 +364,8 @@ export interface VoiceTransportEvents {
    * 'err' | 'warn' | undefined). Off unless the surface supplies it.
    */
   onDebug?(msg: string, kind?: string): void;
+  /** The agent's answer to a `session.context` frame: bound, or refused with a reason. */
+  onSessionContextAck?(ack: SessionContextAckFrame): void;
   /** Server transcript frame. `partial=false` means finalized. */
   onTranscript?(role: string, text: string, partial: boolean): void;
   /** Assistant turn ended normally. Playback is NOT flushed — the final audio
@@ -571,6 +573,36 @@ export interface SessionContextFrame {
   room_id: string | null;
   room_name: string | null;
   surface: 'room' | 'dm';
+}
+
+/** Agent → client answer to a `session.context` frame: whether the room was
+ *  bound. The agent binds a room only on the gateway bridge's membership
+ *  verdict (owner and agent both joined), so a client that named a room it may
+ *  not use hears `bound: false` and shows the DM. */
+export const SESSION_CONTEXT_ACK_TYPE = 'session.context.ack';
+
+export interface SessionContextAckFrame {
+  type: typeof SESSION_CONTEXT_ACK_TYPE;
+  version: 1;
+  /** The room the frame named; null for a DM frame. */
+  room_id: string | null;
+  /** True when tasks and results now follow `room_id`. */
+  bound: boolean;
+  /** 'dm' | 'room' | 'refused' (then `reason` says why). */
+  surface: 'dm' | 'room' | 'refused';
+  reason?: string;
+}
+
+export function buildSessionContextAckFrame(roomId: string | null, bound: boolean, reason?: string): SessionContextAckFrame {
+  const frame: SessionContextAckFrame = {
+    type: SESSION_CONTEXT_ACK_TYPE,
+    version: 1,
+    room_id: roomId,
+    bound: bound && !!roomId,
+    surface: !roomId ? 'dm' : bound ? 'room' : 'refused',
+  };
+  if (reason) frame.reason = reason;
+  return frame;
 }
 
 /** Pure: the frame for a room context, or the DM shape when there is none. */
@@ -1777,6 +1809,8 @@ export class VoiceTransport {
       if (this.outputRate !== prevOutputRate) this.retirePlaybackCtx();
       this.ev.onSessionConfig?.(this.inputRate, this.outputRate);
       this.sendSessionContextOnce();
+    } else if (msg?.type === SESSION_CONTEXT_ACK_TYPE) {
+      this.ev.onSessionContextAck?.(msg as SessionContextAckFrame);
     } else if (msg?.type === 'transcript') {
       this.ev.onTranscript?.(msg.role, msg.text, msg.partial !== false);
     } else if (msg?.type === 'turn.end') {

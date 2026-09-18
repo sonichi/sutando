@@ -60,8 +60,9 @@ task: hello world
 
 // Room-bound voice (2026-09): a session docked in a room addresses the task to
 // that room, so `channel_id` carries the room id and no longer says
-// `local-voice`. The verdict keys on `source: voice` / `media_form:
-// live_stream`; the literal stays only for files archived before rooms.
+// `local-voice`. The verdict keys on `source: voice`; the literal stays only
+// for files archived before rooms. `media_form: live_stream` is NOT a voice
+// key: the phone skill stamps it on `source: phone` tasks.
 const VOICE_BODY_ROOM = `id: task-isvoice-test-room-aaa
 timestamp: 2026-09-18T00:00:00Z
 source: voice
@@ -140,6 +141,12 @@ describe('_isVoiceTask — archive-path coverage', () => {
 		const id = 'task-isvoice-test-room-aaa';
 		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_ROOM);
 		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('returns false for a phone task: media_form: live_stream alone is not voice', () => {
+		const id = 'task-isvoice-test-phone-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), `id: ${id}\ntimestamp: 2026-09-18T00:00:00Z\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: CA1\naccess_tier: owner\ntask: hello\n`);
+		assert.equal(_isVoiceTask(id), false);
 	});
 
 	it('keeps the legacy channel_id: local-voice literal for archived files', () => {
