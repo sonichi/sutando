@@ -528,6 +528,16 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md): an
+# mtime refreshed by a CHILD, so it stops the instant this watcher does.
+WATCHER_BEAT_PID=""
+__beat_script="$__REPO_ROOT/skills/worker-pool/scripts/pool_beat.py"
+if [ -f "$__beat_script" ]; then
+  # Optional: a host without the pool skill keeps a watcher that beats nothing.
+  "$SUTANDO_PY_BIN" "$__beat_script" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -726,6 +736,9 @@ cleanup() {
   sentinel_release_if_owner "$PID_FILE" "$$"
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
+  fi
+  if [ -n "${WATCHER_BEAT_PID:-}" ]; then
+    kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
   if declare -F fallback_outstanding_handlers >/dev/null; then
     fallback_outstanding_handlers
