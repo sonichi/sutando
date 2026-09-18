@@ -291,7 +291,24 @@ class AssignmentAttribution(unittest.TestCase):
         tid = "task-3344556677889903"
         self._sentinel(W1, tid)
         self._sentinel(W2, tid)
-        self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
+        # The whole pair: an empty id alone is what zero claimants returns too,
+        # so asserting [0] lets the ambiguous case pass as an ordinary core result.
+        self.assertEqual(self.mod._delivery_recipient(tid), ("", True))
+
+    def test_fan_out_is_refused_through_attribution(self):
+        """The safety property, at the caller that decides whether to send: two
+        sentinels and no assignment record must REFUSE, not read as core."""
+        tid = "task-3344556677889904"
+        self._sentinel(W1, tid)
+        self._sentinel(W2, tid)
+        self.assertEqual(self.mod._attribution(tid), ("", True))
+
+    def test_zero_claimants_still_reads_as_core(self):
+        """The control the refusal must not swallow: no sentinel at all is an
+        ordinary core result, and stays (\"\", False)."""
+        tid = "task-3344556677889905"
+        self.assertEqual(self.mod._delivery_recipient(tid), ("", False))
+        self.assertEqual(self.mod._attribution(tid), ("", False))
 
     # --- the core is a recipient, and that is not an anomaly -------------
 

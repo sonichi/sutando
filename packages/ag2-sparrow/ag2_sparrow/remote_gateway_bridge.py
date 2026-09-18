@@ -4025,7 +4025,17 @@ def _delivery_recipient(task_id: str) -> tuple[str, bool]:
                 return "", False
             claimants.add(name)
             break
-    return (claimants.pop() if len(claimants) == 1 else ""), False
+    if len(claimants) == 1:
+        return claimants.pop(), False
+    if claimants:
+        # Sentinels under several recipients prove a worker owned this task
+        # without saying which, which is the refusal condition, not its absence.
+        _log(f"attribution: {task_id} has delivery sentinels under "
+             f"{len(claimants)} recipients ({', '.join(sorted(claimants))}) - "
+             f"ownership is AMBIGUOUS, so refusing rather than relaying a "
+             f"worker's reply as the core's own.")
+        return "", True
+    return "", False
 
 
 def _attribution(task_id: str) -> tuple[str, bool]:
