@@ -19,8 +19,14 @@ removes something — confirm with the owner before re-running with --yes.
 
 Cloud contract (agent-universe): install is POST /api/skills/{uuid}/install and
 takes the UUID ONLY — a slug is resolved through the station catalog first.
-Re-installing an owned item never charges again. A newly activated cloud tool
-only reaches the core after a core restart (MCP tools are listed at startup).
+Re-installing an owned item never charges again. A newly activated cloud tool is
+usable at once through the gateway's station_find / station_call meta-tools; a
+core restart is needed only when the desktop's station stamp
+(<workspace>/state/station-core-stamp.json) says the running core started
+without the sutando-station server or for another cloud user. Metered cloud
+tools (per call, per unit, per result) exit 3 at plan time so the price is
+confirmed first. Connectors are resolved by exact slug through
+/api/station/catalog?kind=connector&q= and connected with the connect-apps skill.
 """
 
 from __future__ import annotations
@@ -42,12 +48,14 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import cloud_auth  # noqa: E402
 import skill_install  # noqa: E402
 
+from station_stamp import read_station_stamp  # noqa: E402
 from util_paths import claude_home_path  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_CONFIRM = 0, 1, 2, 3
 TIER_RANK = {"free": 0, "plus": 1, "pro": 2, "max": 3}
 BUNDLE_TIMEOUT_S = 60
 STATION_MCP_SERVER = "sutando-station"
+METERED_MODELS = ("per_call", "per_unit", "per_result")
 RESTART_HINT = (
     "New cloud tools are active on your account, but I can only use them after an engine "
     "restart: open Agent settings (the bot icon, bottom left), scroll down to Runtime, and "
@@ -76,6 +84,7 @@ class Context:
         agent_id: str | None,
         config_dir: Path | None = None,
         insecure_hosts: frozenset[str] = frozenset(),
+        workspace: Path | None = None,
     ) -> None:
         self.base = base
         self.token = token
@@ -83,8 +92,9 @@ class Context:
         self.agent_id = agent_id
         self.config_dir = config_dir
         self.insecure_hosts = insecure_hosts
+        self.workspace = workspace
         self._catalog: list[dict] | None = None
-        self._featured_connectors: list[dict] = []
+        self._me: dict | None = None
 
     def http(self, method: str, path: str, body: Any = None) -> Any:
         return cloud_auth.cloud_request(
@@ -110,13 +120,17 @@ class Context:
         if self._catalog is None:
             data = self.http("GET", "/api/station/catalog?kind=all") or {}
             self._catalog = [i for i in data.get("items") or [] if isinstance(i, dict)]
-            self._featured_connectors = [
-                i for i in data.get("featuredConnectors") or [] if isinstance(i, dict)
-            ]
         return self._catalog
 
+    def connectors(self, query: str) -> list[dict]:
+        q = urllib.parse.quote(query)
+        data = self.http("GET", f"/api/station/catalog?kind=connector&limit=100&q={q}") or {}
+        return [i for i in data.get("items") or [] if isinstance(i, dict) and i.get("kind") in (None, "connector")]
+
     def me(self) -> dict:
-        return self.http("GET", "/api/me") or {}
+        if self._me is None:
+            self._me = self.http("GET", "/api/me") or {}
+        return self._me
 
     def inventory(self) -> dict:
         return self.http("GET", "/api/me/inventory") or {}
@@ -130,7 +144,10 @@ def build_context(args: argparse.Namespace) -> Context:
             "Marketplace sign-in), then ask again."
         )
     dest = Path(args.dest_root).expanduser().resolve() if args.dest_root else claude_home_path("skills")
-    return Context(base or cloud_auth.DEFAULT_CLOUD_ORIGIN, token, dest, _agent_id(), claude_home_path())
+    return Context(
+        base or cloud_auth.DEFAULT_CLOUD_ORIGIN, token, dest, _agent_id(), claude_home_path(),
+        workspace=_workspace(),
+    )
 
 
 def _workspace() -> Path:
@@ -169,14 +186,31 @@ def credits_for(item: dict) -> int:
     return 0
 
 
+def _credits(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def price_label(item: dict) -> str:
     price = item.get("price") or {}
-    model, credits = price.get("model"), price.get("credits") or 0
+    model, credits = price.get("model"), _credits(price.get("credits"))
     if model == "one_time" and credits:
-        return f"{credits} credits once"
-    if model in ("per_call", "per_unit") and credits:
-        return f"{credits} credits per {price.get('unitLabel') or 'call'}"
+        return f"{credits:g} credits once"
+    if model in METERED_MODELS and credits:
+        unit = price.get("unitLabel") or ("result" if model == "per_result" else "call")
+        return f"{credits:g} credits per {unit}"
+    if model == "per_result":
+        return "charged per result"
     return "free"
+
+
+def is_metered(item: dict) -> bool:
+    """A cloud tool that charges per use: confirm its price with the owner before relying on it."""
+    price = item.get("price") or {}
+    model = price.get("model")
+    return model == "per_result" or (model in ("per_call", "per_unit") and _credits(price.get("credits")) > 0)
 
 
 def tier_ok(required: str | None, plan: str | None) -> bool:
@@ -236,9 +270,17 @@ def emit(args: argparse.Namespace, payload: dict, text: str) -> None:
 
 def cmd_find(ctx: Context, args: argparse.Namespace) -> int:
     kind = args.kind or "all"
-    q = urllib.parse.quote(" ".join(args.query))
-    data = ctx.http("GET", f"/api/station/catalog?kind={kind}&q={q}") or {}
-    items = [i for i in data.get("items") or [] if isinstance(i, dict) and i.get("kind") != "connector"]
+    query = " ".join(args.query)
+    items: list[dict] = []
+    if kind != "connector":
+        q = urllib.parse.quote(query)
+        data = ctx.http("GET", f"/api/station/catalog?kind={kind}&q={q}") or {}
+        items = [i for i in data.get("items") or [] if isinstance(i, dict) and i.get("kind") != "connector"]
+    if kind in ("all", "connector"):
+        connectors = ctx.connectors(query)
+        if kind == "all":
+            connectors = [c for c in connectors if _slug_key(c.get("slug")) == _slug_key(query)]
+        items += [{**c, "kind": "connector"} for c in connectors]
     rows = [
         {
             "slug": i.get("slug"),
@@ -253,10 +295,12 @@ def cmd_find(ctx: Context, args: argparse.Namespace) -> int:
     ]
     lines = [f"{len(rows)} result(s)"] + [
         f"- {r['slug']} [{r['kind']}] {r['price']}, tier {r['tier']}"
-        + (" — owned" if r["owned"] else "")
+        + ((" — connected" if r["kind"] == "connector" else " — owned") if r["owned"] else "")
         + (f"\n    {r['description']}" if r["description"] else "")
         for r in rows
     ]
+    if any(r["kind"] == "connector" for r in rows):
+        lines.append("Connectors are connected from chat with the connect-apps skill.")
     emit(args, {"results": rows}, "\n".join(lines))
     return EXIT_OK
 
@@ -264,16 +308,20 @@ def cmd_find(ctx: Context, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- install
 
 
+def _slug_key(value: Any) -> str:
+    return "".join(str(value or "").lower().split())
+
+
 def resolve(ctx: Context, slug: str) -> dict:
-    """Catalog row for a slug, or a {'error': ...} row. Connectors can't be
-    installed from here (they need a browser OAuth)."""
+    """Catalog row for a slug, or a {'error': ...} row. A connector is matched by
+    exact slug; it is connected from chat (connect-apps), never installed here."""
     slug = slug.strip().lower()
     for item in ctx.catalog():
         if (item.get("slug") or "").lower() == slug:
             return item
-    for conn in ctx._featured_connectors:
-        if (conn.get("slug") or conn.get("id") or "").lower() == slug:
-            return {"slug": slug, "name": conn.get("name"), "kind": "connector"}
+    for conn in ctx.connectors(slug):
+        if _slug_key(conn.get("slug")) == _slug_key(slug):
+            return {"slug": conn.get("slug"), "name": conn.get("name"), "kind": "connector"}
     return {"slug": slug, "error": "not_found"}
 
 
@@ -293,7 +341,7 @@ def build_plan(ctx: Context, slugs: list[str]) -> dict:
         if row.get("error"):
             entry.update(action="skip", reason="not found in the marketplace — check the slug with `find`")
         elif row.get("kind") == "connector":
-            entry.update(action="skip", reason="connector — connect it from the Marketplace (needs a browser sign-in)")
+            entry.update(action="skip", reason="connector — connect it from chat with the connect-apps skill (the owner taps Connect on the card)")
         elif row.get("comingSoon"):
             entry.update(action="skip", reason="coming soon — not installable yet")
         elif not tier_ok(row.get("tierRequired"), plan_name):
@@ -305,6 +353,7 @@ def build_plan(ctx: Context, slugs: list[str]) -> dict:
             entry["credits"] = 0 if owned else credits_for(row)
             if row.get("kind") == "cloud_tool":
                 entry["action"] = "already_active" if owned else "activate"
+                entry["metered"] = is_metered(row)
             else:
                 state = local_state(ctx.dest_root, slug)
                 if state == "bundled":
@@ -322,6 +371,7 @@ def build_plan(ctx: Context, slugs: list[str]) -> dict:
         "wallet_credits": wallet,
         "total_credits": total,
         "insufficient_credits": isinstance(wallet, int) and total > wallet,
+        "metered": [i["slug"] for i in items if i.get("action") == "activate" and i.get("metered")],
         "items": items,
     }
 
@@ -350,6 +400,9 @@ def render_plan(plan: dict) -> str:
     )
     if plan["insufficient_credits"]:
         lines.append("Not enough credits for everything — paid items will fail until you top up.")
+    for i in plan["items"]:
+        if i["action"] == "activate" and i.get("metered"):
+            lines.append(f"{i['slug']} charges per use: {i['price']}.")
     return "\n".join(lines)
 
 
@@ -399,7 +452,7 @@ def run_install(ctx: Context, args: argparse.Namespace, slugs: list[str]) -> int
     plan = build_plan(ctx, slugs)
     actionable = [i for i in plan["items"] if i["action"] in ("install", "download", "activate")]
     if not args.yes:
-        needs_confirm = plan["total_credits"] > 0
+        needs_confirm = plan["total_credits"] > 0 or bool(plan["metered"])
         hint = (
             "Spends credits — confirm with the owner, then re-run with --yes."
             if needs_confirm
@@ -416,23 +469,37 @@ def run_install(ctx: Context, args: argparse.Namespace, slugs: list[str]) -> int
             results.append({"slug": item["slug"], "status": "skipped", "reason": item.get("reason")})
         else:
             results.append({"slug": item["slug"], "status": item["action"]})
-    return report_results(args, results)
+    return report_results(args, results, ctx)
 
 
-def report_results(args: argparse.Namespace, results: list[dict]) -> int:
+def report_results(args: argparse.Namespace, results: list[dict], ctx: Context) -> int:
+    newly_active = any(r.get("restart") for r in results)
+    runtime = station_runtime(ctx) if newly_active else None
     summary = {
         "installed": [r["slug"] for r in results if r["status"] == "installed"],
         "activated": [r["slug"] for r in results if r["status"] == "activated"],
         "already": [r["slug"] for r in results if r["status"] in ("already_active", "already_installed")],
         "skipped": [{"slug": r["slug"], "reason": r.get("reason")} for r in results if r["status"] == "skipped"],
         "failed": [{"slug": r["slug"], "reason": r.get("reason")} for r in results if r["status"] == "failed"],
-        "restart_required": any(r.get("restart") for r in results),
+        "restart_required": bool(newly_active and (runtime is None or runtime["restart_required"])),
     }
+    usable_now = bool(runtime and runtime["core_loaded"] and not runtime["restart_required"])
+    summary["usable_now"] = summary["activated"] if usable_now else []
+    # Contract D: once the desktop writes the station entry the core didn't load, it needs a restart.
+    summary["restart_after_sign_in"] = bool(
+        runtime and not runtime["core_loaded"] and not runtime["on_disk"] and not runtime["restart_required"]
+    )
     lines = []
     if summary["installed"]:
         lines.append("Installed (usable now, no restart): " + ", ".join(summary["installed"]))
     if summary["activated"]:
-        lines.append("Activated cloud tools: " + ", ".join(summary["activated"]))
+        label = "Activated cloud tools (usable now through station_call): " if usable_now else "Activated cloud tools: "
+        lines.append(label + ", ".join(summary["activated"]))
+    if summary["restart_after_sign_in"]:
+        lines.append(
+            "The desktop app hasn't connected the engine to AG2 Cloud yet. Once it has, the engine needs "
+            "one restart to reach these tools; run `status` to re-check."
+        )
     if summary["already"]:
         lines.append("Already set up: " + ", ".join(summary["already"]))
     for s in summary["skipped"]:
@@ -509,6 +576,30 @@ def station_mcp_registered(ctx: Context) -> bool | None:
         return False
 
 
+def station_runtime(ctx: Context) -> dict | None:
+    """Whether a restart would change what the running core can reach, from the
+    station stamp: (on_disk and not core_loaded) or user_changed. None without a stamp."""
+    stamp = read_station_stamp(ctx.workspace)
+    if stamp is None:
+        return None
+    on_disk = station_mcp_registered(ctx) is not False
+    core_loaded = stamp.get("has_station_entry") is True
+    stamped_user = stamp.get("cloud_user_id") or None
+    current_user = None
+    if stamped_user:
+        try:
+            current_user = ctx.me().get("id") or None
+        except cloud_auth.CloudError:
+            current_user = None
+    user_changed = bool(stamped_user and current_user and stamped_user != current_user)
+    return {
+        "on_disk": on_disk,
+        "core_loaded": core_loaded,
+        "user_changed": user_changed,
+        "restart_required": (on_disk and not core_loaded) or user_changed,
+    }
+
+
 def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     st = collect_status(ctx)
     me = ctx.me()
@@ -532,7 +623,12 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     pending = [s for s in st["skills"] if s["status"] in ("missing", "outdated") and not s.get("assigned_to_other_agents")]
     if pending:
         lines.append(f"{len(pending)} skill(s) need updating — run `update --yes` (no charge).")
-    if st["cloud_tools"] and st["station_mcp_registered"] is False:
+    runtime = station_runtime(ctx) if st["cloud_tools"] else None
+    st["station_runtime"] = runtime
+    if runtime is not None:
+        if runtime["restart_required"]:
+            lines.append("Cloud tools aren't reachable from the running engine — " + RESTART_HINT)
+    elif st["cloud_tools"] and st["station_mcp_registered"] is False:
         lines.append("Cloud tools aren't wired into the core yet — " + RESTART_HINT)
     emit(args, st, "\n".join(lines))
     return EXIT_OK
@@ -565,7 +661,7 @@ def cmd_update(ctx: Context, args: argparse.Namespace) -> int:
             continue
         item = {"slug": s["slug"], "id": row["id"], "kind": row.get("kind") or "skill"}
         results.append(install_item(ctx, item, plan_name))
-    return report_results(args, results)
+    return report_results(args, results, ctx)
 
 
 # --------------------------------------------------------------------------- uninstall
@@ -604,7 +700,7 @@ def cmd_uninstall(ctx: Context, args: argparse.Namespace) -> int:
             removed_local = skill_install.remove_skill(slug, ctx.dest_root)
     text = f"Removed {slug} from your account" + (" and this machine." if removed_local else ".")
     if owned["kind"] == "cloud_tool":
-        text += " Its tools disappear from the core after the next restart."
+        text += " Its tools stop working now; a tool entry the running engine still lists goes away at its next restart."
     emit(args, {"slug": slug, "status": "uninstalled", "removed_local": removed_local}, text)
     return EXIT_OK
 
@@ -619,7 +715,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("find")
     f.add_argument("query", nargs="+")
-    f.add_argument("--kind", choices=["skill", "cloud_tool"])
+    f.add_argument("--kind", choices=["skill", "cloud_tool", "connector"])
     sub.add_parser("status")
     i = sub.add_parser("install")
     i.add_argument("slugs", nargs="+")

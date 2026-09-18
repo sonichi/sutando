@@ -107,14 +107,21 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
                         "the bytes must survive somewhere in the live queue")
 
     def test_quarantine_does_not_clobber_an_earlier_quarantine(self) -> None:
-        self.tasks_dir.mkdir()
-        os.chmod(self.tasks_dir, 0o500)
-        self.addCleanup(os.chmod, self.tasks_dir, 0o700)
         (self.live / "task-z.txt.archive-failed").write_text("FIRST")
         src = self.live / "task-z.txt"
         src.write_text("SECOND")
 
-        self.assertTrue(self._archive(src, "task-z"))
+        real_move = _task_archive._move_without_clobbering
+
+        def fail_primary_move(source, destination):
+            if Path(destination).parent == self.tasks_dir / self.month:
+                raise PermissionError("archive unavailable")
+            return real_move(source, destination)
+
+        with mock.patch.object(
+                _task_archive, "_move_without_clobbering",
+                side_effect=fail_primary_move):
+            self.assertTrue(self._archive(src, "task-z"))
         self.assertEqual((self.live / "task-z.txt.archive-failed").read_text(), "FIRST")
         self.assertEqual((self.live / "task-z.txt.archive-failed.1").read_text(), "SECOND")
         self.assertFalse(src.exists())

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # helpers live in the core; repo root is parents[3] from this directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
+import pool_attribution as pa  # noqa: E402
 import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
@@ -68,6 +69,10 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
                              os.O_CREAT | os.O_EXCL))
         except FileExistsError:
             return "already"
+        # Under the SAME lock as the sentinel: attribution and delivery are one
+        # fact. Recording earlier attributed refusals that never delivered.
+        if recipient != pr.CORE:
+            pa.record(workspace, task_id, recipient)
     return "delivered"
 
 
@@ -87,7 +92,7 @@ def route(workspace, task: dict, roster=None) -> dict:
         raise RouterRefused("task has no id")
 
     source = task.get("channel_id") or task.get("source") or ""
-    targets = pr.targets_for(r, source, task.get("requested_worker"))
+    targets = pr.targets_for(r, source, pr.requested_worker_of(task))
 
     # A name not on the roster is not a worker: the core takes it. The core is
     # a recipient, not a fallback, and no OTHER worker ever gets the task.
