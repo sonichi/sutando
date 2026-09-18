@@ -598,7 +598,8 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
         _pop_pending_reply(task_id)
         raise
 
-# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# Per-task NUDGE timer, NOT task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (which
+# abandons a task at its deadline; this keeps waiting, hence still 10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
 # loops on the API error), no result file is ever written and the Slack user
 # gets silence. After this many seconds we post a one-time "still working /
