@@ -116,6 +116,8 @@ class FakeTmuxHarness(unittest.TestCase):
         self.gate_on_capture_flag = self.root / "gate-on-capture.flag"
         # Holds a row of owner text that lands under our paste (consumed once).
         self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
+        # The core pane is gone (its window may live on with a replacement).
+        self.pane_gone_flag = self.root / "pane-gone.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -220,13 +222,15 @@ case "$cmd" in
     case "$*" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
+      *pane_id*) [ -f "{self.pane_gone_flag}" ] && exit 1; echo "%1" ;;
       *) echo "" ;;
     esac
     exit 0
     ;;
   send-keys)
-    # args: -t SESSION[:0] [-l -- TEXT | C-m]
-    shift 2  # -t SESSION
+    # args: -t TARGET [-l -- TEXT | C-m]; the target is recorded so a test can pin it
+    printf 'TARGET %s\\n' "$2" >> "{self.sendkeys_log}"
+    shift 2  # -t TARGET
     if [ "${{1:-}}" = -l ]; then
       shift 2  # -l --
       text="$1"
@@ -622,6 +626,49 @@ class EventDispatchTests(FakeTmuxHarness):
         result = self.run_event("task-g.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "")
+
+
+class TargetTests(FakeTmuxHarness):
+    """Every capture and keystroke goes to the declared target, and a vanished
+    pane ends the wait at once rather than at the ready timeout."""
+
+    def _deliver(self, env):
+        self.write_task("task-t.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-t.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish); t.start()
+        result = self.run_event("task-t.txt", env_extra=env)
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_notifier_addresses_the_declared_window(self):
+        self._deliver({"SUTANDO_TMUX_WINDOW": "3"})
+        log = self.sendkeys_log_text()
+        self.assertIn("TARGET sutando-core-test:3", log)
+        self.assertNotIn("TARGET sutando-core-test:0", log, "a keystroke went to window 0")
+
+    def test_the_notifier_addresses_the_declared_pane_over_the_window(self):
+        self._deliver({"SUTANDO_TMUX_WINDOW": "3", "SUTANDO_TMUX_PANE": "%7"})
+        log = self.sendkeys_log_text()
+        self.assertIn("TARGET %7", log)
+        self.assertNotIn("TARGET sutando-core-test", log, "a keystroke went to a window instead of the pane")
+
+    def test_a_vanished_pane_ends_the_wait_at_once(self):
+        # The session (and even the window) may live on; the pane is what matters.
+        self.pane_gone_flag.write_text("1")
+        self.pane_file.write_text(BUSY_FOOTER + "\n")
+        self.write_task("task-gone.txt")
+        started = time.time()
+        result = self.run_event("task-gone.txt", env_extra={"SUTANDO_TMUX_PANE": "%7"}, timeout=8)
+        elapsed = time.time() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertLess(elapsed, 3, f"waited {elapsed:.1f}s for a pane that no longer exists")
 
 
 class TallComposerScrollbackTests(FakeTmuxHarness):

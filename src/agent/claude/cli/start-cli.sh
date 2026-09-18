@@ -707,11 +707,30 @@ watcher_session_exists() {
   tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null
 }
 
+# The live core's own window and pane, read from the pane that runs it: a heal
+# may have placed it off index 0, and a plain rerun must not forget that.
+resolve_core_target() {
+  local pid row
+  CORE_PANE=""
+  for pid in $(core_claude_pids); do
+    row="$(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{window_index} #{pane_id} #{pane_pid}' 2>/dev/null \
+      | awk -v p="$pid" '$3 == p {print $1, $2; exit}')"
+    if [ -n "$row" ]; then
+      CORE_WINDOW="${row%% *}"
+      CORE_PANE="${row##* }"
+      return 0
+    fi
+  done
+  CORE_WINDOW="${CORE_WINDOW:-0}"
+}
+
 # Standby delivery path: pastes a queued task into the core pane only when the
 # pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
 ensure_task_notifier() {
-  local expected_version active_version version_files
+  local expected_version active_version version_files notifier_py
   [ -z "$WORKER_INSTANCE" ] || return 0   # the notifier serves the core alone
+  resolve_core_target
+  notifier_py="$(require_python "$REPO" "run the task notifier" 2>/dev/null || command -v python3)"
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$NOTIFIER_SCRIPT"
@@ -720,7 +739,7 @@ ensure_task_notifier() {
   )
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -740,6 +759,9 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")
+  [ -n "$CORE_PANE" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_PANE=$CORE_PANE")
+  # The launcher-resolved interpreter, never a bare name from the watcher's PATH.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_PY=$notifier_py")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }

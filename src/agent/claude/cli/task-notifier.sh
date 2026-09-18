@@ -8,6 +8,8 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # The core's window in that session; a heal may place it off index 0.
 CORE_WINDOW="${SUTANDO_TMUX_WINDOW:-0}"
+# The pane itself when the launcher named it: an index can be reused, a pane id cannot.
+TARGET="${SUTANDO_TMUX_PANE:-$SESSION:$CORE_WINDOW}"
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
   TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
 else
@@ -154,13 +156,13 @@ pane_text_composer_is_empty() {
 
 core_pane_is_busy() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:$CORE_WINDOW" 2>/dev/null)" || return 0
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$TARGET" 2>/dev/null)" || return 0
   pane_text_is_busy "$pane"
 }
 
 core_pane_is_idle_ready() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:$CORE_WINDOW" 2>/dev/null)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$TARGET" 2>/dev/null)" || return 1
   pane_text_is_idle_ready "$pane"
 }
 
@@ -186,7 +188,7 @@ wait_for_core_idle() {
   started="$(date +%s)"
   while ! core_is_idle; do
     # The exact pane, not the session: a sibling window can outlive the core.
-    if ! tmux -S "$TMUX_SOCKET" list-panes -t "=$SESSION:$CORE_WINDOW" >/dev/null 2>&1; then
+    if ! tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" '#{pane_id}' >/dev/null 2>&1; then
       return 1
     fi
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
@@ -201,7 +203,7 @@ wait_for_core_idle() {
 # the global option can move without it), never `show-options -g`. Empty on failure.
 pane_history_field() {
   local v
-  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$SESSION:$CORE_WINDOW" "#{$1}" 2>/dev/null)"
+  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" "#{$1}" 2>/dev/null)"
   case "$v" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
 }
 
@@ -216,7 +218,7 @@ effective_scrollback_lines() {
 # Scrollback (-S), not just the visible screen: a wrapped prompt taller than
 # the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_raw() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$SESSION:$CORE_WINDOW" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 capture_tail() {
@@ -298,7 +300,7 @@ deliver_prompt() {
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
     fi
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:$CORE_WINDOW" -l -- "$prompt"
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
     staged_tail="$(printf '%s\n' "$staged_raw" | sed '/^[[:space:]]*$/d')"
@@ -323,7 +325,7 @@ deliver_prompt() {
     log_notifier "pane changed or went busy since $filename staged; not pressing Enter (failing closed, core may need attention)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:$CORE_WINDOW" C-m
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -348,7 +350,7 @@ deliver_prompt() {
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:$CORE_WINDOW" C-m
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   done
 }
 
