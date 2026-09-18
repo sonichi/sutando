@@ -424,15 +424,18 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
             out.append((m.group(1), anchor, (), brace_line, brace_line))
             i = brace_line + 1
             continue
-        start = brace_line + 1
-        j = start
+        has_rest = bool(rest.strip())
+        j = brace_line + 1
         while j < n and depth > 0:
             depth += _brace_delta(lines[j])
             j += 1
         close_line = j - 1
         end = close_line - 1 if _CLOSE_ONLY_RE.match(lines[close_line]) else close_line
+        # `rest` on the opener is body content too -- a function with no
+        # line past it before a bare `}` needs the opener IN its own span.
+        start = brace_line if has_rest else brace_line + 1
         if end >= start:
-            out.append((m.group(1), anchor, sig_lines, start, end))
+            out.append((m.group(1), anchor, () if has_rest else sig_lines, start, end))
         i = j
     return out
 
@@ -451,17 +454,46 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     top-level flow outside every function.
 
     A call resolves to whichever definition of that NAME was already
-    ANCHORED (its own first line) before the call's own line -- Bash
-    redefinition is last-wins only AT THAT POINT in execution, never
+    ANCHORED (its own first line) before the CALLING CONTEXT's own point of
+    execution -- Bash redefinition is last-wins only AT THAT POINT, never
     globally (round 33, keweichen: a decoy defined AFTER a real call still
     "won" under a single global last-definition rule, and the inverse --
     a helper defined and called BEFORE a later decoy -- wrongly lost credit
     for a call that had already run). A call before every definition of
-    that name resolves to nothing, matching a real `command not found`."""
+    that name resolves to nothing, matching a real `command not found`.
+
+    A call INSIDE a function's own body resolves against whichever line
+    reached that function's OWN invocation, not the nested call's fixed
+    textual position in the caller's body -- running a body never advances
+    the script's sequential position, so a name used inside `outer` binds
+    exactly as if written at `outer`'s own call site (round 33 follow-up,
+    kewei-red-ag2space: resolving against the nested call's own line instead
+    credited whichever definition preceded it in SOURCE order, which is
+    always the STALEST one, regardless of what a later redefinition --
+    reached before `outer` was ever invoked -- would really run).
+
+    A same-line function-open ("name() { CMD" or "name() { CMD; }") glues
+    its body to the declaration syntax on one physical line; that line is
+    unmasked to just CMD before any call-scan sees it (round 33 follow-up:
+    `discover() { helper; }` then `discover` still read as calling nothing,
+    since "discover() { helper" tokenizes its own first word as
+    "discover()", never "helper"). A candidate line's own call is credited
+    only when it also survives the SAME multi-line AND-OR/if dead-branch
+    state the whole candidate region would see, not just its own isolated
+    text -- a per-line check alone can't tell `false &&\n  discover` or
+    `if false; then\n  discover\nfi` from an unconditional call."""
     lines = text.split("\n")
     funcs = _function_bodies(text)
     if not funcs:
         return text
+
+    # A same-line opener's body is glued to its declaration syntax; unmask
+    # it to just the body text before any call-scan sees the line.
+    for _, anchor, _, start, _ in funcs:
+        if start == anchor:
+            m = _FUNC_START_RE.match(lines[start]) or _FUNC_START_KEYWORD_RE.match(lines[start])
+            if m:
+                lines[start] = m.group(2)
 
     # Every signature/body line is off-limits for call-scanning regardless
     # of reachability -- a declaration is never a call (see `discover ()`).
@@ -480,8 +512,31 @@ def _strip_unreachable_function_bodies(text: str) -> str:
         spans.sort()
 
     def called_on(name: str, idxs: list[int]) -> list[int]:
-        """Line indices among `idxs` whose own line calls `name`."""
-        return [idx for idx in idxs if any(_segment_calls(seg, name) for seg in _segments(lines[idx]))]
+        """Line indices among `idxs` whose own line calls `name`, subject
+        to the SAME multi-line AND-OR/if dead-branch state the whole
+        candidate region would see -- a per-line check alone can't tell
+        `false &&\\n  discover` or `if false; then\\n  discover\\nfi` from
+        an unconditional call (kewei-red-ag2space round 33 follow-up).
+        Lines outside `idxs` are blanked, not omitted, so a gap (an
+        excluded function body sitting between two candidates) can't
+        shift adjacency; a blank line is a no-op to the AND-OR/if scanner,
+        exactly like a line that was never there."""
+        if not idxs:
+            return []
+        idx_set = set(idxs)
+        region = [lines[k] if k in idx_set else "" for k in range(len(lines))]
+        live = _segments("\n".join(region))
+        live_pos, out = 0, []
+        for idx in idxs:
+            own = _segments(lines[idx])
+            matched = []
+            for seg in own:
+                if live_pos < len(live) and live[live_pos] == seg:
+                    matched.append(seg)
+                    live_pos += 1
+            if any(_segment_calls(seg, name) for seg in matched):
+                out.append(idx)
+        return out
 
     def resolve(name: str, at_line: int) -> "tuple[int, int] | None":
         """The (start, end) of `name`'s definition active at `at_line` --
@@ -492,23 +547,25 @@ def _strip_unreachable_function_bodies(text: str) -> str:
                 best = (start, end)
         return best
 
+    # `at_line` is the call site that reached each queued function, not
+    # the nested call's own body-line position (see the docstring above).
     reachable: set[tuple[int, int]] = set()
-    queue: list[tuple[int, int]] = []
+    queue: list[tuple[int, int, int]] = []
     for name in by_name:
         for idx in called_on(name, top_level_idx):
             span = resolve(name, idx)
             if span and span not in reachable:
                 reachable.add(span)
-                queue.append(span)
+                queue.append((span[0], span[1], idx))
     while queue:
-        cstart, cend = queue.pop()
+        cstart, cend, at_line = queue.pop()
         body_idx = list(range(cstart, cend + 1))
         for name in by_name:
             for idx in called_on(name, body_idx):
-                span = resolve(name, idx)
+                span = resolve(name, at_line)
                 if span and span not in reachable:
                     reachable.add(span)
-                    queue.append(span)
+                    queue.append((span[0], span[1], at_line))
 
     for _, _, _, start, end in funcs:
         if (start, end) in reachable:

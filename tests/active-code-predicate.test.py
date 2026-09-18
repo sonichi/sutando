@@ -521,6 +521,69 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertFalse(program_invokes(text, NAME))
         self.assertTrue(program_invokes(text + "dead\n", NAME))
 
+    def test_a_called_one_liner_still_credits_its_own_body(self):
+        """kewei-red-ag2space round 33 follow-up: `discover() { helper; }`
+        then `discover` still read as calling nothing -- the one-liner's own
+        declaration text ("discover() {") glued to its body made the whole
+        line tokenize as a call to "discover()", never to the real command."""
+        text = f"discover() {{ bash scripts/{NAME}; }}\ndiscover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_an_open_line_with_no_further_body_line_before_a_bare_close_is_tracked(self):
+        """kewei-red-ag2space round 33 follow-up: `discover() { :; helper`
+        closed by a BARE `}` on the very next line (no body line between
+        them) vanished from `_function_bodies` entirely -- its content then
+        read as unconditional top-level code, though discover is never called."""
+        text = f"discover() {{ :; bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_an_and_guard_on_the_prior_line_still_gates_the_call(self):
+        """kewei-red-ag2space round 33 follow-up: `called_on()` scanned each
+        physical line alone, so a guard opened on the PRIOR line was invisible
+        -- `false &&\\n  discover` read as an unconditional call to discover."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nfalse &&\n  discover\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_an_and_guard_true_on_the_prior_line_still_credits_the_call(self):
+        """Control for the above: a TRUE guard on the prior line lets the
+        chain proceed, so the call after it must still be credited."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\ntrue &&\n  discover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_multiline_if_false_block_still_gates_the_call_inside_it(self):
+        """kewei-red-ag2space round 33 follow-up: the same per-line blindness
+        for `if false; then\\n  discover\\nfi` -- Bash never runs discover."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nif false; then\n  discover\nfi\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_multiline_if_true_block_still_credits_the_call_inside_it(self):
+        """Control for the above: a TRUE literal condition really does run
+        the branch, so the call inside it must still be credited."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nif true; then\n  discover\nfi\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_nested_call_resolves_against_the_outer_calls_own_line_not_its_body_line(self):
+        """kewei-red-ag2space round 33 follow-up: `outer` calls `inner` from
+        a fixed line inside outer's own body; a LATER redefinition of inner,
+        reached before outer is ever invoked, is the one that actually runs
+        -- resolving against the inner call's own (always-earlier) textual
+        position instead credited the shadowed, never-executed definition."""
+        text = (f"inner() {{\n  bash scripts/{NAME}\n}}\n"
+                f"outer() {{\n  inner\n}}\n"
+                f"inner() {{\n  printf DECOY\n}}\n"
+                f"outer\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_nested_call_reaches_a_redefinition_that_lands_before_the_outer_call(self):
+        """Mirror of the above: the helper-carrying redefinition of inner
+        lands BEFORE outer is invoked, so outer's own call now reaches it."""
+        text = (f"inner() {{\n  printf DECOY\n}}\n"
+                f"outer() {{\n  inner\n}}\n"
+                f"inner() {{\n  bash scripts/{NAME}\n}}\n"
+                f"outer\n")
+        self.assertTrue(program_invokes(text, NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier
