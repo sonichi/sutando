@@ -62,9 +62,8 @@ next_pending_task() {
   "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR"
 }
 
-# Claude's footer adds "esc to interrupt" for any in-flight turn (tool or
-# text); core-input-watch.py's gate signatures don't cover this (a running
-# turn isn't a gate), so it stays this adapter's own signal.
+# "esc to interrupt" covers any in-flight turn; core-input-watch.py's gate
+# signatures don't (a running turn isn't a gate), so this stays local.
 core_pane_is_busy() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
@@ -72,10 +71,7 @@ core_pane_is_busy() {
 }
 
 # Delegates gate/idle-footer classification to core-input-watch.py's
-# _is_idle_ready — the shared owner of Claude's pane-state patterns
-# (trust/login/selection/permission gates) already maintained for the M0-M4
-# core supervisor. Reimplementing that pattern list here would be exactly
-# the duplicated-policy defect CLAUDE.md's architecture rules call out.
+# _is_idle_ready, the shared owner of Claude's pane-state patterns.
 core_pane_is_idle_ready() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
@@ -90,14 +86,13 @@ sys.exit(0 if ciw._is_idle_ready(sys.stdin.read()) else 1)
 ' "$REPO/src/core-input-watch.py"
 }
 
-# Claude's live core self-reports to core-status.json (CLAUDE.md's "Work
-# Status" convention); trust that first and use the pane only to catch a
-# stale or wrong self-report, mirroring Codex's core_is_idle() exactly.
+# Trust core-status.json, pane only to catch a stale/wrong self-report.
+# Both branches require POSITIVE idle-readiness -- "not busy" alone admits a gate.
 core_is_idle() {
   local now status_ts
   [ -f "$CORE_STATUS_FILE" ] || return 1
   grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && ! core_pane_is_busy && return 0
+    && core_pane_is_idle_ready && return 0
   grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
     || return 1
   status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
@@ -125,26 +120,33 @@ wait_for_core_idle() {
 
 # A wide tail: our newline-free prompt wraps across several rows at default
 # pane width (agy caught this live — a narrow tail missed the marker).
+capture_tail() {
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null \
+    | sed '/^[[:space:]]*$/d' | tail -20
+}
+
+# Staged = marker present AND tail changed since $2, a baseline from before
+# this episode's send-keys -- a stale copy already in scrollback must not count.
 prompt_is_staged() {
-  local pane tail
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
-  tail="$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -20)"
-  printf '%s\n' "$tail" | grep -Fq "Sutando task ready: $1"
+  local tail="$1" baseline="$2"
+  printf '%s\n' "$tail" | grep -Fq "Sutando task ready: $3" && [ "$tail" != "$baseline" ]
 }
 
 # Type + verify staged, then C-m + verify submitted; both halves retry.
-# A core that stays non-idle is a hard gate — give up rather than risk
-# typing over a live turn (see PR body for why this differs from Codex).
+# A core that stays non-idle is a hard gate -- give up rather than type over a live turn.
 deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0
+  local baseline staged_tail
   if ! wait_for_core_idle; then
     log_notifier "core did not become idle for $filename; leaving it queued"
     return 1
   fi
   while :; do
+    baseline="$(capture_tail)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
-    if prompt_is_staged "$filename"; then staged=1; break; fi
+    staged_tail="$(capture_tail)"
+    if prompt_is_staged "$staged_tail" "$baseline" "$filename"; then staged=1; break; fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
@@ -159,10 +161,8 @@ deliver_prompt() {
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
-      # Confirmed by the pane going BUSY, not by the marker vanishing — the
-      # submitted prompt stays visible as scrollback, so that check always
-      # read "still staged" (caught live: 3 spurious re-presses on a real
-      # Claude session before this fix — see PR body).
+      # Confirmed by the pane going BUSY, never by the marker vanishing --
+      # the submitted prompt stays visible as scrollback, so it never does.
       if has_result "$filename" || core_pane_is_busy; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
         return 0
@@ -173,6 +173,12 @@ deliver_prompt() {
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SUBMIT_RETRIES" ]; then
       log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged (core may need attention)"
+      return 0
+    fi
+    # Re-validate our prompt is STILL the exact composer content before
+    # pressing C-m again -- a changed pane means this Enter is not ours.
+    if [ "$(capture_tail)" != "$staged_tail" ]; then
+      log_notifier "pane changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
@@ -219,9 +225,8 @@ watcher_pid=$!
 while IFS= read -r event; do
   case "$event" in
     "TASK_FILE: "*)
-      # Watcher output is a wake signal, not queue order. While the core is
-      # busy, keep every task durable on disk; once idle, re-scan and pick
-      # by priority (FIFO within a tier).
+      # A wake signal, not queue order -- once idle, re-scan and pick by
+      # priority so every task stays durable on disk until then.
       next_pending_task >/dev/null || continue
       wait_for_core_idle || exit 1
       filename="$(next_pending_task)" || continue

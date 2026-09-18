@@ -78,6 +78,7 @@ class FakeTmuxHarness(unittest.TestCase):
         self.sendkeys_log.write_text("")
         self.swallow_flag = self.root / "swallow-next-paste.flag"
         self.busy_after_enter_flag = self.root / "busy-after-enter.flag"
+        self.owner_types_after_enter_flag = self.root / "owner-types-after-enter.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -121,6 +122,12 @@ case "$cmd" in
       # prove the confirm check doesn't misread that as still-staged.
       if [ -f "{self.busy_after_enter_flag}" ]; then
         printf '%s\\n' "{BUSY_FOOTER}" >> "{self.pane_file}"
+      fi
+      # Simulates the owner typing something new right after our C-m --
+      # not busy, and not our own staged prompt either.
+      if [ -f "{self.owner_types_after_enter_flag}" ]; then
+        rm -f "{self.owner_types_after_enter_flag}"
+        printf '%s\\n' "owner is typing something else" >> "{self.pane_file}"
       fi
     fi
     exit 0
@@ -293,6 +300,52 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "",
                           "a folder-trust gate must never be typed over")
+
+    def test_trust_gate_on_fresh_idle_status_blocks_dispatch(self):
+        # A fresh (non-stale) idle status alone must not satisfy dispatch --
+        # a trust-gate pane is "not busy" too (no in-flight turn to interrupt).
+        self.write_task("task-gate2.txt")
+        self.write_status("idle")
+        self.pane_file.write_text(TRUST_GATE_PANE + "\n")
+        result = self.run_event("task-gate2.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "",
+                          "a folder-trust gate must never be typed over, even under a fresh idle status")
+
+    def test_stale_same_task_marker_plus_swallowed_paste_is_not_mistaken_for_staged(self):
+        # A previous episode's own prompt still in scrollback, plus this
+        # episode's paste swallowed, must not read as this episode's staged.
+        self.pane_file.write_text(IDLE_FOOTER + "\nSutando task ready: task-i.txt\n")
+        self.write_task("task-i.txt")
+        self.swallow_flag.write_text("1")
+
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-i.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-i.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-i.txt")
+        self.assertEqual(type_calls, 2,
+                          "a stale marker from a prior episode must not be read as this "
+                          "episode's own staged paste -- the swallowed retype must still fire")
+
+    def test_pane_change_after_enter_blocks_a_second_press(self):
+        # After the first C-m, the pane changing to something other than
+        # busy (e.g. the owner typing) must never get a second C-m.
+        self.write_task("task-j.txt")
+        self.owner_types_after_enter_flag.write_text("1")
+        result = self.run_event("task-j.txt", timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1,
+                          "a pane that changed to something other than our own prompt "
+                          "must not receive a second C-m")
 
     def test_dropped_paste_is_retyped(self):
         self.write_task("task-d.txt")
