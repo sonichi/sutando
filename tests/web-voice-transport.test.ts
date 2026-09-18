@@ -17,6 +17,9 @@ import {
 	VOICE_FAILURE_REMEDIATION,
 	SESSION_CONTEXT_TYPE,
 	buildSessionContextFrame,
+	UI_NAVIGATE_TYPE,
+	buildUiNavigateFrame,
+	parseUiNavigateFrame,
 	type VoiceConnectFailure,
 	type VoiceTransportOptions,
 	type AgentStateV1,
@@ -157,6 +160,30 @@ describe('web-voice-transport turn lifecycle', () => {
 		feed(t, { type: 'image', base64: 'x' });
 		feed(t, { type: 'turn.end' });
 		assert.deepEqual(seen, ['image', 'turn.end']);
+	});
+
+	it('onServerFrame receives every JSON frame the agent sends, including ui.navigate', () => {
+		const frames: Record<string, unknown>[] = [];
+		let ended = 0;
+		const t = new VoiceTransport({ onServerFrame: (f) => frames.push(f), onTurnEnd: () => ended++ });
+		const nav = buildUiNavigateFrame('req-1', 'room', 'GTM in Investors');
+		feed(t, nav);
+		feed(t, { type: 'turn.end' });
+		feed(t, { type: 'totally.unknown', x: 1 });
+		assert.deepEqual(frames.map((f) => f.type), [UI_NAVIGATE_TYPE, 'turn.end', 'totally.unknown']);
+		assert.deepEqual(parseUiNavigateFrame(frames[0]), nav, 'the frame arrives whole, ready for the client parser');
+		assert.equal(ended, 1, 'the transport still interprets the frames it knows');
+	});
+
+	it('unknown frame types are still ignored by the transport itself (no throw, no callback but the raw sinks)', () => {
+		let status = 0;
+		let ended = 0;
+		const t = new VoiceTransport({ onStatus: () => status++, onTurnEnd: () => ended++ });
+		assert.doesNotThrow(() => feed(t, { type: 'ui.navigate', version: 1, request_id: 'r', target: 'dm' }));
+		assert.doesNotThrow(() => feed(t, { type: 'nope' }));
+		assert.doesNotThrow(() => feed(t, 'just a string'));
+		assert.equal(status, 0);
+		assert.equal(ended, 0);
 	});
 
 	it('disconnect()/close() are idempotent with no live session (no throw)', () => {
