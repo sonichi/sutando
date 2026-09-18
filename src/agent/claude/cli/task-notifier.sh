@@ -25,6 +25,9 @@ TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-f
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
+# A long single-line prompt wraps past the pane's own height, scrolling its
+# leading marker into scrollback -- capture-pane -p alone never sees it.
+CAPTURE_SCROLLBACK_LINES="${SUTANDO_NOTIFIER_CAPTURE_SCROLLBACK_LINES:-2000}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -187,11 +190,11 @@ wait_for_core_idle() {
   done
 }
 
-# A wide tail: our newline-free prompt wraps across several rows at default
-# pane width (agy caught this live — a narrow tail missed the marker).
+# Scrollback (-S), not just the visible screen: a wrapped prompt taller than
+# the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_tail() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null \
-    | sed '/^[[:space:]]*$/d' | tail -20
+  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$CAPTURE_SCROLLBACK_LINES" -t "$SESSION:0" 2>/dev/null \
+    | sed '/^[[:space:]]*$/d'
 }
 
 # Delegates to core-input-watch.py's _composer_text (dewrapped, footer/gate

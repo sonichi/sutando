@@ -59,6 +59,10 @@ TRUST_GATE_PANE = "\n".join([
 class FakeTmuxHarness(unittest.TestCase):
     """Base: builds a stub `tmux` + isolated workspace for one test."""
 
+    # Lines a non-`-S` capture-pane returns (the viewport height); a subclass
+    # narrows this to put the marker above it. `-S` always returns it all.
+    PANE_HEIGHT = 500
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -111,7 +115,15 @@ case "$cmd" in
     exit 1
     ;;
   capture-pane)
-    cat "{self.pane_file}" 2>/dev/null
+    scrollback=0
+    for a in "$@"; do
+      [ "$a" = -S ] && scrollback=1
+    done
+    if [ "$scrollback" = 1 ]; then
+      cat "{self.pane_file}" 2>/dev/null
+    else
+      tail -n {self.PANE_HEIGHT} "{self.pane_file}" 2>/dev/null
+    fi
     exit 0
     ;;
   send-keys)
@@ -502,6 +514,42 @@ class EventDispatchTests(FakeTmuxHarness):
         result = self.run_event("task-g.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "")
+
+
+class TallComposerScrollbackTests(FakeTmuxHarness):
+    """Regression for a real head-e540f676a review finding (qingyun-wu's
+    Codex, 2026-09-18): a prompt taller than the pane's own height scrolls
+    its leading composer marker into scrollback, where a plain
+    `capture-pane -p` (no -S) never sees it again -- the periodic retry then
+    finds a permanently nonempty composer and stalls forever. PANE_HEIGHT=2
+    makes the fake tmux's non-`-S` reads a 2-line viewport, exactly wide
+    enough for the untyped idle footer and no more, so appending even one
+    typed line pushes the marker out of view unless capture_tail() asks for
+    scrollback."""
+
+    PANE_HEIGHT = 2
+
+    def test_marker_scrolled_off_pane_top_is_still_found_via_scrollback(self):
+        self.write_task("task-tall.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-tall.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-tall.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertIn(
+            "ENTER", log,
+            "staging must succeed even though the marker line sits above "
+            "the fake pane's 2-line viewport -- capture_tail() must ask for "
+            "scrollback (-S), not just the visible screen",
+        )
 
 
 class MainLoopWiringTest(FakeTmuxHarness):
