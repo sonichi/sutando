@@ -7,7 +7,12 @@
 Both share src/current_track.py's lock with rotation, so neither an entry nor a rewrite can land
 between rotation's read and its replace. `replace` is the "create it if absent / rewrite it when the
 track moves" path the context-reconstruct skill prescribes; `append` is the per-pass entry.
-Exit 0 written; 1 empty stdin; 2 usage.
+
+The target must name a host: `.../hosts/<label>/current-track.md`. A caller that builds it as
+`hosts/$H/current-track.md` with $H unset collapses to `hosts/current-track.md`, which the vault's
+carrier rules do not cover (`!hosts/*/**` needs the directory level), so the entry lands on a path
+that is ignored and never backed up — silently, since writing succeeds.
+Exit 0 written; 1 empty stdin; 2 usage or a target that names no host.
 """
 from __future__ import annotations
 
@@ -25,11 +30,17 @@ def main(argv=None) -> int:
     if len(argv) != 2 or argv[0] not in OPS:
         print("usage: current-track-write.py append|replace <current-track.md>  (text on stdin)", file=sys.stderr)
         return 2
+    target = Path(argv[1])
+    if target.parent.name in ("", "hosts") or target.parent.parent.name != "hosts":
+        print(f"current-track-write: {target} does not sit under hosts/<label>/ — refusing. "
+              "An unset host label collapses hosts/$H/ to hosts/, whose content the vault does not carry.",
+              file=sys.stderr)
+        return 2
     text = sys.stdin.read()
     if not text.strip():
         print(f"current-track-write: empty stdin, nothing written ({argv[0]})", file=sys.stderr)
         return 1
-    OPS[argv[0]](Path(argv[1]), text)
+    OPS[argv[0]](target, text)
     return 0
 
 
