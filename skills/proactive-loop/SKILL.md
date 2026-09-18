@@ -86,7 +86,11 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
    (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
    retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
-   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run the same
+   `quiet <hash>`. On `post`: resolve the target with
+   `python3 src/owner_channel.py --workspace "$WORKSPACE"` — it reads the owner's last-active
+   channel and REFUSES (exit 3) a room bound to a live worker; the core never posts into a
+   worker's room unless that worker is dead and recovery is speaking. On `allow`, send ONE FYI
+   line there; on `refuse`, send nothing (macOS-only). THEN re-run the same
    pipe with `--write` on `idle-held.py` AND `--commit` on `idle-surface-hash.py` — each flag belongs
    to its own side, and `--commit` alone leaves added holds, removal reasons and notes unpersisted, so
    the next pass re-posts the stale hold. Never commit before the send; never build the list from
