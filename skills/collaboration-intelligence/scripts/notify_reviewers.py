@@ -31,6 +31,15 @@ Roster: <workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-
            "room": "!triage:ag2.space", "allowlisted": true, "gh": "john-the-dev"}}
 `allowlisted` is evidence, not hope: true (a mention has triggered this
 Stand), false (it bounced), null/absent (never observed — send, then record).
+
+Every routing field this file reads (stand/room/discord_id/stand_discord_id/
+home_channel) is read through `roster_union.route_value()`, never a raw
+`.get()`, in `resolve()`, `durable_endpoints()` and `_routable()` alike
+(kewei-red-ag2space, PR #3509 round 3: only the Matrix pair went through the
+shared classifier; Discord read the same fields by truthiness, so a
+malformed value -- a list, a dict, `True` -- could pass classification and
+still reach the sender, and un-stripped whitespace could split one person's
+identity into two, letting them clear the two-distinct-reviewer gate alone).
 """
 from __future__ import annotations
 
@@ -62,7 +71,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from roster_union import (CAVEAT_SUFFIX, is_caveat, REFUSAL_FIELDS, TEXT_FIELDS, declared, host_rosters,
-                          roster_login, roster_union)
+                          roster_login, roster_union, route_value)
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
@@ -144,12 +153,11 @@ def durable_endpoints(entry: dict) -> set:
     """
     if not isinstance(entry, dict):
         return set()
-    stand, room = entry.get("stand"), entry.get("room")
-    dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
-    if not isinstance(stand, (str, type(None))):
-        stand = None
-    if not isinstance(dm_id, (str, int, type(None))):
-        dm_id = None
+    # Validated through the SAME classifier `resolve()` uses for a route,
+    # not a second, looser truthiness read (see module docstring).
+    stand = route_value("stand", entry.get("stand"))
+    dm_id = (route_value("discord_id", entry.get("discord_id"))
+             or route_value("stand_discord_id", entry.get("stand_discord_id")))
     out = set()
     # Identity is what the row declares; route completeness is durable_endpoint's.
     # Gating here made one person read as two and satisfy the two-reviewer minimum.
@@ -163,8 +171,8 @@ def durable_endpoints(entry: dict) -> set:
 def _routable(entry: dict, endpoint: str) -> bool:
     """Whether THIS endpoint can actually be sent on — the half identity drops."""
     if endpoint.startswith("discord:"):
-        return bool(entry.get("home_channel"))
-    return bool(entry.get("room"))
+        return route_value("home_channel", entry.get("home_channel")) is not None
+    return route_value("room", entry.get("room")) is not None
 
 
 def durable_endpoint(entry: dict) -> "str | None":
@@ -210,8 +218,8 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   "add them from the map, do not guess", file=sys.stderr)
             worst = max(worst, 2)
             continue
-        # Both the ROUTE and its VALUES come from the classifier, so what is sent
-        # is what was validated -- a blank or a list can reach neither.
+        # Both the ROUTE and its VALUES come from the classifier for BOTH
+        # transports now, so what is sent is what was validated (see module docstring).
         stand, room = declared(entry.get("stand")), declared(entry.get("room"))
         why = stated_reason(entry)
         # A caveat nobody prints is a note, not a step. Derived from the entry:
@@ -220,8 +228,9 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             if entry.get(field):
                 label = field[: -len(CAVEAT_SUFFIX)].upper().replace("_", " ")
                 print(f"{label} CAVEAT '{name}': {entry[field]}", file=sys.stderr)
-        dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
-        channel = entry.get("home_channel")
+        dm_id = (route_value("discord_id", entry.get("discord_id"))
+                 or route_value("stand_discord_id", entry.get("stand_discord_id")))
+        channel = route_value("home_channel", entry.get("home_channel"))
         if stand and room:
             transport = "matrix"
         elif dm_id and channel:

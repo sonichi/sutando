@@ -171,6 +171,33 @@ class MalformedRouteValues(_Base):
                 self.ru.declared_routes({"stand": value, "room": "!peer:x"}), (),
                 f"{value!r} was read as naming a Matrix route")
 
+    def test_a_LIST_discord_id_does_not_crash_the_batch(self):
+        """kewei-red-ag2space, PR #3509 round 3: `resolve()` read Discord ids
+        by raw truthiness, so a list-valued id passed straight to the
+        sender instead of refusing like the Matrix arms above already do."""
+        targets, rc, err, _ = self._batch({"discord_id": ["111"], "home_channel": "c"})
+        self.assertEqual([t["name"] for t in targets], ["good"], err)
+        self.assertEqual(rc, 3, err)
+
+    def test_a_DICT_discord_id_does_not_crash_the_batch(self):
+        targets, rc, err, _ = self._batch(
+            {"discord_id": {"id": "222"}, "home_channel": "c"})
+        self.assertEqual([t["name"] for t in targets], ["good"], err)
+        self.assertEqual(rc, 3, err)
+
+    def test_a_BOOL_discord_id_is_refused_through_resolve_not_just_the_classifier(self):
+        """A `bool` subclasses `int` in Python, so a truthiness-only read
+        credits it as a snowflake; the classifier already refuses it
+        (see StillWorks below) -- this pins that resolve() agrees."""
+        targets, rc, err, _ = self._batch({"discord_id": True, "home_channel": "c"})
+        self.assertEqual([t["name"] for t in targets], ["good"], err)
+        self.assertEqual(rc, 3, err)
+
+    def test_a_LIST_home_channel_does_not_crash_the_batch(self):
+        targets, rc, err, _ = self._batch({"discord_id": 111, "home_channel": ["c"]})
+        self.assertEqual([t["name"] for t in targets], ["good"], err)
+        self.assertEqual(rc, 3, err)
+
 
 class StillWorks(_Base):
     """Controls: a blanket refusal, or a classifier tightened until nothing is a
@@ -231,6 +258,31 @@ class StillWorks(_Base):
                 bool(targets), kind in self.nr.SUPPORTED_ROUTES,
                 f"resolve() and SUPPORTED_ROUTES disagree about {kind}: "
                 f"targets={targets} declared={self.nr.SUPPORTED_ROUTES} err={err!r}")
+
+    def test_a_valid_numeric_discord_row_still_resolves_end_to_end(self):
+        """Control for the malformed-Discord arms above: the real shape
+        (numeric id, string channel) must keep resolving after routing
+        moved onto the shared classifier."""
+        targets, rc, err, _ = self._resolve(
+            [("local", {"v": {"discord_id": 111, "home_channel": "c"}})], ("v",))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(t["transport"], t["discord_id"], t["channel"])
+                          for t in targets], [("discord", 111, "c")])
+
+    def test_padded_and_unpadded_stand_room_are_ONE_person_not_two(self):
+        """kewei-red-ag2space, PR #3509 round 3: identity used to be built
+        from the raw (unstripped) field, so whitespace padding alone could
+        split one person into two rows and let them clear a two-distinct-
+        reviewer gate alone. Two DIFFERENT roster keys, same normalized
+        Stand+room, must collapse to one deliverable target."""
+        targets, rc, err, roster = self._resolve(
+            [("local", {"padded": {"stand": " @same:x ", "room": " !r:x "},
+                        "bare": {"stand": "@same:x", "room": "!r:x"}})],
+            ("padded", "bare"))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(targets), 1,
+                         f"whitespace padding split one person into two targets: "
+                         f"{targets} roster={sorted(roster)}")
 
     def test_a_local_discord_route_still_wins_for_a_caller_that_can_send_on_it(self):
         """The default union is unchanged: narrowing is the CALLER's declaration,
