@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
@@ -154,11 +155,21 @@ def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -
     This file is the durable at-most-once record, per core incarnation (a pane pid
     or session stamp); the notifier clears it when a result is ready.
     """
+    incarnation = incarnation.strip()
+    if not incarnation:
+        raise ValueError("an in-flight marker needs the core incarnation; empty would read as live forever")
     path = _inflight_path(inflight_dir, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(incarnation.strip() + "\n")
-    os.replace(tmp, path)
+    # A private temp file per writer: two notifiers marking at once must not
+    # race on one shared temp path.
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(incarnation + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str) -> bool:
@@ -239,6 +250,10 @@ def _main(argv: list[str]) -> int:
             return 0
         except ValueError as exc:
             print(f"task_dispatch.py: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            # Cannot decide is its own answer: 1 would read as "not in flight".
+            print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
             return 2
     if cmd not in ("pending-candidates", "next-pending"):
         print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)

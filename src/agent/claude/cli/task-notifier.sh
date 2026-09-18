@@ -125,9 +125,9 @@ next_pending_task() {
 # Every pane predicate has a TEXT form so one snapshot can be judged for healthy
 # and composer-empty at once -- two separate reads are two races.
 
-# cli_wedge.py owns the banners, both families: parked (a limit, a login prompt,
-# a compaction, an API error) and the live retry line, each judged as a whole line
-# of a wrap-joined capture. Prose about either is neither.
+# cli_wedge.py owns the live-banner grammar, both families: parked (a limit, a
+# login prompt, a compaction, an API error) and retrying, each a whole line of a
+# wrap-joined capture. Prose about either is neither.
 pane_text_is_abnormal() {
   printf '%s' "$1" | "$NOTIFIER_PY" -c '
 import importlib.util, sys
@@ -136,7 +136,7 @@ wedge = importlib.util.module_from_spec(spec)
 sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
 spec.loader.exec_module(wedge)
 text = sys.stdin.read()
-sys.exit(0 if (wedge.matched_abnormal([text]) or wedge.live_retry_banner_lines(text)) else 1)
+sys.exit(0 if wedge.live_banner_lines(text) else 1)
 ' "$REPO/src/cli_wedge.py"
 }
 
@@ -292,10 +292,15 @@ warn_if_capture_truncated() {
 # tool's own notification does. Only an unhealthy pane or a draft holds.
 deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 staged=0
-  local baseline_esc baseline_raw staged_raw=""
+  local baseline_esc baseline_raw staged_raw="" incarnation=""
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
+  fi
+  # The wait can outlast the task: another path may have answered it meanwhile.
+  if has_result "$filename"; then
+    log_notifier "result for $filename appeared while waiting for the core; not delivering"
+    return 0
   fi
   while :; do
     # ONE snapshot is the last read before the paste and is judged whole:
@@ -303,6 +308,13 @@ deliver_prompt() {
     # (re-checked every retype). Any later read would be a new race.
     baseline_esc="$(capture_view_esc)"
     baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
+    # The incarnation the prompt is typed INTO: sampled here, before the paste,
+    # never after the Enter, when a restart could already have replaced the pane.
+    incarnation="$(core_incarnation)"
+    if [ -z "$incarnation" ]; then
+      log_notifier "core incarnation unreadable at the paste for $filename; leaving it queued (failing closed)"
+      return 1
+    fi
     if ! pane_text_is_healthy "$baseline_raw"; then
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
       return 1
@@ -336,7 +348,7 @@ deliver_prompt() {
     log_notifier "composer changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
     return 1
   fi
-  press_enter_and_confirm "$filename" "$prompt"
+  press_enter_and_confirm "$filename" "$prompt" "$incarnation"
 }
 
 # Which core is running: a marker from another incarnation is stale, and the
@@ -345,11 +357,17 @@ core_incarnation() {
   pane_history_field pane_pid
 }
 
-# C-m, then confirm the prompt LEFT the composer (submitted, or queued behind a
-# running turn); re-press while it is still exactly ours. Records the in-flight marker
-# on confirmation; an unconfirmed submit leaves the prompt staged for the next pick.
+# Marker first, then C-m, then confirm the prompt LEFT the composer (submitted, or
+# queued behind a running turn); re-press while it is still exactly ours. The marker
+# precedes the Enter so no crash window exists in which the prompt was submitted
+# and nothing recorded it; a marker beside a still-staged prompt means resume.
 press_enter_and_confirm() {
-  local filename="$1" prompt="$2" attempt=0 waited
+  local filename="$1" prompt="$2" incarnation="$3" attempt=0 waited cap
+  has_result "$filename" && return 0
+  if ! "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$INFLIGHT_DIR" "$filename" "$incarnation"; then
+    log_notifier "could not record the in-flight marker for $filename; not pressing Enter (failing closed)"
+    return 1
+  fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
   while :; do
     waited=0
@@ -359,10 +377,10 @@ press_enter_and_confirm() {
       if has_result "$filename"; then
         return 0
       fi
-      if ! composer_holds_prompt "$(capture_raw)" "$prompt"; then
+      # A failed capture says nothing about the composer; only a read that
+      # shows the prompt gone confirms.
+      if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
-        "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$INFLIGHT_DIR" "$filename" "$(core_incarnation)" \
-          || log_notifier "could not record the in-flight marker for $filename"
         return 0
       fi
       sleep 1
@@ -401,7 +419,7 @@ staged_prompt_is_ambiguous() {
 }
 
 submit_task() {
-  local filename="$1" prompt started raw
+  local filename="$1" prompt started raw incarnation live_rc
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -413,17 +431,31 @@ submit_task() {
   fi
   # A capture can fail (the pane is gone); the liveness wait below is what decides that.
   raw="$(capture_raw)" || raw=""
-  if "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$(core_incarnation)"; then
-    log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
-  elif prompt_is_staged "$raw" "$prompt"; then
-    # Typed but never confirmed sent (a swallowed Enter, a restart between the
-    # paste and C-m): the composer is exactly ours, so resume at the Enter.
+  incarnation="$(core_incarnation)"
+  # 0 live, 1 not live, anything else undecidable (an unreadable marker): a
+  # marker that cannot be read is not evidence the prompt was never submitted.
+  live_rc=0
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$incarnation" || live_rc=$?
+  if [ "$live_rc" -ne 0 ] && [ "$live_rc" -ne 1 ]; then
+    log_notifier "cannot decide whether $filename is already in flight (marker read failed, rc $live_rc); leaving it queued (failing closed)"
+    return 0
+  fi
+  if prompt_is_staged "$raw" "$prompt"; then
+    # Typed but never confirmed sent (a swallowed Enter, a crash or restart between
+    # the paste and C-m): the composer is exactly ours, so resume at the Enter. This
+    # precedes the marker: a marker beside a staged prompt records an Enter that never landed.
     if staged_prompt_is_ambiguous "$raw" "$filename"; then
       log_notifier "composer holds a prompt that reads as $filename's and another pending task's; leaving it queued (failing closed, core may need attention)"
       return 0
     fi
+    if [ -z "$incarnation" ]; then
+      log_notifier "core incarnation unreadable while $filename is staged; not pressing Enter (failing closed)"
+      return 0
+    fi
     log_notifier "prompt for $filename is staged but unsent; resuming its submission"
-    press_enter_and_confirm "$filename" "$prompt" || return 0
+    press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
+  elif [ "$live_rc" -eq 0 ]; then
+    log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
     return 0

@@ -75,6 +75,9 @@ class FakeTmuxHarness(unittest.TestCase):
     # "chars" cuts anywhere, "word" is the input box's own word wrap + 2-space indent.
     WRAP_COLS = 0
     WRAP_STYLE = "chars"
+    # Physical pane width for capture-pane: a row longer than this is returned as
+    # several rows unless -J joins them, as a real pane soft-wraps. 0 = no wrap.
+    CAPTURE_COLS = 0
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -123,6 +126,13 @@ class FakeTmuxHarness(unittest.TestCase):
         # The pane's #{pane_pid}: the core incarnation an in-flight marker is keyed to.
         self.pane_pid_file = self.root / "pane-pid.txt"
         self.inflight_dir = self.state_dir / "task-notifier-inflight"
+        # Holds a pid: on the next ENTER the pane pid flips to it (a restart racing
+        # the submit), consumed once.
+        self.pid_after_enter_flag = self.root / "pid-after-enter.flag"
+        # The NEXT capture-pane fails (rc 1, no output), consumed once; the
+        # after-Enter variant arms it at the moment C-m lands.
+        self.fail_next_capture_flag = self.root / "fail-next-capture.flag"
+        self.fail_capture_after_enter_flag = self.root / "fail-capture-after-enter.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -198,6 +208,7 @@ case "$cmd" in
     ;;
   capture-pane)
     n=$(( $(cat "{self.capture_count}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{self.capture_count}"
+    if [ -f "{self.fail_next_capture_flag}" ]; then rm -f "{self.fail_next_capture_flag}"; exit 1; fi
     # Consumed once: the pane goes BUSY on the Nth capture (a turn starting
     # between the idle gate and the paste), modeled as the footer flipping.
     if [ -f "{self.busy_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.busy_on_capture_flag}")" ]; then
@@ -207,10 +218,11 @@ case "$cmd" in
     if [ -f "{self.gate_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.gate_on_capture_flag}")" ]; then
       rm -f "{self.gate_on_capture_flag}"; printf '%s\\n' "{TRUST_GATE_PANE}" > "$PANE"
     fi
-    scrollback=0; esc=0
+    scrollback=0; esc=0; join=0
     for a in "$@"; do
       [ "$a" = -S ] && scrollback=1
       [ "$a" = -e ] && esc=1
+      [ "$a" = -J ] && join=1
     done
     if [ "$scrollback" = 1 ]; then
       out="$(tail -n $(( {self.PANE_HEIGHT} + $(history_size) )) "$PANE" 2>/dev/null)"
@@ -226,6 +238,9 @@ case "$cmd" in
       else
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
+    fi
+    if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
+      out="$(printf '%s\\n' "$out" | fold -w {self.CAPTURE_COLS})"
     fi
     printf '%s\\n' "$out"
     exit 0
@@ -270,7 +285,13 @@ case "$cmd" in
         fi
       fi
     else
-      printf 'ENTER\\n' >> "{self.sendkeys_log}"
+      printf 'ENTER markers=%s\\n' "$(ls "{self.inflight_dir}" 2>/dev/null | grep -vc '^\\.')" >> "{self.sendkeys_log}"
+      if [ -f "{self.pid_after_enter_flag}" ]; then
+        cat "{self.pid_after_enter_flag}" > "{self.pane_pid_file}"; rm -f "{self.pid_after_enter_flag}"
+      fi
+      if [ -f "{self.fail_capture_after_enter_flag}" ]; then
+        rm -f "{self.fail_capture_after_enter_flag}"; touch "{self.fail_next_capture_flag}"
+      fi
       # Real Claude keeps the submitted prompt visible as scrollback and opens
       # a fresh empty composer row under it; a swallowed Enter changes nothing.
       if [ ! -f "{self.swallow_enter_flag}" ]; then
@@ -742,6 +763,17 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-prose2.txt", self.sendkeys_log_text())
 
+    def test_prose_naming_an_api_error_or_a_retry_does_not_hold(self):
+        for name, line in (("task-p4.txt", "⏺ API Error handling is covered by tests."),
+                           ("task-p5.txt", "  ⎿  Connection error. The fix was retrying")):
+            self.write_task(name)
+            self.pane_file.write_text(line + "\n" + IDLE_FOOTER + "\n")
+            t = self._finish_on(name, lambda log, n=name: f"TYPE Sutando task ready: {n}" in log and "ENTER" in log)
+            result = self.run_event(name)
+            t.join(timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"TYPE Sutando task ready: {name}", self.sendkeys_log_text(), line)
+
     def test_a_wrapped_sentence_starting_with_a_retry_word_does_not_hold(self):
         self.write_task("task-prose3.txt")
         self.pane_file.write_text("⏺ I verified the docs that say\n  Connection error handling is covered by tests.\n" + IDLE_FOOTER + "\n")
@@ -859,6 +891,35 @@ class SmallViewportTests(FakeTmuxHarness):
         self.assertEqual(self.sendkeys_log_text(), "")
 
 
+class NarrowCaptureTests(FakeTmuxHarness):
+    """A real pane soft-wraps a long row; capture-pane without -J returns the pieces,
+    and a banner cut in two matches no whole-line grammar. -J is what makes it one line."""
+    CAPTURE_COLS = 40
+
+    def test_a_long_retry_banner_wrapped_by_the_pane_still_holds(self):
+        self.write_task("task-wide.txt")
+        self.pane_file.write_text('  ⎿  API Error (529 {"type":"overloaded_error"}) · Retrying in 1 seconds… (attempt 1/10)\n' + IDLE_FOOTER + "\n")
+        result = self.run_event("task-wide.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "", "a wrapped live banner was typed over")
+        self.assertIn("did not become healthy", result.stderr)
+
+    def test_a_long_prose_row_wrapped_by_the_pane_still_delivers(self):
+        self.write_task("task-wide2.txt")
+        self.pane_file.write_text("⏺ I verified the docs that say Connection error handling is covered by tests and nothing more.\n" + IDLE_FOOTER + "\n")
+        import threading
+        def _finish():
+            for _ in range(60):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-wide2.txt"); return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish); t.start()
+        result = self.run_event("task-wide2.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-wide2.txt", self.sendkeys_log_text())
+
+
 class RePickTests(FakeTmuxHarness):
     def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
         # First pass types and submits; no result ever appears. The re-pick after
@@ -894,7 +955,8 @@ class RePickTests(FakeTmuxHarness):
                                                           "SUTANDO_NOTIFIER_SUBMIT_RETRIES": "2"}, timeout=20)
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertIn("NOT confirmed", first.stderr)
-        self.assertFalse((self.inflight_dir / "task-swal.txt").exists(), "an unconfirmed submit must not be marked in flight")
+        # The marker precedes the Enter by design; beside a still-staged prompt it means resume.
+        self.assertTrue((self.inflight_dir / "task-swal.txt").is_file(), "the submit attempt left no marker")
         enters = self.sendkeys_log_text().count("ENTER")
         self.swallow_enter_flag.unlink()
         t = self._finish_on("task-swal.txt", lambda log: log.count("ENTER") > enters)
@@ -957,6 +1019,103 @@ class RePickTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "", "an ambiguous staged prompt was submitted")
         self.assertIn("another pending task", result.stderr)
+
+    def test_the_marker_exists_before_the_enter_is_pressed(self):
+        # No crash window: a submit that reached the pane is already on record.
+        self.write_task("task-ord.txt")
+        t = self._finish_on("task-ord.txt", lambda log: "ENTER" in log)
+        result = self.run_event("task-ord.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        enters = [ln for ln in self.sendkeys_log_text().splitlines() if ln.startswith("ENTER")]
+        self.assertTrue(enters and all(ln == "ENTER markers=1" for ln in enters), enters)
+
+    def test_the_marker_records_the_incarnation_the_prompt_was_typed_into(self):
+        # The pane pid flips right after the Enter (a restart racing the submit): the
+        # marker must name the OLD core, and the next pick under the new one delivers again.
+        self.write_task("task-race.txt")
+        self.pid_after_enter_flag.write_text("9999\n")
+        first = self.run_event("task-race.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual((self.inflight_dir / "task-race.txt").read_text().strip(), "4242",
+                         "the marker named the core that appeared after the Enter")
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        t = self._finish_on("task-race.txt", lambda log: log.count("ENTER") >= 2)
+        second = self.run_event("task-race.txt")
+        t.join(timeout=5)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "the new core never received the task")
+
+    def test_an_unreadable_incarnation_refuses_to_submit(self):
+        # Empty identity would read as live forever; the paste never happens.
+        self.write_task("task-noid.txt")
+        self.pane_pid_file.write_text("")
+        result = self.run_event("task-noid.txt", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "", "typed with no incarnation to record")
+        self.assertIn("incarnation unreadable", result.stderr)
+        self.assertFalse(self.inflight_dir.exists() and any(self.inflight_dir.iterdir()))
+
+    def test_a_marker_beside_a_staged_prompt_means_resume_not_await(self):
+        # The crash landed after the marker and before the Enter.
+        self.write_task("task-mk.txt")
+        prompt = (f"Sutando task ready: task-mk.txt. Read {self.tasks_dir}/task-mk.txt, follow CLAUDE.md, "
+                  f"complete the task, and write the result to {self.results_dir}/task-mk.txt.")
+        self.inflight_dir.mkdir(parents=True, exist_ok=True)
+        (self.inflight_dir / "task-mk.txt").write_text("4242\n")
+        self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        t = self._finish_on("task-mk.txt", lambda log: "ENTER" in log)
+        result = self.run_event("task-mk.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1, "a marker beside a staged prompt was awaited, not resumed")
+
+    def test_an_unreadable_marker_holds_the_task_rather_than_reading_as_not_in_flight(self):
+        import os as _os
+        if _os.geteuid() == 0:
+            self.skipTest("root cannot be denied a read")
+        self.write_task("task-unr.txt")
+        self.inflight_dir.mkdir(parents=True, exist_ok=True)
+        marker = self.inflight_dir / "task-unr.txt"
+        marker.write_text("4242\n"); marker.chmod(0o000)
+        try:
+            result = self.run_event("task-unr.txt", timeout=10)
+        finally:
+            marker.chmod(0o644)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "", "an unreadable marker was read as 'not in flight' and the task typed")
+        self.assertIn("cannot decide", result.stderr)
+
+    def test_a_result_that_lands_during_the_healthy_wait_is_not_delivered(self):
+        # Parked on a banner; meanwhile another path answers the task; then the pane clears.
+        self.write_task("task-late.txt")
+        self.pane_file.write_text("API Error: 529 overloaded\n" + IDLE_FOOTER + "\n")
+        import threading
+        def _answer_then_clear():
+            time.sleep(1.0)
+            self.write_result("task-late.txt")
+            time.sleep(0.3)
+            self.pane_file.write_text(IDLE_FOOTER + "\n")
+        t = threading.Thread(target=_answer_then_clear); t.start()
+        result = self.run_event("task-late.txt", timeout=12)
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "", "a task answered during the wait was delivered again")
+        self.assertIn("appeared while waiting", result.stderr)
+
+    def test_a_failed_capture_after_the_enter_is_not_a_confirmation(self):
+        # Enter swallowed and the very next capture fails: the notifier must keep
+        # checking and re-press, not read the empty capture as "prompt gone".
+        self.write_task("task-cap.txt")
+        self.swallow_enter_flag.write_text("1")
+        self.fail_capture_after_enter_flag.write_text("1")
+        result = self.run_event("task-cap.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1",
+                                                          "SUTANDO_NOTIFIER_SUBMIT_RETRIES": "2"}, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(self.sendkeys_log_text().count("ENTER"), 2,
+                                "a failed capture was taken as the prompt having left the composer")
+        self.assertIn("NOT confirmed", result.stderr)
 
     def test_filenames_differing_only_in_whitespace_are_distinct_tasks(self):
         # `task-a b.txt` completing must not suppress `task-ab.txt`: identity is the

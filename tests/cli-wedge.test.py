@@ -1102,6 +1102,8 @@ class LiveRetryBanner(unittest.TestCase):
         "  Connection error handling is covered by tests.",   # a wrapped sentence's second row
         "⎿  Read 3 files; retrying the build later",
         "Retrying in 2 seconds is what the docs recommend.",
+        "Connection error. The fix was retrying",              # cause, then prose, then the verb
+        "API Error handling is covered by tests.",
     )
 
     def test_each_live_banner_matches(self):
@@ -1116,10 +1118,58 @@ class LiveRetryBanner(unittest.TestCase):
         pane = "⏺ working\n" + self.LIVE[0] + "\n❯ \n"
         self.assertEqual(1, len(w.live_retry_banner_lines(pane)))
 
+    def test_a_cause_followed_by_prose_is_not_a_banner_even_when_it_ends_in_retrying(self):
+        self.assertEqual([], w.live_retry_banner_lines("Connection error. The fix was retrying"))
+        self.assertEqual(1, len(w.live_retry_banner_lines("Connection error · Retrying")))
+
     def test_the_retry_family_keyword_check_is_wider_than_the_banner(self):
         # RETRY_PATTERNS is telemetry over any text; the banner grammar must be strictly narrower.
         for line in self.PROSE:
             self.assertTrue(w.matched_patterns([line]) or "retry" not in line.lower(), line)
+
+
+class LiveParkedBanner(unittest.TestCase):
+    """The parked family as whole lines: the CLI's own stop banner, never a sentence naming it."""
+
+    LIVE = (
+        ("api-error", 'API Error: 529 {"type":"overloaded_error"}'),
+        ("api-error", "  ⎿  API Error (Connection error.)"),
+        ("api-error", "API Error"),
+        ("compacting", "Compacting conversation…"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired. Run /login"),
+        ("quota-limit", "You have hit your usage limit · resets 3pm"),
+        ("out-of-credits", "Credit balance is too low"),
+        ("awaiting-input", "Waiting for your approval"),
+        ("network-error", "Network error: fetch failed"),
+    )
+    PROSE = (
+        "API Error handling is covered by tests.",
+        "⏺ The API Error we saw yesterday was a 529.",
+        "compacting the notes into one file",
+        "the network error we saw yesterday was different",
+        "I logged in to continue the review",
+        "the usage limit is documented here",
+    )
+
+    def test_each_live_banner_is_found_with_its_family_and_name(self):
+        for name, line in self.LIVE:
+            hits = w.live_banner_lines(line)
+            self.assertEqual(1, len(hits), line)
+            self.assertEqual(("parked", name), hits[0][:2], line)
+
+    def test_prose_naming_a_parked_condition_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_banner_lines(line), line)
+
+    def test_a_retry_banner_reports_the_retry_family(self):
+        self.assertEqual(("retry", "retrying"), w.live_banner_lines("  ⎿  Connection error. Retrying in 2 seconds…")[0][:2])
+
+    def test_the_gate_grammar_is_narrower_than_the_detector(self):
+        # ABNORMAL_PATTERNS is telemetry over any text and may match prose; the gate must not.
+        for line in self.PROSE:
+            if w.matched_abnormal([line]):
+                self.assertEqual([], w.live_banner_lines(line), line)
 
 
 if __name__ == "__main__":

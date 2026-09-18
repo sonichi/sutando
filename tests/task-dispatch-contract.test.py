@@ -693,6 +693,53 @@ class InflightRecordTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mark_inflight(self.dir, bad, "1")
 
+    def test_an_empty_incarnation_is_refused_by_the_writer_and_the_cli(self):
+        with self.assertRaises(ValueError):
+            mark_inflight(self.dir, "task-e.txt", "  ")
+        self.assertFalse((self.dir / "task-e.txt").exists())
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-e.txt", ""]))
+
+    def test_concurrent_writers_never_race_on_a_shared_temp_path(self):
+        import threading
+        errors = []
+        def _w(i):
+            try:
+                mark_inflight(self.dir, "task-c.txt", str(i))
+            except Exception as exc:  # noqa: BLE001 - the point is that none happens
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=_w, args=(i,)) for i in range(128)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual([], errors)
+        self.assertTrue((self.dir / "task-c.txt").read_text().strip().isdigit())
+        self.assertEqual([], list(self.dir.glob(".task-c.txt.*")), "a temp file was left behind")
+
+    def test_cli_arms_in_process(self):
+        # The subprocess round trip proves the exit codes; this hits the same arms
+        # under the coverage tracer.
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-mark", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "2"]))
+        self.assertEqual(0, _main(["inflight-clear", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "../x.txt", "1"]))
+        self.assertEqual(2, _main(["inflight-clear", str(self.dir), "task-p.txt", "extra"]))
+
+    def test_an_unreadable_marker_is_cannot_decide_not_absent(self):
+        import os as _os
+        if _os.geteuid() == 0:
+            self.skipTest("root cannot be denied a read")
+        mark_inflight(self.dir, "task-u.txt", "1")
+        (self.dir / "task-u.txt").chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                inflight_is_live(self.dir, "task-u.txt", "1")
+            self.assertEqual(2, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]))
+        finally:
+            (self.dir / "task-u.txt").chmod(0o644)
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]), "readable again, it is live")
+
     def test_cli_round_trip(self):
         script = Path(__file__).resolve().parent.parent / "src" / "delivery" / "task_dispatch.py"
         def run(*args):
