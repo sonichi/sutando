@@ -563,7 +563,10 @@ TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 _tmux_wake() {
   # Poke the idle CLI session so it processes the new task without waiting
   # for the next 5-min proactive-loop cron tick (sutando-skills#27 / #1289).
-  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
+  # Through the shared sender, so wiring this path back in cannot reintroduce a
+  # writer that types into another writer's open transaction.
+  bash "$__REPO_ROOT/scripts/tmux-send-line.sh" "$TMUX_SESSION" '[watcher-ping]' \
+    --socket "$TMUX_SOCK" >/dev/null 2>&1 || true
 }
 
 # Clean up on exit:

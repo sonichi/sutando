@@ -80,6 +80,15 @@ rm -f "$T/bin/python3"
 : > "$TMUX_LOG"; (TMUX_CAP_DELAY=0.4 TMUX_SEND_DELAY=0.2 PATH="$T/bin:$PATH" bash "$HERE/scripts/tmux-send-line.sh" probe alpha --socket "$T/s.sock" >/dev/null 2>&1) & sleep 0.1; (PATH="$T/bin:$PATH" bash "$HERE/scripts/tmux-send-line.sh" probe beta --socket "$T/s.sock" >/dev/null 2>&1) & wait
 SEQ="$(grep send-keys "$TMUX_LOG" | sed -E 's/.*-l (alpha|beta)$/lit:\1/; s/.*Enter$/enter/' | tr '\n' ' ')"
 case "$SEQ" in "lit:alpha enter lit:beta enter "|"lit:beta enter lit:alpha enter ") ok "S7 two overlapping callers are serialized: $SEQ";; *) fail "S7 interleave" "$SEQ";; esac
+# --lock-fd: a caller holding THIS pane's lock across a transaction lends its fd; any other file is refused
+LOCKP="$(bash "$HERE/scripts/tmux-pane-lock.sh" "$T/s.sock" probe)"; : > "$TMUX_LOG"; rm -f "$T/rc"
+(exec 8>"$LOCKP"; "$(bash "$HERE/scripts/sutando-config.sh" python-bin)" -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX)'; PATH="$T/bin:$PATH" $SEND probe hello --socket "$T/s.sock" --lock-fd 8 > "$T/out" 2> "$T/err"; echo $? > "$T/rc") &
+i=0; until [ -e "$T/rc" ] || [ $i -ge 100 ]; do sleep 0.1; i=$((i+1)); done; [ -e "$T/rc" ] || { kill %% 2>/dev/null; echo hang > "$T/rc"; }; wait
+[ "$(cat "$T/rc")" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && ok "L1 --lock-fd on the caller-held pane lock: sends inside it, no deadlock" || fail "L1 lock-fd held" "rc=$(cat "$T/rc") $(cat "$T/err")"
+rc=$(: > "$TMUX_LOG"; exec 8>"$T/other.lock"; PATH="$T/bin:$PATH" $SEND probe hello --socket "$T/s.sock" --lock-fd 8 > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 8 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "is not the pane lock" "$T/err" && ok "L2 --lock-fd on some OTHER file: refused (8), nothing sent" || fail "L2 wrong lock" "rc=$rc $(cat "$T/err")"
+rc=$(run probe hello --socket "$T/s.sock" --lock-fd 8x); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && ok "L3 a non-integer --lock-fd: exit 2 before any tmux write" || fail "L3" "rc=$rc"
+[ "$LOCKP" = "$(bash "$HERE/scripts/tmux-pane-lock.sh" "$T/s.sock" probe)" ] && [ "$LOCKP" != "$(bash "$HERE/scripts/tmux-pane-lock.sh" "$T/s.sock" other)" ] && ok "L4 tmux-pane-lock.sh is deterministic per socket+session and distinct across sessions" || fail "L4 lock path" "$LOCKP"
 # --- real-tmux leg (optional): the same policy against a real server on a throwaway socket
 if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ]; then
   SOCKW="$T/w.sock"; OUTW="$T/pane.out"

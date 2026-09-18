@@ -66,6 +66,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from tmux_pane_lock import pane_lock  # noqa: E402
 
 import argparse
 import hashlib
@@ -500,13 +501,19 @@ def capture(socket, session):
 
 
 def send_keys(socket, session, key):
-    """Type one key into the core pane. True only when tmux accepted it."""
-    try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
-                           capture_output=True, timeout=8)
-        return r.returncode == 0
-    except Exception:
-        return False
+    """Type one key into the core pane. True only when tmux accepted it.
+
+    Taken under the pane lock: a key typed into another writer's open picker answers
+    the wrong prompt, so a busy pane defers rather than injecting."""
+    with pane_lock(socket, session) as held:
+        if not held:
+            return False
+        try:
+            r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
+                               capture_output=True, timeout=8)
+            return r.returncode == 0
+        except Exception:
+            return False
 
 
 def answer_step(state, kind, prompt, answered_prompt, enabled=True):

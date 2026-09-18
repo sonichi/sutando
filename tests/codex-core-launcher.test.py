@@ -89,6 +89,13 @@ class CodexCoreLauncherTests(unittest.TestCase):
             # sutando-config.sh sources this; a fixture repo without it dies with
             # "python-binary.sh: No such file or directory" (CI, #2599).
             "scripts/python-binary.sh",
+            # the notifier holds the pane lock across a delivery; both halves of the
+            # shared owner must exist or it refuses to type at all.
+            "scripts/tmux-pane-lock.bash",
+            "scripts/tmux-pane-lock.sh",
+            # tmux-pane-lock.bash execs this for the flock; absent, every take fails
+            # and the notifier reads as "declined" rather than "could not".
+            "src/tmux_pane_lock.py",
             "skills/task-workstream-grouping/scripts/workstreams.py",
         ):
             target = self.root / rel
