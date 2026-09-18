@@ -52,6 +52,66 @@ check $? "an install with no skills/ still launches (probe exits 0)"
 ! echo "$out3" | grep -q "SUTANDO_FIXTURE_CONFIG_VAR"
 check $? "nothing manifest-sourced appears when there is no skills/ dir"
 
+# --- hostile manifests (review blockers B1/B2) -------------------------------
+# Each case rebuilds skills/ so the fixtures cannot interact.
+hostile() {  # $1 = manifest JSON, sets $hout / $hrc / $herr
+  rm -rf "$TMP/repo/skills"; mkdir -p "$TMP/repo/skills/zz-hostile"
+  printf '%s' "$1" > "$TMP/repo/skills/zz-hostile/manifest.json"
+  hout="$(env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI_T" --print-core-env 2>"$TMP/err")"
+  hrc=$?; herr="$(cat "$TMP/err")"
+}
+
+# B1: a non-identifier key must not reach `export`, which aborts the launcher
+# under `set -e` and takes down every restart path.
+hostile '{"config": {"my-skill-key": "v", "ZZ_AFTER_BAD_KEY": "still-here"}}'
+[ "$hrc" -eq 0 ]
+check $? "a non-identifier config key does not abort the launch"
+echo "$hout" | grep -qx -- "ZZ_AFTER_BAD_KEY=still-here"
+check $? "keys after an invalid one are still forwarded"
+! echo "$hout" | grep -q "my-skill-key"
+check $? "the invalid key is not exported"
+echo "$herr" | grep -q "not a shell identifier"
+check $? "the skip is reported on stderr, not silent"
+
+# A newline in a value must not forge a second assignment (records are NUL-framed).
+hostile '{"config": {"ZZ_NL": "a\nZZ_INJECTED=yes", "ZZ_AFTER_NL": "still-here"}}'
+! echo "$hout" | grep -q "^ZZ_INJECTED="
+check $? "a newline in a value cannot inject a second env assignment"
+! echo "$hout" | grep -q "^ZZ_NL="
+check $? "the control-character value is skipped, not forwarded corrupted"
+echo "$hout" | grep -qx -- "ZZ_AFTER_NL=still-here"
+check $? "keys after a control-character value are still forwarded"
+echo "$herr" | grep -q "control character in value"
+check $? "the control-character skip is reported on stderr"
+
+# Exec-hijack vectors are refused however they are declared.
+hostile '{"config": {"PATH": "/tmp/evil", "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib", "ZZ_OK": "1"}}'
+! echo "$hout" | grep -qx -- "PATH=/tmp/evil"
+check $? "a manifest cannot set PATH"
+! echo "$hout" | grep -q "DYLD_INSERT_LIBRARIES"
+check $? "a manifest cannot set a loader-injection variable"
+echo "$hout" | grep -qx -- "ZZ_OK=1"
+check $? "an ordinary key alongside a protected one still lands"
+
+# Duplicate keys across skills resolve deterministically to one record.
+rm -rf "$TMP/repo/skills"
+mkdir -p "$TMP/repo/skills/aa-dup" "$TMP/repo/skills/bb-dup"
+printf '%s' '{"config": {"ZZ_DUP": "first"}}' > "$TMP/repo/skills/aa-dup/manifest.json"
+printf '%s' '{"config": {"ZZ_DUP": "second"}}' > "$TMP/repo/skills/bb-dup/manifest.json"
+dout="$(env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI_T" --print-core-env 2>/dev/null)"
+[ "$(echo "$dout" | grep -c '^ZZ_DUP=')" -eq 1 ]
+check $? "a key declared by two skills is forwarded exactly once"
+echo "$dout" | grep -qx -- "ZZ_DUP=first"
+check $? "the duplicate resolves to the first skill in glob order"
+
+# B2: an explicitly-empty caller value is a disable, and must not be re-filled.
+hostile '{"config": {"ZZ_DISABLED": "1"}}'
+eout="$(env -i HOME="$HOME" PATH="$STUB_PATH" ZZ_DISABLED= bash "$STARTCLI_T" --print-core-env 2>/dev/null)"
+! echo "$eout" | grep -qx -- "ZZ_DISABLED=1"
+check $? "a manifest does not override a caller's explicit empty value"
+[ "$(echo "$eout" | grep -c '^ZZ_DISABLED=')" -eq 1 ]
+check $? "the explicitly-disabled variable is forwarded exactly once"
+
 # Generic: the launcher itself must never name the fixture skill.
 ! grep -q "fixture-skill" "$STARTCLI"
 check $? "the core's launcher names no concrete skill (it discovers manifests generically)"

@@ -188,17 +188,29 @@ if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
 # Any installed skill's manifest.json "config" block, forwarded like every var
-# above; an already-set var always wins, so a caller's value is never overridden.
+# above. Set-ness wins, not non-emptiness: an explicit empty value (a product
+# deployment disabling a feature) must not be re-filled from a manifest.
+# Records are NUL-framed and the key is validated by the emitter; re-checked
+# here so a bad key can never reach `export` under `set -e`.
 if declare -F skill_manifest_config_pending >/dev/null; then
-  while IFS='=' read -r _mck _mcv; do
+  _mc_seen=" "
+  while IFS= read -r -d '' _mcrec; do
+    _mck=${_mcrec%%=*}
+    _mcv=${_mcrec#*=}
     [ -n "$_mck" ] || continue
-    if [ -n "${!_mck:-}" ]; then
+    case "$_mck" in
+      [!A-Za-z_]* | *[!A-Za-z0-9_]*) continue ;;
+    esac
+    case "$_mc_seen" in *" $_mck "*) continue ;; esac
+    _mc_seen="$_mc_seen$_mck "
+    if [ "${!_mck+x}" = x ]; then
       CORE_ENV_ARGS+=(-e "$_mck=${!_mck}")
     else
       export "$_mck=$_mcv"
       CORE_ENV_ARGS+=(-e "$_mck=$_mcv")
     fi
   done < <(skill_manifest_config_pending "$REPO" "$PY")
+  unset _mc_seen _mcrec
 fi
 # Route the core through the credential proxy when one is live (quota
 # telemetry, #2211/#2288). startup.sh exports ANTHROPIC_BASE_URL for cores
