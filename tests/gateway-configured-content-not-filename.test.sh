@@ -122,9 +122,8 @@ out="$(drive_health "$MATRIX_ENV" '')"
 case "$out" in "health=False runtime=False") check 0 "no token anywhere: both report unconfigured" ;;
                *) check 1 "no token anywhere: both report unconfigured" ;; esac
 
-# ── 6. Degrade path: with no runnable interpreter the resolver cannot run, and
-#      a configured host must still reach the explicit skip rather than read as
-#      unconfigured (which would hide the reason from the operator).
+# ── 6. Degrade path: with no runnable interpreter a configured host must still
+#      reach the explicit skip rather than read as unconfigured.
 out="$(drive_startup 'REMOTE_TASK_TOKEN=dot-env-token
 ' '' "")"
 echo "  no python3       -> ${out:-<no output>}"

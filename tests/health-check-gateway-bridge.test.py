@@ -323,8 +323,7 @@ def main() -> int:
         check("_gateway_configured: token only in a COMMENT → False",
               _configured(channels_dir=_chan) is False)
 
-        # The filename defect: `.env` carries another channel's creds and the
-        # token sits in a sibling. Reading `.env` by name reports unconfigured,
+        # Reading `.env` by name reports a sibling-held token as unconfigured,
         # which suppresses this probe AND the gateway-down warn.
         _gw.write_text("MATRIX_ACCESS_TOKEN=matrix-only\n")
         _sibling.write_text("REMOTE_TASK_TOKEN=sibling-token\n")
