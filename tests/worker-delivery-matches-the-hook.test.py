@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from worker_delivery import SENTINEL_SUFFIXES, holder_of  # noqa: E402
+from worker_delivery import SENTINEL_SUFFIXES, _is_dir, holder_of  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -70,6 +70,7 @@ check(holder_of(ws3, "task-ccc") is None, "another task's sentinel does not mark
 
 ws4 = Path(tempfile.mkdtemp())
 check(holder_of(ws4, "task-ddd") is None, "an absent deliveries/ means nobody holds it")
+check(_is_dir(ws4 / "not-there") is False, "_is_dir: a path that is simply absent is False, not an error")
 
 # Only ENOENT is absence. is_dir()/exists() report a FAILED stat as False, so an
 # unreadable recipient or sentinel would read as "nobody holds it".
@@ -162,6 +163,27 @@ else:
         (ws6 / "deliveries").chmod(0o755)
     check(r3.returncode == 2, "an unreadable deliveries/ exits 2 (cannot decide), never 1")
     check("cannot decide" in r3.stderr, "and says so on stderr rather than raising a traceback")
+    # In-process too: the subprocess above proves the exit code, but no coverage
+    # tracer follows it, so main()'s except arm reads as unhit in the gate.
+    _ut2 = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_ut2)
+    _errbuf = _io.StringIO()
+    (ws6 / "deliveries").chmod(0o000)
+    try:
+        _saved_argv = sys.argv[:]
+        sys.argv = ["unanswered-tasks.py", "--workspace", str(ws6)]
+        with _ctx.redirect_stderr(_errbuf):
+            # Catch rather than propagate: a bare-script suite aborts on the first
+            # exception, which would hide every case below this one.
+            try:
+                _rc = _ut2.main()
+            except OSError as _exc:
+                _rc = f"raised {type(_exc).__name__}"
+    finally:
+        sys.argv = _saved_argv
+        (ws6 / "deliveries").chmod(0o755)
+    check(_rc == 2, "main() in-process returns 2 on an unreadable deliveries/")
+    check("cannot decide" in _errbuf.getvalue(), "and writes the cannot-decide line itself")
     check("Traceback" not in r3.stderr, "no traceback: the CLI owns its own failure mode")
     # The same tree, readable, is the control that proves the 2 came from the mode bits.
     r4 = subprocess.run([sys.executable, str(ROOT / "scripts" / "unanswered-tasks.py"),
