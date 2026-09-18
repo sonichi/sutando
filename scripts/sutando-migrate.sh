@@ -1673,11 +1673,27 @@ commit_source() {
     fi
 }
 
+# Is the installer's OWN archive-hook command shape (current or legacy
+# Desktop form) registered in this settings file -- never a bare substring,
+# which a foreign hook merely naming the script would also match.
+_settings_has_archive_hook() {
+    [ -f "$1" ] || return 1
+    # Every pattern via -e -- BSD grep (macOS default) treats a bare pattern
+    # mixed with -e as a filename, not a fourth alternative.
+    jq -r '(.hooks.PreCompact // [])[] .hooks[]? .command // empty' "$1" 2>/dev/null \
+        | grep -Eq -e "^bash '[^']*/archive-transcript\.sh' '[^']*logs/conversations/[^']*'\$" \
+                   -e "^cp \"\\\$TRANSCRIPT_PATH\" \"\\\$HOME/Desktop/sutando-conversations/" \
+                   -e "^bash '[^']*/archive-transcript\.sh' \"\\\$HOME/Desktop/sutando-conversations/\"\$"
+}
+
 commit_main() {
     # Set by the hook bridge below on a real installer failure; checked at the
     # end so `--commit`'s own exit status reflects it (startup.sh's migration
     # sentinel is gated on that status, not on this function's prose output).
     local _hook_bridge_failed=0
+    # Default here, not only inside the bridge branch below: a retry marker
+    # write must see this even when that branch never ran (skip/fallback path).
+    local _archive_opted_in=0
 
     # Mini's polish: --delete-source REQUIRES --backup-id pointer. Forces
     # operator to reference a real backup before destructive op.
@@ -1855,10 +1871,13 @@ commit_main() {
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
                     # Default-off transcript archiving unless already opted in
-                    # (health-check's --fix policy) -- migration must not silently enable it.
-                    local _archive_opted_in=0
-                    if grep -q 'archive-transcript\.sh' "$_new_settings" 2>/dev/null \
-                       || grep -q 'archive-transcript\.sh' "$_old_settings" 2>/dev/null; then
+                    # (health-check's --fix policy) -- migration must not silently
+                    # enable it. Anchored to the installer's own emitted shape, not
+                    # a bare substring: an unrelated hook/comment merely mentioning
+                    # "archive-transcript.sh" (a foreign decoy) must not count as
+                    # consent (keweichen, round 16).
+                    if _settings_has_archive_hook "$_new_settings" \
+                       || _settings_has_archive_hook "$_old_settings"; then
                         _archive_opted_in=1
                     fi
                     # `local _hb_rc=$?` after a failing command aborts under `set -e`
@@ -2005,8 +2024,10 @@ commit_main() {
     # comes from THIS function's exit status alone (see _hook_bridge_failed above).
     if [ "$_hook_bridge_failed" = "1" ]; then
         mkdir -p "$DEST_REAL/state" 2>/dev/null
-        printf 'hook_bridge_failed_at=%s\nretry=bash src/install-claude-hooks.sh\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$DEST_REAL/state/.hook-bridge-retry-needed" 2>/dev/null
+        # Persist this attempt's archive-consent decision so a retry (src/startup.sh)
+        # doesn't silently re-enable archiving regardless of what the original run chose.
+        printf 'hook_bridge_failed_at=%s\nretry=bash src/install-claude-hooks.sh\narchive_opted_in=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_archive_opted_in" > "$DEST_REAL/state/.hook-bridge-retry-needed" 2>/dev/null
         echo
         echo "sutando-migrate: COMMIT reporting FAILURE — the hook bridge did not install successfully (see above)." >&2
         echo "  Retry marker: $DEST_REAL/state/.hook-bridge-retry-needed" >&2
