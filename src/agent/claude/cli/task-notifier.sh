@@ -217,12 +217,6 @@ capture_tail() {
   capture_raw | sed '/^[[:space:]]*$/d'
 }
 
-# One read serves both baseline checks: the escapes (-e) tell the CLI's dim ghost
-# text from a typed draft, and the same capture stripped of them is the plain text.
-capture_raw_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
-}
-
 # The visible screen only: a banner is live when it is on screen, and an error
 # that scrolled off is history however small the pane.
 capture_view_esc() {
