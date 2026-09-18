@@ -31,6 +31,26 @@ grep -q "transition RUNNING" "$log" 2>/dev/null && echo "PASS RUNNING follows th
 grep -q "transition QUEUED" "$log" 2>/dev/null && { echo "FAIL emit_dispatch_task_file must not re-mark QUEUED"; fail=1; } || echo "PASS QUEUED is dispatch_task's, not the emitter's"
 rm -rf "$tmp"
 
+# The QUEUE line: the TASK_FILE line stays byte-identical, and a second line
+# `QUEUE: <n> pending after this` follows only when other owner tasks are waiting.
+tmpq="$(mktemp -d)"; mkdir -p "$tmpq/ws/tasks" "$tmpq/ws/state"
+printf 'id: task-q1\ntask: first\n' > "$tmpq/ws/tasks/task-q1.txt"
+out1="$(TASKS_DIR="$tmpq/ws/tasks" bash -c 'source "$1"; emit_dispatch_task_file task-q1.txt' _ "$SRC/task-emit.sh" 2>/dev/null)"
+[ "$out1" = "TASK_FILE: task-q1.txt" ] && echo "PASS alone in the queue: exactly the TASK_FILE line" || { echo "FAIL alone in the queue, stdout was: $out1"; fail=1; }
+sleep 1
+printf 'id: task-q2\ntask: second\n' > "$tmpq/ws/tasks/task-q2.txt"
+printf 'id: task-cron-x\ntask: bookkeeping\n' > "$tmpq/ws/tasks/task-cron-x.txt"
+out2="$(TASKS_DIR="$tmpq/ws/tasks" bash -c 'source "$1"; emit_dispatch_task_file task-q2.txt' _ "$SRC/task-emit.sh" 2>/dev/null)"
+[ "$(printf '%s\n' "$out2" | head -1)" = "TASK_FILE: task-q2.txt" ] && echo "PASS the first line is byte-identical with a queue" || { echo "FAIL first line changed: $out2"; fail=1; }
+[ "$(printf '%s\n' "$out2" | sed -n 2p)" = "QUEUE: 1 pending after this" ] && echo "PASS QUEUE names the one other owner task (bookkeeping excluded)" || { echo "FAIL QUEUE line: $out2"; fail=1; }
+[ "$(printf '%s\n' "$out2" | wc -l | tr -d ' ')" = "2" ] && echo "PASS nothing after the QUEUE line" || { echo "FAIL extra lines: $out2"; fail=1; }
+grep -q '"depth": 2' "$tmpq/ws/state/task-queue.json" 2>/dev/null && echo "PASS the snapshot is refreshed on dispatch" || { echo "FAIL no fresh state/task-queue.json: $(cat "$tmpq/ws/state/task-queue.json" 2>/dev/null)"; fail=1; }
+# A stubbed interpreter that prints nothing: no line it cannot vouch for.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$tmpq/py"; chmod +x "$tmpq/py"
+out3="$(TASKS_DIR="$tmpq/ws/tasks" SUTANDO_PY_BIN="$tmpq/py" bash -c 'source "$1"; emit_dispatch_task_file task-q2.txt' _ "$SRC/task-emit.sh" 2>/dev/null)"
+[ "$out3" = "TASK_FILE: task-q2.txt" ] && echo "PASS no counter, no QUEUE line" || { echo "FAIL a QUEUE line without a count: $out3"; fail=1; }
+rm -rf "$tmpq"
+
 # Behaviour, not text: a grep for the argument NAME cannot tell the resolved
 # variable from a reverted one -- both are plain `"$var"`. Assert the row.
 tmp2="$(mktemp -d)"; log2="$tmp2/bus.log"

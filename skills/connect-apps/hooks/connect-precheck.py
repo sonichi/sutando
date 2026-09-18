@@ -9,7 +9,9 @@ network: a cold cache says nothing about connectedness), and one line of `additi
 printed:
 
   connect-apps precheck: needs_connect=googlecalendar (Google Calendar); connected=linear;
-  room_kind=dm; run: … connectors.py card googlecalendar --room … --owner-from-task …
+  room_kind=dm; reply_to=dm; run: … connectors.py card googlecalendar --room … --owner-from-task …
+
+`reply_to` is where the answer goes: the task's own room (`room`) unless the room is the owner's DM.
 
 The same script is declared for PreToolUse and PostToolUse (manifest.json): Claude Code documents
 `additionalContext` for PostToolUse, and the PreToolUse copy reaches the agent on versions that honor
@@ -131,6 +133,11 @@ def room_kind(fields: dict) -> str:
     return "unknown"
 
 
+def reply_to(fields: dict) -> str:
+    """dm when the task's room is the owner's DM, else room: the answer goes where it was asked."""
+    return "dm" if room_kind(fields) == "dm" else "room"
+
+
 def card_eligible(fields: dict) -> bool:
     """The skill's Step 0: only the owner's own AG2 Space message task gets a card."""
     return (fields.get("source") == "ag2space" and fields.get("access_tier") == "owner"
@@ -199,6 +206,7 @@ def context_line(hits: list[dict], connected: set[str] | None, fields: dict, tid
         parts = ["needs_connect=" + (",".join(f"{h['slug']} ({h['name']})" for h in hits if h["slug"] in missing) or "none"),
                  "connected=" + (",".join(sorted(connected)[:MAX_CONNECTED]) or "none")]
     parts.append(f"room_kind={kind}")
+    parts.append(f"reply_to={reply_to(fields)}")
     if missing and card_eligible(fields):
         room = fields.get("source_room_id") or fields.get("channel_id") or "<room>"
         private = " --private" if kind == "room" else ("" if kind == "dm" else " [--private unless the room is your DM]")

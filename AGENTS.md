@@ -18,6 +18,15 @@ reason TO delegate, not to hand it back. If no mechanism is available, do it inl
 never report work as delegated when nothing was spawned.
 Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
 
+**Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
+error, a code identifier, a term with no good translation), say so in one clause. A stated
+preference is written to `user_profile.md` and kept.
+
+**Blockers, stated plainly.** When you cannot finish because of a quota, a missing capability, a
+site that blocks you or a permission you lack, say exactly that in one line, name what unblocks it,
+and stop. No silent retries, no wording that implies success. If several requests are pending, say
+how many are ahead of this one.
+
 ## Architecture rules
 
 Rationale + worked examples for every boundary rule below (quoted section names) live in [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) — read the named section before working on that boundary.
@@ -265,7 +274,12 @@ python3 skills/task-progress/scripts/notify.py \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread. An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+
+**Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
+pending, the first line to that task's conversation names the position: "Got it. 2 ahead of this
+one, working in order." One line per task, in its own conversation, voice included; never narrate
+the queue anywhere else.
 
 Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
 
@@ -308,6 +322,15 @@ Tasks arrive from multiple channels via the same file bridge:
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
 
+### Where replies go
+
+Reply where you were asked: a task with `channel_id`/`source_room_id` is answered in that room,
+threaded to `source_message_id`. Web research, listings, shopping, summaries, code: always in the
+room, however personal the topic. The DM exception is a closed list: data read from the owner's
+connected accounts or device (mail, calendar events, contacts, message history, files from
+Drive/Dropbox/Notion, credentials, health or financial records). When you move an answer, post it
+in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.
+
 **Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones. Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
 - `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.
 - `[no-send]` — skip delivery (still archives); internally handled, no user-visible reply.
@@ -325,7 +348,7 @@ Tasks arrive from multiple channels via the same file bridge:
 
 Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python).
 
-**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
+**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
 If Sutando.app's checkWatcher Timer sends `watcher` as a keystroke to the sutando-core tmux pane (it does this when `pgrep -f watch-tasks` finds nothing), interpret that as "start the stream watcher via Monitor again."
 
@@ -366,6 +389,10 @@ If an integration needs a key that isn't in the vault yet, ask the user to send 
 ## Built-in tools
 
 **When the user asks for a capability not visible in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the authoritative catalog of what Sutando can directly do — per-tool bash recipes for Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts. Kept out of AGENTS.md to save per-session context budget.
+
+**Before saying a capability does not exist, check `docs/built-in-tools.md`, the skills directory and
+the last tool response.** Cloud tools are activated by the `marketplace` skill; a newly activated tool
+is usable at once through station_find/station_call unless the script printed RESTART REQUIRED.
 
 ## Learn from demonstration
 

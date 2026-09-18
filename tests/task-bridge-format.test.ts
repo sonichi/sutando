@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { workTool } from '../src/task-bridge.js';
+import { countQueuedAhead, queuedAheadInstruction, workTool } from '../src/task-bridge.js';
+import { readQueueDepth } from '../src/inline-tools.js';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 // Integration test for PR #460's unified task-file schema. Every voice /
 // work-tool task should emit the same set of fields the Discord bridge
@@ -90,5 +93,49 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		const fn1 = await invokeWorkTool('first');
 		const fn2 = await invokeWorkTool('second');
 		assert.notEqual(fn1, fn2, 'task IDs must differ');
+	});
+
+	it('returns queuedAhead: how many owner tasks stood in tasks/ before this one', async () => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const first = await (workTool.execute as any)({ task: 'queue probe one' }, null) as { taskId: string; queuedAhead: number; message: string };
+		createdFiles.push(first.taskId + '.txt');
+		assert.equal(typeof first.queuedAhead, 'number');
+		assert.ok(first.queuedAhead >= 0);
+		// The first file is still in tasks/, so the second call sees at least one ahead of it,
+		// and its message carries the one sentence the voice agent is to say.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const second = await (workTool.execute as any)({ task: 'queue probe two' }, null) as { taskId: string; queuedAhead: number; message: string };
+		createdFiles.push(second.taskId + '.txt');
+		assert.ok(second.queuedAhead >= first.queuedAhead + 1, `second saw ${second.queuedAhead}, first ${first.queuedAhead}`);
+		assert.match(second.message, new RegExp(`Got it, ${second.queuedAhead} ahead of this one, working in order`));
+		assert.ok(second.message.startsWith('Task has been '), 'the original instruction is kept in front');
+	});
+});
+
+describe('queue depth helpers (pure, temp dirs)', () => {
+	it('countQueuedAhead counts owner task files only, excluding this task and bookkeeping', () => {
+		const dir = mkdtempSync(join(tmpdir(), 'queue-ahead-'));
+		for (const f of ['task-1.txt', 'task-2.txt', 'task-chat-3.txt', 'task-cron-4.txt', 'task-bench-5.txt',
+			'task-workstream-6.txt', 'task-project-grouping-7.txt', 'notes.md', 'task-8.json']) {
+			writeFileSync(join(dir, f), 'id: x\ntask: y\n');
+		}
+		assert.equal(countQueuedAhead(dir, 'task-2'), 2, 'task-1 and task-chat-3');
+		assert.equal(countQueuedAhead(dir, 'task-none'), 3);
+		assert.equal(countQueuedAhead(join(dir, 'missing'), 'task-2'), 0, 'an unreadable dir is 0, never a throw');
+		assert.equal(queuedAheadInstruction(0), '');
+		assert.match(queuedAheadInstruction(2), /Got it, 2 ahead of this one, working in order/);
+	});
+
+	it('readQueueDepth reads state/task-queue.json and treats a stale or absent snapshot as unknown', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'queue-depth-'));
+		assert.equal(readQueueDepth(ws), null, 'absent');
+		mkdirSync(join(ws, 'state'), { recursive: true });
+		const now = 1_800_000_000;
+		writeFileSync(join(ws, 'state', 'task-queue.json'), JSON.stringify({ ts: now - 30, depth: 3, pending: [] }));
+		assert.equal(readQueueDepth(ws, now), 3);
+		writeFileSync(join(ws, 'state', 'task-queue.json'), JSON.stringify({ ts: now - 601, depth: 3, pending: [] }));
+		assert.equal(readQueueDepth(ws, now), null, 'older than 10 minutes');
+		writeFileSync(join(ws, 'state', 'task-queue.json'), '{not json');
+		assert.equal(readQueueDepth(ws, now), null, 'torn');
 	});
 });

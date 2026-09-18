@@ -147,12 +147,18 @@ line (Step 2) repeats the verdict as `room_kind=dm|room|unknown`; `unknown` mean
 
 ## Where the answer may go
 
-- **Something the owner asked you to do or find where they asked** (post to Slack, create a Linear
-  issue, search YouTube, summarize a public page): reply in the room they asked in, like any reply.
-- **Private content** (mail, calendar events, files and docs, messages, contacts): only in the
-  owner's DM. From a shared room, find your DM with the owner with `room.list` and confirm it with
-  `room.inspect` as above; the answer goes there, and the shared room gets only "I sent it to you in
-  our DM." No confirmed DM: text only, no data ("I can only share your calendar in our DM.").
+Reply where you were asked. The precheck line (Step 2) says it as `reply_to=room|dm`.
+
+- **Anything you did, found or wrote on the web or in a public app** (post to Slack, create a Linear
+  issue, search YouTube, summarize a public page, web research, listings, shopping, summaries, code):
+  reply in the room they asked in, like any reply, however personal the topic. An apartment search
+  asked in a shared room is answered in that room.
+- **The DM exception is a closed list: data read from the owner's connected accounts or device**
+  (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
+  health or financial records): only in the owner's DM. From a shared room, find your DM with the
+  owner with `room.list` and confirm it with `room.inspect` as above; the answer goes there, and the
+  shared room gets exactly one line: "I sent it to you in our DM." Never move silently. No confirmed
+  DM: text only, no data ("I can only share your calendar in our DM.").
 
 Connecting itself (the card, "isn't connected yet", "once that's done", timeouts, account notes) is
 never posted in a shared room: it goes on the private card (step 3b).
@@ -160,7 +166,7 @@ never posted in a shared room: it goes on the private card (step 3b).
 ## Step 2: find the apps
 
 When you first touched the task file, the connect-apps precheck hook may have added a line to your
-context: `connect-apps precheck: needs_connect=<slugs>; connected=<slugs>; room_kind=…; run: …`.
+context: `connect-apps precheck: needs_connect=<slugs>; connected=<slugs>; room_kind=…; reply_to=…; run: …`.
 It is read from the task's words and a 30-second cache of the owner's connections, so:
 
 - `needs_connect=` names every app the request needs (and `connected=` the rest): skip
@@ -384,7 +390,10 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
   connecting new apps.
 - Never disconnect an app, and never switch one without the owner's card tap.
 - One card per request, listing every app it needs.
-- Private content (mail, calendar, files, messages, contacts) only in a room confirmed as the owner's DM.
+- Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
+  history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
+  confirmed as the owner's DM; that list is closed. Web research, listings, shopping, summaries and
+  code go where they were asked. A moved answer leaves one line in the room: "I sent it to you in our DM."
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
   on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.

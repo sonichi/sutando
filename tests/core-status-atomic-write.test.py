@@ -81,6 +81,53 @@ strays = [f.name for f in wd.status_path("core-status.json", ws).parent.iterdir(
           if ".tmp" in f.name]
 check(not strays, f"no stray temp files ({strays})")
 
+print("4. the shell wrapper carries the pending queue and refreshes state/task-queue.json")
+# The real scripts/core-status.sh from a copy of the repo tooling whose workspace_default is
+# pinned to a temp workspace: the production writer and queue reader, none of the live workspace.
+import json
+import os
+import shutil
+import subprocess
+
+rig = Path(tempfile.mkdtemp())
+ws4 = rig / "ws"
+(ws4 / "tasks").mkdir(parents=True)
+(rig / "scripts").mkdir(); (rig / "src").mkdir()
+shutil.copy(REPO / "scripts" / "core-status.sh", rig / "scripts" / "core-status.sh")
+shutil.copy(REPO / "scripts" / "python-binary.sh", rig / "scripts" / "python-binary.sh")
+(rig / "src" / "workspace_default.py").write_text(
+    "import importlib.util\nfrom pathlib import Path\n"
+    f"_spec = importlib.util.spec_from_file_location('wd_real', {str(REPO / 'src' / 'workspace_default.py')!r})\n"
+    "_m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)\n"
+    f"WS = Path({str(ws4)!r})\n"
+    "def resolve_workspace(migrate=True): return WS\n"
+    "def status_path(name, workspace=None): return _m.status_path(name, WS)\n"
+    "def write_status(name, payload, workspace=None): return _m.write_status(name, payload, workspace=WS)\n")
+(rig / "src" / "task_queue.py").write_text(
+    "import importlib.util\n"
+    f"_spec = importlib.util.spec_from_file_location('task_queue', {str(REPO / 'src' / 'task_queue.py')!r})\n"
+    "_m = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_m)\n"
+    "pending = _m.pending\nwrite_snapshot = _m.write_snapshot\n")
+(ws4 / "tasks" / "task-one.txt").write_text("id: task-one\nsource: ag2space\ntask: hi\n")
+(ws4 / "tasks" / "task-cron-1.txt").write_text("id: task-cron-1\ntask: bookkeeping\n")
+run = subprocess.run(["bash", str(rig / "scripts" / "core-status.sh"), "running", "probe"],
+                     capture_output=True, text=True, cwd=str(rig))
+check(run.returncode == 0, f"core-status.sh exits 0 ({run.stderr.strip()[-200:]})")
+rec = json.loads((ws4 / "state" / "core-status.json").read_text())
+check(rec.get("status") == "running" and rec.get("step") == "probe" and isinstance(rec.get("ts"), int),
+      "status, step and ts are still written")
+check([t.get("id") for t in rec.get("pending", [])] == ["task-one"],
+      f"pending lists the owner queue, bookkeeping excluded ({rec.get('pending')})")
+snap = json.loads((ws4 / "state" / "task-queue.json").read_text())
+check(snap.get("depth") == 1 and [t["id"] for t in snap["pending"]] == ["task-one"],
+      "state/task-queue.json is refreshed by the same write")
+run_idle = subprocess.run(["bash", str(rig / "scripts" / "core-status.sh"), "idle"],
+                          capture_output=True, text=True, cwd=str(rig))
+rec_idle = json.loads((ws4 / "state" / "core-status.json").read_text())
+check(run_idle.returncode == 0 and rec_idle.get("status") == "idle" and "pending" in rec_idle,
+      "idle carries pending too")
+shutil.rmtree(rig, ignore_errors=True)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)")
     sys.exit(1)

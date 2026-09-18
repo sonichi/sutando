@@ -592,6 +592,26 @@ class Wiring(unittest.TestCase):
         bus.main(["transition", "COMPLETED", "--task-file", str(self.ws / "tasks" / "task-w1.txt"), "--into-task", "task-h1", "--workspace", str(self.ws)])
         self.assertEqual((self.rows()[-1]["line"], self.rows()[-1]["task"]["into"]), ("consolidated", "$holder"))
 
+    def test_the_queued_row_carries_the_tasks_place_in_the_pending_list(self):
+        # Three files land: the QUEUED transition of each names how many are ahead of it, from the
+        # pending list (task_queue.position), and only the queued row carries `queue`.
+        for i, name in enumerate(("task-w1", "task-w2", "task-w3")):
+            if name != "task-w1":
+                (self.ws / "tasks" / f"{name}.txt").write_text(
+                    f"id: {name}\nchannel_id: !r:s\nuser_id: @q:s\ntask: Fix it {i}\nsource_message_id: $m{i}\nsource: ag2space\n")
+            os.utime(self.ws / "tasks" / f"{name}.txt", (1_700_000_000 + i, 1_700_000_000 + i))
+        (self.ws / "tasks" / "task-cron-9.txt").write_text("id: task-cron-9\ntask: bookkeeping\n")
+        for name in ("task-w1", "task-w2", "task-w3"):
+            self.assertEqual(bus.main(["transition", "QUEUED", "--task-file", str(self.ws / "tasks" / f"{name}.txt"), "--workspace", str(self.ws)]), 0)
+        rows = self.rows()
+        self.assertEqual([(r["line"], r["queue"]) for r in rows],
+                         [("queued", {"depth": 3, "position": 1}), ("queued · 1 ahead", {"depth": 3, "position": 2}),
+                          ("queued · 2 ahead", {"depth": 3, "position": 3})])
+        self.assertEqual(bus.main(["transition", "RUNNING", "--task-file", str(self.ws / "tasks" / "task-w3.txt"), "--workspace", str(self.ws)]), 0)
+        self.assertNotIn("queue", self.rows()[-1], "only the queued row carries the queue")
+        self.assertEqual(bus.queued_line({"depth": 5, "position": 1}), "queued")
+        self.assertEqual(bus.queued_line(None), "queued")
+
     def test_a_queued_that_lands_after_its_running_is_history_not_a_regression(self):
         # The emitter's QUEUED and RUNNING are independent processes: RUNNING (stamped later) can take
         # the lock first. The earlier-stamped QUEUED still writes its row and never regresses the phase.

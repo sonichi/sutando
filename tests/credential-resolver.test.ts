@@ -14,6 +14,9 @@
  *  5. S3/R15 read side: opaque generations are REPORTED (managed `generation`
  *     field / SUTANDO_VOICE_CREDENTIAL_GENERATION), never minted; top-level
  *     `preferenceRevision`/`sessionRevision` are tolerated and ignored.
+ *  6. 'gemini-image': slots text THEN voice per tier; a byok voice preference
+ *     skips only the managed voice slot; a managed preference never blocks its
+ *     env fallback; quarantine hides every managed entry.
  *
  * TWIN: tests/credential-resolver.test.py mirrors this file one-for-one; any
  * contract change must land in both (policy-twin lesson, #2516).
@@ -241,6 +244,64 @@ test('gemini-text env key never picks up the VOICE generation env var', () => {
 	process.env.SUTANDO_VOICE_CREDENTIAL_GENERATION = 'cg1-injected';
 	assert.deepEqual(resolveCredential('gemini-text', { managedPath: missing() }),
 		{ key: 'mk', source: 'env' });
+});
+
+// --- gemini-image: any Gemini key, text slot first, voice slot second -------
+
+test('image: legacy env chain is TEXT key first, then VOICE key, then none', () => {
+	process.env.GEMINI_VOICE_API_KEY = 'vk';
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: 'vk', source: 'env' });
+	delete process.env.GEMINI_VOICE_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: '', source: 'none' });
+});
+
+test('image: managed TEXT beats managed VOICE and env; a voice-only managed install serves images', () => {
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS) }),
+		{ key: 'managed-t', source: 'managed' });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }) }),
+		{ key: 'managed-v', source: 'managed' });
+});
+
+test('image: byok voice preference skips only the managed VOICE slot', () => {
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS, { voicePreference: 'byok' }) }),
+		{ key: 'managed-t', source: 'managed' });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }, { voicePreference: 'byok' }) }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }, { voicePreference: 'byok' }) }),
+		{ key: '', source: 'none' });
+});
+
+test('image: a managed voice preference never blocks the env fallback (not a voice surface)', () => {
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({}, { voicePreference: 'managed' }) }),
+		{ key: 'mk', source: 'env' });
+});
+
+test('image: quarantine hides every managed entry', () => {
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS, { quarantined: true }) }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS, { quarantined: true }) }),
+		{ key: '', source: 'none' });
+});
+
+test('image: managed generation reported verbatim; env never carries the VOICE generation', () => {
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-text': { key: 'managed-t', generation: 'cg1-img' } }) }),
+		{ key: 'managed-t', source: 'managed', credentialGeneration: 'cg1-img' });
+	process.env.GEMINI_VOICE_API_KEY = 'vk';
+	process.env.SUTANDO_VOICE_CREDENTIAL_GENERATION = 'cg1-injected';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: 'vk', source: 'env' });
 });
 
 // --- credentialSourceLabel: the design's user-facing vocabulary -------------

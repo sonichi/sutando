@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-15"
+   "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -299,7 +299,7 @@
    ],
    "status": "active",
    "canonical_for": "generated source-module inventory",
-   "last_verified": "2026-07-23"
+   "last_verified": "2026-09-18"
   },
   "docs/state-sync-allowlist.md": {
    "title": "State sync allowlist design",
