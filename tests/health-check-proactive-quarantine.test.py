@@ -104,6 +104,38 @@ class TestProactiveQuarantine(unittest.TestCase):
             r = self._run(td)
             self.assertEqual(r["status"], "ok", r)
 
+    def test_a_body_inside_a_subdirectory_is_still_undelivered(self):
+        """The sibling above pins that an empty subdirectory is not a message.
+        It must not be read as "anything below the top level is ignored": the
+        only documented action on this directory is for a human to move bodies
+        out of the way, so a dated folder of them is the expected shape, and a
+        top-level-only scan reports the host clean while messages sit unread.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            nested = q / "triaged-2026-09-11"
+            nested.mkdir()
+            body = nested / "proactive-1785870055.txt"
+            body.write_text("a reply nobody received")
+            os.utime(body, (time.time() - 8100, time.time() - 8100))
+            r = self._run(td)
+            self.assertEqual(r["status"], "warn", r)
+            self.assertIn("1 proactive message(s)", r["detail"])
+            # Named by its path under the quarantine root, not a bare basename:
+            # two triage folders can hold the same filename.
+            self.assertIn("triaged-2026-09-11/proactive-1785870055.txt", r["detail"])
+
+    def test_an_empty_subdirectory_still_does_not_inflate_the_count(self):
+        """Control for the test above: descending must not make a directory
+        entry itself count. Without this, "sees nested bodies" is satisfied by
+        counting directories too."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            (q / "triaged-2026-09-11").mkdir()
+            (q / "triaged-2026-09-17" / "deeper").mkdir(parents=True)
+            r = self._run(td)
+            self.assertEqual(r["status"], "ok", r)
+
     # --- coverage is part of the verdict ---------------------------------
     def test_an_unreadable_entry_is_reported_not_rounded_down(self):
         """An entry we cannot stat must appear in the detail. Rounding it into
