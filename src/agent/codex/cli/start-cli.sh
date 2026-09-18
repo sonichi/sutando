@@ -228,7 +228,9 @@ ensure_core_monitor() {
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
-  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET} .*--out ${mon_out}" >/dev/null 2>&1; then
+  # Socket only (see the claude launcher): the desktop launcher's tmux-window
+  # copy spells --out differently, and one watcher per socket is the invariant.
+  if pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" >/dev/null 2>&1; then
     return 0
   fi
   python3 "$REPO/src/core-input-watch.py" \

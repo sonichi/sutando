@@ -11,8 +11,18 @@ Existing `health_fix_*` and `core_*` events retain their current meanings.
 | `recovery_issue_recovered` | The issue's recovery was subsequently observed |
 
 Every issue event contains `issue_id` and `issue_type` (`health_check` or `core`).
-Check names, task identities, paths, and details stay local. Each health check has
-its own UUID even though its exported type is the same privacy-safe category.
+Events also contain `issue_cause`, fixed at the first detection and retained across
+retries, restarts, and recovery. Built-in checks emit `health:<check>:<status>`
+(for example `health:disk-space:warn`); core restarts emit `core:dead` or
+`core:wedged`. These are observed trigger reasons, not proven underlying root causes.
+Only built-in names in `HEALTH_CAUSES` are exported. User-defined names become
+`custom-check`, dynamic loop names become `dynamic-loop`, and unrecognized names
+become `other-check`. Details, task identities, paths, and custom names stay local.
+Open issues created before this change retain `unknown` (no guessed backfill).
+A check first detected as `warn` keeps that cause even if it later becomes `down`.
+The source inventory test checks literal built-in names, named helper calls, and
+static probe loops against the allowlist without running host-dependent probes.
+Each health check still has its own UUID.
 A partial batch can therefore recover two checks while a third stays open.
 
 Health issues begin when a non-OK check enters a fix pass. They remain open across
@@ -67,3 +77,7 @@ A contended writer skips that tick rather than delaying repairs. The next explic
 OK can still close the original issue; an entire episode inside contention may
 be missed. A renamed or removed check stays unmatched until explicitly migrated
 or observed OK; do not treat those orphaned records as confirmed failures.
+
+For a cause pie chart, group installation + issue first and choose the cause on
+the earliest detected event. Missing causes belong to “Cause not recorded”.
+Count each detected issue once, regardless of its attempts or later status.

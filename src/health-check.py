@@ -66,12 +66,19 @@ from channel_env_resolve import resolve_channel_env  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_platform import (  # noqa: E402
+    find_pids,
+    probe_pids,
+    process_executable as _platform_process_executable,
+    process_snapshot as _platform_process_snapshot,
+)
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
@@ -719,12 +726,7 @@ _VAULT_SCANNER_SCRIPTS = {
 def _proc_executable(pid: "str | int") -> "str | None":
     """Executable path of `pid`, or None. `comm` is one field, so a path with
     spaces survives it — argv cannot be split back apart reliably."""
-    try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip() or None
+    return _platform_process_executable(pid)
 
 
 # The script must appear as its own argv token — a `-c` payload that merely
@@ -1266,6 +1268,10 @@ def check_session_cron_registration(
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
             return False
+        if entry_owner(entry) != CRON_CORE:
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
+            return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
             return False
@@ -1721,6 +1727,40 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+# The compact forms a compacted index uses for entries, shared by the two
+# readers below so a row cannot be an entry for one and invisible to the other.
+INDEX_ENTRY_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
+_INDEX_ROW_ENTRY = re.compile(
+    r"^\s*[-*] .*(?:\]\(|(?<![\w-])(?:"
+    + "|".join(re.escape(s) for s in INDEX_ENTRY_ABBREV.values())
+    + r")[\w-])"
+)
+
+
+def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
+    """True when a corpus holds memories rather than just an untouched index.
+
+    MEMORY.md is the index every corpus ships with, so counting it makes a bare
+    project dir read as populated forever. Nothing can be invisible there — the
+    corpus has no memories — and a warning that can never clear is the exact
+    failure this probe's scope filter already guards against elsewhere. An index
+    carrying entries still counts: that says something wrote here.
+    """
+    if any(p.name != "MEMORY.md" for p in mds):
+        return True
+    index = mem / "MEMORY.md"
+    if not index.is_file():
+        return False
+    try:
+        text = index.read_text(errors="replace")
+    except OSError:
+        return True  # unreadable: report rather than silently drop a real corpus
+
+    # Anchor on the bullet, not the link: a compacted index writes `- f:slug`.
+    return any(_INDEX_ROW_ENTRY.search(ln) for ln in text.splitlines())
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -1764,8 +1804,9 @@ def check_memory_dir_siblings() -> "dict | None":
             continue
         if _slug_derivation_key(entry.name) != live_key:
             continue  # unrelated project, not a slug split
-        count = len(list(mem.glob("*.md")))
-        if count == 0:
+        mds = list(mem.glob("*.md"))
+        count = len(mds)
+        if not _corpus_holds_memories(mem, mds):
             continue
         key = str(mem.resolve())  # collapse symlinked twins onto one entry
         if key not in seen or count > seen[key][1]:
@@ -2490,9 +2531,6 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
-    # An index that outgrows the load budget compacts its entries to prefix
-    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
-    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
 
     def _referenced_in(hay: str, name: str) -> bool:
         stem = name[:-3] if name.endswith(".md") else name
@@ -2500,7 +2538,7 @@ def check_memory_index_integrity() -> "dict | None":
             return True
         # Without this the probe calls an indexed file unindexed, and the
         # "fix" it invites — expanding the index — is what blows the read limit.
-        for full, short in _INDEX_ABBREV.items():
+        for full, short in INDEX_ENTRY_ABBREV.items():
             if not stem.startswith(full):
                 continue
             token = short + stem[len(full):]
@@ -3334,8 +3372,54 @@ def check_skills_driver_code_drift(workspace: "Path | None" = None) -> dict:
         return {"name": name, "status": "ok", "detail": "no stamp recorded yet — driver has not logged a version"}
     if not head:
         return {"name": name, "status": "ok", "detail": "could not read skills HEAD — not asserting drift"}
-    if running == head:
-        return {"name": name, "status": "ok", "detail": f"content-driver running {running}, matches skills HEAD"}
+    # Never compare two abbreviations: each writer picks its own length, so they
+    # agree until a colliding object lands and `--short` grows. Resolve both.
+    def _git(*args, timeout=10):
+        return subprocess.run(git_argv("-C", str(skills), *args),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _oid(rev):
+        """(state, oid) — 'ok' | 'absent' | 'unknown'.
+
+        A nonzero exit does not establish absence: an unreadable loose object,
+        a signal, or exit 128 all fail while the commit is right there. Absence
+        is established POSITIVELY, by asking how many objects carry the prefix.
+        """
+        try:
+            r = _git("rev-parse", "--verify", f"{rev}^{{commit}}")
+            if r.returncode == 0 and r.stdout.strip():
+                return ("ok", r.stdout.strip())
+            # --disambiguate takes an object PREFIX. A symbolic name like HEAD
+            # matches nothing, which would read as absence rather than a failure.
+            if not _re.fullmatch(r"[0-9a-fA-F]{4,40}", rev or ""):
+                return ("unknown", "")
+            d = _git("rev-parse", f"--disambiguate={rev}")
+        except Exception:
+            return ("unknown", "")
+        # rc 0 with nothing on stdout and a complaint on stderr is a FAILED
+        # read, not an empty candidate set: an unreadable object dir does this.
+        if d.returncode != 0 or (not d.stdout.strip() and d.stderr.strip()):
+            return ("unknown", "")
+        n = len([ln for ln in d.stdout.split() if ln.strip()])
+        # 0 candidates is the only positively-established absence. One candidate
+        # that would not resolve means present-but-unreadable; >1 is ambiguous.
+        return ("absent", "") if n == 0 else ("unknown", "")
+    head_state, head_oid = _oid("HEAD")
+    if head_state != "ok":
+        return {"name": name, "status": "ok",
+                "detail": f"HEAD in the skills checkout is {head_state} — not asserting drift"}
+    run_state, run_oid = _oid(running)
+    # Unobserved is not stale. An ambiguous prefix or an unrunnable git says
+    # nothing about the driver; only a resolvable, different commit does.
+    if run_state == "unknown":
+        return {"name": name, "status": "ok",
+                "detail": (f"could not identify the driver stamp {running} (ambiguous prefix, "
+                           f"unreadable object, or git unavailable) — INCONCLUSIVE, not asserting "
+                           f"drift or a re-arm")}
+    same = run_oid == head_oid
+    if same:
+        return {"name": name, "status": "ok",
+                "detail": f"content-driver running {running}, matches skills HEAD ({head})"}
     return {"name": name, "status": "warn",
             "detail": (f"content-driver is running {running} but skills HEAD is {head} — the pull did not reach "
                        f"the process, which froze its code at launch. Merged skill fixes are NOT in effect. "
@@ -6626,7 +6710,8 @@ def check_core_supervisor() -> dict:
     "needs you" line + the prompt excerpt; degraded states (crashed / hung /
     gateway-down) → warn; healthy (running / idle-ready / blocked-known, the
     last being pre-seeded/auto-answered) → ok. File missing → ok (monitor not
-    running, or a pre-supervisor install).
+    running, or a pre-supervisor install). File present but unparseable → warn:
+    it can hide a hard blocker, and the relay escalates on it too.
     """
     name = "core-supervisor"
     sig_path = status_read_path("core-supervisor.json", WORKSPACE_DIR)
@@ -6635,7 +6720,12 @@ def check_core_supervisor() -> dict:
     try:
         data = json.loads(sig_path.read_text())
     except Exception as e:
-        return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+        data, err = None, str(e)[:60]
+    else:
+        err = f"expected an object, got {type(data).__name__}"
+    if not isinstance(data, dict):
+        return {"name": name, "status": "warn",
+                "detail": f"core-supervisor.json unreadable ({err}) — a blocked core can't be ruled out"}
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
@@ -6728,16 +6818,18 @@ def check_gateway_bridge() -> "dict | None":
     if not configured:
         return None
     try:
-        gw = subprocess.run(
-            # remote-relay-bridge.py is a shipped compat stub running the same
-            # client, so an instance under the old name is a real duplicate.
-            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+        # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
+        # apart. The relay name is a compat stub, so it is a real duplicate.
+        pids, probe_ok = probe_pids(r"remote-(gateway|relay)-bridge\.py$")
     except Exception:
-        pids = []
+        pids, probe_ok = [], False
     if not pids:
+        if not probe_ok:
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": "process probe failed — gateway bridge state unknown",
+            }
         return {
             "name": "gateway-bridge",
             "status": "warn",
@@ -7714,11 +7806,12 @@ def check_disk_space() -> dict:
     targets = {}
     for label, path in (("workspace", WORKSPACE_DIR), ("tmp", Path(tempfile.gettempdir()))):
         try:
-            st = os.statvfs(str(path))
+            device = path.stat().st_dev
+            free_gib = shutil.disk_usage(path).free / (1024 ** 3)
         except OSError as e:
             return {"name": name, "status": "error", "detail": f"cannot stat {label} ({path}): {e}"}
         # Key by device so the same volume isn't reported twice.
-        targets[st.f_fsid or label] = (label, path, st.f_bavail * st.f_frsize / (1024 ** 3))
+        targets[device or label] = (label, path, free_gib)
 
     worst_label, worst_path, worst_free = min(targets.values(), key=lambda t: t[2])
     where = f"{worst_free:.1f} GiB free on {worst_label} ({worst_path})"
@@ -7755,8 +7848,19 @@ def _is_ephemeral(target: str) -> bool:
     Equality counts: a link pointing AT the root is as ephemeral as one pointing
     inside it, and a trailing-slash prefix test answers False for exactly that case.
     """
-    t = os.path.normpath(target).rstrip("/") or "/"
-    return any(t == r or t.startswith(r + "/") for r in _ephemeral_roots())
+    t = os.path.normcase(os.path.normpath(target))
+    roots = (os.path.normcase(os.path.normpath(r)) for r in _ephemeral_roots())
+    return any(t == r or t.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def _is_skill_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        # Directory junctions are mount-point reparse tags, including on Python 3.11.
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError):
+        return False
 
 
 def check_skill_symlinks() -> dict:
@@ -7820,13 +7924,14 @@ def check_skill_symlinks() -> dict:
             continue
         skill_name = skill_dir.name
         dst = skills_dst / skill_name
-        if dst.is_symlink() and not dst.exists():
+        is_link = _is_skill_link(dst)
+        if is_link and not dst.exists():
             broken.append(skill_name)
-        elif not dst.exists() and not dst.is_symlink():
+        elif not dst.exists() and not is_link:
             unlinked.append(skill_name)
-        elif dst.is_dir() and not dst.is_symlink():
+        elif dst.is_dir() and not is_link:
             shadowed.append(skill_name)
-        elif (dst.is_symlink() and _is_ephemeral(os.path.realpath(dst))
+        elif (is_link and _is_ephemeral(os.path.realpath(dst))
               and not _is_ephemeral(str(skills_src.resolve()))):
             # The MISMATCH is the defect, not temp-rootedness: a temp-rooted repo
             # is self-consistent, and another DURABLE clone is a supported layout.
@@ -7844,7 +7949,7 @@ def check_skill_symlinks() -> dict:
         for entry in sorted(skills_dst.iterdir()):
             if entry.name in repo_names:
                 continue
-            if entry.is_symlink() and not entry.exists():
+            if _is_skill_link(entry) and not entry.exists():
                 orphaned.append(entry.name)
     except OSError:
         pass
@@ -8191,6 +8296,40 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
         except OSError:
             continue
     return out
+
+
+def check_pool_advertisement() -> dict:
+    """The picker follows the roster only through the advertisement the bridge
+    sends; a roster version that file does not carry is a pin nobody was told."""
+    name = "pool-advertisement"
+    roster_p = WORKSPACE_DIR / "state" / "roster.json"
+    ad_p = WORKSPACE_DIR / "state" / "pool-advertisement.json"
+    if not roster_p.exists():
+        return {"name": name, "status": "ok", "detail": "no pool roster"}
+    try:
+        roster = json.loads(roster_p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn", "detail": f"roster.json unreadable: {e}"}
+    rv = roster.get("version")
+    rooms = len(roster.get("bindings") or {})
+    repair = "re-publish the pool advertisement from the roster"
+    try:
+        ad = json.loads(ad_p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"name": name, "status": "warn",
+                "detail": f"roster v{rv} ({rooms} binding(s)) has no advertisement — "
+                          f"the picker was never told; repair: {repair}"}
+    except (OSError, ValueError) as e:
+        return {"name": name, "status": "warn",
+                "detail": f"pool-advertisement.json unreadable: {e}; repair: {repair}"}
+    workers = ad.get("workers") if isinstance(ad, dict) else None
+    av = workers.get("roster_version") if isinstance(workers, dict) else None
+    if av != rv:
+        return {"name": name, "status": "warn",
+                "detail": f"binding unpublished: advertisement carries roster v{av}, "
+                          f"roster is v{rv} ({rooms} binding(s)); repair: {repair}"}
+    return {"name": name, "status": "ok",
+            "detail": f"advertisement matches roster v{rv} ({rooms} binding(s))"}
 
 
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
@@ -8668,12 +8807,7 @@ def _ps_snapshot() -> "str | None":
     a nonzero exit: its empty stdout would otherwise read as a successful scan
     that found nothing, which is the absence callers must not assert.
     """
-    try:
-        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5)
-    except Exception:  # noqa: BLE001
-        return None
-    return done.stdout if done.returncode == 0 else None
+    return _platform_process_snapshot()
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":
@@ -12595,19 +12729,9 @@ def run_all_checks() -> list[dict]:
         if not env_file.exists() and not access_file.exists():
             continue
         try:
-            # Anchor on the .py suffix so we don't match unrelated processes
-            # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
-            # name produces false-positive "multiple processes" warnings
-            # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            # rc 1 is the authoritative no-match; any other non-zero exit is a
-            # PROBE ERROR and must not read as "bridge is down".
-            _probe_ok = result.returncode in (0, 1)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-            # A launcher's argv ends with the same script path, so it matches
-            # this pgrep too — see _drop_launcher_parents.
+            # Anchor to the script suffix; find_pids preserves anchors on every OS.
+            # Drop launcher parents so only actual pollers remain.
+            pids, _probe_ok = probe_pids(f"{proc_name}\\.py$")
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
@@ -12891,6 +13015,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
+    checks.append(check_pool_advertisement())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
@@ -13727,7 +13852,7 @@ def _recovery_duration(seconds: float) -> str:
 
 
 def track_health_fix(checks: list, *, start: bool = False, state_file=None, now=None) -> None:
-    """Observe fix health; names are local correlation data, never telemetry properties."""
+    """Observe fix health; only allowlisted check names leave local correlation state."""
     try:
         if fcntl is None:
             return
@@ -14000,7 +14125,7 @@ def recover_core_if_wedged(
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 
         _track_core_issue(state_file, alive=alive, task=cur_key,
-                          status_ts=status_ts, start=True)
+                          status_ts=status_ts, start=True, cause=cur_mode)
         _recovery_metric("core_recovery_attempted", trigger=cur_mode)
         try:
             restart_ok = restart_fn()

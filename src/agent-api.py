@@ -29,7 +29,17 @@ Twilio setup:
   Set webhook URL in Twilio console to https://<your-tunnel>/twilio/voice (calls)
   and https://<your-tunnel>/twilio/sms (messages).
 
+  The tunnel must also forward /twilio/transcription: handle_twilio_voice sets it
+  as the voicemail transcribeCallback, so an allowlist without it records messages
+  whose transcripts never arrive. Forward ONLY those three. A whole-port tunnel
+  publishes every endpoint above, and a proxy that connects from localhost defeats the
+  AGENT_API_BIND=127.0.0.1 default that is otherwise the only thing in front of
+  POST /task -- check_auth() returns True unconditionally when SUTANDO_API_TOKEN
+  is unset, which is the default.
+
 Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <token>).
+Without it POST /task is unauthenticated and the bind is the sole protection, so
+set the token BEFORE exposing this port by any route.
 For remote access: use ngrok or SSH tunnel.
 """
 
@@ -109,6 +119,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -573,7 +584,7 @@ def dismiss_question(qid: str) -> tuple:
     return 200, {"ok": True, "id": qid}
 
 
-def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
     return {
         "tasks": _active_task_rows(),
@@ -1008,7 +1019,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, _questions_queue_payload())
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+            watcher_pids, probe_ok = probe_pids("watch-tasks", timeout=3.0)
+            watcher_ok = bool(watcher_pids) if probe_ok else None
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:

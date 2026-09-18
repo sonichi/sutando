@@ -47,6 +47,13 @@ def _fake_run(cmd, *args, **kwargs):
     return FakeProc()
 
 
+def _fake_platform_capture(path, fmt="png"):
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"\x00fakemediabytes")
+    return True
+
+
 class FakePopen:
     """Emulate an open-ended `screencapture -v <path>` for the toggle path:
     the .mov is finalized (written) when the process is SIGINT'd on stop."""
@@ -99,6 +106,14 @@ class TestCaptureVideoRouting(unittest.TestCase):
         pp = mock.patch.object(self.mod.subprocess, "Popen", FakePopen)
         pp.start()
         self.addCleanup(pp.stop)
+        platform = mock.patch.object(self.mod, "is_macos", return_value=True)
+        platform.start()
+        self.addCleanup(platform.stop)
+        capture = mock.patch.object(
+            self.mod, "_platform_capture_screen", _fake_platform_capture
+        )
+        capture.start()
+        self.addCleanup(capture.stop)
         # Deterministic token so /capture and /capture-video auth is testable.
         # Fresh module per test, so this assignment doesn't leak.
         self.token = "test-capture-token"

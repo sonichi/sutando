@@ -79,6 +79,7 @@ class TestWarnDetail(unittest.TestCase):
         # running returns "configured but NOT running" and never reaches this.
         with mock.patch.object(HC, "_gateway_configured", return_value=True, create=True), \
              mock.patch.object(HC, "subprocess") as sp, \
+             mock.patch.object(HC, "probe_pids", return_value=(["4242"], True)), \
              mock.patch.object(HC, "_gateway_lock_pids", return_value={}, create=True), \
              mock.patch.object(HC, "_gateway_serving", return_value=False), \
              mock.patch.object(HC, "_gateway_last_ok_age_h", return_value=age_h):

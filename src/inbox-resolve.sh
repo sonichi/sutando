@@ -24,7 +24,9 @@ resolve_inbox_entry() {
 	# One bounding path, never `timeout` when available: `timeout` with no
 	# kill-after leaves a TERM-resistant resolver unbounded, and only one branch runs per host.
 	out_file="$(mktemp)"
-	"$SUTANDO_INBOX_RESOLVER" "$entry" > "$out_file" 2>/dev/null &
+	# The assignment is APPENDED: $1 stays the entry, so a resolver written
+	# before this flag existed is unaffected, and a new one can require it.
+	"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null &
 	resolver_pid=$!
 	# The sleep runs in the watchdog's BACKGROUND under a TERM trap: bash defers a
 	# signal while a foreground child runs, which stalled every resolution.

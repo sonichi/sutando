@@ -48,7 +48,14 @@ import sys
 
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
-HARD_ESCALATE = {"blocked-human", "logged-out"}
+HARD_ESCALATE = {"blocked-human", "logged-out", "signal-unreadable"}
+# A signal file that exists but can't be parsed may be hiding a hard blocker, so it
+# escalates once like one: a spurious notice costs a message, a suppressed one an outage.
+UNREADABLE_SIGNAL = {
+    "state": "signal-unreadable",
+    "detail": "the core supervisor's status file is unreadable, so a blocked core can't be ruled out",
+    "prompt": "",
+}
 # Gates the monitor answered by itself but the owner should still hear about:
 # the core changed something (its model) without anyone asking.
 SOFT_NOTICE_KINDS = {"fable-limit"}
@@ -213,6 +220,10 @@ def compose_message(signal: dict) -> str:
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
                 " (that could spend credits). Pick the switch at the core's terminal, or"
                 " /usage-credits to stay on Fable.")
+    elif signal.get("state") == "signal-unreadable":
+        host = _core_host_label() or "the host"
+        msg += (f" — check the core on {host}; restarting the engine rewrites the file."
+                " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
@@ -409,10 +420,12 @@ def main(argv=None):
     try:
         with open(a.signal) as f:
             signal = json.load(f)
-        if not isinstance(signal, dict):
-            signal = {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return 0  # no signal yet → nothing to escalate (degrade quietly)
+    except (OSError, ValueError):
+        signal = None
+    if not isinstance(signal, dict):
+        signal = dict(UNREADABLE_SIGNAL)
 
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
                     source=source, channel=channel, dry_run=a.dry_run)

@@ -250,13 +250,16 @@ class DelegationTest(unittest.TestCase):
 
     def test_result_lookup_is_not_reimplemented(self):
         """Live-then-archive is one policy: an archive-only copy reads a
-        delivered-but-unarchived result as never delivered."""
+        delivered-but-unarchived result as never delivered. A consumer either
+        calls `find_result` or delegates to `task_dispatch.py has-result`, the
+        completion owner that walks the same candidates to a ready body."""
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()
-                self.assertIn(
-                    "find_result", src,
-                    f"{name}: must use local_task_protocol.find_result",
+                self.assertTrue(
+                    "find_result" in src or "task_dispatch.py\" has-result" in src,
+                    f"{name}: must use local_task_protocol.find_result or "
+                    f"delegate to task_dispatch.py has-result",
                 )
                 self.assertNotIn(
                     "find_archived_result", src,
