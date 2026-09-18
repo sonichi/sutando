@@ -384,6 +384,19 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
     _migrate_script_sentinels_present=1
   fi
 
+  # A per-source sentinel means the copy succeeded, not that the hook bridge
+  # did -- consult its retry marker before treating sentinels as "done".
+  _hook_bridge_retry_marker="${_ws_new}/state/.hook-bridge-retry-needed"
+  if [ -n "$_ws_new" ] && [ -f "$_hook_bridge_retry_marker" ]; then
+    echo "⚠️  a previous migration's hook bridge failed — retrying (bash src/install-claude-hooks.sh)" >&2
+    if bash "$REPO/src/install-claude-hooks.sh"; then
+      rm -f "$_hook_bridge_retry_marker"
+      echo "✅ hook bridge retry succeeded — marker cleared." >&2
+    else
+      echo "❌ hook bridge retry failed again — will retry on next boot. Core hooks may be incomplete." >&2
+    fi
+  fi
+
   if [ -n "$_ws_new" ] && [ ! -f "$_migrate_sentinel" ] \
      && [ "$_migrate_script_sentinels_present" = "0" ] \
      && [ -d "$_ws_legacy" ] && [ -n "$(ls -A "$_ws_legacy" 2>/dev/null)" ]; then

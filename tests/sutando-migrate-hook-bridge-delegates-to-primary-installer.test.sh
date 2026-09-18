@@ -77,9 +77,14 @@ jq -e '[.hooks.PreCompact // [] | .[].hooks[] | select(.command | contains("sess
    "$CORE_SETTINGS" >/dev/null 2>&1
 check "THE POINT: PreCompact handoff hook present" $? "missing -- primary installer never ran"
 
-jq -e '[.hooks.PreCompact // [] | .[].hooks[] | select(.command | contains("archive-transcript.sh"))] | length >= 1' \
+# #4309 round 15 (keweichen finding #4): this fixture has no PRIOR archive
+# opt-in (the legacy project-level entry below is the deprecated ~/Desktop
+# `cp` shape, not the current archiver), so the bridge must default-off the
+# full-transcript-copy hook -- it must NOT appear just because migration ran.
+! jq -e '[.hooks.PreCompact // [] | .[].hooks[] | select(.command | contains("archive-transcript.sh"))] | length >= 1' \
    "$CORE_SETTINGS" >/dev/null 2>&1
-check "THE POINT: PreCompact archiver hook present" $? "missing -- primary installer never ran"
+check "THE POINT: PreCompact archiver hook absent (no prior opt-in -- migration must not silently enable it)" $? \
+    "present -- migration enabled full-transcript archiving with no prior consent"
 
 # THE POINT: the legacy PROJECT-level deprecated shape got swept too.
 ! jq -e '[.hooks.PreCompact // [] | .[].hooks[] | select(.command | contains("Desktop/sutando-conversations"))] | length >= 1' \
