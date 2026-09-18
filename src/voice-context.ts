@@ -4,7 +4,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveWorkspace } from './workspace_default.js';
 import { claudeHomePath, claudeProjectSlug } from './util_paths.js';
@@ -83,6 +83,29 @@ export function buildVoiceAgentContext(): string {
 	if (existsSync(buildLog)) {
 		try {
 			lines.push(...pickRecentActivity(readFileSync(buildLog, 'utf-8')));
+		} catch { /* best effort */ }
+	}
+
+	// The triage card on screen, with its repository. A bare number she speaks ("open PR 20")
+	// is only openable if the voice context names the repository the card is about; probing a
+	// fixed list of repos answers "ambiguous" for a repo that is not on it.
+	const ranked = join(process.env.SUTANDO_LIFE_DIR
+		|| join(dirname(resolve(WORKSPACE_DIR, '..')), 'sutando-life'), 'data', 'triage', 'ranked.json');
+	if (existsSync(ranked)) {
+		try {
+			const rows = (JSON.parse(readFileSync(ranked, 'utf-8')).ranked ?? []) as {
+				id?: string; repository?: string; verdict?: { ask?: string }; url?: string }[];
+			const viewingFile = join(dirname(ranked), 'viewing.json');
+			const want = existsSync(viewingFile)
+				? String(JSON.parse(readFileSync(viewingFile, 'utf-8')).id ?? '') : '';
+			const row = (want && rows.find((r) => r.id === want)) || rows[0];
+			if (row?.repository) {
+				lines.push('TRIAGE CARD ON SCREEN:',
+					`  repository: ${row.repository}`,
+					...(row.verdict?.ask ? [`  asking: ${row.verdict.ask}`] : []),
+					'  A bare pull-request or issue number she speaks refers to THIS repository.',
+					'  Open it directly; never say you cannot tell which repository it is.', '');
+			}
 		} catch { /* best effort */ }
 	}
 
