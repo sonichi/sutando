@@ -9,7 +9,6 @@ prepares inert snapshots, validates the model's proposal, and applies it atomica
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -20,11 +19,12 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
+from file_lock import locked_file
 from task_archive import archive_id_from_filename, task_id_for
 from workspace_default import status_read_path
 
@@ -95,13 +95,8 @@ def _classifier_state_path(workspace: Path) -> Path:
 def _workstream_store_lock(workspace: Path):
     """Serialize sidecar/state read-modify-write operations across processes."""
     lock_path = Path(workspace) / "data" / "task-workstreams.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with locked_file(lock_path):
+        yield
 
 
 def _empty_store() -> dict:
@@ -856,11 +851,13 @@ def _source_directories(workspace: Path, state: dict, *, discover: bool) -> tupl
             for value in saved:
                 if not isinstance(value, str):
                     continue
-                path = Path(value)
-                if path.is_absolute() or ".." in path.parts:
+                normalized = value.replace("\\", "/")
+                path = PurePosixPath(normalized)
+                if (path.is_absolute() or PureWindowsPath(value).is_absolute()
+                        or ".." in path.parts):
                     continue
-                if value.startswith(("tasks/archive/", "results/archive")):
-                    directories.add(value)
+                if normalized.startswith(("tasks/archive/", "results/archive")):
+                    directories.add(normalized)
     if not discover:
         return tuple(sorted(directories))
 
@@ -884,7 +881,7 @@ def _source_directories(workspace: Path, state: dict, *, discover: bool) -> tupl
     for archive_root in archive_roots:
         for root, child_dirs, _files in os.walk(archive_root):
             try:
-                directories.add(str(Path(root).relative_to(workspace)))
+                directories.add(Path(root).relative_to(workspace).as_posix())
             except ValueError:
                 continue
             # Symlinked directories are not part of the result archive contract.

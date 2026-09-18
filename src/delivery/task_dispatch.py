@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""Shared candidate-selection policy for task-file-injection watchers.
+"""Consumer-side dispatch policy shared by every external task-notifier.
 
-Codex's and agy's `task-notifier.sh` both ask the same two questions of the
-same on-disk state: "does this task already have a delivered result?" and
-"which pending task should be dispatched next?". Each notifier used to answer
-both with its own hand-rolled bash, and the copies diverged from the correct
-answer: a zero-byte partial result read as delivered (should not — readiness
-is `delivery.readiness`'s contract), and a `find -name "$stem-[0-9]*.txt"`
-glob matched `task-probe-1-other.txt` as an epoch archive of `task-probe`
-(should not — `local_task_protocol.find_result`'s epoch-suffix match requires
-the WHOLE suffix to be digits, not just its first character).
+`src/watch-tasks-stream.sh` is the detection layer for all core runtimes and
+emits `TASK_FILE: <name>` wakes. The external notifiers (Codex, agy, Claude
+standalone) consume those wakes, and each one answers the same two questions
+of the same on-disk state: "does this task already have a delivered result?"
+and "which pending task goes next?". Three hand-rolled bash copies answered
+them, and the copies were wrong the same way: `[ -f results/<f> ]` read an
+empty placeholder as delivered, and `find -name "<stem>-[0-9]*.txt"` took
+another task's `task-x-1-other.txt` for `task-x`'s epoch archive.
 
-This module is the one place both delegate to (CLAUDE.md's "Shared adapter
-policy" rule: two adapters interpreting the same workspace state get a
-dependency-light `src/` module, never a second copy). Provider-specific
-extras — Codex's optional-task-handler claim probe, a fallback-receipt
-cleanup side effect — stay in the calling bash, at the adapter edge.
+This module is the one owner (CLAUDE.md "Shared adapter policy"). Completion
+is `find_ready_result`: `local_task_protocol.iter_result_candidates` (every
+archive layout, all-digits epoch suffix, live first) walked with
+`delivery.readiness.read_ready_result` (whitespace-only is not ready) until a
+candidate is READY — an existing empty live placeholder must not hide a ready
+archived body. `watch-tasks-stream.sh`'s `handler_result_exists` and every
+notifier call it through `has-result`; order is `task_priority`.
+Runtime-specific holds stay in the calling bash: the optional-handler probe and
+the fallback receipt it is gated on (both need `--runtime`), and the receipt
+cleanup.
 
-Callable as a library (`has_ready_result`, `pending_candidates`,
-`next_pending_task`) or as a CLI for bash callers that only have a python3
-binary to shell out to:
+CLI, for bash callers with only an interpreter path:
 
-    task_dispatch.py has-result <results_dir> <filename>       # exit 0/1
-    task_dispatch.py pending-candidates <tasks_dir> <results_dir>  # one name/line
-    task_dispatch.py next-pending <tasks_dir> <results_dir>     # first name, exit 0/1
+    task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
+    task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
+    task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
+    task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
+
+`find-ready` exists because "does a ready result exist" and "read what it says" must resolve
+to the SAME file: a caller that re-derives the live path after `has-result` says yes can be
+answering about an archived body while reading an untouched live placeholder instead.
 """
 from __future__ import annotations
 
@@ -31,49 +38,75 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
-# Same self-sufficient sys.path bootstrap task_priority.py uses (reaches src/, not the workspace).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspace-resolution: allow-repo-root
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import find_result, valid_archive_lookup_id  # noqa: E402
+from local_task_protocol import iter_result_candidates  # noqa: E402
 
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
-__all__ = ["has_ready_result", "pending_candidates", "next_pending_task"]
+__all__ = [
+    "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
+    "pending_candidates", "next_pending_task",
+]
+
+
+def _task_id_for_filename(filename: str) -> str:
+    """The one place a task filename is stripped to its id — has-result and find-ready must agree."""
+    return filename[:-4] if filename.endswith(".txt") else filename
+
+
+def find_ready_result(results_dir: "Path | str", task_id: str, *,
+                      reader=read_ready_result) -> "Path | None":
+    """First result file for `task_id` whose body `reader` accepts, or None.
+
+    Candidates come from `iter_result_candidates` (traversal ids yield none) in
+    its precedence, and EVERY one is read until a body is ready: a live
+    `results/<id>.txt` can exist empty while the delivered answer sits in an
+    archive, and stopping at the first existing path reads that completed task
+    as pending. `reader` is the readiness contract, injected so a test can pin
+    the walk without re-stating what "ready" means.
+    """
+    for candidate in iter_result_candidates(Path(results_dir), task_id):
+        if reader(candidate) is not None:
+            return candidate
+    return None
+
+
+def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
+                                   reader=read_ready_result) -> "Path | None":
+    """`find_ready_result` keyed by task FILENAME (`has_ready_result`'s own id derivation).
+
+    Exists so a caller that already asked `has_ready_result` "does one exist" can ask this
+    "which path is it" without re-deriving `task_id` a second, possibly divergent way — and so
+    it can read THAT path's body instead of assuming the live one backs every ready result.
+    """
+    return find_ready_result(results_dir, _task_id_for_filename(filename), reader=reader)
 
 
 def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
-    """True iff `filename` (a task file's basename, e.g. `task-x.txt`) has a
-    delivered result: a non-empty live `results/<filename>`, or an archived
-    copy under any of the archive layouts `local_task_protocol` knows about.
+    """True iff task file `filename` has a ready result, live or in any archive layout.
 
-    Delegates path resolution entirely to `local_task_protocol.find_result`
-    (live-then-archive, correct digits-only epoch-suffix matching) and the
-    live-file readiness check to `delivery.readiness.read_ready_result` (a
-    zero-byte or partial write is not a delivered result). An archived path
-    is a completed delivery by construction — archival trails a ready live
-    write, so it needs no re-check.
+    An empty or whitespace-only file — live or archived — is not a delivery and
+    does not stop the search; `find_ready_result` walks past it.
     """
-    task_id = filename[:-4] if filename.endswith(".txt") else filename
-    if not valid_archive_lookup_id(task_id):
-        return False
-    found = find_result(results_dir, task_id)
-    if found is None:
-        return False
-    live = Path(results_dir) / filename
-    if found == live:
-        return read_ready_result(found) is not None
-    return True
+    return find_ready_result_for_filename(results_dir, filename) is not None
 
 
-def pending_candidates(tasks_dir: "Path | str", results_dir: "Path | str") -> Iterator[str]:
-    """Task filenames in `tasks_dir`, priority-sorted (mtime-FIFO within a
-    tier), that do not yet have a delivered result. A provider-specific
-    notifier applies its own additional holds (an optional-handler claim, a
-    Team-tier probe) on top of this — this generator answers only the
-    provider-neutral half: priority order + completion.
+def pending_candidates(
+    tasks_dir: "Path | str",
+    results_dir: "Path | str",
+    *,
+    claims_dir: "Path | str | None" = None,
+) -> Iterator[str]:
+    """Task filenames without a ready result, priority-sorted (mtime FIFO within a tier).
+
+    A name under `claims_dir` is held by a watcher-owned handler and skipped.
+    Only regular files are yielded, never a name that carries a path separator
+    or traversal sentinel, whatever the sort step handed back.
     """
+    claims = Path(claims_dir) if claims_dir else None
     for task in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt")):
         if not task.is_file():
             continue
@@ -82,38 +115,77 @@ def pending_candidates(tasks_dir: "Path | str", results_dir: "Path | str") -> It
             continue
         if has_ready_result(results_dir, name):
             continue
+        if claims is not None and (claims / name).is_file():
+            continue
         yield name
 
 
-def next_pending_task(tasks_dir: "Path | str", results_dir: "Path | str") -> str | None:
+def next_pending_task(
+    tasks_dir: "Path | str",
+    results_dir: "Path | str",
+    *,
+    claims_dir: "Path | str | None" = None,
+) -> str | None:
     """First entry of `pending_candidates`, or None."""
-    for name in pending_candidates(tasks_dir, results_dir):
+    for name in pending_candidates(tasks_dir, results_dir, claims_dir=claims_dir):
         return name
     return None
 
 
+_USAGE = (
+    "usage: task_dispatch.py has-result <results_dir> <filename>\n"
+    "       task_dispatch.py find-ready <results_dir> <filename>\n"
+    "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR]\n"
+    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR]"
+)
+
+
+def _parse_claims_dir(rest: list[str]) -> "str | None":
+    """`[--claims-dir DIR]` after the two positional dirs; anything else is a usage error."""
+    if not rest:
+        return None
+    if len(rest) == 2 and rest[0] == "--claims-dir" and rest[1]:
+        return rest[1]
+    raise ValueError(_USAGE)
+
+
 def _main(argv: list[str]) -> int:
     if len(argv) < 3:
-        print("usage: task_dispatch.py {has-result <results_dir> <filename>"
-              " | pending-candidates <tasks_dir> <results_dir>"
-              " | next-pending <tasks_dir> <results_dir>}", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
         return 2
-    cmd = argv[0]
+    cmd, first, second, rest = argv[0], argv[1], argv[2], argv[3:]
     if cmd == "has-result":
-        return 0 if has_ready_result(argv[1], argv[2]) else 1
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if has_ready_result(first, second) else 1
+    if cmd == "find-ready":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        found = find_ready_result_for_filename(first, second)
+        if found is None:
+            return 1
+        print(found)
+        return 0
+    if cmd not in ("pending-candidates", "next-pending"):
+        print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)
+        return 2
+    try:
+        claims_dir = _parse_claims_dir(rest)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if cmd == "pending-candidates":
-        names = list(pending_candidates(argv[1], argv[2]))
+        names = list(pending_candidates(first, second, claims_dir=claims_dir))
         for name in names:
             print(name)
         return 0 if names else 1
-    if cmd == "next-pending":
-        name = next_pending_task(argv[1], argv[2])
-        if name is None:
-            return 1
-        print(name)
-        return 0
-    print(f"task_dispatch.py: unknown command {cmd!r}", file=sys.stderr)
-    return 2
+    name = next_pending_task(first, second, claims_dir=claims_dir)
+    if name is None:
+        return 1
+    print(name)
+    return 0
 
 
 if __name__ == "__main__":

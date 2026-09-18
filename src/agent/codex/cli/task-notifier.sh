@@ -108,18 +108,13 @@ prepare_workstream_context() {
   fi
 }
 
-# Completion-detection is owned by src/delivery/task_dispatch.py — see its
-# header for why the bash copy this used to be was a defect, not just a
-# duplicate (sonichi#4303 review). The fallback-receipt cleanup below is
-# Codex-specific bookkeeping (an optional task-handler concern), not shared
-# policy, so it stays here rather than in the shared module.
+# Completion detection is src/delivery/task_dispatch.py's contract (with the
+# watcher's handler_result_exists); only the receipt cleanup is this notifier's.
 has_result() {
   local filename="$1"
-  if "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename"; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
-  fi
-  return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
+  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+  return 0
 }
 
 core_pane_is_busy() {
@@ -172,17 +167,11 @@ wait_for_core_idle() {
   done
 }
 
-# Candidates arrive already priority-sorted and already filtered to those
-# without a delivered result (src/delivery/task_dispatch.py — shared with
-# agy's notifier). This loop applies only Codex-specific holds on top: a
-# Team-tier handler's claim, or its not-yet-published probe.
 next_pending_task() {
   local candidate
+  # Priority order, completion and live claims come from task_dispatch; the
+  # optional-handler probe needs --runtime, so that hold stays here.
   while IFS= read -r candidate; do
-    case "$candidate" in
-      ""|*/*|*..*) continue ;;
-    esac
-    [ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue
     if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
         && probe_optional_task_handler "$candidate"; then
       # The watcher has not published its claim yet. Leave the file durable;
@@ -191,7 +180,10 @@ next_pending_task() {
     fi
     printf '%s\n' "$candidate"
     return 0
-  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR")
+  done < <(
+    "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
+      --claims-dir "$TASK_HANDLER_CLAIMS_DIR"
+  )
   return 1
 }
 

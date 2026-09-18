@@ -29,6 +29,7 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import spawn_worker as sw  # noqa: E402
@@ -95,13 +96,13 @@ def preflight(workspace, repo, room: str) -> None:
                    if handler else ""))
 
 
-def compile_with(workspace, worker_id: str, label: str, room) -> dict:
+def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> dict:
     """Add this worker to the roster, and its room to the bindings.
 
     Delegates to the one locked registration writer: two `create_worker` runs
     against the same workspace must not race each other's read-merge-write.
     """
-    return pr.register_worker(workspace, worker_id, label, room)
+    return pr.register_worker(workspace, worker_id, label, room, runtime=runtime)
 
 
 def report(made: dict, roster: dict, room, orphans: list) -> str:
@@ -173,7 +174,16 @@ def main(argv=None) -> int:
         return REFUSED
 
     try:
-        roster = compile_with(workspace, made["worker_id"], a.label, a.room)
+        roster = compile_with(workspace, made["worker_id"], a.label, a.room,
+                              runtime=made.get("runtime"))
+    except pr.PublishError as e:
+        print(f"create-worker: worker {made['worker_id']} is routable (roster "
+              f"v{e.roster['version']}), but the advertisement could not be "
+              f"written: {e.__cause__}\n"
+              f"  the picker will not show it until this succeeds: "
+              f"python3 skills/worker-pool/scripts/pool_advertise.py --workspace {workspace} --write",
+              file=sys.stderr)
+        return 1
     except (pr.RosterError, OSError) as e:
         # The worker exists and the roster does not know it: say so loudly with
         # the repair, or it becomes the silent stale-roster case again.

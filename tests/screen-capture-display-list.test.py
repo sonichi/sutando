@@ -30,6 +30,8 @@ except SystemExit:
     pass
 
 failures = []
+_real_is_macos = scs.is_macos
+scs.is_macos = lambda: True
 
 
 def check(label, got, want):
@@ -240,6 +242,36 @@ with tempfile.TemporaryDirectory() as probe_dir:
         scs.subprocess.run = _real
         scs.DIR = real_dir
     check("a raising probe surfaces as OSError to the handler's try", raised, "OSError")
+
+# --- non-macOS listing uses one virtual-screen capture -----------------------
+with tempfile.TemporaryDirectory() as probe_dir:
+    real_dir = scs.DIR
+    real_is_macos = scs.is_macos
+    real_capture = scs._platform_capture_screen
+    scs.DIR = probe_dir
+    scs.is_macos = lambda: False
+
+    def fake_platform_capture(path, fmt="png"):
+        _png(path, 1920, 1200)
+        return True
+
+    scs._platform_capture_screen = fake_platform_capture
+    try:
+        virtual = scs.list_displays()
+        leftover = os.listdir(probe_dir)
+    finally:
+        scs.DIR = real_dir
+        scs.is_macos = real_is_macos
+        scs._platform_capture_screen = real_capture
+
+    check("non-macOS reports one virtual display", virtual, [{
+        "index": 1,
+        "width": 1920,
+        "height": 1200,
+        "name": "Virtual screen",
+        "is_main": True,
+    }])
+    check("virtual display probe is cleaned up", leftover, [])
 
 # --- /displays route ---------------------------------------------------------
 class _FakeHandler(scs.Handler):

@@ -119,6 +119,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -583,7 +584,7 @@ def dismiss_question(qid: str) -> tuple:
     return 200, {"ok": True, "id": qid}
 
 
-def _active_tasks_payload(watcher_ok: bool, core_ok: bool) -> dict:
+def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
     return {
         "tasks": _active_task_rows(),
@@ -1018,7 +1019,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, _questions_queue_payload())
         elif path == "/tasks/active":
             # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["/usr/bin/pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+            watcher_pids, probe_ok = probe_pids("watch-tasks", timeout=3.0)
+            watcher_ok = bool(watcher_pids) if probe_ok else None
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:

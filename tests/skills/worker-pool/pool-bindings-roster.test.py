@@ -272,5 +272,140 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRoster(Base):
         self.assertEqual(p.read_text(), "{not json")
 
 
+class TestBindRoom(Base):
+    """`bind_room`/`unbind_room`: the pin's own writers, locked like register_worker."""
+
+    def setUp(self):
+        super().setUp()
+        pr.compile_roster(self.ws, live(W1, W2))
+
+    def test_a_pin_by_id_lands_in_bindings_and_roster(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W1)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_bindings(self.ws), {"!x:ag2.space": W1})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {"!x:ag2.space": W1})
+
+    def test_a_pin_by_unique_label_resolves_to_the_id(self):
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2[:6])
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_an_unknown_name_is_refused_before_anything_is_saved(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "nobody")
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        self.assertEqual(pr.load_roster(self.ws)["bindings"], {})
+
+    def test_an_ambiguous_label_is_refused(self):
+        pr.compile_roster(self.ws, {W1: {"label": "same", "state": "live"},
+                                    W2: {"label": "same", "state": "live"}})
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "!x:ag2.space", "same")
+
+    def test_a_repin_replaces_the_binding(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        r = pr.bind_room(self.ws, "!x:ag2.space", W2)
+        self.assertEqual(r["bindings"], {"!x:ag2.space": W2})
+
+    def test_the_version_moves_so_the_advertisement_can_cite_it(self):
+        v0 = pr.load_roster(self.ws)["version"]
+        self.assertEqual(pr.bind_room(self.ws, "!x:ag2.space", W1)["version"], v0 + 1)
+
+    def test_unpin_removes_the_binding_and_keeps_the_others(self):
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        pr.bind_room(self.ws, "!y:ag2.space", W2)
+        r = pr.unbind_room(self.ws, "!x:ag2.space")
+        self.assertEqual(r["bindings"], {"!y:ag2.space": W2})
+        self.assertEqual(pr.load_bindings(self.ws), {"!y:ag2.space": W2})
+
+    def test_unpin_of_an_unbound_room_is_the_state_asked_for(self):
+        r = pr.unbind_room(self.ws, "!never:ag2.space")
+        self.assertEqual(r["bindings"], {})
+
+    def test_no_roster_refuses_both(self):
+        ws = Path(tempfile.mkdtemp())
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(ws, "!x:ag2.space", W1)
+        with self.assertRaises(pr.RosterError):
+            pr.unbind_room(ws, "!x:ag2.space")
+
+
+class TestRosterRowTypes(Base):
+    """compile_roster is the roster's validation boundary: a row that is not an
+    object must become a RosterError there, not an AttributeError in whichever
+    reader touched it first."""
+
+    def test_every_non_object_row_is_a_roster_error(self):
+        for label, row in (("none", None), ("string", "live"), ("list", ["live"]),
+                           ("int", 7), ("bool", True), ("float", 1.5)):
+            with self.subTest(row=label):
+                with self.assertRaises(pr.RosterError) as caught:
+                    pr.compile_roster(self.ws, {W1: row})
+                self.assertNotIsInstance(caught.exception, AttributeError)
+
+    def test_a_valid_row_is_unchanged(self):
+        out = pr.compile_roster(self.ws, live(W1))
+        self.assertEqual(out["workers"][W1]["state"], "live")
+
+    def test_a_valid_row_beside_a_malformed_one_commits_nothing(self):
+        """Partial acceptance would publish half a roster: the valid row lands,
+        the malformed one raises, and the file says the pool is smaller."""
+        pr.compile_roster(self.ws, live(W1))
+        before = pr.roster_path(self.ws).read_text()
+        with self.assertRaises(pr.RosterError):
+            pr.compile_roster(self.ws, {**live(W1), W2: "live"})
+        self.assertEqual(pr.roster_path(self.ws).read_text(), before,
+                         "a refused compile rewrote the roster anyway")
+
+    def test_the_validator_is_callable_on_its_own(self):
+        pr.validate_workers(live(W1))
+        with self.assertRaises(pr.RosterError):
+            pr.validate_workers({W1: "live"})
+        with self.assertRaises(pr.RosterError):
+            pr.validate_workers("not-a-map")
+
+
+class TestRequestedWorkerField(Base):
+    """One canonical field with a migration alias. A producer on the old name
+    keeps working and says so; two fields that disagree route neither."""
+
+    def resolve(self, task):
+        said = []
+        got = pr.requested_worker_of(task, warn=said.append)
+        return got, " ".join(said)
+
+    def test_canonical_alone(self):
+        self.assertEqual(self.resolve({"requested_worker": "mars"}), ("mars", ""))
+
+    def test_legacy_alone_maps_and_reports(self):
+        got, said = self.resolve({pr.LEGACY_WORKER_FIELD: "mars"})
+        self.assertEqual(got, "mars")
+        self.assertIn("DEPRECATED", said)
+
+    def test_both_agreeing_is_not_a_conflict(self):
+        got, said = self.resolve({"requested_worker": "mars", pr.LEGACY_WORKER_FIELD: "mars"})
+        self.assertEqual(got, "mars")
+        self.assertEqual(said, "", "agreement must not warn")
+
+    def test_disagreement_routes_neither_and_warns(self):
+        got, said = self.resolve({"requested_worker": "mars", pr.LEGACY_WORKER_FIELD: "sudoo"})
+        self.assertIsNone(got, "a conflict must not silently pick one recipient")
+        self.assertIn("SECURITY", said)
+
+    def test_absent_and_blank_are_unaddressed(self):
+        for task in ({}, {"requested_worker": "  "}, {pr.LEGACY_WORKER_FIELD: ""}):
+            with self.subTest(task=task):
+                self.assertIsNone(self.resolve(task)[0])
+
+    def test_the_binding_still_decides_when_unaddressed(self):
+        roster = pr.compile_roster(self.ws, live(W1), bindings={"!r:x": W1})
+        self.assertEqual(pr.targets_for(roster, "!r:x", pr.requested_worker_of({})), [W1])
+
+    def test_a_conflict_falls_through_to_the_binding(self):
+        roster = pr.compile_roster(self.ws, live(W1), bindings={"!r:x": W1})
+        task = {"requested_worker": W2, pr.LEGACY_WORKER_FIELD: W1}
+        self.assertEqual(pr.targets_for(roster, "!r:x", pr.requested_worker_of(task, warn=lambda m: None)),
+                         [W1], "a conflicting pair must land on the binding, not on either name")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
