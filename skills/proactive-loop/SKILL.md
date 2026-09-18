@@ -17,7 +17,7 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
+2. Task watcher via the `Monitor` tool: `command: 'h="$PWD/skills/worker-pool/scripts/pool_route_handler.py"; [ -x "$h" ] && export SUTANDO_TASK_EVENT_HANDLER="$h"; bash src/watch-tasks-stream.sh'`, `persistent: true`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
    Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
@@ -108,7 +108,7 @@ caps this file and refuses date stamps in it).
    Then pivot; never block.
 9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
    owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
+   Not running with no trees → `Monitor` the activation-step-2 command (handler env + `bash src/watch-tasks-stream.sh`) persistent. A missing sentinel
    is UNKNOWN, not dead; never hand-roll a process check.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
