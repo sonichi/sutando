@@ -417,7 +417,8 @@ submit_task() {
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
-  raw="$(capture_raw)"
+  # A capture can fail (the pane is gone); the liveness wait below is what decides that.
+  raw="$(capture_raw)" || raw=""
   if "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$(core_incarnation)"; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
   elif prompt_is_staged "$raw" "$prompt"; then
