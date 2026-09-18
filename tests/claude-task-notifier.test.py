@@ -947,6 +947,56 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_a_busy_core_keeps_the_notifier_alive_until_the_session_is_gone(self):
+        # A pending task on a core that stays busy past the ready timeout is
+        # a wait, not a death: only a vanished session ends the process.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        self.pane_file.write_text(BUSY_FOOTER + "\n")
+        self.write_task("task-busy.txt")
+        err = open(self.root / "notifier.stderr", "w")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env({"SUTANDO_NOTIFIER_CORE_READY_TIMEOUT": "1",
+                           "SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
+            cwd=str(self.root),
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+            log = (self.root / "notifier.stderr").read_text()
+            self.assertIn("core did not become idle within 1s", log)
+            self.assertIsNone(proc.poll(),
+                              "a busy core made the notifier exit instead of waiting:\n" + log)
+            self.assertNotIn("TYPE", self.sendkeys_log_text(),
+                             "nothing may be typed into a busy core")
+            self.session_flag.unlink()
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+            self.assertEqual(proc.poll(), 1,
+                             "a vanished session must still end the notifier with status 1")
+        finally:
+            err.close()
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
     def test_a_queued_task_is_retried_with_no_further_wake_at_all(self):
         # A task left queued at its only wake has no other trigger once no
         # unrelated task arrives -- only the periodic self-poll can retry it.

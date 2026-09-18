@@ -377,7 +377,11 @@ watcher_pid=$!
 attempt_highest_pending() {
   local filename
   next_pending_task >/dev/null || return 0
-  wait_for_core_idle || exit 1
+  if ! wait_for_core_idle; then
+    # A busy core is not a dead one: the task stays on disk for the next poll.
+    tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || exit 1
+    return 0
+  fi
   filename="$(next_pending_task)" || return 0
   submit_task "$filename"
 }
