@@ -10,6 +10,10 @@ is {depth, position}: how many are pending and this task's 1-based rank (0 when 
 fresh queue for readers (voice's get_core_status, the desktop). core-status.json stays its own
 single-writer record: its `ts` is a liveness gate, so the queue does not ride on it.
 
+Only an absent tasks/ (or a file where the dir should be) is an empty queue. Any other failure to
+read it — permissions above all — raises: a queue that could not be counted is never reported as
+zero, and `write_snapshot` then leaves the previous snapshot in place rather than publish one.
+
 CLI (every command takes --workspace; --task-file derives it from the file's own tasks/ dir):
   task_queue.py pending                      the list, JSON
   task_queue.py position --task-file P       {depth, position}, JSON
@@ -66,12 +70,13 @@ def _source(path: Path) -> str | None:
 
 
 def pending(workspace: Path | None = None) -> list[dict]:
-    """[{id, source, priority, since}] in consumption order. A missing tasks/ dir is an empty queue."""
+    """[{id, source, priority, since}] in consumption order. A missing tasks/ dir is an empty queue;
+    one that exists but cannot be read raises (PermissionError and the rest), never reads as empty."""
     ws = workspace or resolve_workspace()
     tasks_dir = ws / "tasks"
     try:
         paths = [p for p in tasks_dir.iterdir() if p.is_file() and is_queue_task(p.name)]
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return []
     out = []
     for p in sort_tasks_by_priority(paths):
@@ -84,22 +89,30 @@ def pending(workspace: Path | None = None) -> list[dict]:
 
 
 def position(workspace: Path | None, task_id: str) -> dict:
-    """{depth, position}: position is 1-based in consumption order, 0 when the task is not pending."""
+    """{depth, position}: position is 1-based in consumption order, 0 when the task is not pending.
+    Raises like `pending` when tasks/ cannot be read: there is no depth to report then."""
     queue = pending(workspace)
     ids = [t["id"] for t in queue]
     return {"depth": len(queue), "position": ids.index(task_id) + 1 if task_id in ids else 0}
 
 
 def waiting(workspace: Path | None, task_id: str) -> int:
-    """How many other tasks are pending besides this one: the QUEUE line's number."""
+    """How many other tasks are pending besides this one: the QUEUE line's number. Raises like
+    `pending` when tasks/ cannot be read: the line is then not printed rather than printed as 0."""
     pos = position(workspace, task_id)
     return pos["depth"] - (1 if pos["position"] else 0)
 
 
-def write_snapshot(workspace: Path | None = None) -> Path:
-    """Atomically publish {ts, depth, pending} to <workspace>/state/task-queue.json."""
+def write_snapshot(workspace: Path | None = None) -> Path | None:
+    """Atomically publish {ts, depth, pending} to <workspace>/state/task-queue.json. When tasks/
+    cannot be read nothing is published — the previous snapshot stays as it was (readers date it
+    by `ts`, so it ages into "unknown"), one line goes to stderr, and None is returned."""
     ws = workspace or resolve_workspace()
-    queue = pending(ws)
+    try:
+        queue = pending(ws)
+    except OSError as exc:
+        print(f"task_queue: snapshot not published, tasks/ could not be read: {exc}", file=sys.stderr)
+        return None
     return write_status(SNAPSHOT_NAME, {"ts": int(time.time()), "depth": len(queue), "pending": queue}, workspace=ws)
 
 
@@ -113,7 +126,7 @@ def _workspace_of(task_file: str | None, workspace: str | None) -> Path | None:
 
 def main(argv: list[str] | None = None) -> int:
     """Exits 0 on every path: a caller in the dispatch path must never fail because the queue could
-    not be counted; a count it cannot give is simply not printed."""
+    not be counted; a count it cannot give is not printed, and the reason goes to stderr."""
     import argparse
     ap = argparse.ArgumentParser(description="the pending task queue")
     ap.add_argument("cmd", choices=("pending", "position", "waiting", "snapshot"))
@@ -125,7 +138,9 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "pending":
             print(json.dumps(pending(ws)))
         elif a.cmd == "snapshot":
-            print(str(write_snapshot(ws)))
+            written = write_snapshot(ws)
+            if written is not None:
+                print(str(written))
         elif not tid:
             return 0
         elif a.cmd == "position":

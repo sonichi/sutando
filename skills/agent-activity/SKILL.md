@@ -30,7 +30,8 @@ hand, only for files that name a room and a message). With at least one task ahe
 `python3 $S/activity.py queue --task-file <workspace>/tasks/task-….txt` prints that task's
 `{"depth": N, "position": K}` now. When more than one task is pending, the first line to the task's
 own conversation names the position ("Got it, right after the one I'm on." for one ahead, "Got it,
-N in line before this one." for more); nothing else narrates the queue.
+N in line before this one." for more); nothing else narrates the queue. When `tasks/` cannot be read
+it prints nothing, says why on stderr and exits 1: the position is unknown then, not zero.
 
 A task's rows are **live** until its `done` row; a task-less row is live 15 minutes. The drawer
 shows only live rows and hides itself when none is live. Rows are flat: the client marks the first

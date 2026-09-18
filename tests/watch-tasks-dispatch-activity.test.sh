@@ -49,6 +49,18 @@ grep -q '"depth": 2' "$tmpq/ws/state/task-queue.json" 2>/dev/null && echo "PASS 
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmpq/py"; chmod +x "$tmpq/py"
 out3="$(TASKS_DIR="$tmpq/ws/tasks" SUTANDO_PY_BIN="$tmpq/py" bash -c 'source "$1"; emit_dispatch_task_file task-q2.txt' _ "$SRC/task-emit.sh" 2>/dev/null)"
 [ "$out3" = "TASK_FILE: task-q2.txt" ] && echo "PASS no counter, no QUEUE line" || { echo "FAIL a QUEUE line without a count: $out3"; fail=1; }
+# tasks/ that cannot be listed (x-only: the task file still opens by path): no QUEUE line, not
+# "QUEUE: 0", and the snapshot on disk is left exactly as it was. Root lists anything: skipped there.
+if [ "$(id -u)" = "0" ]; then
+	echo "SKIP unreadable tasks/ (root)"
+else
+	snap_before="$(cat "$tmpq/ws/state/task-queue.json")"
+	chmod 100 "$tmpq/ws/tasks"
+	out4="$(TASKS_DIR="$tmpq/ws/tasks" bash -c 'source "$1"; emit_dispatch_task_file task-q2.txt' _ "$SRC/task-emit.sh" 2>/dev/null)"
+	chmod 755 "$tmpq/ws/tasks"
+	[ "$out4" = "TASK_FILE: task-q2.txt" ] && echo "PASS unreadable tasks/: the dispatch goes on with no QUEUE line" || { echo "FAIL unreadable tasks/, stdout was: $out4"; fail=1; }
+	[ "$(cat "$tmpq/ws/state/task-queue.json")" = "$snap_before" ] && echo "PASS unreadable tasks/: the previous snapshot is untouched" || { echo "FAIL the snapshot changed: $(cat "$tmpq/ws/state/task-queue.json")"; fail=1; }
+fi
 rm -rf "$tmpq"
 
 # Behaviour, not text: a grep for the argument NAME cannot tell the resolved
