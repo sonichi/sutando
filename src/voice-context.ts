@@ -93,7 +93,7 @@ export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null } 
 
 	if (opts.room) {
 		const label = opts.room.name ? `"${opts.room.name}" (${opts.room.id})` : opts.room.id;
-		lines.push(`ROOM: You are docked in room ${label}. Work you delegate answers in that room; say "in this room", never "in your DM".`, '');
+		lines.push(`ROOM: You are docked in room ${label}. What you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went.`, '');
 	}
 
 	// Read build log summary

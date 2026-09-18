@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
-import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult } from './inject-framing.js';
+import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
 
@@ -93,8 +93,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		return false;
 	});
 
-	startResultWatcher((result) => {
-		console.log(`${ts()} [TaskBridge] Delivering result to user`);
+	startResultWatcher((result, deliveryNote) => {
+		console.log(`${ts()} [TaskBridge] Delivering result to user${deliveryNote ? ' (with a delivery note)' : ''}`);
 		// Re-check session state inside the timer rather than at callback
 		// time. Reason: TaskBridge delivers `voice-*.txt` results the
 		// instant the WebSocket reconnects, but Gemini setup completes
@@ -108,7 +108,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		// T+1500ms when setup is reliably finished.
 		const inject = () => {
 			if (session.sessionManager.isActive && session.clientConnected) {
-				injectText(session, frameTaskResult(result));
+				// The note sits OUTSIDE the TASK_RESULT markers: it is delivery
+				// state the model acts on, not result text it must only summarise.
+				injectText(session, frameTaskResult(result) + (deliveryNote ? `\n\n${framedSystem(deliveryNote)}` : ''));
 				return true;
 			}
 			return false;
