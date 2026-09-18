@@ -119,11 +119,20 @@ next_pending_task() {
   return 1
 }
 
-# Every pane predicate has a TEXT form so one snapshot can be judged for busy,
-# idle-ready and composer-empty at once -- three separate reads are three races.
-# "esc to interrupt" covers any in-flight turn; the gate signatures don't.
-pane_text_is_busy() {
-  printf '%s\n' "$1" | tail -12 | grep -Fq 'esc to interrupt'
+# Every pane predicate has a TEXT form so one snapshot can be judged for healthy
+# and composer-empty at once -- two separate reads are two races.
+
+# cli_wedge.py owns the abnormal banners: a retry parked on an error, a limit,
+# a login prompt, a compaction. An in-flight turn is not one of them.
+pane_text_is_abnormal() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cli_wedge", sys.argv[1])
+wedge = importlib.util.module_from_spec(spec)
+sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
+spec.loader.exec_module(wedge)
+sys.exit(0 if wedge.matched_abnormal([sys.stdin.read()]) else 1)
+' "$REPO/src/cli_wedge.py"
 }
 
 # core-input-watch.py owns Claude's pane-state patterns; $2 names the predicate.
@@ -137,9 +146,11 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 ' "$REPO/src/core-input-watch.py" "$2"
 }
 
-pane_text_is_idle_ready() {
+# Healthy = the pane accepts input: a composer with the CLI's own footer, no
+# gate signature, no abnormal banner. A running turn still accepts (it queues).
+pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  pane_text_is_busy "$1" && return 1
+  pane_text_is_abnormal "$1" && return 1
   pane_text_ciw "$1" _is_idle_ready
 }
 
@@ -148,33 +159,27 @@ pane_text_composer_is_empty() {
   pane_text_ciw "$1" _composer_is_empty
 }
 
-core_pane_is_busy() {
-  local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
-  pane_text_is_busy "$pane"
-}
-
-core_pane_is_idle_ready() {
+core_pane_is_healthy() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
-  pane_text_is_idle_ready "$pane"
+  pane_text_is_healthy "$pane"
 }
 
 # The pane is the only witness; the core's own status file is a self-report that
-# is stale or absent in exactly the moments this path serves. POSITIVE idle only.
-core_is_idle() {
-  core_pane_is_idle_ready
+# is stale or absent in exactly the moments this path serves.
+core_is_healthy() {
+  core_pane_is_healthy
 }
 
-wait_for_core_idle() {
+wait_for_core_healthy() {
   local started
   started="$(date +%s)"
-  while ! core_is_idle; do
+  while ! core_is_healthy; do
     if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
       return 1
     fi
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
-      log_notifier "core did not become idle within ${CORE_READY_TIMEOUT}s"
+      log_notifier "core did not become healthy within ${CORE_READY_TIMEOUT}s"
       return 1
     fi
     sleep "$POLL_INTERVAL"
@@ -230,13 +235,22 @@ print(ciw._composer_text(sys.stdin.read()) or "")
 }
 
 # Staged = the composer holds EXACTLY our prompt (not merely our marker as a
-# substring -- interleaved owner text would still match that) AND changed since baseline.
+# substring -- interleaved owner text would still match that).
 # Whitespace is ignored on both sides: the input box word-wraps at the pane width and
 # indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
 prompt_is_staged() {
-  local tail="$1" baseline="$2" prompt="$3"
-  [ "$(composer_text "$tail" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ] \
-    && [ "$tail" != "$baseline" ]
+  local raw="$1" prompt="$2"
+  [ "$(composer_text "$raw" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ]
+}
+
+# The composer still carries our prompt at all (exactly, or with owner text
+# mixed in). False once it left: submitted, or queued behind a running turn.
+composer_holds_prompt() {
+  local raw="$1" prompt="$2"
+  case "$(composer_text "$raw" | tr -d '[:space:]')" in
+    *"$(printf '%s' "$prompt" | tr -d '[:space:]')"*) return 0 ;;
+  esac
+  return 1
 }
 
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
@@ -269,23 +283,23 @@ warn_if_capture_truncated() {
 }
 
 # Type + verify staged, then C-m + verify submitted; both halves retry.
-# A core that stays non-idle is a hard gate -- give up rather than type over a live turn.
+# A running turn is not a gate: the line queues behind it, as the Monitor
+# tool's own notification does. Only an unhealthy pane or a draft holds.
 deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0
-  local baseline baseline_raw staged_tail staged_raw=""
-  if ! wait_for_core_idle; then
-    log_notifier "core did not become idle for $filename; leaving it queued"
+  local baseline_esc baseline_raw staged_raw=""
+  if ! wait_for_core_healthy; then
+    log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
   fi
   while :; do
     # ONE snapshot is the last read before the paste and is judged whole:
-    # positively idle-ready (a gate or a turn fails it) and composer empty
+    # healthy (an abnormal banner or a gate fails it) and composer empty
     # (re-checked every retype). Any later read would be a new race.
     baseline_esc="$(capture_raw_esc)"
     baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
-    baseline="$(printf '%s\n' "$baseline_raw" | sed '/^[[:space:]]*$/d')"
-    if ! pane_text_is_idle_ready "$baseline_raw"; then
-      log_notifier "core is not idle-ready at the paste for $filename (busy or a gate); leaving it queued (failing closed)"
+    if ! pane_text_is_healthy "$baseline_raw"; then
+      log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
       return 1
     fi
     if ! pane_text_composer_is_empty "$baseline_esc"; then
@@ -296,8 +310,7 @@ deliver_prompt() {
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
-    staged_tail="$(printf '%s\n' "$staged_raw" | sed '/^[[:space:]]*$/d')"
-    if prompt_is_staged "$staged_tail" "$baseline" "$prompt"; then staged=1; break; fi
+    if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
@@ -312,19 +325,19 @@ deliver_prompt() {
   fi
   [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
-  # Re-verify the exact composer content AND idleness immediately before THIS
-  # Enter too; Enter is still unsent here, so this is not-yet-submitted.
-  if core_pane_is_busy || [ "$(capture_tail)" != "$staged_tail" ]; then
-    log_notifier "pane changed or went busy since $filename staged; not pressing Enter (failing closed, core may need attention)"
+  # The composer must hold EXACTLY our prompt at this Enter; the rest of the
+  # pane may move. Owner text mixed in means this Enter would not be ours.
+  if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+    log_notifier "composer changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
     return 1
   fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
-      # Confirmed by the pane going BUSY, never by the marker vanishing --
-      # the submitted prompt stays visible as scrollback, so it never does.
-      if has_result "$filename" || core_pane_is_busy; then
+      # Confirmed when the prompt has LEFT the composer: submitted, or queued
+      # behind a running turn. A busy footer proves nothing about our line.
+      if has_result "$filename" || ! composer_holds_prompt "$(capture_raw)" "$prompt"; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
         return 0
       fi
@@ -336,10 +349,10 @@ deliver_prompt() {
       log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged (core may need attention)"
       return 0
     fi
-    # Re-validate our prompt is STILL the exact composer content before
-    # pressing C-m again -- a changed pane means this Enter is not ours.
-    if [ "$(capture_tail)" != "$staged_tail" ]; then
-      log_notifier "pane changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
+    # Re-press only while the composer is STILL exactly our prompt -- with
+    # owner text mixed in, this Enter would not be ours.
+    if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+      log_notifier "composer changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
@@ -388,7 +401,7 @@ watcher_pid=$!
 attempt_highest_pending() {
   local filename
   next_pending_task >/dev/null || return 0
-  if ! wait_for_core_idle; then
+  if ! wait_for_core_healthy; then
     # A busy core is not a dead one: the task stays on disk for the next poll.
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || exit 1
     return 0

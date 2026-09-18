@@ -158,7 +158,8 @@ _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
 # The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
 # on the first typed character, so it is never a draft. Plain capture loses its dimming.
-_COMPOSER_PLACEHOLDER = re.compile(r'^\s*❯\s*Try "[^"\n]*"\s*$')
+_COMPOSER_PLACEHOLDER = re.compile(
+    r'^\s*❯\s*(?:Try "[^"\n]*"|Press up to edit queued messages)\s*$')
 # With `capture-pane -e` the CLI's ghost text (that hint, a suggested reply) is dimmed:
 # SGR 2 on some builds, a 256-colour grey (232-255) on others. Typed text never is.
 _ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
