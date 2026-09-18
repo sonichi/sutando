@@ -317,6 +317,10 @@ def _strip_heredoc_bodies(text: str) -> str:
 
 
 _FUNC_START_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s*\{\s*(.*)$")
+# The `{` on its OWN line -- a valid spelling `_FUNC_START_RE` alone can't
+# see, since it anchors the `{` to the same line as `name()`.
+_FUNC_START_SPLIT_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s*$")
+_BRACE_ONLY_RE = re.compile(r"^\s*\{\s*$")
 
 
 def _brace_delta(line: str) -> int:
@@ -348,21 +352,28 @@ def _brace_delta(line: str) -> int:
 
 def _function_bodies(text: str) -> list[tuple[str, int, int]]:
     """(name, first_body_line, last_body_line) for every multi-line
-    `name() { ... }` definition — 0-based inclusive indices into
-    `text.split("\\n")`, excluding the opening/closing brace lines
-    themselves. A one-liner (`name() { cmd; }`) has no line to hide."""
+    `name() { ... }` definition, `{` on the same line OR its own next
+    line — 0-based inclusive indices into `text.split("\\n")`, excluding
+    the opening/closing brace lines themselves. A one-liner
+    (`name() { cmd; }`) has no line to hide."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
         m = _FUNC_START_RE.match(lines[i])
-        if not m:
-            i += 1
-            continue
-        depth = 1 + _brace_delta(m.group(2))
+        if m:
+            rest, brace_line = m.group(2), i
+        else:
+            m = _FUNC_START_SPLIT_RE.match(lines[i])
+            if m and i + 1 < n and _BRACE_ONLY_RE.match(lines[i + 1]):
+                rest, brace_line = "", i + 1
+            else:
+                i += 1
+                continue
+        depth = 1 + _brace_delta(rest)
         if depth <= 0:
-            i += 1
+            i = brace_line + 1
             continue
-        start = i + 1
+        start = brace_line + 1
         j = start
         while j < n and depth > 0:
             depth += _brace_delta(lines[j])

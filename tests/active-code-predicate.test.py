@@ -413,6 +413,21 @@ class FunctionScopedInvocations(unittest.TestCase):
         text = f"dead() {{\n  echo ${{x:-${{y}}}}\n  bash scripts/{NAME}\n}}\nprintf ok\n"
         self.assertFalse(program_invokes(text, NAME))
 
+    def test_split_brace_function_is_recognized_uncalled(self):
+        """kewei-red-ag2space round 32: `name()` with `{` on its OWN line is
+        a valid, common spelling `_FUNC_START_RE` alone cannot see -- the
+        body then reads as unconditional top-level code."""
+        text = f"discover()\n{{\n  bash scripts/{NAME} > files\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_split_brace_function_called_is_credited(self):
+        text = f"discover()\n{{\n  bash scripts/{NAME} > files\n}}\ndiscover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_split_brace_function_keyword_form(self):
+        text = f"function discover()\n{{\n  bash scripts/{NAME}\n}}\ndiscover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier

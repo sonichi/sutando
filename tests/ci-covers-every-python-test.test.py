@@ -81,6 +81,24 @@ def _yaml_dquote_unescape(body: str) -> str:
     return "".join(out)
 
 
+def _dquote_join(parts: list[str]) -> str:
+    """Join a double-quoted scalar's physical-line parts per YAML spec 5.7:
+    a line ending in an ODD run of `\\` is an escaped break -- no fold space,
+    and that one backslash is consumed by the break, not passed to
+    `_yaml_dquote_unescape` (round 32, kewei-red-ag2space: unconditional
+    `" ".join` let `\\<space>` decode the join's own inserted space back into
+    a real one, silently matching real YAML by accident on this input and
+    diverging on any other)."""
+    out = parts[0]
+    for part in parts[1:]:
+        trailing = len(out) - len(out.rstrip("\\"))
+        if trailing % 2 == 1:
+            out = out[:-1] + part
+        else:
+            out = out + " " + part
+    return out
+
+
 def _quote_close_split(value: str, q: str) -> "tuple[bool, str]":
     """(closed, text before the matching close), honouring the quote
     style's own escape — `''` inside single quotes is a literal quote,
@@ -186,7 +204,9 @@ def _run_bodies(text: str) -> list[str]:
             closed, before = _quote_close_split(ln.strip(), quote_char)
             quote_parts.append(before)
             if closed:
-                out.append(_yaml_scalar(quote_char + " ".join(quote_parts) + quote_char))
+                joined = (_dquote_join(quote_parts) if quote_char == '"'
+                          else " ".join(quote_parts))
+                out.append(_yaml_scalar(quote_char + joined + quote_char))
                 quote_char, quote_parts = None, []
             continue
         stripped = ln.strip()
@@ -326,6 +346,27 @@ class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
     def test_an_attached_dash_c_does_not_name_its_argument(self):
         wf = "steps:\n  - run: python3 -cpass packages/x/test_dead.py\n"
         self.assertEqual(_named_in(wf), set())
+
+    def test_backslash_continued_dquote_scalar_joins_with_no_space(self):
+        """kewei-red-ag2space round 32: a YAML double-quoted scalar's own
+        escaped line break (spec 5.7) joins its two physical lines directly,
+        with no fold space -- confirmed against PyYAML, which decodes this
+        to the single glued token `python3packages/...`, not a real `python3
+        <script>` invocation. The unconditional `\" \".join()` this used to be
+        let the join's own inserted space get re-consumed by `\\<space>`
+        decoding, accidentally manufacturing a plausible-looking command
+        that never actually runs in real CI (a false green: this test would
+        read as covered when the workflow step is in fact malformed)."""
+        bs = chr(92)  # exactly one backslash char, unambiguous vs source escaping
+        wf = f'steps:\n  - run: "python3{bs}\n          packages/x/test_glued.py"\n'
+        self.assertEqual(_named_in(wf), set())
+
+    def test_plain_dquote_fold_still_inserts_a_space(self):
+        """Control for the case above: no trailing backslash means an
+        ORDINARY fold, which still must insert a space (unchanged)."""
+        wf = ('steps:\n  - run: "python3\n'
+              '          packages/x/test_real.py"\n')
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
 
 
 class OptionContractThroughTheConsumerPath(unittest.TestCase):
