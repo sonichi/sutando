@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — locates the CODE script scripts/tmux-pane-lock.sh
 DEFAULT_TIMEOUT = 5.0
 
 
