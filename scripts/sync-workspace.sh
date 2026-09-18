@@ -855,9 +855,8 @@ _refuse_foreign_host_deletions() {
     return 1
 }
 
-# Pre-pull half of the push-time guard above: a local commit can untrack a
-# peer's subtree before it's ever staged for push. Unstage (never abort) so
-# the caller's own legitimate edits alongside it still land.
+# Pre-pull half of the push-time guard above; unstage (never abort) so the
+# caller's own legitimate edits alongside it still land.
 _unstage_foreign_host_deletions_pre_pull() {
     [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
     local path hits=0

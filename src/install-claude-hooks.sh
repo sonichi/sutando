@@ -72,12 +72,8 @@ resolve_or_die() {  # resolve_or_die <subcommand> <fallback> -> sets RESOLVED
   RESOLVED="$_out"
 }
 
-# These hooks belong to the CORE SESSION, not to the checkout. Project-level
-# `.claude/settings.json` scopes by repo, so every other Claude session with
-# this cwd — a review automation, an ad-hoc owner session, a worktree — also
-# fired them: the Stop hook handed guests the core's task queue to drain, and
-# session-handoff overwrote the core's session-state.md with a guest's tail.
-# The core's own CLAUDE_CONFIG_DIR is read by the core and nothing else.
+# Core-session hooks, not project-level: `.claude/settings.json` scopes by
+# repo, so every OTHER session with this cwd would fire them too.
 resolve_or_die claude-sutando-config-dir "$REPO_DIR/workspace/.claude-sutando"
 CORE_CONFIG_DIR="$RESOLVED"
 SETTINGS="$CORE_CONFIG_DIR/settings.json"
@@ -228,20 +224,28 @@ SKIPPED=0
 REMOVED=0
 
 # Real argv tokenizer (quotes/backslash honored, never expands $vars/`cmd`).
-# Sets TOKENIZE_RESULT + TOKENIZE_HAS_OPERATOR; returns 1 on an unterminated quote.
+# Sets TOKENIZE_RESULT/TOKENIZE_HAS_OPERATOR/TOKENIZE_UNSAFE (1 per token iff
+# unneutralized); returns 1 on an unterminated quote.
 tokenize_argv() {
-  local s="$1" n=${#1} i=0 c cur="" in_word=0
+  local s="$1" n=${#1} i=0 c cur="" in_word=0 cur_unsafe=0
   TOKENIZE_RESULT=()
   TOKENIZE_HAS_OPERATOR=0
+  TOKENIZE_UNSAFE=()
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
     case "$c" in
       ' '|$'\t')
-        if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
+        if [ "$in_word" = 1 ]; then
+          TOKENIZE_RESULT+=("$cur"); TOKENIZE_UNSAFE+=("$cur_unsafe")
+          cur=""; cur_unsafe=0; in_word=0
+        fi
         i=$((i+1)) ;;
       $'\n'|';'|'&'|'|'|'<'|'>'|'('|')')
         TOKENIZE_HAS_OPERATOR=1
-        if [ "$in_word" = 1 ]; then TOKENIZE_RESULT+=("$cur"); cur=""; in_word=0; fi
+        if [ "$in_word" = 1 ]; then
+          TOKENIZE_RESULT+=("$cur"); TOKENIZE_UNSAFE+=("$cur_unsafe")
+          cur=""; cur_unsafe=0; in_word=0
+        fi
         i=$((i+1)) ;;
       "'")
         in_word=1; i=$((i+1))
@@ -249,7 +253,7 @@ tokenize_argv() {
           [ "$i" -ge "$n" ] && return 1
           c="${s:i:1}"
           [ "$c" = "'" ] && { i=$((i+1)); break; }
-          cur="$cur$c"; i=$((i+1))
+          cur="$cur$c"; i=$((i+1))    # single-quoted: nothing here is live
         done ;;
       '"')
         in_word=1; i=$((i+1))
@@ -261,17 +265,21 @@ tokenize_argv() {
             i=$((i+1)); [ "$i" -ge "$n" ] && return 1
             cur="$cur${s:i:1}"; i=$((i+1)); continue
           fi
+          # inside "...": $ and ` still expand; glob/brace chars do not.
+          case "$c" in '$'|'`') cur_unsafe=1 ;; esac
           cur="$cur$c"; i=$((i+1))
         done ;;
       '\')
         in_word=1; i=$((i+1))
         [ "$i" -ge "$n" ] && return 1
-        cur="$cur${s:i:1}"; i=$((i+1)) ;;
+        cur="$cur${s:i:1}"; i=$((i+1)) ;;   # escaped: never live
       *)
-        in_word=1; cur="$cur$c"; i=$((i+1)) ;;
+        in_word=1
+        case "$c" in '$'|'`'|'*'|'?'|'~'|'['|']'|'{'|'}') cur_unsafe=1 ;; esac
+        cur="$cur$c"; i=$((i+1)) ;;
     esac
   done
-  [ "$in_word" = 1 ] && TOKENIZE_RESULT+=("$cur")
+  [ "$in_word" = 1 ] && { TOKENIZE_RESULT+=("$cur"); TOKENIZE_UNSAFE+=("$cur_unsafe"); }
   return 0
 }
 
@@ -306,14 +314,13 @@ _is_installer_path_shape() {
   esac
 }
 
-# Is $1 (an ISOLATED path token, never a full command tail) free of shell
-# expansion/glob syntax? shq()/shlex.quote() never emit any of these chars.
+# Is $1 free of LIVE shell expansion/glob syntax? $2 is tokenize_argv's
+# TOKENIZE_UNSAFE flag for this token — quoting provenance, not a re-scan.
 _is_installer_path_literal() {
   case "$1" in
     '$HOME/Desktop/sutando'*) return 0 ;;
-    *'$'*|*'`'*|*'*'*|*'?'*|*'~'*|*'['*|*']'*) return 1 ;;
   esac
-  return 0
+  [ "${2:-1}" = 0 ]
 }
 
 # Matches src/skill_hooks.py's `[ -f Q ] || exit 0; exec RUNNER Q` guard
@@ -331,7 +338,9 @@ _skill_hook_guard_path() {
   [ "$guard" = "$exec_arg" ] || return 1
   tokenize_argv "$guard" || return 1
   [ "$TOKENIZE_HAS_OPERATOR" = 0 ] && [ "${#TOKENIZE_RESULT[@]}" -eq 1 ] || return 1
-  printf '%s\n' "${TOKENIZE_RESULT[0]}"
+  # Two lines: path, then its TOKENIZE_UNSAFE flag -- the only way the flag
+  # survives this function's own command-substitution boundary to the caller.
+  printf '%s\n%s\n' "${TOKENIZE_RESULT[0]}" "${TOKENIZE_UNSAFE[0]}"
 }
 
 # Is $1 (a raw .command string) a stale/foreign variant of the current entry
@@ -347,16 +356,17 @@ candidate_is_owned() {
   if [ -n "$HOOK_PRIOR_CUR" ] && [ "$cand" = "$HOOK_PRIOR_CUR" ]; then
     return 0
   fi
-  # Only a skill-declared entry may wear this guard shape. MARKER is the full
-  # "skills/<name>/<relative-command>" suffix, matched as a suffix (not a
-  # substring), so a foreign command sharing only the basename cannot satisfy it.
-  local guard_path
+  # Only a skill-declared entry may wear this guard shape. MARKER matches as
+  # a suffix, not a substring, so a shared basename alone can't satisfy it.
+  local guard_out guard_path guard_unsafe
   if [ "$HOOK_IS_SKILL_CUR" = "1" ] \
-     && guard_path="$(_skill_hook_guard_path "$cand" "${HOOK_PRIOR_CUR%% *}")"; then
+     && guard_out="$(_skill_hook_guard_path "$cand" "${HOOK_PRIOR_CUR%% *}")"; then
+    guard_path="${guard_out%%$'\n'*}"
+    guard_unsafe="${guard_out#*$'\n'}"
     case "$guard_path" in
       *"$MARKER")
         _is_installer_path_shape "$guard_path" || return 1
-        _is_installer_path_literal "$guard_path" && return 0
+        _is_installer_path_literal "$guard_path" "$guard_unsafe" && return 0
         ;;
     esac
     return 1
@@ -376,7 +386,7 @@ candidate_is_owned() {
     case "${TOKENIZE_RESULT[1]}" in
       *"$MARKER"*)                                        # bucket: clean argv[1] match
         _is_installer_path_shape "${TOKENIZE_RESULT[1]}" || return 1
-        _is_installer_path_literal "${TOKENIZE_RESULT[1]}" || return 1
+        _is_installer_path_literal "${TOKENIZE_RESULT[1]}" "${TOKENIZE_UNSAFE[1]}" || return 1
         ;;
       *)                                                  # bucket B
         # Collapse doubled slashes (mktemp -d can produce them; REPO_DIR is

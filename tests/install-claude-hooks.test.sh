@@ -1054,6 +1054,80 @@ ok "round 13: our own SessionEnd hook still installed alongside PoC #2" \
    "$([ "$(echo "$K2S_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
 rm -rf "$K2ROOT"
 
+# --- 19. #4309 review round 14 (keweichen), the brace-expansion pair.
+# PoC #1: an operator's own hook path containing an UNQUOTED brace-expansion
+# construct (`{operator,other}`) must survive -- a shell running this string
+# expands it into a DIFFERENT path than the literal text appears to name, so
+# the installer cannot know which path it would actually execute and must
+# refuse to claim it. Before the fix, `_is_installer_path_literal()` did not
+# check for `{`/`}` at all, so the false-owned check happily matched it.
+K3ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r14.XXXXXX")"
+K3REPO="$K3ROOT/repo"
+mkdir -p "$K3REPO/src" "$K3REPO/.claude" "$K3REPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$K3REPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\ntrue\n' > "$K3REPO/src/session-handoff.sh"
+echo '{}' > "$K3REPO/workspace/.claude-sutando/settings.json"
+export K3_SETTINGS="$K3REPO/workspace/.claude-sutando/settings.json"
+python3 - << 'PY'
+import json, os
+p = os.environ['K3_SETTINGS']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         # unquoted brace expansion -- bash would run
+         # /tmp/operator/src/session-handoff.sh at runtime, NOT the literal
+         # string; the installer must not treat this as its own written path.
+         "command": 'bash /tmp/{operator,other}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$K3REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K3S_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K3_SETTINGS")"
+ok "round 14 PoC #1: brace-expansion operator path survives" \
+   "$(echo "$K3S_SURV" | grep -qF '{operator,other}' && echo 0 || echo 1)"
+ok "round 14: our own SessionEnd hook still installed alongside PoC #1" \
+   "$([ "$(echo "$K3S_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$K3ROOT"
+
+# PoC #2 (the paired quoted-literal control the review asked for): a SKILL
+# hook written by a PRIOR run at an OLD checkout path that itself contained
+# literal brackets must still be recognized as ours and swept after the
+# checkout moved -- shlex.quote() single-quotes the whole token because `[`
+# isn't in its safe set, so the guard-path branch must read that quoting
+# (TOKENIZE_UNSAFE) rather than re-derive "unsafe" from the dequoted string,
+# or the bracketed-but-safely-quoted OLD entry is mistaken for a foreign
+# command and left behind duplicated alongside the newly-installed one.
+K4ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r14.XXXXXX")"
+K4REPO="$K4ROOT/repo"
+mkdir -p "$K4REPO/src" "$K4REPO/.claude" "$K4REPO/workspace/.claude-sutando" \
+         "$K4REPO/skills/discoveredskill"
+cp "$INSTALLER" "$K4REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$K4REPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$K4REPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$K4REPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$K4REPO/skills/discoveredskill/hook.sh"
+chmod +x "$K4REPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$K4REPO/workspace/.claude-sutando/settings.json"
+export K4_SETTINGS="$K4REPO/workspace/.claude-sutando/settings.json" \
+       K4_OLDREPO="$K4ROOT/old checkout[x]/that no longer exists"
+python3 - << 'PY'
+import json, os, shlex
+p, old_repo = os.environ['K4_SETTINGS'], os.environ['K4_OLDREPO']
+old_hook = f"{old_repo}/skills/discoveredskill/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$K4REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K4P_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K4_SETTINGS")"
+ok "round 14 PoC #2: pre-move SKILL hook at a BRACKETED old path is swept, not left duplicated" \
+   "$(echo "$K4P_SURV" | grep -qF 'old checkout[x]' && echo 1 || echo 0)"
+ok "round 14: our own discovered-skill hook still installed after sweeping the bracketed old entry" \
+   "$([ "$(echo "$K4P_SURV" | grep -c 'discoveredskill/hook.sh')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$K4ROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then

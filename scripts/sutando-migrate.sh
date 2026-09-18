@@ -1854,9 +1854,8 @@ commit_main() {
                 # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
                 if [ -f "$_primary_installer" ]; then
                     echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
-                    # `local _hb_rc=$?` after a bare failing command would abort here under
-                    # `set -e` before the assignment ever ran -- `|| _hb_rc=$?` keeps the
-                    # statement itself successful so errexit never fires.
+                    # `local _hb_rc=$?` after a failing command aborts under `set -e`
+                    # before the assignment runs -- `|| _hb_rc=$?` keeps it successful.
                     local _hb_rc=0
                     bash "$_primary_installer" || _hb_rc=$?
                     if [ "$_hb_rc" -ne 0 ]; then

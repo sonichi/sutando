@@ -2,19 +2,12 @@
 # sutando-config-hooks.sh — hook helper for the per-runtime CLAUDE_CONFIG_DIR
 # migration (Option D from #design 2026-06-07 design discussion).
 #
-# Background: when Sutando migrates a user from `~/.claude/` to a per-runtime
-# `$CLAUDE_CONFIG_DIR` (typically `<workspace>/.claude-sutando/`), hooks that
-# reference literal `~/.claude/hooks/...` paths in their `command:` strings
-# can't move cleanly. Owner's design (Option D, 01:38Z): drop those hooks at
-# migration time and (i) auto-re-install Sutando-owned hooks pointing at the
-# correct workspace paths, and (ii) print a notice listing dropped non-Sutando
-# entries so the user can re-add manually.
+# A `~/.claude/` → `$CLAUDE_CONFIG_DIR` migration can't carry literal
+# `~/.claude/hooks/...` command strings, so this re-installs Sutando's own
+# and notices any dropped non-Sutando entries for manual re-add.
 #
-# This script is parametric on the target settings.json path — unlike the two
-# existing installers (`src/install-claude-hooks.sh` writes to repo's
-# `.claude/settings.json`; `skills/catchup-after-startup/scripts/install-hook.sh`
-# writes to `~/.claude/settings.json`), this one can target any settings.json,
-# making it suitable for `$CLAUDE_CONFIG_DIR/settings.json` post-migration.
+# Parametric on the target settings.json path — unlike the two existing
+# installers, which each write one fixed file, this one can target any.
 #
 # Subcommands:
 #   detect-missing <settings.json>
@@ -52,15 +45,8 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-# Sutando-owned hook commands (canonical forms — must match what the existing
-# installers write, so detect-missing recognizes them). The catchup hook
-# resolves SUTANDO_REPO_DIR/src/session-handoff.sh; the project hooks live in
-# project-level .claude/settings.json (NOT user-level), so they're not part of
-# this migration's scope unless --with-project-hooks is set.
-#
-# Per `feedback_claude_code_hook_scoping`: catchup hook is USER-level (fires
-# everywhere), project hooks are PROJECT-level (fire only when Claude runs in
-# this repo). The migration target is USER-level CLAUDE_CONFIG_DIR.
+# Canonical command forms, matched against what the two installers write.
+# --with-project-hooks is named for its origin, not its scope: both hook sets are core-session (CLAUDE_CONFIG_DIR), same as this script's migration target.
 
 # install-claude-hooks.sh owns the command strings; this asks it for them. Exit
 # codes differ: 1 = genuinely absent (safe to guess a fallback); 2 = present but this hook didn't come back — never guess, only skip or propagate.
