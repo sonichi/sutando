@@ -362,6 +362,36 @@ enum SutandoConfig {
         return proc.terminationStatus == 0
     }
 
+    /// The selected persistent core CLI runtime, mirroring
+    /// `src/sutando_config.py:resolve_core_runtime` and resolving from the same
+    /// merged config this type already loads: `$SUTANDO_CORE_RUNTIME` first,
+    /// else `core.runtime`, else "claude".
+    ///
+    /// An unrecognised value returns nil rather than raising: a caller choosing
+    /// a pane parser must not send with a guessed runtime, and nil lets it fall
+    /// back to a policy that is safe on either.
+    static func resolveCoreRuntime(
+        repoRoot explicitRoot: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        let env = (environment["SUTANDO_CORE_RUNTIME"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        let configured: String
+        if !env.isEmpty {
+            configured = env
+        } else {
+            let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
+            let core = cfg["core"] as? [String: Any] ?? [:]
+            configured = ((core["runtime"] as? String) ?? "claude")
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return supportedCoreRuntimes.contains(configured) ? configured : nil
+    }
+
+    /// Keep in step with `_SUPPORTED_CORE_RUNTIMES` in src/sutando_config.py and
+    /// the `--runtime` validation in scripts/tmux-send-line.sh.
+    static let supportedCoreRuntimes: Set<String> = ["claude", "codex"]
+
     /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
     /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
     static func resolvePython(

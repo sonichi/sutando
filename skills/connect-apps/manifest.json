@@ -1,15 +1,25 @@
 {
   "name": "connect-apps",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Just-in-time app connections: answers from Station connectors, posts one Connect card when an app is missing (private to the owner, under their message, in a room with other people), and resumes the owner's request after sign-in through a detached waiter and one resume task.",
+  "description": "Just-in-time app connections: answers from Station connectors, posts one Connect card when an app is missing (private to the owner, under their message, in a room with other people), and resumes the owner's request after sign-in through a detached waiter and one resume task. The precheck hook tells the agent, on its first touch of a task, which apps the message names and (from the 30s read cache) which are not connected.",
   "permissions": {
     "network": true,
     "filesystem": "read-write",
     "secrets": ["AG2_CLOUD_TOKEN"]
   },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "command": "./hooks/connect-precheck.py"
+    },
+    {
+      "event": "PostToolUse",
+      "command": "./hooks/connect-precheck.py"
+    }
+  ],
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

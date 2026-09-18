@@ -139,6 +139,8 @@ _AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
+#: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
+_BORDER_LINE = re.compile(r"^[\s─-╿]+$")
 
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
@@ -155,6 +157,9 @@ _TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
+# The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
+# on the first typed character, so it is never a draft. Plain capture loses its dimming.
+_COMPOSER_PLACEHOLDER = re.compile(r'^\s*❯\s*Try "[^"\n]*"\s*$')
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40
 
@@ -236,6 +241,57 @@ def _is_idle_ready(pane: str) -> bool:
     idle. Mirrors classify()'s idle-footer suppression."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
     return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
+
+
+def _composer_is_empty(pane: str) -> bool:
+    """True iff the bottommost ❯ prompt line carries no unsent draft text.
+
+    Distinct from `_is_idle_ready`, which classifies gates/turn state and says
+    nothing about a partial owner draft sitting in the composer — an idle-ready
+    footer and an unsent "❯ owner draft" line are not mutually exclusive. Mirrors
+    `refused_turn`'s own prompt-line predicate (a `_PROMPT_LINE` match with
+    non-empty content after stripping the marker means a draft is staged). No
+    ❯ line at all is NOT verifiably empty — fails closed (False), never assumed.
+    """
+    for ln in reversed([ln for ln in pane.splitlines() if ln.strip()]):
+        if _PROMPT_LINE.match(ln):
+            return bool(_COMPOSER_PLACEHOLDER.match(ln)) or not ln.strip().lstrip("❯").strip()
+    return False
+
+
+def _composer_text(pane: str) -> "str | None":
+    """The composer's full typed content, dewrapped, or None with no ❯ line.
+
+    From the bottommost ❯ line to the end. Below an editable composer the
+    pane renders exactly one structural footer — the box rule and ONE status
+    row (a gate replaces the composer; the idle/busy checks refuse before
+    anyone compares text). So the strip is structural, not classifying:
+    trailing box rules, at most one status row, trailing box rules again.
+    Nothing exposed by that strip is re-classified — an owner row that reads
+    "for agents" or "────" is typed text and stays, else a mixed composer
+    would compare equal to the bare prompt. Wrapped rows join with no separator.
+    """
+    lines = [ln for ln in pane.splitlines() if ln.strip()]
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _PROMPT_LINE.match(lines[i]):
+            start = i
+            break
+    if start is None:
+        return None
+    block = lines[start:]
+
+    def _pop_borders():
+        while len(block) > 1 and _BORDER_LINE.match(block[-1]):
+            block.pop()
+    _pop_borders()
+    if len(block) > 1 and _IDLE.search(block[-1]):
+        block.pop()
+    _pop_borders()
+    if not block or (len(block) == 1 and _COMPOSER_PLACEHOLDER.match(block[0])):
+        return ""
+    block[0] = block[0].lstrip().lstrip("❯").lstrip()
+    return "".join(block)
 
 
 def refused_turn(pane: str):

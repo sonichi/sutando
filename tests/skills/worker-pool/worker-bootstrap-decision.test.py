@@ -188,7 +188,11 @@ class TestMain(Base):
         real = sys.modules.get("workspace_default")
         sys.modules["workspace_default"] = stub
         try:
-            rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
+            # A spawner-assigned workspace in the env bypasses the loader;
+            # this case is about the loader, so the env must not answer.
+            with patch.dict(os.environ):
+                os.environ.pop("SUTANDO_WORKSPACE_DIR", None)
+                rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox)
         finally:
             if real is None:
                 del sys.modules["workspace_default"]

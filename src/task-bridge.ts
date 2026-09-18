@@ -10,6 +10,7 @@
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -409,8 +410,10 @@ export const workTool: ToolDefinition = {
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
+		// Skipped on Windows: shells out to /bin/sh + bash + invokes a .sh skill
+		// that isn't ported yet. The slow file-bridge path below still works.
 		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
-		if (concatMatch) {
+		if (concatMatch && process.platform !== 'win32') {
 			try {
 				const { execFileSync } = await import('node:child_process');
 				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
@@ -426,13 +429,30 @@ export const workTool: ToolDefinition = {
 			} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
 		}
 
-		// Check if the watcher (Claude Code brain) is running
+		// Check if the watcher (Claude Code brain) is running. The historic probe
+		// uses `pgrep -f watch-tasks` (POSIX only). On Windows we fall back to a
+		// PID-file sentinel written by src/watch-tasks-stream.ps1.
 		let watcherOnline = false;
 		try {
-			const { execFileSync } = await import('node:child_process');
-			// execFileSync argv array — no shell interpolation (fixes #1451)
-			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-			watcherOnline = !!watcherRunning;
+			if (process.platform === 'win32') {
+				const { existsSync, readFileSync } = await import('node:fs');
+				const pidFile = join(REPO_DIR, 'state', 'watch-tasks-stream.pid');
+				if (existsSync(pidFile)) {
+					const pid = parseInt(readFileSync(pidFile, 'utf-8').trim());
+					if (pid > 0) {
+						try {
+							// `process.kill(pid, 0)` is a liveness probe (signal 0); throws if process is gone.
+							process.kill(pid, 0);
+							watcherOnline = true;
+						} catch {}
+					}
+				}
+			} else {
+				const { execFileSync } = await import('node:child_process');
+				// execFileSync argv array — no shell interpolation (fixes #1451)
+				const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+				watcherOnline = !!watcherRunning;
+			}
 		} catch {
 			// pgrep returns exit code 1 if no match
 		}
@@ -626,7 +646,7 @@ export function getRecentConversation(count = 10): string {
 }
 
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
-const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
+const NOTE_VIEWING_FILE = join(tmpdir(), 'sutando-note-viewing.json');
 
 /**
  * Watch for context-drop.txt and inject into Gemini conversation.
