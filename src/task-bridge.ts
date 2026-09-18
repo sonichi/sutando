@@ -195,6 +195,42 @@ export function forwardVoiceResultToRoom(taskId: string, result: string, room: s
 	return file;
 }
 
+/** `[dm-only]` is detected the way every text bridge detects it
+ *  (result_markers.parse_markers: anywhere in the body, case-insensitive);
+ *  the drain's strip below is narrower on purpose (a standalone line only). */
+export const DM_ONLY_RE = /\[dm-only\]/i;
+
+/** Keep a room-bound voice result to the owner's DM: the same gateway-tagged
+ *  proactive shape as the room post, with no `[channel:]` line and the
+ *  `[dm-only]` marker restored on top, so `_proactive_route` delivers it to
+ *  the owner's own room whatever else the body says. Claimed at once, for the
+ *  same reason as the room shape. */
+export function forwardVoiceResultToOwnerDm(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.to-ag2space.txt`;
+	writeFileSync(join(RESULT_DIR, file), `[dm-only]\n${result}`);
+	_deliveredResults.add(file);
+	return file;
+}
+
+/** A room-bound result that declared itself `[dm-only]` goes to the owner's
+ *  DM instead of the room (CLAUDE.md "Where replies go": what the owner asked
+ *  for themselves goes to the DM even by voice while docked). Owner 2026-09-18,
+ *  after a "look into the mute bug" analysis landed in a customer room: "it
+ *  should only send messages that are RELEVANT to that room otherwise should go
+ *  to the DM". Returns the DM file, or null when the task is not room-bound or
+ *  the result is not dm-only — then the caller's room leg decides. */
+export function keepVoiceResultToDm(taskId: string, result: string, dmOnly: boolean, nowSec = Math.floor(Date.now() / 1000)): string | null {
+	if (!dmOnly || !_voiceTaskRoom(taskId)) return null;
+	const file = forwardVoiceResultToOwnerDm(taskId, result, nowSec);
+	console.log(`${ts()} [TaskBridge] ${taskId} result kept to the DM ([dm-only]) via ${file}`);
+	return file;
+}
+
+/** What voice hears under a result kept to the DM, outside the TASK_RESULT
+ *  markers, so the model says "in your DM" rather than the docked room's
+ *  "in this room". */
+export const DM_ONLY_DELIVERY_NOTE = 'That result was for the owner alone: its written copy went to their DM, not the room this session is docked in. Tell them it is in their DM ("I sent it to your DM"), never "in this room".';
+
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // Per-task pending state: submission epoch, timeout (ms), and whether to
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
@@ -476,9 +512,12 @@ export async function resolveVoiceResultRoom(taskId: string): Promise<string | n
 	return null;
 }
 
-/** Voice result with no client attached: into its verified room, else the
- *  owner-DM proactive shape every bridge already delivers. */
-export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000)): Promise<string> {
+/** Voice result with no client attached: into its verified room — unless it
+ *  is `[dm-only]`, then the owner's DM — else the owner-DM proactive shape
+ *  every bridge already delivers. */
+export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
+	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
+	if (kept) return kept;
 	const room = await resolveVoiceResultRoom(taskId);
 	if (room) {
 		const file = forwardVoiceResultToRoom(taskId, result, room, nowSec);
@@ -497,7 +536,7 @@ export async function forwardOfflineVoiceResult(taskId: string, result: string, 
 export function sessionRoomNotice(change: SessionRoomChange, room: VoiceSessionRoom | null): string | null {
 	if (change === 'entered' && room) {
 		const label = room.name ? `"${room.name}"` : room.id;
-		return `You are now in room ${label}. Work you delegate answers in that room; when you tell the user where a result went, say "in this room", never "in your DM". No reply is needed.`;
+		return `You are docked in room ${label}; what you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went. No reply is needed.`;
 	}
 	if (change === 'left') {
 		return 'You are back in your DM. Work you delegate answers there; say "in your DM" or "here", never "in this room". No reply is needed.';
@@ -526,6 +565,14 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	if (room) lines.push('channel_kind: room', `source_room_id: ${room}`);
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
+}
+
+/** The one body line under `task:` that tells the core how to answer a task
+ *  delegated while docked in a room. A body line, not a header key: the core
+ *  reads it as guidance, no consumer parses it, and it needs no
+ *  KNOWN_HEADER_KEYS entry. The drain honours the marker it names. */
+export function voiceRoomTaskGuidance(room: string): string {
+	return `room_context: ${room} — post there only what its members are meant to read; for anything the owner asked for themselves start the result with [dm-only]`;
 }
 
 /** The room a voice task was delegated from, read through the same
@@ -819,10 +866,13 @@ export const workTool: ToolDefinition = {
 			}
 		} catch { /* best effort — never block delegation on context attach */ }
 		// A session docked in a room addresses the task to that room (headers
-		// via buildVoiceTaskHeader); a DM session keeps `channel_id: local-voice`.
+		// via buildVoiceTaskHeader) and tells the core, in the body, what that
+		// room may read; a DM session keeps `channel_id: local-voice`.
+		const room = _voiceSessionRoom?.id ?? null;
+		const roomGuidance = room ? `\n${voiceRoomTaskGuidance(room)}` : '';
 		const content =
-			buildVoiceTaskHeader(taskId, timestamp, ownerId, _voiceSessionRoom?.id ?? null) +
-			`task: ${confineUserContent(task)}${contextBlock}\n`;
+			buildVoiceTaskHeader(taskId, timestamp, ownerId, room) +
+			`task: ${confineUserContent(task)}${roomGuidance}${contextBlock}\n`;
 		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -1079,7 +1129,7 @@ export function resetNoteViewingDebounce(): void {
  * submitted. Results it doesn't own are left untouched for their real
  * consumers on the core host. Skip markers get the same silent-archive
  * treatment as the local path. */
-function startRelayResultWatcher(onResult: (result: string) => void): void {
+function startRelayResultWatcher(onResult: ResultListener): void {
 	console.log(`${ts()} [TaskBridge] Relay result watcher polling core agent-api`);
 	let inFlight = false;
 	setInterval(async () => {
@@ -1126,7 +1176,12 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 	}, 2000);
 }
 
-export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
+/** The drain's listener: the result text, plus an optional delivery note the
+ *  adapter injects under it (where the written copy went) when it differs from
+ *  what the session was told to expect. */
+export type ResultListener = (result: string, deliveryNote?: string) => void;
+
+export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
 	if (_delegation.mode === 'relay') {
 		// Split-host mode: the local watcher below reads core-host state
 		// (task files for timeout snippets, voice-/question-/proactive- flows,
@@ -1245,7 +1300,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// The old expression here was /\[dm-only\]\s*/gi, which stripped
 				// every occurrence and made this consumer disagree with every
 				// text bridge after the Python side was narrowed.
-				const result = readFileSync(path, 'utf-8')
+				const rawResult = readFileSync(path, 'utf-8');
+				// Detected before the strip: a room-bound voice result that carries
+				// the marker is kept to the owner's DM (keepVoiceResultToDm).
+				const dmOnly = DM_ONLY_RE.test(rawResult);
+				const result = rawResult
 					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
 					.trim();
 				if (!result) continue;
@@ -1337,7 +1396,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						// bridge still vouches for it, else the owner DM gets it.
 						_deliveredResults.add(file);
 						_pendingTasks.delete(taskId);
-						forwardOfflineVoiceResult(taskId, result).catch(e => {
+						forwardOfflineVoiceResult(taskId, result, undefined, dmOnly).catch(e => {
 							_deliveredResults.delete(file);
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} offline:`, e);
 						});
@@ -1419,10 +1478,15 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
-					onResult(result);
-					// A voice task delegated from a room is spoken AND posted in that
-					// room — the owner asked there, and the room keeps the record.
-					if (registersTask && !foreignOrigin && _voiceTaskRoom(taskId)) {
+					// A voice task delegated from a room is spoken AND written: into
+					// that room when the answer is for its members (the owner asked
+					// there, and the room keeps the record), into the owner's DM when
+					// the core marked it `[dm-only]` — and voice is told which.
+					const roomBound = registersTask && !foreignOrigin && _voiceTaskRoom(taskId) !== null;
+					const keptToDm = roomBound ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
+					if (keptToDm) onResult(result, DM_ONLY_DELIVERY_NOTE);
+					else onResult(result);
+					if (roomBound && !keptToDm) {
 						resolveVoiceResultRoom(taskId).then(room => {
 							if (!room) return;
 							const proactiveFile = forwardVoiceResultToRoom(taskId, result, room);

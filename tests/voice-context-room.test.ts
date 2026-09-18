@@ -6,7 +6,8 @@ import { join } from 'node:path';
 
 // Room-bound voice (Zerlinda 2026-09-17: spoken in a room, answered in the
 // DM). The instructions carry a ROOM line whenever the live session is docked
-// in a room, so the model says "in this room" and never "in your DM".
+// in a room, so the model knows where delegated work answers: the room when it
+// is for the room's members, the owner's DM otherwise (a `[dm-only]` result).
 
 // Hermetic: memory and workspace are tmp dirs, set BEFORE the source-ordered
 // import binds voice-context's module-level paths.
@@ -32,8 +33,8 @@ describe('buildVoiceAgentContext({ room }) — the ROOM line', () => {
 		const lines = roomLine(ctx);
 		assert.equal(lines.length, 1, 'exactly one ROOM line');
 		assert.match(lines[0], /docked in room "Commorai" \(!abc123:ag2\.space\)/);
-		assert.match(lines[0], /answers in that room/);
-		assert.match(lines[0], /say "in this room", never "in your DM"/);
+		assert.match(lines[0], /answered there only when it is for the room's members, otherwise in the owner's DM; say where it went/);
+		assert.doesNotMatch(lines[0], /never "in your DM"/);
 	});
 
 	it('falls back to the id when the room has no name', () => {
