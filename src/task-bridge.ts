@@ -364,6 +364,17 @@ export function setTaskStatusCallback(fn: (taskId: string, status: string, text:
 // Main agent tool — writes task file directly, no subagent needed
 // ---------------------------------------------------------------------------
 
+/** Asking for something to be PUT IN a notch, rather than work done ON the notch itself.
+ *  Opening one is never background work: the notch tools are inline and re-read the card on
+ *  screen at call time, which nothing spawned from this bridge can do. */
+export function _isNotchOpenRequest(task: string): boolean {
+	// Bound stops at a sentence break, not a full stop — a URL is full of dots.
+	const open = /\b(open|show|put|bring\s+up|pull\s+up|display)\b(?:(?!\.\s)[^?!]){0,60}?\bnotch\b/i;
+	// Work ON the notch must still route here; an over-broad refusal would strand it.
+	const maintenance = /\bnotch\b[\s-]*(skill|process|binary|code|import|path|panel|overlay|repo)|voice[\s-]?notch|\b(fix|restart|rebuild|install|update|debug|patch)\b[^.?!]{0,40}?\bnotch\b/i;
+	return open.test(task) && !maintenance.test(task);
+}
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
@@ -406,6 +417,17 @@ export const workTool: ToolDefinition = {
 		const screenViewOnly = /\b(describe\s+(my\s+)?screen|what.s on\s+(my\s+)?screen|look at\s+(my\s+)?screen)\b/i;
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
+		}
+
+		if (_isNotchOpenRequest(task)) {
+			return {
+				status: 'rejected',
+				message: 'Never open a notch through work. Call the inline notch tool yourself: '
+					+ 'show_triage_in_notch for the triage queue, show_web_in_notch for a page, a '
+					+ 'pull request or an issue (pass a bare number as `number` and it resolves the '
+					+ 'repository from the card on screen), fold_notch to put one away. '
+					+ 'Both notches are addressable — pass second: true for the other one.',
+			};
 		}
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
