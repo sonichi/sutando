@@ -110,6 +110,9 @@ dout="$(env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI_T" --print-core-en
 check $? "a key declared by two skills is forwarded exactly once"
 echo "$dout" | grep -qx -- "ZZ_DUP=first"
 check $? "the duplicate resolves to the first skill in glob order"
+derr="$(env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI_T" --print-core-env 2>&1 >/dev/null)"
+echo "$derr" | grep -q "ZZ_DUP declared by more than one skill"
+check $? "the dropped duplicate is reported on stderr, like every other rejection"
 
 # B2: an explicitly-empty caller value is a disable, and must not be re-filled.
 hostile '{"config": {"ZZ_DISABLED": "1"}}'

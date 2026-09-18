@@ -201,7 +201,15 @@ if declare -F skill_manifest_config_pending >/dev/null; then
     case "$_mck" in
       [!A-Za-z_]* | *[!A-Za-z0-9_]*) continue ;;
     esac
-    case "$_mc_seen" in *" $_mck "*) continue ;; esac
+    case "$_mc_seen" in
+      *" $_mck "*)
+        # Every other rejection in this path reports itself; a duplicate must
+        # too, or the losing skill's value vanishes by glob order alone.
+        printf 'skill-manifest-config: %s declared by more than one skill; keeping the first\n' \
+          "$_mck" >&2
+        continue
+        ;;
+    esac
     _mc_seen="$_mc_seen$_mck "
     if [ "${!_mck+x}" = x ]; then
       CORE_ENV_ARGS+=(-e "$_mck=${!_mck}")
