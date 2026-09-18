@@ -701,6 +701,26 @@ class EventDispatchTests(FakeTmuxHarness):
                          "an abnormal pane must not be typed into")
         self.assertIn("did not become healthy", result.stderr)
 
+    def test_a_stale_error_high_in_scrollback_does_not_hold(self):
+        # The error was hours ago; the pane has moved on to an idle prompt. Deliver.
+        self.write_task("task-old.txt")
+        history = "\n".join(f"⏺ line {i}" for i in range(30))
+        self.pane_file.write_text("API Error: 529 Overloaded\n" + history + "\n" + IDLE_FOOTER + "\n")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-old.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-old.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-old.txt", self.sendkeys_log_text(),
+                      "an error that scrolled off the live tail must not hold delivery")
+
     def test_the_queued_messages_composer_is_not_a_draft(self):
         # A line already queued behind the turn leaves this hint in the composer;
         # the next task must still go in, on top of the queue.

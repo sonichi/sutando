@@ -150,7 +150,8 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # gate signature, no abnormal banner. A running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  pane_text_is_abnormal "$1" && return 1
+  # A live banner sits at the bottom; an old error higher up the scrollback is history.
+  pane_text_is_abnormal "$(printf '%s\n' "$1" | sed '/^[[:space:]]*$/d' | tail -14)" && return 1
   pane_text_ciw "$1" _is_idle_ready
 }
 
