@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { countQueuedAhead, queuedAheadInstruction, workTool } from '../src/task-bridge.js';
+import { buildVoiceTaskHeader, countQueuedAhead, queuedAheadInstruction, setVoiceSessionRoom, getVoiceSessionRoom, workTool } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -137,5 +137,88 @@ describe('queue depth helpers (pure, temp dirs)', () => {
 		assert.equal(readQueueDepth(ws, now), null, 'older than 10 minutes');
 		writeFileSync(join(ws, 'state', 'task-queue.json'), '{not json');
 		assert.equal(readQueueDepth(ws, now), null, 'torn');
+	});
+});
+
+// Room-bound voice (Zerlinda 2026-09-17: "talking but replying to the DM").
+// One header writer for the work tool and the cancel tool; the room is
+// addressed through the same keys a gateway-written room task carries.
+describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
+	const TS = '2026-09-18T10:00:00.000Z';
+
+	it('DM shape: channel_id: local-voice, no room keys, priority urgent, nothing at or after task:', () => {
+		const header = buildVoiceTaskHeader('task-1', TS, 'owner-1', null);
+		assert.equal(header, [
+			'id: task-1',
+			`timestamp: ${TS}`,
+			'source: voice',
+			'interaction_type: realtime_audio',
+			'media_form: live_stream',
+			'channel_id: local-voice',
+			'user_id: owner-1',
+			'access_tier: owner',
+			'priority: urgent',
+			'',
+		].join('\n'));
+		assert.doesNotMatch(header, /^task:/m, 'the header is everything ABOVE task: — the caller appends it');
+		assert.doesNotMatch(header, /^(channel_kind|source_room_id):/m);
+	});
+
+	it('room shape: channel_id is the room, channel_kind: room and source_room_id follow it, still voice and urgent', () => {
+		const header = buildVoiceTaskHeader('task-2', TS, 'owner-1', '!abc123:ag2.space');
+		assert.equal(header, [
+			'id: task-2',
+			`timestamp: ${TS}`,
+			'source: voice',
+			'interaction_type: realtime_audio',
+			'media_form: live_stream',
+			'channel_id: !abc123:ag2.space',
+			'channel_kind: room',
+			'source_room_id: !abc123:ag2.space',
+			'user_id: owner-1',
+			'access_tier: owner',
+			'priority: urgent',
+			'',
+		].join('\n'));
+		assert.doesNotMatch(header, /local-voice/, 'a room-bound task never claims the DM channel');
+	});
+
+	it('every key sits above task: in the file the work tool writes, for both shapes', async () => {
+		const lines = (content: string) => content.split('\n');
+		// The envelope stamper adds its own `envelope_hmac` after `id`; it is
+		// not this writer's key and is dropped from the order under test.
+		const keysAbove = (content: string) => {
+			const out: string[] = [];
+			for (const l of lines(content)) {
+				if (l.startsWith('task:')) break;
+				out.push(l.split(':')[0]);
+			}
+			return out.filter(k => k !== 'envelope_hmac');
+		};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const exec = workTool.execute as any;
+		const dm = await exec({ task: 'header shape probe dm' }, null) as { taskId: string };
+		const dmFile = dm.taskId + '.txt';
+		const roomFiles: string[] = [];
+		try {
+			const c1 = readFileSync(join(TASK_DIR, dmFile), 'utf-8');
+			assert.deepEqual(keysAbove(c1), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'user_id', 'access_tier', 'priority']);
+			assert.match(c1, /^priority: urgent$/m);
+
+			setVoiceSessionRoom({ id: '!abc123:ag2.space', name: 'Commorai' });
+			assert.deepEqual(getVoiceSessionRoom(), { id: '!abc123:ag2.space', name: 'Commorai' });
+			const room = await exec({ task: 'header shape probe room' }, null) as { taskId: string };
+			roomFiles.push(room.taskId + '.txt');
+			const c2 = readFileSync(join(TASK_DIR, room.taskId + '.txt'), 'utf-8');
+			assert.deepEqual(keysAbove(c2), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'channel_kind', 'source_room_id', 'user_id', 'access_tier', 'priority']);
+			assert.match(c2, /^channel_id: !abc123:ag2\.space$/m);
+			assert.match(c2, /^source_room_id: !abc123:ag2\.space$/m);
+			assert.match(c2, /^priority: urgent$/m);
+			assert.match(c2, /^task: header shape probe room$/m);
+		} finally {
+			setVoiceSessionRoom(null);
+			for (const f of [dmFile, ...roomFiles]) { try { unlinkSync(join(TASK_DIR, f)); } catch { /* gone */ } }
+		}
+		assert.equal(getVoiceSessionRoom(), null, 'the binding is released after the probe');
 	});
 });

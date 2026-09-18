@@ -23,7 +23,7 @@ const TASK_DIR = join(TMP, 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
 mkdirSync(TASK_DIR, { recursive: true });
 
-const { _isVoiceTask } = await import('../src/task-bridge.js');
+const { _isVoiceTask, _voiceTaskRoom } = await import('../src/task-bridge.js');
 
 after(() => {
 	try { rmSync(TMP, { recursive: true, force: true }); } catch {}
@@ -55,6 +55,47 @@ source: voice
 interaction_type: realtime_audio
 media_form: live_stream
 channel_id: local-voice
+task: hello world
+`;
+
+// Room-bound voice (2026-09): a session docked in a room addresses the task to
+// that room, so `channel_id` carries the room id and no longer says
+// `local-voice`. The verdict keys on `source: voice` / `media_form:
+// live_stream`; the literal stays only for files archived before rooms.
+const VOICE_BODY_ROOM = `id: task-isvoice-test-room-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: voice
+interaction_type: realtime_audio
+media_form: live_stream
+channel_id: !abc123:ag2.space
+channel_kind: room
+source_room_id: !abc123:ag2.space
+user_id: voice-local
+access_tier: owner
+priority: urgent
+task: hello room
+`;
+// Legacy archived shape: only the channel_id literal identifies voice.
+const VOICE_BODY_LEGACY_LITERAL = `id: task-isvoice-test-legacy-aaa
+timestamp: 2026-05-06T00:00:00Z
+channel_id: local-voice
+task: hello world
+`;
+// A non-voice room task carrying source_room_id must not read as a voice room.
+const GATEWAY_ROOM_BODY = `id: task-isvoice-test-gw-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: ag2space
+channel_id: !abc123:ag2.space
+source_room_id: !abc123:ag2.space
+task: hello world
+`;
+// A room-bound body whose forged room id is not a Matrix room id.
+const VOICE_BODY_BAD_ROOM = `id: task-isvoice-test-badroom-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: voice
+media_form: live_stream
+channel_id: not-a-room
+source_room_id: ../../etc
 task: hello world
 `;
 
@@ -93,6 +134,33 @@ describe('_isVoiceTask — archive-path coverage', () => {
 		const id = 'task-isvoice-test-ls-aaa';
 		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_LIVESTREAM);
 		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('returns true for a room-bound voice task (channel_id is the room, not local-voice)', () => {
+		const id = 'task-isvoice-test-room-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_ROOM);
+		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('keeps the legacy channel_id: local-voice literal for archived files', () => {
+		const id = 'task-isvoice-test-legacy-aaa';
+		writeTask(join(ARCHIVE_DIR, '2026-05', `${id}.txt`), VOICE_BODY_LEGACY_LITERAL);
+		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('_voiceTaskRoom: the room of a room-bound voice task; null for DM, non-voice, malformed or missing', () => {
+		writeTask(join(TASK_DIR, 'task-isvoice-test-room-aaa.txt'), VOICE_BODY_ROOM);
+		assert.equal(_voiceTaskRoom('task-isvoice-test-room-aaa'), '!abc123:ag2.space');
+		writeTask(join(TASK_DIR, 'task-isvoice-test-aaa.txt'), VOICE_BODY);
+		assert.equal(_voiceTaskRoom('task-isvoice-test-aaa'), null, 'a DM voice task has no room');
+		writeTask(join(TASK_DIR, 'task-isvoice-test-gw-aaa.txt'), GATEWAY_ROOM_BODY);
+		assert.equal(_voiceTaskRoom('task-isvoice-test-gw-aaa'), null, 'a gateway room task is not voice');
+		writeTask(join(TASK_DIR, 'task-isvoice-test-badroom-aaa.txt'), VOICE_BODY_BAD_ROOM);
+		assert.equal(_voiceTaskRoom('task-isvoice-test-badroom-aaa'), null, 'a malformed room id is never a destination');
+		assert.equal(_voiceTaskRoom('task-isvoice-test-no-such-file'), null);
+		// Archived copies resolve too — the result can land after the task moved.
+		writeTask(join(ARCHIVE_DIR, '2026-09', 'task-isvoice-test-room-arch.txt'), VOICE_BODY_ROOM.replace('room-aaa', 'room-arch'));
+		assert.equal(_voiceTaskRoom('task-isvoice-test-room-arch'), '!abc123:ag2.space');
 	});
 
 	it('returns true for a voice task in tasks/processed/', () => {

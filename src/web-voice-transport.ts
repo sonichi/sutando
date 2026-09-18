@@ -544,7 +544,44 @@ function mintNonce(): string {
   return Math.random().toString(36).slice(2, 10).padEnd(8, '0');
 }
 
+/** The room a voice session is docked in (the desktop's in-room Talk). */
+export interface VoiceRoomContext {
+  /** Matrix room id, `!opaque:server`. */
+  roomId: string;
+  /** Display name, already capped by the caller; absent for an unnamed room. */
+  roomName?: string;
+}
+
+/** Client → agent frame announcing where this session is docked. Sent once per
+ *  connection right after `session.config`, so the engine binds the room before
+ *  the first delegated task is written. */
+export const SESSION_CONTEXT_TYPE = 'session.context';
+
+export interface SessionContextFrame {
+  type: typeof SESSION_CONTEXT_TYPE;
+  version: 1;
+  room_id: string | null;
+  room_name: string | null;
+  surface: 'room' | 'dm';
+}
+
+/** Pure: the frame for a room context, or the DM shape when there is none. */
+export function buildSessionContextFrame(ctx: VoiceRoomContext | null | undefined): SessionContextFrame {
+  const roomId = ctx?.roomId ?? null;
+  return {
+    type: SESSION_CONTEXT_TYPE,
+    version: 1,
+    room_id: roomId,
+    room_name: roomId ? (ctx?.roomName ?? null) : null,
+    surface: roomId ? 'room' : 'dm',
+  };
+}
+
 export interface VoiceTransportOptions extends VoiceTransportEvents {
+  /** The room this session is docked in. When set, one `session.context`
+   *  frame goes out per connection after `session.config`; absent or null,
+   *  nothing is sent and the agent keeps its DM default. */
+  roomContext?: VoiceRoomContext | null;
   /** Mic capture buffer size (ScriptProcessor). Default 2048, matching web-client. */
   captureBuf?: number;
   /** Default input rate until `session.config` overrides. Default 16000. */
@@ -728,8 +765,14 @@ export class VoiceTransport {
   private inputDeviceSig: string | null = null;
   private deviceChangeHandler: (() => void) | null = null;
 
+  /** Room context announced after each `session.config` (null = DM, nothing sent). */
+  private roomContext: VoiceRoomContext | null;
+  /** Once per connection: reset in connect(), latched by the first send. */
+  private sessionContextSent = false;
+
   constructor(opts: VoiceTransportOptions = {}) {
     this.ev = opts;
+    this.roomContext = opts.roomContext ?? null;
     this.captureBuf = opts.captureBuf ?? 2048;
     this.inputRate = opts.inputRate ?? 16000;
     this.outputRate = opts.outputRate ?? 24000;
@@ -796,6 +839,7 @@ export class VoiceTransport {
     this.agentStateSeen = false;
     this.legacyServer = false;
     this.lastUpstream = null;
+    this.sessionContextSent = false;
     this.clearConnectTimer();
     this.clearLegacyTimer();
     if (this.ws) {
@@ -906,6 +950,19 @@ export class VoiceTransport {
       return false;
     }
     return true;
+  }
+
+  /** The one `session.context` frame per connection, sent after the agent's
+   *  `session.config` (the first frame it emits on attach, so the socket is
+   *  open and the agent is listening). A DM session (no room context) sends
+   *  nothing; a frame that did not go out stays unsent so a later
+   *  `session.config` on the same attempt can retry it. */
+  private sendSessionContextOnce(): void {
+    if (this.sessionContextSent || !this.roomContext) return;
+    if (this.sendClientCommand(buildSessionContextFrame(this.roomContext))) {
+      this.sessionContextSent = true;
+      this.debug('Sent session.context for room ' + this.roomContext.roomId, 'event');
+    }
   }
 
   /** Send a surface-owned protocol command (e.g. voice.retryUpstream), JSON-
@@ -1609,6 +1666,7 @@ export class VoiceTransport {
       this.outputRate = msg.audioFormat.outputSampleRate ?? this.outputRate;
       if (this.outputRate !== prevOutputRate) this.retirePlaybackCtx();
       this.ev.onSessionConfig?.(this.inputRate, this.outputRate);
+      this.sendSessionContextOnce();
     } else if (msg?.type === 'transcript') {
       this.ev.onTranscript?.(msg.role, msg.text, msg.partial !== false);
     } else if (msg?.type === 'turn.end') {

@@ -1101,6 +1101,24 @@ let micAnnounced = false;       // one "Microphone active" system line per sessi
 let cleanupDone = true;         // doCleanup idempotence latch (reset on connect)
 let _voiceUrlOverride = null;   // takeoverVoice() one-shot URL override
 
+// Room this voice session is docked in: the desktop's CallAgentView appends
+// ?room_id=&room_name= to the page URL when Talk is pressed inside a room.
+// Validated here (same room-id shape the gateway routes on; name capped) so a
+// stray query string can never name a room the engine would post results into.
+// Template-literal note: backslashes are eaten by the outer template, so the
+// regex is spelled with doubled escapes through new RegExp (see reSay below).
+var _voiceRoomContext = (function () {
+  try {
+    var q = new URLSearchParams(window.location.search);
+    var id = (q.get('room_id') || '').trim();
+    if (!new RegExp('^![^\\\\s:]+:\\\\S+$').test(id)) return null;
+    var name = (q.get('room_name') || '').trim().slice(0, 120);
+    return name ? { roomId: id, roomName: name } : { roomId: id };
+  } catch (e) {
+    return null;
+  }
+})();
+
 // Chrome STT state — provides real-time interim display; server STT replaces with final
 let recognition = null;
 
@@ -2097,6 +2115,7 @@ function connectWs() {
   setStatus('Connecting...', '');
 
   voice = new SutandoVoice.VoiceTransport({
+    roomContext: _voiceRoomContext,
     captureBuf: CAPTURE_BUF,
     inputRate: INPUT_RATE,
     outputRate: OUTPUT_RATE,

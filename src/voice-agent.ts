@@ -57,7 +57,10 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, applySessionContextFrame, sessionRoomNotice } from './task-bridge.js';
+import { SESSION_CONTEXT_TYPE } from './web-voice-transport.js';
+import { framedSystem } from './inject-framing.js';
+import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
@@ -721,6 +724,7 @@ const _configCtx: VoiceConfigContext = {
 	resetNoteViewingDebounce,
 	getRecentConversation,
 	getSecondsSinceLastTurn,
+	getSessionRoom: getVoiceSessionRoom,
 };
 
 const mainAgent: MainAgent = {
@@ -1054,6 +1058,37 @@ async function main() {
 	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
 	// session-only) + worker-thread persistence. Created before the session so
 	// the hooks below can reference it; the wraps install after construction.
+	// Room-bound voice: spoken in a room, answered in that room, not the DM.
+	// The client sends a `session.context` frame after session.config and
+	// again on every room change (a DM frame when it leaves rooms); the task
+	// bridge keeps the last one and reports whether the room actually changed,
+	// so the model hears one notice per change and nothing for a duplicate.
+	// The notice rides the task-result injection path (delay-then-check): the
+	// first frame lands ~100ms before Gemini's setup completes, so an immediate
+	// inject would fall through.
+	function handleSessionContextFrame(message: Record<string, unknown>): void {
+		if (message?.type !== SESSION_CONTEXT_TYPE) return;
+		const applied = applySessionContextFrame(message);
+		if (!applied) return;
+		const { change, room } = applied;
+		console.log(`${ts()} [SessionRoom] session.context: ${room ? `${room.id}${room.name ? ` (${room.name})` : ''}` : 'DM'} — ${change}`);
+		const notice = sessionRoomNotice(change, room);
+		if (!notice) return;
+		const line = framedSystem(notice);
+		deliverWithRetry({
+			attempt: () => {
+				try {
+					if (session.sessionManager.isActive && session.clientConnected) {
+						injectText(session, line);
+						return true;
+					}
+				} catch { /* session still constructing — retry */ }
+				return false;
+			},
+			onExhausted: () => console.log(`${ts()} [SessionRoom] session not active — room notice not injected (task routing still bound)`),
+		});
+	}
+
 	const healthPersistence = createHealthPersistence();
 	const audioHealth = createAudioHealthLedger({
 		sessionId: SESSION_ID,
@@ -1085,12 +1120,21 @@ async function main() {
 		inputAudioTranscription: true,
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
-		onClientCommand: (message) => voiceRecoveryCoordinator?.handleClientCommand(message),
+		onClientCommand: (message) => {
+			handleSessionContextFrame(message);
+			voiceRecoveryCoordinator?.handleClientCommand(message);
+		},
 		onClientConnected: () => {
 			if (legacyReconnectInFlight) return; // not a real attach edge
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
-		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
+		onClientDisconnected: () => {
+			// The room binding belongs to the client that announced it; the next
+			// client announces its own (or none, and tasks fall back to the DM).
+			if (getVoiceSessionRoom()) console.log(`${ts()} [SessionRoom] client gone — room released`);
+			setVoiceSessionRoom(null);
+			voiceRecoveryCoordinator?.handleClientDisconnected();
+		},
 		// Whenever the coordinator owns the episode (restarting, waiting-retry,
 		// terminal, or a recovered origin), bodhi's attach auto-actions —
 		// greeting, context replay and especially the CLOSED auto-reconnect —

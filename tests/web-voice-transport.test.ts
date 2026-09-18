@@ -15,6 +15,8 @@ import {
 	AGENT_STATE_LEGACY_MS,
 	DISCONNECT_CLOSE_TIMEOUT_MS,
 	VOICE_FAILURE_REMEDIATION,
+	SESSION_CONTEXT_TYPE,
+	buildSessionContextFrame,
 	type VoiceConnectFailure,
 	type VoiceTransportOptions,
 	type AgentStateV1,
@@ -2489,6 +2491,84 @@ describe('playback runs on a dedicated AudioContext at the stream rate', () => {
 		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
 		assert.equal(FakeAudioContext.created.length, 2);
 		assert.equal(FakeAudioContext.created[1].state, 'running');
+		h.t.disconnect();
+	});
+});
+
+// Room-bound voice (Zerlinda 2026-09-17: talking in a room, answered in the
+// DM). The desktop docks the session in a room; the transport announces it
+// with ONE session.context frame per connection, right after session.config.
+describe('session.context — the room a voice session is docked in', () => {
+	const ROOM = { roomId: '!abc123:ag2.space', roomName: 'Commorai' };
+	const contextFrames = (s: FakeSocket) =>
+		s.sent
+			.filter((x): x is string => typeof x === 'string')
+			.map((x) => JSON.parse(x))
+			.filter((m) => m.type === SESSION_CONTEXT_TYPE);
+
+	it('buildSessionContextFrame is pure: room shape, and the DM shape without a room', () => {
+		assert.deepEqual(buildSessionContextFrame(ROOM), {
+			type: 'session.context', version: 1, room_id: '!abc123:ag2.space', room_name: 'Commorai', surface: 'room',
+		});
+		assert.deepEqual(buildSessionContextFrame({ roomId: '!x:s' }), {
+			type: 'session.context', version: 1, room_id: '!x:s', room_name: null, surface: 'room',
+		});
+		assert.deepEqual(buildSessionContextFrame(null), {
+			type: 'session.context', version: 1, room_id: null, room_name: null, surface: 'dm',
+		});
+		assert.equal(SESSION_CONTEXT_TYPE, 'session.context');
+	});
+
+	it('sends exactly one session.context frame, after session.config, and never twice on one connection', async () => {
+		const h = harness({ roomContext: ROOM });
+		const s = await goLive(h);
+		assert.equal(contextFrames(s).length, 0, 'nothing before the agent\'s session.config');
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		const frames = contextFrames(s);
+		assert.equal(frames.length, 1);
+		assert.deepEqual(frames[0], buildSessionContextFrame(ROOM));
+		// A second session.config on the same attempt (rate renegotiation) must not re-announce.
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 48000 } });
+		assert.equal(contextFrames(s).length, 1, 'once per connection');
+		h.t.disconnect();
+	});
+
+	it('a new connection announces the room again (the agent re-binds per client)', async () => {
+		const h = harness({ roomContext: ROOM });
+		const s1 = await goLive(h);
+		s1.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s1).length, 1);
+		await h.t.disconnect();
+		const s2 = await goLive(h);
+		assert.notEqual(s1, s2);
+		s2.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s2).length, 1, 'the new socket gets its own announcement');
+		h.t.disconnect();
+	});
+
+	it('sends nothing without a room context (a DM session keeps the agent\'s default)', async () => {
+		const h = harness();
+		const s = await goLive(h);
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s).length, 0);
+		h.t.disconnect();
+		const h2 = harness({ roomContext: null });
+		const s2 = await goLive(h2);
+		s2.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s2).length, 0, 'explicit null is the same as absent');
+		h2.t.disconnect();
+	});
+
+	it('a frame that did not go out is retried on the next session.config, not lost', async () => {
+		const h = harness({ roomContext: ROOM });
+		const s = await goLive(h);
+		const realSend = s.send.bind(s);
+		s.send = () => { throw new Error('InvalidStateError'); };
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s).length, 0, 'the throw is swallowed and nothing is recorded as sent');
+		s.send = realSend;
+		s.message({ type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } });
+		assert.equal(contextFrames(s).length, 1, 'still once, on the retry');
 		h.t.disconnect();
 	});
 });

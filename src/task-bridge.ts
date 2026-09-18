@@ -95,7 +95,7 @@ const _HEADER_KEYS = [
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
-	'thread_root', 'source_room_id',
+	'thread_root', 'source_room_id', 'channel_kind',
 	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
@@ -174,6 +174,23 @@ export function writeChatTask(taskDescription: string): string {
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
+/** Test seam: whether the drain already delivered (or pre-claimed) `file`. */
+export function _isDeliveredResult(file: string): boolean {
+	return _deliveredResults.has(file);
+}
+
+/** Post a room-bound voice result into its room: a `proactive-result-*` file
+ *  whose first line is the `[channel: <room>]` marker the ag2space gateway's
+ *  `_proactive_route` sends to that room. The filename is claimed in
+ *  `_deliveredResults` at once — it passes `_shouldFallthrough`, and without
+ *  the claim the next drain tick would speak the same result a second time. */
+export function forwardVoiceResultToRoom(taskId: string, result: string, room: string, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.txt`;
+	writeFileSync(join(RESULT_DIR, file), `[channel: ${room}]\n${result}`);
+	_deliveredResults.add(file);
+	return file;
+}
+
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // Per-task pending state: submission epoch, timeout (ms), and whether to
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
@@ -188,7 +205,7 @@ const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
 
 /** True if the task file (in tasks/, tasks/processed/, or tasks/archive/
  * — including month-partitioned subdirs `tasks/archive/YYYY-MM/`) is
- * voice-originated (channel_id: local-voice). Used by the result watcher
+ * voice-originated (`source: voice`, see _headerIsVoice). Used by the result watcher
  * to decide whether to forward an unsent result to Discord DM when voice is
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
@@ -243,7 +260,123 @@ export function _readTaskHeader(taskId: string): string[] | null {
 export function _isVoiceTask(taskId: string): boolean {
 	const headerLines = _readTaskHeader(taskId);
 	if (headerLines === null) return false;
-	return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+	return _headerIsVoice(headerLines);
+}
+
+/** The voice verdict over header lines.
+ *  `source: voice` and `media_form: live_stream` are the canonical keys; a
+ *  room-bound voice task carries the room id in `channel_id`, so that field no
+ *  longer identifies voice. The `channel_id: local-voice` literal stays for
+ *  files archived before rooms. */
+function _headerIsVoice(headerLines: string[]): boolean {
+	return headerLines.some(l =>
+		l.startsWith('source: voice') || l.startsWith('media_form: live_stream') || l.startsWith('channel_id: local-voice'));
+}
+
+// ---------------------------------------------------------------------------
+// Room-bound voice sessions. The desktop docks a voice session in a room and
+// the client announces it with `session.context` frames (after session.config,
+// then on every room change); while a room is bound, every task the voice
+// agent delegates is addressed to that room and its result is posted there.
+// ---------------------------------------------------------------------------
+
+/** Matrix room id as the gateway's `_proactive_route` accepts it. */
+export const MATRIX_ROOM_ID_RE = /^![^\s:]+:\S+$/;
+/** Display names are prose from the client; capped before they reach a prompt. */
+export const ROOM_NAME_MAX_CHARS = 120;
+
+export interface VoiceSessionRoom { id: string; name?: string }
+
+let _voiceSessionRoom: VoiceSessionRoom | null = null;
+
+/** Bind (or, with null, release) the room the live voice session is docked in. */
+export function setVoiceSessionRoom(room: VoiceSessionRoom | null): void {
+	_voiceSessionRoom = room;
+}
+
+export function getVoiceSessionRoom(): VoiceSessionRoom | null {
+	return _voiceSessionRoom;
+}
+
+/** The room a `session.context` frame binds, null for a DM/absent room, or
+ *  undefined when `msg` is not a session.context frame at all. The type
+ *  literal mirrors SESSION_CONTEXT_TYPE in web-voice-transport.ts (the client
+ *  file is re-vendored into the desktop, so it cannot be imported here);
+ *  tests/task-bridge-voice-room-result.test.ts pins the two together. */
+export function parseSessionContextFrame(msg: Record<string, unknown> | null | undefined): VoiceSessionRoom | null | undefined {
+	if (!msg || msg.type !== 'session.context') return undefined;
+	const id = typeof msg.room_id === 'string' ? msg.room_id.trim() : '';
+	if (!id || !MATRIX_ROOM_ID_RE.test(id)) return null;
+	const rawName = typeof msg.room_name === 'string' ? msg.room_name.replace(/[\r\n]+/g, ' ').trim() : '';
+	const name = rawName.slice(0, ROOM_NAME_MAX_CHARS);
+	return name ? { id, name } : { id };
+}
+
+/** What a frame did to the binding: `entered` a room (from the DM or from
+ *  another room), `left` for the DM, or `none` (a duplicate, or DM-to-DM). */
+export type SessionRoomChange = 'none' | 'entered' | 'left';
+
+/** Apply a `session.context` frame for the life of the session: the client
+ *  sends one per room change and a DM frame when it leaves rooms, so the last
+ *  frame wins and a DM frame releases the room. Tasks written afterwards use
+ *  the room current at write time. Returns the change so the caller speaks a
+ *  notice once per actual change and never per duplicate frame; undefined
+ *  when `msg` is not a session.context frame. */
+export function applySessionContextFrame(msg: Record<string, unknown> | null | undefined): { change: SessionRoomChange; room: VoiceSessionRoom | null } | undefined {
+	const room = parseSessionContextFrame(msg);
+	if (room === undefined) return undefined;
+	const prev = _voiceSessionRoom;
+	_voiceSessionRoom = room;
+	if (room && room.id !== prev?.id) return { change: 'entered', room };
+	if (!room && prev) return { change: 'left', room: null };
+	return { change: 'none', room };
+}
+
+/** The one system line the model hears when the docked room changes; null
+ *  when nothing changed. Pure: the caller frames and injects it. */
+export function sessionRoomNotice(change: SessionRoomChange, room: VoiceSessionRoom | null): string | null {
+	if (change === 'entered' && room) {
+		const label = room.name ? `"${room.name}"` : room.id;
+		return `You are now in room ${label}. Work you delegate answers in that room; when you tell the user where a result went, say "in this room", never "in your DM". Do not speak this notice.`;
+	}
+	if (change === 'left') {
+		return 'You are back in your DM. Work you delegate answers there; say "in your DM" or "here", never "in this room". Do not speak this notice.';
+	}
+	return null;
+}
+
+/** Every header line of a voice task, above `task:`. One writer for the work
+ *  tool and the cancel tool so the two cannot drift. A room-bound task keeps
+ *  `source: voice` and `media_form: live_stream` as its voice identity and
+ *  addresses the room through `channel_id`, `channel_kind` and
+ *  `source_room_id` — the same keys a gateway-written room task carries, so
+ *  the core's "reply where you were asked" rule applies unchanged. */
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, room: string | null): string {
+	const lines = [
+		`id: ${taskId}`,
+		`timestamp: ${timestamp}`,
+		`source: voice`,
+		`interaction_type: realtime_audio`,
+		// interaction-model 4D, step 1.5 (scope A): the media-form axis on
+		// live-plane tasks. `live_stream` = the payload originates from a
+		// continuous real-time session (frames stay out-of-band; provenance).
+		'media_form: live_stream',
+		`channel_id: ${room ?? 'local-voice'}`,
+	];
+	if (room) lines.push('channel_kind: room', `source_room_id: ${room}`);
+	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
+	return lines.join('\n') + '\n';
+}
+
+/** The room a voice task was delegated from, read through the same
+ *  delimiter-honoring header reader as `_isVoiceTask`; null for a DM voice
+ *  task, a non-voice task, a missing file or a malformed room id. */
+export function _voiceTaskRoom(taskId: string): string | null {
+	const headerLines = _readTaskHeader(taskId);
+	if (headerLines === null || !_headerIsVoice(headerLines)) return null;
+	const line = headerLines.find(l => l.startsWith('source_room_id:'));
+	const room = line ? line.slice('source_room_id:'.length).trim() : '';
+	return MATRIX_ROOM_ID_RE.test(room) ? room : null;
 }
 
 const CLAIM_LEDGERS = 'remote-task-inflight';
@@ -522,22 +655,10 @@ export const workTool: ToolDefinition = {
 					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 			}
 		} catch { /* best effort — never block delegation on context attach */ }
+		// A session docked in a room addresses the task to that room (headers
+		// via buildVoiceTaskHeader); a DM session keeps `channel_id: local-voice`.
 		const content =
-			`id: ${taskId}\n` +
-			`timestamp: ${timestamp}\n` +
-			`source: voice\n` +
-			`interaction_type: realtime_audio\n` +
-			// interaction-model 4D, step 1.5 (scope A): stamp the media-form axis
-			// on live-plane tasks. Additive/observability — routing still keys on
-			// _isVoiceTask (source/channel_id); scope B makes this the canonical
-			// plane-routing signal. `live_stream` = the payload originates from a
-			// continuous real-time session (media frames stay out-of-band per the
-			// three-channel rule; this is provenance, not stream bytes).
-			`media_form: live_stream\n` +
-			`channel_id: local-voice\n` +
-			`user_id: ${ownerId}\n` +
-			`access_tier: owner\n` +
-			`priority: urgent\n` +
+			buildVoiceTaskHeader(taskId, timestamp, ownerId, _voiceSessionRoom?.id ?? null) +
 			`task: ${confineUserContent(task)}${contextBlock}\n`;
 		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
@@ -1050,9 +1171,18 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					if (file.startsWith('task-') && _isVoiceTask(taskId)) {
 						try {
 							const proactiveTs = Math.floor(Date.now() / 1000);
-							const proactivePath = join(RESULT_DIR, `proactive-result-${taskId}-${proactiveTs}.txt`);
-							writeFileSync(proactivePath, result);
-							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
+							// A task delegated from a room answers in that room even when
+							// the voice client is gone; a DM voice task keeps the owner-DM
+							// proactive shape every bridge already delivers.
+							const room = _voiceTaskRoom(taskId);
+							if (room) {
+								const proactiveFile = forwardVoiceResultToRoom(taskId, result, room, proactiveTs);
+								console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to room ${room} via ${proactiveFile}`);
+							} else {
+								const proactivePath = join(RESULT_DIR, `proactive-result-${taskId}-${proactiveTs}.txt`);
+								writeFileSync(proactivePath, result);
+								console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
+							}
 							_deliveredResults.add(file);
 							_pendingTasks.delete(taskId);
 							setTimeout(() => {
@@ -1137,6 +1267,19 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_pendingTasks.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
 					onResult(result);
+					// A voice task delegated from a room is spoken AND posted in that
+					// room — the owner asked there, and the room keeps the record.
+					if (registersTask && !foreignOrigin) {
+						const room = _voiceTaskRoom(taskId);
+						if (room) {
+							try {
+								const proactiveFile = forwardVoiceResultToRoom(taskId, result, room);
+								console.log(`${ts()} [TaskBridge] Posted ${taskId} result to room ${room} via ${proactiveFile}`);
+							} catch (e) {
+								console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to room ${room}:`, e);
+							}
+						}
+					}
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

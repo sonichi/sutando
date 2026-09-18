@@ -26,6 +26,7 @@ import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
+import type { VoiceSessionRoom } from './task-bridge.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -44,6 +45,8 @@ export interface VoiceConfigContext {
 	resetNoteViewingDebounce(): void;
 	getRecentConversation(count: number): string;
 	getSecondsSinceLastTurn(): number | null;
+	/** The room the live session is docked in (task-bridge owns it); null in a DM. */
+	getSessionRoom(): VoiceSessionRoom | null;
 }
 
 /** Test-only determinism hooks. Production passes nothing — the verbatim
@@ -148,8 +151,9 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	const recent = ctx.getRecentConversation(8);
 	// Offline-delivery hint: count proactive-result-*.txt files archived
 	// in the last 30 min. These are voice-task results forwarded to the
-	// owner's Discord DM while voice was offline (per task-bridge.ts
-	// fallback). Surface a one-line ack on reconnect so voice doesn't
+	// owner's chat while voice was offline (per task-bridge.ts fallback:
+	// the room the task came from, else the owner's DM on whichever bridge
+	// is active). Surface a one-line ack on reconnect so voice doesn't
 	// have to re-deliver and the user knows where to find the answers.
 	let offlineDeliveryHint = '';
 	try {
@@ -161,7 +165,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 				statSync(join(archDir, f)).mtimeMs >= cutoff
 			);
 			if (recent_proactive.length > 0) {
-				offlineDeliveryHint = `\n\n[While the user was offline, ${recent_proactive.length} task result(s) were delivered to their Discord DM. If they ask about a task, refer them to Discord.]`;
+				offlineDeliveryHint = `\n\n[While the user was offline, ${recent_proactive.length} task result(s) were delivered to their chat — the room they asked in, or their DM. If they ask about a task, refer them to that chat.]`;
 			}
 		}
 	} catch {}
@@ -228,7 +232,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
 		'',
-		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext(),
+		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ room: ctx.getSessionRoom() }),
 		'',
 		'DEFAULT BEHAVIOR: Call work for almost everything.',
 		'You are the voice interface. The Claude Code session is the brain.',
@@ -239,7 +243,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- Self-introduction ("who are you", "introduce yourself", "what can you do") — use the context above',
 		'- Yes/no acknowledgments',
 		'- Asking the user a clarifying question',
-		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
+		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — say yes and switch at once; then call work exactly once with "remember my language preference: <language>" so the preference is kept for next time',
 		'- get_current_time (current date/time)',
 		// googleSearch line conditional on VOICE_GOOGLE_SEARCH (per-surface config).
 		// When search is off, omit — model would otherwise be told it can use a
