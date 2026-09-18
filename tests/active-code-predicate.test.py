@@ -401,6 +401,18 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertTrue(program_invokes(
             f"discover() {{\n  echo dead\n}}\nbash scripts/{NAME}\n", NAME))
 
+    def test_a_parameter_expansion_inside_an_uncalled_body_does_not_close_it_early(self):
+        """keweichen's [P2 blocker] round 30b: `${x}`'s closing brace alone
+        was counted as ending the function block, so the real call after it
+        read as top-level and got credited though the function is uncalled."""
+        text = f"dead() {{\n  echo ${{x}}\n  bash scripts/{NAME} > files\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "dead\n", NAME))
+
+    def test_a_nested_parameter_expansion_is_skipped_as_one_unit(self):
+        text = f"dead() {{\n  echo ${{x:-${{y}}}}\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier

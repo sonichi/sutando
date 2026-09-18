@@ -320,14 +320,23 @@ _FUNC_START_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s
 
 
 def _brace_delta(line: str) -> int:
-    """Net `{`/`}` depth change, quote- and `${...}`-aware — neither a quoted
-    brace nor a parameter-expansion one opens or closes a function block."""
+    """Net `{`/`}` depth change, quote- and `${...}`-aware — a parameter
+    expansion's OWN braces (opener, any nested ones, and its closer) never
+    open or close a function block, so the whole span is skipped as a unit,
+    not just its opener (round 30b, keweichen: `echo ${x}` left the closer
+    uncounted, so its `}` alone closed an unrelated function block early)."""
     masked = unquoted(line)
     delta, i, n = 0, 0, len(masked)
     while i < n:
         ch = masked[i]
         if ch == "$" and i + 1 < n and masked[i + 1] == "{":
-            i += 2
+            depth, i = 1, i + 2
+            while i < n and depth > 0:
+                if masked[i] == "{":
+                    depth += 1
+                elif masked[i] == "}":
+                    depth -= 1
+                i += 1
             continue
         if ch == "{":
             delta += 1
