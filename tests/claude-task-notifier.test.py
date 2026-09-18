@@ -4,12 +4,12 @@
 standby path, matching Codex/agy's shape.
 
 Hermetic: a stub `tmux` on PATH stands in for the real binary. Pane content
-and core-status.json are plain files the test controls directly, so
-status-file/pane gating and staging verification are deterministic rather
-than timing-races against a real TUI. `--event <filename>` drives one
-dispatch directly (exercises has_result, idle-gating via both
-core-status.json and the pane, staging-retry, submit-confirm-retry) without
-needing the fswatch-driven main loop.
+is a plain file the test controls directly, so pane gating and staging
+verification are deterministic rather than timing-races against a real TUI.
+core-status.json is written too, only to prove it is never read. `--event
+<filename>` drives one dispatch directly (exercises has_result, the pane
+gate, staging-retry, submit-confirm-retry) without needing the fswatch-driven
+main loop.
 
 core_pane_is_idle_ready() delegates gate/idle-footer classification to the
 REAL src/core-input-watch.py (not a stub) — that module already owns Claude's
@@ -366,9 +366,8 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("Sutando task ready: task-b.txt", pane)
         self.assertIn("follow CLAUDE.md", log)
 
-    def test_stale_running_status_falls_back_to_pane(self):
-        # status.json says "running" but is stale (>90s): the notifier must
-        # fall back to the pane's own idle-ready read rather than trust it.
+    def test_a_stale_running_self_report_does_not_block_an_idle_pane(self):
+        # The status file is never read; a stale "running" is as irrelevant as a fresh one.
         self.write_task("task-stale.txt")
         self.write_status("running", ts=time.time() - 200)
         self.pane_file.write_text(IDLE_FOOTER + "\n")
@@ -624,6 +623,20 @@ class EventDispatchTests(FakeTmuxHarness):
                           "confirmed on the first attempt, not re-pressed")
         self.assertIn("Sutando task ready: task-h.txt", self.pane_file.read_text(),
                        "the submitted text staying in scrollback is the exact case this pins")
+
+    def test_a_novel_prompt_under_an_old_idle_footer_is_not_typed_into(self):
+        # An unforeseen confirmation shares the window with a stale idle footer
+        # and a blank bottom composer; with no status file to veto it, the
+        # pane read alone must refuse.
+        self.status_file.unlink()
+        self.write_task("task-novel.txt")
+        self.pane_file.write_text("\n".join([
+            "❯", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "Overwrite the existing config file?", "Enter to confirm · Esc to cancel", "❯", ""]))
+        result = self.run_event("task-novel.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "",
+                         "a live prompt must never receive the task as its answer")
 
     def test_no_status_file_does_not_block_an_idle_pane(self):
         # A fresh install or a core that never wrote its status has no file;
