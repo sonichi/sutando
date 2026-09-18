@@ -105,13 +105,17 @@ def _clean_for(var: str, value: object) -> str:
 
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
-    # errors="replace", not strict: one non-UTF-8 byte would otherwise raise a
-    # ValueError past every caller's OSError guard and read the file as absent.
+    # Decode per line, strictly: an undecodable line is skipped so one bad byte
+    # cannot hide a valid token elsewhere, nor return mojibake as if it were one.
     try:
-        text = env_file.read_text(errors="replace")
+        raw = env_file.read_bytes()
     except OSError:
         return ""
-    for line in text.splitlines():
+    for chunk in raw.splitlines():
+        try:
+            line = chunk.decode()
+        except UnicodeDecodeError:
+            continue
         line = line.strip()
         if line.startswith("#") or "=" not in line:
             continue
