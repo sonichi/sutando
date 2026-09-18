@@ -68,7 +68,7 @@ _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.js
 
 # The transports this tool can DRIVE. Stated once: the union tie-break and
 # resolve() must not answer "is this row deliverable?" differently.
-SUPPORTED_ROUTES = ("matrix",)
+SUPPORTED_ROUTES = ("matrix", "discord")
 
 
 def _host_label() -> str:

@@ -125,7 +125,8 @@ class OneClaimWins(unittest.TestCase):
                             "home_channel": "1535008"}}
         targets, _ = nr.resolve(["kewei"], roster)
         self.assertEqual(targets[0]["transport"], "discord")
-        self.assertIsNone(targets[0]["stand"], "fixture stopped being Discord-only")
+        # blank-is-absent (roster_union.declared()'s single spelling), not None.
+        self.assertEqual(targets[0]["stand"], "", "fixture stopped being Discord-only")
         ep = targets[0].get("endpoint")
         self.assertTrue(ep, "a Discord target carries no durable endpoint")
         self.assertTrue(nr.claim_park(MSG, "kewei", "alpha", endpoint=ep))
