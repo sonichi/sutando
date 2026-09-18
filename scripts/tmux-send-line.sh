@@ -43,9 +43,9 @@ _pending() {
   printf '%s\n' "$1" | "$PY" -c 'import sys,re
 rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
 SGR=re.compile(r"\x1b\[[0-9;]*m")
-# dim (2) or a grey 256-colour foreground (38;5;2xx), up to the reset/normal-intensity
-# code that ends it -- both CLIs use styled runs for placeholder/ghost text only.
-GHOST=re.compile(r"\x1b\[(?:2|38;5;2[0-9]{2})m.*?(?=\x1b\[(?:0|22|39)m|$)")
+# dim (2) or the xterm greyscale ramp (232-255), up to the reset/normal-intensity code
+# that ends it. 200-231 are colour-cube entries a real draft can legitimately use.
+GHOST=re.compile(r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 W=int(sys.argv[2]) if len(sys.argv)>2 and sys.argv[2].isdigit() else 0
 lines=sys.stdin.read().splitlines()
 last_i=-1
