@@ -57,8 +57,8 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, applySessionContextFrame, sessionRoomNotice } from './task-bridge.js';
-import { SESSION_CONTEXT_TYPE } from './web-voice-transport.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, bindSessionContextFrame, sessionRoomNotice } from './task-bridge.js';
+import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame } from './web-voice-transport.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1069,12 +1069,21 @@ async function main() {
 	// context turn, not realtime input: realtime text is answered out loud, and
 	// the model answered every room switch with "Working on it." until it was
 	// made silent (owner 2026-09-18).
-	function handleSessionContextFrame(message: Record<string, unknown>): void {
+	// The room in the frame is the client's claim; bindSessionContextFrame
+	// admits it only on the gateway bridge's membership verdict, and the ack
+	// frame tells the client which surface it actually got.
+	async function handleSessionContextFrame(message: Record<string, unknown>): Promise<void> {
 		if (message?.type !== SESSION_CONTEXT_TYPE) return;
-		const applied = applySessionContextFrame(message);
+		const applied = await bindSessionContextFrame(message);
 		if (!applied) return;
-		const { change, room } = applied;
-		console.log(`${ts()} [SessionRoom] session.context: ${room ? `${room.id}${room.name ? ` (${room.name})` : ''}` : 'DM'} — ${change}`);
+		const { change, room, refused } = applied;
+		console.log(`${ts()} [SessionRoom] session.context: ${room ? `${room.id}${room.name ? ` (${room.name})` : ''}` : 'DM'} — ${change}${refused ? ` (refused ${refused.id}: ${refused.reason})` : ''}`);
+		try {
+			const ack = refused
+				? buildSessionContextAckFrame(refused.id, false, refused.reason)
+				: buildSessionContextAckFrame(room?.id ?? null, !!room);
+			session.sendJsonToClient({ ...ack });
+		} catch { /* no client attached — the next frame gets its own ack */ }
 		const notice = sessionRoomNotice(change, room);
 		if (!notice) return;
 		const line = framedSystem(notice);
@@ -1123,7 +1132,7 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
-			handleSessionContextFrame(message);
+			void handleSessionContextFrame(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 		},
 		onClientConnected: () => {
