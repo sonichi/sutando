@@ -11,6 +11,9 @@ Run: python3 tests/current-track-write-names-a-host.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -56,6 +59,24 @@ class TargetMustNameAHost(unittest.TestCase):
         r = run(self.ws / "current-track.md")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertFalse((self.ws / "current-track.md").exists())
+
+    def test_the_refusal_is_measured_in_process_not_only_by_subprocess(self):
+        """The subprocess cases above pin the exit code a caller sees, but no
+        coverage tracer follows a subprocess, so the refusal branch reads unhit."""
+        spec = importlib.util.spec_from_file_location("ctw", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        err = io.StringIO()
+        saved = sys.argv[:]
+        try:
+            sys.argv = ["current-track-write.py", "append", str(self.ws / "hosts" / "current-track.md")]
+            with contextlib.redirect_stderr(err):
+                rc = mod.main()
+        finally:
+            sys.argv = saved
+        self.assertEqual(rc, 2)
+        self.assertIn("hosts/<label>/", err.getvalue())
+        self.assertFalse((self.ws / "hosts" / "current-track.md").exists())
 
 
 if __name__ == "__main__":
