@@ -677,6 +677,14 @@ class InflightRecordTest(unittest.TestCase):
         self.assertTrue(inflight_is_live(self.dir, "task-a.txt", ""))
         self.assertTrue((self.dir / "task-a.txt").exists())
 
+    def test_a_blank_marker_already_on_disk_is_corrupt_not_live(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "task-z.txt").write_text("\n")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", "4242"))
+        self.assertFalse((self.dir / "task-z.txt").exists(), "the corrupt marker was left to hold the task")
+        (self.dir / "task-z.txt").write_text("")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", ""), "blank against unreadable must not read as live")
+
     def test_no_marker_is_not_live_and_clear_is_idempotent(self):
         self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
         clear_inflight(self.dir, "task-a.txt")

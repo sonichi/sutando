@@ -185,8 +185,13 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
         recorded = path.read_text().strip()
     except FileNotFoundError:
         return False
+    if not recorded:
+        # The writer refuses an empty identity; a blank file is a corrupt marker,
+        # not a submit, and reading it as live would hold the task forever.
+        path.unlink(missing_ok=True)
+        return False
     current = incarnation.strip()
-    if current and recorded and recorded != current:
+    if current and recorded != current:
         path.unlink(missing_ok=True)
         return False
     return True
