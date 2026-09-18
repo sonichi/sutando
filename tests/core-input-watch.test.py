@@ -464,6 +464,26 @@ class TestRefusedTurn(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
 
 
+class TestComposerIsEmpty(unittest.TestCase):
+    """_composer_is_empty: distinct from _is_idle_ready -- an idle-ready
+    footer and an unsent owner draft in the composer are not mutually
+    exclusive (task-notifier.sh's typing-safety gate, #4307)."""
+
+    def test_empty_composer_is_empty(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE))
+
+    def test_a_draft_in_the_composer_is_not_empty(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertFalse(_mod._composer_is_empty(draft))
+
+    def test_no_prompt_line_at_all_fails_closed(self):
+        self.assertFalse(_mod._composer_is_empty("no prompt line here\njust text"))
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 
