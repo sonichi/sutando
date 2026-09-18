@@ -21,10 +21,15 @@ from __future__ import annotations
 
 import os
 import stat as _stat
+import sys
 from pathlib import Path
 
-#: Suffixes the router writes. Kept in one place so a new stage is added once.
-SENTINEL_SUFFIXES = (".txt", ".accepted", ".claimed")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX
+
+#: The router's stages, spelled once in pool_delivery; a new stage is added there.
+SENTINEL_SUFFIXES = (PENDING_SUFFIX, ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX)
 
 
 def _is_dir(path: Path) -> bool:
