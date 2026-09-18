@@ -184,6 +184,26 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(self.sendkeys_log_text(), "",
                           "a task with an existing result must never be typed into the pane")
 
+    def test_empty_live_placeholder_with_no_ready_result_anywhere_is_still_dispatched(self):
+        # `[ -f results/<f> ]` treated an empty file as delivered regardless
+        # of content; the shared module's READY walk rejects whitespace-only.
+        self.write_task("task-c.txt")
+        (self.results_dir / "task-c.txt").write_text("")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-c.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-c.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-c.txt", self.sendkeys_log_text(),
+                       "an empty placeholder with nothing ready behind it must not block dispatch")
+
     def test_pending_task_is_typed_and_submitted(self):
         self.write_task("task-b.txt")
         import threading

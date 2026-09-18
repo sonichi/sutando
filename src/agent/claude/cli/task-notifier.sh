@@ -17,6 +17,7 @@ CORE_STATUS_STALE_SEC=90
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
+DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -51,58 +52,14 @@ log_notifier() {
   printf '%s\n' "$msg" >&2
 }
 
-# Duplicated from Codex's task-notifier.sh has_result() — same provider-
-# neutral policy; no shared module exists to delegate to yet (a named
-# follow-up per agy's task-notifier.sh header, not this PR's scope).
+# Completion detection and the priority-ordered pick are
+# src/delivery/task_dispatch.py's contract, shared with Codex and agy.
 has_result() {
-  local filename="$1" stem archive_dir
-  if [ -f "$RESULTS_DIR/$filename" ]; then
-    return 0
-  fi
-  stem="${filename%.txt}"
-  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
-      -mindepth 1 -maxdepth 2 -type f \
-      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-      | grep -q .; then
-    return 0
-  fi
-  for archive_dir in "$RESULTS_DIR"/archive-*; do
-    [ -d "$archive_dir" ] || continue
-    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
-        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-        | grep -q .; then
-      return 0
-    fi
-  done
-  return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$1"
 }
 
-# The sort is the one real shared piece (src/task_priority.py); the pick
-# loop is duplicated the same way agy's next_pending_task() is.
 next_pending_task() {
-  local candidate
-  while IFS= read -r candidate; do
-    case "$candidate" in
-      ""|*/*|*..*) continue ;;
-    esac
-    has_result "$candidate" && continue
-    printf '%s\n' "$candidate"
-    return 0
-  done < <(
-    "$NOTIFIER_PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from task_priority import sort_tasks_by_priority
-
-tasks_dir = Path(sys.argv[2])
-for task in sort_tasks_by_priority(tasks_dir.glob("*.txt")):
-    if task.is_file():
-        print(task.name)
-PY
-  )
-  return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR"
 }
 
 # Claude's footer adds "esc to interrupt" for any in-flight turn (tool or
