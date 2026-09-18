@@ -153,6 +153,35 @@ class ReplyOutboxTest(unittest.TestCase):
             self.assertTrue(r["pending"], "route kept")
             self.assertEqual(r["status"], "READY", "re-readied, attempt recorded")
 
+    def test_partial_multipart_send_parks_instead_of_retrying(self):
+        # Chunk 1 lands, chunk 2 takes a DEFINITE refusal: part of the body is
+        # already visible, so a retry would duplicate it — park, never re-send.
+        n = {"calls": 0}
+        def _second_refuses():
+            n["calls"] += 1
+            if n["calls"] == 1:
+                return _Resp()
+            e = sys.modules["slack_sdk.errors"].SlackApiError("msg_too_long")
+            e.response = types.SimpleNamespace(
+                status_code=200, data={"ok": False, "error": "msg_too_long"})
+            raise e
+        def prepare(results):
+            (results / f"{TID}.txt").write_text("x" * 4100)  # two 4000-char chunks
+        with tempfile.TemporaryDirectory() as td:
+            r = self._one_pass(td, _second_refuses, prepare)
+            self.assertEqual(n["calls"], 2, "second chunk was attempted")
+            self.assertEqual(r["status"], "PARKED",
+                             "a refusal after a posted chunk must park, not re-ready")
+        # control: the same refusal on the FIRST chunk still retries
+        def _first_refuses():
+            e = sys.modules["slack_sdk.errors"].SlackApiError("msg_too_long")
+            e.response = types.SimpleNamespace(
+                status_code=200, data={"ok": False, "error": "msg_too_long"})
+            raise e
+        with tempfile.TemporaryDirectory() as td:
+            r = self._one_pass(td, _first_refuses, prepare)
+            self.assertEqual(r["status"], "READY", "nothing posted: retry is safe")
+
     def test_ambiguous_send_parks_and_never_retries(self):
         def _timeout():
             raise TimeoutError("read timed out")

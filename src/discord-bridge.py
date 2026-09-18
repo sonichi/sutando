@@ -3909,8 +3909,9 @@ async def _handle_discord_message(message, force=False):
     _inst = getattr(getattr(client, "user", None), "id", None)
     if _inst and getattr(message, "id", None):
         task_id = provider_task_id(f"dc{_inst}", str(message.id))
+        # Every month partition: an event archived before a rollover is still admitted.
         if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
-                            lambda tid: archive_path("tasks", tid).exists()):
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
             print(f"  [ingress-dedup] replay of {task_id} — already admitted",
                   flush=True)
             return

@@ -1160,11 +1160,9 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     if _ev_channel and _ev_ts:
         task_id = provider_task_id(f"sl{event.get('team') or '0'}",
                                    f"{_ev_channel}-{_ev_ts}")
-        from datetime import datetime as _dt
+        # Every month partition: an event archived before a rollover is still admitted.
         if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
-                            lambda tid: (ARCHIVE_TASKS_DIR /
-                                         _dt.now().strftime("%Y-%m") /
-                                         f"{tid}.txt").exists()):
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
             print(f"  [ingress-dedup] replay of {task_id} — already admitted",
                   flush=True)
             return None
@@ -1496,6 +1494,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # chat_postMessage response, and the exception that broke the chunk loop.
     _last_resp = None
     _chunk_exc: Exception | None = None
+    _chunks_posted = 0
 
     # Post the text body in <=4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k). Use the shared fence-aware
@@ -1515,6 +1514,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 kwargs["thread_ts"] = thread_ts
             try:
                 _last_resp = app.client.chat_postMessage(**kwargs)
+                _chunks_posted += 1
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 _chunk_exc = e
@@ -1606,7 +1606,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     if receipt_out is not None:
         # Three-state outcome for the outbox (reply leg): classification is
         # shared policy in slack_result_delivery, not re-derived here.
-        receipt_out.append(_srd.receipt_for_send(delivered_ok, _last_resp, _chunk_exc))
+        receipt_out.append(_srd.receipt_for_send(delivered_ok, _last_resp, _chunk_exc,
+                                                 chunks_posted=_chunks_posted))
     return delivered_ok
 
 

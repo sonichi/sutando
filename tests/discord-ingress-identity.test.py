@@ -224,6 +224,40 @@ class HandlerReplaySkip(unittest.TestCase):
             self.assertIn("[ingress-dedup] replay of", buf.getvalue(),
                           "skip did not go through the ingress-dedup branch")
 
+            # Archived under LAST month's partition (a calendar rollover happened
+            # between delivery and replay): the durable skip must still hold.
+            live = next(tasks.glob("task-*.txt"))
+            prev = tasks / "archive" / "2000-01"
+            prev.mkdir(parents=True)
+            live.rename(prev / live.name)
+            db.seen_message_ids.clear()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg()))
+            self.assertEqual(len(list(tasks.glob("task-*.txt"))), 0,
+                             "replay of an event archived in a previous month minted a task")
+            # positive control: a genuinely new event still mints
+            class _Msg2(_Msg):
+                def __init__(self):
+                    super().__init__(); self.id = 424243
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg2()))
+            self.assertEqual(len(list(tasks.glob("task-*.txt"))), 1,
+                             "a new event after the archived replay did not mint")
+
+
+class ArchiveProbeAllMonths(unittest.TestCase):
+    """Both bridges' archive probes search every month partition, like the
+    other archive readers in discord-bridge (glob(f"*/{task_id}.txt"))."""
+
+    def test_probe_sites_glob_every_partition(self):
+        for name in ("discord-bridge.py", "slack-bridge.py"):
+            src = (REPO / "src" / name).read_text()
+            site = re.search(r"already_admitted\(task_id, TASKS_DIR, RESULTS_DIR,\s*"
+                             r"lambda tid: any\(ARCHIVE_TASKS_DIR\.glob\(f\"\*/\{tid\}\.txt\"\)\)\)", src)
+            self.assertIsNotNone(site, f"{name}: archive probe must glob every month partition")
+            self.assertNotIn('strftime("%Y-%m") /', src.split("already_admitted(task_id")[1][:300],
+                             f"{name}: archive probe is pinned to the current month")
+
 
 if __name__ == "__main__":
     unittest.main()

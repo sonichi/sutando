@@ -118,14 +118,20 @@ def receipt_for_error(exc: BaseException) -> DeliveryReceipt:
 
 
 def receipt_for_send(delivered_ok: bool, response: Any = None,
-                     error: Optional[BaseException] = None) -> DeliveryReceipt:
+                     error: Optional[BaseException] = None, *,
+                     chunks_posted: int = 0) -> DeliveryReceipt:
     """Bridge-observed send material -> three-state receipt.
 
     A provider error outranks the boolean (it says WHY); success classifies
     the last chunk's response; an attachment-only success is accept-is-confirm
     (files_upload_v2 returned); a failure with no provider material is a
-    definite NOT_DELIVERED (nothing external is ambiguous).
+    definite NOT_DELIVERED (nothing external is ambiguous). A failure AFTER a
+    chunk already posted is OUTCOME_UNKNOWN: part of the body is visible, so a
+    retry would duplicate it — park for a human, never re-send.
     """
+    if error is not None and chunks_posted > 0:
+        return DeliveryReceipt(ReceiptOutcome.OUTCOME_UNKNOWN,
+                               detail=f"partial: {chunks_posted} chunk(s) posted before {type(error).__name__}")
     if error is not None:
         return receipt_for_error(error)
     if delivered_ok:
