@@ -97,7 +97,10 @@ def _command_tokens(seg: str) -> list[str]:
     fix could not tell apart from the reserved word."""
     stripped = seg.lstrip()
     leading_bang = stripped == "!" or stripped[:2] in ("! ", "!\t")
-    leading_brace = stripped[:1] == "{" and (len(stripped) == 1 or stripped[1] in " \t")
+    # `!` is peeled first (below); the opener check looks PAST it too,
+    # or `! { helper; }` -- which really runs helper -- goes unrecognized.
+    after_bang = stripped[1:].lstrip() if leading_bang else stripped
+    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t")
     import shlex
     try:
         toks = shlex.split(seg)
@@ -354,7 +357,37 @@ def _line_continues(line: str) -> bool:
     return (len(masked) - i) % 2 == 1
 
 
-def _brace_delta(line: str, at_start: bool = True) -> int:
+def _logical_line(lines: list, i: int) -> "tuple[str, int]":
+    """(joined text, last physical index) of the continuation-joined
+    logical line starting at physical line `i`. A backslash-newline joins
+    physical lines into ONE command, so brace-depth scanning must see
+    them as one unit -- round 36 follow-up, kewei-red-ag2space: forcing
+    every continued line to a fresh non-command-start state discarded a
+    `;` that had already re-armed it before the backslash."""
+    parts = [lines[i]]
+    j = i
+    while _line_continues(parts[-1]) and j + 1 < len(lines):
+        parts[-1] = parts[-1][:-1]
+        j += 1
+        parts.append(lines[j])
+    return "".join(parts), j
+
+
+def _closer_trailing_content(line: str, needed_delta: int) -> "str | None":
+    """The text STRICTLY AFTER the closer that brings `line`'s running
+    delta to `needed_delta`, or None if no prefix of `line` reaches it.
+    Content there belongs to whatever ENCLOSES the thing this line
+    closes, never to the closing definition itself -- round 36 follow-up,
+    kewei-red-ag2space: a nested function's `}; H` put a real command
+    from the OUTER scope on the same line as the nested close, and
+    "does this line have content" alone can't see which side it is on."""
+    for i in range(1, len(line) + 1):
+        if _brace_delta(line[:i]) == needed_delta:
+            return line[i:]
+    return None
+
+
+def _brace_delta(line: str) -> int:
     """Net `{`/`}` depth change, quote- and `${...}`-aware — a parameter
     expansion's OWN braces (opener, any nested ones, and its closer) never
     open or close a function block, so the whole span is skipped as a unit,
@@ -380,15 +413,17 @@ def _brace_delta(line: str, at_start: bool = True) -> int:
     close, the text "inner() " before the nested opener left command-start
     state disabled with nothing to re-arm it, so the nested `{` went
     uncounted and the nested function's OWN close was mistaken for the
-    outer's). `at_start` is False when the CALLER knows this line is a
-    backslash-newline continuation of the previous one, so its own start
-    is not a fresh command-start (see `_line_continues`)."""
+    outer's). Callers join a backslash-continued run into ONE logical
+    line first (`_logical_line`) rather than passing a per-line override
+    here -- round 36 follow-up, kewei-red-ag2space: a fixed "continuation
+    means not command-start" flag discarded a `;` that had already
+    re-armed command position before the backslash."""
     masked = unquoted(line)
     m = _FUNC_START_RE.match(masked) or _FUNC_START_KEYWORD_RE.match(masked)
     if m:
         return 1 + _brace_delta(m.group(2))
     delta, i, n = 0, 0, len(masked)
-    at_cmd_start = at_start  # a continuation line does not restart command position
+    at_cmd_start = True  # the start of a physical (or joined logical) line is itself command-start
 
     def boundary(pos: int) -> bool:
         return pos < 0 or pos >= n or masked[pos].isspace() or masked[pos] in _CMD_SEP
@@ -492,13 +527,17 @@ def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, in
             i = brace_line + 1
             continue
         j = brace_line + 1
-        cont = _line_continues(rest)
+        close_line, last_logical, depth_before_last = j, "", depth
         while j < n and depth > 0:
-            depth += _brace_delta(lines[j], at_start=not cont)
-            cont = _line_continues(lines[j])
-            j += 1
-        close_line = j - 1
-        end = close_line - 1 if _CLOSE_ONLY_RE.match(lines[close_line]) else close_line
+            logical, close_line = _logical_line(lines, j)
+            depth_before_last = depth
+            depth += _brace_delta(logical)
+            last_logical, j = logical, close_line + 1
+        trailing = (_closer_trailing_content(last_logical, -depth_before_last)
+                    if last_logical else None)
+        excluded_close = bool(_CLOSE_ONLY_RE.match(lines[close_line])
+                              or (trailing is not None and trailing.strip()))
+        end = close_line - 1 if excluded_close else close_line
         # `rest` on the opener is body content too -- a function with no
         # line past it before a bare `}` needs the opener IN its own span.
         start = brace_line if has_rest else brace_line + 1
@@ -631,24 +670,44 @@ def _strip_unreachable_function_bodies(text: str) -> str:
                 out.append(idx)
         return out
 
-    def resolve(name: str, at_line: int) -> "tuple[int, int] | None":
-        """The (start, end) of `name`'s definition active at `at_line` --
-        the latest anchor strictly before it -- or None if none precedes."""
+    def resolve(name: str, at_line: int, own_line: int = None,
+                body_bounds: "tuple[int, int] | None" = None
+                ) -> "tuple[int, int, int] | None":
+        """The (anchor, start, end) of `name`'s definition active at the
+        call, kept in the result (not just start/end) since two DIFFERENT
+        definitions -- typically an outer one-liner and a nested one
+        inside it -- can share an identical (start, end) span (round 36
+        follow-up, kewei-red-ag2space: a reachability key of span alone
+        aliased them, so outer being reachable made a never-called
+        sibling read as reachable too).
+
+        A candidate ANCHORED inside `body_bounds` uses `own_line` (the
+        call's OWN textual position) as its reference instead of
+        `at_line` -- a name defined and called within the SAME body
+        executes in that body's own sequential order regardless of when
+        the ENCLOSING function itself was invoked; only a candidate
+        OUTSIDE that body can shift with the enclosing call (round 36
+        follow-up, qingyun-sutando/kewei-red-ag2space: calling a name
+        before its own later definition, both inside the same body, must
+        resolve to nothing -- a real `command not found` -- not to
+        whatever the propagated at_line happened to make current)."""
         best = None
         for anchor, start, end in by_name.get(name, ()):
-            if anchor < at_line:
-                best = (start, end)
+            ref = (own_line if body_bounds and body_bounds[0] <= anchor <= body_bounds[1]
+                   else at_line)
+            if anchor < ref:
+                best = (anchor, start, end)
         return best
 
-    # `at_line` is the call site that reached each queued function; `visited`
-    # keys on (span, at_line), not span alone (see the docstring above).
-    reachable: set[tuple[int, int]] = set()
-    visited: set[tuple[int, int, int]] = set()
-    queue: list[tuple[int, int, int]] = []
+    # `at_line` is the call site that reached each queued function; `span`
+    # is the full (anchor, start, end) `resolve()` returns (see docstring).
+    reachable: set[tuple[int, int, int]] = set()
+    visited: set[tuple[int, int, int, int]] = set()
+    queue: list[tuple[int, int, int, int]] = []
 
     def enqueue(span, at_line):
         reachable.add(span)
-        key = (span[0], span[1], at_line)
+        key = span + (at_line,)
         if key not in visited:
             visited.add(key)
             queue.append(key)
@@ -659,16 +718,16 @@ def _strip_unreachable_function_bodies(text: str) -> str:
             if span:
                 enqueue(span, idx)
     while queue:
-        cstart, cend, at_line = queue.pop()
+        _, cstart, cend, at_line = queue.pop()
         body_idx = list(range(cstart, cend + 1))
         for name in by_name:
             for idx in called_on(name, body_idx):
-                span = resolve(name, at_line)
+                span = resolve(name, at_line, own_line=idx, body_bounds=(cstart, cend))
                 if span:
                     enqueue(span, at_line)
 
-    for _, _, _, start, end in funcs:
-        if (start, end) in reachable:
+    for _, anchor, _, start, end in funcs:
+        if (anchor, start, end) in reachable:
             continue
         for k in range(start, end + 1):
             lines[k] = ""

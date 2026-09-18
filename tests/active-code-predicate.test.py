@@ -713,6 +713,50 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertFalse(program_invokes(text, NAME))
         self.assertTrue(program_invokes(text.replace("}\nprintf TOP\n", "}\ndiscover\nprintf TOP\n"), NAME))
 
+    def test_negation_before_a_group_still_sees_the_group_opener(self):
+        """kewei-red-ag2space round 36 follow-up: `! { helper; }` really
+        runs helper (direct execution) -- computing the group-opener check
+        against the pre-`!`-peel text left the now-leading `{` unrecognized."""
+        self.assertTrue(program_invokes(f"! {{ bash scripts/{NAME}; }}\n", NAME))
+
+    def test_a_semicolon_before_a_continuation_still_reopens_command_start(self):
+        """kewei-red-ag2space round 36 follow-up: `:;` before a
+        backslash-newline already re-arms command position, so the `}` on
+        the continued line closes the function for real -- confirmed by
+        direct execution (the helper runs unconditionally, outside it)."""
+        text = "outer() {\n  :; \\\n}\n" + f"bash scripts/{NAME}\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_an_outer_and_a_nested_one_liner_do_not_alias_by_span(self):
+        """kewei-red-ag2space round 36 follow-up: an outer one-liner and a
+        nested one-liner inside it can share an identical (start, end)
+        span; reachability keyed on span alone credited the never-called
+        nested one just because the span happened to match the outer's."""
+        text = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertFalse(program_invokes(text, NAME))
+        called = text.replace("}\nouter\n", "}\n  inner\n}\nouter\n")
+        self.assertTrue(program_invokes(called, NAME))
+
+    def test_content_after_a_nested_close_belongs_to_the_enclosing_body(self):
+        """kewei-red-ag2space round 36 follow-up: `}; helper` puts the
+        ENCLOSING function's own command on the same line as a NESTED
+        function's close -- that command must survive even when the
+        nested function is never called and its body gets blanked."""
+        text = ("outer() {\n  inner() {\n    :\n"
+                f"  }}; bash scripts/{NAME}\n}}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_call_before_its_own_nested_definition_invokes_nothing(self):
+        """qingyun-sutando / kewei-red-ag2space round 36 follow-up: a name
+        called then defined, both inside the SAME body, must resolve to
+        nothing -- real Bash reports command-not-found, since the later
+        definition has not executed yet at the point of the call."""
+        text = f"outer() {{\n  inner\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertFalse(program_invokes(text, NAME))
+        reordered = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n  inner\n}}\nouter\n"
+        self.assertTrue(program_invokes(reordered, NAME))
+
 
 class LiteralConstantAndOrChains(unittest.TestCase):
     """The `&&`/`||` under-credit named and deferred through every earlier
