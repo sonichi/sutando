@@ -672,5 +672,18 @@ class Wiring(unittest.TestCase):
         self.assertEqual(calls, [("task-w1", "COMPLETED")])
 
 
+class QueuedWithoutACount(unittest.TestCase):
+    def test_a_queue_that_cannot_be_counted_is_a_plain_queued(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "tasks").mkdir()
+            f = ws / "tasks" / "task-q.txt"
+            f.write_text("id: task-q\nsource: ag2space\nsource_message_id: $m\nsource_room_id: !r:s\ntask: hi\n")
+            with unittest.mock.patch.object(bus, "queue_position", side_effect=RuntimeError("no count")):
+                t = bus.transition_from_file("QUEUED", f, ws=ws, ts=1)
+            self.assertEqual((t.task_id, t.to_phase), ("task-q", "QUEUED"))
+            self.assertIsNone(t.queue)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
