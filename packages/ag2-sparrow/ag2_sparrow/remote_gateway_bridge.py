@@ -3966,10 +3966,11 @@ _CORE_RECIPIENT = "core"
 _DELIVERY_SUFFIXES = (".txt", ".accepted", ".claimed")
 
 
-def _delivery_recipient(task_id: str) -> str:
-    """Which worker this task was DELIVERED to, read from the pool's delivery
-    sentinel. Used ONLY to tell "this was a worker's task" from "this was the
-    core's" when attribution is missing — never as an attribution source.
+def _delivery_recipient(task_id: str) -> tuple[str, bool]:
+    """`(recipient, blind)` — which worker this task was DELIVERED to, read
+    from the pool's delivery sentinel. Used ONLY to tell "this was a worker's
+    task" from "this was the core's" when attribution is missing — never as an
+    attribution source.
 
     Path convention (deliveries/<recipient>/<task_id>.{txt,accepted,claimed})
     is owned by the pool's own delivery writer, an optional local skill this
@@ -3983,23 +3984,24 @@ def _delivery_recipient(task_id: str) -> str:
     record" is the ordinary shape of a task the core answered itself, not an
     invariant violation.
 
-    Fails closed like its siblings: non-regular or claimed by more than one
-    recipient yields "". A genuine read error also yields "" but SAYS SO — an
-    unreadable tree is no reading, which is not the same fact as "never
-    delivered", and a silent "" would make those indistinguishable.
+    `blind` is the second outcome because a read failure and "never delivered"
+    are different facts that both have no recipient, and the caller WITHHOLDS on
+    one and sends on the other. Logging the difference was not enough: the send
+    decision could not see a log. An ABSENT tree is not blind — a host with no
+    pool has no deliveries dir, and that is knowledge, not failure.
     """
     if not task_id or "/" in task_id or task_id in (".", ".."):
-        return ""
+        return "", False
     root = _STATE.parent / "deliveries"
     try:
         recipients = sorted(p.name for p in root.iterdir())
     except FileNotFoundError:
-        return ""
+        return "", False
     except OSError as exc:
         _log(f"attribution: cannot read {root} ({type(exc).__name__}) - the "
              f"delivery discriminator is BLIND for {task_id}, which is not the "
              f"same as this task never having been delivered.")
-        return ""
+        return "", True
     claimants = set()
     for name in recipients:
         if name == _CORE_RECIPIENT:
@@ -4016,12 +4018,14 @@ def _delivery_recipient(task_id: str) -> str:
                      f"{task_id} under {name} ({type(exc).__name__}) - the "
                      f"delivery discriminator is BLIND for this task, which is "
                      f"not the same as it never having been delivered.")
-                return ""
+                return "", True
             if not stat.S_ISREG(st.st_mode):
-                return ""
+                # Malformed, not unreadable: the writer would never make one,
+                # so this is refusal to believe it, not absence of a reading.
+                return "", False
             claimants.add(name)
             break
-    return claimants.pop() if len(claimants) == 1 else ""
+    return (claimants.pop() if len(claimants) == 1 else ""), False
 
 
 def _attribution(task_id: str) -> tuple[str, bool]:
@@ -4052,7 +4056,14 @@ def _attribution(task_id: str) -> tuple[str, bool]:
         return residue, False
     # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
     # so silence here would relay it as if the core had produced it.
-    delivered = _delivery_recipient(task_id)
+    delivered, blind = _delivery_recipient(task_id)
+    if blind:
+        # The evidence store is exactly what decides worker-vs-core here, so an
+        # unreadable one is not a licence to assume core and send.
+        _log(f"attribution: {task_id} cannot be classified - the delivery "
+             f"evidence is unreadable, so whether a worker owned this task is "
+             f"UNKNOWN. Withholding rather than assuming the core produced it.")
+        return "", True
     if delivered:
         _log(f"attribution: {task_id} was DELIVERED to {delivered} but has no "
              f"assignment record and no completion residue - refusing to stamp "

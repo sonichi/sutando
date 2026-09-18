@@ -222,7 +222,7 @@ class AssignmentAttribution(unittest.TestCase):
             self.assertEqual(self.mod._assigned_worker(tid), "")
 
     def test_delivery_traversal_is_refused(self):
-        self.assertEqual(self.mod._delivery_recipient("../../etc/passwd"), "")
+        self.assertEqual(self.mod._delivery_recipient("../../etc/passwd")[0], "")
 
     def test_unreadable_deliveries_root_is_refused(self):
         """An unreadable root is NO READING, not "never delivered" — the whole
@@ -232,7 +232,7 @@ class AssignmentAttribution(unittest.TestCase):
         tid = "task-8899001122334455"
         self._sentinel(W1, tid)
         with mock.patch.object(Path, "iterdir", side_effect=PermissionError("x")):
-            self.assertEqual(self.mod._delivery_recipient(tid), "")
+            self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
         self.assertTrue(
             any("BLIND" in m for m in self.logs),
             f"an unreadable root must say so, got {self.logs}",
@@ -242,21 +242,21 @@ class AssignmentAttribution(unittest.TestCase):
         """The other half of the discriminator: a genuinely undelivered task
         must NOT log the blind anomaly, or the signal means nothing."""
         self.assertEqual(
-            self.mod._delivery_recipient("task-8899001122334456"), "")
+            self.mod._delivery_recipient("task-8899001122334456")[0], "")
         self.assertEqual([m for m in self.logs if "BLIND" in m], [])
 
     def test_another_tasks_sentinel_is_not_ours(self):
         """A populated recipient dir holding somebody else's sentinel must not
         claim this task — both suffixes miss and the loop falls through."""
         self._sentinel(W1, "task-9900112233445566")
-        self.assertEqual(self.mod._delivery_recipient("task-0011223344556677x"), "")
+        self.assertEqual(self.mod._delivery_recipient("task-0011223344556677x")[0], "")
 
     def test_unreadable_sentinel_is_refused(self):
         tid = "task-1122334455667780"
         self._sentinel(W1, tid)
         with mock.patch.object(self.mod.os, "lstat",
                                side_effect=PermissionError("x")):
-            self.assertEqual(self.mod._delivery_recipient(tid), "")
+            self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
 
     def test_non_regular_sentinel_is_refused(self):
         """A directory named like a sentinel is malformed; the writer would
@@ -265,7 +265,7 @@ class AssignmentAttribution(unittest.TestCase):
         d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{tid}{pool_delivery.PENDING_SUFFIX}").mkdir()
-        self.assertEqual(self.mod._delivery_recipient(tid), "")
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
 
     def test_accepted_stage_counts_too(self):
         """Positive control for the second suffix: a task already accepted is
@@ -274,7 +274,7 @@ class AssignmentAttribution(unittest.TestCase):
         d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{tid}{pool_delivery.ACCEPTED_SUFFIX}").write_text("")
-        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], W1)
 
     def test_legacy_accepted_suffix_counts_too(self):
         """Work accepted under the old sentinel name is still evidence of
@@ -283,7 +283,7 @@ class AssignmentAttribution(unittest.TestCase):
         d = pool_delivery.deliveries_dir(Path(self.workspace), W1)
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{tid}{pool_delivery.LEGACY_ACCEPTED_SUFFIX}").write_text("")
-        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], W1)
 
     def test_fan_out_to_two_recipients_claims_neither(self):
         """Two claimants is not one answer. Asserted against the GUARD too, so
@@ -291,7 +291,7 @@ class AssignmentAttribution(unittest.TestCase):
         tid = "task-3344556677889903"
         self._sentinel(W1, tid)
         self._sentinel(W2, tid)
-        self.assertEqual(self.mod._delivery_recipient(tid), "")
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
 
     # --- the core is a recipient, and that is not an anomaly -------------
 
@@ -302,7 +302,7 @@ class AssignmentAttribution(unittest.TestCase):
         violation the guard exists to report."""
         tid = "task-4455667788990011"
         self._sentinel(pool_roster.CORE, tid)
-        self.assertEqual(self.mod._delivery_recipient(tid), "")
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], "")
 
     def test_core_routed_task_does_not_trip_the_guard(self):
         """The same case through the real caller: ordinary core traffic must
@@ -320,7 +320,7 @@ class AssignmentAttribution(unittest.TestCase):
         tid = "task-4455667788990013"
         self._sentinel(pool_roster.CORE, tid)
         self._sentinel(W1, tid)
-        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], W1)
 
     def test_a_stray_file_at_the_root_does_not_blind_the_guard(self):
         """BLOCKER 2. Reading THROUGH a non-directory raises NotADirectoryError,
@@ -330,7 +330,7 @@ class AssignmentAttribution(unittest.TestCase):
         self._sentinel(W1, tid)
         root = pool_delivery.deliveries_dir(Path(self.workspace), W1).parent
         (root / ".DS_Store").write_text("")
-        self.assertEqual(self.mod._delivery_recipient(tid), W1)
+        self.assertEqual(self.mod._delivery_recipient(tid)[0], W1)
         self.assertEqual([m for m in self.logs if "BLIND" in m], [])
 
     def test_bridge_constants_cover_what_the_pool_writes(self):
@@ -428,6 +428,57 @@ class AssignmentAttribution(unittest.TestCase):
                                              result_file=rf))
         self.assertEqual(seen.get("tid"), tid)
         self.assertIn("attribution refused", seen.get("why", ""))
+
+    # --- an unreadable evidence store must WITHHOLD, not assume core --------
+
+    def test_unreadable_root_withholds_at_the_caller(self):
+        """THE FAIL-OPEN THIS CLOSES. A log is not a decision: the sender could
+        not see it, so an unreadable deliveries tree published every result as
+        an ordinary core result — the guard went dark exactly when its evidence
+        store was broken."""
+        tid = "task-6677889900112244"
+        self._sentinel(W1, tid)
+        calls = self._counting_core()
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError("x")):
+            ok = self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!")
+        self.assertFalse(ok)
+        self.assertEqual(calls, {"publish": 0, "deliver": 0},
+                         f"blind discriminator still reached the wire: {calls}")
+        self.assertTrue(any("UNKNOWN" in m for m in self.logs), self.logs)
+
+    def test_unreadable_sentinel_withholds_at_the_caller(self):
+        """The per-entry half of the same hole: iterdir succeeds, the lstat
+        beneath it does not."""
+        tid = "task-6677889900112245"
+        self._sentinel(W1, tid)
+        calls = self._counting_core()
+        with mock.patch.object(self.mod.os, "lstat",
+                               side_effect=PermissionError("x")):
+            ok = self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!")
+        self.assertFalse(ok)
+        self.assertEqual(calls, {"publish": 0, "deliver": 0})
+
+    def test_a_host_with_no_deliveries_tree_is_not_blind(self):
+        """THE CONTROL that bounds the blast radius. An ABSENT tree is a host
+        with no worker pool — knowledge, not failure. If this withheld, a
+        single-core install would stop delivering everything."""
+        tid = "task-6677889900112246"
+        self.assertFalse((Path(self.workspace) / "deliveries").exists())
+        calls = self._counting_core()
+        self.assertTrue(
+            self.mod._deliver_result_payload(tid, f"broker-{tid}", "done!"))
+        self.assertEqual(calls, {"publish": 1, "deliver": 1})
+        self.assertEqual([m for m in self.logs if "UNKNOWN" in m], [])
+
+    def test_blind_is_reported_separately_from_absent(self):
+        """The pair at the discriminator itself: same "" recipient, different
+        second element — which is the whole reason it is a pair."""
+        tid = "task-6677889900112247"
+        self._sentinel(W1, tid)
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError("x")):
+            self.assertEqual(self.mod._delivery_recipient(tid), ("", True))
+        self.assertEqual(
+            self.mod._delivery_recipient("task-6677889900112248"), ("", False))
 
     def test_attribution_reports_refusal_separately_from_no_worker(self):
         """The pair exists because "" alone cannot separate these two."""
