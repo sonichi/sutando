@@ -69,7 +69,7 @@ class _Resp:
 
 
 class ReplyOutboxTest(unittest.TestCase):
-    def _one_pass(self, td: str, post, prepare=None):
+    def _one_pass(self, td: str, post, prepare=None, patch=None):
         results, tasks = Path(td) / "results", Path(td) / "tasks"
         (results / "archive").mkdir(parents=True)
         (tasks / "archive").mkdir(parents=True)
@@ -91,6 +91,8 @@ class ReplyOutboxTest(unittest.TestCase):
         sb.ARCHIVE_TASKS_DIR = tasks / "archive"
         sb.app = types.SimpleNamespace(client=types.SimpleNamespace(chat_postMessage=_post))
         sb._atomic_write_pending_replies = lambda *a, **k: None
+        for _k, _v in (patch or {}).items():
+            setattr(sb, _k, _v)
         sb.pending_replies.clear()
         sb.pending_replies[TID] = {"channel": "D0TEST", "thread_ts": None,
                                    "submitted_at": sb.time.time(),
@@ -181,6 +183,37 @@ class ReplyOutboxTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             r = self._one_pass(td, _first_refuses, prepare)
             self.assertEqual(r["status"], "READY", "nothing posted: retry is safe")
+
+    def test_text_posted_then_attachment_fails_parks(self):
+        # Text landed, the file upload fails without a raise: the text is
+        # already visible, so the item must park rather than re-post the text.
+        calls = {"post": 0}
+        def _ok():
+            calls["post"] += 1
+            return _Resp()
+        def prepare(results):
+            f = results / "att.txt"; f.write_text("payload")
+            (results / f"{TID}.txt").write_text(f"a reply body\n[file: {f}]")
+        sb = sys.modules.get("slack_bridge")
+        with tempfile.TemporaryDirectory() as td:
+            def _one(td=td):
+                return self._one_pass(td, _ok, prepare,
+                                      patch={"_is_path_sendable": lambda p: True,
+                                             "_send_file": lambda *a, **k: False})
+            r = _one()
+            self.assertEqual(calls["post"], 1, "text chunk posted")
+            self.assertEqual(r["status"], "PARKED",
+                             "a failed attachment after visible text must park, not retry")
+        # control: attachment fails with NO text posted -> nothing visible -> retry
+        calls["post"] = 0
+        def prepare_only_file(results):
+            f = results / "att.txt"; f.write_text("payload")
+            (results / f"{TID}.txt").write_text(f"[file: {f}]")
+        with tempfile.TemporaryDirectory() as td:
+            r = self._one_pass(td, _ok, prepare_only_file,
+                               patch={"_is_path_sendable": lambda p: True,
+                                      "_send_file": lambda *a, **k: False})
+            self.assertEqual(r["status"], "READY", "nothing visible: retry is safe")
 
     def test_ambiguous_send_parks_and_never_retries(self):
         def _timeout():

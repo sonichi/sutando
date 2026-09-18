@@ -1494,7 +1494,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # chat_postMessage response, and the exception that broke the chunk loop.
     _last_resp = None
     _chunk_exc: Exception | None = None
-    _chunks_posted = 0
+    _parts_visible = 0  # chunks, files and notices the user can already see
 
     # Post the text body in <=4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k). Use the shared fence-aware
@@ -1514,7 +1514,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                 kwargs["thread_ts"] = thread_ts
             try:
                 _last_resp = app.client.chat_postMessage(**kwargs)
-                _chunks_posted += 1
+                _parts_visible += 1
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 _chunk_exc = e
@@ -1542,6 +1542,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
         if _is_path_sendable(fpath):
             if _send_file(channel, thread_ts, fpath):
                 sent_files += 1
+                _parts_visible += 1
                 print(f"  Sent file: {fpath}", flush=True)
             else:
                 delivered_ok = False
@@ -1553,6 +1554,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file access denied: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
+                _parts_visible += 1
             except Exception as e:
                 # The deny notice can be the ONLY user-visible output: a body of
                 # just `[file: /blocked]` posts no text chunk, so if this refusal
@@ -1567,6 +1569,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file not found: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
+                _parts_visible += 1
             except Exception as e:
                 # Same reasoning as the deny branch above.
                 print(f"[Slack] not-found notice chat_postMessage failed: {e}", flush=True)
@@ -1607,7 +1610,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
         # Three-state outcome for the outbox (reply leg): classification is
         # shared policy in slack_result_delivery, not re-derived here.
         receipt_out.append(_srd.receipt_for_send(delivered_ok, _last_resp, _chunk_exc,
-                                                 chunks_posted=_chunks_posted))
+                                                 parts_visible=_parts_visible))
     return delivered_ok
 
 
