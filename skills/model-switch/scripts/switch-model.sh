@@ -113,9 +113,13 @@ if [ "$RUNTIME" = codex ]; then
   # The observer drives both pickers (model row, then reasoning level) and waits for the acceptance line.
   VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" ${EFFORT:+--effort "$EFFORT"} --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" 2> "$STATE_DIR/.observe.err")"
   case "$VERDICT" in
-    ACCEPTED|"ACCEPTED "*) EFFORT_SEEN="${VERDICT#ACCEPTED}"; EFFORT_SEEN="${EFFORT_SEEN# }";;
+    ACCEPTED*)
+      EFFORT_SEEN="${VERDICT#ACCEPTED}"; EFFORT_SEEN="${EFFORT_SEEN# }"
+      # The codex record's whole claim is the effort the CLI applied; absent one there is nothing to record.
+      [ -n "$EFFORT_SEEN" ] || { echo "switch-model: the CLI acknowledged $MODEL with no readable effort word; the applied reasoning level is unknown, nothing recorded" >&2; exit 11; };;
     NOT-OFFERED) echo "switch-model: $(cat "$STATE_DIR/.observe.err") Nothing recorded" >&2; exit 9;;
     "EFFORT-MISMATCH"*) echo "switch-model: $(cat "$STATE_DIR/.observe.err") Nothing recorded" >&2; exit 10;;
+    EFFORT-UNREADABLE) echo "switch-model: $(cat "$STATE_DIR/.observe.err") Nothing recorded" >&2; exit 11;;
     *) echo "switch-model: sent '/model' and picked $MODEL but saw no 'Model changed to $MODEL' within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8;;
   esac
 else

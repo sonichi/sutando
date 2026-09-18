@@ -65,6 +65,7 @@ from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from tmux_pane_lock import pane_lock  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -14254,20 +14255,25 @@ def _default_cron_nudge(
     if tmux_bin is None:
         tmux_bin = _resolve_tmux_bin()
     env = _resolve_launch_env()
-    try:
-        has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
-            env=env, capture_output=True, timeout=15,
-        )
-        if has.returncode != 0:
+    # Held across the probe and the keystroke: a nudge typed into another writer's open
+    # picker drives that picker instead of re-arming the crons.
+    with pane_lock(sock, session) as held:
+        if not held:
             return False
-        send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
-        )
-        return send.returncode == 0
-    except Exception:
-        return False
+        try:
+            has = subprocess.run(
+                [tmux_bin, "-S", sock, "has-session", "-t", session],
+                env=env, capture_output=True, timeout=15,
+            )
+            if has.returncode != 0:
+                return False
+            send = subprocess.run(
+                [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+                env=env, capture_output=True, timeout=15,
+            )
+            return send.returncode == 0
+        except Exception:
+            return False
 
 
 def recover_cron_if_dead(

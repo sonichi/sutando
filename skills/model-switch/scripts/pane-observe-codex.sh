@@ -2,7 +2,7 @@
 # pane-observe-codex.sh <session> --socket PATH --model M [--effort low|medium|high|xhigh] (--count | --wait --baseline N [--timeout S] | --cancel)
 # Codex's bare /model opens two pickers; a digit key selects AND confirms a row. Acceptance = a new
 # "Model changed to <M> <effort>" line for the REQUESTED id, whose effort word must equal --effort when given.
-# Exit: 0 "ACCEPTED <effort>" · 11 TIMEOUT · 12 capture failed · 13 model not offered (picker cancelled) · 14 effort not offered · 15 "EFFORT-MISMATCH <seen>".
+# Exit: 0 "ACCEPTED <effort>" · 11 TIMEOUT · 12 capture failed · 13 model not offered (picker cancelled) · 14 effort not offered · 15 "EFFORT-MISMATCH <seen>" · 16 EFFORT-UNREADABLE (no effort word in the acknowledgement).
 set -u
 SESSION="${1:?session}"; shift
 SOCK=""; MODE=""; BASE=0; TIMEOUT=20; REQ=""; EFFORT=""
@@ -66,7 +66,14 @@ fi
 # The NEWEST matching line (count above baseline) is the switch; its effort word is what the CLI applied.
 while :; do
   if text="$(cap)" && [ "$(printf '%s\n' "$text" | grep -Ec -- "$ACCEPT")" -gt "$BASE" ]; then
-    seen="$(printf '%s\n' "$text" | grep -E -- "$ACCEPT" | tail -1 | sed -E "s/.*Model changed to ${ESC} ?([[:alnum:]_-]*).*/\\1/")"
+    ack="$(printf '%s\n' "$text" | grep -E -- "$ACCEPT" | tail -1)"
+    seen="$(printf '%s\n' "$ack" | sed -E "s/.*Model changed to ${ESC} ?([[:alnum:]_-]*).*/\\1/")"
+    # An acknowledgement with no readable effort word leaves the applied reasoning level
+    # unknown; there is nothing to record, so it is never an acceptance.
+    if [ -z "$seen" ]; then
+      echo "pane-observe-codex: the acknowledgement for $REQ carries no readable effort word (${ack}); the applied reasoning level is unknown, not accepted." >&2
+      echo EFFORT-UNREADABLE; exit 16
+    fi
     if [ -n "$EFFORT" ] && [ "$seen" != "$EFFORT" ]; then
       echo "pane-observe-codex: requested effort '$EFFORT' but the CLI applied '${seen:-none}' (Model changed to $REQ ${seen}); not accepted." >&2
       echo "EFFORT-MISMATCH $seen"; exit 15

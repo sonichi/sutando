@@ -64,6 +64,10 @@ rc=$(runx gpt-5.5); R=$(python3 -c "import json;d=json.load(open('$T/state/model
 [ "$rc" = 0 ] && [ "$(xkeys)" = "/model Enter 4 Enter" ] && [ "$R" = medium ] && grep -q "effort=medium" "$T/out" && ok "12c codex without --effort: Enter takes the reasoning picker's default; the effort RECORDED is the one the CLI printed (medium), not invented" || fail "12c observed effort" "rc=$rc keys='$(xkeys)' R=$R"
 rc=$(TMUX_ACCEPT_EFFORT_AS=medium runx gpt-5.5 --effort high); [ "$rc" = 10 ] && [ ! -e "$T/state/model-switch.json" ] && [ "$(xkeys)" = "/model Enter 4 3" ] && grep -q "requested effort 'high' but the CLI applied 'medium'" "$T/err" \
   && ok "12c2 --effort high requested, pane prints 'Model changed to gpt-5.5 medium': exit 10, NO record, requested vs observed named" || fail "12c2 effort mismatch" "rc=$rc keys='$(xkeys)' R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_EFFORT_AS=' ' runx gpt-5.5); [ "$rc" = 11 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "carries no readable effort word" "$T/err" \
+  && ok "12c3 the acknowledgement names the model and NO effort word: exit 11, NO record — an unknown reasoning level is never a success" || fail "12c3 effort absent" "rc=$rc R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_EFFORT_AS='!!' runx gpt-5.5 --effort high); [ "$rc" = 11 ] && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "12c4 ...and an UNPARSABLE effort token fails closed the same way, never as an effort the record could name" || fail "12c4 effort unparsable" "rc=$rc R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
 rc=$(TMUX_CODEX_CONFIG="$T/codexhome/config.toml" runx gpt-5.6-sol --effort low); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous'])" 2>/dev/null); NOW=$(sed -n 's/^model = "\(.*\)"/\1/p' "$T/codexhome/config.toml")
 [ "$rc" = 0 ] && [ "$R" = gpt-5.5 ] && [ "$NOW" = gpt-5.6-sol ] && ok "12d the CLI rewrote config.toml on acceptance; previous still records the model BEFORE the send" || fail "12d previous read after acceptance" "rc=$rc R=$R now=$NOW"
 printf '%s\n' "$TOML_BEFORE" > "$T/codexhome/config.toml"
@@ -153,4 +157,4 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 45 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 47 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

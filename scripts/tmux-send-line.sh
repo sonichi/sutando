@@ -21,6 +21,7 @@ PY="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" python-
 [ -x "$PY" ] || { echo "tmux-send-line: python interpreter not found ($PY) — cannot inspect the prompt, not sending" >&2; exit 7; }
 # One sender at a time per socket+session: inspection and both send-keys run
 # under a lock, so two callers cannot interleave payloads before either Enter.
+. "$(cd "$(dirname "$0")" && pwd)/tmux-pane-lock.bash"
 LOCK="$(bash "$(cd "$(dirname "$0")" && pwd)/tmux-pane-lock.sh" "$SOCK" "$SESSION")" || { echo "tmux-send-line: could not derive the pane lock — not sending" >&2; exit 7; }
 if [ -n "$LOCKFD" ]; then
   # A caller holding this pane's lock across a transaction lends its fd; any other file is refused.
@@ -29,9 +30,8 @@ a=os.fstat(int(sys.argv[1])); b=os.stat(sys.argv[2]); sys.exit(0 if (a.st_dev,a.
     || { echo "tmux-send-line: --lock-fd $LOCKFD is not the pane lock for '$SESSION' on $SOCK ($LOCK) — refused" >&2; exit 8; }
   eval "exec 9>&$LOCKFD"
 else
-  exec 9>"$LOCK"
+  pane_lock_take "$SOCK" "$SESSION" 9 || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
 fi
-"$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
 # The current prompt is the LAST line starting with the runtime's glyph (Claude ❯,
 # Codex ›; scrollback holds old ones); its input is what follows the glyph and one
 # optional space/nbsp. Codex draws a DIM placeholder hint on the empty composer, so
