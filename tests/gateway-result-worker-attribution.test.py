@@ -28,6 +28,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import json
+import stat
 import sys
 import tempfile
 import unittest
@@ -40,8 +41,11 @@ _POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
 
 sys.path.insert(0, str(_POOL_SCRIPTS))
 sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(_REPO / "tests" / "_helpers"))
 import pool_delivery  # noqa: E402
 import pool_record  # noqa: E402
+
+from deadline import deadline  # noqa: E402
 
 
 def _load():
@@ -158,6 +162,27 @@ class WorkerAttribution(unittest.TestCase):
         tid = "task-dirrecord000000001"
         pool_delivery.done_flag(Path(self.workspace), "worker-4", tid).mkdir(parents=True)
         self.assertEqual(self.mod._worker_of(tid), "")
+
+    def test_a_fifo_at_the_record_name_fails_closed_without_waiting(self):
+        """A blocking read-open of a FIFO waits for a writer that never comes,
+        so the resolver must classify one without ever waiting on the open."""
+        tid = "task-fiforecord0000001"
+        pend = pool_delivery.mark_done(Path(self.workspace), "worker-6", tid,
+                                       published=False)
+        # Control on the SAME path: a regular record there still resolves, so
+        # the assertions below are about the file's type and nothing else.
+        with deadline(5.0, "_worker_of over a regular record"):
+            self.assertEqual(self.mod._worker_of(tid), "worker-6")
+        os.unlink(pend)
+        os.mkfifo(str(pend))
+        self.assertTrue(stat.S_ISFIFO(os.lstat(pend).st_mode), pend)
+        with deadline(5.0, "_worker_of over a FIFO record"):
+            self.assertEqual(self.mod._worker_of(tid), "")
+        with deadline(5.0, "_deliver_result_payload over a FIFO record"):
+            self.assertNotIn("metadata", self._doc(tid))
+        # The writer's own predicate reads the same record the same way.
+        with deadline(5.0, "is_done_flag over a FIFO record"):
+            self.assertFalse(pool_delivery.is_done_flag(pend))
 
     def test_a_symlink_at_the_record_name_is_refused(self):
         tid = "task-symlinkrecord00001"

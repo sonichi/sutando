@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import sys
 import tempfile
 import unittest
@@ -22,9 +23,12 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "skills" / "worker-pool" / "scripts"))
+sys.path.insert(0, str(_REPO / "tests" / "_helpers"))
 
 import pool_record  # noqa: E402
 import pool_delivery  # noqa: E402
+
+from deadline import deadline  # noqa: E402
 
 _BRIDGE = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
 _VENDORED = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "pool_record.py"
@@ -119,6 +123,22 @@ class TheGrammarIsBounded(unittest.TestCase):
         d.mkdir()
         self.assertIs(pool_record.read_record_state(d),
                       pool_record.RecordState.MALFORMED)
+
+    def test_a_special_file_classifies_without_waiting_on_the_open(self):
+        """The probe opens before it can classify, so the open must not be able
+        to block: a FIFO has no writer and a blocking one would wait forever."""
+        root = Path(tempfile.mkdtemp())
+        regular = root / "regular"
+        regular.write_text("")
+        with deadline(5.0, "read_record_state over a regular file"):
+            self.assertIs(pool_record.read_record_state(regular),
+                          pool_record.RecordState.PRESENT)   # control
+        fifo = root / "fifo"
+        os.mkfifo(str(fifo))
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+        with deadline(5.0, "read_record_state over a FIFO"):
+            self.assertIs(pool_record.read_record_state(fifo),
+                          pool_record.RecordState.MALFORMED)
 
     def test_an_entry_that_cannot_be_typed_is_left_for_the_record_probe(self):
         """is_dir() failing does not PROVE the entry is not a recipient, so it

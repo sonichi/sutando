@@ -65,11 +65,19 @@ def record_path(root, recipient: str, task_id: str, stage: str = DONE_STAGE) -> 
     return record_dir(root, recipient) / f"{task_id}.{stage}"
 
 
+# Non-blocking: a blocking O_RDONLY open of a FIFO waits for a writer, so the
+# classification below would never be reached for one.
+_PROBE_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0))
+
+
 def record_state(path) -> RecordState:
     """Open-based, never lstat: a record is a REGULAR file openable without
-    following a symlink. An unreadable one raises rather than reading as
-    absent, so a caller can abstain instead of naming someone else."""
-    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    following a symlink. The open cannot wait, so a FIFO or device at the name
+    classifies as MALFORMED instead of stalling the caller. An unreadable one
+    raises rather than reading as absent, so a caller can abstain instead of
+    naming someone else."""
+    fd = os.open(str(path), _PROBE_FLAGS)
     try:
         regular = stat.S_ISREG(os.fstat(fd).st_mode)
     finally:
