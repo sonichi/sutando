@@ -37,7 +37,7 @@ import { inlineTools, personalSkillSetups } from './inline-tools.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
-import { injectText } from './browser-tools.js';
+import { injectText, injectSilentContext } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
@@ -1066,7 +1066,10 @@ async function main() {
 	// so the model hears one notice per change and nothing for a duplicate.
 	// The notice rides the task-result injection path (delay-then-check): the
 	// first frame lands ~100ms before Gemini's setup completes, so an immediate
-	// inject would fall through.
+	// inject would fall through. It goes in as an open (turnComplete=false)
+	// context turn, not realtime input: realtime text is answered out loud, and
+	// the model answered every room switch with "Working on it." until it was
+	// made silent (owner 2026-09-18).
 	function handleSessionContextFrame(message: Record<string, unknown>): void {
 		if (message?.type !== SESSION_CONTEXT_TYPE) return;
 		const applied = applySessionContextFrame(message);
@@ -1080,8 +1083,7 @@ async function main() {
 			attempt: () => {
 				try {
 					if (session.sessionManager.isActive && session.clientConnected) {
-						injectText(session, line);
-						return true;
+						return injectSilentContext(session, line);
 					}
 				} catch { /* session still constructing — retry */ }
 				return false;

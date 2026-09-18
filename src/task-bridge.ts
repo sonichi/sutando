@@ -337,10 +337,10 @@ export function applySessionContextFrame(msg: Record<string, unknown> | null | u
 export function sessionRoomNotice(change: SessionRoomChange, room: VoiceSessionRoom | null): string | null {
 	if (change === 'entered' && room) {
 		const label = room.name ? `"${room.name}"` : room.id;
-		return `You are now in room ${label}. Work you delegate answers in that room; when you tell the user where a result went, say "in this room", never "in your DM". Do not speak this notice.`;
+		return `You are now in room ${label}. Work you delegate answers in that room; when you tell the user where a result went, say "in this room", never "in your DM". No reply is needed.`;
 	}
 	if (change === 'left') {
-		return 'You are back in your DM. Work you delegate answers there; say "in your DM" or "here", never "in this room". Do not speak this notice.';
+		return 'You are back in your DM. Work you delegate answers there; say "in your DM" or "here", never "in this room". No reply is needed.';
 	}
 	return null;
 }
@@ -514,7 +514,10 @@ export function countQueuedAhead(dir: string, excludeId: string): number {
 /** The sentence the voice agent says when other tasks are ahead; empty when none are. */
 export function queuedAheadInstruction(queuedAhead: number): string {
 	if (queuedAhead <= 0) return '';
-	return ` ${queuedAhead} task(s) are ahead of this one. Tell the user exactly "Got it, ${queuedAhead} ahead of this one, working in order" and wait; do not narrate the queue again.`;
+	const line = queuedAhead === 1
+		? 'Got it, right after the one I\'m on.'
+		: `Got it, ${queuedAhead} in line before this one.`;
+	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
 }
 
 export const workTool: ToolDefinition = {

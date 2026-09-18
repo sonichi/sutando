@@ -107,7 +107,8 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		const second = await (workTool.execute as any)({ task: 'queue probe two' }, null) as { taskId: string; queuedAhead: number; message: string };
 		createdFiles.push(second.taskId + '.txt');
 		assert.ok(second.queuedAhead >= first.queuedAhead + 1, `second saw ${second.queuedAhead}, first ${first.queuedAhead}`);
-		assert.match(second.message, new RegExp(`Got it, ${second.queuedAhead} ahead of this one, working in order`));
+		const expected = second.queuedAhead === 1 ? "Got it, right after the one I'm on." : `Got it, ${second.queuedAhead} in line before this one.`;
+		assert.ok(second.message.includes(expected), `message carries the spoken line: ${second.message}`);
 		assert.ok(second.message.startsWith('Task has been '), 'the original instruction is kept in front');
 	});
 });
@@ -123,7 +124,8 @@ describe('queue depth helpers (pure, temp dirs)', () => {
 		assert.equal(countQueuedAhead(dir, 'task-none'), 3);
 		assert.equal(countQueuedAhead(join(dir, 'missing'), 'task-2'), 0, 'an unreadable dir is 0, never a throw');
 		assert.equal(queuedAheadInstruction(0), '');
-		assert.match(queuedAheadInstruction(2), /Got it, 2 ahead of this one, working in order/);
+		assert.match(queuedAheadInstruction(1), /Got it, right after the one I'm on\./, 'one ahead reads as a person, not a queue');
+		assert.match(queuedAheadInstruction(2), /Got it, 2 in line before this one\./);
 	});
 
 	it('readQueueDepth reads state/task-queue.json and treats a stale or absent snapshot as unknown', () => {
