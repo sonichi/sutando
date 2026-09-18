@@ -533,6 +533,11 @@ class TestComposerIsEmpty(unittest.TestCase):
         pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m\x1b[38;5;246myes\x1b[39m")
         self.assertTrue(_mod._composer_is_empty(pane))
 
+    def test_the_queued_messages_line_is_not_a_draft(self):
+        # After Enter on a running turn the composer shows this hint, not our text.
+        pane = _IDLE.replace("❯ ", "❯ Press up to edit queued messages")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
     def test_a_grey_colour_outside_the_ramp_is_not_dim(self):
         pane = _IDLE.replace("❯ ", "\x1b[39m❯ \x1b[38;5;208mdraft\x1b[39m")
         self.assertFalse(_mod._composer_is_empty(pane))
