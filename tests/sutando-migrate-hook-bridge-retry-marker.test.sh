@@ -45,8 +45,8 @@ touch "$PC/repo/CLAUDE.md" \
 printf '{"workspace": {"path": "%s"}}\n' "$PC/ws" > "$PC/repo/sutando.config.local.json"
 
 # A REAL, nonempty recognized source -- SUTANDO_MIGRATE_SRC_B stands in for
-# $HOME/.sutando/workspace, the same legacy dir startup.sh's own env-migration
-# path (`_ws_legacy`) copies from. The prior failure tests left every source
+# the legacy pre-v0.8 workspace dir startup.sh's own env-migration path
+# (`_ws_legacy`) copies from. The prior failure tests left every source
 # empty and so never exercised a copy actually landing.
 mkdir -p "$PC/src/b/notes"
 echo "real legacy note content" > "$PC/src/b/notes/keep.md"
