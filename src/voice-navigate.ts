@@ -9,6 +9,13 @@
  * `resolveUiNavigated`, and fails the in-flight requests when the client goes
  * away. With no seam installed (the phone server, tests) the tool answers
  * `unsupported` at once instead of waiting on a reply that cannot come.
+ *
+ * The frame goes out only to a client that announced the `ui.navigate`
+ * capability in its `session.context` frame. Every desktop that merely
+ * connects satisfies "attached"; only one that speaks the frame can answer
+ * it, so an attached-but-silent client (any desktop that predates the
+ * client half) gets an immediate `unsupported` telling the owner to update
+ * — not six seconds of silence and then a timeout.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -17,6 +24,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
 	buildUiNavigateFrame,
 	parseUiNavigatedFrame,
+	UI_NAVIGATE_CAPABILITY,
 	UI_NAVIGATE_TARGETS,
 	type UiNavigatedError,
 	type UiNavigatedFrame,
@@ -30,10 +38,21 @@ export const NAVIGATE_UI_UNSUPPORTED_MESSAGE =
 	'No desktop client is connected to this session. Navigation works in the AG2 Space desktop app; tell the user that and move on.';
 export const NAVIGATE_UI_TIMEOUT_MESSAGE =
 	'The desktop did not confirm the move in time. Tell the user it did not go through and that they can ask again.';
+/** An attached client that never announced `ui.navigate`: it cannot answer
+ *  the frame, so nothing is sent and the owner hears this at once. */
+export const NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE =
+	"This desktop app can't be navigated by voice yet; update it.";
+/** `target:'room'` needs the spoken room words; without them there is nothing
+ *  for the desktop to resolve, so no frame goes out. */
+export const NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE =
+	"Say which room, for example 'take me to GTM in Investors'.";
 
 export interface VoiceNavigateClient {
 	/** True while a real client is attached and can receive frames. */
 	attached(): boolean;
+	/** True when the attached client announced `capability` in its
+	 *  `session.context` frame (see parseSessionContextCapabilities). */
+	supports(capability: string): boolean;
 	send(frame: Record<string, unknown>): void;
 }
 
@@ -95,7 +114,13 @@ export async function navigateUi(args: { target: UiNavigateTarget; query?: strin
 	if (!client || !client.attached()) {
 		return { ok: false, target, error: 'unsupported', message: NAVIGATE_UI_UNSUPPORTED_MESSAGE };
 	}
+	if (!client.supports(UI_NAVIGATE_CAPABILITY)) {
+		return { ok: false, target, error: 'unsupported', message: NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE };
+	}
 	const frame = buildUiNavigateFrame(opts.requestId ?? `nav-${randomUUID()}`, target, query);
+	if (target === 'room' && !frame.query) {
+		return { ok: false, target, error: 'not_found', message: NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE };
+	}
 	const timeoutMs = opts.timeoutMs ?? NAVIGATE_UI_TIMEOUT_MS;
 
 	const reply = await new Promise<UiNavigatedFrame | null | 'timeout'>((resolve) => {
