@@ -23,12 +23,17 @@ hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
 
 SUPERVISOR = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+CLAUDE_NOTIFIER = REPO / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
+CODEX_NOTIFIER = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
 
 
 class FakeTmux:
-    def __init__(self, *, core_exists: bool = True, panes=None) -> None:
+    def __init__(self, *, core_exists: bool = True, panes=None,
+                 notifier_script: "str | None" = None) -> None:
         self.core_exists = core_exists
         self.panes = panes
+        # What `show-environment` reports for SUTANDO_NOTIFIER_SCRIPT (None = unset).
+        self.notifier_script = notifier_script
         self.calls = []
 
     @staticmethod
@@ -46,6 +51,10 @@ class FakeTmux:
             if self.panes is None:
                 return self._result(args, 1)
             return self._result(args, 0, "".join(f"{d}\t{c}\n" for d, c in self.panes))
+        if args and args[0] == "show-environment":
+            if self.notifier_script is None:
+                return self._result(args, 1, "-SUTANDO_NOTIFIER_SCRIPT\n")
+            return self._result(args, 0, f"SUTANDO_NOTIFIER_SCRIPT={self.notifier_script}\n")
         return self._result(args, 1)
 
 
@@ -120,9 +129,28 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
         self.assertEqual(result["status"], "warn")
         self.assertIn("unexpected command", result["detail"])
 
+    def test_supervisor_on_its_default_notifier_warns(self):
+        # A bare supervisor runs the Codex notifier; the pane command alone looks right.
+        self.write_local_core()
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")], notifier_script=None)
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux):
+            result = hc.check_claude_task_notifier()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("supervisor default", result["detail"])
+
+    def test_supervisor_on_the_codex_notifier_warns(self):
+        self.write_local_core()
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
+                        notifier_script=str(CODEX_NOTIFIER))
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux):
+            result = hc.check_claude_task_notifier()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("codex/cli/task-notifier.sh", result["detail"])
+
     def test_healthy_supervisor_pane_is_ok(self):
         self.write_local_core()
-        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")])
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
+                        notifier_script=str(CLAUDE_NOTIFIER))
         with mock.patch.object(hc, "_run_tmux", side_effect=tmux):
             result = hc.check_claude_task_notifier()
         self.assertEqual(result["status"], "ok", result)

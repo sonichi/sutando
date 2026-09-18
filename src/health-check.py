@@ -9996,8 +9996,13 @@ def _probe_codex_task_notifier(target: dict) -> dict:
                                 expected=_expected_codex_notifier_entrypoint())
 
 
-def _probe_task_notifier(target: dict, *, name: str, expected: Path) -> dict:
-    """Inspect the exact managed notifier tmux session for one healthy pane."""
+def _probe_task_notifier(target: dict, *, name: str, expected: Path,
+                         script: "Path | None" = None) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane.
+
+    `script`, when given, is the notifier the supervisor must be running; the
+    supervisor's own default is another runtime's, so the pane command alone
+    cannot certify which one is live."""
     socket_path = target["socket"]
     watcher_session = f"{target['session']}-watcher"
     exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
@@ -10047,12 +10052,27 @@ def _probe_task_notifier(target: dict, *, name: str, expected: Path) -> dict:
                 f"command; expected {expected.name}"
             ),
         }
+    if script is not None:
+        env = _run_tmux(socket_path, "show-environment", "-t", f"={watcher_session}",
+                        "SUTANDO_NOTIFIER_SCRIPT")
+        configured = ""
+        if env is not None and env.returncode == 0:
+            configured = env.stdout.strip().partition("=")[2]
+        if configured != str(script):
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"managed tmux session {watcher_session!r} runs notifier "
+                    f"{configured or '(supervisor default)'!r}; expected {script}"
+                ),
+            }
     return {
         "name": name,
         "status": "ok",
         "detail": (
             f"managed notifier healthy in {watcher_session!r} "
-            f"({expected.name})"
+            f"({(script or expected).name})"
         ),
     }
 
@@ -10264,7 +10284,8 @@ def check_claude_task_notifier() -> dict:
         return {"name": name, "status": "warn",
                 "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
     supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
-    return _probe_task_notifier(target, name=name, expected=supervisor)
+    notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
+    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
 
 
 def fix_codex_task_notifier() -> str:
