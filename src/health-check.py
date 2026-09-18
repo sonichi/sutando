@@ -8778,11 +8778,7 @@ def check_proactive_quarantine() -> dict:
             continue
         # Relative to the quarantine root: two subdirectories can hold the
         # same filename, and this label is what a reader opens.
-        try:
-            label = str(path.relative_to(quarantine))
-        except ValueError:
-            label = path.name
-        kept.append((label, int(age), int(arrived)))
+        kept.append((str(path.relative_to(quarantine)), int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:

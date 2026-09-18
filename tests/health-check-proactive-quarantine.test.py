@@ -125,6 +125,27 @@ class TestProactiveQuarantine(unittest.TestCase):
             # two triage folders can hold the same filename.
             self.assertIn("triaged-2026-09-11/proactive-1785870055.txt", r["detail"])
 
+    def test_an_unreadable_subdirectory_is_counted_not_skipped(self):
+        """The reason this walks explicitly instead of using `rglob`: rglob
+        ignores a subdirectory it cannot read, so bodies under it vanish and
+        the probe reports clean. An unreadable one must land in the same
+        `unreadable` tally the top level already uses."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            blocked = q / "triaged-2026-09-11"
+            blocked.mkdir()
+            real_iterdir = pathlib.Path.iterdir
+
+            def boom(self):
+                if self.name == "triaged-2026-09-11":
+                    raise PermissionError(13, "Permission denied")
+                return real_iterdir(self)
+
+            with mock.patch.object(pathlib.Path, "iterdir", boom):
+                r = self._run(td)
+            self.assertEqual(r["status"], "warn", r)
+            self.assertIn("1 entry unreadable", r["detail"])
+
     def test_an_empty_subdirectory_still_does_not_inflate_the_count(self):
         """Control for the test above: descending must not make a directory
         entry itself count. Without this, "sees nested bodies" is satisfied by
