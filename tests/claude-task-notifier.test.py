@@ -62,6 +62,9 @@ class FakeTmuxHarness(unittest.TestCase):
     # Lines a non-`-S` capture-pane returns (the viewport height); a subclass
     # narrows this to put the marker above it. `-S` always returns it all.
     PANE_HEIGHT = 500
+    # tmux's own history-limit, capping what `-S` can ever return; a subclass
+    # narrows this below CAPTURE_SCROLLBACK_LINES to make IT the real bound.
+    HISTORY_LIMIT = 500
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -120,10 +123,14 @@ case "$cmd" in
       [ "$a" = -S ] && scrollback=1
     done
     if [ "$scrollback" = 1 ]; then
-      cat "{self.pane_file}" 2>/dev/null
+      tail -n {self.HISTORY_LIMIT} "{self.pane_file}" 2>/dev/null
     else
       tail -n {self.PANE_HEIGHT} "{self.pane_file}" 2>/dev/null
     fi
+    exit 0
+    ;;
+  show-options)
+    printf 'history-limit %s\n' {self.HISTORY_LIMIT}
     exit 0
     ;;
   send-keys)
@@ -550,6 +557,30 @@ class TallComposerScrollbackTests(FakeTmuxHarness):
             "the fake pane's 2-line viewport -- capture_tail() must ask for "
             "scrollback (-S), not just the visible screen",
         )
+
+
+class HistoryLimitBoundTests(FakeTmuxHarness):
+    """Regression for a real review finding on PR #4307 (rui / yixuan-ag2,
+    2026-09-18): CAPTURE_SCROLLBACK_LINES only helps when IT is the binding
+    constraint. When tmux's own history-limit is smaller, `-S` can never
+    return more than that no matter how high the env var is raised, and
+    that miss must be a distinguishable, loud condition -- not the generic
+    never-staged message. HISTORY_LIMIT=2 caps `-S` itself at the untyped
+    footer's own line count, so even scrollback can't recover the marker
+    once a line is typed."""
+
+    PANE_HEIGHT = 2
+    HISTORY_LIMIT = 2
+
+    def test_marker_past_historys_own_limit_is_reported_distinctly(self):
+        self.write_task("task-past-limit.txt")
+        result = self.run_event("task-past-limit.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ENTER", self.sendkeys_log_text(),
+                          "must fail closed -- tmux truly has no more history to give")
+        log_text = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("may exceed the capture window", log_text)
+        self.assertIn("history-limit", log_text)
 
 
 class MainLoopWiringTest(FakeTmuxHarness):

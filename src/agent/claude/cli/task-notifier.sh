@@ -145,9 +145,13 @@ sys.exit(0 if ciw._is_idle_ready(sys.stdin.read()) else 1)
 
 # Delegates to core-input-watch.py's _composer_is_empty -- idle-ready and an
 # unsent owner draft are not mutually exclusive; typing over one mixes both.
+# Uses capture_tail()'s scrollback, not a fresh viewport-only capture: a
+# retry's OWN prior (still-unstaged) attempt can already be tall enough to
+# push the marker off-screen, which must read as "still ours", not "a
+# foreign draft" -- the same visibility gap capture_tail() exists to close.
 core_pane_composer_is_empty() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  pane="$(capture_tail)"
   [ -n "$pane" ] || return 1
   printf '%s' "$pane" | "$NOTIFIER_PY" -c '
 import importlib.util, sys
@@ -190,10 +194,22 @@ wait_for_core_idle() {
   done
 }
 
+# Never ask tmux for more than it actually retains, or a hit-our-own-cap and
+# a hit-tmux's-real-cap look identical below. Best-effort: falls back on any lookup failure.
+effective_scrollback_lines() {
+  local limit
+  limit="$(tmux -S "$TMUX_SOCKET" show-options -g history-limit 2>/dev/null | awk '{print $2}')"
+  case "$limit" in
+    ''|*[!0-9]*) printf '%s' "$CAPTURE_SCROLLBACK_LINES" ;;
+    *) if [ "$limit" -lt "$CAPTURE_SCROLLBACK_LINES" ]; then printf '%s' "$limit"
+       else printf '%s' "$CAPTURE_SCROLLBACK_LINES"; fi ;;
+  esac
+}
+
 # Scrollback (-S), not just the visible screen: a wrapped prompt taller than
 # the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_tail() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$CAPTURE_SCROLLBACK_LINES" -t "$SESSION:0" 2>/dev/null \
+  tmux -S "$TMUX_SOCKET" capture-pane -p -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null \
     | sed '/^[[:space:]]*$/d'
 }
 
@@ -216,6 +232,22 @@ prompt_is_staged() {
   [ "$(composer_text "$tail")" = "$prompt" ] && [ "$tail" != "$baseline" ]
 }
 
+# A capture at (or past) the effective cap with no marker found is the one
+# case raising CAPTURE_SCROLLBACK_LINES alone cannot fix -- name it explicitly.
+capture_may_be_truncated() {
+  local tail="$1" lines
+  [ -n "$(composer_text "$tail")" ] && return 1
+  lines="$(printf '%s\n' "$tail" | grep -c '')"
+  [ "$lines" -ge "$(effective_scrollback_lines)" ]
+}
+
+# Shared by every give-up site below -- each still logs its OWN reason too.
+warn_if_capture_truncated() {
+  local tail="$1" filename="$2"
+  capture_may_be_truncated "$tail" || return 0
+  log_notifier "prompt for $filename may exceed the capture window (effective cap $(effective_scrollback_lines) lines = min(CAPTURE_SCROLLBACK_LINES=$CAPTURE_SCROLLBACK_LINES, tmux history-limit)) -- no composer marker found in a capture at the cap; raising CAPTURE_SCROLLBACK_LINES will not help past tmux's own history-limit"
+}
+
 # Type + verify staged, then C-m + verify submitted; both halves retry.
 # A core that stays non-idle is a hard gate -- give up rather than type over a live turn.
 deliver_prompt() {
@@ -229,6 +261,7 @@ deliver_prompt() {
     # Require an empty composer before typing (re-checked every retype, not
     # just the first) -- idle-ready and an unsent draft are not exclusive.
     if ! core_pane_composer_is_empty; then
+      warn_if_capture_truncated "$(capture_tail)" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
     fi
@@ -245,6 +278,7 @@ deliver_prompt() {
   # Nothing observably staged: never press Enter blind into a live session.
   # Enter never sent -> the caller must leave this queued, not wait on a result.
   if [ "$staged" != 1 ]; then
+    warn_if_capture_truncated "$staged_tail" "$filename"
     log_notifier "prompt for $filename never verifiably staged after $((type_tries + 1)) attempts; not pressing Enter (failing closed)"
     return 1
   fi
