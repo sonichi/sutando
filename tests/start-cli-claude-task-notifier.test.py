@@ -24,7 +24,7 @@ CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nsleep 120\n'
 
 
 class Harness:
-    def __init__(self) -> None:
+    def __init__(self, claude_body: str = CLAUDE_STUB) -> None:
         if not TMUX:
             raise unittest.SkipTest("tmux not found")
         self.td = Path(tempfile.mkdtemp())
@@ -46,7 +46,7 @@ class Harness:
         bind = self.td / "bin"
         bind.mkdir()
         (self.td / "home").mkdir()
-        for stub, body in (("claude", CLAUDE_STUB), ("pgrep", PGREP_STUB),
+        for stub, body in (("claude", claude_body), ("pgrep", PGREP_STUB),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body)
             (bind / stub).chmod(0o755)
@@ -122,6 +122,46 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
                             "restart kept the old watcher session alive")
         sessions = self.h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
         self.assertEqual(sessions.count("sutando-core-watcher"), 1)
+
+
+class HealPathStartsTheNotifierOnlyForALiveCore(unittest.TestCase):
+    """A sibling window keeps the session alive while the core window is gone;
+    the heal recreates the core at index 0. The watcher targets that index, so
+    it may exist only once the healed process is proven alive."""
+
+    def _session_with_sibling_only(self, h: Harness) -> None:
+        # The server inherits this env; a window healed later must see the harness HOME.
+        subprocess.run([TMUX, "-S", str(h.sock), "new-session", "-d", "-s", "sutando-core",
+                        "-n", "core", "sleep 120"], env=h.env, check=True)
+        h.tm("new-window", "-d", "-t", "sutando-core", "-n", "gateway", "sleep 120")
+        h.tm("kill-window", "-t", "=sutando-core:0")   # index 0 freed, session survives
+
+    def test_a_healed_core_that_dies_at_once_leaves_no_watcher(self):
+        h = Harness(claude_body="exit 0\n")   # no pid file: the core is never seen alive
+        try:
+            self._session_with_sibling_only(h)
+            run = h.launch()
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn("healed window did not come up", run.stderr)
+            sessions = h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
+            self.assertIn("sutando-core", sessions, "the sibling window must keep the session")
+            self.assertNotIn("sutando-core-watcher", sessions,
+                             "a failed heal left a watcher aimed at a session with no core")
+        finally:
+            h.close()
+
+    def test_a_healed_core_that_lives_gets_the_watcher(self):
+        h = Harness()
+        try:
+            self._session_with_sibling_only(h)
+            run = h.launch()
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertNotIn("healed window did not come up", run.stderr)
+            exists, cmd, _ = h.watcher()
+            self.assertTrue(exists, "a live healed core must get its watcher")
+            self.assertIn("task-notifier-supervisor.sh", cmd)
+        finally:
+            h.close()
 
 
 class WorkerLaunchStartsNoNotifier(unittest.TestCase):

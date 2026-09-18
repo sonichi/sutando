@@ -846,7 +846,6 @@ if tmux_session_exists; then
   tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
   ensure_core_monitor
   # new-window returning an index proves tmux ACCEPTED the command, not that the
-  ensure_task_notifier
   # child lives; poll before opening intake, same bound as the fresh-start path.
   for _ in $(seq 1 25); do
     tmux_core_session_running && break
@@ -854,8 +853,11 @@ if tmux_session_exists; then
   done
   if tmux_core_session_running; then
     clear_shutdown_sentinel
+    ensure_task_notifier
   else
     echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    # A surviving sibling window keeps the session alive; a watcher would type into it.
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   fi
   if [ -t 1 ]; then
     echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
