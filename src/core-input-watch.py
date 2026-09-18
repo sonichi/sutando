@@ -237,6 +237,22 @@ def _is_idle_ready(pane: str) -> bool:
     return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
 
 
+def _composer_is_empty(pane: str) -> bool:
+    """True iff the bottommost ❯ prompt line carries no unsent draft text.
+
+    Distinct from `_is_idle_ready`, which classifies gates/turn state and says
+    nothing about a partial owner draft sitting in the composer — an idle-ready
+    footer and an unsent "❯ owner draft" line are not mutually exclusive. Mirrors
+    `refused_turn`'s own prompt-line predicate (a `_PROMPT_LINE` match with
+    non-empty content after stripping the marker means a draft is staged). No
+    ❯ line at all is NOT verifiably empty — fails closed (False), never assumed.
+    """
+    for ln in reversed([ln for ln in pane.splitlines() if ln.strip()]):
+        if _PROMPT_LINE.match(ln):
+            return not ln.strip().lstrip("❯").strip()
+    return False
+
+
 def refused_turn(pane: str):
     """(kind, line) when the pane sits at the idle footer and the turn that ended there —
     the last completed one, with nothing newer below it — was refused: a short turn (≤1s

@@ -43,8 +43,11 @@ REPO = Path(os.environ.get(
 NOTIFIER = REPO / "src/agent/claude/cli/task-notifier.sh"
 
 # Drawn from a live capture against real Claude Code v2.1.261 (see PR body).
-IDLE_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-BUSY_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents"
+# Leading "❯ " is the real composer line, empty = no unsent draft.
+IDLE_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+BUSY_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents"
+# Same footer, but the composer carries an unsent owner draft.
+DRAFT_FOOTER = "❯ owner draft\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 TRUST_GATE_PANE = "\n".join([
     " Quick safety check: Is this a project you created or one you trust?",
     " ❯ No, exit",
@@ -79,6 +82,9 @@ class FakeTmuxHarness(unittest.TestCase):
         self.swallow_flag = self.root / "swallow-next-paste.flag"
         self.busy_after_enter_flag = self.root / "busy-after-enter.flag"
         self.owner_types_after_enter_flag = self.root / "owner-types-after-enter.flag"
+        # Consumed with a swallowed paste: an unrelated line appears instead,
+        # modeling an interleaved owner keystroke landing where ours didn't.
+        self.concurrent_draft_flag = self.root / "concurrent-draft.flag"
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -112,6 +118,10 @@ case "$cmd" in
       printf 'TYPE %s\\n' "$text" >> "{self.sendkeys_log}"
       if [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"
+        if [ -f "{self.concurrent_draft_flag}" ]; then
+          rm -f "{self.concurrent_draft_flag}"
+          printf '%s\\n' "owner is typing something else" >> "{self.pane_file}"
+        fi
       else
         printf '%s\\n' "$text" >> "{self.pane_file}"
       fi
@@ -313,9 +323,9 @@ class EventDispatchTests(FakeTmuxHarness):
                           "a folder-trust gate must never be typed over, even under a fresh idle status")
 
     def test_stale_same_task_marker_plus_swallowed_paste_is_not_mistaken_for_staged(self):
-        # A previous episode's own prompt still in scrollback, plus this
-        # episode's paste swallowed, must not read as this episode's staged.
-        self.pane_file.write_text(IDLE_FOOTER + "\nSutando task ready: task-i.txt\n")
+        # A prior episode's prompt in OLDER scrollback (above the current
+        # composer) plus this episode's paste swallowed must not read staged.
+        self.pane_file.write_text("Sutando task ready: task-i.txt\n" + IDLE_FOOTER + "\n")
         self.write_task("task-i.txt")
         self.swallow_flag.write_text("1")
 
@@ -335,6 +345,43 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(type_calls, 2,
                           "a stale marker from a prior episode must not be read as this "
                           "episode's own staged paste -- the swallowed retype must still fire")
+
+    def test_stale_marker_plus_concurrent_owner_draft_is_not_mistaken_for_staged(self):
+        # Same stale marker, but the swallowed paste is masked by an
+        # UNRELATED pane change instead of leaving the tail byte-identical.
+        self.pane_file.write_text("Sutando task ready: task-k.txt\n" + IDLE_FOOTER + "\n")
+        self.write_task("task-k.txt")
+        self.swallow_flag.write_text("1")
+        self.concurrent_draft_flag.write_text("1")
+
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-k.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-k.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-k.txt")
+        self.assertEqual(type_calls, 2,
+                          "a stale marker plus an unrelated concurrent pane change must not "
+                          "satisfy staging -- the swallowed retype must still fire")
+
+    def test_composer_draft_blocks_typing(self):
+        # An unsent owner draft in the composer must never be typed over,
+        # even though the pane is otherwise idle-ready (no gate signature).
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-m.txt")
+        result = self.run_event("task-m.txt", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TYPE", self.sendkeys_log_text(),
+                          "an unsent owner draft in the composer must never be typed over")
+        self.assertFalse((self.results_dir / "task-m.txt").exists(),
+                          "a task blocked on a draft composer must stay queued, not consumed")
 
     def test_pane_change_after_enter_blocks_a_second_press(self):
         # After the first C-m, the pane changing to something other than
@@ -464,6 +511,60 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 self.fail("main loop never dispatched the dropped task file:\n"
                           + self.sendkeys_log_text())
             self.write_result("task-live.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_claimed_task_is_never_selected_by_an_unrelated_wake(self):
+        # next_pending_task must skip a task claimed must-handle, whichever
+        # unrelated task's wake triggered the rescan -- see CLAIMS_DIR.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        claims_dir = self.state_dir / "task-event-handler-claims"
+        claims_dir.mkdir(parents=True, exist_ok=True)
+        self.write_task("task-claimed.txt")
+        (claims_dir / "task-claimed.txt").write_text("claimed\n")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(
+                self._wait_for_fswatch_attach(),
+                "fswatch never attached to the watched tasks dir",
+            )
+            self.write_task("task-unrelated.txt")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-unrelated.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("main loop never dispatched the unrelated task file:\n"
+                          + self.sendkeys_log_text())
+            self.assertNotIn(
+                "Sutando task ready: task-claimed.txt", self.sendkeys_log_text(),
+                "a claimed must-handle task must never be typed into the live core")
+            self.write_result("task-unrelated.txt")
             deadline = time.time() + 10
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(0.2)

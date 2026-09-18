@@ -13,6 +13,12 @@ else
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
+# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR (its
+# SUTANDO_WORKSPACE_DIR override, honored here too, so both agree on the
+# same directory under a test override) -- a task claimed must-handle by a
+# required task-event handler must never reach this unrestricted live core,
+# whichever unrelated task's wake triggered the rescan.
+CLAIMS_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}/state/task-event-handler-claims"
 CORE_STATUS_STALE_SEC=90
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
@@ -59,7 +65,7 @@ has_result() {
 }
 
 next_pending_task() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR"
+  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR"
 }
 
 # "esc to interrupt" covers any in-flight turn; core-input-watch.py's gate
@@ -83,6 +89,22 @@ spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
 ciw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ciw)
 sys.exit(0 if ciw._is_idle_ready(sys.stdin.read()) else 1)
+' "$REPO/src/core-input-watch.py"
+}
+
+# Delegates to core-input-watch.py's _composer_is_empty -- idle-ready and an
+# unsent owner draft in the composer are not mutually exclusive; typing over
+# one would submit a mix of the draft and our prompt, or clobber the draft.
+core_pane_composer_is_empty() {
+  local pane
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  [ -n "$pane" ] || return 1
+  printf '%s' "$pane" | "$NOTIFIER_PY" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
+ciw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ciw)
+sys.exit(0 if ciw._composer_is_empty(sys.stdin.read()) else 1)
 ' "$REPO/src/core-input-watch.py"
 }
 
@@ -125,11 +147,28 @@ capture_tail() {
     | sed '/^[[:space:]]*$/d' | tail -20
 }
 
-# Staged = marker present AND tail changed since $2, a baseline from before
-# this episode's send-keys -- a stale copy already in scrollback must not count.
+# The tail suffix from the LAST ❯ prompt line onward -- the live composer.
+# A stale copy of our own marker sitting in OLDER scrollback (above the
+# current composer, e.g. an already-submitted prior attempt) must never be
+# mistaken for freshly-staged content. No ❯ line at all returns the whole
+# tail (conservative fallback). Mirrors core-input-watch.py's
+# _composer_from_tail -- kept local in bash since it operates on a tail this
+# script already captured, not on a live pane read.
+composer_from_tail() {
+  awk '
+    /^[[:space:]]*❯/ { start = NR }
+    { line[NR] = $0 }
+    END { for (i = (start ? start : 1); i <= NR; i++) print line[i] }
+  ' <<<"$1"
+}
+
+# Staged = OUR marker is in the LIVE COMPOSER (not merely somewhere in the
+# tail — a stale copy already in scrollback above the composer must not
+# count) AND the tail changed since $2, a baseline from before this
+# episode's send-keys.
 prompt_is_staged() {
   local tail="$1" baseline="$2"
-  printf '%s\n' "$tail" | grep -Fq "Sutando task ready: $3" && [ "$tail" != "$baseline" ]
+  composer_from_tail "$tail" | grep -Fq "Sutando task ready: $3" && [ "$tail" != "$baseline" ]
 }
 
 # Type + verify staged, then C-m + verify submitted; both halves retry.
@@ -142,6 +181,13 @@ deliver_prompt() {
     return 1
   fi
   while :; do
+    # Require an empty composer before typing -- idle-ready and an unsent
+    # owner draft are not mutually exclusive; typing over one mixes our
+    # prompt into theirs. Re-checked on every retype, not just the first.
+    if ! core_pane_composer_is_empty; then
+      log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+      return 1
+    fi
     baseline="$(capture_tail)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
@@ -152,12 +198,21 @@ deliver_prompt() {
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
     sleep "$POLL_INTERVAL"
   done
-  [ "$staged" = 1 ] && [ "$type_tries" -gt 0 ] \
+  # Nothing observably staged: never press Enter blind into a live session --
+  # that would submit whatever the composer actually holds, ours or not.
+  if [ "$staged" != 1 ]; then
+    log_notifier "prompt for $filename never verifiably staged after $((type_tries + 1)) attempts; not pressing Enter (failing closed)"
+    return 0
+  fi
+  [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
+  # Re-verify the exact composer content immediately before THIS Enter too --
+  # same discipline the retry loop below already applies to every later one.
+  if [ "$(capture_tail)" != "$staged_tail" ]; then
+    log_notifier "pane changed since $filename staged; not pressing Enter (failing closed, core may need attention)"
+    return 0
+  fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
-  # Nothing observable staged: the submit is sent and unverifiable — never
-  # re-press C-m blind into a live session.
-  [ "$staged" = 1 ] || return 0
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
