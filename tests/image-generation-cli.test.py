@@ -13,10 +13,12 @@ import importlib.util
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -27,7 +29,19 @@ gen = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(gen)
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def png_1x1() -> bytes:
+    """A real one-pixel RGB PNG, so a Pillow that is present decodes it instead of rejecting it."""
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00" + b"\x00\x80\x80")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+PNG = png_1x1()
+NOT_A_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32  # the signature and nothing behind it
 
 
 def response(parts=None, finish=None, block=None):
@@ -217,13 +231,24 @@ class FakeImage:
         FakeImage.saved.append((fmt or format, quality))
 
 
-def fake_pil():
+def fake_pil(open=lambda fh: FakeImage()):
     image_mod = types.ModuleType("PIL.Image")
-    image_mod.open = lambda fh: FakeImage()
+    image_mod.open = open
     image_mod.LANCZOS = 1
     pil = types.ModuleType("PIL")
     pil.Image = image_mod
     return {"PIL": pil, "PIL.Image": image_mod}
+
+
+def _reject(fh):
+    raise OSError("cannot identify image file")
+
+
+def pillow_present():
+    """The real Pillow when it is installed; otherwise a stub that rejects every image the way it would."""
+    if importlib.util.find_spec("PIL") is not None:
+        return contextlib.nullcontext()
+    return mock.patch.dict(sys.modules, fake_pil(open=_reject))
 
 
 class KeyAndEnv(Base):
@@ -302,6 +327,27 @@ class InputsAndOutputs(Base):
         self.assertEqual((data, mime), (b"FAKE-PNG", "image/png"))
         self.assertIn("Resized", err.getvalue())
         self.assertIn("4096x2048", err.getvalue())
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            self.assertEqual(gen.read_input_image(str(src)), (PNG, "image/png"), "no Pillow: bytes pass through as-is")
+
+    def test_a_corrupt_image_file_is_bad_input_with_pillow_present(self):
+        bad = self.ws / "bad.png"; bad.write_bytes(NOT_A_PNG)
+        err = io.StringIO()
+        with pillow_present(), contextlib.redirect_stderr(err):
+            self.assertIsNone(gen.read_input_image(str(bad)))
+            rc, line = self.run_main("--prompt", "x", "--input", str(bad), opener=self.opener(response()))
+        self.assertEqual((rc, line["error"]), (2, "bad_input"))
+        self.assertEqual(self.calls, [], "nothing is sent for an image Pillow cannot read")
+        self.assertIn("Not a readable image", err.getvalue())
+
+    def test_a_returned_blob_pillow_cannot_convert_keeps_its_own_extension(self):
+        parts = [{"inlineData": {"mimeType": "image/png", "data": base64.b64encode(NOT_A_PNG).decode()}}]
+        out = self.ws / "pic.jpg"
+        with pillow_present():
+            rc, line = self.run_main("--prompt", "x", "--output", str(out), opener=self.opener(response(parts)))
+        self.assertEqual((rc, Path(line["path"]).suffix), (0, ".png"))
+        self.assertEqual(Path(line["path"]).read_bytes(), NOT_A_PNG)
+        self.assertFalse(out.exists())
 
     def test_http_error_without_a_json_body_reads_as_its_code(self):
         err = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b"<html>oops</html>"))
