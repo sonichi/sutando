@@ -339,14 +339,17 @@ finish_handler_task() {
 TERMINAL_REFUSAL_MARK="could not safely process"
 
 handler_result_is_answer() {
-  # Our own refusal means the handler was interrupted and a restart MUST
-  # re-dispatch; an archived result belongs to the reap path, not to this guard.
-  local filename="$1" live="$RESULTS_DIR/$1" first
+  # An archive-only result (no live file) still belongs to the reap path, not
+  # to this guard; unchanged from before this function's fix.
+  local filename="$1" live="$RESULTS_DIR/$1" ready first
   [ -f "$live" ] || return 1
-  handler_result_exists "$filename" || return 1
+  [ -n "$SUTANDO_PY_BIN" ] || return 1
+  # Once a live file exists, even a placeholder, the refusal-or-answer line
+  # must come from find-ready's own READY path, never a hardcoded $live.
+  ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$live" || first=""
+  IFS= read -r first < "$ready" || first=""
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }

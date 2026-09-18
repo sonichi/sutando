@@ -11,9 +11,14 @@ Pinned regressions, each one a defect the bash copies shipped:
   4. A ready ARCHIVED result IS a delivery even when an empty or
      whitespace-only live `results/<id>.txt` also exists: the first-existing
      lookup stopped at the placeholder and requeued a completed task.
+  5. `handler_result_is_answer()` must read the REFUSAL-OR-ANSWER first line
+     from wherever the ready body actually lives, never a hardcoded live
+     path: an archived refusal behind an empty/whitespace live placeholder
+     was misread as "answered" and never re-dispatched.
 And the parity that makes this the one truth: on every fixture — single-state
 and mixed — the answer equals what `watch-tasks-stream.sh`'s
-`handler_result_exists` computes, running the shipped bash function itself.
+`handler_result_exists` and `handler_result_is_answer` compute, running the
+shipped bash functions themselves.
 
 Run: python3 tests/task-dispatch-contract.test.py
 """
@@ -35,6 +40,7 @@ sys.path.insert(0, str(REPO / "src"))
 from delivery.task_dispatch import (  # noqa: E402
     _main,
     find_ready_result,
+    find_ready_result_for_filename,
     has_ready_result,
     next_pending_task,
     pending_candidates,
@@ -111,6 +117,35 @@ MIXED_FIXTURES = {
 def _populate(results: Path, entries) -> None:
     for rel, body in entries:
         _write(results / rel, body)
+
+
+# Fixtures for handler_result_is_answer's own question: is the READY body a
+# refusal (re-dispatch) or a genuine answer (leave it), never "does $live say so".
+REFUSAL_MARK = "could not safely process"
+REFUSAL_BODY = f"I {REFUSAL_MARK} this Team-tier task because the restricted runtime x. No unrestricted fallback was used.\n"
+ANSWER_BODY = "done\n"
+ANSWER_FIXTURES = {
+    "no_result": ([], False),
+    "live_answer": ([(F, ANSWER_BODY)], True),
+    "live_refusal": ([(F, REFUSAL_BODY)], False),
+    "empty_live_only": ([(F, EMPTY)], False),
+    "whitespace_live_only": ([(F, WS)], False),
+    "archived_refusal_only": ([(f"archive/{F}", REFUSAL_BODY)], False),
+    # Regression 5: these two used to read the empty/whitespace live placeholder
+    # instead of the archived refusal that find-ready actually resolves to.
+    "archived_refusal_plus_empty_live": (
+        [(f"archive/2026-09/{F}", REFUSAL_BODY), (F, EMPTY)], False),
+    "archived_refusal_plus_whitespace_live": (
+        [(f"archive/{F}", REFUSAL_BODY), (F, WS)], False),
+    "archived_answer_plus_empty_live": (
+        [(f"archive/2026-09/{F}", ANSWER_BODY), (F, EMPTY)], True),
+    "archived_answer_plus_whitespace_live": (
+        [(f"archive/{F}", ANSWER_BODY), (F, WS)], True),
+    "live_refusal_wins_over_archived_answer": (
+        [(F, REFUSAL_BODY), (f"archive/{F}", ANSWER_BODY)], False),
+    "live_answer_wins_over_stale_archive": (
+        [(F, ANSWER_BODY), (f"archive/{F}", "stale\n")], True),
+}
 
 
 class HasReadyResultTest(unittest.TestCase):
@@ -312,6 +347,63 @@ class WatcherParityTest(unittest.TestCase):
         self.assertNotIn("read_ready_result", self.function)
 
 
+class HandlerResultIsAnswerTest(unittest.TestCase):
+    """`handler_result_is_answer` in watch-tasks-stream.sh is bash. Run THAT
+    function — its shipped text, with the watcher's own variables bound — on
+    every ANSWER_FIXTURES case and require the reference verdict below: is the
+    body `find_ready_result_for_filename` resolves to a refusal, or an answer?
+    A caller that re-reads a hardcoded live path instead cannot tell the two
+    apart when the ready body is archived — regression 5."""
+
+    @classmethod
+    def setUpClass(cls):
+        text = WATCHER.read_text()
+        mark = re.search(r'\nTERMINAL_REFUSAL_MARK="([^"]+)"\n', text)
+        assert mark, "TERMINAL_REFUSAL_MARK not found in watch-tasks-stream.sh"
+        assert mark.group(1) == REFUSAL_MARK, "test fixture drifted from the shipped marker text"
+        m = re.search(r"\nhandler_result_is_answer\(\) \{\n(.*?)\n\}\n", text, re.S)
+        assert m, "handler_result_is_answer() not found in watch-tasks-stream.sh"
+        cls.function = m.group(0).strip("\n")
+        cls.mark_line = mark.group(0).strip("\n")
+
+    def _reference_verdict(self, results: Path) -> bool:
+        found = find_ready_result_for_filename(results, F)
+        if found is None:
+            return False
+        first = found.read_text().splitlines()[:1]
+        return not (first and first[0].startswith(f"I {REFUSAL_MARK}"))
+
+    def _watcher_verdict(self, results: Path) -> bool:
+        script = "\n".join([
+            f"SUTANDO_PY_BIN={shlex.quote(sys.executable)}",
+            f"__REPO_ROOT={shlex.quote(str(REPO))}",
+            f"RESULTS_DIR={shlex.quote(str(results))}",
+            self.mark_line,
+            self.function,
+            f"handler_result_is_answer {shlex.quote(F)}",
+        ])
+        proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertIn(proc.returncode, (0, 1), proc.stderr)
+        return proc.returncode == 0
+
+    def test_same_verdict_on_every_answer_fixture(self):
+        for fixture, (entries, expected) in ANSWER_FIXTURES.items():
+            with self.subTest(fixture=fixture):
+                with tempfile.TemporaryDirectory() as td:
+                    results = Path(td) / "results"
+                    results.mkdir()
+                    _populate(results, entries)
+                    watcher = self._watcher_verdict(results)
+                    self.assertEqual(watcher, expected, fixture)
+                    self.assertEqual(watcher, self._reference_verdict(results), fixture)
+
+    def test_the_watcher_reads_the_resolved_ready_path_not_a_fixed_live_path(self):
+        # The shipped function must read find-ready's own resolved path, never
+        # $live directly -- that unconditional read is regression 5's shape.
+        self.assertIn("find-ready", self.function)
+        self.assertNotIn('< "$live"', self.function)
+
+
 class PendingCandidatesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -461,6 +553,27 @@ class MainDispatchTest(unittest.TestCase):
         (self.results_dir / "task-b.txt").write_text("   \n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
 
+    def test_find_ready_both_outcomes(self):
+        rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        (self.results_dir / "task-a.txt").write_text("done\n")
+        rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
+        self.assertEqual((rc, out), (0, f"{self.results_dir / 'task-a.txt'}\n"))
+
+    def test_find_ready_resolves_to_the_archive_behind_an_empty_live_placeholder(self):
+        # This is the path handler_result_is_answer reads its refusal-or-answer
+        # line from; a first-hit lookup here reintroduces regression 5.
+        _write(self.results_dir / "archive" / "2026-09" / "task-a.txt")
+        (self.results_dir / "task-a.txt").write_text("")
+        rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
+        self.assertEqual((rc, out), (0, f"{self.results_dir / 'archive' / '2026-09' / 'task-a.txt'}\n"))
+
+    def test_find_ready_rejects_trailing_args(self):
+        rc, _, err = self._run("find-ready", str(self.results_dir), "task-a.txt", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
     def test_pending_candidates_omits_a_task_whose_ready_result_is_archived_behind_a_placeholder(self):
         (self.tasks_dir / "task-a.txt").write_text("task: x\n")
         (self.tasks_dir / "task-b.txt").write_text("task: y\n")
@@ -529,6 +642,17 @@ class CliSmokeTest(unittest.TestCase):
             miss = subprocess.run([sys.executable, str(CLI), "has-result", str(results), "task-b.txt"],
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(miss.returncode, 1, miss.stderr)
+
+    def test_find_ready_via_interpreter(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = Path(td)
+            (results / "task-a.txt").write_text("done\n")
+            ok = subprocess.run([sys.executable, str(CLI), "find-ready", str(results), "task-a.txt"],
+                                capture_output=True, text=True, timeout=30)
+            miss = subprocess.run([sys.executable, str(CLI), "find-ready", str(results), "task-b.txt"],
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual((ok.returncode, ok.stdout), (0, f"{results / 'task-a.txt'}\n"))
         self.assertEqual(miss.returncode, 1, miss.stderr)
 
 

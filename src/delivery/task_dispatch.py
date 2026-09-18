@@ -24,8 +24,13 @@ cleanup.
 CLI, for bash callers with only an interpreter path:
 
     task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
+    task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
+
+`find-ready` exists because "does a ready result exist" and "read what it says" must resolve
+to the SAME file: a caller that re-derives the live path after `has-result` says yes can be
+answering about an archived body while reading an untouched live placeholder instead.
 """
 from __future__ import annotations
 
@@ -41,7 +46,15 @@ from local_task_protocol import iter_result_candidates  # noqa: E402
 
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
-__all__ = ["find_ready_result", "has_ready_result", "pending_candidates", "next_pending_task"]
+__all__ = [
+    "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
+    "pending_candidates", "next_pending_task",
+]
+
+
+def _task_id_for_filename(filename: str) -> str:
+    """The one place a task filename is stripped to its id — has-result and find-ready must agree."""
+    return filename[:-4] if filename.endswith(".txt") else filename
 
 
 def find_ready_result(results_dir: "Path | str", task_id: str, *,
@@ -61,14 +74,24 @@ def find_ready_result(results_dir: "Path | str", task_id: str, *,
     return None
 
 
+def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
+                                   reader=read_ready_result) -> "Path | None":
+    """`find_ready_result` keyed by task FILENAME (`has_ready_result`'s own id derivation).
+
+    Exists so a caller that already asked `has_ready_result` "does one exist" can ask this
+    "which path is it" without re-deriving `task_id` a second, possibly divergent way — and so
+    it can read THAT path's body instead of assuming the live one backs every ready result.
+    """
+    return find_ready_result(results_dir, _task_id_for_filename(filename), reader=reader)
+
+
 def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
     An empty or whitespace-only file — live or archived — is not a delivery and
     does not stop the search; `find_ready_result` walks past it.
     """
-    task_id = filename[:-4] if filename.endswith(".txt") else filename
-    return find_ready_result(results_dir, task_id) is not None
+    return find_ready_result_for_filename(results_dir, filename) is not None
 
 
 def pending_candidates(
@@ -111,6 +134,7 @@ def next_pending_task(
 
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
+    "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR]"
 )
@@ -135,6 +159,15 @@ def _main(argv: list[str]) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return 0 if has_ready_result(first, second) else 1
+    if cmd == "find-ready":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        found = find_ready_result_for_filename(first, second)
+        if found is None:
+            return 1
+        print(found)
+        return 0
     if cmd not in ("pending-candidates", "next-pending"):
         print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)
         return 2
