@@ -19,10 +19,31 @@ the two to the same suffix set so they cannot drift apart silently.
 """
 from __future__ import annotations
 
+import os
+import stat as _stat
 from pathlib import Path
 
 #: Suffixes the router writes. Kept in one place so a new stage is added once.
 SENTINEL_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
+def _is_dir(path: Path) -> bool:
+    """Path.is_dir() answers False for a stat that FAILED, which would silently
+    skip a recipient we merely cannot read. Only ENOENT is absence."""
+    try:
+        return _stat.S_ISDIR(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _sentinel_present(path: Path) -> bool:
+    """lstat, not exists(): exists() reports EACCES as False, and a dangling
+    symlink still names a delegation, so absence must mean ENOENT and nothing else."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def holder_of(workspace: Path, task_id: str) -> str | None:
@@ -30,15 +51,17 @@ def holder_of(workspace: Path, task_id: str) -> str | None:
 
     An unreadable deliveries/ is NOT "nobody holds it" — that is the reading
     that hands a worker's task to the core — so only a genuinely absent
-    directory answers None; anything else propagates.
+    directory or sentinel answers None; every other OSError propagates, at each
+    of the three places one can arise: listing deliveries/, stat-ing a recipient,
+    and stat-ing a sentinel.
     """
     deliveries = Path(workspace) / "deliveries"
     try:
-        recipients = sorted(p for p in deliveries.iterdir() if p.is_dir())
+        recipients = sorted(p for p in deliveries.iterdir() if _is_dir(p))
     except FileNotFoundError:
         return None
     for recipient in recipients:
         for suffix in SENTINEL_SUFFIXES:
-            if (recipient / f"{task_id}{suffix}").exists():
+            if _sentinel_present(recipient / f"{task_id}{suffix}"):
                 return recipient.name
     return None
