@@ -1,10 +1,6 @@
 #!/bin/bash
-# Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
-# Not wired into core selection — see src/agent/agy/README.md for scope.
-#
-# Usage:
-#   bash src/agent/agy/cli/start-cli.sh           # start (or attach if running)
-#   bash src/agent/agy/cli/start-cli.sh --check   # verify agy + auth, no launch
+# Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI);
+# not wired into core selection — see src/agent/agy/README.md for scope.
 set -euo pipefail
 
 # This script lives at src/agent/agy/cli/ — four levels under the repo root.
@@ -15,7 +11,9 @@ cd "$REPO"
 # with the real sutando-core session (claude or codex) on the same host.
 TMUX_SOCKET="${SUTANDO_AGY_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}}"
 SESSION="${SUTANDO_AGY_TMUX_SESSION:-sutando-agy}"
+WATCHER_SESSION="${SESSION}-watcher"
 ONBOARDING_PATH="${SUTANDO_AGY_ONBOARDING_PATH:-$HOME/.gemini/antigravity-cli/cache/onboarding.json}"
+NOTIFIER="${SUTANDO_AGY_NOTIFIER_SCRIPT:-$REPO/src/agent/agy/cli/task-notifier.sh}"
 
 PY=""
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
@@ -37,6 +35,38 @@ EOF
 
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
+watcher_session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null; }
+
+# Starts task-notifier.sh in its own tmux session, once per core session.
+# No crash-restart supervision — a dead watcher is recreated on next launch.
+ensure_task_notifier() {
+  watcher_session_exists && return 0
+  [ -x "$NOTIFIER" ] || { echo "  ⚠ agy task notifier not found/executable: $NOTIFIER — tasks will not reach this session" >&2; return 0; }
+  # task-notifier.sh hard-requires fswatch; without it the pane process dies
+  # within ~1s, so a tmux new-session that "succeeds" leaves nothing alive.
+  if ! command -v fswatch >/dev/null 2>&1; then
+    echo "  ⚠ fswatch not found — required by the agy task notifier (brew install fswatch); tasks will not reach this session" >&2
+    return 0
+  fi
+  # Bind every queue-related var explicitly, never omit -e: the tmux server's
+  # global env can carry a foreign value that only an explicit -e overrides.
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION" -e "SUTANDO_INSTANCE_ID=agy-task-notifier")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=${SUTANDO_TASKS_DIR:-}")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=${SUTANDO_RESULTS_DIR:-}")
+  if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
+      "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
+    echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
+    return 0
+  fi
+  # new-session rc=0 only means tmux accepted it; poll rather than trust a
+  # session that can still die on its first tick (e.g. a notifier crash).
+  for _ in $(seq 1 10); do
+    watcher_session_exists || break
+    sleep 0.2
+  done
+  watcher_session_exists \
+    || echo "  ⚠ agy task notifier exited immediately after starting — tasks will not reach this session" >&2
+}
 
 # `agy` exposes no dedicated auth-status subcommand; `agy models` makes one
 # authenticated round trip and doubles as the lightest available probe.
@@ -94,6 +124,7 @@ fi
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.
 if session_exists; then
+  ensure_task_notifier
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -124,6 +155,8 @@ if ! session_exists; then
   echo "  ⚠ $SESSION did not come up within ~5s." >&2
   exit 1
 fi
+
+ensure_task_notifier
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
