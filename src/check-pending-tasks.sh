@@ -55,9 +55,11 @@ sentinel_task_id() {
 claimed_by_a_worker() {
   # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
   # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
-  local task_id="$1"
+  local task_id="$1" rc
   [ -n "$PYBIN" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
+  # 2 = cannot decide (root unreadable): hold, never report it to the core.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
 }
 
 # A delivered result is claimed out of results/ within about a second

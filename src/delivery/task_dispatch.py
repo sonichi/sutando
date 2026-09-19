@@ -106,22 +106,41 @@ def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
 
 
+class WorkerHoldUnreadable(OSError):
+    """The deliveries root exists but cannot be read: ownership is undecidable, not absent."""
+
+
 def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     """True iff some worker's own `deliveries/<worker>/` folder holds a sentinel for this task.
 
     The pool router hands a task to a worker by writing `<id>.txt` there (the
     worker renames it `.accepted` / `.claimed`); the task file itself stays in
     `tasks/`, so a queue reader that never looks here re-delivers it to the core.
+    An absent root is the no-pool case (False); a root that exists but cannot be
+    listed raises WorkerHoldUnreadable — a caller must hold, never deliver, on it.
     """
     if not filename or "/" in filename or ".." in filename:
         return False
     task_id = _task_id_for_filename(filename)
     root = Path(deliveries_dir)
     try:
-        folders = [d for d in root.iterdir() if d.is_dir()]
-    except OSError:
+        entries = list(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
         return False
-    return any((d / f"{task_id}{suffix}").exists() for d in folders for suffix in _WORKER_HOLD_SUFFIXES)
+    except OSError as exc:
+        raise WorkerHoldUnreadable(f"cannot list {root}: {exc}") from exc
+    for d in entries:
+        for suffix in _WORKER_HOLD_SUFFIXES:
+            try:
+                os.lstat(d / f"{task_id}{suffix}")
+            except FileNotFoundError:
+                continue
+            except NotADirectoryError:
+                continue
+            except OSError as exc:
+                raise WorkerHoldUnreadable(f"cannot stat under {d}: {exc}") from exc
+            return True
+    return False
 
 
 def pending_candidates(
@@ -150,8 +169,14 @@ def pending_candidates(
             continue
         if claims is not None and (claims / name).is_file():
             continue
-        if deliveries_dir and worker_holds(deliveries_dir, name):
-            continue
+        if deliveries_dir:
+            try:
+                if worker_holds(deliveries_dir, name):
+                    continue
+            except WorkerHoldUnreadable as exc:
+                # Undecidable ownership holds the task: delivering it is the duplicate this guards.
+                print(f"task_dispatch: holding {name}: {exc}", file=sys.stderr)
+                continue
         yield name
 
 
@@ -234,7 +259,7 @@ _USAGE = (
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
-    "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0/1\n"
+    "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
@@ -301,7 +326,12 @@ def _main(argv: list[str]) -> int:
         if rest:
             print(_USAGE, file=sys.stderr)
             return 2
-        return 0 if worker_holds(first, second) else 1
+        try:
+            return 0 if worker_holds(first, second) else 1
+        except WorkerHoldUnreadable as exc:
+            # 2 = cannot decide; a caller that reads it as 1 delivers on an unreadable root.
+            print(f"task_dispatch.py: worker-holds: {exc}", file=sys.stderr)
+            return 2
     if cmd not in ("pending-candidates", "next-pending"):
         print(f"task_dispatch.py: unknown command {cmd!r}\n{_USAGE}", file=sys.stderr)
         return 2
