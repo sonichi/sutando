@@ -32,7 +32,7 @@ INTERRUPTED = "was interrupted"
 # Import the sibling suite's harness (import-safe) rather than restating it:
 # a copied harness drifts from the script it drives.
 _spec = importlib.util.spec_from_file_location(
-    "_reap_harness", REPO / "tests" / "watch-tasks-stream-dead-worker-reap.test.py")
+    "_reap_harness", REPO / "tests" / "skills" / "worker-pool" / "watch-tasks-stream-dead-worker-reap.test.py")
 _reap = importlib.util.module_from_spec(_spec)
 sys.modules["_reap_harness"] = _reap
 _spec.loader.exec_module(_reap)
