@@ -68,6 +68,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             "src/delivery/__init__.py",
             "src/delivery/readiness.py",
@@ -316,11 +317,13 @@ exit 0
                 os.close(slave)
 
     def _install_pool_skill(self):
-        p = self.root / "skills" / "worker-pool" / "scripts" / "pool_route_handler.py"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("#!/bin/sh\nexit 0\n")
-        p.chmod(0o755)
-        return p
+        script = self.root / "skills" / "pool" / "scripts" / "route_handler.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        link = self.root / "skills" / "pool" / "task-event-handler"
+        link.symlink_to("scripts/route_handler.py")
+        return link
 
     def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
         p = self._install_pool_skill()

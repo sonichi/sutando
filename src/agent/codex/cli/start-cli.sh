@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/task-event-handler-lookup.sh"
 
 # This runtime has no worker mode: everything below is the canonical core's
 # ceremony, so an instance launch is refused before the first step of it.
@@ -206,9 +207,9 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  # The pool router is an optional skill: hand its path over when present, never import it.
-  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$REPO/skills/worker-pool/scripts/pool_route_handler.py" ]; then
-    SUTANDO_TASK_EVENT_HANDLER="$REPO/skills/worker-pool/scripts/pool_route_handler.py"
+  # An optional skill may publish the watcher's handler; the lookup names no skill.
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || SUTANDO_TASK_EVENT_HANDLER=""
   fi
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
