@@ -45,7 +45,9 @@ fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 python3 - "$REPO" <<'PYEOF' || exit 0
+import hashlib
 import json
+import os
 import sys
 
 repo = sys.argv[1]
@@ -65,6 +67,26 @@ except ImportError:
 
 MARKER = "<!-- COMPACT-CORE-END -->"
 
+# Opt-in (0 = whole file): the platform's preview cap is undocumented, so a
+# default bound would truncate files it already delivers intact.
+try:
+    CORE_BYTES = int(os.environ.get("SUTANDO_COMPACT_CORE_BYTES", "0"))
+except ValueError:
+    CORE_BYTES = 0
+
+
+def _bounded_head(text, limit):
+    """Head of text within `limit` bytes, trimmed to the last full line."""
+    raw = text.encode("utf-8", "replace")
+    if limit <= 0 or len(raw) <= limit:
+        return text, False
+    head = raw[:limit].decode("utf-8", "ignore")
+    nl = head.rfind("\n")
+    if nl > 0:
+        head = head[:nl]
+    return head.rstrip(), True
+
+
 p = personal_path("PERSONAL_CLAUDE.md")
 if not p.exists():
     sys.exit(0)  # no personal overrides on this install — stay silent
@@ -83,12 +105,39 @@ if MARKER in content:
         f"you need it.)"
     )
 else:
-    body = content
+    core, trimmed = _bounded_head(content, CORE_BYTES)
+    if trimmed:
+        shown = core.count("\n") + 1
+        total = content.count("\n") + 1
+        body = (
+            f"{core}\n\n"
+            f"(Injected: first {shown} of {total} lines of {p}, bounded to stay "
+            f"within the post-compaction preview so these top rules survive intact. "
+            f"Read the full file for the rest — set a `{MARKER}` marker to choose "
+            f"the boundary yourself.)"
+        )
+    else:
+        body = content
+
+# A top preview is otherwise indistinguishable from a full load, so the header
+# names an EOF sentinel only the very bottom carries: absent => truncated.
+full = content.encode("utf-8", "replace")
+sha = hashlib.sha256(full).hexdigest()
+eof = f"<<<PERSONAL_CLAUDE_EOF sha256={sha[:16]}>>>"
 
 context = (
     "PERSONAL_CLAUDE.md (re-injected after context compaction — these "
     "per-user rules override/extend CLAUDE.md and were lost from the "
-    f"compacted context; source: {p}):\n\n{body}"
+    f"compacted context; source: {p}).\n"
+    f"INTEGRITY: file is {len(full)} bytes, sha256 {sha}. This injection MUST "
+    f"end with the exact line `{eof}`. If you do NOT see that line at the end "
+    "of this block, your context received a TRUNCATED preview and the rules "
+    f"below are INCOMPLETE — you MUST `Read {p}` in FULL before any substantive "
+    "decision. A preview is indistinguishable from a full load EXCEPT by the "
+    "presence of that end line. Seeing it proves only that this BLOCK arrived "
+    "intact, not that it carries the whole file: if the block states it was "
+    f"bounded to the first N lines, `Read {p}` in FULL for the "
+    f"rest.\n\n{body}\n\n{eof}"
 )
 
 print(json.dumps({
