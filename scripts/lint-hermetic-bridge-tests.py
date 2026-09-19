@@ -91,6 +91,8 @@ BRIDGE_IMPORT = re.compile(r"(discord|slack|telegram)-bridge\.py")
 #     than fixed here: repairing another PR's test is a second concern, and
 #     CONTRIBUTING forbids bundling it. Follow-up tracked separately. Mini's shared-helper
 # migration removes these; the stale-entry check below forces the list to shrink.
+#   + ADDED tests/dm-fallback-digest-no-dm.test.py — false positive: it only
+#     reads the bridge's source text and execs an unrelated snippet, never imports it.
 # Measured on origin/main (2026-07-30, post-#2428-merge) with the AST classifier. The count rose
 # from 26 to 27 when detection moved off regex: two files the regex called clean were real
 # bypasses (assignment-shaped comment / assignment after exec_module), which is exactly the
@@ -119,6 +121,7 @@ tests/discord-bridge-reply-directive.test.py
 tests/discord-bridge-task-write-instrument.test.py
 tests/discord-task-source-invariance.test.py
 tests/discord-writeside-attachments.test.py
+tests/dm-fallback-digest-no-dm.test.py
 tests/health-check-fix-down-bridges.test.py
 tests/owner-activity-channel-id.test.py
 tests/slack-bridge-access-durable-backup.test.py
