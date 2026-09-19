@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The worker-pool completion record has ONE contract, and both sides bind it.
 
-src/pool_record.py owns the recipient grammar, the workers-root layout, the
+skills/worker-pool/scripts/pool_record.py owns the recipient grammar, the workers-root layout, the
 stage names and the record predicate. The pool's writer and the gateway reader
 delegate to it; a second private regex or open/lstat predicate in either is the
 drift this guard exists to catch (docs/architecture-boundaries.md, "Shared

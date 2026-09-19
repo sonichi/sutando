@@ -12,7 +12,7 @@ reformatting it must not silently change routing or attribution.
 The fixture writes through pool_delivery.done_flag() rather than
 hand-spelling the path: packages/ag2-sparrow is a standalone PyPI package and
 cannot import skills/worker-pool/ in production, so both sides bind the same
-src/pool_record.py contract (bundled into the package) for the layout, the
+the pool_record contract (bundled into the package) for the layout, the
 recipient grammar and the record predicate. Building the fixture from the real
 writer keeps a future drift showing up as a failing test instead of a
 silently-always-empty lookup (sonichi/sutando, 2026-09-16: _worker_of
