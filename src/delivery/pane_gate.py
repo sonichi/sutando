@@ -45,7 +45,7 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, live_banner_lines, matched_abnormal  # noqa: E402
+from cli_wedge import capture_pane, core_target, frame_abnormal  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -305,19 +305,6 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     return None
 
 
-def banner_abnormal_names(tail: str) -> List[str]:
-    """cli_wedge's whole-line banner families -- the only reader of a live
-    "Retrying in Ns" line. The retry family outranks everything; the parked
-    family waits for the gate signatures, since its quota-limit line also
-    matches the Fable-consent dialog, which is a named gate first."""
-    names: List[str] = []
-    for family, name, _line in live_banner_lines(tail):
-        tag = f"{family}:{name}" if family == "retry" else name
-        if tag not in names:
-            names.append(tag)
-    return names
-
-
 # A working turn queues typed input (the Claude notifier delivers like the Monitor
 # tool); a dialog, a parked banner or an unreadable pane does not.
 def accepts_input(verdict: Verdict) -> bool:
@@ -335,17 +322,11 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
         return Verdict("unknown", "empty pane")
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
-    # A retry is abnormal even mid-turn: the interrupt affordance stays up while
-    # the CLI retries, and a line typed then queues into a turn that is not served.
-    retrying = [t for t in banner_abnormal_names(tail) if t.startswith("retry:")]
-    if retrying:
-        return Verdict("abnormal", ",".join(retrying))
-    if adapter.busy.search(tail):
-        return Verdict("busy", "working")
-    abnormal = matched_abnormal([tail])
-    if abnormal:
-        return Verdict("abnormal", ",".join(abnormal))
-    joined = "\n".join(lines)
+    # cli_wedge ranks abnormal text above motion. A retry keeps that rank against
+    # a dialog too; a parked line may be the dialog's own text, so the gate reads first.
+    abn = frame_abnormal(tail)
+    if abn and abn.retrying:
+        return Verdict("abnormal", ",".join(abn.names))
     # FULL capture, not the TAIL_LINES tail: a wrapped draft past that window
     # loses its own glyph line to truncation and the footer reads as empty.
     line = prompt_line(capture, adapter)
@@ -354,9 +335,10 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
-    banner = banner_abnormal_names(tail)
-    if banner:
-        return Verdict("abnormal", ",".join(banner))
+    if abn:
+        return Verdict("abnormal", ",".join(abn.names))
+    if adapter.busy.search(tail):
+        return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
     if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
