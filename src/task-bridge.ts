@@ -174,7 +174,9 @@ export function writeChatTask(taskDescription: string): string {
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
-const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
+// A voice task's wait is dominated by the queue ahead of it, not by its own
+// work: the core is one worker and priority cannot preempt a turn in flight.
+const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour default
 // Per-task pending state: submission epoch, timeout (ms), and whether to
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
 // defaults to false (silent timeout — Susan's PR #578 contract). Voice agent
@@ -376,10 +378,10 @@ export const workTool: ToolDefinition = {
 			.number()
 			.optional()
 			.describe(
-				'Per-task timeout in minutes. Default 10. Pass a larger value (e.g. 30) for ' +
-				'multi-step jobs like rendering, batch encoding, or long research. Pass 0 for ' +
-				'no timeout — use sparingly, only when the user explicitly asks for a long ' +
-				'autonomous job that may legitimately take hours.'
+				'Per-task timeout in minutes. Default 60. Lower it (e.g. 5) only when a late ' +
+				'answer is worse than no answer, so the user is told it failed instead of ' +
+				'waiting. Pass 0 for no timeout — use sparingly, only when the user ' +
+				'explicitly asks for a long autonomous job that may legitimately take hours.'
 			),
 		dm_on_timeout: z
 			.boolean()
