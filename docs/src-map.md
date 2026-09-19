@@ -270,6 +270,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Optional capability lookup for the watcher's task-event handler.
 
+## `src/agent/agy/`
+
+- **`onboarding_seed.py`** — Idempotently pre-seed agy's (Antigravity CLI) onboarding-complete cache.
+
+## `src/agent/agy/cli/`
+
+- **`start-cli.sh`** — Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
+
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
