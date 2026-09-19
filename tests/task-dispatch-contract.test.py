@@ -45,6 +45,8 @@ from delivery.task_dispatch import (  # noqa: E402
     find_ready_result_for_filename,
     has_ready_result,
     next_pending_task,
+    owned_task_ids,
+    _WORKER_HOLD_SUFFIXES,
     pending_candidates,
     worker_holds,
     WorkerHoldUnreadable,
@@ -716,6 +718,38 @@ class MainDispatchTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
 
+    def test_owned_by_command_prints_one_id_per_line(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        (deliveries / "w1" / "task-a.txt").write_text("")
+        (deliveries / "w1" / "task-a.accepted").write_text("")
+        (deliveries / "w1" / "task-b.claimed").write_text("")
+        rc, out, _ = self._run("owned-by", str(deliveries), "w1")
+        self.assertEqual((rc, out.split()), (0, ["task-a", "task-b"]))
+
+    def test_owned_by_command_is_zero_and_silent_for_an_undelivered_recipient(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        deliveries.mkdir()
+        rc, out, _ = self._run("owned-by", str(deliveries), "never")
+        self.assertEqual((rc, out.strip()), (0, ""))
+
+    def test_owned_by_command_exits_2_on_an_unreadable_folder(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        os.chmod(deliveries / "w1", 0)
+        self.addCleanup(os.chmod, deliveries / "w1", 0o755)
+        rc, out, err = self._run("owned-by", str(deliveries), "w1")
+        # 1 would read as "this worker owes nothing" and end the turn.
+        self.assertEqual((rc, out.strip()), (2, ""))
+        self.assertIn("owned-by", err)
+
+    def test_owned_by_command_rejects_extra_arguments(self):
+        rc, _, err = self._run("owned-by", str(self.tmp.name), "w1", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
     def test_worker_holds_command_exits_2_on_an_unreadable_root(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory modes")
@@ -891,6 +925,71 @@ class InflightRecordTest(unittest.TestCase):
         self.assertEqual(0, run("inflight-clear", str(self.dir), "task-c.txt").returncode)
         self.assertEqual(2, run("inflight-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
         self.assertEqual(2, run("inflight-mark", str(self.dir), "../x.txt", "1").returncode)
+
+
+class OwnedTaskIdsTest(unittest.TestCase):
+    """The worker's own question. `worker_holds` answers the core's; both must
+    read the same sentinel stages, so they share one suffix set."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.deliveries = Path(self.tmp.name) / "deliveries"
+        (self.deliveries / "w1").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, name, recipient="w1"):
+        (self.deliveries / recipient / name).write_text("")
+
+    def test_every_stage_yields_its_task_id_exactly_once(self):
+        self._touch("task-a.txt")
+        self._touch("task-a.accepted")
+        self._touch("task-b.claimed")
+        self.assertEqual(owned_task_ids(self.deliveries, "w1"), ["task-a", "task-b"])
+
+    def test_a_non_sentinel_name_is_ignored(self):
+        self._touch("notes.log")
+        self.assertEqual(owned_task_ids(self.deliveries, "w1"), [])
+
+    def test_absent_folder_is_nothing_owed(self):
+        self.assertEqual(owned_task_ids(self.deliveries, "never-delivered"), [])
+
+    def test_unreadable_folder_is_undecidable_not_empty(self):
+        os.chmod(self.deliveries / "w1", 0o000)
+        try:
+            with self.assertRaises(WorkerHoldUnreadable):
+                owned_task_ids(self.deliveries, "w1")
+        finally:
+            os.chmod(self.deliveries / "w1", 0o755)
+
+    def test_a_traversing_recipient_is_refused(self):
+        self._touch("task-a.txt")
+        self.assertEqual(owned_task_ids(self.deliveries, "../w1"), [])
+
+    def test_it_shares_the_suffix_set_with_worker_holds(self):
+        # A stage added for worker_holds must reach this function too, or the
+        # core and the worker disagree about what was delivered.
+        for suffix in _WORKER_HOLD_SUFFIXES:
+            self._touch(f"task-s{suffix}")
+            self.assertIn("task-s", owned_task_ids(self.deliveries, "w1"))
+            self.assertTrue(worker_holds(self.deliveries, "task-s.txt"))
+            (self.deliveries / "w1" / f"task-s{suffix}").unlink()
+
+    def test_the_cli_prints_one_id_per_line_and_exits_2_when_undecidable(self):
+        self._touch("task-a.txt")
+        r = subprocess.run([sys.executable, str(CLI), "owned-by", str(self.deliveries), "w1"],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.split()), (0, ["task-a"]))
+        os.chmod(self.deliveries / "w1", 0o000)
+        try:
+            r2 = subprocess.run([sys.executable, str(CLI), "owned-by", str(self.deliveries), "w1"],
+                                capture_output=True, text=True)
+        finally:
+            os.chmod(self.deliveries / "w1", 0o755)
+        self.assertEqual(r2.returncode, 2)
+        self.assertIn("owned-by", r2.stderr)
+
 
 
 if __name__ == "__main__":
