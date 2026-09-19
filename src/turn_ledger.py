@@ -452,33 +452,34 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None,
     """
     session = _resolve_session(session)
     ws = _workspace(workspace)
+    reason = _refusal(ws, session)
+    if commit:
+        if reason is None:
+            mark_stop(ws, session)
+        else:
+            spend_reminder(ws, session)
+    return reason
+
+
+def _refusal(ws: Path, session: str | None) -> str | None:
+    """`stop_gate`'s decision alone; it writes nothing."""
     # An absent ledger means nothing was ever sent, which is what this gate
     # catches. Only a missing boundary below is genuinely unjudgeable.
     since = last_stop_ts(ws, session)
     if since is None:
-        if commit:
-            mark_stop(ws, session)
         return None
     # An explicit no-send is a decision ABOUT this turn, so its age cannot make it
     # stale; only a message is judged on whether the turn ended on it.
     if any(e.get("kind") == "no-send" and _entry_matches_session(e, session)
            for e in read_entries(ws) if float(e["ts"]) > since):
-        if commit:
-            mark_stop(ws, session)
         return None
     last = delivery_after(since, ws, session)
     if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
-        if commit:
-            mark_stop(ws, session)
         return None
     if reminder_spent(ws, session):
         # One nudge per turn. A turn that was already reminded ends regardless:
         # refusing twice is how a gate that is wrong becomes a loop.
-        if commit:
-            mark_stop(ws, session)
         return None
-    if commit:
-        spend_reminder(ws, session)
     return ("This turn is ending without a message and without an explicit "
             "no-send. Reply — post to the room (`room_ops.py say`) or write the "
             "result file the task expects — or, if silence is right, record it: "

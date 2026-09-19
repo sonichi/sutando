@@ -450,6 +450,40 @@ def test_an_unrecognised_stop_never_blocks() -> None:
                   "no-send" in runs[0].stderr, runs[0].stderr)
 
 
+def _hook_with_open_stdin(ws: pathlib.Path, written: str) -> dict:
+    """Run the real hook with a writer that sends `written` and never closes stdin."""
+    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    proc = subprocess.Popen(["/bin/bash", str(REPO / "src" / "check-pending-tasks.sh")],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, env=env)
+    try:
+        proc.stdin.write(written)
+        proc.stdin.flush()
+        proc.wait(timeout=30)
+        return json.loads(proc.stdout.read() or "{}")
+    finally:
+        proc.stdin.close()
+        proc.stdout.close()
+
+
+def test_a_payload_read_that_times_out_still_gates() -> None:
+    """A slow or open-ended writer is a real Stop, not a hand run: it must gate and record."""
+    for label, written in (("nothing arrives", ""), ("payload sent, pipe held open", STOP_PAYLOAD)):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            _arm(ws)
+            _hook(ws)
+            decision = _hook_with_open_stdin(ws, written)
+            check(f"{label}: a silent turn is still refused", _blocked(decision), repr(decision))
+            check(f"{label}: ... and the refusal spent the reminder",
+                  turn_ledger.reminder_spent(ws), "")
+            before = turn_ledger.last_stop_ts(ws)
+            again = _hook_with_open_stdin(ws, written)
+            check(f"{label}: the retry ends the turn and records the stop",
+                  again == {} and turn_ledger.last_stop_ts(ws) != before, repr(again))
+
+
 def main() -> int:
     for fn in (
         test_module_records_both_kinds,
@@ -488,6 +522,7 @@ def main() -> int:
         test_a_hand_run_does_not_move_the_boundary,
         test_a_dry_run_spends_no_reminder,
         test_an_unrecognised_stop_never_blocks,
+        test_a_payload_read_that_times_out_still_gates,
     ):
         print(f"{fn.__name__}:")
         fn()

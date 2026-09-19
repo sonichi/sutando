@@ -157,13 +157,21 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
-# Only a real Stop event may move the turn boundary; a hand run of this script
-# (no Stop payload on stdin) reports the same decision and records nothing.
-HOOK_PAYLOAD=""
-[ -t 0 ] || IFS= read -r -d '' -t 2 HOOK_PAYLOAD || true
+# Only a real Stop event may move the turn boundary; a hand run (no Stop payload,
+# stdin at EOF) reports the same decision and records nothing.
 COMMIT=()
-if SUTANDO_HOOK_PAYLOAD="$HOOK_PAYLOAD" "$PYBIN" -c 'import json,os,sys
-try: d = json.loads(os.environ.get("SUTANDO_HOOK_PAYLOAD") or "{}")
+# No EOF within 2s is a slow real writer, so that records the stop as before.
+if [ ! -t 0 ] && "$PYBIN" -c 'import json,os,select,sys,time
+buf, end = b"", time.monotonic() + 2
+while True:
+    left = end - time.monotonic()
+    if left <= 0 or not select.select([0], [], [], left)[0]:
+        sys.exit(0)
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+try: d = json.loads(buf or b"{}")
 except ValueError: d = {}
 sys.exit(0 if isinstance(d, dict) and d.get("hook_event_name") == "Stop" else 1)' 2>/dev/null; then
   COMMIT=(--commit)
