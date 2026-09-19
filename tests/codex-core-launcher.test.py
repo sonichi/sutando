@@ -70,7 +70,12 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/restart-guard.sh",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
+            # cli_wedge imports sutando_platform; without it every classify
+            # dies on import and the gate reads every pane as unreadable.
+            "src/cli_wedge.py",
+            "src/sutando_platform.py",
             "src/delivery/__init__.py",
+            "src/delivery/pane_gate.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
@@ -774,7 +779,7 @@ exit 0
             start_new_session=True,
         )
         try:
-            stdout, stderr = process.communicate(timeout=3)
+            stdout, stderr = process.communicate(timeout=8)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=2)
@@ -792,6 +797,7 @@ exit 0
         # This stub reports the core session alive for notifier calls.
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "$3" = has-session ] && exit 0
 exit 0
 ''')
@@ -988,6 +994,7 @@ exit 0
         context_path = Path(self.tmp.name) / "context-path.txt"
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
@@ -1027,7 +1034,7 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
 
         result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=3
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=8
         )
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
@@ -1072,6 +1079,7 @@ exit 0
         watcher.chmod(0o755)
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
@@ -1097,7 +1105,7 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
         result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=3
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=8
         )
         elapsed = time.monotonic() - started
 
@@ -1106,6 +1114,93 @@ exit 0
         calls = self.log.read_text()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
+
+    def test_a_refused_task_is_retried_on_the_timer_without_a_second_event(self):
+        # qingyun-wu on #4320: one watcher event, a transient unsafe pane, and
+        # eventual delivery after it clears WITHOUT a second filesystem event.
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (workspace / "state" / "core-status.json").write_text('{"status":"idle","ts":1}\n')
+        (tasks / "task-owner.txt").write_text("task: deliver me\n")
+        scratch = Path(self.tmp.name)
+        clock, buf, emits = scratch / "clock", scratch / "buf", scratch / "emits"
+        # ONE event, then hold the fifo open: only the retry timer can wake the loop.
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(
+            "#!/bin/bash\n"
+            'printf \'TASK_FILE: task-owner.txt\\n\'\n'
+            'printf \'emit\\n\' >> "$EMITS"\n'
+            "sleep 9\n"
+        )
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+_last="${@: -1}"
+for _a in "$@"; do
+  case "$_a" in
+    capture-pane)
+      # First read is clean, so the core-idle gate opens; the pane then goes
+      # unsafe, which is the only way to reach deliver_prompt's refusal.
+      if [ ! -f "$PANE_CLOCK" ]; then
+        date +%s > "$PANE_CLOCK"
+        printf '› \n← for agents\n'
+        exit 0
+      fi
+      if [ $(( $(date +%s) - $(cat "$PANE_CLOCK") )) -lt 2 ]; then
+        printf '› half typed\n← for agents\n'
+      else
+        printf '› %s\n← for agents\n' "$(cat "$PANE_BUF" 2>/dev/null)"
+      fi
+      exit 0 ;;
+    has-session) exit 0 ;;
+    send-keys)
+      if [ "$_last" = C-m ]; then
+        printf 'done\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+        : > "$PANE_BUF"
+      else
+        printf '%s' "$_last" >> "$PANE_BUF"
+      fi
+      exit 0 ;;
+  esac
+done
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            PANE_CLOCK=str(clock),
+            PANE_BUF=str(buf),
+            EMITS=str(emits),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.05",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="4",
+            SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
+            SUTANDO_NOTIFIER_RETRY_INTERVAL="1",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=30
+        )
+
+        stderr = result.stderr
+        # Phase 2: the unsafe pane refused to take the prompt, and said so.
+        self.assertIn("refusing to type task-owner.txt", stderr, stderr)
+        # Phase 3: delivered once the pane cleared, on the timer alone.
+        self.assertTrue(
+            (results / "task-owner.txt").exists(),
+            f"a refused task was never retried after the pane cleared\n{stderr}",
+        )
+        # ...and the watcher emitted exactly one event the whole run.
+        self.assertEqual(
+            emits.read_text().count("emit"), 1, "the retry must not need a second event"
+        )
 
     def test_managed_notifier_waits_for_each_result_before_next_task(self):
         workspace = self.root / "workspace"
@@ -1124,6 +1219,7 @@ exit 0
         count = Path(self.tmp.name) / "submit-count"
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
@@ -1270,7 +1366,7 @@ exit 0
             env=env,
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=8,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         calls = self.log.read_text()
@@ -1334,6 +1430,252 @@ exit 0
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
         self.assertFalse((results / "task-owner.txt").exists())
+
+    def test_managed_notifier_does_not_recover_stale_running_from_PROSE_containing_the_placeholder(self):
+        """keweichen, 04:23Z: `pane_gate.classify_pane`'s old raw-tail substring check let
+        the literal phrase "Ask Codex to do anything" ANYWHERE in the visible pane -- a past
+        turn's own transcript text, not a live composer -- authorize stale-running recovery.
+        That would inject/retype a queued task into an active Codex turn. Fixed in
+        src/delivery/pane_gate.py: idle-ready now requires either the idle footer or a
+        current PROMPT LINE the parser actually found styled as the placeholder."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"running","step":"interrupted","ts":1}\n')
+        (tasks / "task-owner.txt").write_text(
+            "priority: normal\ntask: owner message\n"
+        )
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf 'working transcript containing Ask Codex to do anything from an earlier turn\\n'
+  exit 0
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(
+            ["/bin/bash", str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.communicate(timeout=1)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=2)
+        calls = self.log.read_text()
+        self.assertIn("capture-pane", calls)
+        self.assertNotIn("send-keys", calls)
+        self.assertFalse((results / "task-owner.txt").exists())
+
+
+
+    def test_managed_notifier_refuses_to_send_when_status_idle_but_pane_is_really_pending(self):
+        """keweichen round-4 (review 5231933087, blocker 2): the OLD core_is_idle treated
+        status="idle" plus "not busy" as safe to send -- and pending/abnormal/unknown are
+        all "not busy" too. With a REAL unsent draft ("\u203a my unsent draft", state
+        pending) on screen, the old code sent the task on the very FIRST check (near
+        instantly), concatenating it onto the user's draft. The fix requires the POSITIVE
+        idle-ready verdict, so wait_for_core_idle now retries instead of sending -- same
+        proof pattern as the sibling PROSE test above: nothing sent in a short observation
+        window, because the (correct) new behaviour is to keep waiting, not to finish."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"idle","ts":1}\n')
+        (tasks / "task-owner.txt").write_text(
+            "priority: normal\ntask: owner message\n"
+        )
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then
+  printf '\\xe2\\x80\\xba my unsent draft\n'
+  exit 0
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPOSER_POLL="0.02",
+            SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(
+            ["/bin/bash", str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.communicate(timeout=3)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=2)
+        calls = self.log.read_text()
+        self.assertIn("capture-pane", calls)
+        self.assertNotIn("send-keys", calls)
+
+    def test_managed_notifier_refuses_to_send_when_the_pane_is_unreadable(self):
+        """An unreadable pane -- capture yields nothing the gate can classify -- is an
+        ABSENCE of evidence, never evidence of safety: it may hold an unsent draft. The
+        notifier must hold instead of typing into it, so nothing reaches send-keys."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text('{"status":"idle","ts":1}\n')
+        (tasks / "task-owner.txt").write_text("priority: normal\ntask: owner message\n")
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = capture-pane ]; then exit 0; fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPOSER_POLL="0.02",
+            SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        process = subprocess.Popen(
+            ["/bin/bash", str(script)], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.communicate(timeout=3)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=2)
+        calls = self.log.read_text()
+        self.assertIn("capture-pane", calls)
+        self.assertNotIn("send-keys", calls)
+
+    def _run_managed_notifier_against_pane(self, pane_printf):
+        """One managed task with core-status idle; the tmux stub shows `pane_printf` (a printf
+        format, escapes kept as capture-pane -e would) and completes the task on C-m."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        status = workspace / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        status.write_text(f'{{"status":"idle","ts":{int(time.time())}}}\n')
+        (tasks / "task-owner.txt").write_text("priority: normal\ntask: owner message\n")
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", f'''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${{1:-}}" = -S ] && shift 2
+if [ "${{1:-}}" = has-session ]; then exit 0; fi
+if [ "${{1:-}}" = capture-pane ]; then
+  printf '{pane_printf}'
+  exit 0
+fi
+if [ "${{1:-}}" = send-keys ] && [ "${{*: -1}}" = C-m ]; then
+  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="1",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=10)
+        return result, self.log.read_text(), results / "task-owner.txt"
+
+    def test_managed_notifier_delivers_over_select_prose_above_the_empty_composer(self):
+        # A completed Codex turn said "Select"; the empty composer and footer sit under it.
+        result, calls, done = self._run_managed_notifier_against_pane(
+            "• Select the best file for the user.\\n"
+            "\\033[1m›\\033[0m \\033[2mAsk Codex to do anything\\033[0m\\n"
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("send-keys -t sutando-core:0 -l -- Sutando task ready: task-owner.txt", calls)
+        self.assertTrue(done.exists())
+
+    def test_managed_notifier_holds_while_a_real_picker_is_open(self):
+        result, calls, done = self._run_managed_notifier_against_pane(
+            "  Select Model and Effort\\n› 4. gpt-5.5 (current)  Proven previous-generation model\\n"
+            "  Press enter to confirm or esc to go back\\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("core did not become idle within 1s", result.stderr)
+        self.assertIn("capture-pane", calls)
+        self.assertNotIn("send-keys", calls)
+        self.assertFalse(done.exists())
 
 
 if __name__ == "__main__":

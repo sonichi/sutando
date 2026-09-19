@@ -410,11 +410,14 @@ def core_target(socket_path: str, session: str = DEFAULT_SESSION, tmux_bin: str 
 
 
 def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
-                 runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
+                 runner: Callable = subprocess.run, env: Optional[dict] = None,
+                 escapes: bool = False) -> Optional[str]:
     """One pane frame, or None when tmux cannot be read (absent = no reading).
-    The one capture implementation: health-check and the CLI both call this."""
+    The one capture implementation: health-check and the CLI both call this.
+    escapes=True keeps SGR attributes (-e) for a runtime whose empty composer is a DIM hint."""
+    flags = ["-e", "-p"] if escapes else ["-p"]
     try:
-        proc = runner([tmux_bin, "-S", socket_path, "capture-pane", "-p", "-t", target],
+        proc = runner([tmux_bin, "-S", socket_path, "capture-pane", *flags, "-t", target],
                       capture_output=True, text=True, timeout=10, env=env)
     except Exception:  # noqa: BLE001 — a failed probe is an absent reading, never a verdict
         return None
