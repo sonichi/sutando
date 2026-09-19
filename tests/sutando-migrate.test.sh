@@ -41,6 +41,24 @@ touch -t 202506010800 "$B/notes/divergent.md"
 touch -t 202606010800 "$C/notes/divergent.md"
 touch -t 202606012100 "$A/notes/divergent.md"
 
+# --- Fixture: hosts/ + relay/ same-mtime same-size DIFFERENT content —
+# equal proxies must never certify identity; only a content hash may.
+mkdir -p "$A/hosts/Test-Host" "$A/relay" "$DEST/hosts/Test-Host" "$DEST/relay"
+printf 'AAAA\n' > "$A/hosts/Test-Host/crons.json"
+printf 'BBBB\n' > "$DEST/hosts/Test-Host/crons.json"
+touch -t 202606011200 "$A/hosts/Test-Host/crons.json" "$DEST/hosts/Test-Host/crons.json"
+printf 'RRRR\n' > "$A/relay/relay-1.md"
+printf 'SSSS\n' > "$DEST/relay/relay-1.md"
+touch -t 202606011200 "$A/relay/relay-1.md" "$DEST/relay/relay-1.md"
+
+# --- Fixture: unreadable-identity — identical bytes both sides, but the SOURCE
+# copy is unreadable: the scan must report UNVERIFIED, never proven divergence.
+mkdir -p "$A/notes" "$DEST/notes"
+printf 'same bytes\n' > "$A/notes/unreadable.md"
+printf 'same bytes\n' > "$DEST/notes/unreadable.md"
+touch -t 202606011300 "$A/notes/unreadable.md" "$DEST/notes/unreadable.md"
+chmod 000 "$A/notes/unreadable.md"
+
 # --- Fixture: rehome — loose root JSON at C ---
 echo '{"k":"v"}' > "$C/cloud-auth.json"
 
@@ -120,6 +138,140 @@ RUN_MIGRATE scan --source A,B,C 2>&1 \
     | head -25 || true
 
 echo
+echo "==== TEST: scan --json content-identity regression ===="
+# Equal mtime+size but different bytes (hosts/ + relay/ fixtures) must be
+# actionable, never certified identical_content, in the machine contract.
+SCAN_JSON_FILE="$TMP/scan-out.json"
+RUN_MIGRATE scan --source A,B,C --json 2>/dev/null > "$SCAN_JSON_FILE"
+if python3 - "$SCAN_JSON_FILE" <<'PYSCAN'
+import json, sys
+raw = open(sys.argv[1]).read()
+d = json.JSONDecoder().raw_decode(raw[raw.index("{"):])[0]
+t = d["totals"]
+notable = {n["rel"]: n for n in d["notable_collisions"]}
+bad = []
+for rel in ("hosts/Test-Host/crons.json", "relay/relay-1.md"):
+    n = notable.get(rel)
+    if n is None:
+        bad.append(f"{rel}: missing from notable_collisions"); continue
+    if n["byte_identical"] is not False:
+        bad.append(f"{rel}: byte_identical={n['byte_identical']!r}, want False")
+if t.get("proxy_identical_divergent", 0) < 2:
+    bad.append(f"proxy_identical_divergent={t.get('proxy_identical_divergent')}, want >=2")
+ident_true = sum(1 for n in notable.values() if n["byte_identical"] is True)
+if t["identical_content"] != ident_true:
+    bad.append(f"identical_content={t['identical_content']} != byte-verified count {ident_true}")
+n = notable.get("notes/unreadable.md")
+if n is None:
+    bad.append("notes/unreadable.md: missing from notable_collisions")
+elif n["byte_identical"] is not None:
+    bad.append(f"notes/unreadable.md: byte_identical={n['byte_identical']!r}, want None (unverified)")
+if t.get("identity_unverified") != 1:
+    bad.append(f"identity_unverified={t.get('identity_unverified')!r}, want 1")
+if any(nn["rel"] == "notes/unreadable.md" for nn in d["notable_collisions"])\
+        and t.get("proxy_identical_divergent", 0) != 2:
+    bad.append(f"proxy_identical_divergent={t.get('proxy_identical_divergent')} counts the unreadable file, want exactly 2")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+sys.exit(0)
+PYSCAN
+then
+    echo "  OK: scan --json marks equal-proxy divergent fixtures actionable (byte_identical=false)"
+else
+    echo "  FAIL: scan --json content-identity contract"
+    fail_scan_json=1
+fi
+
+echo
+echo "==== TEST: scan uses the resolved interpreter, not PATH python3 ===="
+# Control for the clean-macOS CLT-stub case: PATH python3 is a failing shim and
+# $SUTANDO_PY points at a real interpreter — both report paths must still work.
+REAL_PY="$(command -v python3)"
+SHIMDIR="$TMP/shim-bin"
+mkdir -p "$SHIMDIR"
+printf '#!/bin/sh\nexit 97\n' > "$SHIMDIR/python3"
+chmod +x "$SHIMDIR/python3"
+fail_stub=0
+STUB_HUMAN="$(PATH="$SHIMDIR:$PATH" SUTANDO_PY="$REAL_PY" RUN_MIGRATE scan --source A,B,C 2>&1 || true)"
+if ! echo "$STUB_HUMAN" | grep -q "of which identical-content (byte-verified):  [0-9]"; then
+    echo "  FAIL: human scan lost its identity report under a shadowed PATH python3"
+    fail_stub=1
+fi
+STUB_JSON="$TMP/scan-stub.json"
+if ! PATH="$SHIMDIR:$PATH" SUTANDO_PY="$REAL_PY" RUN_MIGRATE scan --source A,B,C --json 2>/dev/null > "$STUB_JSON"; then
+    echo "  FAIL: json scan exited non-zero under a shadowed PATH python3"
+    fail_stub=1
+elif ! "$REAL_PY" -c 'import json,sys;raw=open(sys.argv[1]).read();d=json.JSONDecoder().raw_decode(raw[raw.index("{"):])[0];assert "identity_unverified" in d["totals"]' "$STUB_JSON" 2>/dev/null; then
+    echo "  FAIL: json scan emitted no parseable contract under a shadowed PATH python3"
+    fail_stub=1
+fi
+[ "$fail_stub" -eq 0 ] && echo "  OK: both report paths ran on \$SUTANDO_PY with PATH python3 shadowed"
+
+echo
+echo "==== TEST: scan leaves no residue in TMPDIR (verdict tempfile cleanup) ===="
+# Two probes: GNU mktemp honors $TMPDIR (isolated dir discriminates on Linux);
+# macOS ignores it, so the named-template count in the real temp root gates there.
+ISO_TMP="$TMP/iso-tmpdir"
+mkdir -p "$ISO_TMP"
+REAL_T="$(dirname "$(mktemp -u)")"
+PRE_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
+TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C --json > /dev/null 2>&1
+TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C > /dev/null 2>&1
+# Scope to the tempfiles THIS script creates. Any-file-is-a-leak is wrong on a
+# Command-Line-Tools host, where Apple's xcrun caches `xcrun_db` into $TMPDIR.
+LEFTOVER="$(ls -A "$ISO_TMP" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
+POST_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
+if [ -n "$LEFTOVER" ]; then
+    echo "  FAIL: scan left files in isolated TMPDIR: $LEFTOVER"
+    fail_stub=1
+elif [ "$POST_VERDICTS" != "$PRE_VERDICTS" ]; then
+    echo "  FAIL: verdict tempfiles accumulated in $REAL_T ($PRE_VERDICTS -> $POST_VERDICTS)"
+    fail_stub=1
+else
+    echo "  OK: no scan residue (isolated TMPDIR empty; verdict count stable $PRE_VERDICTS)"
+fi
+
+# The narrowed probe must still SEE a real leak and NOT fire on foreign residue;
+# without the first, narrowing could make the assertion unable to fail at all.
+_ctl="$TMP/leak-ctl"; mkdir -p "$_ctl"
+: > "$_ctl/sutando-migrate-verdicts.abc123"
+_pos="$(ls -A "$_ctl" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
+if [ -n "$_pos" ]; then
+    echo "  OK: control — the narrowed probe still CATCHES a real verdict tempfile"
+else
+    echo "  FAIL: control — narrowed probe cannot see a real leak; it can no longer fail"
+    fail_stub=1
+fi
+rm -f "$_ctl/sutando-migrate-verdicts.abc123"
+: > "$_ctl/xcrun_db"
+_neg="$(ls -A "$_ctl" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
+if [ -z "$_neg" ]; then
+    echo "  OK: control — foreign tooling residue (xcrun_db) is correctly ignored"
+else
+    echo "  FAIL: control — probe fired on foreign residue: $_neg"
+    fail_stub=1
+fi
+rm -rf "$_ctl"
+
+echo
+echo "==== TEST: python-binary.sh owns require_python (no shadow) ===="
+# The sourced helper is the single loud-failure owner; a local redefinition
+# shadows it and its subshell memoization silently never caches.
+if [ "$(grep -cE '^require_python\(\)' "$REPO/scripts/sutando-migrate.sh")" != "0" ]; then
+    echo "  FAIL: sutando-migrate.sh redefines require_python (shadows python-binary.sh)"
+    fail_stub=1
+elif ! grep -q 'python-binary.sh' "$REPO/scripts/sutando-migrate.sh"; then
+    echo "  FAIL: sutando-migrate.sh no longer sources python-binary.sh"
+    fail_stub=1
+else
+    echo "  OK: single require_python owner (sourced from python-binary.sh)"
+fi
+
+# Restore the unreadable fixture before commit — its scan job is done, and the
+# commit-phase copy semantics for unreadable sources are a separate contract.
+chmod 644 "$A/notes/unreadable.md"
+
+echo
 echo "==== TEST: commit ===="
 COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
@@ -128,6 +280,8 @@ INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz"
 echo
 echo "==== ASSERTIONS ===="
 fail=0
+[ "${fail_stub:-0}" -ne 0 ] && { echo "FAIL: interpreter-resolution control"; fail=1; }
+[ "${fail_scan_json:-0}" = "1" ] && fail=1
 
 # 1. build_log.md sidecar default: each source's variant goes to legacy/<tag>/build_log.md
 for tag in A B C; do
@@ -170,6 +324,19 @@ else
         echo "  OK: notes/divergent.md collision A-wins; C-version sidecared at $(basename "$sidecar_path") (timestamped per Mini #3)"
     fi
 fi
+
+# 3b. hosts/ + relay/ equal-mtime equal-size different content must be a
+#     COLLISION (both variants present under DEST), never identical-drop.
+for pair in "hosts/Test-Host/crons.json|AAAA|BBBB" "relay/relay-1.md|RRRR|SSSS"; do
+    rel="${pair%%|*}"; rest="${pair#*|}"; srcv="${rest%%|*}"; dstv="${rest#*|}"
+    hits_src="$( { grep -rl "$srcv" "$DEST/$(dirname "$rel")" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    hits_dst="$( { grep -rl "$dstv" "$DEST/$(dirname "$rel")" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    if [ "$hits_src" -ge 1 ] && [ "$hits_dst" -ge 1 ]; then
+        echo "  OK: $rel equal-mtime/equal-size different content preserved as collision (both variants under DEST)"
+    else
+        echo "  FAIL: $rel — same-mtime/same-size different content lost a variant (src-present=$hits_src dst-present=$hits_dst)"; fail=1
+    fi
+done
 
 # 4. cloud-auth.json re-homed to dest/state/auth/ per Mini #design 2026-06-02
 if [ ! -f "$DEST/state/auth/cloud-auth.json" ]; then
@@ -334,11 +501,16 @@ python3 - "$MIGRATE" "$u3_fn" "$REPO" <<'PYX'
 import sys
 src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(src).read()
-i = s.index("union_json_arrays_into() {")
-j = s.index("\n}\n", i) + 3
+def fn(name):
+    i = s.index(name + "() {")
+    return s[i:s.index("\n}\n", i) + 3]
+# The writer delegates parent modes to the shared policy; extract that too,
+# or the harness fails on a missing command rather than on the rule.
+body = "".join(fn(n) for n in
+               ("_stat", "mode_of", "dir_mode_chain", "mirror_dir_modes", "union_json_arrays_into"))
 open(out, "w").write(
     f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
-    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + body)
 PYX
 u3_check="$(
   . "$u3_fn"
@@ -400,6 +572,17 @@ done
 
 # 9. Idempotency: re-run commit, should detect sentinel + skip
 echo
+echo "==== TEST: verify (mandatory phase three — this suite claims scan→commit→verify) ===="
+# The fixture's divergent union pins class-aware semantic verification: the
+# result differs from both inputs by design and must still verify.
+VERIFY_OUT="$(RUN_MIGRATE --verify 2>&1)" && verify_rc=0 || verify_rc=$?
+echo "$VERIFY_OUT" | grep -E "verify summary|verify:" | head -3
+if [ "$verify_rc" -ne 0 ]; then
+    echo "  FAIL: verify exited $verify_rc after a successful commit"; fail=1
+else
+    echo "  OK: post-commit verify passes"
+fi
+
 echo "==== TEST: re-run commit (idempotency) ===="
 out="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 if echo "$out" | grep -q "prior migration sentinel — skip"; then
