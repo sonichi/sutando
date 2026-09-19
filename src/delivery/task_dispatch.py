@@ -144,6 +144,35 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     return False
 
 
+def owned_task_ids(deliveries_dir: "Path | str", recipient: str) -> "list[str]":
+    """Task ids whose sentinel sits in ONE recipient's folder — the worker's own question.
+
+    `worker_holds` answers the core's ("has anyone taken this?"); this answers a
+    worker's ("what was handed to me?"), so the suffixes are spelled once for both.
+    An absent folder is "nothing delivered yet" ([]); a folder that exists but
+    cannot be listed raises WorkerHoldUnreadable, because "I owe nothing" and
+    "I cannot tell" must not share an answer.
+    """
+    if not recipient or "/" in recipient or ".." in recipient:
+        return []
+    folder = Path(deliveries_dir) / recipient
+    try:
+        names = sorted(q.name for q in folder.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise WorkerHoldUnreadable(f"cannot list {folder}: {exc}") from exc
+    out: "list[str]" = []
+    for name in names:
+        for suffix in _WORKER_HOLD_SUFFIXES:
+            if name.endswith(suffix):
+                task_id = name[: -len(suffix)]
+                if task_id and task_id not in out:
+                    out.append(task_id)
+                break
+    return out
+
+
 def pending_candidates(
     tasks_dir: "Path | str",
     results_dir: "Path | str",
@@ -261,6 +290,7 @@ _USAGE = (
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
+    "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
@@ -323,6 +353,19 @@ def _main(argv: list[str]) -> int:
             # Cannot decide is its own answer: 1 would read as "not in flight".
             print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
             return 2
+    if cmd == "owned-by":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            ids = owned_task_ids(first, second)
+        except WorkerHoldUnreadable as exc:
+            # 2 = cannot decide; 1 here would read as "this worker owes nothing".
+            print(f"task_dispatch.py: owned-by: {exc}", file=sys.stderr)
+            return 2
+        for task_id in ids:
+            print(task_id)
+        return 0
     if cmd == "worker-holds":
         if rest:
             print(_USAGE, file=sys.stderr)
