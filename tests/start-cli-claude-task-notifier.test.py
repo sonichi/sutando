@@ -331,9 +331,10 @@ class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
         script.parent.mkdir(parents=True)
         script.write_text("#!/bin/sh\nexit 0\n")
         script.chmod(0o755)
-        link = self.h.root / "skills" / name / "task-event-handler"
-        link.symlink_to("scripts/route_handler.py")
-        return link
+        (script.parent.parent / "manifest.json").write_text(
+            '{"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}\n')
+        # realpath: the resolver resolves symlinks, and /tmp is one on macOS.
+        return Path(os.path.realpath(script))
 
     def test_without_the_skill_no_handler_is_set(self):
         run = self.h.launch()
@@ -360,13 +361,13 @@ class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
         self._install_skill("pool-b")
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("2 skills publish one", run.stderr)
+        self.assertIn("2 skills declare SUTANDO_TASK_EVENT_HANDLER_SCRIPT", run.stderr)
         _, _, env = self.h.watcher()
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
 
     def test_a_non_executable_skill_file_sets_nothing(self):
         p = self._install_skill()
-        os.chmod(p.parent / "scripts" / "route_handler.py", 0o644)
+        os.chmod(p, 0o644)
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()

@@ -260,7 +260,26 @@ publish_terminal_failure() {
   return "$rc"
 }
 
-if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+# shellcheck source=agent/task-event-handler-lookup.sh
+. "$__REPO_ROOT/src/agent/task-event-handler-lookup.sh"
+
+# Resolved per task, never captured at start: a handler installed, changed or
+# removed after this process booted takes effect on the next task, not a restart.
+task_event_handler() {
+  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    # An explicit pin that is not runnable is an operator error, not "unrouted":
+    # falling back to the lookup would silently route somewhere else.
+    [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
+    printf '%s\n' "$SUTANDO_TASK_EVENT_HANDLER"
+    return 0
+  fi
+  resolve_task_event_handler "$__REPO_ROOT"
+}
+
+# Idempotent, and called both at start (when a handler already resolves) and on
+# the first routed task, so a handler installed later still gets its queue.
+ensure_dispatch_ready() {
+  [ -z "$DISPATCH_DIR" ] || return 0
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
     "$DISPATCH_DIR/workers"
@@ -272,7 +291,11 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
     claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
-fi
+}
+
+# Prepare at start when a handler already resolves, so claims and fallback
+# receipts keep landing under the resolved workspace from the first moment.
+task_event_handler >/dev/null 2>&1 && ensure_dispatch_ready
 
 acquire_dispatch_lock() {
   [ -n "$DISPATCH_DIR" ] || return 1
@@ -364,7 +387,7 @@ handler_result_exists() {
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
+  local filename worker_pid handler
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -409,8 +432,15 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
+    # Resolved here, not at queue time: a receipt may outlive the handler that
+    # queued it, and the task must run under whatever provides one NOW.
+    if ! handler="$(task_event_handler)"; then
+      release_dispatch_lock
+      finish_handler_task "$running_marker" "$task_path" 1
+      return
+    fi
     SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
-      "$SUTANDO_TASK_EVENT_HANDLER" \
+      "$handler" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
       "$task_path" \
@@ -463,7 +493,7 @@ task_announce() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved
+  local task_path="$1" rc filename announce resolved handler hrc
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   resolved="$(resolve_inbox_entry "$task_path")" || return 0
@@ -479,11 +509,16 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if [ -z "$DISPATCH_DIR" ]; then
+  handler="$(task_event_handler)"; hrc=$?
+  if [ "$hrc" -ne 0 ]; then
+    # rc 1 is "nobody provides one", the ordinary unrouted case. Anything else
+    # means the lookup could not answer, which must be visible, never silent.
+    [ "$hrc" -eq 1 ] || echo "watch-tasks-stream: handler lookup could not answer (rc $hrc) for $filename; falling back to the live core" >&2
     emit_dispatch_task_file "$announce"
     return
   fi
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  ensure_dispatch_ready
+  "$handler" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
