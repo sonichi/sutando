@@ -110,6 +110,42 @@ st, d = tick(st, {"w": alive()}, 341.0, expected_period_s=30.0)
 check("a live beat clears the ladder", d["w"], ps.NOTHING)
 check("a live beat clears the evidence", st.workers["w"], ps.WorkerEvidence())
 
+# --- a recovery that worked, on a worker that writes no beat --------------
+
+# Until a worker beat exists every reading is `absent`, so a LIVE beat never
+# arrives to clear the ladder. The session coming back is the proof it worked.
+
+
+def back(beat=ps.ABSENT):
+    return ps.Observation(beat=beat, session_alive=True)
+
+
+st, d = run_ticks(ps.SupervisionState(), lambda t: {"w": dead()},
+                  [100.0, 130.0, 160.0, 200.0], expected_period_s=30.0)
+check("(setup) the first death is recovered", d["w"], ps.RECOVER)
+st, d = tick(st, {"w": back()}, 230.0, expected_period_s=30.0)
+check("a session that is back clears the ladder, beat or no beat",
+      st.workers["w"], ps.WorkerEvidence())
+# same cadence as before: a jump here would be read, correctly, as a host resume
+st, d = run_ticks(st, lambda t: {"w": dead()},
+                  [260.0, 290.0, 320.0, 355.0], expected_period_s=30.0)
+check("so a SECOND death is recovered again, not escalated on sight", d["w"], ps.RECOVER)
+
+# what must NOT clear it: a reading that says nothing either way
+st, _ = run_ticks(ps.SupervisionState(), lambda t: {"w": dead()}, [100.0, 130.0],
+                  expected_period_s=30.0)
+st2, _ = tick(st, {"w": ps.Observation(beat=ps.STALE, session_alive=None)}, 160.0,
+              expected_period_s=30.0)
+check("an UNANSWERED session probe still holds the evidence", st2.workers["w"].consecutive, 2)
+st3, _ = tick(st, {"w": ps.Observation(beat=ps.UNKNOWN, session_alive=False)}, 160.0,
+              expected_period_s=30.0)
+check("an UNREADABLE beat still holds the evidence", st3.workers["w"].consecutive, 2)
+
+# and a live session is still not DEATH, however stale its beat: nothing is recovered
+st4, d = run_ticks(ps.SupervisionState(), lambda t: {"w": back(beat=ps.STALE)},
+                   [100.0, 130.0, 160.0, 200.0, 400.0], expected_period_s=30.0)
+check("a live session with a stale beat is never recovered", d["w"], ps.NOTHING)
+
 # --- owner-paused ---------------------------------------------------------
 
 stp, d = run_ticks(ps.SupervisionState(), lambda t: {"w": dead(paused=True)},
@@ -171,7 +207,7 @@ real_after2, real_d2 = tick(after, POOL, 7201.0, expected_period_s=300.0)
 check("with the gap check, the same two ticks recover nobody",
       sorted(set(real_d2.values())), [ps.NOTHING])
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision (30 checks)")
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision (35 checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)

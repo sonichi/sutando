@@ -105,7 +105,9 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
 
         ev = workers.get(worker_id, WorkerEvidence())
 
-        if obs.beat == LIVE:
+        # A session that answers contradicts "the session is gone", so it clears a
+        # death as surely as a beat does; an UNANSWERED probe does not, and holds.
+        if obs.beat == LIVE or obs.session_alive is True:
             workers[worker_id] = WorkerEvidence()
             decisions[worker_id] = NOTHING
             continue
