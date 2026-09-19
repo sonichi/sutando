@@ -119,6 +119,29 @@ class Idempotence(Base):
 
 
 class Failures(Base):
+    def test_bootout_waits_for_an_asynchronous_unload_before_returning(self):
+        self.install()
+        lingering = {"n": 2}                      # `print` keeps answering "loaded" twice
+        real = self.lc.__call__
+
+        def slow(argv, **kw):
+            r = real(argv, **kw)
+            if argv[1] == "print" and lingering["n"] > 0 and r.returncode != 0:
+                lingering["n"] -= 1
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return r
+        naps = []
+        t.bootout(slow, sleep=naps.append)
+        self.assertEqual(len(naps), 2, "bootout returned before launchd reported the job gone")
+
+    def test_status_reports_an_unreadable_plist_instead_of_guessing(self):
+        t.plist_path(self.la).parent.mkdir(parents=True)
+        t.plist_path(self.la).write_text("not a plist")
+        st = t.status(launch_agents=self.la, runner=self.lc)
+        self.assertTrue(st["installed"])
+        self.assertIn("plist unreadable", st["error"])
+        self.assertNotIn("interval_s", st)
+
     def test_a_bootstrap_failure_is_an_error_not_an_installed_looking_job(self):
         self.lc.bootstrap_fails = True
         with self.assertRaises(RuntimeError) as cm:
@@ -144,6 +167,20 @@ class TheCommandLine(Base):
 
     def test_install_needs_both_paths(self):
         self.assertEqual(self._run("install", "--workspace", str(self.ws))[0], 2)
+
+    def test_a_refused_interval_is_a_nonzero_exit_with_the_reason_on_stderr(self):
+        rc, _, err = self._run("install", "--workspace", str(self.ws), "--repo", str(REPO),
+                               "--interval", "30")
+        self.assertEqual(rc, 1)
+        self.assertIn("interval must be >= 60s", err)
+        self.assertFalse(t.plist_path(self.la).exists(), "a refused install wrote a plist")
+
+    def test_uninstall_from_the_command_line(self):
+        self._run("install", "--workspace", str(self.ws), "--repo", str(REPO))
+        rc, out, _ = self._run("uninstall")
+        self.assertEqual(rc, 0)
+        self.assertIn("removed: True", out)
+        self.assertIn("bootout", [a[1] for a in self.lc.calls])
 
     def test_status_before_and_after(self):
         rc, out, _ = self._run("status")
