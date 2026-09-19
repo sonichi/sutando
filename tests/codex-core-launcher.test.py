@@ -214,7 +214,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self):
+    def _notifier_version(self, handler=""):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -223,7 +223,12 @@ exit 0
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
-        return f"{checksum[0]}-{checksum[1]}"
+        # Matches the launcher's own formula, which now folds the resolved
+        # handler (empty here — this fixture publishes none) into the version.
+        handler_cksum = subprocess.run(
+            ["cksum"], input=handler.encode(), capture_output=True,
+            check=True, text=False).stdout.decode().split()[0]
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
