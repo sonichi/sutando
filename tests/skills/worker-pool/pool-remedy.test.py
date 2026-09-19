@@ -154,6 +154,56 @@ class WhatItRefusesToTouch(Base):
         self.assertEqual(self.recover()["outcome"], rem.NO_SESSION)
         self.assertEqual(len(self.t.launches()), self.launched_before)
 
+    def test_an_indeterminate_probe_writes_nothing_and_is_not_already_running(self):
+        # tmux exits 3 with a message the shared classifier does not recognise:
+        # `session_probe` answers "unknown". The worker MAY be alive.
+        wi.start_incarnation(self.ws, self.wid, self.session, tmux_socket=SOCK,
+                             tmux_session=wi.tmux_session_name(self.wid))   # a second open run
+        runs_path = wi.incarnations_path(self.ws, self.wid)
+        before = runs_path.read_bytes()
+        real = self.t.__call__
+
+        def cannot_answer(argv, **kw):
+            if len(argv) > 3 and argv[3] == "has-session":
+                return subprocess.CompletedProcess(argv, 3, "", "error connecting to server")
+            return real(argv, **kw)
+        self.t.__call__ = cannot_answer
+        out = rem.recover(self.ws, REPO, self.wid, runner=cannot_answer)
+        self.assertEqual(out["outcome"], rem.INDETERMINATE)
+        self.assertNotEqual(out["outcome"], rem.ALREADY_RUNNING,
+                            "'could not check' was recorded as 'checked and running'")
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        self.assertEqual(runs_path.read_bytes(), before,
+                         "a probe that could not answer closed runs of a worker that may be "
+                         "alive; with zero open runs the supervisor returns None for it forever")
+        self.assertEqual(len([r for r in wi.incarnations(self.ws, self.wid)
+                              if r["ended_at"] is None]), 2)
+
+
+class APartialCloseIsBounded(Base):
+    def test_an_io_failure_mid_close_is_a_recorded_outcome_not_an_exception(self):
+        wi.start_incarnation(self.ws, self.wid, self.session, tmux_socket=SOCK,
+                             tmux_session=wi.tmux_session_name(self.wid))   # two open runs
+        real, calls = wi.end_incarnation, []
+
+        def flaky(*a, **k):
+            calls.append(a)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+            return real(*a, **k)
+        wi.end_incarnation = flaky
+        try:
+            out = self.recover()          # the docstring promises: never raises
+        finally:
+            wi.end_incarnation = real
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn("No space left", out["why"])
+        self.assertEqual(len(out["closed_runs"]), 1,
+                         "the runs that WERE closed must be reported, or the partial close "
+                         "looks like a completed one")
+        self.assertEqual(len(self.t.launches()), self.launched_before,
+                         "it launched over records it had not finished settling")
+
 
 class ApplyingATick(Base):
     def test_only_recover_acts_and_escalate_passes_through(self):

@@ -34,8 +34,9 @@ sup = _sibling("pool_supervise")
 sw = _sibling("spawn_worker")
 ps, wi = sup.ps, sup.wi
 
-RECOVERED, ALREADY_RUNNING, PAUSED, NO_SESSION, FAILED = (
-    "recovered", "already-running", "paused", "no-recorded-session", "failed")
+RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
+    "recovered", "already-running", "indeterminate", "paused", "no-recorded-session",
+    "failed")
 
 
 def _last_run(workspace, worker_id) -> dict:
@@ -43,10 +44,11 @@ def _last_run(workspace, worker_id) -> dict:
     return runs[-1] if runs else {}
 
 
-def close_dead_runs(workspace, worker_id) -> list:
+def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
     """The ladder established death, so every run still open is over. Left open,
-    the next probe reads the newest of them as the worker's live run."""
-    closed = []
+    the next probe reads the newest of them as the worker's live run.
+    `closed` is appended in place, so a caller sees the partial list if a write fails."""
+    closed = [] if closed is None else closed
     for run in wi.incarnations(workspace, worker_id):
         if run.get("ended_at") is None:
             wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
@@ -79,11 +81,16 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
                              **({"runner": runner} if runner is not None else {}))
     if probe == "exists":
         return {"worker_id": worker_id, "outcome": ALREADY_RUNNING}
+    if probe != "absent":
+        # tmux could not answer, so the worker may be alive: nothing is written.
+        # Closing its runs here would leave it with none, invisible to supervision.
+        return {"worker_id": worker_id, "outcome": INDETERMINATE, "probe": probe}
 
-    closed = close_dead_runs(workspace, worker_id)
+    closed: list = []
     try:
+        close_dead_runs(workspace, worker_id, closed)
         out = spawn(workspace, repo, **kw)
-    except (sw.SpawnRefused, sw.SpawnRetained) as e:
+    except (sw.SpawnRefused, sw.SpawnRetained, OSError) as e:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
                 "closed_runs": closed}
     return {"worker_id": worker_id, "outcome": RECOVERED, "closed_runs": closed,
