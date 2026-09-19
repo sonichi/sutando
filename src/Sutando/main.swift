@@ -600,11 +600,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for line in listing.split(separator: "\n") {
             switch watcherLineMatches(line, excluding: selfPID) {
             case .some(true): return true
-            case .none: sawUndecidable = true
+            case .none:
+                // The flattened column cannot decide this shape, and since the
+                // notifier passes a tasks-dir operand it IS the normal launch.
+                // Ask the kernel for the real argv before recording an unknown.
+                if let pid = linePID(line), let decided = watcherVerdictForPID(pid) {
+                    if decided { return true }
+                    continue
+                }
+                sawUndecidable = true
             case .some(false): continue
             }
         }
         return sawUndecidable ? nil : false
+    }
+
+    /// The pid column of a `ps -axo pid,command` row.
+    private func linePID(_ line: Substring) -> Int32? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return nil }
+        return Int32(trimmed[trimmed.startIndex..<spaceIdx])
+    }
+
+    /// The kernel's real argv for `pid`, NUL-separated, so a script path holding
+    /// a space is distinguishable from a script plus operands -- which `ps`'s
+    /// flattened column is not. Mirrors watcher_identity.py's proc_argv_vector.
+    private func procArgvVector(_ pid: Int32) -> [String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > 4 else { return nil }
+        let argc = Int(buf.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) })
+        guard argc > 0 else { return nil }
+        var fields: [[UInt8]] = []
+        var cur: [UInt8] = []
+        for b in buf[4..<size] {
+            if b == 0 { fields.append(cur); cur = [] } else { cur.append(b) }
+        }
+        var i = 0
+        while i < fields.count && fields[i].isEmpty { i += 1 }
+        i += 1                                    // the exec path
+        while i < fields.count && fields[i].isEmpty { i += 1 }
+        var out: [String] = []
+        while i < fields.count && out.count < argc {
+            out.append(String(decoding: fields[i], as: UTF8.self))
+            i += 1
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    /// Definite verdict for one pid from its real argv: a shell at argv[0] and the
+    /// watcher script at argv[1]. `nil` ONLY when the kernel would not answer --
+    /// an unreadable vector stays an unknown, never a dead watcher.
+    private func watcherVerdictForPID(_ pid: Int32) -> Bool? {
+        guard let vec = procArgvVector(pid), vec.count >= 2 else { return nil }
+        let shells: Set<String> = ["sh", "bash", "zsh", "ksh"]
+        guard shells.contains(String(vec[0].split(separator: "/").last ?? "")) else { return false }
+        guard !vec[1].hasPrefix("-") else { return false }
+        return (vec[1].split(separator: "/").last.map(String.init) ?? vec[1]) == "watch-tasks-stream.sh"
     }
 
     /// True when `s` contains the watcher script's name at a path/whitespace
