@@ -190,6 +190,8 @@ def canonical_shape_failure(rec) -> "dict | None":
         # Present-but-unusable ("", null, {}, 0, false) blocks; only a
         # missing key or a valid [] degrades to no-identity-fact.
         out["kind"] = INVALID_KIND
+        out["path"] = None  # reserved kinds are pathless by design (schema.md)
+        out.pop(PATH_ENCODING_FIELD, None)
     st = rec.get("arbitrated_states")
     st = [st] if isinstance(st, str) else st
     st = [v for v in st if v in _REFERENTS] if isinstance(st, (list, tuple)) else []

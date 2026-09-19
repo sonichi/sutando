@@ -1346,7 +1346,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
 
     def test_a_falsey_but_present_arbitrated_ids_is_invalid_not_absent(self):
         # A present-but-unusable value must block like a malformed one, not
-        # vanish like a missing key (keweichen, #3537, 2026-09-17T03:26:52Z).
+        # vanish like a missing key.
         base = {"path": "p", "kind": "str", "reason": "r"}
         for falsey in ("", None, {}, 0, False):
             rec = dict(base, arbitrated_ids=falsey)
