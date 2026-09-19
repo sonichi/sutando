@@ -78,6 +78,10 @@ def _load_sibling_stub():
 
 _stub = _load_sibling_stub()
 
+# What Claude Code pipes to a Stop hook; only this may move the turn boundary.
+STOP_PAYLOAD = json.dumps({"hook_event_name": "Stop", "session_id": "test",
+                           "stop_hook_active": False})
+
 FAILURES: list[str] = []
 
 
@@ -103,7 +107,7 @@ def _hook(ws: pathlib.Path, repo_dir: pathlib.Path | None = None) -> dict:
         stub.write_text(stub.read_text().replace(f'REPO_DIR="{REPO}"',
                                                  f'REPO_DIR="{repo_dir}"'))
     out = subprocess.run(["/bin/bash", str(stub)], capture_output=True, text=True,
-                         stdin=subprocess.DEVNULL)
+                         input=STOP_PAYLOAD)
     assert out.returncode == 0, f"hook exited {out.returncode}: {out.stderr}"
     return json.loads(out.stdout or "{}")
 
@@ -392,6 +396,44 @@ print(json.dumps(turn_ledger.read_entries()))
               repr(entries))
 
 
+def test_a_hand_run_does_not_move_the_boundary() -> None:
+    """A diagnostic run of the hook, 2.5s before the real Stop, stole the turn's evidence."""
+    for label, stdin_text in (("no stdin", ""), ("not a Stop payload", '{"hook_event_name": "SubagentStop"}'),
+                              ("garbage", "not json")):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            _arm(ws)
+            _hook(ws)
+            turn_ledger.record_send("room", "!r:ag2.space", ws)
+            before = turn_ledger.last_stop_ts(ws)
+            hand = _run_hook_script(REPO / "src" / "check-pending-tasks.sh", ws, None, stdin_text)
+            check(f"{label}: a hand run reports the real decision",
+                  json.loads(hand.stdout or "{}") == {}, hand.stdout + hand.stderr)
+            check(f"{label}: ... and leaves the boundary where it was",
+                  turn_ledger.last_stop_ts(ws) == before, "")
+            decision = _hook(ws)
+            check(f"{label}: the real Stop that follows still sees the turn's reply",
+                  decision == {}, repr(decision))
+
+
+def test_a_dry_run_spends_no_reminder() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)
+        turn_ledger.begin_turn(ws)
+        check("a dry run of a silent turn gives the reason",
+              turn_ledger.stop_gate(ws, commit=False) is not None, "")
+        check("... without spending the one reminder", not turn_ledger.reminder_spent(ws), "")
+        rc = turn_ledger.main(["--workspace", str(ws), "stop-gate"])
+        check("the CLI without --commit refuses the same way", rc == 1, repr(rc))
+        check("... and still spends nothing", not turn_ledger.reminder_spent(ws), "")
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws, commit=False)
+        check("a dry run on a fresh install sets no boundary",
+              turn_ledger.last_stop_ts(ws) is None, "")
+
+
 def main() -> int:
     for fn in (
         test_module_records_both_kinds,
@@ -427,6 +469,8 @@ def main() -> int:
         test_writer_lock_survives_flock_failure,
         test_trim_survives_an_unwritable_state_dir,
         test_result_after_skips_an_entry_whose_stat_races_away,
+        test_a_hand_run_does_not_move_the_boundary,
+        test_a_dry_run_spends_no_reminder,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -478,11 +522,11 @@ def test_the_command_line_surface() -> None:
         buf = io.StringIO()
 
         with contextlib.redirect_stdout(buf):
-            first = turn_ledger.main(["--workspace", str(ws), "stop-gate"])
+            first = turn_ledger.main(["--workspace", str(ws), "stop-gate", "--commit"])
         check("first stop allows (rc 0)", first == 0, repr(first))
 
         with contextlib.redirect_stdout(buf):
-            second = turn_ledger.main(["--workspace", str(ws), "stop-gate"])
+            second = turn_ledger.main(["--workspace", str(ws), "stop-gate", "--commit"])
         check("a silent second stop refuses (rc 1)", second == 1, repr(second))
         check("the refusal prints a reason", "no-send" in buf.getvalue(), repr(buf.getvalue()[:80]))
 
@@ -494,7 +538,7 @@ def test_the_command_line_surface() -> None:
 
         with contextlib.redirect_stdout(buf):
             check("a recorded send lets the turn end",
-                  turn_ledger.main(["--workspace", str(ws), "stop-gate"]) == 0, "")
+                  turn_ledger.main(["--workspace", str(ws), "stop-gate", "--commit"]) == 0, "")
 
         rc = turn_ledger.main(["--workspace", str(ws), "no-send", "nothing", "to", "say"])
         check("no-send records and exits 0", rc == 0, repr(rc))
@@ -835,7 +879,7 @@ def test_turn_start_is_reachable_from_the_command_line() -> None:
 
 
 def _run_hook_script(script: pathlib.Path, ws: pathlib.Path, session_id: str | None,
-                      stdin_text: str = "") -> subprocess.CompletedProcess:
+                      stdin_text: str | None = None) -> subprocess.CompletedProcess:
     """The REAL hook script (not a stub, not turn_ledger.main()), against `ws`
     pinned via the production `SUTANDO_TEST_MODE` escape hatch — the same
     mechanism the PR's own before/after demo used, and what `sutando_config.py`
@@ -848,6 +892,7 @@ def _run_hook_script(script: pathlib.Path, ws: pathlib.Path, session_id: str | N
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if session_id:
         env["CLAUDE_CODE_SESSION_ID"] = session_id
+    stdin_text = STOP_PAYLOAD if stdin_text is None else stdin_text
     return subprocess.run(["/bin/bash", str(script)], input=stdin_text, capture_output=True,
                            text=True, env=env)
 
