@@ -1172,5 +1172,45 @@ class LiveParkedBanner(unittest.TestCase):
                 self.assertEqual([], w.live_banner_lines(line), line)
 
 
+class FrameAbnormalRanksOneCaptureAsTheWindowRanksASample(unittest.TestCase):
+    """A single capture cannot show recurrence, so its abnormal verdict is the
+    window classifier's ranking of a current sample and nothing more: provider-limit
+    over retry over the rest. A gate that consumed the detectors and ranked them
+    itself once put the interrupt affordance above a retry; the ranking is here."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    API = "API Error: 529 Overloaded"
+    QUOTA = "You've hit your usage limit · resets 3pm"
+    PROSE = "⏺ I once saw a Connection error. Retrying was the fix.\n❯ \n"
+    ABNORMAL_KINDS = {"provider-limit", "retry-loop", "abnormal"}
+
+    def test_prose_is_no_verdict(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_a_retry_alone_is_a_retry_loop_and_says_so(self):
+        v = w.frame_abnormal(self.RETRY)
+        self.assertEqual((v.kind, v.retrying, v.names), ("retry-loop", True, ("retry:retrying",)))
+
+    def test_a_retry_beside_a_parked_line_is_abnormal_keeping_both_names(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.API}")
+        self.assertEqual((v.kind, v.retrying), ("abnormal", True))
+        self.assertEqual(set(v.names), {"retry:retrying", "api-error"})
+
+    def test_a_provider_limit_outranks_a_retry(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.QUOTA}")
+        self.assertEqual((v.kind, v.retrying), ("provider-limit", True))
+
+    def test_the_kind_is_what_the_window_classifier_says_of_a_run_of_that_capture(self):
+        # Banners only: the window's retry telemetry is searched text and may fire on
+        # still prose, which the whole-line grammar here is narrower than by design.
+        th = w.PROVISIONAL_THRESHOLDS
+        for text in (self.RETRY, self.API, self.QUOTA, f"{self.RETRY}\n{self.API}",
+                     f"{self.RETRY}\n{self.QUOTA}"):
+            with self.subTest(text=text):
+                frames = [text] * max(3, th["min_samples"])
+                window = w.classify(frames, work_outstanding=False, duration_s=th["min_duration_s"] + 1)
+                self.assertEqual(w.frame_abnormal(text).kind, window["kind"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

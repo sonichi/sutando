@@ -213,6 +213,38 @@ def live_retry_banner_lines(text: str) -> list:
     return [line for family, _, line in live_banner_lines(text) if family == "retry"]
 
 
+@dataclass(frozen=True)
+class FrameAbnormal:
+    kind: str          # provider-limit | retry-loop | abnormal
+    names: tuple       # "retry:retrying" plus each parked/abnormal family name
+    retrying: bool
+
+
+def frame_abnormal(text: str) -> Optional[FrameAbnormal]:
+    """One capture's abnormal verdict, ranked as `_classify_run` ranks a current
+    sample: provider-limit over retry over the rest. One frame has no recurrence,
+    so it reads the live (whole-line) detectors, never the searched RETRY_PATTERNS.
+    None means no abnormal text; motion, idleness and dialogs are the caller's."""
+    retrying = False
+    names: list = []
+    for family, name, _line in live_banner_lines(text):
+        if family == "retry":
+            retrying = True
+        elif name not in names:
+            names.append(name)
+    for name in matched_abnormal([text]):
+        if name not in names:
+            names.append(name)
+    if not retrying and not names:
+        return None
+    tagged = tuple((["retry:retrying"] if retrying else []) + names)
+    if any(n in PROVIDER_LIMIT_PATTERNS for n in names):
+        return FrameAbnormal("provider-limit", tagged, retrying)
+    if retrying and not names:
+        return FrameAbnormal("retry-loop", tagged, True)
+    return FrameAbnormal("abnormal", tagged, retrying)
+
+
 def matched_abnormal(frames: list) -> list:
     """abnormal-family names in `frames` — credits, login, compaction, waiting.
 

@@ -22,6 +22,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 from delivery import pane_gate as pg  # noqa: E402
+import cli_wedge as wedge  # noqa: E402
 
 FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 CODEX_DIM_IDLE = "\x1b[1m›\x1b[0m \x1b[2mImprove documentation in @filename\x1b[0m\n"
@@ -403,6 +404,47 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
+    """The gate asks cli_wedge one question -- frame_abnormal -- and ranks nothing
+    itself. A gate that composed the detectors and ordered them by hand once put
+    the interrupt affordance above a retry, against the rule the window classifier
+    already held (abnormal text outranks motion). Pinned by substitution: whatever
+    cli_wedge answers is the verdict, and without its answer no banner is seen."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    PARKED = "API Error: 529 Overloaded"
+    INTERRUPT = "✻ Thinking… (12s · esc to interrupt)"
+
+    def test_cli_wedges_answer_is_the_verdict_even_over_an_idle_footer(self):
+        stub = wedge.FrameAbnormal("abnormal", ("stubbed-family",), False)
+        with mock.patch.object(pg, "frame_abnormal", return_value=stub):
+            v = pg.classify_pane(CLAUDE_IDLE, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "stubbed-family"))
+
+    def test_without_cli_wedges_answer_the_gate_sees_no_banner_at_all(self):
+        with mock.patch.object(pg, "frame_abnormal", return_value=None):
+            for text in (self.RETRY, self.PARKED):
+                with self.subTest(text=text):
+                    self.assertEqual(state(f"{text}\n{CLAUDE_IDLE}", "claude"), "idle-ready")
+
+    def test_a_parked_line_beside_the_affordance_is_abnormal_as_the_window_rule_says(self):
+        # cli_wedge: moving + abnormal is a warning; the affordance is motion, not health.
+        v = pg.classify_pane(f"{self.INTERRUPT}\n{self.PARKED}\n{CLAUDE_IDLE}", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason, pg.accepts_input(v)), ("abnormal", "api-error", False))
+
+    def test_a_named_dialog_still_outranks_a_parked_line_that_is_its_own_text(self):
+        dialog = ("  You've reached your Fable limit\n  ❯ Switch to Opus 5 and continue\n"
+                  "    Continue with Fable 5.1\n  Esc to cancel\n")
+        self.assertIsNotNone(wedge.frame_abnormal(dialog))   # control: the line IS parked text
+        self.assertEqual(pg.classify_pane(dialog, pg.CLAUDE).reason, "fable-limit")
+
+    def test_a_retry_outranks_a_named_dialog(self):
+        dialog = f"{self.RETRY}\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n"
+        v = pg.classify_pane(dialog, pg.CLAUDE)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("retry:retrying", v.reason)
+
+
 class ARetryIsAbnormalEvenInsideARunningTurn(unittest.TestCase):
     """Owner's rule: retry means abnormal. The interrupt affordance stays on screen
     while the CLI retries, so "esc to interrupt" cannot vouch for a served turn --
@@ -448,7 +490,7 @@ class AbnormalIsBothOfCliWedgesFamilies(unittest.TestCase):
 
     def test_control_the_same_retry_banner_was_invisible_to_the_parked_patterns(self):
         # Proves the fixture reaches the family only the banner grammar reads.
-        self.assertEqual(pg.matched_abnormal([self.RETRY]), [])
+        self.assertEqual(wedge.matched_abnormal([self.RETRY]), [])
 
     def test_a_parked_api_error_banner_is_abnormal(self):
         v = pg.classify_pane(f"{self.PARKED}\n{CLAUDE_IDLE}", pg.CLAUDE)
