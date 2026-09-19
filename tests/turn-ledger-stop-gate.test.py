@@ -434,6 +434,22 @@ def test_a_dry_run_spends_no_reminder() -> None:
               turn_ledger.last_stop_ts(ws) is None, "")
 
 
+def test_an_unrecognised_stop_never_blocks() -> None:
+    """A real Stop whose payload is lost or unrecognised must fail open, not refuse forever."""
+    for label, stdin_text in (("no payload", ""), ("unrecognised payload", '{"event": "stop"}')):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            _arm(ws)
+            _hook(ws)
+            runs = [_run_hook_script(REPO / "src" / "check-pending-tasks.sh", ws, None, stdin_text)
+                    for _ in range(3)]
+            check(f"{label}: three silent stops in a row never block",
+                  all(json.loads(r.stdout or "{}") == {} for r in runs),
+                  repr([r.stdout for r in runs]))
+            check(f"{label}: ... but the decision is still reported on stderr",
+                  "no-send" in runs[0].stderr, runs[0].stderr)
+
+
 def main() -> int:
     for fn in (
         test_module_records_both_kinds,
@@ -471,6 +487,7 @@ def main() -> int:
         test_result_after_skips_an_entry_whose_stat_races_away,
         test_a_hand_run_does_not_move_the_boundary,
         test_a_dry_run_spends_no_reminder,
+        test_an_unrecognised_stop_never_blocks,
     ):
         print(f"{fn.__name__}:")
         fn()

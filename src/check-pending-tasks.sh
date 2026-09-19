@@ -171,9 +171,12 @@ fi
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate "${COMMIT[@]}" 2>/dev/null)"
 STOP_RC=$?
 
-# Fail OPEN on anything but an explicit refusal (rc 1 AND a reason): a gate that
-# cannot run must never wedge the agent into a turn it has no way to end.
-if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
+# Fail OPEN on anything but a committed refusal: an uncommitted one never spends
+# its reminder, so blocking on it would refuse every Stop. A hand run reports on stderr.
+if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ] && [ "${#COMMIT[@]}" -eq 0 ]; then
+  echo "check-pending-tasks (not a Stop event, nothing recorded): $STOP_REASON" >&2
+  echo '{}'
+elif [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
   SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Turn is ending without a message or an explicit no-send","additionalContext":os.environ.get("SUTANDO_HOOK_REASON","")}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'
