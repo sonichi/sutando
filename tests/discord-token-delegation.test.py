@@ -151,6 +151,37 @@ def main() -> int:
             check(f"{fname} has no private DISCORD_BOT_TOKEN= parser",
                   not re.search(r'startswith\(["\']DISCORD_BOT_TOKEN=', body)
                   and "partition(\"=\")" not in body.split("def _load_token")[-1][:400])
+        # 8. The sixth sender. Behavioural: $CLAUDE_HOME is the tier a private
+        #    CLAUDE_CONFIG_DIR-or-~/.claude rederivation silently drops.
+        scm_path = (REPO / "skills" / "collaboration-intelligence" / "scripts"
+                    / "send_channel_message.py")
+        spec = importlib.util.spec_from_file_location("scm_t", scm_path)
+        scm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scm)
+        with tempfile.TemporaryDirectory() as home:
+            chan = Path(home) / "channels" / "discord"
+            chan.mkdir(parents=True)
+            (chan / ".env").write_text("DISCORD_BOT_TOKEN=tok-claude-home\n")
+            saved = {k: os.environ.get(k) for k in
+                     ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "DISCORD_BOT_TOKEN")}
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            os.environ.pop("DISCORD_BOT_TOKEN", None)
+            os.environ["CLAUDE_HOME"] = home
+            try:
+                check("send_channel_message honours $CLAUDE_HOME",
+                      scm.token() == "tok-claude-home")
+                os.environ["DISCORD_BOT_TOKEN"] = "tok-env"
+                check("send_channel_message: env wins over the file",
+                      scm.token() == "tok-env")
+            finally:
+                for k, v in saved.items():
+                    os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        body = scm_path.read_text()
+        check("send_channel_message has no private DISCORD_BOT_TOKEN= parser",
+              not re.search(r'startswith\(["\']DISCORD_BOT_TOKEN=', body))
+        check("send_channel_message does not rederive the Claude home",
+              'Path.home() / ".claude"' not in body
+              and "pathlib.Path.home()" not in body)
     finally:
         if env_backup is not None:
             os.environ["DISCORD_BOT_TOKEN"] = env_backup
