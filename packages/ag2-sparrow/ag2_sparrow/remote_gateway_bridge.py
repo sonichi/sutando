@@ -3241,7 +3241,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         # a dedup requeue re-renders it there from the stored header (#3613).
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
-            _one_line(task.get("addressed_to") or "")))
+            _one_line(task.get("addressed_to") or ""),
+            task.get("reply_to_me"), _one_line(task.get("reply_to_sender") or "")))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
