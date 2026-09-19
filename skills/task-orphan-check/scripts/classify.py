@@ -192,10 +192,31 @@ def completion_marker(results_dir: Path, task_id: str) -> str:
     return ""
 
 
+def neutralize(text: str) -> str:
+    """Make untrusted text inert before it enters a trusted result body.
+    A square bracket is the structural precondition of every result marker, so
+    removing it cannot leave an action behind without duplicating the grammar."""
+    return text.replace("[", "(").replace("]", ")")
+
+
 def channel_label(headers: dict) -> str:
     name = headers.get("room_name") or headers.get("channel_name")
     cid = headers.get("channel_id") or headers.get("chat_id") or ""
-    return f"{name} ({cid})" if name else (cid or "DM")
+    return neutralize(f"{name} ({cid})" if name else (cid or "DM"))
+
+
+PREVIEW_CHARS = 100
+# The bridge appends its sandbox block AFTER the ask; the parsed body carries both.
+_SYSTEM_BLOCK_RE = re.compile(r"^===\s*SUTANDO SYSTEM INSTRUCTIONS\b", re.M)
+
+
+def preview(body: str) -> str:
+    """The `task:` value as the recovery DM shows it: the ask up to the bridge's
+    system-instructions block, neutralized, whitespace collapsed, first
+    PREVIEW_CHARS chars. Truncation runs LAST so it cannot re-open a marker."""
+    m = _SYSTEM_BLOCK_RE.search(body)
+    ask = body[:m.start()] if m else body
+    return " ".join(neutralize(ask).split())[:PREVIEW_CHARS]
 
 
 def classify_task(path: Path, workspace: Path, now: float) -> dict:
@@ -216,6 +237,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         "access_tier": tier,
         "channel_id": headers.get("channel_id") or headers.get("chat_id") or "",
         "label": channel_label(headers),
+        "preview": preview(parsed.body),
         "age_s": age_s,
         "age_from": age_from,
         "import": False,
