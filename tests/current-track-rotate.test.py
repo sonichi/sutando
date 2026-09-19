@@ -15,6 +15,14 @@ REPO = Path(__file__).resolve().parents[1]
 ROTATE = REPO / "scripts" / "current-track-rotate.py"
 APPEND = REPO / "scripts" / "current-track-append.py"
 WRITE = REPO / "scripts" / "current-track-write.py"
+
+
+def _host_anchor(tmpdir) -> Path:
+    """A temp anchor at the shape the writer requires: hosts/<label>/current-track.md."""
+    h = Path(tmpdir) / "hosts" / "TestHost"
+    h.mkdir(parents=True, exist_ok=True)
+    return h / "current-track.md"
+
 sys.path.insert(0, str(REPO / "src"))
 import current_track as ct  # noqa: E402
 
@@ -156,7 +164,7 @@ class PinnedEntries(unittest.TestCase):
 
     def test_retiring_a_middle_pin_adds_no_second_copy(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
         p.write_text("# t\n\n" + E("2026-01-01", "A") + E("2026-02-01", "B")
@@ -170,7 +178,7 @@ class PinnedEntries(unittest.TestCase):
     def test_a_repeated_ordinary_entry_across_rotations_is_two_records(self):
         """Nothing cancels an outgoing entry by content: a real repeat is a second record."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         E = lambda st, n: f"## {st} — {n}\n" + ("x" * 100) + "\n\n"
         A, B, C = E("2026-01-01", "A"), E("2026-02-01", "B"), E("2026-03-01", "C")
@@ -184,7 +192,7 @@ class PinnedEntries(unittest.TestCase):
     def test_the_refusal_names_the_cause_pins_or_one_giant_entry(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         pre, _ = fixture(0)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         rot = Cli(load(ROTATE))
         # Cause 1: many pinned entries, none of them individually huge.
         holds = "".join(f"## 2026-0{i%9+1}-01T00:00Z — HOLD: hands off #{3000+i}\n" + ("h" * 900) + "\n\n"
@@ -214,7 +222,7 @@ class PinnedEntries(unittest.TestCase):
     def test_the_archive_is_ordered_by_departure_not_by_entry_stamp(self):
         """P,A,B,C: the pin outlives A and B in the head, so it lands after them."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
         A = "## 2026-05-01T00:00Z — A\n" + ("a" * 3000) + "\n\n"
         B = "## 2026-06-01T00:00Z — B\n" + ("b" * 3000) + "\n\n"
@@ -237,7 +245,7 @@ class PinnedEntries(unittest.TestCase):
 
     def test_reconstruction_is_the_archive_then_whatever_the_head_still_holds(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         p.write_text(self.corpus())
         original = p.read_text()
         ct.rotate(p, 8 * 1024)
@@ -254,7 +262,7 @@ class PinnedEntries(unittest.TestCase):
     def test_a_repeated_identical_entry_is_two_records_not_one(self):
         """The same text written twice is two records; nothing cancels an entry by content."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
         big = lambda n, c: f"## 2026-0{n}-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
@@ -271,7 +279,7 @@ class PinnedEntries(unittest.TestCase):
 
     def test_a_pin_reaches_the_archive_exactly_once_when_it_retires(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         p.write_text(self.corpus())
         ct.rotate(p, 8 * 1024)
@@ -282,7 +290,7 @@ class PinnedEntries(unittest.TestCase):
     def test_identical_pins_retired_in_separate_generations_are_two_records(self):
         """The reviewer's generation case: same pin text, two lifetimes, two archived records."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         P = "## 2026-01-01T00:00Z — HOLD: hands off #3166\nowner instruction\n\n"
         big = lambda c: f"## 2026-09-01T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
@@ -298,7 +306,7 @@ class PinnedEntries(unittest.TestCase):
     def test_odd_stamps_do_not_reorder_the_archive(self):
         """Reversed, equal and missing stamps: order comes from the file, never from headings."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         E = lambda h: f"## {h}\n" + ("x" * 900) + "\n\n"
         p.write_text("# t\n\n" + E("2026-09-01T03:00Z A") + E("2026-09-02T01:00Z P HOLD: hands off")
@@ -320,7 +328,7 @@ class PinnedEntries(unittest.TestCase):
     def test_interruption_on_either_side_duplicates_but_never_loses(self):
         """Archive-first is a deliberate choice: retry repeats a batch, it never drops one."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         body = lambda n, c: f"## 2026-09-0{n}T00:00Z — {c}\n" + (c.lower() * 3000) + "\n\n"
         p.write_text("# t\n\n" + body(1, "A") + body(2, "B") + body(3, "C"))
@@ -361,7 +369,7 @@ class PinnedEntries(unittest.TestCase):
     def test_an_edit_through_replace_leaves_no_archived_copy(self):
         """The documented limit: replace() rewrites the head and archives nothing."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         archive = p.with_name("current-track-archive.md")
         ct.replace(p, "# t\n\n## 2026-01-01 — alpha\nbody\n\n## 2026-02-01 — beta\nbody\n")
         ct.replace(p, "# t\n\n## 2026-02-01 — beta\nbody\n")
@@ -393,7 +401,7 @@ class PinnedEntries(unittest.TestCase):
         """rc=3 next to 'nothing was archived' read as a no-op while 213 KB moved."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
         pre, _ = fixture(0)
-        p = Path(d.name) / "current-track.md"
+        p = _host_anchor(d.name)
         holds = "".join(f"## 2026-0{i%9+1}-01T00:00Z — HOLD: hands off #{3000+i}\n" + ("h" * 900) + "\n\n"
                         for i in range(12))
         p.write_text(pre + holds + "".join(f"## 2026-09-0{i%9+1}T00:00Z — entry {i}\n" + ("x" * 500) + "\n\n"
@@ -416,7 +424,7 @@ class PinnedEntries(unittest.TestCase):
                  ("space sorts below T", "2026-09-06 23:00", "2026-09-06T01:00Z")]
         for why, newest, oldest in cases:
             d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-            p = Path(d.name) / "current-track.md"
+            p = _host_anchor(d.name)
             p.write_text(E(newest, "newest") + E(oldest, "oldest"))
             ct.rotate(p, 1200, pin=None)
             archive = p.with_name("current-track-archive.md")
@@ -442,7 +450,7 @@ class PinnedEntries(unittest.TestCase):
                  ("minute vs second", "2026-09-06T10:27", "2026-09-06T10:27:02Z")]
         for why, newest, oldest in cases:
             d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-            p = Path(d.name) / "current-track.md"
+            p = _host_anchor(d.name)
             p.write_text(E(newest, "newest") + E(oldest, "oldest"))
             ct.rotate(p, 1200, pin=None)
             archive = p.with_name("current-track-archive.md")
@@ -510,7 +518,7 @@ class PinnedEntries(unittest.TestCase):
 
     def test_cli_pin_flags(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
-        p = Path(d.name) / "current-track.md"; p.write_text(self.corpus())
+        p = _host_anchor(d.name); p.write_text(self.corpus())
         rot = Cli(load(ROTATE))
         r = rot(p, "--keep-bytes", "8192", "--dry-run"); self.assertEqual(r.returncode, 0)
         r = rot(p, "--keep-bytes", "8192", "--pin", "KEEPME", "--no-pin"); self.assertEqual(r.returncode, 2)
@@ -524,7 +532,7 @@ class PinnedEntries(unittest.TestCase):
 
 class RotateAndAppend(unittest.TestCase):
     def setUp(self):
-        self.d = tempfile.TemporaryDirectory(); self.p = Path(self.d.name) / "current-track.md"
+        self.d = tempfile.TemporaryDirectory(); self.p = _host_anchor(self.d.name)
         pre, ents = fixture(); self.pre = pre; self.p.write_text(pre + "".join(ents))
         self.archive = self.p.with_name("current-track-archive.md")
 
