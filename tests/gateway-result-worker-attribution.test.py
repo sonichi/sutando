@@ -288,6 +288,48 @@ class WorkerAttribution(unittest.TestCase):
 
 
 
+class AnAliasNeverNamesAnotherWorker(unittest.TestCase):
+    """Reviewer repro (sonichi/sutando#4306): worker A's recipient dir is a
+    symlink to worker B's real dir. If the writer publishes through it and the
+    reader skips the alias, B is the unique claimant and the payload names B —
+    another worker's identity on A's reply. Neither half may happen."""
+
+    A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    setUp, _doc = WorkerAttribution.setUp, WorkerAttribution._doc
+
+    def _alias(self):
+        root = pool_delivery.done_flag(Path(self.workspace), self.B, "task-0alias00000000000").parent.parent.parent
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).symlink_to(root / self.B)
+        return root
+
+    def test_the_writer_refuses_and_the_payload_carries_no_identity(self):
+        self._alias()
+        tid = "task-0alias0000000000a"
+        with self.assertRaises(OSError):
+            pool_delivery.mark_done(Path(self.workspace), self.A, tid, published=True)
+        self.assertEqual(self.mod._worker_of(tid), "")
+        self.assertNotIn("metadata", self._doc(tid))
+
+    def test_even_a_record_already_under_the_alias_is_never_attributed_to_b(self):
+        # A record that reached B's folder some other way, with the alias still
+        # present: the reader must abstain, never resolve the alias to B.
+        root = self._alias()
+        tid = "task-0alias0000000000b"
+        real = pool_delivery.done_flag(Path(self.workspace), self.B, tid)
+        real.write_text("")
+        self.assertTrue((root / self.A / "done" / real.name).exists(), "fixture: alias resolves")
+        self.assertEqual(self.mod._worker_of(tid), "", "the alias made B look unique")
+        doc = self._doc(tid)
+        self.assertNotIn("metadata", doc, f"payload named {doc.get('metadata')}")
+
+    def test_control_without_the_alias_b_is_attributed(self):
+        tid = "task-0alias0000000000c"
+        pool_delivery.mark_done(Path(self.workspace), self.B, tid, published=True)
+        self.assertEqual(self._doc(tid)["metadata"], {"worker_id": self.B})
+
+
 class PromotionBetweenProbes(unittest.TestCase):
     """keweichen on #4306: the writer creates `.flag` and only then unlinks
     `.pending`, so probing flag-first can observe NEITHER name if promotion

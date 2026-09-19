@@ -149,6 +149,9 @@ class TheGrammarIsBounded(unittest.TestCase):
             def is_dir(self, follow_symlinks=True):
                 raise PermissionError("denied")
 
+            def is_symlink(self):
+                raise PermissionError("denied")
+
         class _Scan:
             def __enter__(self):
                 return iter([_Entry()])
@@ -166,6 +169,29 @@ class TheGrammarIsBounded(unittest.TestCase):
         (root / "worker-b").write_text("")
         (root / ".DS_Store").write_text("")
         self.assertEqual(pool_record.iter_recipients(root), ["worker-a"])
+
+    def test_a_recipient_named_symlink_is_malformed_state_not_a_stray(self):
+        # The writer follows an alias, so a record under the target could wear
+        # this name; skipping it hands the target a unique claim — abstain instead.
+        root = Path(tempfile.mkdtemp()) / "workers"
+        (root / "worker-b").mkdir(parents=True)
+        (root / "worker-a").symlink_to(root / "worker-b")
+        with self.assertRaises(pool_record.RecipientAliasError) as cm:
+            pool_record.iter_recipients(root)
+        self.assertIsInstance(cm.exception, OSError, "an alias must abstain like any unreadable state")
+        # A symlink with a name the writer would refuse is still merely not a recipient.
+        (root / "worker-a").unlink()
+        (root / "Not-A-Recipient").symlink_to(root / "worker-b")
+        self.assertEqual(pool_record.iter_recipients(root), ["worker-b"])
+
+    def test_require_own_dir_accepts_absent_and_real_and_refuses_an_alias(self):
+        root = Path(tempfile.mkdtemp())
+        self.assertEqual(pool_record.require_own_dir(root / "absent"), root / "absent")
+        (root / "real").mkdir()
+        self.assertEqual(pool_record.require_own_dir(root / "real"), root / "real")
+        (root / "alias").symlink_to(root / "real")
+        with self.assertRaises(pool_record.RecipientAliasError):
+            pool_record.require_own_dir(root / "alias")
 
 
 if __name__ == "__main__":

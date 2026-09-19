@@ -40,7 +40,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
-                         RecordState, read_record_state, record_path,
+                         RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
 
 # `.txt` because the watcher that wakes a worker emits for no other extension.
@@ -123,6 +123,10 @@ def is_done_flag(path) -> bool:
 
 
 def _publish_record(dst: Path) -> None:
+    # The recipient's folder and its `done/` must be this recipient's OWN: through
+    # an alias the record would land under another recipient's name.
+    require_own_dir(dst.parent.parent)
+    require_own_dir(dst.parent)
     # Temp file + rename inside the same directory, so a concurrent reader sees
     # the name either absent or complete, never half-written.
     dst.parent.mkdir(parents=True, exist_ok=True)

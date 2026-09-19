@@ -13,6 +13,7 @@ resolved.
 from __future__ import annotations
 
 import enum
+import errno
 import os
 import re
 import stat
@@ -48,6 +49,22 @@ def require_recipient(name: str) -> str:
     if not is_recipient(name):
         raise ValueError(f"recipient id must match {RECIPIENT_PATTERN!r}: {name!r}")
     return name
+
+
+class RecipientAliasError(OSError):
+    """A recipient-named entry that is a symlink. It aliases some other folder,
+    so any record beneath it is that folder's claim wearing this name: neither
+    the writer nor the reader may treat it as this recipient's own."""
+
+
+def require_own_dir(path) -> Path:
+    """`path` may be absent or a real directory; a symlink at it is refused.
+    Shared by the writer (before publishing under a recipient) and the reader
+    (while enumerating recipients), so both refuse the same state."""
+    p = Path(path)
+    if p.is_symlink():
+        raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias", str(p))
+    return p
 
 
 def workers_root(state_dir) -> Path:
@@ -99,7 +116,9 @@ def iter_recipients(root) -> list[str]:
 
     Entries PROVEN not to be recipients — a name the writer would refuse, or
     an entry that is not a directory — are skipped, never treated as an
-    unreadable claimant. An unreadable root raises.
+    unreadable claimant. A recipient-named SYMLINK raises RecipientAliasError
+    (an OSError): it is malformed state a caller must abstain on. An
+    unreadable root raises.
     """
     names = []
     with os.scandir(str(root)) as entries:
@@ -107,8 +126,15 @@ def iter_recipients(root) -> list[str]:
             if not is_recipient(entry.name):
                 continue
             try:
+                # An alias is malformed state, not a stray: the writer follows
+                # it, so a record under the target could be published under this name.
+                if entry.is_symlink():
+                    raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias",
+                                              entry.path)
                 if not entry.is_dir(follow_symlinks=False):
                     continue
+            except RecipientAliasError:
+                raise
             except OSError:
                 pass  # cannot prove otherwise: leave it for the record probe
             names.append(entry.name)
