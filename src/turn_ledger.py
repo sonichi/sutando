@@ -16,8 +16,8 @@ reason}` for a deliberate decision not to speak. Writers append with O_APPEND
 and a single `write()` so concurrent workers cannot interleave a line; nothing
 here read-modify-writes the log.
 
-WHAT COUNTS AS "THE TURN SPOKE". Two surfaces, because there are two ways a
-reply leaves this agent, and only one of them is instrumented:
+WHAT COUNTS AS "THE TURN SPOKE". Three surfaces, one per way a reply leaves
+this agent:
 
   • a ledger entry newer than the previous Stop — `room_ops say`, or an explicit
     `record_no_send`;
@@ -25,7 +25,15 @@ reply leaves this agent, and only one of them is instrumented:
     previous Stop — the result-file protocol, delivered by whichever bridge owns
     the task. Readiness is `delivery.readiness`, the same policy the bridges
     apply, so this agrees with what will actually be sent rather than counting a
-    half-written file as a reply.
+    half-written file as a reply;
+  • a line in `<workspace>/state/room-actions.jsonl` newer than the previous
+    Stop — written by the desktop app's ag2-space MCP proxy after each
+    SUCCESSFUL `room.action.execute`, whatever the action. The proxy serves
+    Claude and Codex alike and knows nothing of this rule; it records facts,
+    this module decides what they mean. Reads never land there, and neither
+    do failed calls. The proxy owns that file's bound: it rotates it to
+    `room-actions.jsonl.1`, so both are read. Its lines carry no session and
+    therefore count for every session, like an untagged ledger line.
 
 The results surface is deliberately NOT recursive. A delivered result is
 archived into `results/archive/YYYY-MM/` within seconds, so an archived result
@@ -65,7 +73,9 @@ only session-aware callers gain isolation. An entry with no `session` key
 (written before this change, or by an unscoped caller) still counts for
 everyone, so the fix does not require a flag day.
 
-NOT SCOPED: the result-file evidence surface (`_result_after`). A delivered
+NOT SCOPED: the result-file evidence surface (`_result_after`), nor the
+room-action surface (`_room_action_after`), whose writer has no session id.
+A delivered
 `results/` file carries no session identity anywhere in the result-file
 protocol — it is written by whichever process handles the task and delivered
 by a bridge independent of any session — so there is nothing to filter it by.
@@ -93,11 +103,14 @@ from workspace_default import resolve_workspace, status_read_path, write_status 
 __all__ = [
     "LEDGER_NAME", "STOP_NAME", "ledger_path", "record_send", "record_no_send",
     "last_action_after", "delivery_after", "last_stop_ts", "mark_stop", "stop_gate",
+    "ROOM_ACTIONS_NAME", "room_actions_path",
 ]
 
 LEDGER_NAME = "turn-ledger.jsonl"
 STOP_NAME = "turn-stop.json"
 TURN_NAME = "turn-reminder.json"
+# Written by the desktop's MCP proxy, not by this module; see the docstring.
+ROOM_ACTIONS_NAME = "room-actions.jsonl"
 
 # An entry is ~90 bytes and the only question ever asked of this file is "since
 # the last Stop", so the cap is about unbounded growth, not retention depth.
@@ -120,6 +133,11 @@ def _workspace(workspace: Path | str | None) -> Path:
 def ledger_path(workspace: Path | str | None = None) -> Path:
     """Absolute path of the ledger. `state/` per the workspace contract."""
     return _workspace(workspace) / "state" / LEDGER_NAME
+
+
+def room_actions_path(workspace: Path | str | None = None) -> Path:
+    """Absolute path of the MCP proxy's room-action log."""
+    return _workspace(workspace) / "state" / ROOM_ACTIONS_NAME
 
 
 def _scoped_name(base: str, session: str | None) -> str:
@@ -275,7 +293,10 @@ def record_no_send(reason: str, workspace: Path | str | None = None,
 
 def read_entries(workspace: Path | str | None = None) -> list[dict]:
     """Every parseable entry, oldest first. A damaged line is skipped, not fatal."""
-    path = ledger_path(workspace)
+    return _read_jsonl(ledger_path(workspace))
+
+
+def _read_jsonl(path: Path) -> list[dict]:
     out: list[dict] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -355,16 +376,29 @@ def _result_after(ts: float, workspace: Path | str | None = None) -> dict | None
     return best
 
 
+def _room_action_after(ts: float, workspace: Path | str | None = None) -> dict | None:
+    """The newest successful MCP room action newer than `ts`, or None."""
+    path = room_actions_path(workspace)
+    newer = [e for p in (path.with_name(path.name + ".1"), path) for e in _read_jsonl(p)
+             if e.get("kind") == "room-action" and float(e["ts"]) > ts]
+    if not newer:
+        return None
+    last = max(newer, key=lambda e: float(e["ts"]))
+    return {"ts": float(last["ts"]), "kind": "room-action",
+            "target": str(last.get("room_id") or "")}
+
+
 def delivery_after(ts: float, workspace: Path | str | None = None,
                     session: str | None = None) -> dict | None:
-    """The turn's newest outbound message since `ts`, over either surface.
+    """The turn's newest outbound message since `ts`, over any surface.
 
-    Only the ledger side is session-filtered; `_result_after` carries no
-    session identity to filter by (see the module docstring's NOT SCOPED note).
+    Only the ledger side is session-filtered; the result and room-action surfaces
+    carry no session identity to filter by (see the module docstring's NOT SCOPED note).
     """
     session = _resolve_session(session)
     candidates = [c for c in (last_action_after(ts, workspace, session),
-                              _result_after(ts, workspace)) if c]
+                              _result_after(ts, workspace),
+                              _room_action_after(ts, workspace)) if c]
     return max(candidates, key=lambda e: float(e["ts"])) if candidates else None
 
 
