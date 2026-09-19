@@ -21,6 +21,7 @@ shapes for both machine classes.
 """
 
 import importlib.util
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -51,12 +52,15 @@ def _stats_with(pmset_stdout):
     def fake_run(cmd, **kwargs):
         return types.SimpleNamespace(stdout=pmset_stdout, stderr="", returncode=0)
 
-    orig = dashboard.subprocess.run
+    orig_run = dashboard.subprocess.run
+    orig_disk_usage = shutil.disk_usage
     dashboard.subprocess.run = fake_run
+    shutil.disk_usage = lambda _path: types.SimpleNamespace(free=100 * 1024 ** 3)
     try:
         return dashboard.get_system_stats()
     finally:
-        dashboard.subprocess.run = orig
+        dashboard.subprocess.run = orig_run
+        shutil.disk_usage = orig_disk_usage
 
 
 def test_desktop_mac_shows_dash_and_no_bolt():
@@ -86,6 +90,20 @@ def test_laptop_charged_on_ac_keeps_bolt():
     assert stats["charging"] is True, stats["charging"]
 
 
+def test_pmset_absent_is_a_supported_platform_fallback():
+    orig_run = dashboard.subprocess.run
+    orig_disk_usage = shutil.disk_usage
+    dashboard.subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError())
+    shutil.disk_usage = lambda _path: types.SimpleNamespace(free=100 * 1024 ** 3)
+    try:
+        stats = dashboard.get_system_stats()
+    finally:
+        dashboard.subprocess.run = orig_run
+        shutil.disk_usage = orig_disk_usage
+    assert stats["battery"] == "—", stats["battery"]
+    assert stats["charging"] is False, stats["charging"]
+
+
 def main():
     failures = []
     for fn in (
@@ -93,6 +111,7 @@ def main():
         test_laptop_on_ac_keeps_percent_and_bolt,
         test_laptop_on_battery_keeps_percent_no_bolt,
         test_laptop_charged_on_ac_keeps_bolt,
+        test_pmset_absent_is_a_supported_platform_fallback,
     ):
         try:
             fn()

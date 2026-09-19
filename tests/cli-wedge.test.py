@@ -11,9 +11,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -426,7 +426,12 @@ class IoEdge(unittest.TestCase):
         junk = lambda *a, **k: SimpleNamespace(returncode=0, stdout="garbage\n")
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=junk, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[4242]))
         self.assertEqual(w._pid_ancestors(pid=777, runner=boom), [777])
-        self.assertIn(os.getppid(), w._pid_ancestors())
+        snapshot = "PID PPID ARGS\n777 4242 child\n4242 1 parent\n"
+        with patch.object(w, "is_windows", return_value=True), \
+                patch.object(w, "process_snapshot", return_value=snapshot):
+            self.assertEqual(w._pid_ancestors(pid=777), [777, 4242])
+        if os.name != "nt":
+            self.assertIn(os.getppid(), w._pid_ancestors())
 
     def test_pane_identity_probe(self):
         ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
@@ -438,7 +443,7 @@ class IoEdge(unittest.TestCase):
 
 def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     """A stand-in tmux binary: each capture-pane prints the next frame from a file."""
-    script = dir_ / "tmux"
+    script = dir_ / ("tmux.py" if os.name == "nt" else "tmux")
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import sys, pathlib\n"
@@ -451,7 +456,28 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
         "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        wrapper = dir_ / "tmux.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        return wrapper
     return script
+
+
+def _append_window_worker(workspace: str, barrier, index: int) -> None:
+    barrier.wait(timeout=20)
+    w.append_window(Path(workspace), working_frame(index), 10.0 + index)
+
+
+def _racy_window_worker(workspace: str, barrier, index: int) -> None:
+    path = w.window_path(Path(workspace))
+    entries = w.load_window(path)
+    barrier.wait(timeout=20)
+    (Path(workspace) / f"racy-{index}.attempted").write_text("1")
+    entries.append({"ts": 10.0 + index, "state": "s", "raw_state": "r", "patterns": []})
+    try:
+        w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+    except OSError:
+        pass
 
 
 class Identity(unittest.TestCase):
@@ -799,8 +825,9 @@ class Cli(unittest.TestCase):
         path = w.record(args, lambda: IDLE, clock=clock, sleep=lambda s: None)
         first = json.loads(path.read_text().splitlines()[0])
         self.assertEqual(sorted(first), ["patterns", "raw_state", "state", "ts"])
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
         args2 = SimpleNamespace(**{**vars(args), "keep_normalized": True})
         path2 = w.record(args2, lambda: IDLE, clock=clock, sleep=lambda s: None)
         self.assertIn("normalized", json.loads(path2.read_text().splitlines()[0]))
@@ -825,14 +852,11 @@ class ConcurrentWriters(unittest.TestCase):
             # Every worker holds the lock only inside append_window; a barrier lines them up
             # at the door so they contend for the same read/modify/write.
             n = 6
-            barrier = mp.Barrier(n)
-
-            def worker(i):
-                barrier.wait(timeout=20)
-                w.append_window(ws, working_frame(i), 10.0 + i)
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=worker, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_append_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
@@ -841,7 +865,8 @@ class ConcurrentWriters(unittest.TestCase):
             entries = w.load_window(w.window_path(ws))
             self.assertEqual(len(entries), 1 + n)
             self.assertEqual(sorted(e["ts"] for e in entries), [1.0] + [10.0 + i for i in range(n)])
-            self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
+            if os.name != "nt":
+                self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
 
     def test_without_the_lock_the_same_race_loses_a_sample(self):
         # Negative control: the pre-fix shape — load, then append+replace after every
@@ -851,22 +876,18 @@ class ConcurrentWriters(unittest.TestCase):
             ws = Path(d)
             w.append_window(ws, IDLE, 1.0)
             n = 3
-            barrier = mp.Barrier(n)
-
-            def racy(i):
-                path = w.window_path(ws)
-                entries = w.load_window(path)
-                barrier.wait(timeout=20)  # everyone has loaded the same 1 entry
-                entries.append({"ts": 10.0 + i, "state": "s", "raw_state": "r", "patterns": []})
-                w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=racy, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_racy_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
                 pr.join(30)
-            self.assertEqual(len(w.load_window(w.window_path(ws))), 2)  # 1 + one survivor, not 4
+            self.assertEqual([pr.exitcode for pr in procs], [0] * n)
+            self.assertEqual(len(list(ws.glob("racy-*.attempted"))), n)
+            self.assertLess(len(w.load_window(w.window_path(ws))), 1 + n)
 
 
 class Confidentiality(unittest.TestCase):
@@ -891,6 +912,7 @@ class Confidentiality(unittest.TestCase):
                 self.assertLessEqual(set(e[-1][key]), vocab, key)
             self.assertNotIn("/login", w.window_path(Path(d)).read_text())
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not meaningful on Windows")
     def test_files_are_owner_only_under_a_permissive_umask(self):
         old = os.umask(0o022)
         try:
@@ -1050,6 +1072,104 @@ class FourCasesFold(unittest.TestCase):
         self.assertFalse(r["raw_static"], "moving")
         self.assertTrue(r["warn"], "abnormal")
         self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
+
+
+
+class BannerPrefix(unittest.TestCase):
+    def test_the_clis_retry_banner_is_the_retry_family_under_its_result_prefix(self):
+        # Claude Code renders errors under "⎿"; the prefix must not hide the banner
+        # from either family's line-start anchor.
+        for line in ("Connection error. Retrying…",
+                     "  ⎿  Connection error. Retrying in 2 seconds…"):
+            self.assertIn("connection-error", w.matched_patterns([line]), line)
+            self.assertEqual([], w.matched_abnormal([line]), line)
+        self.assertIn("api-error", w.matched_abnormal(["  ⎿  API Error: 529 Overloaded"]))
+
+
+class LiveRetryBanner(unittest.TestCase):
+    """The CLI's own retry line, judged whole; prose that mentions a retry is not one."""
+
+    LIVE = (
+        "  ⎿  Connection error. Retrying in 2 seconds…",
+        '  ⎿  API Error (529 {"type":"overloaded_error"}) · Retrying in 1 seconds… (attempt 1/10)',
+        "Rate limit reached. Retrying in 30s (attempt 2 of 5)",
+        "Retrying…",
+        "Reconnecting…",
+    )
+    PROSE = (
+        "  ⎿  Connection error. Retrying was the fix.",       # the tool-result prefix, then prose
+        "⏺ I once saw a Connection error. Retrying was the fix.",
+        "  Connection error handling is covered by tests.",   # a wrapped sentence's second row
+        "⎿  Read 3 files; retrying the build later",
+        "Retrying in 2 seconds is what the docs recommend.",
+        "Connection error. The fix was retrying",              # cause, then prose, then the verb
+        "API Error handling is covered by tests.",
+    )
+
+    def test_each_live_banner_matches(self):
+        for line in self.LIVE:
+            self.assertEqual(1, len(w.live_retry_banner_lines(line)), line)
+
+    def test_prose_about_a_retry_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_retry_banner_lines(line), line)
+
+    def test_a_banner_is_found_inside_a_full_pane(self):
+        pane = "⏺ working\n" + self.LIVE[0] + "\n❯ \n"
+        self.assertEqual(1, len(w.live_retry_banner_lines(pane)))
+
+    def test_a_cause_followed_by_prose_is_not_a_banner_even_when_it_ends_in_retrying(self):
+        self.assertEqual([], w.live_retry_banner_lines("Connection error. The fix was retrying"))
+        self.assertEqual(1, len(w.live_retry_banner_lines("Connection error · Retrying")))
+
+    def test_the_retry_family_keyword_check_is_wider_than_the_banner(self):
+        # RETRY_PATTERNS is telemetry over any text; the banner grammar must be strictly narrower.
+        for line in self.PROSE:
+            self.assertTrue(w.matched_patterns([line]) or "retry" not in line.lower(), line)
+
+
+class LiveParkedBanner(unittest.TestCase):
+    """The parked family as whole lines: the CLI's own stop banner, never a sentence naming it."""
+
+    LIVE = (
+        ("api-error", 'API Error: 529 {"type":"overloaded_error"}'),
+        ("api-error", "  ⎿  API Error (Connection error.)"),
+        ("api-error", "API Error"),
+        ("compacting", "Compacting conversation…"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired. Run /login"),
+        ("quota-limit", "You have hit your usage limit · resets 3pm"),
+        ("out-of-credits", "Credit balance is too low"),
+        ("awaiting-input", "Waiting for your approval"),
+        ("network-error", "Network error: fetch failed"),
+    )
+    PROSE = (
+        "API Error handling is covered by tests.",
+        "⏺ The API Error we saw yesterday was a 529.",
+        "compacting the notes into one file",
+        "the network error we saw yesterday was different",
+        "I logged in to continue the review",
+        "the usage limit is documented here",
+    )
+
+    def test_each_live_banner_is_found_with_its_family_and_name(self):
+        for name, line in self.LIVE:
+            hits = w.live_banner_lines(line)
+            self.assertEqual(1, len(hits), line)
+            self.assertEqual(("parked", name), hits[0][:2], line)
+
+    def test_prose_naming_a_parked_condition_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_banner_lines(line), line)
+
+    def test_a_retry_banner_reports_the_retry_family(self):
+        self.assertEqual(("retry", "retrying"), w.live_banner_lines("  ⎿  Connection error. Retrying in 2 seconds…")[0][:2])
+
+    def test_the_gate_grammar_is_narrower_than_the_detector(self):
+        # ABNORMAL_PATTERNS is telemetry over any text and may match prose; the gate must not.
+        for line in self.PROSE:
+            if w.matched_abnormal([line]):
+                self.assertEqual([], w.live_banner_lines(line), line)
 
 
 if __name__ == "__main__":

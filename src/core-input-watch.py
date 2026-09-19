@@ -113,7 +113,12 @@ def _load_runtime_health():
 
 # Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
 # with the caret on its "Switch to <fallback> and continue" row.
-_FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
+from delivery.pane_gate import (  # noqa: E402
+    AWAIT_HINT, BORDER_LINE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE, COMPOSER_PLACEHOLDER, FABLE_TEXT,
+    composer_text as _pg_composer_text,
+)
+
+_FABLE_TEXT = FABLE_TEXT
 #: Lines allowed between the nearest Fable text and the focused switch row (body may wrap).
 _FABLE_CARET_GAP = 3
 
@@ -121,23 +126,13 @@ _FABLE_CARET_GAP = 3
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
 # the net-new layer over runtime-health: it identifies WHICH gate the core is
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
-_SIGNATURES = [
-    # The caret ON the Fable dialog's switch row (classify also demands the Fable text
-    # above it); the same dialog with the caret anywhere else is the human gate below.
-    ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
-    ("fable-limit-unfocused", _FABLE_TEXT),
-    ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
-    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
-    ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
-    ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
-    ("press-enter", re.compile(r"Press Enter to continue", re.I)),
-    ("selection", re.compile(r"(❯\s*\d+\.|\bSelect\b).*", re.S)),
-    ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
-]
-_AWAIT_HINT = re.compile(
-    r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
-    r"|Continuing automatically|❯\s*\d+\.", re.I)
-_IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
+# The list (with the caret-on-the-Fable-switch-row entry classify() leans on) and the
+# affordance hint that gates it are src/delivery/pane_gate.py's, shared with the notifiers.
+_SIGNATURES = list(CLAUDE_GATE_SIGNATURES)
+_AWAIT_HINT = AWAIT_HINT
+_IDLE = CLAUDE_IDLE
+#: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
+_BORDER_LINE = BORDER_LINE
 
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
@@ -154,6 +149,13 @@ _TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
+# The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
+# on the first typed character, so it is never a draft. Plain capture loses its dimming.
+_COMPOSER_PLACEHOLDER = COMPOSER_PLACEHOLDER
+# With `capture-pane -e` the CLI's ghost text (that hint, a suggested reply) is dimmed:
+# SGR 2 on some builds, a 256-colour grey (232-255) on others. Typed text never is.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_DIM_SPAN = re.compile(r"\x1b\[(?:2|38;5;2(?:3[2-9]|4\d|5[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40
 
@@ -205,7 +207,11 @@ def classify(pane: str):
     # mid-session "Do you want to proceed? / Allow this action" prompt rendered
     # above the footer was hidden — a false negative on a MAIN escalation case. The
     # footer itself matches none of the signatures, so idle still suppresses.)
-    if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES):
+    # The footer vouches only for itself: a hint on any OTHER line is a live
+    # prompt sharing the window with an old footer, and must not be suppressed.
+    beyond_footer = "\n".join(ln for ln in tail.splitlines() if not _IDLE.search(ln))
+    if (_IDLE.search(tail) and not _AWAIT_HINT.search(beyond_footer)
+            and not any(rx.search(tail) for _, rx in _SIGNATURES)):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
@@ -234,7 +240,32 @@ def _is_idle_ready(pane: str) -> bool:
     no-affordance pane (mid-processing / blank / frozen); that must NOT be read as
     idle. Mirrors classify()'s idle-footer suppression."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
-    return bool(_IDLE.search(tail)) and not any(rx.search(tail) for _, rx in _SIGNATURES)
+    return bool(_IDLE.search(tail)) and classify(pane) is None
+
+
+def _composer_is_empty(pane: str) -> bool:
+    """True iff the bottommost ❯ prompt line carries no unsent draft text.
+
+    Distinct from `_is_idle_ready`, which classifies gates/turn state and says
+    nothing about a partial owner draft sitting in the composer — an idle-ready
+    footer and an unsent "❯ owner draft" line are not mutually exclusive. Mirrors
+    `refused_turn`'s own prompt-line predicate (a `_PROMPT_LINE` match with
+    non-empty content after stripping the marker means a draft is staged). No
+    ❯ line at all is NOT verifiably empty — fails closed (False), never assumed.
+    """
+    for raw in reversed([ln for ln in pane.splitlines() if ln.strip()]):
+        ln = _ANSI_SGR.sub("", raw)
+        if _PROMPT_LINE.match(ln):
+            undimmed = _ANSI_SGR.sub("", _DIM_SPAN.sub("", raw))
+            return (bool(_COMPOSER_PLACEHOLDER.match(ln))
+                    or not undimmed.strip().lstrip("❯").strip())
+    return False
+
+
+# Aliases src/delivery/pane_gate.py's composer_text(), the one parser also
+# reachable via `pane_gate.py composer-text` for task-notifier.sh's staging checks.
+def _composer_text(pane: str) -> "str | None":
+    return _pg_composer_text(pane)
 
 
 def refused_turn(pane: str):

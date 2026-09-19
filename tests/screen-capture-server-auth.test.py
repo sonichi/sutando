@@ -167,8 +167,9 @@ def test_load_creates_new_token_when_missing() -> None:
             token = sc._load_or_create_capture_token()
         ok("creates token when missing", bool(token) and len(token) >= 32,
            f"got {token!r}")
-        ok("token file created 0600",
-           os.path.exists(tok_path) and (os.stat(tok_path).st_mode & 0o777) == 0o600,
+        mode_ok = os.name == "nt" or (os.stat(tok_path).st_mode & 0o777) == 0o600
+        ok("token file created with platform-secure permissions",
+           os.path.exists(tok_path) and mode_ok,
            f"mode={oct(os.stat(tok_path).st_mode) if os.path.exists(tok_path) else 'missing'}")
 
 
@@ -185,6 +186,8 @@ def test_load_reuses_existing_valid_token() -> None:
 
 
 def test_load_rejects_wrong_permissions() -> None:
+    if os.name == "nt":
+        return
     with tempfile.TemporaryDirectory() as td:
         tok_path = os.path.join(td, "screen-capture-token")
         # Write with 0644 — world-readable, should be rejected
@@ -207,15 +210,12 @@ test_load_rejects_wrong_permissions()
 # Downscale budget tests
 # ---------------------------------------------------------------------------
 
-def test_downscale_invokes_sips_with_bounds() -> None:
+def test_downscale_delegates_with_bounds() -> None:
     with tempfile.NamedTemporaryFile() as frame:
-        with unittest.mock.patch.object(sc.subprocess, "run") as run:
+        with unittest.mock.patch.object(sc, "_platform_resize_image", return_value=True) as resize:
             ok_result = sc._downscale_frame(frame.name, 1280, 60)
-        ok("downscale succeeds when sips succeeds", ok_result)
-        ok("downscale bounds reach sips", run.call_args.args[0] == [
-            "sips", "--resampleHeightWidthMax", "1280", "-s", "format",
-            "jpeg", "-s", "formatOptions", "60", frame.name,
-        ], f"got {run.call_args.args[0] if run.call_args else None}")
+        ok("downscale succeeds when platform resize succeeds", ok_result)
+        ok("downscale bounds reach platform resize", resize.call_args.args == (frame.name, 1280, 60))
 
 
 def test_downscale_failure_only_allows_small_original() -> None:
@@ -224,10 +224,10 @@ def test_downscale_failure_only_allows_small_original() -> None:
         small.flush()
         large.write(b"x" * (sc.DOWNSCALE_FAIL_MAX_BYTES + 1))
         large.flush()
-        with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")):
+        with unittest.mock.patch.object(sc, "_platform_resize_image", return_value=False):
             ok("downscale failure permits a small original", sc._downscale_frame(small.name, 1280, 60))
             ok("downscale failure rejects an over-budget original", not sc._downscale_frame(large.name, 1280, 60))
-    with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")), \
+    with unittest.mock.patch.object(sc, "_platform_resize_image", return_value=False), \
          unittest.mock.patch.object(sc.os.path, "getsize", side_effect=OSError("stat failed")):
         ok("downscale failure rejects an unreadable original", not sc._downscale_frame("missing.jpg", 1280, 60))
 
@@ -237,6 +237,7 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
          unittest.mock.patch("os.makedirs"), \
          unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_platform_capture_screen", return_value=True), \
          unittest.mock.patch.object(sc, "_downscale_frame", return_value=True) as downscale:
         handler._handle_capture()
     ok("capture passes bounded JPEG options to downscale", downscale.call_args.args[1:] == (1280, 60),
@@ -248,6 +249,7 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
          unittest.mock.patch("os.makedirs"), \
          unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_platform_capture_screen", return_value=True), \
          unittest.mock.patch.object(sc, "_downscale_frame", return_value=False):
         failed._handle_capture()
     ok("capture rejects a frame that cannot meet the downscale budget", failed._response_code == 500,
@@ -257,9 +259,33 @@ def test_capture_downscale_options_and_failure_are_visible() -> None:
     }, f"got body={failed._buf.getvalue()!r}")
 
 
-test_downscale_invokes_sips_with_bounds()
+def test_notification_and_macos_display_delegate() -> None:
+    with unittest.mock.patch.object(sc, "_platform_notify") as notify:
+        sc._notify_capture_blocking()
+        ok("capture notification delegates to the platform helper",
+           notify.call_args.args == ("Captured screen",))
+    with unittest.mock.patch.object(
+            sc, "_platform_notify", side_effect=RuntimeError("unavailable")):
+        sc._notify_capture_blocking()
+        ok("capture notification failures remain advisory", True)
+
+    handler = _FakeHandler("/capture?display=2&format=png&silent=true", "secret-token")
+    with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+         unittest.mock.patch("os.makedirs"), \
+         unittest.mock.patch.object(sc, "is_macos", return_value=True), \
+         unittest.mock.patch.object(sc.subprocess, "run") as run:
+        handler._handle_capture()
+    command = run.call_args.args[0]
+    ok("macOS display capture passes the requested display to screencapture",
+       "-D2" in command and command[-1].endswith("-d2.png"), f"got command={command!r}")
+    ok("macOS display capture returns success", handler._response_code == 200,
+       f"got code={handler._response_code}")
+
+
+test_downscale_delegates_with_bounds()
 test_downscale_failure_only_allows_small_original()
 test_capture_downscale_options_and_failure_are_visible()
+test_notification_and_macos_display_delegate()
 
 # ---------------------------------------------------------------------------
 # Summary

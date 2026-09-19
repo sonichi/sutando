@@ -12,6 +12,8 @@ else
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+# The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
+DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
@@ -24,7 +26,9 @@ TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-f
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
-CORE_STATUS_STALE_SEC=90
+# Wait this long for a watcher event before retrying a task a refusal left queued.
+# Integer seconds: bash 3.2's `read -t` rejects a fractional timeout.
+RETRY_INTERVAL="${SUTANDO_NOTIFIER_RETRY_INTERVAL:-30}"
 # Submit verification: re-press C-m while the prompt is still staged in the
 # composer and no result has appeared. See submit_and_confirm.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
@@ -32,8 +36,9 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 COMPOSER_READY_TIMEOUT="${SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT:-30}"
 # Poll the composer at the caller's cadence; the default is human-scale.
 COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
-CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
+PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
+DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -107,68 +112,50 @@ prepare_workstream_context() {
   fi
 }
 
+# Completion detection is src/delivery/task_dispatch.py's contract (with the
+# watcher's handler_result_exists); only the receipt cleanup is this notifier's.
 has_result() {
-  local filename="$1" stem archive_dir
-  if [ -f "$RESULTS_DIR/$filename" ]; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
-  fi
-  stem="${filename%.txt}"
-  # Local bridges archive as archive/YYYY-MM/<task>.txt. The remote gateway
-  # archives as archive/<task>-<epoch>.txt. Startup retention uses sibling
-  # archive-YYYY-MM-DD/<task>.txt directories. All are completed deliveries.
-  if [ -d "$RESULTS_DIR/archive" ] && find "$RESULTS_DIR/archive" \
-      -mindepth 1 -maxdepth 2 -type f \
-      \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-      | grep -q .; then
-    rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-    return 0
-  fi
-  for archive_dir in "$RESULTS_DIR"/archive-*; do
-    [ -d "$archive_dir" ] || continue
-    if find "$archive_dir" -mindepth 1 -maxdepth 1 -type f \
-        \( -name "$filename" -o -name "$stem-[0-9]*.txt" \) -print -quit 2>/dev/null \
-        | grep -q .; then
-      rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-      return 0
-    fi
-  done
-  return 1
+  local filename="$1"
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
+  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
+  return 0
 }
 
-core_pane_is_busy() {
+# What the pane text MEANS (idle footer, gate signatures, working marker, the
+# empty-composer placeholder) is src/delivery/pane_gate.py's; only the capture is ours.
+pane_state() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
-  printf '%s\n' "$pane" | tail -12 | grep -Fq 'esc to interrupt'
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  # A blank capture is NO information, which is not the same as a pane we read and
+  # could not account for; fail here so callers see "" and keep the two apart.
+  [ -n "${pane//[[:space:]]/}" ] || return 1
+  printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime codex 2>/dev/null
 }
 
 core_pane_is_idle_ready() {
-  local pane tail
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
-  tail="$(printf '%s\n' "$pane" | sed '/^[[:space:]]*$/d' | tail -14)"
-  # Keep this positive-idle contract aligned with core-input-watch.py's
-  # _is_idle_ready(): the known Codex footer must be present, and no active
-  # gate signature or live-working marker may share the tail.
-  printf '%s\n' "$tail" \
-    | grep -Eiq '⏵⏵[[:space:]]*bypass permissions on|for agents([^[:alpha:]]|$)' \
-    || return 1
-  ! printf '%s\n' "$tail" | grep -Eiq \
-    "esc to interrupt|trust the files in this folder|Do you trust|Bypass Permissions mode|Yes, I accept|Select login method|Paste code here|Browser didn.?t open|Press Enter to continue|❯[[:space:]]*[0-9]+\\.|Do you want to (proceed|allow)|Allow this action|permission to"
+  [ "$(pane_state)" = idle-ready ]
 }
 
+# Refuses on a real draft, a live turn, a crashed TUI -- and on "unknown", because
+# a pane nobody could parse is an absence of evidence, not evidence of safety.
+pane_is_unsafe() {
+  # pane_gate.py owns which states may be typed into; the allow-list is fetched once
+  # and tested in shell because a python fork per poll is itself a defect.
+  # "" is an unreadable pane -- an absence of evidence, never evidence of safety. It
+  # may hold an unsent draft, so it refuses, matching the Claude notifier's guard.
+  [ -z "$1" ] && return 0
+  if [ -z "${_SAFE_STATES:-}" ]; then
+    _SAFE_STATES="$("$NOTIFIER_PY" "$PANE_GATE_PY" safe-states 2>/dev/null)"
+    [ -z "$_SAFE_STATES" ] && _SAFE_STATES="__UNAVAILABLE__"
+  fi
+  [ "$_SAFE_STATES" = "__UNAVAILABLE__" ] && return 0
+  case " $_SAFE_STATES " in *" $1 "*) return 1 ;; *) return 0 ;; esac
+}
+
+# The pane is the only witness; the core's own status file is a self-report that
+# is stale or absent in exactly the moments this path serves. POSITIVE idle only.
 core_is_idle() {
-  local now status_ts
-  [ -f "$CORE_STATUS_FILE" ] || return 1
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"idle"' "$CORE_STATUS_FILE" 2>/dev/null \
-    && ! core_pane_is_busy && return 0
-  grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"' "$CORE_STATUS_FILE" 2>/dev/null \
-    || return 1
-  status_ts="$(sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CORE_STATUS_FILE" \
-    | head -1)"
-  [ -n "$status_ts" ] || return 1
-  now="$(date +%s)"
-  [ $((now - status_ts)) -gt "$CORE_STATUS_STALE_SEC" ] \
-    && core_pane_is_idle_ready
+  core_pane_is_idle_ready
 }
 
 wait_for_core_idle() {
@@ -188,12 +175,9 @@ wait_for_core_idle() {
 
 next_pending_task() {
   local candidate
+  # Priority order, completion and live claims come from task_dispatch; the
+  # optional-handler probe needs --runtime, so that hold stays here.
   while IFS= read -r candidate; do
-    case "$candidate" in
-      ""|*/*|*..*) continue ;;
-    esac
-    has_result "$candidate" && continue
-    [ -f "$TASK_HANDLER_CLAIMS_DIR/$candidate" ] && continue
     if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
         && probe_optional_task_handler "$candidate"; then
       # The watcher has not published its claim yet. Leave the file durable;
@@ -203,18 +187,8 @@ next_pending_task() {
     printf '%s\n' "$candidate"
     return 0
   done < <(
-    "$NOTIFIER_PY" - "$REPO/src" "$TASKS_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from task_priority import sort_tasks_by_priority
-
-tasks_dir = Path(sys.argv[2])
-for task in sort_tasks_by_priority(tasks_dir.glob("*.txt")):
-    if task.is_file():
-        print(task.name)
-PY
+    "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
+      --claims-dir "$TASK_HANDLER_CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR"
   )
   return 1
 }
@@ -248,11 +222,9 @@ prompt_is_staged() {
 # painting its startup banner discards the whole paste, text and C-m alike,
 # leaving nothing staged and nothing dispatched.
 composer_ready() {
-  # Either accepted idle shape: this file's existing positive-idle contract, or
-  # the empty-composer placeholder a live Codex prints between turns.
-  core_pane_is_idle_ready && return 0
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null \
-    | tail -8 | grep -Fq 'Ask Codex to do anything'
+  # idle-ready covers both accepted shapes: the idle footer, or the
+  # empty-composer placeholder a live Codex prints between turns.
+  core_pane_is_idle_ready
 }
 
 wait_for_composer() {
@@ -279,10 +251,25 @@ wait_for_composer() {
 # the second half, so a swallowed paste read as instant success and the
 # notifier slept out its completion timeout on a task Codex never received.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0
-  # Verification is ADVISORY. A pane that never echoes our paste (a harness, or
-  # a Codex build with another footer) must still receive the task.
-  wait_for_composer || true
+  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state
+  # Verification is ADVISORY only when the pane hands us NO information at all --
+  # a harness or Codex build we cannot read, where wait_for_composer's own poll
+  # never had anything to key on (pane_state fails outright: capture-pane errored).
+  # It must NOT be advisory once we CAN read the pane and it says something other
+  # than idle-ready: typing our task over a real unsent draft concatenates the two
+  # and submits both (keweichen round-4, review 5231933087, blocker 2 -- "the
+  # queued task is concatenated with and submits the user's unsent draft").
+  if ! wait_for_composer; then
+    final_state="$(pane_state || true)"
+    if pane_is_unsafe "$final_state"; then
+      if [ -z "$final_state" ]; then
+        log_notifier "refusing to type $filename: pane UNREADABLE after ${COMPOSER_READY_TIMEOUT}s (no verdict, not a safe verdict)"
+      else
+        log_notifier "refusing to type $filename: composer is '$final_state', not idle-ready, after ${COMPOSER_READY_TIMEOUT}s"
+      fi
+      return 1
+    fi
+  fi
   while :; do
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
@@ -341,7 +328,14 @@ submit_task() {
     fi
   fi
   # Type + verify staged, then C-m + verify dispatched — see deliver_prompt.
-  deliver_prompt "$filename" "$prompt"
+  # A refusal (composer holds a real unsent draft) must not crash the notifier
+  # under set -e: leave the task file unclaimed so the watcher's next idle
+  # cycle retries it, instead of exiting the whole process on one busy pane.
+  if ! deliver_prompt "$filename" "$prompt"; then
+    log_notifier "deferring $filename: composer was not idle-ready, will retry on the next idle cycle"
+    clear_workstream_context
+    return 0
+  fi
 
   # Codex's interactive input is not a durable multi-message queue: sending a
   # second prompt while the first turn is starting can replace or interleave
@@ -381,17 +375,32 @@ mkfifo "$event_dir/events"
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
-while IFS= read -r event; do
-  case "$event" in
-    "TASK_FILE: "*)
-      # Watcher output is a wake signal, not queue order. While the core is
-      # busy, keep every task durable on disk instead of typing into Codex's
-      # non-durable interactive input. Once idle, re-scan the whole queue and
-      # select urgent/normal/low priority with FIFO only inside each tier.
-      next_pending_task >/dev/null || continue
-      wait_for_core_idle || exit 1
-      filename="$(next_pending_task)" || continue
-      submit_task "$filename" 1
-      ;;
-  esac
+# Watcher output is a wake signal, not queue order. While the core is busy, keep
+# every task durable on disk rather than typing into Codex's non-durable input.
+attempt_highest_pending() {
+  local filename
+  next_pending_task >/dev/null || return 0
+  wait_for_core_idle || exit 1
+  filename="$(next_pending_task)" || return 0
+  submit_task "$filename" 1
+}
+
+# `read || rc=$?`, NOT `read; rc=$?` -- under `set -e` the bare form dies before
+# the assignment runs, leaving the timeout branch below unreachable.
+while :; do
+  event="" rrc=0
+  IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
+  if [ "$rrc" -eq 0 ]; then
+    case "$event" in
+      "TASK_FILE: "*) attempt_highest_pending ;;
+    esac
+    continue
+  fi
+  # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike, so
+  # the code cannot tell them apart -- ask whether the watcher is still alive.
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    attempt_highest_pending   # a refused task has no other trigger; retry it
+    continue
+  fi
+  break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"

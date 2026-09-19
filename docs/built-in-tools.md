@@ -40,6 +40,8 @@ stream, pull or push) are bounded first: anything over 200 KB is resampled to a
 unbounded frame delays speech, not just vision. Reading a captured file from disk
 is unaffected — the bound applies only on the way into a session.
 
+**Windows platform tools** — `open_file` uses Windows ShellExecute with a literal target; characters such as `&`, `%`, and apostrophes are not interpreted as commands. Missing handlers return an error. Clipboard reads and writes preserve Unicode and multiline text through UTF-8. `pwsh -File src/notify.ps1 "message"` delegates Discord delivery to the shared owner-resolution and send policy, honoring the configured Claude home. Voice frames use Windows image resizing before the same frame-size limit is applied.
+
 **Notes** — the user's second brain. Save and retrieve notes:
 - Save: write to `notes/{slug}.md` with a descriptive filename
 - Retrieve: search notes with `Glob("notes/**/*.md")` or `Grep` for content
@@ -289,10 +291,30 @@ app is signed in with a new account.
 
 **App launcher** — open any macOS app:
 ```bash
-open -a "Safari"                    # open by name
+# Windows: use the registered display name; success requires verified foreground focus.
+pwsh -NoProfile -File scripts/open-app.ps1 "Paint"
+pwsh -NoProfile -File scripts/open-app.ps1 "Microsoft Store"
+
+# macOS
+open -a "Safari"
 open -a "Slack"
 open "https://github.com"           # open URL in default browser
 ```
+Voice and phone can use `switch_app` on macOS and Windows. The Windows CLI and
+inline tool share `src/windows-app-launcher.ps1`; bundled services ship the same
+backend beside their JavaScript artifacts.
+
+Windows matches registered app IDs or exact executable paths, never window-title
+substrings. It reuses an existing window (restoring it if minimized) or launches
+once, then verifies the intended app actually owns the foreground. An already
+foreground app is left alone; otherwise the first matching window is selected,
+not a particular document or profile. Shortcuts whose identity cannot be resolved
+fail rather than guessing from their display name.
+
+An interactive desktop is required. Windows may refuse foreground activation,
+especially when the agent runs in the background; the tool reports that refusal
+and asks the user to select the app from the taskbar. Merely launching a process
+or making a window visible is not success.
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 

@@ -44,6 +44,16 @@ class RosterError(Exception):
     """A declaration the roster cannot represent, refused at compile time."""
 
 
+class PublishError(OSError):
+    """The roster was written but its advertisement was not: the router will
+    follow the new roster, the picker will not until a publish succeeds."""
+
+    def __init__(self, roster: dict, cause: OSError):
+        super().__init__(getattr(cause, "errno", None),
+                         f"roster v{roster.get('version')} written, advertisement not: {cause}")
+        self.roster = roster
+
+
 def _root(workspace) -> Path:
     return Path(workspace) if workspace is not None else resolve_workspace()
 
@@ -254,7 +264,58 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
     _write_atomic(roster_path(workspace), roster)
+    _publish(workspace, roster)
     return roster
+
+
+def _publish(workspace, roster: dict) -> None:
+    """The advertisement is derived from the roster, so it is published where the
+    roster is written: a direct `bind_room` is then harmless by construction."""
+    import pool_advertise as pa  # sibling; it imports this module, so bound late
+    try:
+        pa.write_advertisement(workspace)
+    except OSError as e:
+        raise PublishError(roster, e) from e
+
+
+class HandlerPublishError(RosterError):
+    """The handler could not be published, so no pool may be registered.
+
+    The launcher reads zero publishers as the ordinary no-pool case, so a pool
+    that exists without one is indistinguishable from no pool at all -- and
+    worker-bound tasks would fall through to the unrestricted core.
+    """
+
+
+def publish_task_event_handler():
+    """Publish this skill's handler where the launcher's neutral lookup finds it.
+
+    Created when a pool first exists rather than shipped in the repo: an install
+    that never made a worker publishes nothing, the lookup finds none, and the
+    watcher behaves exactly as it did before this skill existed.
+    """
+    link = Path(__file__).resolve().parents[1] / "task-event-handler"
+    if link.is_symlink() or link.exists():
+        return link
+    try:
+        link.symlink_to(Path("scripts") / "pool_route_handler.py")
+    except OSError as e:
+        raise HandlerPublishError(
+            f"cannot publish the task-event handler at {link}: {e}") from e
+    return link
+
+
+def ensure_task_event_handler_published(workspace):
+    """Republish this skill's handler if a pool already has a worker but the
+    file is missing -- self-heals a checkout from before the file stopped
+    being tracked in git. A no-op with no pool: the handler stays unshipped.
+    """
+    roster = load_roster(workspace)
+    if roster and roster.get("workers"):
+        return publish_task_event_handler()
+    return None
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
@@ -265,6 +326,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
     drops one of them from the result.
     """
     with _locked(workspace):
+        # Before any durable write: a registration that survived a failed publish
+        # would leave a real pool the launcher cannot distinguish from no pool.
+        publish_task_event_handler()
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
         if runtime:
@@ -280,10 +344,11 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
 
 def bind_room(workspace, room: str, target: str) -> dict:
     """Bind one room to one worker, named by id or by a unique label — the one
-    production writer for a pin. Same locked read-merge-write as
-    `register_worker`; an unknown or ambiguous name is refused BEFORE the
-    declaration is saved, so bindings.json never names a target the roster
-    would reject on its next compile."""
+    production writer for a pin, and it publishes: the compile it ends in writes
+    the advertisement too. Same locked read-merge-write as `register_worker`; an
+    unknown or ambiguous name is refused BEFORE the declaration is saved, so
+    bindings.json never names a target the roster would reject on its next
+    compile."""
     with _locked(workspace):
         raw = _load_existing_roster_strict(workspace)
         if raw is None:

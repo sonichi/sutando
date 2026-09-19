@@ -487,14 +487,16 @@ class TestApply(unittest.TestCase):
     def test_a_set_of_two_is_refused_untouched(self):
         cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W1} {W2} — bound set, "
                                "pool-restriction routing (worker picker)")
+        before = pa.advertisement_path(self.ws).read_bytes()
         with self.assertRaises(pr.RosterError):
             wpc.apply(self.ws, cmd, task_id="task-refused")
         self.assertEqual(pr.load_bindings(self.ws), {})
-        self.assertFalse(pa.advertisement_path(self.ws).exists())
+        self.assertEqual(pa.advertisement_path(self.ws).read_bytes(), before)
 
     def test_add_is_not_applied_here(self):
+        before = pa.advertisement_path(self.ws).read_bytes()
         self.assertIsNone(wpc.apply(self.ws, wpc.parse(hdr(), ADD), task_id="task-add"))
-        self.assertFalse(pa.advertisement_path(self.ws).exists())
+        self.assertEqual(pa.advertisement_path(self.ws).read_bytes(), before)
 
 
 class TestAuthorizedCommand(unittest.TestCase):

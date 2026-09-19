@@ -23,7 +23,6 @@ import contextlib
 import ctypes
 import ctypes.util
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -31,8 +30,14 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+
+try:
+    from .file_lock import lock_fd
+except ImportError:
+    from file_lock import lock_fd
 
 CLAIMS_DIR = ".claims"
 LOCKS_DIR = ".claim-locks"
@@ -116,6 +121,54 @@ def _linux_process_identity(pid: int) -> Optional[ProcessIdentity]:
         return ProcessIdentity(pid, OwnerState.ALIVE)
 
 
+@lru_cache(maxsize=1)
+def _windows_api():
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    api.WaitForSingleObject.restype = wintypes.DWORD
+    api.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    api.GetProcessTimes.restype = wintypes.BOOL
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    return api
+
+
+def _windows_process_identity(pid: int) -> ProcessIdentity:
+    unknown = ProcessIdentity(pid, OwnerState.UNKNOWN)
+    if not isinstance(pid, int) or pid <= 0 or pid > 0xFFFFFFFF:
+        return unknown
+    try:
+        api = _windows_api()
+    except (OSError, AttributeError):
+        return unknown
+    handle = api.OpenProcess(0x101000, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == 87:
+            return ProcessIdentity(pid, OwnerState.DEAD)
+        return unknown
+    try:
+        wait = api.WaitForSingleObject(handle, 0)
+        if wait == 0:
+            return ProcessIdentity(pid, OwnerState.DEAD)
+        if wait != 258:
+            return unknown
+        from ctypes import wintypes
+
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not api.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                   ctypes.byref(kernel), ctypes.byref(user)):
+            return unknown
+        filetime = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return ProcessIdentity(pid, OwnerState.ALIVE,
+                               (filetime - 116444736000000000) // 10)
+    finally:
+        api.CloseHandle(handle)
+
+
 def process_identity(pid: int) -> ProcessIdentity:
     """ALIVE / DEAD / UNKNOWN for a pid, with a microsecond birth token when visible.
 
@@ -123,6 +176,8 @@ def process_identity(pid: int) -> ProcessIdentity:
     one case a two-state probe gets catastrophically wrong, because "unknown"
     then reads as "dead" and the claim gets stolen from a running worker.
     """
+    if os.name == "nt":
+        return _windows_process_identity(pid)
     linux = _linux_process_identity(pid)
     if linux is not None:
         return linux
@@ -356,7 +411,7 @@ def _item_lock(root: Path, item_id: str):
     fd = os.open(str(d / lock_name), os.O_CREAT | os.O_RDWR, 0o644)
     held.add(key)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_fd(fd)
         yield
     finally:
         held.discard(key)

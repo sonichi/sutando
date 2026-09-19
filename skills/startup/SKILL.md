@@ -14,7 +14,7 @@ ARGUMENTS: $ARGUMENTS — `--worker` selects the worker bootstrap below; empty i
 
 ## Worker mode (`/startup --worker`)
 
-A pool worker is an instance, not the canonical core. It shares the host's workspace but owns exactly one thing: the watcher on its own delivery folder. **When `$ARGUMENTS` contains `--worker`, run ONLY the sequence in this section and none of the steps below it** — no orphan check (the core owns `tasks/`), no cron registration (a second registrant duplicates every scheduled fire), no ceremony gate (it stamps the core's `schedule-crons-stamp.json`), and no `/startup complete` line.
+A pool worker is an instance, not the canonical core. It shares the host's workspace but owns exactly one thing: the watcher on its own delivery folder. **When `$ARGUMENTS` contains `--worker`, run ONLY the sequence in this section and none of the steps below it** — no orphan check (the core owns `tasks/`), no `/schedule-crons` invocation, no ceremony gate (it stamps the core's `schedule-crons-stamp.json`), and no `/startup complete` line. The one exception is step 2.5 below: a `crons.json` entry explicitly pinned to THIS worker's own id (via its `owner` field, see `skills/schedule-crons/SKILL.md`) is this worker's to register — that is not "a second registrant" for it, because `/schedule-crons` skips any entry owned by a worker (`src/cron_ownership.py`). Every entry without an `owner`, or owned by a different worker, stays untouched here.
 
 1. Ask whether this instance's own watcher is already live. **The core's step 1.5 gate is the wrong question here** — it is satisfied by *any* watcher tree on the host, and the core's own always satisfies it, so a worker that consults it never starts the watcher it exists to run:
 
@@ -28,7 +28,26 @@ A pool worker is an instance, not the canonical core. It shares the host's works
 
 2. On `start` only, start the streaming watcher via the `Monitor` tool — `command: 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'`, `persistent: true`. Both are absolute and come from the launcher, because this session's cwd is the spawner's `--cwd` and need not be the repo — a relative `src/watch-tasks-stream.sh` exits 127 there. If `$SUTANDO_WATCHER_CMD` is unset you were not launched as a worker: stop and say so rather than guessing a path.
 
-3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>`; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
+2.5. **On `start` only** (same gate as step 2 — a fresh incarnation; a `skip` means this instance is already running and re-registering here would duplicate whatever it already has), register any `crons.json` entries pinned to THIS worker's own id. There is no in-session memory of a prior registration to compare against the way `/schedule-crons` step 3 has for a mid-session re-run, so this only ever needs to handle the fresh-boot case:
+
+   ```bash
+   REPO="$(cd "$(dirname "$SUTANDO_WATCHER_CMD")/.." && pwd)"
+   H="$(bash "$REPO/scripts/sutando-config.sh" host-label)"
+   CF="$SUTANDO_WORKSPACE_DIR/hosts/$H/crons.json"
+   "$SUTANDO_PY" -c "
+   import json, sys
+   sys.path.insert(0, '$REPO/src')
+   from cron_ownership import entries_for_owner
+   try:
+       cfg = json.load(open('$CF'))
+   except FileNotFoundError:
+       cfg = []
+   print(json.dumps(entries_for_owner(cfg, '$SUTANDO_INSTANCE_ID')))"
+   ```
+
+   The repo root is derived from `$SUTANDO_WATCHER_CMD` rather than assumed from cwd, for the same reason step 2 does. For each entry the filter returns, `CronCreate` it exactly as `/schedule-crons` step 3 would (`prompt_skill` → `/skill-name`; otherwise the `prompt` string) — an entry pinned to a worker is never a `monitor`, `execution: "codex-task"`, or `launchd: true` entry (those ownership models are core-only), so no further filtering is needed. If `crons.json` doesn't exist, or nothing is pinned to `$SUTANDO_INSTANCE_ID`, there is nothing to do here — that is the common case for most workers.
+
+3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>` (plus `+ N cron(s) registered` when step 2.5 registered any); `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
 
 
 ## What this replaces

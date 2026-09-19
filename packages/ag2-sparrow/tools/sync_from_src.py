@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 14 of them, including outbox.py and its
+canonical for those modules — currently 15 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -30,6 +30,7 @@ MAP = {
     "result_markers.py": "result_markers.py",
     "delivery/readiness.py": "result_ready.py",
     "dedup_recovery.py": "dedup_recovery.py",
+    "file_lock.py": "file_lock.py",
     "workspace_lock.py": "workspace_lock.py",
     "chat_secret_filter.py": "chat_secret_filter.py",
     "policy/egress/result.py": "team_result_guard.py",
@@ -47,6 +48,9 @@ MAP = {
     "outbox_cli.py": "outbox_cli.py",
     # quarantine naming: the bridge moves results in, requeue moves them back
     "undelivered_quarantine.py": "undelivered_quarantine.py",
+    # worker-pool completion-record contract: the pool skill writes through it
+    # and the bridge reads through it, so neither keeps a private predicate.
+    "pool_record.py": "pool_record.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

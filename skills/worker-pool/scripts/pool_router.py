@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # helpers live in the core; repo root is parents[3] from this directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
+import pool_attribution as pa  # noqa: E402
 import pool_delivery as pd  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
@@ -68,6 +69,10 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
                              os.O_CREAT | os.O_EXCL))
         except FileExistsError:
             return "already"
+        # Under the SAME lock as the sentinel: attribution and delivery are one
+        # fact. Recording earlier attributed refusals that never delivered.
+        if recipient != pr.CORE:
+            pa.record(workspace, task_id, recipient)
     return "delivered"
 
 
