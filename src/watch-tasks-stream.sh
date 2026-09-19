@@ -493,7 +493,7 @@ task_announce() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved handler
+  local task_path="$1" rc filename announce resolved handler hrc
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   resolved="$(resolve_inbox_entry "$task_path")" || return 0
@@ -509,7 +509,11 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if ! handler="$(task_event_handler)"; then
+  handler="$(task_event_handler)"; hrc=$?
+  if [ "$hrc" -ne 0 ]; then
+    # rc 1 is "nobody provides one", the ordinary unrouted case. Anything else
+    # means the lookup could not answer, which must be visible, never silent.
+    [ "$hrc" -eq 1 ] || echo "watch-tasks-stream: handler lookup could not answer (rc $hrc) for $filename; falling back to the live core" >&2
     emit_dispatch_task_file "$announce"
     return
   fi
