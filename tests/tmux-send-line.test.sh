@@ -109,17 +109,27 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --refuse-if-pending --dry-run > "$T/out" 2>&1; echo $?)
   [ "$rc" = 0 ] && grep -q "pending: ''" "$T/out" && ok "R7 the same pane read as claude (default) sees NO prompt — the pre-flag defect, now opt-out only" || fail "R7 default-runtime contrast" "rc=$rc $(cat "$T/out")"
   tmux -S "$SOCKW" kill-server 2>/dev/null
-  # A REAL tmux server, no shim: the composer starts idle, and 150ms into the sender's
-  # 250ms Codex delay the pane is overwritten to a picker row -- genuine timing, not a mock.
-  tmux -S "$SOCKW" new-session -d -s probe 'printf "\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m"; sleep 0.3; printf "\r\033[2K  Select Model and Effort\r\n\xe2\x80\xba 4. gpt-5.5 (current)"; sleep 30'; sleep 0.05
-  rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
-  [ "$rc" = 5 ] && grep -q "pane changed during the paste-burst delay" "$T/err" && ok "R8 real tmux + real timing: a picker appearing mid-delay withholds Enter (the live 03:13Z finding)" || fail "R8 real TOCTOU" "rc=$rc $(cat "$T/err")"
+  # A REAL tmux server, no shim. The transition is driven by an OBSERVED staged payload, never a
+  # sleep: a fixed delay can beat the sender's first capture, and the run then refuses before it
+  # reaches the withheld-Enter branch and still passes (keweichen 2026-09-19: 1 pass / 3 fails).
+  run_toctou() {
+    rm -f "$T/trig" "$T/rc"
+    tmux -S "$SOCKW" new-session -d -s probe "printf '\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m'; while [ ! -f $T/trig ]; do sleep 0.02; done; printf '$1'; sleep 30"
+    ( bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $? > "$T/rc" ) &
+    local sp=$! i; STAGED=0
+    for i in $(seq 1 250); do
+      tmux -S "$SOCKW" capture-pane -p -t probe 2>/dev/null | grep -q hello && { STAGED=1; break; }
+      sleep 0.02
+    done
+    touch "$T/trig"; wait "$sp" 2>/dev/null; RC="$(cat "$T/rc" 2>/dev/null)"
+  }
+  run_toctou "\r\033[2K  Select Model and Effort\r\n\xe2\x80\xba 4. gpt-5.5 (current)"
+  [ "$STAGED" = 1 ] && [ "$RC" = 5 ] && grep -q "pane changed during the paste-burst delay" "$T/err" && ok "R8 real tmux: payload staged FIRST (observed), then a picker appears -> Enter withheld" || fail "R8 real TOCTOU" "staged=$STAGED rc=$RC $(cat "$T/err")"
   tmux -S "$SOCKW" kill-server 2>/dev/null
   # Real tmux, real timing: the composer keeps showing the SAME typed line (stale, matching
   # the staged payload) but a gate appears BELOW it 300ms in -- must still withhold Enter.
-  tmux -S "$SOCKW" new-session -d -s probe 'printf "\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m"; sleep 0.3; printf "\r\033[2K\xe2\x80\xba hello\r\nLogin successful. Press Enter to continueâ¦"; sleep 30'; sleep 0.05
-  rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $?)
-  [ "$rc" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ok "R9 real tmux: a stale matching prompt with a NEW gate below it withholds Enter (keweichen/qingyun-wu live repro)" || fail "R9 real stale-gate" "rc=$rc $(cat "$T/err")"
+  run_toctou "\r\033[2K\xe2\x80\xba hello\r\nLogin successful. Press Enter to continueâ¦"
+  [ "$STAGED" = 1 ] && [ "$RC" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ok "R9 real tmux: payload staged FIRST (observed), then a gate appears below -> Enter withheld" || fail "R9 real stale-gate" "staged=$STAGED rc=$RC $(cat "$T/err")"
   tmux -S "$SOCKW" kill-server 2>/dev/null
   # A REAL python interpreter that succeeds through smoke/hash/lock (those never decode
   # multi-byte pane text) but fails INSIDE _pending/_after's stdin decode: PYTHONIOENCODING=ascii
