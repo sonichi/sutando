@@ -510,6 +510,35 @@ _normalize_include_path() {
 # `.git/info/exclude` lives INSIDE `.git/` which outer treats as opaque,
 # so identical un-ignore rules here cannot cross the inner/outer boundary.
 #
+# Lines _compose_exclude_content() ALWAYS emits, never operator-editable — its
+# own function so _is_safe_carveout_addition() recognizes them without a second list that can drift from what the composer actually ships.
+_hard_deny_lines() {
+    echo ".env*"
+    echo "*.heartbeat"
+    echo "*.alive"
+    echo "*.sentinel"
+    echo "*.pid"
+    # Secret material — name-pattern deny (M3). The deny list above caught
+    # transient state + .env*; it did NOT cover SSH private keys or
+    # cert/key material, which would be carried if they ever landed in a
+    # synced path. Public keys (*.pub) are intentionally NOT denied.
+    echo "id_rsa"
+    echo "id_dsa"
+    echo "id_ecdsa"
+    echo "id_ed25519"
+    echo "*.pem"
+    echo "*.key"
+    echo "*.p12"
+    echo "*.pfx"
+    echo "*.ppk"
+    echo "*.keystore"
+    echo "*.jks"
+    # The PreCompact archiver writes full transcripts under logs/conversations/;
+    # a broadened vault.sync.include (e.g. "logs/") could otherwise carry them.
+    echo "logs/conversations/"
+    echo "logs/conversations/**"
+}
+
 # Carrier set driven by vault.sync.{include,exclude} in
 # sutando.config.{json,local.json} (PR-3). Edit those to customize.
 _compose_exclude_content() {
@@ -549,28 +578,8 @@ _compose_exclude_content() {
     fi
 
     echo ""
-    echo "# Hard-deny credentials regardless of carrier set"
-    echo ".env*"
-    echo "*.heartbeat"
-    echo "*.alive"
-    echo "*.sentinel"
-    echo "*.pid"
-    # Secret material — name-pattern deny (M3). The deny list above caught
-    # transient state + .env*; it did NOT cover SSH private keys or
-    # cert/key material, which would be carried if they ever landed in a
-    # synced path. These are gitignore-style globs composed into
-    # .git/info/exclude. Public keys (*.pub) are intentionally NOT denied.
-    echo "id_rsa"
-    echo "id_dsa"
-    echo "id_ecdsa"
-    echo "id_ed25519"
-    echo "*.pem"
-    echo "*.key"
-    echo "*.p12"
-    echo "*.pfx"
-    echo "*.ppk"
-    echo "*.keystore"
-    echo "*.jks"
+    echo "# Hard-deny credentials + transcript archive regardless of carrier set"
+    _hard_deny_lines
 }
 
 # Print `existing` with a legacy per-host carrier scope rewritten to the shared
@@ -623,14 +632,14 @@ _is_safe_carveout_addition() {
     _widen_legacy_host_scope "$existing" > "$widened"
     existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
-    # Compare against what the composer EMITS, not the raw config value: a
-    # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
+    # Compare against what the composer EMITS (a directory yields both `p/`
+    # and `p/**`), and always ADD the hard-deny lines regardless of whether the config-driven list resolved — they are never operator-editable.
     shipped_rules=""
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
+    shipped_rules+="$(_hard_deny_lines)"$'\n'
     shipped="$shipped_rules"
     rc=0
     # Refuse if the refresh would DROP any rule the existing file carries.
@@ -812,32 +821,55 @@ _refuse_staged_secrets() {
 # peer's durable state. In-place foreign-file modifications are outside this
 # guard's #2391 deletion scope. The existing explicit force switch remains the
 # operator escape hatch for intentional recovery.
+_is_foreign_host_path() {  # $1 = repo-relative path; true iff under another host's hosts/<label>/ subtree
+    local path="$1" relative path_host own_host
+    own_host="$(_host)"
+    case "$path" in
+        hosts/*/*)
+            relative="${path#hosts/}"
+            path_host="${relative%%/*}"
+            [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 _refuse_foreign_host_deletions() {
     [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
 
-    local own_host foreign_hits=0 path relative path_host first_path=""
-    own_host="$(_host)"
+    local foreign_hits=0 path first_path=""
     while IFS= read -r -d '' path; do
-        case "$path" in
-            hosts/*/*)
-                relative="${path#hosts/}"
-                path_host="${relative%%/*}"
-                if [ -n "$path_host" ] && [ "$path_host" != "$own_host" ]; then
-                    foreign_hits=$((foreign_hits + 1))
-                    [ -z "$first_path" ] && first_path="$path"
-                fi
-                ;;
-        esac
+        if _is_foreign_host_path "$path"; then
+            foreign_hits=$((foreign_hits + 1))
+            [ -z "$first_path" ] && first_path="$path"
+        fi
     done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
 
     if [ "$foreign_hits" -eq 0 ]; then
         return 0
     fi
 
-    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$own_host"
-    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$own_host' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
+    log "_refuse_foreign_host_deletions: ABORT — would delete $foreign_hits foreign host file(s); first=$first_path own_host=$(_host)"
+    echo "sync-workspace: refusing push — would delete $foreign_hits foreign host file(s) (first: $first_path). Only '$(_host)' may write its hosts/<label>/ subtree. Restore/pull the peer state, or set SUTANDO_FORCE_SYNC=1 for an intentional recovery." >&2
     git reset -q
     return 1
+}
+
+# Pre-pull half of the push-time guard above; unstage (never abort) so the
+# caller's own legitimate edits alongside it still land.
+_unstage_foreign_host_deletions_pre_pull() {
+    [ "${SUTANDO_FORCE_SYNC:-0}" = "1" ] && return 0
+    local path hits=0
+    while IFS= read -r -d '' path; do
+        if _is_foreign_host_path "$path"; then
+            git reset -q HEAD -- "$path" 2>/dev/null || true
+            hits=$((hits + 1))
+        fi
+    done < <(git diff --cached --no-renames --name-only --diff-filter=D -z)
+    if [ "$hits" -gt 0 ]; then
+        log "_unstage_foreign_host_deletions_pre_pull: kept $hits foreign host file(s) tracked (carrier-set enforcement tried to untrack them)"
+        echo "sync-workspace: kept $hits foreign host file(s) tracked before commit -- only their own host may remove them from hosts/<label>/" >&2
+    fi
 }
 
 # Snapshot the per-host config from the canonical Claude config dir into
@@ -1266,11 +1298,12 @@ _migrate_flat_anchor() {
     echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
 }
 
-# Commit modified + new carrier files before a pull. Runs generate_exclude first
-# so an out-of-carrier path cannot ride into the vault on this commit.
+# Commit modified + new carrier files before a pull. Untracks newly-denied
+# paths first, same order as _push_only_impl -- `git add` stages a tracked path's edit regardless of exclude rules.
 _commit_local_pre_pull() {
-    generate_exclude 2>/dev/null || true
+    _enforce_carrier_set_pre 2>/dev/null || true
     git add --ignore-removal . 2>/dev/null || true
+    _unstage_foreign_host_deletions_pre_pull 2>/dev/null || true
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
             && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"

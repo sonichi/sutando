@@ -9771,9 +9771,10 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
-# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
-_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
-_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
+# Copies whole transcripts; excluded from unattended repair — a timer should not
+# start duplicating full conversation logs, wherever they land.
+_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:logs/conversations/"
+_TRANSCRIPT_ARCHIVE_FAMILY = "logs/conversations/"
 
 
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
@@ -9788,8 +9789,7 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
     than assumed repaired — a fixer's self-report is not evidence of the result.
 
-    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
-    leaves the workspace, and the dominant caller of `--fix` is an unattended
+    Scoped: the transcript archiver copies entire conversations, and the dominant caller of `--fix` is an unattended
     30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
     routine timer must not make that egress decision, so it is left to explicit
     opt-in and its absence keeps warning.
@@ -9828,7 +9828,7 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
         scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
         if not scoped:
             print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
-                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
+                  f"transcripts to <workspace>/logs/conversations/. Opt in with `bash src/{installer.name}`",
                   file=out)
             continue
         print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
@@ -11790,7 +11790,28 @@ def check_claude_hook_registration(
                           f"cannot verify skill-declared hooks"}
 
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    raw = sm.group(1) if sm else "$CORE_CONFIG_DIR/settings.json"
+    # Resolve $CORE_CONFIG_DIR as the installer does: a probe reading a different
+    # file than the installer writes reports on nothing.
+    if "$CORE_CONFIG_DIR" in raw:
+        try:
+            sys.path.insert(0, str(repo / "src"))
+            from sutando_config import resolve_claude_sutando_config_dir
+        except ImportError:
+            # The resolver module genuinely does not exist (e.g. a bare test
+            # fixture) — the only case a guessed default may stand in.
+            core_cfg = str(repo / "workspace" / ".claude-sutando")
+        else:
+            try:
+                core_cfg = str(resolve_claude_sutando_config_dir(repo))
+            except Exception as exc:
+                # The resolver IS available here, so a call-time failure means
+                # something is wrong -- do not guess a path (see PR body, #4309).
+                return {"name": name, "status": "warn",
+                        "detail": f"resolve_claude_sutando_config_dir() failed ({exc}) — "
+                                  f"cannot verify hook registration without a real config dir"}
+        raw = raw.replace("$CORE_CONFIG_DIR", core_cfg)
+    settings = Path(raw.replace("$REPO_DIR", str(repo)))
     if not settings.is_file():
         return {"name": name, "status": "warn",
                 "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
@@ -11814,6 +11835,27 @@ def check_claude_hook_registration(
         return {"name": name, "status": "warn",
                 "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
                           f"cannot verify {len(owned)} hook(s)"}
+
+    # $TRANSCRIPT_DIR must resolve as the installer resolves it, or the stored
+    # command never compares equal. resolve_workspace() always answers for the LIVE repo.
+    _ws = repo / "workspace"
+    if (repo / "scripts" / "sutando-config.sh").is_file():
+        try:
+            sys.path.insert(0, str(repo / "src"))
+            from workspace_default import resolve_workspace
+        except ImportError:
+            # Genuinely unimportable (bare fixture) — the fallback above stands.
+            pass
+        else:
+            try:
+                _ws = Path(resolve_workspace())
+            except Exception as exc:
+                # Same as the $CORE_CONFIG_DIR resolver above: available but
+                # erroring means don't guess — report it (#4309 review).
+                return {"name": name, "status": "warn",
+                        "detail": f"resolve_workspace() failed ({exc}) — "
+                                  f"cannot verify hook registration without a real transcript dir"}
+    transcript_dir = str(_ws / "logs" / "conversations")
 
     missing, foreign = [], []
     for event, marker, owned_cmd in owned:
@@ -11840,7 +11882,7 @@ def check_claude_hook_registration(
             _hook_command_targets(
                 c,
                 (repo / marker) if marker.startswith("src/") else None,
-                owned_cmd.replace("$REPO_DIR", str(repo)),
+                owned_cmd.replace("$REPO_DIR", str(repo)).replace("$TRANSCRIPT_DIR", transcript_dir),
                 marker,
             )
             for c in hit
@@ -11849,32 +11891,52 @@ def check_claude_hook_registration(
             # at another checkout or carrying the path as an inert argument.
             foreign.append(f"{event}:{marker}")
     # Present-but-dead is invisible to the owned-list check above: a registered hook whose
-    # script is gone fails on every fire. Relative paths resolve against the project.
+    # script is gone fails on every fire. Relative paths resolve against `repo` itself,
+    # not the settings file's own location (unreliable since #4309, see PR body).
     dead: list[str] = []
     dead_records: list[dict] = []
-    project_dir = settings.resolve().parent.parent
+    project_dir = repo
     # Owned families are judged above (present / missing / foreign); the dead scan covers
     # the rest, and only commands that run a script through an interpreter.
     owned_families = {Path(marker).name for _e, marker, _c in owned}
-    for event, groups in hooks.items():
-        for g in _as_list(groups):
-            if not isinstance(g, dict):
-                continue
-            for h in _as_list(g.get("hooks")):
-                if not isinstance(h, dict):
+
+    def _scan_dead(hooks_dict: dict) -> None:
+        for event, groups in hooks_dict.items():
+            for g in _as_list(groups):
+                if not isinstance(g, dict):
                     continue
-                cmd = str(h.get("command", ""))
-                if not _runs_a_script(cmd):
-                    continue
-                script = _hook_script_path(cmd)
-                if not script or Path(script).name in owned_families:
-                    continue
-                target = Path(script) if Path(script).is_absolute() else project_dir / script
-                if not target.exists():
-                    family = Path(script).name
-                    dead.append(f"{event}:{family} -> {script}")
-                    dead_records.append({"event": event, "command": cmd,
-                                         "path": script, "family": family})
+                for h in _as_list(g.get("hooks")):
+                    if not isinstance(h, dict):
+                        continue
+                    cmd = str(h.get("command", ""))
+                    if not _runs_a_script(cmd):
+                        continue
+                    script = _hook_script_path(cmd)
+                    if not script or Path(script).name in owned_families:
+                        continue
+                    target = Path(script) if Path(script).is_absolute() else project_dir / script
+                    if not target.exists():
+                        family = Path(script).name
+                        dead.append(f"{event}:{family} -> {script}")
+                        dead_records.append({"event": event, "command": cmd,
+                                             "path": script, "family": family})
+
+    _scan_dead(hooks)
+
+    # Moving the core-owned target to $CORE_CONFIG_DIR made the scan above blind
+    # to families that stay PROJECT-scoped on purpose; scan that file too (#4309).
+    legacy_settings = repo / ".claude" / "settings.json"
+    try:
+        if legacy_settings.is_file() and legacy_settings.resolve() != settings.resolve():
+            legacy_conf = json.loads(legacy_settings.read_text())
+            legacy_hooks = legacy_conf.get("hooks") if isinstance(legacy_conf, dict) else None
+            if isinstance(legacy_hooks, dict):
+                _scan_dead(legacy_hooks)
+    except (OSError, json.JSONDecodeError):
+        # Same tolerance as the core file above: a malformed/unreadable legacy
+        # settings.json must not abort the probe or hide the core-scoped result.
+        pass
+
     if missing or foreign or dead:
         bits = []
         if missing:
@@ -11889,7 +11951,7 @@ def check_claude_hook_registration(
         # The bare installer registers the opt-in-only transcript archiver, so the remedy
         # must not prescribe it when that hook is the only thing missing.
         only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
-        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
+        remedy = ("that hook copies full transcripts to <workspace>/logs/conversations/ and is left to explicit opt-in — "
                   "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
                   "you intend to enable it"
                   if only_archive else
@@ -11904,13 +11966,13 @@ def check_claude_hook_registration(
                 remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
                           "— that flag is what adds the legacy archive form to the prune list, so with "
                           f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
-                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
+                          "src/install-claude-hooks.sh` plain, which also REGISTERS the transcript "
                           "archiver: if this host does not want it, delete that one PreCompact entry "
                           "afterwards")
             else:
                 remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
                           "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
-                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
+                          f"so {', '.join(foreign)} is still pruned and the transcript archiver is not "
                           "installed. If an entry is genuinely foreign (another program or checkout) "
                           "the installer cannot own it — remove that one by hand")
         if dead and not missing and not foreign:

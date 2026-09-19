@@ -1673,7 +1673,39 @@ commit_source() {
     fi
 }
 
+# Is THIS INSTALL's own archive-hook command (exact script+dest path, not any
+# script by that name) or, when $4=1, the path-less legacy Desktop form here.
+# $4 defaults on -- the deprecated Desktop shape is a real prior-consent form
+# at its own historical locations, but never at a location this fix newly
+# added checking (it holds only whatever the legacy sweep is about to remove).
+_settings_has_archive_hook() {
+    local settings_file="$1" script_path="${2:-}" dest_path="${3:-}" legacy_desktop_ok="${4:-1}" cmds want
+    [ -f "$settings_file" ] || return 1
+    cmds="$(jq -r '(.hooks.PreCompact // [])[] .hooks[]? .command // empty' "$settings_file" 2>/dev/null)"
+    if [ -n "$script_path" ] && [ -n "$dest_path" ]; then
+        want="bash $(shq "$script_path") $(shq "${dest_path%/}/")"
+        printf '%s\n' "$cmds" | grep -Fxq -- "$want" && return 0
+    fi
+    [ "$legacy_desktop_ok" = "1" ] || return 1
+    printf '%s\n' "$cmds" | grep -Eq -e "^cp \"\\\$TRANSCRIPT_PATH\" \"\\\$HOME/Desktop/sutando-conversations/" \
+                                      -e "^bash '[^']*/archive-transcript\.sh' \"\\\$HOME/Desktop/sutando-conversations/\"\$"
+}
+
+# Single-quote for embedding in a stored shell command -- must match
+# install-claude-hooks.sh's own shq() exactly, or the exact-match above misses.
+shq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 commit_main() {
+    # Set by the hook bridge below on a real installer failure; checked at the
+    # end so `--commit`'s own exit status reflects it (startup.sh's migration
+    # sentinel is gated on that status, not on this function's prose output).
+    local _hook_bridge_failed=0
+    # Default here, not only inside the bridge branch below: a retry marker
+    # write must see this even when that branch never ran (skip/fallback path).
+    local _archive_opted_in=0
+
     # Mini's polish: --delete-source REQUIRES --backup-id pointer. Forces
     # operator to reference a real backup before destructive op.
     if [ "$DELETE_SOURCE" = "1" ] && [ -z "$ROLLBACK_ID" ]; then
@@ -1838,20 +1870,60 @@ commit_main() {
         echo "  hook bridge: skipped (SUTANDO_MIGRATE_DEST set — test-redirected migration must not write the real config dir)"
     elif [ "$NO_HOOK_BRIDGE" = "0" ] && [ "$DELETE_SOURCE" = "0" ]; then
         local _hook_helper="$(dirname "$0")/sutando-config-hooks.sh"
+        local _primary_installer="$(dirname "$0")/../src/install-claude-hooks.sh"
         local _new_ccd; _new_ccd="$(bash "$(dirname "$0")/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
         local _new_settings="${_new_ccd}/settings.json"
         local _old_settings="$HOME/.claude/settings.json"
+        # The real pre-move project-level location (install-claude-hooks.sh's
+        # own LEGACY_PROJECT_SETTINGS) -- distinct from $_old_settings above.
+        local _legacy_project_settings="$REPO_DIR/.claude/settings.json"
+        local _archive_ws; _archive_ws="$(bash "$(dirname "$0")/sutando-config.sh" workspace 2>/dev/null || true)"
+        local _archive_script="$REPO_DIR/src/archive-transcript.sh"
+        local _archive_dest="${_archive_ws}/logs/conversations"
         if [ -x "$_hook_helper" ] || [ -f "$_hook_helper" ]; then
             if [ -n "$_new_ccd" ]; then
                 echo
-                echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh ..."
-                # Idempotent install of catchup hook; project hooks are repo-level (already in repo's .claude/settings.json).
-                bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
-                    echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                # install-claude-hooks.sh is the single owner of the full core hook set
+                # and the legacy project-settings sweep; the fallback below covers only SessionEnd.
+                if [ -f "$_primary_installer" ]; then
+                    echo "sutando-migrate: bridging hooks via the primary installer (install-claude-hooks.sh) ..."
+                    # Default-off transcript archiving unless already opted in --
+                    # anchored to THIS install's exact script+dest path, checked
+                    # at every location a prior opt-in could actually live.
+                    if _settings_has_archive_hook "$_new_settings" "$_archive_script" "$_archive_dest" \
+                       || _settings_has_archive_hook "$_old_settings" "$_archive_script" "$_archive_dest" \
+                       || _settings_has_archive_hook "$_legacy_project_settings" "$_archive_script" "$_archive_dest" 0; then
+                        _archive_opted_in=1
+                    fi
+                    # `local _hb_rc=$?` after a failing command aborts under `set -e`
+                    # before the assignment runs -- `|| _hb_rc=$?` keeps it successful.
+                    local _hb_rc=0
+                    if [ "$_archive_opted_in" = "1" ]; then
+                        bash "$_primary_installer" || _hb_rc=$?
+                    else
+                        SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$_primary_installer" || _hb_rc=$?
+                    fi
+                    if [ "$_hb_rc" -ne 0 ]; then
+                        echo "  hook install: primary installer failed (rc=$_hb_rc) — re-run manually: bash src/install-claude-hooks.sh" >&2
+                        _hook_bridge_failed=1
+                    fi
+                else
+                    echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh (primary installer not found at expected path) ..."
+                    local _hb_rc=0
+                    bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || _hb_rc=$?
+                    if [ "$_hb_rc" -ne 0 ]; then
+                        echo "  hook install: failed (rc=$_hb_rc) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
+                        _hook_bridge_failed=1
+                    fi
+                fi
                 # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
                 bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
             else
-                echo "  hook bridge: skipped (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+                # A required destination that cannot be resolved is a bridge
+                # failure too -- hooks silently never install, same as the
+                # installer itself failing.
+                echo "  hook bridge: FAILED (couldn't resolve claude-sutando-config-dir; check sutando.config.local.json)" >&2
+                _hook_bridge_failed=1
             fi
         else
             echo "  hook bridge: skipped (scripts/sutando-config-hooks.sh not found at expected path; run manually after migrate)"
@@ -1961,6 +2033,20 @@ commit_main() {
         echo "  Sources NOT deleted (default). After ~7d observing no source-side writes, run:"
         echo "    bash scripts/sutando-migrate.sh commit --delete-source --backup-id $BACKUP_ID"
         echo "  Two-phase pattern keeps the (b)-style reader-fallback bridge intact during transition."
+    fi
+
+    # A failed hook bridge must fail the whole commit -- startup.sh's sentinel
+    # comes from THIS function's exit status alone (see _hook_bridge_failed above).
+    if [ "$_hook_bridge_failed" = "1" ]; then
+        mkdir -p "$DEST_REAL/state" 2>/dev/null
+        # Persist this attempt's archive-consent decision so a retry (src/startup.sh)
+        # doesn't silently re-enable archiving regardless of what the original run chose.
+        printf 'hook_bridge_failed_at=%s\nretry=bash src/install-claude-hooks.sh\narchive_opted_in=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_archive_opted_in" > "$DEST_REAL/state/.hook-bridge-retry-needed" 2>/dev/null
+        echo
+        echo "sutando-migrate: COMMIT reporting FAILURE — the hook bridge did not install successfully (see above)." >&2
+        echo "  Retry marker: $DEST_REAL/state/.hook-bridge-retry-needed" >&2
+        return 1
     fi
 }
 

@@ -127,6 +127,16 @@ check "generated rules still un-ignore notes/ (carrier intact)" \
 check "generated rules carve out notes/generated/" \
     grep -qE '^notes/generated/' "$RULES"
 
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): the shipped default carrier
+# never named logs/ at all, so it relied on omission rather than a real deny —
+# an operator broadening vault.sync.include could carry the full Claude Code
+# transcript corpus with nothing to stop it. Now a hard deny, same mechanism
+# as the credential globs (emitted last in _compose_exclude_content).
+check "generated rules hard-deny the transcript archive dir regardless of config" \
+    grep -qxF 'logs/conversations/' "$RULES"
+check "...and its contents too" \
+    grep -qxF 'logs/conversations/**' "$RULES"
+
 # 3. The behaviour the rules are for: what git would actually track.
 #    This half survives a refactor of the rule syntax.
 git -C "$FIXTURE_WS" add -A >/dev/null 2>&1 || true
@@ -276,6 +286,14 @@ compose_rules() {
         log() { :; }; color_warn() { :; }
         _compose_exclude_content' _ "$SYNC_SH"
 }
+# Same composer, but against a caller-chosen SCRIPT_PARENT — for driving a
+# fixture's OWN sutando.config.local.json rather than this repo's real one.
+compose_rules_in() {
+    SCRIPT_PARENT="$1" bash -c 'set -uo pipefail
+        eval "$(awk "/^[A-Za-z_][A-Za-z0-9_]*\(\) \{/,/^\}\$/" "$1")"
+        log() { :; }; color_warn() { :; }
+        _compose_exclude_content' _ "$SYNC_SH"
+}
 # Builds a workspace whose exclude file is the CURRENT generated content minus
 # the lines named, i.e. what an older generated install actually carries.
 seed_older_install() {
@@ -389,8 +407,72 @@ check "the widening is a shared helper, not duplicated awk" \
     test "$(grep -c '_widen_legacy_host_scope' <<< "$SYNC_CODE")" -ge 3
 check "the carve-out recognizer runs on the WIDENED content" \
     grep -qF '_widen_legacy_host_scope "$existing" > "$widened"' <<< "$SYNC_CODE"
+# #4309 follow-up (qingyun-wu 2026-09-16): the empty-shipped early-return this
+# used to count (`rm -f "$widened"; return 1`) is gone -- hard-deny lines make
+# an empty config-driven list no longer a refusal, so there is exactly one
+# exit that ever holds the temp file, and it is the one below.
 check "the widened temp file is removed on every return path" \
-    test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
+    test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 1
+
+# 6. #4309 review's explicit ask (keweichen/qingyun-wu, 2026-09-16): a
+# BROADENED vault.sync.include that names logs/ must still not carry the
+# transcript archive — the hard deny has to survive an include, not just the
+# unconfigured default (section 2 above only proves the default never
+# includes logs/ in the first place, which is a weaker claim).
+LOGROOT="$TEST_ROOT/broadened-include"
+LOGREPO="$LOGROOT/repo"
+mkdir -p "$LOGREPO/scripts" "$LOGREPO/src"
+cp "$REPO/scripts/sync-workspace.sh" "$LOGREPO/scripts/"
+cp "$REPO/scripts/sutando-config.sh" "$LOGREPO/scripts/"
+cp "$REPO/scripts/python-binary.sh" "$LOGREPO/scripts/"
+cp "$REPO/src/sutando_config.py" "$LOGREPO/src/"
+cp "$REPO/sutando.config.json" "$LOGREPO/sutando.config.json"
+python3 -c "
+import json, pathlib
+base = json.loads(pathlib.Path('$REPO/sutando.config.json').read_text())
+inc = list(base['vault']['sync']['include']) + ['logs/']
+pathlib.Path('$LOGREPO/sutando.config.local.json').write_text(
+    json.dumps({'vault': {'sync': {'include': inc}}}))
+"
+LOG_RULES="$(compose_rules_in "$LOGREPO")"
+
+check "the broadened config really does include logs/ (fixture sanity)" \
+    grep -qxF '!logs/**' <<< "$LOG_RULES"
+check "...yet logs/conversations/ is STILL hard-denied" \
+    grep -qxF 'logs/conversations/' <<< "$LOG_RULES"
+check "...and its contents too" \
+    grep -qxF 'logs/conversations/**' <<< "$LOG_RULES"
+# The deny must come AFTER the include's un-ignore for gitignore's last-match-
+# wins to actually apply — a deny emitted first would be silently overridden.
+check "the deny is emitted AFTER the broadened include (order the rule depends on)" \
+    test "$(grep -n '^!logs/\*\*$' <<< "$LOG_RULES" | cut -d: -f1)" \
+      -lt "$(grep -n '^logs/conversations/$' <<< "$LOG_RULES" | cut -d: -f1)"
+
+# 7. THE REAL UPGRADE PATH for the transcript hard-deny (qingyun-wu 2026-09-16,
+# blocking on the first version of this fix): _compose_exclude_content() adding
+# logs/conversations/ is not enough on its own -- an EXISTING generated exclude
+# file only gets new lines through generate_exclude()'s own refusal-or-refresh
+# gate, and until _is_safe_carveout_addition() recognized hard-denies too, this
+# specific addition failed that gate and needed --force-gitignore, leaving
+# upgraded hosts exposed exactly as the original review described.
+UPG_LOG="$TEST_ROOT/upgrade-transcript-denylist"
+seed_older_install "$UPG_LOG" 'logs/conversations/'
+check "an older install starts without the transcript deny" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG/.git/info/exclude")" -eq 0
+check "...the real generate_exclude accepts the refresh with NO --force-gitignore (rc=0)" \
+    test "$(upgrade_rc "$UPG_LOG")" -eq 0
+check "...and both transcript deny lines now land" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG/.git/info/exclude")" -eq 2
+
+UPG_LOG_OP="$TEST_ROOT/upgrade-transcript-denylist-operator"
+seed_older_install "$UPG_LOG_OP" 'logs/conversations/'
+echo '!my/operator/rule' >> "$UPG_LOG_OP/.git/info/exclude"
+check "an operator rule ON TOP of the missing transcript deny is still REFUSED (rc=1)" \
+    test "$(upgrade_rc "$UPG_LOG_OP")" -eq 1
+check "...and that operator rule survives" \
+    grep -qxF '!my/operator/rule' "$UPG_LOG_OP/.git/info/exclude"
+check "...and the transcript deny was NOT force-added behind the refusal" \
+    test "$(grep -cE '^logs/conversations/(\*\*)?$' "$UPG_LOG_OP/.git/info/exclude")" -eq 0
 
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"

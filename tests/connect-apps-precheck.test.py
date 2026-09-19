@@ -289,8 +289,10 @@ class TestRegistration(unittest.TestCase):
         manifest = json.loads((ROOT / "skills" / "connect-apps" / "manifest.json").read_text())
         self.assertEqual([(h["event"], h["command"]) for h in manifest["hooks"]],
                          [("PreToolUse", "./hooks/connect-precheck.py"), ("PostToolUse", "./hooks/connect-precheck.py")])
-        found = {(event, token) for event, token, _cmd, _prior in discover(ROOT) if token == "connect-precheck.py"}
-        self.assertEqual(found, {("PreToolUse", "connect-precheck.py"), ("PostToolUse", "connect-precheck.py")})
+        # discover()'s marker is skills/<name>/<relative-command>, not the basename.
+        marker = "skills/connect-apps/hooks/connect-precheck.py"
+        found = {(event, token) for event, token, _cmd, _prior in discover(ROOT) if token == marker}
+        self.assertEqual(found, {("PreToolUse", marker), ("PostToolUse", marker)})
 
     def test_the_hook_is_self_contained_in_the_skill(self):
         src = HOOK.read_text()
