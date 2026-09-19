@@ -11,7 +11,9 @@ track moves" path the context-reconstruct skill prescribes; `append` is the per-
 The target must name a host: `.../hosts/<label>/current-track.md`. A caller that builds it as
 `hosts/$H/current-track.md` with $H unset collapses to `hosts/current-track.md`, which the vault's
 carrier rules do not cover (`!hosts/*/**` needs the directory level), so the entry lands on a path
-that is ignored and never backed up — silently, since writing succeeds.
+that is ignored and never backed up — silently, since writing succeeds. The rule belongs to
+`current_track.require_host_anchor`, which every writer takes before creating anything; this script
+only turns its refusal into an exit code.
 Exit 0 written; 1 empty stdin; 2 usage or a target that names no host.
 """
 from __future__ import annotations
@@ -20,7 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import append, replace  # noqa: E402
+from current_track import NotAHostAnchor, append, replace, require_host_anchor  # noqa: E402
 
 OPS = {"append": append, "replace": replace}
 
@@ -31,16 +33,18 @@ def main(argv=None) -> int:
         print("usage: current-track-write.py append|replace <current-track.md>  (text on stdin)", file=sys.stderr)
         return 2
     target = Path(argv[1])
-    if target.parent.name in ("", "hosts") or target.parent.parent.name != "hosts":
-        print(f"current-track-write: {target} does not sit under hosts/<label>/ — refusing. "
-              "An unset host label collapses hosts/$H/ to hosts/, whose content the vault does not carry.",
-              file=sys.stderr)
+    try:
+        # The writers enforce this themselves; asking first only buys the exit
+        # code and leaves the caller's stdin unread on a refusal.
+        require_host_anchor(target)
+        text = sys.stdin.read()
+        if not text.strip():
+            print(f"current-track-write: empty stdin, nothing written ({argv[0]})", file=sys.stderr)
+            return 1
+        OPS[argv[0]](target, text)
+    except NotAHostAnchor as e:
+        print(f"current-track-write: {e}", file=sys.stderr)
         return 2
-    text = sys.stdin.read()
-    if not text.strip():
-        print(f"current-track-write: empty stdin, nothing written ({argv[0]})", file=sys.stderr)
-        return 1
-    OPS[argv[0]](target, text)
     return 0
 
 

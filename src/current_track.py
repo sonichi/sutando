@@ -83,8 +83,32 @@ def lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
 
+class NotAHostAnchor(ValueError):
+    """The target does not resolve under hosts/<label>/ — see require_host_anchor()."""
+
+
+def require_host_anchor(path: Path) -> Path:
+    """Raise unless the EFFECTIVE destination sits in hosts/<label>/.
+
+    Resolved, never spelled: `hosts/../x.md` names the workspace root however it
+    reads, and `hosts/hosts/x.md` is the legitimate host whose label is `hosts`.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if resolved.parent.parent.name != "hosts":
+        raise NotAHostAnchor(
+            f"{path} resolves to {resolved}, which does not sit under hosts/<label>/. "
+            "An unset host label collapses hosts/$H/ to hosts/, whose content the vault "
+            "does not carry (`!hosts/*/**` needs the directory level), so the write would "
+            "succeed onto a path that is ignored and never backed up."
+        )
+    return resolved
+
+
 @contextmanager
 def locked(path: Path):
+    # Validate BEFORE mkdir and before the lock file: a refused write leaves no
+    # directory, no lock and no anchor behind.
+    require_host_anchor(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with locked_file(lock_path(path), create_mode=0o600):
         yield
