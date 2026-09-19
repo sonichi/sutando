@@ -414,8 +414,9 @@ def test_an_mcp_room_action_lets_the_turn_end() -> None:
         _arm(ws)
         _hook(ws)
         _proxy_room_action(ws, action="dev.pr.review.publish")
-        check("a fresh room action ends the turn through the real hook", _hook(ws) == {},
-              repr(_hook(ws)))
+        decision = _hook(ws)
+        check("a fresh room action ends the turn through the real hook", decision == {},
+              repr(decision))
 
 
 def test_a_room_action_before_the_boundary_is_not_this_turns() -> None:
