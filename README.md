@@ -117,7 +117,7 @@ core session.
 - [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
 - `pip3 install discord.py` / `slack_bolt` — Discord / Slack bridges (Telegram needs no package)
 - ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
-- tmux (`brew install tmux`) — Sutando.app's Restart/Stop Core CLI menu items drive the core's tmux pane; the core starts without it
+- tmux (`brew install tmux`) — Sutando.app watcher auto-restart; the core starts without it
 - git — vault sync, self-upgrade, commit provenance
 - [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS
 

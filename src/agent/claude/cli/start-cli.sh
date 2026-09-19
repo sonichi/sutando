@@ -951,9 +951,9 @@ fi
 # sentinel is cleared at each launch site below, never before one can fail.
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
-# Sutando.app's Restart/Stop Core CLI items drive a tmux-wrapped CLI pane.
+# watcher-auto-restart depends on a tmux-wrapped CLI pane.
 if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
-  echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app's Restart/Stop Core CLI)..."
+  echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
   brew install tmux 2>&1 | tail -3
 fi
 
@@ -974,7 +974,7 @@ fi
 # Fall back to a bare `exec claude` if tmux is still missing.
 if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
-  echo "    (Sutando.app's Restart/Stop Core CLI won't work; brew install tmux to enable)"
+  echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
   if ! command -v claude >/dev/null 2>&1; then
     echo "  ⚠ claude not found — not clearing the shutdown sentinel, no core can start." >&2
@@ -997,7 +997,7 @@ fi
 
 # Explicit -S socket path so Sutando.app (which runs under a different
 # TMPDIR due to macOS sandboxing when launched via `open`) can reach the
-# same tmux server as the user shell, so the app's menu items reach this pane.
+# same tmux server as the user shell (per #PR_444 watcher-auto-restart).
 #
 # Sutando-friendly tmux defaults — applied to the server before the session
 # attaches (see apply_tmux_defaults above for the full rationale).

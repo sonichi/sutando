@@ -57,7 +57,7 @@ nothing else.
 | Vault sync, self-upgrade, commit provenance | `git` | those features unavailable; everything else runs |
 | Agent-authored PR workflows | `gh` | unavailable |
 | OCR on screen captures | `tesseract` | unavailable |
-| Sutando.app's core controls (Restart/Stop Core CLI, model switch) | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:972` falls back to a bare `exec claude`; only the pane-attached controls are lost |
+| Sutando.app watcher auto-restart | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:973` falls back to a bare `exec claude`; only the auto-restart is lost |
 | Building `Sutando.app` from source | Xcode Command Line Tools | not needed if a prebuilt binary ships |
 
 Two entries worth calling out, because both have been overstated before:
@@ -122,7 +122,7 @@ To make an embedded install self-contained, vendor:
 | Node.js | the `dist/*.js` bundles need a node to run |
 | `python3` **+ the per-feature packages above** | an interpreter with an empty `site-packages` starts nothing |
 | `fswatch` | file watcher |
-| `tmux` | optional — buys Sutando.app's core controls, not core start |
+| `tmux` | optional — buys Sutando.app watcher auto-restart, not core start |
 | `ffmpeg` / `ffprobe` | only if recording features are wanted |
 
 Two conventions the code already follows, so a vendored layout is picked up
