@@ -719,7 +719,9 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
 
     # Daily insight (closing thought) — take first sentence, skip if it's just raw data
     if insight:
-        first_sentence = insight.split('.')[0].strip()
+        # A sentence-ending period is followed by space or end; a bare `.`
+        # is a path (`.github/`) or a decimal, and must not end the sentence.
+        first_sentence = re.split(r"\.(?=\s|$)", insight, maxsplit=1)[0].strip()
         has_raw_data = '{' in first_sentence or first_sentence.count(':') > 2
         if not has_raw_data and len(first_sentence) > 20:
             parts.append(f"Insight: {first_sentence}.")

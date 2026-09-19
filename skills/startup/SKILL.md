@@ -45,7 +45,11 @@ Note: this step runs BEFORE step 2 so that the watcher (started by step 2's down
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
-- Reading `skills/schedule-crons/crons.json`
+- Reading `<workspace>/hosts/<host-label>/crons.json` — the per-host file, resolved via
+  `bash scripts/sutando-config.sh workspace` + `host-label`. **NOT** `skills/schedule-crons/crons.json`,
+  which is the pre-migration path (see that skill's SKILL.md) and has since diverged.
+  Invoke the skill; do not hand-roll `CronCreate` from this bullet — the skill also writes the
+  `schedule-crons-stamp.json` that health-check's `session-crons` probe reads.
 - Calling `CronCreate` for each entry that isn't already scheduled
 - Ensuring a fallback `/proactive-loop` cron exists at `*/10 * * * *` if `crons.json` doesn't include one (post-#954 belt-and-suspenders)
 - Starting the streaming task watcher via the `Monitor` tool (`bash src/watch-tasks-stream.sh`, persistent, description `"Streaming task watcher"`)

@@ -14,7 +14,6 @@ import json
 import os
 import secrets
 import tempfile
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -298,12 +297,10 @@ def _revoke_link_locked(state_dir, stand_id, provider, revoked_by, reason):
 
 
 def verify_discord(state_dir: str | Path, token: str) -> dict:
-    req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me",
-        headers={"Authorization": f"Bot {token}",
-                 "User-Agent": "sutando-entrance-verify (https://ag2.ai, v0)"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        me = json.loads(resp.read().decode())
+    # Through the REST chokepoint, not a hand-rolled request: one HTTP stack
+    # means one place that owns retries, UA and the post-gate.
+    from channels.discord.client import DiscordRestClient
+    me = DiscordRestClient(token).get_json("/users/@me")
     subject = {"type": "bot_user", "id": str(me["id"])}
     display = {}
     name = me.get("global_name") or me.get("username")

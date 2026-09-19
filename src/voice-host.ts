@@ -29,6 +29,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
+import { confineUserContent } from './task_body_guard.js';
 
 const PORT = Number(process.env.SUTANDO_VOICE_HOST_PORT || 8788);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -83,7 +84,7 @@ function buildWorkTool(device: { deviceId?: string; label?: string },
 			const body = [
 				`id: ${id}`,
 				`timestamp: ${new Date().toISOString()}`,
-				`task: ${task.replace(/\n/g, ' ')}`,
+				`task: ${confineUserContent(task).replace(/\n/g, ' ')}`,
 				'source: wearable-voice',
 				'channel_id: voice-host',
 				`user_id: ${device.label || 'wearable'}`,
