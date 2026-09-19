@@ -783,7 +783,15 @@ ensure_task_notifier() {
   # publisher installed, removed or duplicated must replace a running watcher.
   handler_rc=0
   if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    ensure_task_event_handlers_published "$REPO"
+    # A self-heal that could not confirm "no pool" and could not repair one
+    # either must refuse -- resolving anyway would read its own failure as
+    # the ordinary no-publisher case and start unrestricted (fail OPEN).
+    if ! ensure_task_event_handlers_published "$REPO"; then
+      echo "  ⚠ task notifier not started: a task-event-handler publisher could not self-heal." >&2
+      echo "    Fix the error above, or pin SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+      return 0
+    fi
     SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
     [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
   fi

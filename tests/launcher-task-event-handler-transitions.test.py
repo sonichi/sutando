@@ -67,6 +67,12 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
         bool(m) and "kill-session" in m.group(1)
     checks[f"{name}: the refusal tells the operator how to pin it"] = \
         bool(m) and "SUTANDO_TASK_EVENT_HANDLER" in m.group(1)
+    # Fail-closed on the self-heal itself: a hook that could not confirm "no pool"
+    # and could not repair one either must refuse, not resolve anyway.
+    em = re.search(r'if ! ensure_task_event_handlers_published "\$REPO"; then(.*?)\n    fi\n', t, re.S)
+    checks[f"{name}: a failed self-heal refuses to start the watcher"] = bool(em) and "return 0" in em.group(1)
+    checks[f"{name}: a failed self-heal also refuses REUSE (kills any live watcher session)"] = \
+        bool(em) and "kill-session" in em.group(1)
 
 # Property 4a: the self-heal gate, against the canonical module (a copy
 # misattributes coverage); publish is mocked so this touches no real file.
@@ -87,6 +93,53 @@ with tempfile.TemporaryDirectory() as _d:
     with _mock.patch.object(_canonical, "publish_task_event_handler") as _pub2:
         _canonical.ensure_task_event_handler_published(_ws_empty)
         checks["canonical: no pool never calls publish"] = not _pub2.called
+    # A publish failure must propagate, not read as "nothing needed doing" --
+    # the caller depends on this to tell no-pool apart from unrepairable.
+    with _mock.patch.object(_canonical, "publish_task_event_handler",
+                             side_effect=_canonical.HandlerPublishError("simulated")):
+        _raised = None
+        try:
+            _canonical.ensure_task_event_handler_published(_ws_pool)
+        except _canonical.HandlerPublishError as _e:
+            _raised = _e
+        checks["canonical: a publish failure with an existing pool raises, not swallowed"] = _raised is not None
+
+# Property 4b: the ensure hook itself, run as a real subprocess -- proves the
+# process-boundary signal a mock of pool_roster cannot.
+ENSURE = REPO / "skills/worker-pool/task-event-handler-ensure"
+with tempfile.TemporaryDirectory() as _d:
+    _fake = pathlib.Path(_d) / "fake-repo"
+    for _sub in ("scripts", "src", "skills/worker-pool/scripts", "workspace/state"):
+        (_fake / _sub).mkdir(parents=True)
+    for _src, _dst in (
+        ("scripts/python-binary.sh", "scripts/python-binary.sh"),
+        ("scripts/sutando-config.sh", "scripts/sutando-config.sh"),
+        ("src/sutando_config.py", "src/sutando_config.py"),
+        ("src/workspace_default.py", "src/workspace_default.py"),
+        ("skills/worker-pool/scripts/pool_roster.py", "skills/worker-pool/scripts/pool_roster.py"),
+    ):
+        (_fake / _dst).write_bytes((REPO / _src).read_bytes())
+    (_fake / "sutando.config.json").write_text(
+        json.dumps({"workspace": {"path": str(_fake / "workspace")}}))
+    (_fake / "workspace/state/roster.json").write_text(json.dumps(
+        {"version": 1, "workers": {"w1": {"state": "live", "label": "w1"}}, "bindings": {}}))
+    _link = _fake / "skills/worker-pool/task-event-handler"
+
+    ok_run = subprocess.run(["bash", str(ENSURE), str(_fake)], capture_output=True, text=True)
+    checks["ensure hook: exits 0 and republishes when it can write"] = \
+        ok_run.returncode == 0 and _link.is_symlink()
+    _link.unlink()
+
+    # A read-only skill dir models the exact failure a locked-down or
+    # read-only install would hit trying to self-heal.
+    (_fake / "skills/worker-pool").chmod(0o555)
+    try:
+        fail_run = subprocess.run(["bash", str(ENSURE), str(_fake)], capture_output=True, text=True)
+    finally:
+        (_fake / "skills/worker-pool").chmod(0o755)
+    checks["ensure hook: exits NONZERO when it cannot write, instead of silently succeeding"] = \
+        fail_run.returncode != 0
+    checks["ensure hook: a failed self-heal leaves no publisher behind"] = not _link.exists()
 
 # Property 3a: the publisher is not shipped.
 tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", "skills/worker-pool/task-event-handler"],

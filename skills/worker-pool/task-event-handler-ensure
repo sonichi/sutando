@@ -1,19 +1,19 @@
 #!/bin/bash
 # Self-heals a checkout whose pool already has a worker but whose publisher
 # went missing (untracked from git after shipping it stopped): republishes it
-# before every launcher resolution. Fire-and-forget -- the launcher's own
-# resolve_task_event_handler still handles a genuinely missing handler (rc 1),
-# so a failure here is never fatal to starting the watcher.
+# before every launcher resolution. Exit NONZERO on any failure to complete
+# this check -- python/workspace unresolvable, or the publish itself failing.
+# The caller must fail closed on that, not treat it as "no pool": an existing
+# pool this could not repair is exactly the fall-through this fix closes.
 REPO="${1:?repo path required}"
 # shellcheck source=../../scripts/python-binary.sh
-. "$REPO/scripts/python-binary.sh" 2>/dev/null || exit 0
-PY="$(require_python "$REPO" "self-heal the task-event handler" 2>/dev/null)" || exit 0
-WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || exit 0
-"$PY" - "$REPO" "$WORKSPACE" <<'PYEOF' 2>/dev/null
+. "$REPO/scripts/python-binary.sh" || exit 1
+PY="$(require_python "$REPO" "self-heal the task-event handler")" || exit 1
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)" || exit 1
+"$PY" - "$REPO" "$WORKSPACE" <<'PYEOF'
 import sys
 repo, workspace = sys.argv[1], sys.argv[2]
 sys.path.insert(0, f"{repo}/skills/worker-pool/scripts")
 import pool_roster
 pool_roster.ensure_task_event_handler_published(workspace)
 PYEOF
-exit 0
