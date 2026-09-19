@@ -57,15 +57,43 @@ export function pickRecentActivity(content: string): string[] {
 }
 
 /**
+ * The owner's stated language from a `Language: <name>` line in
+ * user_profile.md (the CLAUDE.md language rule writes it there), or null.
+ * Accepts the line bare, bulleted or bold-keyed; the value is one short
+ * phrase, so anything past the first sentence-ish break is dropped.
+ * Exported so the test drives this implementation, not a copy.
+ */
+export function pickLanguage(profile: string): string | null {
+	const m = profile.match(/^\s*(?:[-*]\s*)?\**\s*language\s*\**\s*:\s*\**\s*([^\n]+?)\s*\**\s*$/im);
+	if (!m) return null;
+	const value = m[1].split(/[.;(]/)[0].trim().slice(0, 40);
+	return value || null;
+}
+
+/** The room a voice session is docked in; structurally the task bridge's
+ *  VoiceSessionRoom (not imported: this module stays free of the bridge). */
+export interface VoiceContextRoom { id: string; name?: string }
+
+/**
  * Build a concise context summary for the Gemini voice agent.
  * Gives Gemini awareness of the current system state and user context.
+ * `room` is the room the live session is docked in (null/absent = DM).
  */
-export function buildVoiceAgentContext(): string {
+export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null } = {}): string {
 	const userProfile = readMemory('user_profile.md');
 	const lines: string[] = [];
 
 	if (userProfile) {
 		lines.push('USER CONTEXT:', userProfile.slice(0, 500), '');
+		const language = pickLanguage(userProfile);
+		if (language) {
+			lines.push(`LANGUAGE: The user's stated language is ${language}. Speak ${language} unless they ask to switch; when you deliberately answer in English (a quoted error, a name), say so in one clause.`, '');
+		}
+	}
+
+	if (opts.room) {
+		const label = opts.room.name ? `"${opts.room.name}" (${opts.room.id})` : opts.room.id;
+		lines.push(`ROOM: You are docked in room ${label}. What you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went.`, '');
 	}
 
 	// Read build log summary

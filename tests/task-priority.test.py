@@ -91,6 +91,25 @@ class TestParsing(unittest.TestCase):
         )
         self.assertEqual(parse_priority_from_text(body), "urgent")
 
+    def test_parse_priority_room_bound_voice_still_urgent(self):
+        # Room-bound voice: channel_id carries the room and two room keys sit
+        # above priority:; none of that may push priority: out of the header block.
+        body = (
+            "id: task-1\n"
+            "timestamp: 2026-09-18T00:00:00Z\n"
+            "source: voice\n"
+            "interaction_type: realtime_audio\n"
+            "media_form: live_stream\n"
+            "channel_id: !abc123:ag2.space\n"
+            "channel_kind: room\n"
+            "source_room_id: !abc123:ag2.space\n"
+            "user_id: voice-local\n"
+            "access_tier: owner\n"
+            "priority: urgent\n"
+            "task: find apartments\n"
+        )
+        self.assertEqual(parse_priority_from_text(body), "urgent")
+
     def test_parse_priority_missing_returns_normal(self):
         body = "id: task-1\nsource: chat\n"
         self.assertEqual(parse_priority_from_text(body), "normal")

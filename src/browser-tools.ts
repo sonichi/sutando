@@ -39,6 +39,26 @@ export function injectText(session: any, text: string) {
 	}
 }
 
+/** Add context the model should know but not answer: a `clientContent` turn
+ *  with `turnComplete: false` sits in the conversation until the user's next
+ *  utterance closes it. `injectText` (realtime input) always provokes a spoken
+ *  reply, which is how every room switch produced a stray "Working on it."
+ *  (owner 2026-09-18). Returns false when the transport cannot do it; the
+ *  caller must not fall back to `injectText`, silence beats a phantom line. */
+export function injectSilentContext(session: any, text: string): boolean {
+	try {
+		const transport = session?.transport;
+		if (typeof transport?.sendContent === 'function') {
+			transport.sendContent([{ role: 'user', text }], false);
+			return true;
+		}
+		console.warn(`${ts()} [InjectSilent] transport has no sendContent — context dropped`);
+	} catch (err) {
+		console.error(`${ts()} [InjectSilent] Error:`, err);
+	}
+	return false;
+}
+
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
 const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
 
