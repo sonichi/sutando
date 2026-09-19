@@ -528,14 +528,14 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
-# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md): an
-# mtime refreshed by a CHILD, so it stops the instant this watcher does.
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
 WATCHER_BEAT_PID=""
 # INJECTED, never located: a core helper may run a path it is handed but must not
 # find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
 if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
   "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
-      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" >/dev/null 2>&1 &
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
   WATCHER_BEAT_PID=$!
 fi
 # PID-file cleanup is folded into the unified `cleanup` function below so a

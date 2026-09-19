@@ -17,6 +17,10 @@ export WORKSPACE_DIR="$SB/ws"
 mkdir -p "$WORKSPACE_DIR/tasks" "$WORKSPACE_DIR/state"
 BEAT="$WORKSPACE_DIR/state/watchers/core.alive"
 
+# The beat writer is identified as a CHILD of the watcher, by pid. Matching its
+# argv compares two spellings of one temp path and silently matches nothing.
+beat_child_of() { for c in $(pgrep -P "$1" 2>/dev/null); do ps -o command= -p "$c" 2>/dev/null | grep -q 'pool_beat.py' && { echo "$c"; return; }; done; }
+
 check "beat is absent before the watcher starts" '[ ! -f "$BEAT" ]'
 
 # INJECTED: the core must not locate the skill itself, so the test hands it the
@@ -37,6 +41,8 @@ for _ in $(seq 1 60); do [ -f "$BEAT" ] && break; sleep 0.25; done
 check "watcher created its beat" '[ -f "$BEAT" ]'
 check "beat carries no payload (mtime only)" '[ ! -s "$BEAT" ]'
 check "watcher still alive (beat did not come from a crash path)" 'kill -0 "$WATCHER_PID" 2>/dev/null'
+BEAT_PID="$(beat_child_of "$WATCHER_PID")"
+check "the beat writer is a live child of the watcher (pid=${BEAT_PID:-none})" '[ -n "$BEAT_PID" ] && kill -0 "$BEAT_PID" 2>/dev/null'
 
 _before="$(stat -f %m "$BEAT" 2>/dev/null || echo 0)"
 kill -TERM "-$WATCHER_PID" 2>/dev/null
@@ -51,10 +57,27 @@ check "beat stopped advancing once the watcher exited" '[ "$_before" = "$_after"
 check "beat file itself is left behind for the recency read" '[ -f "$BEAT" ]'
 
 # No leaked beat writers: the child must die with its parent.
-_leaked="$(pgrep -f "pool_beat.py --workspace $WORKSPACE_DIR" 2>/dev/null | wc -l | tr -d ' ')"
-check "no pool_beat child survived the watcher (leaked=$_leaked)" '[ "$_leaked" -eq 0 ]'
+check "that beat writer did not survive the watcher" '[ -n "$BEAT_PID" ] && ! kill -0 "$BEAT_PID" 2>/dev/null'
 
 WATCHER_PID=""
+
+# SIGKILL runs no trap, so the watcher's cleanup cannot stop the beat: the beat
+# must notice its parent is gone. Kill the PID ONLY, a group kill proves nothing.
+SB3="$(mktemp -d)"
+export WORKSPACE_DIR="$SB3/ws"
+mkdir -p "$WORKSPACE_DIR/tasks" "$WORKSPACE_DIR/state"
+python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$REPO/src/watch-tasks-stream.sh" "$WORKSPACE_DIR/tasks" >/dev/null 2>&1 &
+W3=$!
+for _ in $(seq 1 60); do [ -f "$WORKSPACE_DIR/state/watchers/core.alive" ] && break; sleep 0.25; done
+B3="$(beat_child_of "$W3")"
+check "a beat writer is running before the kill (control, pid=${B3:-none})" '[ -n "$B3" ] && kill -0 "$B3" 2>/dev/null'
+kill -KILL "$W3" 2>/dev/null
+for _ in $(seq 1 40); do kill -0 "$W3" 2>/dev/null || break; sleep 0.25; done
+check "watcher is gone after SIGKILL" '! kill -0 "$W3" 2>/dev/null'
+for _ in $(seq 1 24); do kill -0 "$B3" 2>/dev/null || break; sleep 0.25; done
+check "the beat writer exits on its own once its parent is SIGKILLed" '[ -n "$B3" ] && ! kill -0 "$B3" 2>/dev/null'
+kill -TERM "-$W3" 2>/dev/null; sleep 0.4; rm -rf "$SB3"
 
 # ...and with the variable UNSET the core writes no beat at all, which is what
 # keeps a host without the pool skill unaffected.
@@ -71,5 +94,5 @@ check "the watcher itself still runs unaffected" 'kill -0 "$W2" 2>/dev/null'
 kill -TERM "-$W2" 2>/dev/null; sleep 0.5; rm -rf "$SB2"
 
 echo ""
-if [ "$fails" -eq 0 ]; then echo "ALL PASS — watcher writes its beat (11 checks)"; else echo "$fails FAILURE(S)"; fi
+if [ "$fails" -eq 0 ]; then echo "ALL PASS — watcher writes its beat (15 checks)"; else echo "$fails FAILURE(S)"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

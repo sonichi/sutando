@@ -152,8 +152,9 @@ _delegated = {}
 _real_rf = pb.run_forever
 
 
-def _spy(path, interval):
+def _spy(path, interval, *, parent_pid=None):
     _delegated["path"], _delegated["interval"] = path, interval
+    _delegated["parent_pid"] = parent_pid
     return 0
 
 
@@ -166,6 +167,70 @@ check("with neither --once nor --read the CLI runs the daemon", _rc, 0)
 check("...on the beat path it was asked for",
       str(_delegated.get("path", "")).endswith("/state/workers/m2.alive"), True)
 check("...at the interval it was given", _delegated.get("interval"), 7.0)
+check("...with no parent to watch unless one is named", _delegated.get("parent_pid"), None)
+pb.run_forever = _spy
+try:
+    pb.main(["--workspace", SB, "--kind", "watcher", "--id", "m3", "--parent-pid", "4242"])
+finally:
+    pb.run_forever = _real_rf
+check("--parent-pid reaches the daemon", _delegated.get("parent_pid"), 4242)
+
+# --- the beat stops when the process it speaks for dies -------------------
+
+# SIGKILL and a crash run no trap, so nothing tells the beat to stop: it looks.
+
+
+def _raises(exc):
+    def _k(_pid, _sig):
+        raise exc
+    return _k
+
+
+check("a live parent is not gone",
+      pb.parent_gone(7, getppid=lambda: 7, kill=lambda p, s: None), False)
+check("a parent whose pid no longer exists is gone",
+      pb.parent_gone(7, getppid=lambda: 7, kill=_raises(ProcessLookupError())), True)
+check("reparented means gone, even if the pid was recycled and answers",
+      pb.parent_gone(7, getppid=lambda: 1, kill=lambda p, s: None), True)
+check("a parent we may not signal is still a parent",
+      pb.parent_gone(7, getppid=lambda: 7, kill=_raises(PermissionError())), False)
+
+_real_pg = pb.parent_gone
+_dead = pathlib.Path(SB) / "state" / "watchers" / "born-orphaned.alive"
+pb.parent_gone = lambda _pid: True
+try:
+    _rc = pb.run_forever(_dead, 30.0, parent_pid=7)
+finally:
+    pb.parent_gone = _real_pg
+check("a beat whose parent is already gone returns at once", _rc, 0)
+check("...and never writes a fresh mtime for it", _dead.exists(), False)
+
+# Parent alive across one full interval, then dead: exactly one refresh happens,
+# and the loop returns from INSIDE the next sleep rather than finishing it.
+_polls = {"n": 0}
+_touches = {"n": 0}
+_real_touch = pb.touch
+
+
+def _gone_after_three(_pid):
+    _polls["n"] += 1
+    return _polls["n"] > 3
+
+
+def _count_touch(path):
+    _touches["n"] += 1
+    _real_touch(path)
+
+
+_lived = pathlib.Path(SB) / "state" / "watchers" / "lived.alive"
+pb.parent_gone, pb.touch, pb.time.sleep = _gone_after_three, _count_touch, (lambda _s: None)
+try:
+    _rc = pb.run_forever(_lived, 0.02, parent_pid=7, poll_s=0.01)
+finally:
+    pb.parent_gone, pb.touch, pb.time.sleep = _real_pg, _real_touch, _real_sleep
+check("the daemon returns 0 when its parent dies", _rc, 0)
+check("it refreshed once at start and once after a full interval", _touches["n"], 2)
+check("it polled inside the interval, not once per 30 s", _polls["n"], 4)
 
 try:
     pb.main(["--workspace", SB, "--kind", "nope", "--id", "m1", "--once"])
@@ -174,7 +239,7 @@ except SystemExit:
     _bad = "refused"
 check("the CLI refuses an unknown --kind", _bad, "refused")
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (35 checks)")
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat (46 checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)
