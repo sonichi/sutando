@@ -391,11 +391,16 @@ class FunctionScopedInvocations(unittest.TestCase):
         self.assertFalse(program_invokes(
             f"inner() {{\n  bash scripts/{NAME}\n}}\nouter() {{\n  inner\n}}\n", NAME))
 
-    def test_a_one_liner_function_has_no_body_lines_to_strip(self):
-        """`name() { cmd; }` closes on its own line -- the new stripper must
-        find no multi-line body there and leave it untouched either way."""
+    def test_a_one_liner_function_is_tracked_as_its_own_single_line_body(self):
+        """round 33, keweichen: `name() { cmd; }` closes on its own line, so
+        the earlier stripper found no separate body line and left this
+        line out of every function's in_body set -- an UNCALLED one-liner's
+        command then read as unconditional top-level code and got credited."""
         from active_code import _function_bodies
-        self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"), [])
+        self.assertEqual(_function_bodies(f"discover() {{ bash scripts/{NAME}; }}\n"),
+                          [("discover", 0, (), 0, 0)])
+        self.assertFalse(program_invokes(
+            f"discover() {{ bash scripts/{NAME}; echo done; }}\nprintf ok\n", NAME))
 
     def test_an_uncalled_function_does_not_hide_an_unrelated_top_level_call(self):
         self.assertTrue(program_invokes(
@@ -427,6 +432,330 @@ class FunctionScopedInvocations(unittest.TestCase):
     def test_split_brace_function_keyword_form(self):
         text = f"function discover()\n{{\n  bash scripts/{NAME}\n}}\ndiscover\n"
         self.assertTrue(program_invokes(text, NAME))
+
+    def test_bare_function_keyword_with_no_parens_is_recognized(self):
+        """kewei-red-ag2space round 33: `function name { ... }` (no `()` at
+        all) is valid Bash that neither existing FUNC_START regex sees."""
+        text = f"function discover {{\n  bash scripts/{NAME} > files\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_bare_function_keyword_split_brace_is_recognized(self):
+        text = f"function discover\n{{\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_escaped_closing_brace_in_a_default_value_does_not_close_early(self):
+        """kewei-red-ag2space round 33: `${x:-\\}}`'s escaped `}` is a
+        LITERAL default-value character, not the expansion's own closer --
+        misreading it let the real closer fall through to the outer counter
+        and close the function block one line early."""
+        text = "discover() {\n  echo ${x:-\\}}\n  bash scripts/" + NAME + "\n}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_shadowed_definition_keeps_only_the_last_ones_reachability(self):
+        """kewei-red-ag2space round 33: Bash redefinition is last-wins -- an
+        earlier same-named definition never executes, whatever calls the
+        name. Tracking reachability by name alone kept a dead first
+        definition's helper call "reachable" once the decoy shadow ran."""
+        text = (f"discover() {{\n  bash scripts/{NAME}\n}}\n"
+                f"discover() {{\n  printf '%s\\n' tests/only.test.py\n}}\ndiscover\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_shadowed_definition_the_last_ones_own_call_still_credits(self):
+        """Control for the above: when the LAST definition is the one that
+        calls the helper, it must still be credited once invoked."""
+        text = (f"discover() {{\n  printf '%s\\n' tests/only.test.py\n}}\n"
+                f"discover() {{\n  bash scripts/{NAME}\n}}\ndiscover\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_space_before_parens_is_still_a_definition_not_a_call(self):
+        """kewei-red-ag2space round 33 (#4391 follow-up): `discover ()` with
+        a space tokenizes its OWN declaration line as a bare call to
+        "discover" -- `discover()` (no space) only avoided this by luck,
+        since the glued token can't equal the bare name."""
+        text = f"discover () {{\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_redefinition_is_last_wins_only_as_of_the_call_not_globally(self):
+        """A decoy defined BEFORE the call and a real helper defined AFTER
+        it: at runtime the call reaches the decoy, since the helper doesn't
+        exist yet. A single global "last definition" wrongly credited the
+        helper regardless of where the call sits relative to it."""
+        text = (f"discover() {{ printf decoy; }}\n"
+                f"discover\n"
+                f"discover() {{\n  bash scripts/{NAME}\n}}\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_call_between_two_definitions_reaches_the_earlier_one(self):
+        """Mirror of the above: the helper is defined and called BEFORE a
+        later decoy redefinition. The call already reached the helper --
+        a later shadow can't retroactively un-run it."""
+        text = (f"discover() {{\n  bash scripts/{NAME}\n}}\n"
+                f"discover\n"
+                f"discover() {{ printf decoy; }}\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_call_before_any_definition_invokes_nothing(self):
+        """Calling a name before it has been defined at all is a real Bash
+        `command not found` -- it must never resolve to a LATER definition
+        of the same name."""
+        text = f"discover\ndiscover() {{\n  bash scripts/{NAME}\n}}\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_command_sharing_the_closing_brace_line_is_still_tracked(self):
+        """`cmd; }` puts the last real command on the SAME line as the
+        closer -- that line sat outside every recorded span, so an
+        uncalled function's last command read as unconditional top-level."""
+        text = f"dead() {{\n  echo hi\n  bash scripts/{NAME}; }}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "dead\n", NAME))
+
+    def test_a_brace_word_outside_command_position_is_not_structural(self):
+        """`echo hi } more` is `}` as a plain ARGUMENT to echo -- Bash never
+        reaches it as the reserved word, but counting every brace character
+        regardless of position closed the function one line early and let
+        the real helper call after it read as top-level."""
+        text = f"dead() {{\n  echo hi }} more\n  bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "dead\n", NAME))
+
+    def test_a_called_one_liner_still_credits_its_own_body(self):
+        """kewei-red-ag2space round 33 follow-up: `discover() { helper; }`
+        then `discover` still read as calling nothing -- the one-liner's own
+        declaration text ("discover() {") glued to its body made the whole
+        line tokenize as a call to "discover()", never to the real command."""
+        text = f"discover() {{ bash scripts/{NAME}; }}\ndiscover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_an_open_line_with_no_further_body_line_before_a_bare_close_is_tracked(self):
+        """kewei-red-ag2space round 33 follow-up: `discover() { :; helper`
+        closed by a BARE `}` on the very next line (no body line between
+        them) vanished from `_function_bodies` entirely -- its content then
+        read as unconditional top-level code, though discover is never called."""
+        text = f"discover() {{ :; bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_an_and_guard_on_the_prior_line_still_gates_the_call(self):
+        """kewei-red-ag2space round 33 follow-up: `called_on()` scanned each
+        physical line alone, so a guard opened on the PRIOR line was invisible
+        -- `false &&\\n  discover` read as an unconditional call to discover."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nfalse &&\n  discover\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_an_and_guard_true_on_the_prior_line_still_credits_the_call(self):
+        """Control for the above: a TRUE guard on the prior line lets the
+        chain proceed, so the call after it must still be credited."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\ntrue &&\n  discover\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_multiline_if_false_block_still_gates_the_call_inside_it(self):
+        """kewei-red-ag2space round 33 follow-up: the same per-line blindness
+        for `if false; then\\n  discover\\nfi` -- Bash never runs discover."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nif false; then\n  discover\nfi\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_multiline_if_true_block_still_credits_the_call_inside_it(self):
+        """Control for the above: a TRUE literal condition really does run
+        the branch, so the call inside it must still be credited."""
+        text = f"discover() {{\n  bash scripts/{NAME}\n}}\nif true; then\n  discover\nfi\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_nested_call_resolves_against_the_outer_calls_own_line_not_its_body_line(self):
+        """kewei-red-ag2space round 33 follow-up: `outer` calls `inner` from
+        a fixed line inside outer's own body; a LATER redefinition of inner,
+        reached before outer is ever invoked, is the one that actually runs
+        -- resolving against the inner call's own (always-earlier) textual
+        position instead credited the shadowed, never-executed definition."""
+        text = (f"inner() {{\n  bash scripts/{NAME}\n}}\n"
+                f"outer() {{\n  inner\n}}\n"
+                f"inner() {{\n  printf DECOY\n}}\n"
+                f"outer\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_nested_call_reaches_a_redefinition_that_lands_before_the_outer_call(self):
+        """Mirror of the above: the helper-carrying redefinition of inner
+        lands BEFORE outer is invoked, so outer's own call now reaches it."""
+        text = (f"inner() {{\n  printf DECOY\n}}\n"
+                f"outer() {{\n  inner\n}}\n"
+                f"inner() {{\n  bash scripts/{NAME}\n}}\n"
+                f"outer\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_dead_and_a_live_identically_worded_call_are_not_conflated(self):
+        """kewei-red-ag2space round 34 follow-up: a dead `discover` call
+        (inside `if false`) and a later live one, worded identically, must
+        not have the live segment's credit misattributed to the dead line
+        -- that would resolve against the WRONG point in the program and
+        credit whichever definition preceded the dead line instead of the
+        one active when the real call actually runs. One-liner definitions
+        on purpose: a multi-line definition's own bare closing `}` becomes
+        an extra top-level segment that happens to reabsorb the
+        misalignment, masking exactly this defect."""
+        text = (f"discover() {{ bash scripts/{NAME}; }}\n"
+                f"if false; then\n  discover\nfi\n"
+                f"discover() {{ printf DECOY; }}\n  discover\n")
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_a_second_call_to_the_same_function_re_resolves_under_a_later_redefinition(self):
+        """kewei-red-ag2space round 34 follow-up: deduping reachable spans
+        by (start, end) alone skipped re-processing a function's body on a
+        SECOND call, so a redefinition landing between the two calls never
+        got explored -- the second call must still resolve independently."""
+        text = ("inner() { printf DECOY; }\n"
+                "outer() { inner; }\n"
+                "outer\n"
+                f"inner() {{ bash scripts/{NAME}; }}\n"
+                "outer\n")
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_split_opener_brace_line_can_carry_body_content_too(self):
+        """kewei-red-ag2space round 34 follow-up: `name()\\n{ :; helper`
+        (content sharing the split opener's OWN brace line, closed by a
+        bare `}` with no body line between) vanished from
+        `_function_bodies` entirely -- only a BARE `{`-only line was
+        recognized as the split form's brace line."""
+        text = f"discover()\n{{ :; bash scripts/{NAME}\n}}\nprintf ok\n"
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text + "discover\n", NAME))
+
+    def test_an_escaped_semicolon_does_not_open_a_manufactured_command_start(self):
+        """kewei-red-ag2space round 34: exact fixture. `\\;` is a LITERAL
+        semicolon (an argument), never a separator -- treating it as one
+        put the reserved-word check at a manufactured command-start right
+        before the literal `}` argument that followed, closing the
+        function one line early. Direct Bash: exits 0, prints only TOP,
+        never runs the helper."""
+        text = ("discover() {\n"
+                "  printf x \\; } more\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace(
+            "}\nprintf TOP\n", "}\ndiscover\nprintf TOP\n"), NAME))
+
+    def test_a_compact_close_semicolon_still_decrements_depth(self):
+        """kewei-red-ag2space round 34: `}` immediately followed by `;`
+        (no space, `};`) is still a valid, structural close -- Bash really
+        runs the command after it. The token-boundary check required
+        whitespace (or string-edge) on both sides, missing an adjacent
+        operator character as an equally valid boundary."""
+        text = ("outer() {\n"
+                f"  {{ printf nested; }}; bash scripts/{NAME}\n"
+                "}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_compact_open_semicolon_still_increments_depth(self):
+        """Mirror of the above: `{` immediately preceded by `;` (no space,
+        `;{`) is an equally valid open -- confirmed by direct execution."""
+        text = ("outer() {\n"
+                f"  printf x;{{ bash scripts/{NAME}; }}\n"
+                "}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_leading_bare_brace_token_is_a_group_opener_not_the_command(self):
+        """kewei-red-ag2space round 34 follow-up: a command-group's own
+        `{ helper` segment tokenized "{" as the command, never "helper" --
+        the group opener must be peeled like `env`/`bash` are. Spaced on
+        both sides so brace-depth counting alone (already correct here)
+        isn't what's under test -- only the token-peel is."""
+        text = f"outer() {{\n  {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("outer\n", "printf ok\n"), NAME))
+
+    def test_a_quoted_or_escaped_brace_is_a_real_command_name_not_a_group_opener(self):
+        """kewei-red-ag2space round 35: `'{'`/`\\{` are Bash attempts to run
+        a program literally named `{` (rc 127) -- shlex resolves both to
+        the identical bare token `{` the group-opener peel could not tell
+        apart from the real reserved word."""
+        self.assertFalse(program_invokes(f"'{{' bash scripts/{NAME}\n", NAME))
+        self.assertFalse(program_invokes(f"\\{{ bash scripts/{NAME}\n", NAME))
+        self.assertTrue(program_invokes(f"{{ bash scripts/{NAME}; }}\n", NAME))
+
+    def test_a_nested_multiline_function_is_gated_by_its_own_reachability(self):
+        """kewei-red-ag2space round 35: `outer` merely DEFINING a nested
+        `inner` (never calling it) must not credit inner's body -- outer
+        being reachable is not the same as inner being called."""
+        text = (f"outer() {{\n  inner() {{\n    bash scripts/{NAME}\n  }}\n}}\nouter\n")
+        self.assertFalse(program_invokes(text, NAME))
+        called = text.replace("  }\n}\nouter\n", "  }\n  inner\n}\nouter\n")
+        self.assertTrue(program_invokes(called, NAME))
+
+    def test_a_real_call_after_a_nested_definition_is_still_in_the_outer_span(self):
+        """kewei-red-ag2space round 35: a nested definition's own close
+        must not be mistaken for the ENCLOSING function's close -- content
+        AFTER the nested def (here, outer's real helper call) has to stay
+        inside outer's tracked span, or an uncalled outer still credits it
+        as unconditional top-level text. Direct Bash: prints only TOP."""
+        text = ("outer() {\n"
+                "  inner() {\n"
+                "    printf never\n"
+                "  }\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace("}\nprintf TOP\n", "}\nouter\nprintf TOP\n"), NAME))
+
+    def test_a_backslash_continued_line_is_not_a_fresh_command_start(self):
+        """kewei-red-ag2space round 35: the continued half of a
+        backslash-newline command is still mid-command, so its `}` is a
+        plain argument, never a line-start reserved word -- confirmed by
+        direct execution (prints only TOP, the helper never runs)."""
+        text = ("discover() {\n"
+                "  printf x \\\n"
+                "    } more\n"
+                f"  bash scripts/{NAME}\n"
+                "}\nprintf TOP\n")
+        self.assertFalse(program_invokes(text, NAME))
+        self.assertTrue(program_invokes(text.replace("}\nprintf TOP\n", "}\ndiscover\nprintf TOP\n"), NAME))
+
+    def test_negation_before_a_group_still_sees_the_group_opener(self):
+        """kewei-red-ag2space round 36 follow-up: `! { helper; }` really
+        runs helper (direct execution) -- computing the group-opener check
+        against the pre-`!`-peel text left the now-leading `{` unrecognized."""
+        self.assertTrue(program_invokes(f"! {{ bash scripts/{NAME}; }}\n", NAME))
+
+    def test_a_semicolon_before_a_continuation_still_reopens_command_start(self):
+        """kewei-red-ag2space round 36 follow-up: `:;` before a
+        backslash-newline already re-arms command position, so the `}` on
+        the continued line closes the function for real -- confirmed by
+        direct execution (the helper runs unconditionally, outside it)."""
+        text = "outer() {\n  :; \\\n}\n" + f"bash scripts/{NAME}\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_an_outer_and_a_nested_one_liner_do_not_alias_by_span(self):
+        """kewei-red-ag2space round 36 follow-up: an outer one-liner and a
+        nested one-liner inside it can share an identical (start, end)
+        span; reachability keyed on span alone credited the never-called
+        nested one just because the span happened to match the outer's."""
+        text = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertFalse(program_invokes(text, NAME))
+        called = text.replace("}\nouter\n", "}\n  inner\n}\nouter\n")
+        self.assertTrue(program_invokes(called, NAME))
+
+    def test_content_after_a_nested_close_belongs_to_the_enclosing_body(self):
+        """kewei-red-ag2space round 36 follow-up: `}; helper` puts the
+        ENCLOSING function's own command on the same line as a NESTED
+        function's close -- that command must survive even when the
+        nested function is never called and its body gets blanked."""
+        text = ("outer() {\n  inner() {\n    :\n"
+                f"  }}; bash scripts/{NAME}\n}}\nouter\n")
+        self.assertTrue(program_invokes(text, NAME))
+        self.assertFalse(program_invokes(text.replace("}\nouter\n", "}\nprintf ok\n"), NAME))
+
+    def test_a_call_before_its_own_nested_definition_invokes_nothing(self):
+        """qingyun-sutando / kewei-red-ag2space round 36 follow-up: a name
+        called then defined, both inside the SAME body, must resolve to
+        nothing -- real Bash reports command-not-found, since the later
+        definition has not executed yet at the point of the call."""
+        text = f"outer() {{\n  inner\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\n"
+        self.assertFalse(program_invokes(text, NAME))
+        reordered = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n  inner\n}}\nouter\n"
+        self.assertTrue(program_invokes(reordered, NAME))
 
 
 class LiteralConstantAndOrChains(unittest.TestCase):

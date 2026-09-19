@@ -88,15 +88,30 @@ def _dquote_join(parts: list[str]) -> str:
     `_yaml_dquote_unescape` (round 32, kewei-red-ag2space: unconditional
     `" ".join` let `\\<space>` decode the join's own inserted space back into
     a real one, silently matching real YAML by accident on this input and
-    diverging on any other)."""
-    out = parts[0]
-    for part in parts[1:]:
-        trailing = len(out) - len(out.rstrip("\\"))
-        if trailing % 2 == 1:
-            out = out[:-1] + part
+    diverging on any other). A BLANK physical part folds to a newline, not a
+    space -- one `\\n` per consecutive blank (round 33, kewei-red-ag2space:
+    a blank line between two commands is real YAML line-break semantics;
+    joining it with a space instead glued two Bash statements into one,
+    crediting a script as the first command's argument when it never
+    receives it, and orphaning it in the reverse direction)."""
+    out, blanks = None, 0
+    for part in parts:
+        if part == "":
+            blanks += 1
+            continue
+        if out is None:
+            out = "\n" * blanks
+        elif blanks:
+            out += "\n" * blanks
         else:
-            out = out + " " + part
-    return out
+            trailing = len(out) - len(out.rstrip("\\"))
+            if trailing % 2 == 1:
+                out = out[:-1]
+            else:
+                out += " "
+        blanks = 0
+        out += part
+    return (out or "") + "\n" * blanks
 
 
 def _quote_close_split(value: str, q: str) -> "tuple[bool, str]":
@@ -366,6 +381,24 @@ class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
         ORDINARY fold, which still must insert a space (unchanged)."""
         wf = ('steps:\n  - run: "python3\n'
               '          packages/x/test_real.py"\n')
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_blank_continuation_line_folds_to_a_newline_not_a_space(self):
+        """kewei-red-ag2space round 33: a BLANK physical line inside a
+        double-quoted scalar is real YAML line-break semantics (confirmed
+        against PyYAML: decodes to 'python3\\npackages/...'), so Bash runs
+        `python3` with no args on one line and the bare path fails on the
+        next. Joining it with a space instead glues them into one command,
+        crediting the path as python3's argument though it never receives
+        it -- the false green kewei's exact repro demonstrates."""
+        wf = 'steps:\n  - run: "python3\n\n          packages/x/test_dead.py"\n'
+        self.assertEqual(_named_in(wf), set())
+
+    def test_blank_continuation_line_the_reverse_direction_still_names_it(self):
+        """The mirror false-NEGATIVE: a python3 invocation that DOES run,
+        separated from a preceding inert command by a blank line, must
+        still be named -- the old space-join buried it as an argument."""
+        wf = 'steps:\n  - run: "echo inert\n\n          python3 packages/x/test_real.py"\n'
         self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
 
 
