@@ -48,6 +48,9 @@ MAP = {
     "outbox_cli.py": "outbox_cli.py",
     # quarantine naming: the bridge moves results in, requeue moves them back
     "undelivered_quarantine.py": "undelivered_quarantine.py",
+    # worker-pool completion-record contract: the pool skill writes through it
+    # and the bridge reads through it, so neither keeps a private predicate.
+    "pool_record.py": "pool_record.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

@@ -193,11 +193,15 @@ else:
 print("the two guards agree on the suffix set")
 hook = (ROOT / "src" / "check-pending-tasks.sh").read_text(encoding="utf-8")
 m = re.search(r"sentinel_task_id\(\)\s*\{(.*?)\n\}", hook, re.S)
-check(m is not None, "the hook still defines sentinel_task_id()")
 if m:
     hook_suffixes = set(re.findall(r"\*(\.[a-z]+)\)", m.group(1)))
     check(hook_suffixes == set(SENTINEL_SUFFIXES),
           f"hook {sorted(hook_suffixes)} == module {sorted(SENTINEL_SUFFIXES)}")
+else:
+    # No second copy is the stronger state, so check the removal is COMPLETE:
+    # a renamed function must not smuggle the suffix set back past this guard.
+    stray = sorted(set(re.findall(r"\*(\.[a-z]+)\)", hook)) & set(SENTINEL_SUFFIXES))
+    check(not stray, f"the hook spells no sentinel suffix of its own (found {stray})")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)

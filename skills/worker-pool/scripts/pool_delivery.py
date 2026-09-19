@@ -39,6 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
+from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
+                         RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
+                         require_recipient, workers_root)
 
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
@@ -56,7 +59,8 @@ LOCK_NAME = ".lock"
 _SENTINEL = re.compile(
     r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<accepted>\.accepted|\.claimed))$")
 
-RECIPIENT = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# RECIPIENT, the record layout and the record predicate are imported above:
+# the gateway bridge reads what this module writes, so both bind one contract.
 
 
 class NotDelivered(Exception):
@@ -78,9 +82,7 @@ def _root(workspace) -> Path:
 
 
 def deliveries_dir(workspace, recipient: str) -> Path:
-    if not RECIPIENT.match(recipient):
-        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
-    return _root(workspace) / "deliveries" / recipient
+    return _root(workspace) / "deliveries" / require_recipient(recipient)
 
 
 def payload_path(workspace: Path, task_id: str) -> Path:
@@ -102,12 +104,14 @@ def result_path(workspace: Path, task_id: str) -> Path:
 
 
 def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
-    return _root(workspace) / "state" / "workers" / recipient / "done" / f"{task_id}.flag"
+    return record_path(workers_root(_root(workspace) / "state"), recipient,
+                       task_id, DONE_STAGE)
 
 
 def pending_flag(workspace: Path, recipient: str, task_id: str) -> Path:
     """The first stage of the same record: owned, result not yet published."""
-    return done_flag(workspace, recipient, task_id).with_suffix(".pending")
+    return record_path(workers_root(_root(workspace) / "state"), recipient,
+                       task_id, PENDING_STAGE)
 
 
 def is_done_flag(path) -> bool:
@@ -115,19 +119,14 @@ def is_done_flag(path) -> bool:
     symlink at the name is malformed state, and reading either as a finish
     invents a claimant.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return False
-    except OSError:
-        raise
-    try:
-        return stat.S_ISREG(os.fstat(fd).st_mode)
-    finally:
-        os.close(fd)
+    return read_record_state(path) is RecordState.PRESENT
 
 
 def _publish_record(dst: Path) -> None:
+    # The recipient's folder and its `done/` must be this recipient's OWN: through
+    # an alias the record would land under another recipient's name.
+    require_own_dir(dst.parent.parent)
+    require_own_dir(dst.parent)
     # Temp file + rename inside the same directory, so a concurrent reader sees
     # the name either absent or complete, never half-written.
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -148,8 +147,7 @@ def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Pa
     `.flag` after, and that is the only stage `residue` retires on. A promoted
     record is never demoted, so a late `pending` cannot reopen retired work.
     """
-    if not RECIPIENT.match(recipient):
-        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    require_recipient(recipient)
     if not _SENTINEL.match(task_id + PENDING_SUFFIX):
         raise ValueError(f"not a task id: {task_id!r}")
     done = done_flag(workspace, recipient, task_id)
@@ -171,8 +169,7 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     it. Never touches `.flag` -- a finish is never undone -- and is idempotent, so a
     fallback that fires twice is harmless.
     """
-    if not RECIPIENT.match(recipient):
-        raise ValueError(f"recipient id must match {RECIPIENT.pattern!r}: {recipient!r}")
+    require_recipient(recipient)
     if not _SENTINEL.match(task_id + PENDING_SUFFIX):
         raise ValueError(f"not a task id: {task_id!r}")
     pend = pending_flag(workspace, recipient, task_id)
