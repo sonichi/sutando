@@ -46,5 +46,43 @@ into the core, where the descriptions can be checked against a caller.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags.
+- `pool_ask.py` — ask another instance a question through the front door (below).
 
 Suites live at `tests/skills/worker-pool/`.
+
+## Talking to the other instances (core ↔ worker)
+
+You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)
+and zero or more **workers**, each with its own tmux session, watcher and inbox
+(`deliveries/<worker id>/`). There is deliberately no back channel between them —
+what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
+the owner can see, and a reply is an ordinary result.
+
+```
+python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who
+python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|core> --ask "..." [--wait 300]
+```
+
+- `--who` lists every recipient — `core` and each worker by label — with its bound
+  rooms and whether the supervisor sees its session alive; `(you)` marks the caller.
+- `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
+  `requested_worker: <id>` (never for the core, which is the default recipient) and
+  `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like
+  any other delivery; the core's watcher takes an ask addressed to the core.
+- **To answer an ask**, write `results/<task id>.txt` whose first line is `[no-send]`
+  — the asker reads the file (with `--wait`, as soon as it lands) and nothing is
+  posted to any room. The ask's body says so, so an answerer needs no other briefing.
+- An ask carries `access_tier: team` + `collaborator: true` + `priority: low`: the asker is
+  another instance, not the owner, so a standing ask never reads as an owner waiting to
+  `scripts/cron-gate.sh` or the shepherds (measured: an owner-tier ask deferred `sync-workspace`).
+- **Relaying someone else's question** — a peer's, a guest's — is `--relayed-from <who>
+  --tier <team|other|guest>`: the task keeps *their* tier and carries `relayed_from:` for the
+  receiver to key on. `owner` is never a tier an ask can claim, and non-owner content must
+  never be relayed as your own: the tier must say where the question came from, not who ran
+  the script.
+- Refused, never guessed: an unknown name, a label two workers share, and asking yourself.
+
+Not yet: the reply is read from `results/` by the asker, not delivered into the
+asker's inbox (`reply_to_instance` is recorded for that later leg), and a worker
+learns this section by reading it — surfacing it in `/startup --worker` is one line
+in the startup skill, outside this one.

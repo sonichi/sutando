@@ -389,31 +389,27 @@ finish_handler_task() {
 TERMINAL_REFUSAL_MARK="could not safely process"
 
 handler_result_is_answer() {
-  # Our own refusal means the handler was interrupted and a restart MUST
-  # re-dispatch; an archived result belongs to the reap path, not to this guard.
-  local filename="$1" live="$RESULTS_DIR/$1" first
+  # An archive-only result (no live file) still belongs to the reap path, not
+  # to this guard; unchanged from before this function's fix.
+  local filename="$1" live="$RESULTS_DIR/$1" ready first
   [ -f "$live" ] || return 1
-  handler_result_exists "$filename" || return 1
+  [ -n "$SUTANDO_PY_BIN" ] || return 1
+  # Once a live file exists, even a placeholder, the refusal-or-answer line
+  # must come from find-ready's own READY path, never a hardcoded $live.
+  ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$live" || first=""
+  IFS= read -r first < "$ready" || first=""
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }
 
 handler_result_exists() {
-  # Readiness is delivery/readiness's contract (rejects whitespace-only too) and the
-  # live-then-archive lookup is local_task_protocol's; this must not re-decide either.
-  local filename="$1" task_id="${filename%.txt}"
+  # Completion is delivery/task_dispatch's contract (every archive layout, walked past
+  # empty placeholders to a READY body); a first-hit lookup here would re-decide it.
+  local filename="$1"
   [ -n "$SUTANDO_PY_BIN" ] || return 1
-  "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
-import pathlib, sys
-sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
-from local_task_protocol import find_result
-from delivery.readiness import read_ready_result
-found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
-raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
-PYEOF
+  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$filename" 2>/dev/null
 }
 
 drain_dispatch_queue() {
@@ -582,6 +578,16 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+WATCHER_BEAT_PID=""
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -780,6 +786,9 @@ cleanup() {
   sentinel_release_if_owner "$PID_FILE" "$$"
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
+  fi
+  if [ -n "${WATCHER_BEAT_PID:-}" ]; then
+    kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
   if declare -F fallback_outstanding_handlers >/dev/null; then
     fallback_outstanding_handlers

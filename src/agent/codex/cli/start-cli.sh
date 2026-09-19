@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/task-event-handler-lookup.sh"
 
 # This runtime has no worker mode: everything below is the canonical core's
 # ceremony, so an instance launch is refused before the first step of it.
@@ -189,10 +190,34 @@ ensure_task_notifier() {
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
   )
+  # The resolved outcome is part of the identity below, so resolve first: a
+  # publisher installed, removed or duplicated must replace a running watcher.
+  handler_rc=0
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    # A self-heal that could not confirm "no pool" and could not repair one
+    # either must refuse -- resolving anyway would read its own failure as
+    # the ordinary no-publisher case and start unrestricted (fail OPEN).
+    if ! ensure_task_event_handlers_published "$REPO"; then
+      echo "  ⚠ task notifier not started: a task-event-handler publisher could not self-heal." >&2
+      echo "    Fix the error above, or pin SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+      return 0
+    fi
+    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
+    [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
+  fi
+  # Fail CLOSED: without the router probe a worker-bound task would fall
+  # through to the unrestricted core, the inheritance the handler prevents.
+  if [ "$handler_rc" = 2 ]; then
+    echo "  ⚠ task notifier not started: several skills publish skills/*/task-event-handler." >&2
+    echo "    Pin one with SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    return 0
+  fi
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \

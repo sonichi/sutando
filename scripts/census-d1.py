@@ -39,16 +39,19 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                            r"SocketModeHandler")]),
     }),
     ("normalized ingress identity", {
-        "discord": ("none distinct — collapses into the freshly minted "
-                    "task id (event replay after restart = new task)",
-                    [(DISCORD, r'task_id = f"task-\{ts\}"'),
-                     (DISCORD, r"ingress_id|ingress_identity", "absent")]),
+        "discord": ("`task-dc<inst>~<message.id>` via provider_task_id — "
+                    "injective from the provider event id, so a replay after "
+                    "restart maps to the same file (already_admitted dedups)",
+                    [(DISCORD, r'task_id = provider_task_id\(f"dc\{_inst\}", str\(message\.id\)\)'),
+                     (DISCORD, r"from ingress_identity import provider_task_id, already_admitted")]),
         "ag2space": ("`task-<inst>~<broker_id>` — injective mapping from the "
                      "provider id, so a replayed lease maps to the same file",
                      [(AG2, r'return f"task-\{GATEWAY_INSTANCE\}~\{broker_tid\}"')]),
-        "slack": ("none distinct — collapses into the freshly minted task id",
-                  [(SLACK, r'task_id = f"task-\{ts\}"'),
-                   (SLACK, r"ingress_id|ingress_identity", "absent")]),
+        "slack": ("`task-sl<team>~<channel>-<ts>` via provider_task_id — "
+                  "injective from the provider event, replay-deduped by "
+                  "already_admitted",
+                  [(SLACK, r'task_id = provider_task_id\(f"sl'),
+                   (SLACK, r"from ingress_identity import provider_task_id, already_admitted")]),
     }),
     ("task_id", {
         "discord": ("`task-<epoch-ms>` minted by the bridge at write time "

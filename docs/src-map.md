@@ -95,6 +95,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
+- **`ingress_identity.py`** — Provider-event ingress admission — the shared policy behind Slice 3.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
@@ -133,6 +134,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`pool_bindings_declared.py`** — Does <state>/bindings.json declare a worker binding?
+- **`pool_record.py`** — Worker-pool completion record: who may hold one, and what one *is*.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -174,6 +176,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
@@ -183,6 +186,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -266,12 +270,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
+- **`task-event-handler-lookup.sh`** — Optional capability lookup for the watcher's task-event handler.
 
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
+- **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
 
 ## `src/agent/codex/cli/`
 
@@ -297,8 +303,10 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`pane_gate.py`** — Pane idle-gate and line delivery for a core CLI pane — the consumer-side policy every external task-notifier shares.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
+- **`task_dispatch.py`** — Consumer-side dispatch policy shared by every external task-notifier.
 
 ## `src/hitl/`
 

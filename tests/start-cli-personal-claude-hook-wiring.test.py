@@ -62,6 +62,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             REPO / "src/agent/restart-guard.sh",
             self.root / "src/agent/restart-guard.sh",
         )
+        shutil.copy2(
+            REPO / "src/agent/task-event-handler-lookup.sh",
+            self.root / "src/agent/task-event-handler-lookup.sh",
+        )
 
         self.marker = self.root / "installer-ran.marker"
         installer = self.root / "scripts/install-personal-claude-hook.sh"
