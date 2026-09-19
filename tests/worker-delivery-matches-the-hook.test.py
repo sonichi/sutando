@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """The core must not report a task the router already delegated.
 
-Two guards answer "is this still the core's to report?" — the Stop hook in
-shell (it must run without an interpreter) and skills/worker-pool/scripts/worker_delivery.py for
-Python callers. This suite pins the behaviour AND pins the two to the same
-sentinel suffix set, because the failure mode is silent: the copy nobody
-re-reads is the one that hands a worker's task back to the core.
+Two modules answer "is this still the core's to report?" — src/delivery/task_dispatch.py,
+which the Stop hook shells out to, and skills/worker-pool/scripts/worker_delivery.py
+for Python callers. src/ must not import an optional skill, so they cannot share
+the constant; this suite is what keeps them in step. It pins the behaviour AND
+pins the two spellings to the same set, because the failure mode is silent: the
+copy nobody re-reads is the one that hands a worker's task back to the core.
 
 Run: python3 tests/worker-delivery-matches-the-hook.test.py
 Exit: 0 on pass, 1 on fail.
@@ -13,6 +14,7 @@ Exit: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import errno
+import importlib.util
 import re
 import subprocess
 import sys
@@ -190,14 +192,23 @@ else:
                          "--workspace", str(ws6)], capture_output=True, text=True)
     check(r4.returncode == 0, "readable again, the held task is 0 — the 2 was the permission, not the tree")
 
-print("the two guards agree on the suffix set")
+print("the suffix set has one spelling per live owner, and they agree")
+# The hook stopped spelling suffixes in #4437 and asks task_dispatch.py instead,
+# so the second copy is now that module's, not the hook's — follow it, don't re-pin.
 hook = (ROOT / "src" / "check-pending-tasks.sh").read_text(encoding="utf-8")
-m = re.search(r"sentinel_task_id\(\)\s*\{(.*?)\n\}", hook, re.S)
-check(m is not None, "the hook still defines sentinel_task_id()")
-if m:
-    hook_suffixes = set(re.findall(r"\*(\.[a-z]+)\)", m.group(1)))
-    check(hook_suffixes == set(SENTINEL_SUFFIXES),
-          f"hook {sorted(hook_suffixes)} == module {sorted(SENTINEL_SUFFIXES)}")
+hook_suffixes = set(re.findall(r"\*(\.[a-z]+)\)", hook))
+check(not hook_suffixes,
+      f"the hook spells no sentinel suffix of its own (found {sorted(hook_suffixes)})")
+check(re.search(r"task_dispatch\.py\"?\s+owned-by", hook) is not None,
+      "the hook asks task_dispatch.py owned-by for ownership")
+
+spec = importlib.util.spec_from_file_location(
+    "task_dispatch_suffix_guard", ROOT / "src" / "delivery" / "task_dispatch.py")
+task_dispatch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(task_dispatch)
+check(set(task_dispatch._WORKER_HOLD_SUFFIXES) == set(SENTINEL_SUFFIXES),
+      f"task_dispatch {sorted(task_dispatch._WORKER_HOLD_SUFFIXES)} == "
+      f"worker_delivery {sorted(SENTINEL_SUFFIXES)}")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)
