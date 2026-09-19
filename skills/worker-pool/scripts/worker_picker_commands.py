@@ -376,9 +376,11 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
         pr.validate_current_roster(workspace)
         if action == "pin":
             workers = list(cmd.get("workers") or [])
-            if len(workers) != 1:
-                raise pr.RosterError(f"pin names {len(workers)} workers; a room takes one")
-            roster = pr.bind_room(workspace, cmd["room"], workers[0])
+            if not workers:
+                raise pr.RosterError("pin names no worker")
+            # The COMPLETE set in one call: a per-name loop would publish an
+            # advertisement for each prefix of it.
+            roster = pr.bind_room(workspace, cmd["room"], workers)
         else:
             roster = pr.unbind_room(workspace, cmd["room"])
         # bind/unbind end in a compile, and the compile publishes; a publish

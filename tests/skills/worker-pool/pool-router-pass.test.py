@@ -92,14 +92,17 @@ class TestResolution(Base):
         got = rt.route(self.ws, self.task(requested_worker=W2), r)
         self.assertEqual(got["delivered"], [W2])
 
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_a_set_delivers_one_sentinel_per_member(self):
+    def test_an_unaddressed_task_from_a_bound_set_goes_to_the_primary_alone(self):
         r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}}, {SRC: [W1, W2]})
         got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
-        for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
+        self.assertEqual(got["delivered"], [W1])
+        self.assertTrue((self.ws / "deliveries" / W1 / "task-1.txt").exists())
+        self.assertFalse((self.ws / "deliveries" / W2).exists(),
+                         "the second member received a copy of one task")
+
+    def test_the_primary_is_the_first_member_not_the_lowest_name(self):
+        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}}, {SRC: [W2, W1]})
+        self.assertEqual(rt.route(self.ws, self.task(), r)["delivered"], [W2])
 
 
 class TestNeverSubstitutes(Base):
@@ -121,15 +124,33 @@ class TestNeverSubstitutes(Base):
         self.assertEqual(got["delivered"], [W1])
         self.assertFalse((self.ws / "deliveries" / "core").exists())
 
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_every_member_of_a_set_is_delivered_to(self):
+    def test_an_addressed_member_of_a_set_is_the_only_recipient(self):
+        """Addressing selects WITHIN the set — it does not widen it."""
         r = self.roster({W1: {"state": "live"}, W2: {"state": "abandoned"}},
                         {SRC: [W1, W2]})
-        got = rt.route(self.ws, self.task(), r)
-        self.assertEqual(sorted(got["delivered"]), sorted([W1, W2]))
-        for w in (W1, W2):
-            self.assertTrue((self.ws / "deliveries" / w / "task-1.txt").exists())
+        got = rt.route(self.ws, self.task(requested_worker=W2), r)
+        self.assertEqual(got["delivered"], [W2])
+        self.assertFalse((self.ws / "deliveries" / W1).exists())
+
+    def test_a_non_member_named_on_a_bound_set_goes_to_the_core(self):
+        """The name is on the roster but not in the set: it is unknown HERE, so
+        the task falls to the core and never to a member of the set."""
+        W3 = "c5f13e4d6a7b8c9d0e1f2a3b4c5d6e7f"
+        r = self.roster({W1: {"state": "live"}, W2: {"state": "live"},
+                         W3: {"state": "live"}}, {SRC: [W1, W2]})
+        got = rt.route(self.ws, self.task(requested_worker=W3), r)
+        self.assertEqual(got["delivered"], ["core"])
+        self.assertEqual(len(got["redirected"]), 1)
+        self.assertIn(W3, got["redirected"][0])
+        for w in (W1, W2, W3):
+            self.assertFalse((self.ws / "deliveries" / w).exists(), w)
+
+    def test_a_non_member_on_a_single_binding_is_still_honoured(self):
+        """The control for the case above: outside a SET, a roster name the
+        sender addresses is delivered to, exactly as before this change."""
+        W3 = "c5f13e4d6a7b8c9d0e1f2a3b4c5d6e7f"
+        r = self.roster({W1: {"state": "live"}, W3: {"state": "live"}}, {SRC: W1})
+        self.assertEqual(rt.route(self.ws, self.task(requested_worker=W3), r)["delivered"], [W3])
 
 
 class TestDoubleDelivery(Base):
@@ -241,16 +262,15 @@ class TestPayloadGuard(Base):
         self.assertEqual(out["skipped"], [W1])
         self.assertIsNone(pd.find(self.ws, W1, "task-done"))
 
-    @unittest.skip("fan-out bindings are refused by compile_roster on main; never exercised live")
-
-    def test_a_set_skips_only_the_missing_payload_not_the_members(self):
-        # One payload serves every member, so the guard is per-task: either all
-        # members are skipped or none are.
+    def test_a_set_with_no_payload_skips_its_one_recipient(self):
+        # One recipient, so the missing-payload guard has one subject: the
+        # primary is skipped and no member is written to instead.
         r = self.roster({W1: {"state": "live"}, W2: {"state": "live"}},
                         {SRC: [W1, W2]})
         out = rt.route(self.ws, self.task("task-ghost", payload=False), r)
-        self.assertEqual(sorted(out["skipped"]), sorted([W1, W2]))
+        self.assertEqual(out["skipped"], [W1])
         self.assertEqual(out["delivered"], [])
+        self.assertFalse((self.ws / "deliveries" / W2).exists())
 
     def test_the_ordinary_path_still_delivers(self):
         r = self.roster()
