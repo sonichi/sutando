@@ -11110,7 +11110,8 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
         labels = "/".join(e["label"] for e in entries if e.get("label"))
     except (OSError, ValueError, TypeError, AttributeError):
         labels = ""
-    return f"running (hotkeys: {labels})" if labels else "running (hotkeys, none published)"
+    watch = "watcher-watchdog + hotkeys"
+    return f"running ({watch}: {labels})" if labels else f"running ({watch}, none published)"
 
 
 def _outermost_bundle(comm: str) -> Optional[Path]:
@@ -11132,7 +11133,7 @@ def _is_electron_impostor(comm: str) -> bool:
     The desktop UI also installs as "Sutando.app", and its main binary lives
     at the same …/Contents/MacOS/Sutando suffix the sutando-app pgrep pattern
     matches — so the probe reported "running" while the actual Swift menu-bar
-    app (the contextual-chips writer) was dead
+    app (the contextual-chips writer + watcher-auto-restart owner) was dead
     (#2038, 2026-07-09). Electron bundles are distinguishable on disk: they
     ship Contents/Frameworks/Sutando Helper.app; the Swift app has no helper
     frameworks.
@@ -13073,7 +13074,9 @@ def run_all_checks() -> list[dict]:
             checks.append(check)
         elif pgrep_status == "ok-stopped":
             checks.append({"name": "sutando-app", "status": "warn",
-                           "detail": "not running — hotkeys disabled"})
+                           "detail": "not running — hotkeys disabled AND checkWatcher is "
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn

@@ -377,12 +377,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // auto-stop) — observe those and mirror onto the Drop Video Clip row.
         registerRecordingStateObservers()
 
+        // Watcher health: every 5 min, verify the task watcher is running.
+        // Bumped from 30s → 300s on 2026-05-14 (Chi greenlit) — with Claude
+        // Code's `Monitor` tool now driving `watch-tasks-stream.sh` as the
+        // canonical persistent watcher, the menu-bar Timer is purely a
+        // safety net (catches Monitor crash / session-restart race / tmux
+        // pane death). 30s polling was overkill; 5 min keeps recovery in
+        // human-interactive territory (worst-case lag = ~5 min stale before
+        // auto-restart) while cutting 12× the wake-ups.
+        //
+        // Recovery shells out to the launcher dispatcher rather than typing a
+        // keystroke into the pane — see checkWatcher() below.
+        Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
+            self?.checkWatcher()
+        }
+
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent
         // results). No LLM round-trip. Replaces the (never-shipped) draft
         // /personal-reactive-loop skill — the cadence is purely mechanical
         // polling, so the natural home is the menu-bar app that already
-        // runs the other mechanical timers. Per Chi's review 2026-05-05: "if it's only
+        // does watcher liveness. Per Chi's review 2026-05-05: "if it's only
         // scripts, can it be merged with the sutando app?"
         Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
             self?.refreshContextualChips()
@@ -394,7 +409,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Health-check: every 30min, run health-check.py --fix and append
-        // to logs/health-check.log. Same pattern as contextual
+        // to logs/health-check.log. Same pattern as watcher-liveness +
         // chips. Replaces ~/Library/LaunchAgents/com.sutando.health-check
         // .plist (retired in the same change set per trio-design-current
         // .md "Health-check ownership"). After this binary ships:
@@ -551,6 +566,106 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
+    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
+    /// fail-opened on any argv merely mentioning the substring (review #4269,
+    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
+    /// boundary check (`watcherLineMatches`) to keep correct, not two.
+    func watcherProcessSeen() -> Bool? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        // pid,command (not bare command): excluding OUR OWN pid needs it, since
+        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
+        ps.arguments = ["-axo", "pid,command"]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        ps.waitUntilExit()
+        // A failed ps must read as unknown -- an empty listing from a
+        // non-zero exit is not a clean "no match" (the sysmond-unreachable
+        // case this whole probe exists to not misread as "dead", #4269).
+        if ps.terminationStatus != 0 {
+            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            return nil
+        }
+        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        // A definite match short-circuits alive; an undecidable line must not
+        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
+        var sawUndecidable = false
+        for line in listing.split(separator: "\n") {
+            switch watcherLineMatches(line, excluding: selfPID) {
+            case .some(true): return true
+            case .none: sawUndecidable = true
+            case .some(false): continue
+            }
+        }
+        return sawUndecidable ? nil : false
+    }
+
+    /// True when `s` contains the watcher script's name at a path/whitespace
+    /// boundary on both sides.
+    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
+        let marker = "watch-tasks-stream.sh"
+        var searchRange = s.startIndex..<s.endIndex
+        while let r = s.range(of: marker, range: searchRange) {
+            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
+            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
+            if before && after { return true }
+            searchRange = r.upperBound..<s.endIndex
+        }
+        return false
+    }
+
+    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
+    /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
+        let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
+        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return false }
+        guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
+        guard !parts[1].hasPrefix("-") else { return false }
+        // A match here is definite only at exactly 2 tokens -- more tokens could
+        // be a real pathname continuing past a space, so that's undecidable.
+        if matchesWatcherScriptAtBoundary(parts[1]) {
+            return parts.count == 2 ? true : nil
+        }
+        if parts.count == 2 { return false }
+        // A spaced script path is indistinguishable from a script plus arguments.
+        return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
+    /// Both halves are Claude-only. Dispatching against a live non-Claude
+    /// session isn't a no-op like the old keystroke — the launcher's healing
+    /// path would spawn a second core window.
+    func checkWatcher() {
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not repairing a session whose runtime is unknown")
+            return
+        }
+        if rt != "claude" { return }
+
+        switch watcherProcessSeen() {
+        case .some(true): return  // watcher alive
+        case .none:
+            logToFile("checkWatcher: ps could not answer — not alerting on an unknown")
+            return
+        case .some(false): break
+        }
+
+        // Pinned to the runtime `rt` just confirmed, so the dispatcher's own
+        // config-drift check can't force a --restart on top of this.
+        logToFile("checkWatcher: watcher dead — repairing via start-cli.sh")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh",
+                      args: ["--runtime", "claude"],
+                      okMessage: "Task watcher was down — repaired via the core launcher.",
+                      failVerb: "Task watcher repair")
+    }
+
     /// Per-host label for `hosts/<host>/` paths. Lockstep with `_host_label()`
     /// (src/util_paths.py) and `_host()` (scripts/sync-workspace.sh):
     /// $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname
@@ -705,6 +820,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         _ = errPipe.fileHandleForReading.readDataToEndOfFile()
         if proc.terminationStatus != 0 { return nil }
         return String(data: outData, encoding: .utf8)
+    }
+
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
     }
 
     /// Return the avatar image, badged per composite mode:
@@ -2185,7 +2306,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns true if the loop-pause sentinel exists AND its expiry is in
     /// the future. Used by Timers (contextual-chips, health-check) to skip
     /// their body during a pause window — keeps the menu-bar quiet during
-    /// a meeting/dinner break.
+    /// a meeting/dinner break without disabling task watcher recovery.
     func pauseSentinelActive() -> Bool {
         let path = workspace + "/state/loop-paused-until.sentinel"
         guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
