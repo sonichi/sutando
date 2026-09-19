@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 ROOTS = (REPO / "src", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow")
 NEEDLE = "skills/worker-pool"
 

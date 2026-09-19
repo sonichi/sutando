@@ -19,7 +19,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 WRITER="$REPO/skills/worker-pool/scripts/pool_delivery.py"
 PY="$(command -v python3)"

@@ -6,8 +6,8 @@ import pathlib
 import re
 import unittest
 
-DOC = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design.md"
-NOTES = pathlib.Path(__file__).resolve().parents[1] / "docs" / "worker-pool-design-notes.md"
+DOC = pathlib.Path(__file__).resolve().parents[3] / "docs" / "worker-pool-design.md"
+NOTES = pathlib.Path(__file__).resolve().parents[3] / "docs" / "worker-pool-design-notes.md"
 
 # A sentence carrying one of these is denying the mechanism, not prescribing it.
 DENIAL = (
