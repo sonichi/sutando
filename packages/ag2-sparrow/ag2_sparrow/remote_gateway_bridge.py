@@ -4046,6 +4046,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     worker = _result_worker(tid)
     if worker:
         doc["metadata"] = {"worker_id": worker}
+        _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
