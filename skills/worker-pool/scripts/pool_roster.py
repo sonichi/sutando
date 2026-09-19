@@ -305,17 +305,6 @@ def publish_task_event_handler():
     return link
 
 
-def ensure_task_event_handler_published(workspace):
-    """Republish this skill's handler if a pool already has a worker but the
-    file is missing -- self-heals a checkout from before the file stopped
-    being tracked in git. A no-op with no pool: the handler stays unshipped.
-    """
-    roster = load_roster(workspace)
-    if roster and roster.get("workers"):
-        return publish_task_event_handler()
-    return None
-
-
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.

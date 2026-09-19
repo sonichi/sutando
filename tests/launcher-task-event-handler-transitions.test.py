@@ -20,15 +20,21 @@ Three properties, one per defect:
    skill is deleted, so the publisher is created when a pool first exists and is ignored
    by git.
 
-4. EXISTING-POOL SELF-HEAL. `register_worker` is the only writer of the publisher, and it
-   only runs at worker creation -- so a pool created before property 3 landed loses its
-   publisher the moment its checkout pulls past that commit (git deletes a file dropped
-   from the tree) and nothing recreates it, silently reopening property 2's fall-through.
-   Both launchers now call `ensure_task_event_handlers_published` before every resolution.
+RETIRED: property 4 (EXISTING-POOL SELF-HEAL) called `ensure_task_event_handlers_published`
+before every resolution, republishing the legacy `skills/*/task-event-handler` file so a pool
+that predated property 3 kept a working publisher. Once a skill declares its handler in
+`manifest.json` (property 3's actual contract), that declaration is a static, git-tracked
+fact -- nothing needs republishing for it to resolve, and `resolve_task_event_handler` never
+reads the legacy file for routing (only to warn if one is found undeclared). The self-heal
+hook still ran on every launch, wrote to `skills/worker-pool/` to keep a now-unread file
+alive, and fail-closed the whole launcher if that write failed -- so a read-only install
+with an existing, already-manifest-declared pool refused to start over a write it no longer
+needed to make (qingyun-wu, PR #4472 review). Removed from both launchers and from
+`pool_roster.py`; replaced below by a positive proof that a manifest-only checkout starts
+read-only, creating no publisher file.
 
-Properties 3 and 4 are executed against the real `pool_roster` functions; 1, 2 and the
-ordering half of 4 are read off both launcher scripts, since driving a tmux launcher in a
-unit test would assert on a mock."""
+Properties 1-3 are executed against the real `pool_roster` functions and both launcher
+scripts, since driving a tmux launcher in a unit test would assert on a mock."""
 import ast
 import json
 import pathlib
@@ -44,7 +50,6 @@ checks = {}
 
 for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     t = path.read_text()
-    ensure_at = t.find("ensure_task_event_handlers_published \"$REPO\"")
     resolve_at = t.find("resolve_task_event_handler \"$REPO\"")
     ver_at = t.find("expected_version=")
     reuse_at = t.find("SUTANDO_NOTIFIER_VERSION=//p")
@@ -52,10 +57,9 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     checks[f"{name}: resolution precedes the identity computation"] = 0 < resolve_at < ver_at
     checks[f"{name}: resolution precedes the REUSE check, so a publisher change replaces a live watcher"] = \
         0 < resolve_at < reuse_at
-    # An existing pool whose publisher went missing (untracked after shipping stopped)
-    # never re-registers, so nothing else re-creates it -- self-heal before every resolve.
-    checks[f"{name}: gives publishers a chance to self-heal before every resolution"] = \
-        0 < ensure_at < resolve_at
+    # A reappearing call would silently reintroduce the fail-closed-on-a-needless-write regression.
+    checks[f"{name}: no longer calls the retired self-heal hook"] = \
+        "ensure_task_event_handlers_published" not in t
     # The identity must actually carry the resolved outcome, or ordering alone buys nothing.
     ver_line = t[ver_at:t.find("\n", t.find("notifier_py", ver_at)) if name == "claude" else t.find("\"\n", ver_at) + 1]
     checks[f"{name}: the identity includes the resolved handler"] = "SUTANDO_TASK_EVENT_HANDLER" in ver_line
@@ -67,79 +71,43 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
         bool(m) and "kill-session" in m.group(1)
     checks[f"{name}: the refusal tells the operator how to pin it"] = \
         bool(m) and "SUTANDO_TASK_EVENT_HANDLER" in m.group(1)
-    # Fail-closed on the self-heal itself: a hook that could not confirm "no pool"
-    # and could not repair one either must refuse, not resolve anyway.
-    em = re.search(r'if ! ensure_task_event_handlers_published "\$REPO"; then(.*?)\n    fi\n', t, re.S)
-    checks[f"{name}: a failed self-heal refuses to start the watcher"] = bool(em) and "return 0" in em.group(1)
-    checks[f"{name}: a failed self-heal also refuses REUSE (kills any live watcher session)"] = \
-        bool(em) and "kill-session" in em.group(1)
 
-# Property 4a: the self-heal gate, against the canonical module (a copy
-# misattributes coverage); publish is mocked so this touches no real file.
-import importlib.util as _ilu
-import unittest.mock as _mock
-_spec = _ilu.spec_from_file_location(
-    "pool_roster_canonical", REPO / "skills/worker-pool/scripts/pool_roster.py")
-_canonical = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_canonical)
+# RETIRED proof (was properties 4a/4b): both the self-heal gate and its hook are deleted.
+checks["ensure_task_event_handler_published is removed from pool_roster.py"] = \
+    "ensure_task_event_handler_published" not in (REPO / "skills/worker-pool/scripts/pool_roster.py").read_text()
+checks["the ensure hook script itself is deleted"] = \
+    not (REPO / "skills/worker-pool/task-event-handler-ensure").exists()
+
+# NEW proof (qingyun-wu review): a read-only checkout with an existing pool must
+# resolve the manifest-declared handler without ever writing the retired publisher.
 with tempfile.TemporaryDirectory() as _d:
-    _ws_pool = pathlib.Path(_d) / "ws-pool"; (_ws_pool / "state").mkdir(parents=True)
-    _canonical._write_atomic(_canonical.roster_path(_ws_pool),
-                              {"version": 1, "workers": {"w1": {"state": "live", "label": "w1"}}})
-    with _mock.patch.object(_canonical, "publish_task_event_handler") as _pub:
-        _canonical.ensure_task_event_handler_published(_ws_pool)
-        checks["canonical: a pool with a worker calls publish"] = _pub.called
-    _ws_empty = pathlib.Path(_d) / "ws-empty"; (_ws_empty / "state").mkdir(parents=True)
-    with _mock.patch.object(_canonical, "publish_task_event_handler") as _pub2:
-        _canonical.ensure_task_event_handler_published(_ws_empty)
-        checks["canonical: no pool never calls publish"] = not _pub2.called
-    # A publish failure must propagate, not read as "nothing needed doing" --
-    # the caller depends on this to tell no-pool apart from unrepairable.
-    with _mock.patch.object(_canonical, "publish_task_event_handler",
-                             side_effect=_canonical.HandlerPublishError("simulated")):
-        _raised = None
-        try:
-            _canonical.ensure_task_event_handler_published(_ws_pool)
-        except _canonical.HandlerPublishError as _e:
-            _raised = _e
-        checks["canonical: a publish failure with an existing pool raises, not swallowed"] = _raised is not None
+    _ro = pathlib.Path(_d) / "ro-repo"
+    (_ro / "skills/worker-pool").mkdir(parents=True)
+    (_ro / "skills/worker-pool/manifest.json").write_text(json.dumps(
+        {"name": "worker-pool", "config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}))
+    (_ro / "skills/worker-pool/scripts").mkdir()
+    _route = _ro / "skills/worker-pool/scripts/route_handler.py"
+    _route.write_text("#!/usr/bin/env python3\n")
+    _route.chmod(0o755)
+    _link = _ro / "skills/worker-pool/task-event-handler"
 
-# Property 4b: the ensure hook itself, run as a real subprocess -- proves the
-# process-boundary signal a mock of pool_roster cannot.
-ENSURE = REPO / "skills/worker-pool/task-event-handler-ensure"
-with tempfile.TemporaryDirectory() as _d:
-    _fake = pathlib.Path(_d) / "fake-repo"
-    for _sub in ("scripts", "src", "skills/worker-pool/scripts", "workspace/state"):
-        (_fake / _sub).mkdir(parents=True)
-    for _src, _dst in (
-        ("scripts/python-binary.sh", "scripts/python-binary.sh"),
-        ("scripts/sutando-config.sh", "scripts/sutando-config.sh"),
-        ("src/sutando_config.py", "src/sutando_config.py"),
-        ("src/workspace_default.py", "src/workspace_default.py"),
-        ("skills/worker-pool/scripts/pool_roster.py", "skills/worker-pool/scripts/pool_roster.py"),
-    ):
-        (_fake / _dst).write_bytes((REPO / _src).read_bytes())
-    (_fake / "sutando.config.json").write_text(
-        json.dumps({"workspace": {"path": str(_fake / "workspace")}}))
-    (_fake / "workspace/state/roster.json").write_text(json.dumps(
-        {"version": 1, "workers": {"w1": {"state": "live", "label": "w1"}}, "bindings": {}}))
-    _link = _fake / "skills/worker-pool/task-event-handler"
+    _lookup_src = (REPO / "src/agent/task-event-handler-lookup.sh").read_text()
+    _probe = f"{_lookup_src}\nresolve_task_event_handler \"$1\"\n"
+    (_ro / "probe.sh").write_text(_probe)
 
-    ok_run = subprocess.run(["bash", str(ENSURE), str(_fake)], capture_output=True, text=True)
-    checks["ensure hook: exits 0 and republishes when it can write"] = \
-        ok_run.returncode == 0 and _link.is_symlink()
-    _link.unlink()
-
-    # A read-only skill dir models the exact failure a locked-down or
-    # read-only install would hit trying to self-heal.
-    (_fake / "skills/worker-pool").chmod(0o555)
+    (_ro / "skills/worker-pool").chmod(0o555)
+    (_ro / "skills").chmod(0o555)
     try:
-        fail_run = subprocess.run(["bash", str(ENSURE), str(_fake)], capture_output=True, text=True)
+        _ro_run = subprocess.run(["bash", str(_ro / "probe.sh"), str(_ro)],
+                                  capture_output=True, text=True)
     finally:
-        (_fake / "skills/worker-pool").chmod(0o755)
-    checks["ensure hook: exits NONZERO when it cannot write, instead of silently succeeding"] = \
-        fail_run.returncode != 0
-    checks["ensure hook: a failed self-heal leaves no publisher behind"] = not _link.exists()
+        (_ro / "skills").chmod(0o755)
+        (_ro / "skills/worker-pool").chmod(0o755)
+    # The resolver realpaths its answer; macOS /tmp is itself a symlink, so the comparison must too.
+    checks["read-only checkout: resolves the manifest-declared handler"] = \
+        _ro_run.returncode == 0 and _ro_run.stdout.strip() == str(_route.resolve())
+    checks["read-only checkout: resolution never creates the retired publisher file"] = \
+        not _link.exists()
 
 # Property 3a: the publisher is not shipped.
 tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", "skills/worker-pool/task-event-handler"],
@@ -178,22 +146,6 @@ try:
         pr.register_worker(ws, "x" * 32, "probe-worker-2")
         checks["a second registration leaves the publisher alone"] = \
             link.is_symlink() and link.readlink().name == "pool_route_handler.py"
-
-        # Property 4: SELF-HEAL. An existing pool's publisher can go missing and
-        # nothing re-registers on its own; ensure_task_event_handler_published republishes it.
-        link.unlink()
-        checks["fixture precondition: an existing pool's publisher can go missing"] = not link.exists()
-        pr.ensure_task_event_handler_published(ws)
-        checks["an existing pool's missing publisher is republished"] = \
-            link.is_symlink() and link.readlink().name == "pool_route_handler.py"
-        # Control: a workspace with NO pool at all must stay untouched -- the
-        # unshipped-by-default property (3) must survive this new call path too.
-        link.unlink()
-        ws_nopool = root / "ws-nopool"; (ws_nopool / "state").mkdir(parents=True)
-        pr.ensure_task_event_handler_published(ws_nopool)
-        checks["control: a workspace with no pool gets no publisher from self-heal"] = not link.exists()
-        # Restore for the sections below, which assume ws's publisher exists.
-        pr.ensure_task_event_handler_published(ws)
 
         # A pool registered without a publisher reads to the launcher as NO pool,
         # so worker-bound tasks would reach the unrestricted core. Must abort.
