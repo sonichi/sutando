@@ -27,6 +27,14 @@ pr = importlib.util.module_from_spec(spec)
 sys.modules["pool_roster_real"] = pr
 spec.loader.exec_module(pr)
 
+def _publisher_state():
+    """Whether the live publisher exists and where it points — nothing else."""
+    link = SRC.parent.parent / "task-event-handler"
+    return (link.is_symlink(), link.exists(),
+            link.readlink().name if link.is_symlink() else None)
+
+
+_before = _publisher_state()
 checks: dict[str, bool] = {}
 P = pathlib.Path
 real = (P.is_symlink, P.exists, P.symlink_to)
@@ -58,10 +66,16 @@ try:
 finally:
     P.is_symlink, P.exists, P.symlink_to = real
 
-# Control: with publishing restored the same call succeeds on the live host,
-# proving the failure above was the injected one and not a broken fixture.
-checks["control: the real publisher resolves once symlink_to works"] = (
-    pr.publish_task_event_handler().name == "task-event-handler"
+# Deliberately does NOT call the real publisher: that early-returns where the
+# link exists, and creates an ignored one where it does not.
+checks["control: the patch is what failed — symlink_to is restored afterwards"] = (
+    P.symlink_to is real[2] and P.is_symlink is real[0] and P.exists is real[1]
+)
+checks["control: the raise came from the injected OSError, not some other error"] = (
+    raised is not None and getattr(raised.__cause__, "errno", None) == 30
+)
+checks["hermetic: the real publisher's state is byte-identical to before"] = (
+    _publisher_state() == _before
 )
 
 fails = [k for k, ok in checks.items() if not ok]
