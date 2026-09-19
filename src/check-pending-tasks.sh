@@ -157,12 +157,34 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
-STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
+# Only a real Stop event may move the turn boundary; a hand run (no Stop payload,
+# stdin at EOF) reports the same decision and records nothing.
+COMMIT=()
+# No EOF within 2s is a slow real writer, so that records the stop as before.
+if [ ! -t 0 ] && "$PYBIN" -c 'import json,os,select,sys,time
+buf, end = b"", time.monotonic() + 2
+while True:
+    left = end - time.monotonic()
+    if left <= 0 or not select.select([0], [], [], left)[0]:
+        sys.exit(0)
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    buf += chunk
+try: d = json.loads(buf or b"{}")
+except ValueError: d = {}
+sys.exit(0 if isinstance(d, dict) and d.get("hook_event_name") == "Stop" else 1)' 2>/dev/null; then
+  COMMIT=(--commit)
+fi
+STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate "${COMMIT[@]}" 2>/dev/null)"
 STOP_RC=$?
 
-# Fail OPEN on anything but an explicit refusal (rc 1 AND a reason): a gate that
-# cannot run must never wedge the agent into a turn it has no way to end.
-if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
+# Fail OPEN on anything but a committed refusal: an uncommitted one never spends
+# its reminder, so blocking on it would refuse every Stop. A hand run reports on stderr.
+if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ] && [ "${#COMMIT[@]}" -eq 0 ]; then
+  echo "check-pending-tasks (not a Stop event, nothing recorded): $STOP_REASON" >&2
+  echo '{}'
+elif [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
   SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Turn is ending without a message or an explicit no-send","additionalContext":os.environ.get("SUTANDO_HOOK_REASON","")}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'

@@ -432,13 +432,17 @@ def spend_reminder(workspace: Path | str | None = None, session: str | None = No
 ENDED_ON_A_MESSAGE_S = 20.0
 
 
-def stop_gate(workspace: Path | str | None = None, session: str | None = None) -> str | None:
+def stop_gate(workspace: Path | str | None = None, session: str | None = None,
+              commit: bool = True) -> str | None:
     """None when the turn may end; otherwise the reason it must not.
 
     Allowing a stop RECORDS it, so the decision and the next turn's starting
     boundary cannot disagree. A refusal deliberately leaves the boundary alone:
     the turn has not ended, and the message the agent is about to send must still
     count against the boundary it began from.
+
+    `commit=False` answers the same question and writes nothing — no boundary,
+    no spent reminder — for a diagnostic run that is not a real turn ending.
 
     `session`, when known (explicitly, or via `$CLAUDE_CODE_SESSION_ID`),
     scopes the boundary/reminder to a per-session file and the ledger checks to
@@ -448,28 +452,34 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None) -
     """
     session = _resolve_session(session)
     ws = _workspace(workspace)
+    reason = _refusal(ws, session)
+    if commit:
+        if reason is None:
+            mark_stop(ws, session)
+        else:
+            spend_reminder(ws, session)
+    return reason
+
+
+def _refusal(ws: Path, session: str | None) -> str | None:
+    """`stop_gate`'s decision alone; it writes nothing."""
     # An absent ledger means nothing was ever sent, which is what this gate
     # catches. Only a missing boundary below is genuinely unjudgeable.
     since = last_stop_ts(ws, session)
     if since is None:
-        mark_stop(ws, session)
         return None
     # An explicit no-send is a decision ABOUT this turn, so its age cannot make it
     # stale; only a message is judged on whether the turn ended on it.
     if any(e.get("kind") == "no-send" and _entry_matches_session(e, session)
            for e in read_entries(ws) if float(e["ts"]) > since):
-        mark_stop(ws, session)
         return None
     last = delivery_after(since, ws, session)
     if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
-        mark_stop(ws, session)
         return None
     if reminder_spent(ws, session):
         # One nudge per turn. A turn that was already reminded ends regardless:
         # refusing twice is how a gate that is wrong becomes a loop.
-        mark_stop(ws, session)
         return None
-    spend_reminder(ws, session)
     return ("This turn is ending without a message and without an explicit "
             "no-send. Reply — post to the room (`room_ops.py say`) or write the "
             "result file the task expects — or, if silence is right, record it: "
@@ -478,7 +488,8 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None) -
 
 
 def main(argv: list[str]) -> int:
-    """`stop-gate` (exit 1 + reason on stdout when the turn must not end),
+    """`stop-gate [--commit]` (exit 1 + reason on stdout when the turn must not
+    end; only `--commit` records the stop, so a hand run changes nothing),
     `send KIND TARGET`, `no-send REASON`. `--workspace` pins the directory for a
     caller that already resolved it. `--session ID` overrides the session used
     to scope the reminder/boundary/ledger checks — mainly for tests simulating
@@ -495,12 +506,15 @@ def main(argv: list[str]) -> int:
         i = args.index("--session")
         session = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
+    commit = "--commit" in args
+    if commit:
+        args.remove("--commit")
     cmd = args[0] if args else ""
     if cmd == "turn-start":
         begin_turn(ws, session)
         return 0
     if cmd == "stop-gate":
-        reason = stop_gate(ws, session)
+        reason = stop_gate(ws, session, commit=commit)
         if reason:
             print(reason)
             return 1
@@ -512,7 +526,7 @@ def main(argv: list[str]) -> int:
         record_no_send(" ".join(args[1:]), ws, session)
         return 0
     print(f"usage: {Path(__file__).name} [--workspace DIR] [--session ID] "
-          "turn-start | stop-gate | send KIND TARGET | no-send REASON",
+          "turn-start | stop-gate [--commit] | send KIND TARGET | no-send REASON",
           file=sys.stderr)
     return 2
 
