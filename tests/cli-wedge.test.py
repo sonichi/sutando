@@ -1172,6 +1172,27 @@ class LiveParkedBanner(unittest.TestCase):
                 self.assertEqual([], w.live_banner_lines(line), line)
 
 
+class TheWorkingMarkerIsMotionSoItLivesWithTheMotionAxis(unittest.TestCase):
+    """`esc to interrupt` says a turn is in flight, which is this module's axis.
+    classify() answers motion only from frame-to-frame novelty, so it needs two
+    samples and cannot speak for a single capture; frame_working can."""
+
+    RUNNING = "\u273b Thinking\u2026 (12s \u00b7 esc to interrupt)"
+
+    def test_the_affordance_is_a_running_turn(self):
+        self.assertTrue(w.frame_working(self.RUNNING))
+
+    def test_an_idle_footer_is_not(self):
+        self.assertFalse(w.frame_working("\u23f5\u23f5 bypass permissions on"))
+
+    def test_it_is_orthogonal_to_the_abnormal_verdict(self):
+        # A retrying pane is BOTH working-looking and abnormal; each answers its own
+        # question, and the gate's ordering between them is the gate's to make.
+        both = self.RUNNING + "\n  \u23bf  Connection error. Retrying in 2 seconds\u2026"
+        self.assertTrue(w.frame_working(both))
+        self.assertEqual(w.frame_abnormal(both).kind, "retry-loop")
+
+
 class FrameAbnormalRanksOneCaptureAsTheWindowRanksASample(unittest.TestCase):
     """A single capture cannot show recurrence, so its abnormal verdict is the
     window classifier's ranking of a current sample and nothing more: provider-limit

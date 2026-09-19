@@ -208,6 +208,17 @@ def live_banner_lines(text: str) -> list:
     return hits
 
 
+# The CLI's own "a turn is running" affordance. Motion is this module's axis, so
+# the single-frame form of it belongs beside the single-frame abnormal verdict.
+WORKING = re.compile(r"esc to interrupt", re.I)
+
+
+def frame_working(text: str) -> bool:
+    """Is this ONE capture a pane with a turn in flight? Complements classify()'s
+    frame-to-frame novelty, which needs two samples and cannot answer for one."""
+    return bool(WORKING.search(text))
+
+
 def live_retry_banner_lines(text: str) -> list:
     """The retry family only, as lines."""
     return [line for family, _, line in live_banner_lines(text) if family == "retry"]

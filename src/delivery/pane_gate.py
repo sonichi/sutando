@@ -11,7 +11,7 @@ captures, how often it polls, what it logs).
     deliver(line, session, "codex", ...)     -> Outcome mapped from tmux-send-line.sh's exit code
 
 Runtime specifics are DATA on a RuntimeAdapter — prompt glyph, idle footer, gate
-signatures, input-affordance hint, busy marker, placeholder — never branches in the
+signatures, input-affordance hint, placeholder — never branches in the
 policy. A gate signature counts only while a current input affordance is on screen
 and no empty composer sits under it: a finished turn's prose may say "Select" or
 "Press Enter to continue", and above the runtime's own empty prompt it is history.
@@ -45,7 +45,7 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, frame_abnormal  # noqa: E402
+from cli_wedge import capture_pane, core_target, frame_abnormal, frame_working  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -91,7 +91,6 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
-BUSY = re.compile(r"esc to interrupt", re.I)
 
 
 @dataclass(frozen=True)
@@ -101,7 +100,6 @@ class RuntimeAdapter:
     idle_ready: "re.Pattern[str]"
     gate_signatures: Tuple[Tuple[str, "re.Pattern[str]"], ...]
     await_hint: "re.Pattern[str]" = AWAIT_HINT
-    busy: "re.Pattern[str]" = BUSY
 
 
 CLAUDE = RuntimeAdapter(
@@ -337,7 +335,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
         return Verdict("busy", gate)
     if abn:
         return Verdict("abnormal", ",".join(abn.names))
-    if adapter.busy.search(tail):
+    if frame_working(tail):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
