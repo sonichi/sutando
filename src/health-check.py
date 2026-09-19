@@ -9623,8 +9623,8 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     someone who ran the CLI by hand."""
     name = "outbox-parked"
     results = Path(workspace_dir or WORKSPACE_DIR) / "results"
-    # glob and is_dir() answer [] / False on EACCES, judging an unreadable tree
-    # clean; iterdir raises, and only ENOENT here means "nothing to park".
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
     try:
         roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
     except FileNotFoundError:

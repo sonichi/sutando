@@ -177,15 +177,23 @@ class OutboxParkedProbe(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("unjudged", r["detail"])
 
-    def test_is_dir_propagates_EACCES_rather_than_answering_False(self):
-        """The premise of the ROOT case, asserted rather than assumed."""
+    def test_is_dir_never_answers_True_under_an_unreadable_parent(self):
+        """The premise of the ROOT case, in the only form that is version-agnostic.
+
+        Which way it fails moved in CPython: <=3.13 raises, 3.14 answers False.
+        Either way it cannot report a readable dir, which is why the probe uses
+        iterdir() instead of asking this question at all.
+        """
         self._require_modes_enforced()
         parent = self.ws / "results" / ".outbox"
         (parent / ".items").mkdir(parents=True)
         os.chmod(parent, 0)
         self.addCleanup(os.chmod, parent, 0o755)
-        with self.assertRaises(PermissionError):
-            (parent / ".items").is_dir()
+        try:
+            answer = (parent / ".items").is_dir()
+        except OSError:
+            return
+        self.assertFalse(answer, "is_dir() claimed an unreadable dir is readable")
 
     def test_an_unimportable_outbox_module_is_unjudged_not_a_clean_zero(self):
         # The last uncovered branch: without a reader there is no way to judge a
