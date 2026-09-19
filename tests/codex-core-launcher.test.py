@@ -315,6 +315,24 @@ exit 0
             if slave >= 0:
                 os.close(slave)
 
+    def _install_pool_skill(self):
+        p = self.root / "skills" / "worker-pool" / "scripts" / "pool_route_handler.py"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("#!/bin/sh\nexit 0\n")
+        p.chmod(0o755)
+        return p
+
+    def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
+        p = self._install_pool_skill()
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"-e SUTANDO_TASK_EVENT_HANDLER={p}", self.log.read_text())
+
+    def test_no_pool_skill_sets_no_handler(self):
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
+
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={
             "SUTANDO_CORE_MODEL": "gpt-test",

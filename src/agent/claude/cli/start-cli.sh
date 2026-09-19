@@ -796,6 +796,10 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # The pool router is an optional skill: hand its path over when present, never import it.
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$REPO/skills/worker-pool/scripts/pool_route_handler.py" ]; then
+    SUTANDO_TASK_EVENT_HANDLER="$REPO/skills/worker-pool/scripts/pool_route_handler.py"
+  fi
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.

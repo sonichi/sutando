@@ -206,6 +206,10 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  # The pool router is an optional skill: hand its path over when present, never import it.
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$REPO/skills/worker-pool/scripts/pool_route_handler.py" ]; then
+    SUTANDO_TASK_EVENT_HANDLER="$REPO/skills/worker-pool/scripts/pool_route_handler.py"
+  fi
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
