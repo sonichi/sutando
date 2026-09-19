@@ -354,6 +354,55 @@ class ClassifyPaneSeesPastTheTailTruncation(unittest.TestCase):
                            "control invalid: the truncated tail still contains the glyph line")
 
 
+class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
+    """composer_text() (moved here from core-input-watch.py's `_composer_text`,
+    which now aliases it) parses task-notifier.sh's EXACT-equality staging
+    checks. A live Claude Code footer can render the idle-footer row AND a
+    separate rotating "Tip: ..." row beneath it; the old implementation popped
+    only one non-border trailing row, so the tip leaked straight into staged
+    text and a real prompt never compared equal to itself (keweichen/qingyun,
+    #4320 round 5 -- a live incident, not a hypothetical: 47 minutes of a
+    Claude task-notifier refusing every delivery with "composer holds <task>'s
+    prompt with other text").
+    """
+
+    def test_a_footer_with_a_status_row_and_a_tip_row_still_strips_clean(self):
+        capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\nTip: Use /btw to send feedback\n"
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
+
+    def test_control_the_single_row_footer_already_stripped_clean(self):
+        # Proves the fixture reaches the leak path for the right reason: the
+        # ONE-row footer was already clean before this fix.
+        capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\n"
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
+
+    def test_an_owner_row_reading_tip_survives_the_strip(self):
+        # Popping the real tip row must not re-classify an interior row: only
+        # the LAST matching row is ever popped, same guarantee as the idle row.
+        capture = f"❯ Sutando task ready: task-x.txt\nTip: this is what I typed\n{FOOTER}\n"
+        self.assertEqual(pg.composer_text(capture),
+                          "Sutando task ready: task-x.txtTip: this is what I typed")
+
+    def test_no_prompt_line_is_none_not_a_leaked_footer(self):
+        self.assertIsNone(pg.composer_text("no prompt line here\njust text"))
+
+    def test_composer_text_cli_subcommand_matches_the_pending_contract(self):
+        out, err = io.StringIO(), io.StringIO()
+        stdin = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\nTip: Use /btw to send feedback\n"
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pg.main(["composer-text", "--runtime", "claude"])
+        self.assertEqual((code, out.getvalue().strip()), (0, "Sutando task ready: task-x.txt"))
+
+    def test_composer_text_cli_refuses_with_no_prompt_line(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("just prose, no glyph\n")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pg.main(["composer-text", "--runtime", "claude"])
+        self.assertEqual(code, pg.EXIT_UNSAFE)
+        self.assertEqual(out.getvalue(), "")
+
+
 class CliExitCodesAreTheContract(unittest.TestCase):
     """Callers are shell. They branch on the exit code, so each one is pinned here."""
 

@@ -51,6 +51,9 @@ BUSY_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc 
 BUSY_STATUS = BUSY_FOOTER.split("\n", 1)[1]
 # Same footer, but the composer carries an unsent owner draft.
 DRAFT_FOOTER = "❯ owner draft\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+# A second, rotating hint row below the real footer -- distinct from the
+# single trailing row every other fixture in this file models.
+TIP_FOOTER = IDLE_FOOTER + "\nTip: Use /btw to send feedback"
 TRUST_GATE_PANE = "\n".join([
     " Quick safety check: Is this a project you created or one you trust?",
     " ❯ No, exit",
@@ -1082,6 +1085,34 @@ class OwnerRowReadingForAgentsTests(FakeTmuxHarness):
         self.assertNotIn("ENTER", log, "the owner's `for agents` row was stripped as a footer")
         self.assertIn("for agents\n", self.pane_file.read_text(),
                       "fixture precondition: the owner row is really in the pane")
+
+
+class TwoRowFooterTests(FakeTmuxHarness):
+    """A live incident, not a hypothetical: a real Claude Code footer can carry
+    a second, rotating "Tip: ..." row below its idle-footer row. The old
+    composer_text() (core-input-watch.py's _composer_text) popped only one
+    trailing non-border row, so the tip leaked into staged text and every
+    delivery refused with "composer holds <task>'s prompt with other text" for
+    47 minutes until a human cleared the composer by hand."""
+
+    def test_a_tip_row_below_the_real_footer_does_not_block_staging(self):
+        self.pane_file.write_text(TIP_FOOTER + "\n")
+        self.write_task("task-tip.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-tip.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-tip.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertIn("TYPE Sutando task ready: task-tip.txt", log)
+        self.assertIn("ENTER", log, "a tip row below the real footer must not be read as an unsent draft")
 
 
 class PlaceholderComposerTests(FakeTmuxHarness):

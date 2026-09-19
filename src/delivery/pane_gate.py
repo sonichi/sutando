@@ -25,6 +25,7 @@ sender, scripts/tmux-send-line.sh. Nothing here calls send-keys.
 CLI:
     python3 src/delivery/pane_gate.py classify --runtime codex [--json] < capture.txt
     python3 src/delivery/pane_gate.py pending  --runtime codex < capture.txt
+    python3 src/delivery/pane_gate.py composer-text --runtime claude < capture.txt
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
         [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
 """
@@ -215,6 +216,59 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
     return "\n".join(_SGR.sub("", x).strip() for x in lines_[end + 1:])
 
 
+#: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
+BORDER_LINE = re.compile(r"^[\s─-╿]+$")
+# The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
+# on the first typed character, so it is never a draft. Plain capture loses its dimming.
+COMPOSER_PLACEHOLDER = re.compile(
+    r'^\s*❯\s*(?:Try "[^"\n]*"|Press up to edit queued messages)\s*$')
+# A single hint line the CLI prints below its own idle footer; only the fixed
+# "Tip:" lead-in is matched, since the tip text itself rotates release to release.
+TIP_ROW = re.compile(r"Tip:\s")
+
+
+def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[str]:
+    """The composer's full typed content, dewrapped, or None with no <glyph> line
+    at all; "" for an empty composer. The ONE parser for task-notifier.sh's
+    EXACT-equality staging checks -- core-input-watch.py's `_composer_text`
+    aliases this rather than re-deriving it.
+
+    From the bottommost prompt line to the end of the capture. Below an editable
+    composer the CLI renders its own frame -- box rule(s), at most one idle-footer
+    row, at most one hint/tip row -- so the strip removes exactly those, once each,
+    from the back. It never re-classifies an interior row: an owner's own typed
+    line that happens to read one of those rows' words survives, because only the
+    LAST matching row of each kind is ever popped, and never a second time.
+    """
+    lines = [ln for ln in capture.splitlines() if ln.strip()]
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip(" \t").startswith(adapter.glyph):
+            start = i
+            break
+    if start is None:
+        return None
+    block = lines[start:]
+
+    def _pop_borders():
+        while len(block) > 1 and BORDER_LINE.match(block[-1]):
+            block.pop()
+
+    _pop_borders()
+    # A tip row renders below the idle-footer row, so it is popped first --
+    # else the idle-footer check below never reaches its own trailing row.
+    if len(block) > 1 and TIP_ROW.search(block[-1]):
+        block.pop()
+    _pop_borders()
+    if len(block) > 1 and adapter.idle_ready.search(block[-1]):
+        block.pop()
+    _pop_borders()
+    if not block or (len(block) == 1 and COMPOSER_PLACEHOLDER.match(block[0])):
+        return ""
+    block[0] = block[0].lstrip().lstrip(adapter.glyph).lstrip()
+    return "".join(block)
+
+
 def _tail_lines(capture: str) -> List[str]:
     """The last TAIL_LINES non-blank lines, attributes kept (the composer parse needs them)."""
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
@@ -330,6 +384,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--width", type=int, default=0)
         if name == "classify":
             p.add_argument("--json", action="store_true")
+    ct = sub.add_parser("composer-text")
+    ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -353,6 +409,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         # None (no prompt line) and "" (empty composer) are opposite answers; printing
         # both as "" let a caller's `[ -n "$PENDING" ]` authorize a send. Unknown exits 3.
         text = pending_text(_read_stdin(), adapter, getattr(a, "width", 0))
+        if text is None:
+            print("pane_gate: no prompt line found — prompt unknown", file=sys.stderr)
+            return EXIT_UNSAFE
+        print(text)
+        return 0
+    if a.cmd == "composer-text":
+        # Same None/"" contract as "pending", via the frame-stripping parser
+        # Claude's indented word-wrap needs instead of a terminal-wrap width.
+        text = composer_text(_read_stdin(), adapter)
         if text is None:
             print("pane_gate: no prompt line found — prompt unknown", file=sys.stderr)
             return EXIT_UNSAFE
