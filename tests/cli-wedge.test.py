@@ -1172,6 +1172,32 @@ class LiveParkedBanner(unittest.TestCase):
                 self.assertEqual([], w.live_banner_lines(line), line)
 
 
+class NeedsLoginRecognisesTheDialogTitleNotOnlyProseAboutLoggingIn(unittest.TestCase):
+    """The family matched Claude's own "run /login" phrasing but not the login
+    DIALOG'S title text -- a real blind spot, not the Fable-limit collision this
+    looks like at a glance (that one is already caught, by the whole-line
+    quota-limit grammar's optional session/usage/... group, and is fenced off by
+    pane_gate's existing named-gate-first precedence, not by cli_wedge)."""
+
+    TITLES = ("Select login method", "Paste code here", "Browser didn't open")
+    PROSE = "I logged in yesterday and it worked fine."
+
+    def test_each_dialog_title_is_needs_login(self):
+        for title in self.TITLES:
+            with self.subTest(title=title):
+                v = w.frame_abnormal(title)
+                self.assertEqual((v.kind, v.names), ("abnormal", ("needs-login",)))
+
+    def test_prose_about_logging_in_stays_clean(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_fable_limit_was_already_caught_by_the_looser_whole_line_grammar(self):
+        # Control: proves this PR did not newly create the Fable/quota-limit
+        # overlap -- it already existed via live_banner_lines before this change.
+        v = w.frame_abnormal("reached your Fable limit")
+        self.assertEqual((v.kind, v.names), ("provider-limit", ("quota-limit",)))
+
+
 class TheWorkingMarkerIsMotionSoItLivesWithTheMotionAxis(unittest.TestCase):
     """`esc to interrupt` says a turn is in flight, which is this module's axis.
     classify() answers motion only from frame-to-frame novelty, so it needs two
