@@ -382,7 +382,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // results). No LLM round-trip. Replaces the (never-shipped) draft
         // /personal-reactive-loop skill — the cadence is purely mechanical
         // polling, so the natural home is the menu-bar app that already
-        // does watcher liveness. Per Chi's review 2026-05-05: "if it's only
+        // runs the other mechanical timers. Per Chi's review 2026-05-05: "if it's only
         // scripts, can it be merged with the sutando app?"
         Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
             self?.refreshContextualChips()
@@ -394,7 +394,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Health-check: every 30min, run health-check.py --fix and append
-        // to logs/health-check.log. Same pattern as watcher-liveness +
+        // to logs/health-check.log. Same pattern as contextual
         // chips. Replaces ~/Library/LaunchAgents/com.sutando.health-check
         // .plist (retired in the same change set per trio-design-current
         // .md "Health-check ownership"). After this binary ships:
@@ -2185,7 +2185,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns true if the loop-pause sentinel exists AND its expiry is in
     /// the future. Used by Timers (contextual-chips, health-check) to skip
     /// their body during a pause window — keeps the menu-bar quiet during
-    /// a meeting/dinner break without disabling task watcher restarts.
+    /// a meeting/dinner break.
     func pauseSentinelActive() -> Bool {
         let path = workspace + "/state/loop-paused-until.sentinel"
         guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
