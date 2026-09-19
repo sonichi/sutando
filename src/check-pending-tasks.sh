@@ -117,6 +117,10 @@ claimed_by_a_worker() {
   # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
   local task_id="$1" rc
   [ -n "$PYBIN" ] || return 1
+  # A minimal bundle (no src/delivery/ at all) has no worker-pool capability,
+  # so nothing can be "held" -- python's rc 2 for a missing script must not
+  # collapse into the SAME code path as "deliveries root unreadable" below.
+  [ -f "$REPO_DIR/src/delivery/task_dispatch.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
   # 2 = cannot decide (root unreadable): hold, never report it to the core.
   [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
