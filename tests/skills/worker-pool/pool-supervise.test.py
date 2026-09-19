@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -308,6 +309,32 @@ class IsThisHostRouting(Base):
         sup.prr.receipt_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         sup.prr.receipt_path(self.ws).write_text("{not json")
         self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_a_well_formed_receipt_of_the_wrong_shape_is_no_evidence_either(self):
+        # The shape a half-written or schema-drifted receipt actually has: it parses,
+        # but `consulted_at` is not a number (or the document is not an object).
+        self._bind()
+        path = sup.prr.receipt_path(self.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for bad in ('{"consulted_at": "07:20"}', "[]", '{"mode": "probe"}'):
+            path.write_text(bad)
+            self.assertIsNone(sup.prr.read(self.ws), bad)
+            self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "", bad)
+
+    def test_an_archived_task_that_cannot_be_stated_is_skipped_not_fatal(self):
+        self._bind()
+        self._archived_task(1000.0)
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=2000.0)
+        real = Path.stat
+
+        def flaky(self_, *a, **k):
+            if self_.name == "task-abc.txt":
+                raise OSError(5, "Input/output error")
+            return real(self_, *a, **k)
+        with patch.object(Path, "stat", flaky):
+            st = sup.routing_status(self.ws)
+        self.assertIsNone(st["newest_task_at"], "an unreadable task must not become a timestamp")
+        self.assertIsNone(st["alarm"])
 
     def test_the_sweep_prints_the_alarm_and_carries_it_in_json(self):
         self._bind()
