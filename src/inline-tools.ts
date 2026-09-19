@@ -813,14 +813,28 @@ export const getCurrentTimeTool: ToolDefinition = {
 	},
 };
 
+// The pending queue's fresh snapshot (src/task_queue.py write_snapshot):
+// {ts, depth, pending}. Older than 10 minutes, or absent, is unknown — a
+// stale depth is worse than none. Exported for the test.
+export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.now() / 1000)): number | null {
+	try {
+		const p = statusReadPath('task-queue.json', workspaceDir);
+		if (!existsSync(p)) return null;
+		const q = JSON.parse(readFileSync(p, 'utf-8')) as { ts?: number; depth?: number };
+		if (typeof q.ts !== 'number' || nowSec - q.ts > 600 || typeof q.depth !== 'number') return null;
+		return q.depth;
+	} catch { return null; }
+}
+
 // Get what the core agent (Claude Code proactive-loop) is currently doing.
 // Lets voice-agent Gemini answer "what are you working on?" truthfully
-// instead of guessing. Reads core-status.json written by the core agent.
+// instead of guessing. Reads core-status.json written by the core agent, and
+// the queue depth from state/task-queue.json.
 export const getCoreStatusTool: ToolDefinition = {
 	name: 'get_core_status',
 	description:
-		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
-		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
+		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
 		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
 		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
 		'a fallback when unsure what the user wants; fire nothing instead.',
@@ -832,8 +846,10 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
+			const queued = readQueueDepth(WORKSPACE_DIR);
+			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
 			if (!existsSync(corePath)) {
-				return { status: 'idle', description: 'Core agent is not currently running.' };
+				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -844,10 +860,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).`,
+					queued,
+					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', description: 'Core agent is idle right now.' };
+			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}

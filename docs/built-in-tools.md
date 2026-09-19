@@ -289,6 +289,24 @@ app: which apps it needs, which are connected (from the cache), and the room kin
 Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
 app is signed in with a new account.
 
+**Generate an image** — `skills/image-generation`: a picture, logo, hero image, mockup or edited
+photo from a prompt, over the Gemini REST API with the standard library (no pip; any Gemini key the
+credential resolver finds, the managed key included):
+```bash
+python3 skills/image-generation/scripts/generate.py --prompt "A flat-design mascot, teal and cream"
+python3 skills/image-generation/scripts/generate.py --input photo.jpg --prompt "Replace the background"
+```
+stdout is one JSON line: `{"ok": true, "path": "<workspace>/results/media/generated-<ts>.png", "model"}`
+or `{"ok": false, "error": no_key|refused|no_image|api_error, "message", "remedy"}` (exit 0 / 1 / 2).
+Deliver with `[file: <path>]` on its own line in the reply; on a failure say the skill's verbatim
+message for that error (`skills/image-generation/SKILL.md`) and stop. `--video` (Veo) needs the
+`google-genai` SDK and reports `sdk_missing` without it.
+
+**Activate a cloud tool** — the `marketplace` skill (below) is the activation: `install <slug> --yes`
+after the plan; a newly activated tool is usable at once through `station_find` / `station_call`.
+Never send the owner to a dashboard or a Station page for it, and never ask for a restart unless the
+script printed `RESTART REQUIRED`.
+
 **App launcher** — open any macOS app:
 ```bash
 # Windows: use the registered display name; success requires verified foreground focus.
@@ -320,13 +338,23 @@ or making a window visible is not success.
 
 The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.
 
-## Model switch (no CLI needed)
+## Switch model (no CLI needed)
+
+Triggers: `/model <x>` typed in chat (a room message, not only the tray), "switch to opus", "use
+sonnet", "change the model", and the question "which model are you on" / "what model is this".
 
 ```bash
 bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
 bash scripts/switch-model.sh fable --dry-run        # prints what it would do, changes nothing
 bash scripts/switch-model.sh opus --confirm         # a warm core asks to confirm; this answers it (owner instruction)
 ```
+
+**Report the script's `switched:` line verbatim** (`switched: model=<x> (was <y>); accepted by the
+CLI…`); a non-zero exit is reported with its meaning from the list below, never as a switch. The
+current model is `model` in `<workspace>/state/model-switch.json` (`previous`, `ts` beside it);
+no file means no switch was recorded from here, so say the model is the runtime's default rather
+than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
+place to point an owner who wants to switch by hand.
 
 Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
 to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
@@ -335,3 +363,15 @@ dialog is cancelled. Refuses when the input box carries text or on a Codex runti
 `settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
 pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
 The capability lives in `skills/model-switch/`.
+
+## Check quota
+
+Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
+or refused core turn. Read `<workspace>/state/quota-state.json` (written by the credential proxy,
+`skills/quota-tracker`): `utilization_5h` and `utilization_7d` (0..1 of each window used),
+`resets_at_5h` / `resets_at_7d` (ISO times), `last_checked` (ISO). A `last_checked` older than
+6 hours, or no file, means the quota is **unknown**: say so, do not quote stale numbers.
+`python3 skills/quota-tracker/scripts/read-quota.py` prints the same with remaining percentages and
+`--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
+core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
+model (above) is the way to keep going before then.
