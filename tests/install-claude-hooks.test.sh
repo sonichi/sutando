@@ -12,6 +12,9 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$HERE/../src/install-claude-hooks.sh"
+# The installer targets the core's launch dir when this is set; the core session exports it,
+# so a suite inherited from that session would write every fixture into the LIVE settings.
+unset SUTANDO_CLAUDE_WORKING_DIR
 
 pass=0; fail=0
 ok() {  # ok <name> <condition-rc>
@@ -478,6 +481,129 @@ ok "path containing 'exec ': legacy entry is REMOVED, not left blocking" \
 ok "path containing 'exec ': guarded hook registered exactly once" \
    "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
 rm -rf "$EROOT"
+
+# --- 7. the target is the directory the core LAUNCHES from --------------------
+# start-cli.sh honours SUTANDO_CLAUDE_WORKING_DIR; Claude Code reads project settings
+# there, so an installer that always writes the engine tree arms nothing on such a host.
+CROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks cwd.XXXXXX")"
+CREPO="$CROOT/engine repo"; CCWD="$CROOT/core cwd"
+mkdir -p "$CREPO/src" "$CREPO/scripts" "$CREPO/.claude"
+cp "$INSTALLER" "$CREPO/src/install-claude-hooks.sh"
+cp "$HERE/../scripts/python-binary.sh" "$CREPO/scripts/python-binary.sh"
+cp "$HERE/../scripts/core-working-dir.sh" "$CREPO/scripts/core-working-dir.sh"
+printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$CREPO/src/session-handoff.sh"
+printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$CREPO/src/check-pending-tasks.sh"
+chmod +x "$CREPO/src/"*.sh
+echo '{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"echo app-owned"}]}]}}' > "$CREPO/.claude/settings.json"
+ENGINE_BEFORE="$(cat "$CREPO/.claude/settings.json")"
+C_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="$CCWD" bash "$CREPO/src/install-claude-hooks.sh" 2>&1)"; C_RC=$?
+ok "cwd override: installer exits 0" "$([ $C_RC = 0 ] && echo 0 || echo 1)"
+ok "cwd override: settings.json is written in the launch dir" \
+   "$([ -f "$CCWD/.claude/settings.json" ] && echo 0 || echo 1)"
+ok "cwd override: the engine tree's settings are untouched" \
+   "$([ "$(cat "$CREPO/.claude/settings.json")" = "$ENGINE_BEFORE" ] && echo 0 || echo 1)"
+C_SE="$(jq -r '(.hooks // {})["SessionEnd"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$CCWD/.claude/settings.json" | grep session-handoff || true)"
+ok "cwd override: the stored command still runs the ENGINE's script" \
+   "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$C_SE" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
+# Compared physically: macOS resolves /var to /private/var and the installer stores `pwd -P`.
+ok "cwd override: the reported target names the launch dir" \
+   "$(echo "$C_OUT" | grep -qF "→ $(cd "$CCWD" && pwd -P)/.claude/settings.json" && echo 0 || echo 1)"
+rm -rf "$CROOT"
+
+# --- 8. skill-hook discovery runs the LAUNCHER's interpreter, not a bare python3 ----
+# A configured SUTANDO_PY must win over a broken PATH python3, and a broken discovery
+# must be reported (non-zero, stderr) rather than silently dropping the skill hooks.
+PROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks py.XXXXXX")"
+PREPO="$PROOT/repo"; mkdir -p "$PREPO/src" "$PREPO/scripts" "$PREPO/.claude" "$PREPO/skills/demo/hooks" "$PROOT/bin"
+cp "$INSTALLER" "$PREPO/src/install-claude-hooks.sh"
+cp "$HERE/../scripts/python-binary.sh" "$PREPO/scripts/python-binary.sh"
+cp "$HERE/../src/skill_hooks.py" "$PREPO/src/skill_hooks.py"
+printf '#!/bin/bash\nexit 0\n' > "$PREPO/src/session-handoff.sh"; printf '#!/bin/bash\nexit 0\n' > "$PREPO/src/check-pending-tasks.sh"
+printf 'print("HOOK_EXECUTED")\n' > "$PREPO/skills/demo/hooks/demo-hook.py"
+echo '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/demo-hook.py"}]}' > "$PREPO/skills/demo/manifest.json"
+REAL_PY="$(command -v python3)"
+# A PATH python3 that records every invocation and fails.
+printf '#!/bin/bash\necho invoked >> "%s/stub.log"\nexit 79\n' "$PROOT" > "$PROOT/bin/python3"; chmod +x "$PROOT/bin/python3"
+skill_hooks_in() { jq -r '(.hooks // {})["PreToolUse"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$1" 2>/dev/null | grep -c "demo-hook.py"; }
+echo '{}' > "$PREPO/.claude/settings.json"
+P_OUT="$(PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; P_RC=$?
+ok "configured SUTANDO_PY + broken PATH python3: installer exits 0" "$([ $P_RC = 0 ] && echo 0 || echo 1)"
+ok "configured SUTANDO_PY + broken PATH python3: the skill hook IS registered" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
+ok "configured SUTANDO_PY + broken PATH python3: the PATH stub was never invoked" \
+   "$([ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+# EXECUTION, not registration: fire the exact stored command in the same environment.
+P_CMD="$(jq -r '(.hooks // {})["PreToolUse"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$PREPO/.claude/settings.json" | grep demo-hook.py)"
+P_RUN="$(PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash -c "$P_CMD" 2>&1)"; P_RUN_RC=$?
+ok "configured SUTANDO_PY + broken PATH python3: the registered hook EXECUTES (rc 0, HOOK_EXECUTED)" \
+   "$([ $P_RUN_RC = 0 ] && [ "$P_RUN" = "HOOK_EXECUTED" ] && echo 0 || echo 1)"
+[ "$P_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$P_RUN_RC: $P_RUN"
+ok "configured SUTANDO_PY + broken PATH python3: executing it never touched the PATH stub" \
+   "$([ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+# Migration: the shape the previous revision registered (exec bare python3) is swept, not kept beside.
+python3 - "$PREPO/.claude/settings.json" "$PREPO" <<'PY'
+import json, pathlib, shlex, sys
+p, repo = sys.argv[1], sys.argv[2]
+d = json.load(open(p)); q = shlex.quote(str(pathlib.Path(repo).resolve() / "skills/demo/hooks/demo-hook.py"))
+d["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": f"[ -f {q} ] || exit 0; exec python3 {q}"})
+json.dump(d, open(p, "w"), indent=2)
+PY
+ok "old guarded-bare-python3 form present before re-run (fixture sanity)" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 2 ] && echo 0 || echo 1)"
+PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash "$PREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "old guarded-bare-python3 form is SWEPT on re-run (exactly one skill hook)" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
+ok "the survivor is the one that resolves its interpreter through scripts/python-binary.sh" \
+   "$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep -q 'resolve_python' && echo 0 || echo 1)"
+echo '{}' > "$PREPO/.claude/settings.json"
+P_OUT2="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; P_RC2=$?
+ok "broken PATH python3 only: installer exits NON-zero" "$([ $P_RC2 != 0 ] && echo 0 || echo 1)"
+ok "broken PATH python3 only: stderr names the discovery failure" \
+   "$(echo "$P_OUT2" | grep -q "skill-hook discovery failed (rc=79" && echo 0 || echo 1)"
+ok "broken PATH python3 only: the static hooks are still installed" \
+   "$(jq -r '(.hooks // {})["Stop"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$PREPO/.claude/settings.json" | grep -q check-pending-tasks && echo 0 || echo 1)"
+ok "broken PATH python3 only: the skill hook is absent (reported, not silent)" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 0 ] && echo 0 || echo 1)"
+# Second rung: a bundled interpreter beside the engine (repo/../runtime/python/bin/python3) is
+# found by discovery AND becomes the command's default runner, so no SUTANDO_PY and a broken PATH
+# still registers and still EXECUTES the hook.
+mkdir -p "$PROOT/runtime/python/bin"; ln -s "$REAL_PY" "$PROOT/runtime/python/bin/python3"
+echo '{}' > "$PREPO/.claude/settings.json"; rm -f "$PROOT/stub.log"
+B_OUT="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; B_RC=$?
+ok "bundled python, no SUTANDO_PY, broken PATH: installer exits 0 and registers the skill hook" \
+   "$([ $B_RC = 0 ] && [ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
+B_CMD="$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep demo-hook.py)"
+ok "bundled python: the stored command names no interpreter itself (the resolver picks it at event time)" \
+   "$(echo "$B_CMD" | grep -q 'resolve_python' && ! echo "$B_CMD" | grep -qF "runtime/python/bin/python3" && echo 0 || echo 1)"
+B_RUN="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash -c "$B_CMD" 2>&1)"; B_RUN_RC=$?
+ok "bundled python: the registered hook EXECUTES with no SUTANDO_PY and a broken PATH" \
+   "$([ $B_RUN_RC = 0 ] && [ "$B_RUN" = "HOOK_EXECUTED" ] && [ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+[ "$B_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$B_RUN_RC: $B_RUN"
+# A STALE override (nonexistent SUTANDO_PY) must not be exec'd (rc 126): the resolver validates
+# executability at event time and falls to the bundled interpreter.
+S_RUN="$(SUTANDO_PY="$PROOT/no/such/python3" PATH="$PROOT/bin:$PATH" bash -c "$B_CMD" 2>&1)"; S_RUN_RC=$?
+ok "stale SUTANDO_PY + bundled python: the hook EXECUTES via the bundled interpreter (not rc 126)" \
+   "$([ $S_RUN_RC = 0 ] && [ "$S_RUN" = "HOOK_EXECUTED" ] && echo 0 || echo 1)"
+[ "$S_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$S_RUN_RC: $S_RUN"
+ok "the stored command resolves through scripts/python-binary.sh (one interpreter policy)" \
+   "$(echo "$B_CMD" | grep -q "scripts/python-binary.sh" && echo "$B_CMD" | grep -q "resolve_python" && echo 0 || echo 1)"
+rm -rf "$PROOT"
+
+# --- 9. the override contract is ONE policy on both sides (installer + probe): absolute or ~/ only ----
+TROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks tilde.XXXXXX")"
+TREPO="$TROOT/repo"; mkdir -p "$TREPO/src" "$TREPO/scripts" "$TREPO/.claude"; export HOME="$TROOT/home"; mkdir -p "$HOME"
+cp "$INSTALLER" "$TREPO/src/install-claude-hooks.sh"
+cp "$HERE/../scripts/core-working-dir.sh" "$TREPO/scripts/core-working-dir.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/session-handoff.sh"; printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/check-pending-tasks.sh"
+T_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="~/core home" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; T_RC=$?
+ok "tilde: ~/… resolves under HOME" "$([ $T_RC = 0 ] && [ -f "$HOME/core home/.claude/settings.json" ] && echo 0 || echo 1)"
+U_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="~someoneelse/core" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; U_RC=$?
+ok "tilde: ~user/… is REFUSED (rc 1), not mangled into HOME + user" "$([ $U_RC = 1 ] && echo 0 || echo 1)"
+ok "tilde: the refusal names the contract" "$(echo "$U_OUT" | grep -q "absolute path or start with ~/" && echo 0 || echo 1)"
+ok "tilde: nothing was created for the refused form" "$([ ! -e "$HOME/someoneelse" ] && [ ! -e "$HOME/core" ] && [ ! -e "$HOME"someoneelse ] && echo 0 || echo 1)"
+R_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="relative/dir" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; R_RC=$?
+ok "tilde: a relative path is refused too" "$([ $R_RC = 1 ] && echo 0 || echo 1)"
+rm -rf "$TROOT"
 
 rm -rf "$ROOT"
 echo "---"
