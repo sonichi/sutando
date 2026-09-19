@@ -187,6 +187,15 @@ class OutboxParkedProbe(unittest.TestCase):
         with self.assertRaises(PermissionError):
             (parent / ".items").is_dir()
 
+    def test_an_unimportable_outbox_module_is_unjudged_not_a_clean_zero(self):
+        # The last uncovered branch: without a reader there is no way to judge a
+        # root, and a clean zero would hide whatever is parked in it.
+        self._write("task-abc", "PARKED")
+        with unittest.mock.patch.dict(sys.modules, {"outbox": None}):
+            r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("unjudged", r["detail"])
+
     def test_the_probe_is_registered(self):
         src = (REPO / "src" / "health-check.py").read_text(encoding="utf-8")
         self.assertIn("checks.append(check_outbox_parked())", src)
