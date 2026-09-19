@@ -120,22 +120,78 @@ def case_d_archived_sentinel_warns() -> list[str]:
 
 
 def case_e_unscannable_archive_warns() -> list[str]:
-    """An unreadable directory must not read as an absence of failures."""
+    """An unreadable directory must not read as an absence of failures.
+
+    Injected at os.scandir rather than staged with chmod 0o000: CI runs as root,
+    where mode bits are ignored and the branch is never entered — a test that
+    skips under the uid CI uses is a branch CI has never seen."""
     fails = []
-    if os.geteuid() == 0:
-        return fails  # root ignores the mode; the case cannot be staged
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        arch = _results(tmp) / "archive"
+        arch = _results(tmp) / "archive" / "2026-09"
         arch.mkdir(parents=True)
-        (arch / "2026-09").mkdir()
-        os.chmod(arch, 0o000)
+        real = hc.os.scandir
+
+        # Two scandir sites, two branches: enumerating archive/ itself, and
+        # walking each root. Deny each in turn so both error paths are proven.
+        for deny_suffix, label in (("archive", "archive/ enumeration"), ("2026-09", "a month root")):
+            def denied(path, *a, **k):
+                if str(path).endswith(deny_suffix):
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real(path, *a, **k)
+
+            hc.os.scandir = denied
+            try:
+                r = _run(tmp)
+            finally:
+                hc.os.scandir = real
+            if r["status"] != "warn":
+                fails.append(f"(e) unscannable {label}: expected warn, got {r['status']} — {r['detail']}")
+            if "could not scan" not in r["detail"]:
+                fails.append(f"(e) {label}: the warn must say it could not scan, got: {r['detail']}")
+    return fails
+
+
+def case_e2_unreadable_file_is_isolated() -> list[str]:
+    """One unreadable entry must not decide the answer for the directory — and
+    must be counted, so the report says how much it could not see."""
+    fails = []
+    real_open = hc.open if hasattr(hc, "open") else open
+    import builtins
+    orig = builtins.open
+
+    def flaky(path, *a, **k):
+        if str(path).endswith("task-guest-locked.txt"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return orig(path, *a, **k)
+
+    # (i) unreadable beside a real sentinel: still warns, and counts the unreadable one
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (_results(tmp) / "task-guest-locked.txt").write_text("x", encoding="utf-8")
+        (_results(tmp) / "task-guest-9.txt").write_text(SENTINEL, encoding="utf-8")
+        builtins.open = flaky
         try:
             r = _run(tmp)
-            if r["status"] != "warn":
-                fails.append(f"(e) unscannable archive: expected warn, got {r['status']} — {r['detail']}")
         finally:
-            os.chmod(arch, 0o755)
+            builtins.open = orig
+        if r["status"] != "warn":
+            fails.append(f"(e2-i) sentinel + unreadable: expected warn, got {r['status']}")
+        if "1 result file(s) unreadable" not in r["detail"]:
+            fails.append(f"(e2-i) the unreadable count is missing from: {r['detail']}")
+    # (ii) unreadable alone: ok, but the ok names what it could not read
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        (_results(tmp) / "task-guest-locked.txt").write_text("x", encoding="utf-8")
+        builtins.open = flaky
+        try:
+            r = _run(tmp)
+        finally:
+            builtins.open = orig
+        if r["status"] != "ok":
+            fails.append(f"(e2-ii) unreadable alone: expected ok, got {r['status']}")
+        if "1 result file(s) unreadable" not in r["detail"]:
+            fails.append(f"(e2-ii) an ok that hides an unreadable file is a silent gap: {r['detail']}")
     return fails
 
 
@@ -156,7 +212,8 @@ def main() -> int:
     fails: list[str] = []
     for fn in (case_a_recent_sentinel_warns, case_b_no_sentinel_is_ok,
                case_c_old_sentinel_is_ok, case_d_archived_sentinel_warns,
-               case_e_unscannable_archive_warns, case_f_non_task_file_ignored):
+               case_e_unscannable_archive_warns, case_e2_unreadable_file_is_isolated,
+               case_f_non_task_file_ignored):
         fails += fn()
     if fails:
         print("FAIL")
@@ -164,7 +221,8 @@ def main() -> int:
             print("  " + f)
         return 1
     print("PASS sandbox-delegation: warns on a recent sentinel (results/ and archive/), "
-          "ok without one, ok outside the window, warn on an unscannable dir, task-* only")
+          "ok without one, ok outside the window, warn on an unscannable dir, "
+          "unreadable files counted not fatal, task-* only")
     return 0
 
 
