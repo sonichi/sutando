@@ -108,7 +108,12 @@ def observe(workspace, now: float, *, worker_ids=None,
     """One Observation per supervised worker."""
     rows = supervised_workers(workspace)
     if worker_ids is not None:
-        rows = {w: rows.get(w, {}) for w in worker_ids}
+        for w in worker_ids:
+            wi.worker_dir(workspace, w)     # a malformed id is refused, not "unknown"
+
+        # Naming a worker narrows the supervised set; it never widens it. A
+        # retired or unknown id must not reach the ladder through this door.
+        rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
     for wid, row in rows.items():
         obs[wid] = ps.Observation(
@@ -176,7 +181,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
     if persist:
         save_state(workspace, new_state)
+    asked = list(worker_ids or [])
     return {"decisions": decisions,
+            "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
@@ -207,6 +214,8 @@ def main(argv=None) -> int:
             o = out["observations"][wid]
             print(f"{wid[:8]}  {decision:8}  beat={o['beat']:7} "
                   f"session={o['session_alive']!s:5} paused={o['paused']}")
+        for wid in out["not_supervised"]:
+            print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
     return 0

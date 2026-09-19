@@ -142,6 +142,50 @@ class Observing(Base):
         self.assertEqual(list(sup.observe(self.ws, 100.0, worker_ids=[a], runner=Tmux())), [a])
 
 
+class AnIneligibleRecipientIsNotObserved(Base):
+    """Naming a worker must not smuggle it past the filter the sweep applies: once
+    something remedies, a ladder entry for a RETIRED worker is a recovery attempt
+    on one the roster deliberately retired."""
+
+    def _retire(self, wid):
+        roster = json.loads(pr.roster_path(self.ws).read_text())
+        roster["workers"][wid]["state"] = "retired"
+        pr.roster_path(self.ws).write_text(json.dumps(roster))
+
+    def test_a_retired_recipient_is_not_observed(self):
+        gone = make_worker(self.ws, "gone")
+        self._retire(gone)
+        self.assertEqual(sup.observe(self.ws, 100.0, worker_ids=[gone], runner=Tmux()), {})
+
+    def test_an_unknown_recipient_is_not_observed(self):
+        make_worker(self.ws, "real")
+        never = wi.new_worker_id()
+        self.assertEqual(sup.observe(self.ws, 100.0, worker_ids=[never], runner=Tmux()), {})
+
+    def test_neither_reaches_the_persisted_ladder(self):
+        gone, never = make_worker(self.ws, "gone"), wi.new_worker_id()
+        self._retire(gone)
+        for now in (1000.0, 1030.0, 1060.0, 1095.0):
+            out = sup.tick(self.ws, now, worker_ids=[gone, never], runner=Tmux())
+        self.assertEqual(out["decisions"], {})
+        self.assertEqual(sup.load_state(self.ws).workers, {},
+                         "a retired or unknown worker acquired a ladder entry")
+        self.assertEqual(sorted(out["not_supervised"]), sorted([gone, never]))
+
+    def test_the_operator_is_told_rather_than_shown_nothing(self):
+        gone = make_worker(self.ws, "gone")
+        self._retire(gone)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = sup.main(["--workspace", str(self.ws), "--recipient", gone, "--no-persist"])
+        self.assertEqual(rc, 0)
+        self.assertIn("not supervised", out.getvalue())
+
+    def test_control_a_live_recipient_is_still_observed(self):
+        live = make_worker(self.ws, "live")
+        self.assertEqual(list(sup.observe(self.ws, 100.0, worker_ids=[live], runner=Tmux())), [live])
+
+
 class TheLadderSurvivesBetweenTicks(Base):
     def test_state_round_trips(self):
         st = ps.SupervisionState(last_sample_at=5.0, workers={
@@ -239,7 +283,8 @@ class TheCommandLine(Base):
         wid = make_worker(self.ws)
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
-        self.assertEqual(set(json.loads(out)), {"decisions", "observations", "resumed"})
+        self.assertEqual(set(json.loads(out)),
+                         {"decisions", "observations", "resumed", "not_supervised"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
