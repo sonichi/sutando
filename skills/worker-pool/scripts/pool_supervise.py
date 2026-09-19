@@ -139,6 +139,10 @@ def routing_status(workspace) -> dict:
     receipt = prr.read(workspace)
     consulted = receipt["consulted_at"] if receipt else None
     newest, newest_id = None, None
+    # The receipt is stamped before the task it names is routed, so that task's own
+    # archive is always newer than its consult; every OTHER task past it is unrouted.
+    own = receipt.get("task_id") if receipt else None
+    unrouted = None
     for f in (Path(workspace) / "tasks" / "archive").glob("task-*.txt"):
         try:
             mtime = f.stat().st_mtime
@@ -146,16 +150,16 @@ def routing_status(workspace) -> dict:
             continue
         if newest is None or mtime > newest:
             newest, newest_id = mtime, f.stem
+        if (consulted is not None and mtime > consulted and f.stem != own
+                and (unrouted is None or mtime > unrouted[0])):
+            unrouted = (mtime, f.stem)
     alarm = None
     if bound and consulted is None:
         alarm = (f"unrouted: {len(bound)} room(s) bound to workers, but the route handler "
                  "has never been consulted on this host — the watcher runs without it")
-    # The receipt is stamped before the task it names is routed, so that task's own
-    # archive is always newer than its consult: only a DIFFERENT task past it is unrouted.
-    elif (bound and newest is not None and consulted < newest
-          and newest_id != receipt.get("task_id")):
-        alarm = (f"unrouted: {newest_id} arrived at {newest:.0f} after the route handler was "
-                 f"last consulted at {consulted:.0f} — the core processed it unrouted")
+    elif bound and unrouted is not None:
+        alarm = (f"unrouted: {unrouted[1]} arrived at {unrouted[0]:.0f} after the route handler "
+                 f"was last consulted at {consulted:.0f} — the core processed it unrouted")
     return {"bound_rooms": bound, "handler_consulted_at": consulted,
             "newest_task_at": newest, "newest_task_id": newest_id, "alarm": alarm}
 

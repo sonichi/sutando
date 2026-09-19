@@ -311,6 +311,28 @@ class IsThisHostRouting(Base):
         self.assertIn("task-xyz", alarm)
         self.assertIn("processed it unrouted", alarm)
 
+    def test_a_different_task_tied_with_the_consulted_one_on_mtime_is_still_the_alarm(self):
+        # Same clock tick for both archives is routine on coarse filesystems; the
+        # consulted task's exemption must not shadow the other task, whatever the glob order.
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        for tid in ("task-abc", "task-xyz", "task-aaa"):
+            self._archived_task(1002.0, task_id=tid)
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("processed it unrouted", alarm)
+        self.assertNotIn("task-abc", alarm, "the exempt task must not be the one named")
+
+    def test_an_unrouted_task_older_than_the_newest_routed_one_is_still_the_alarm(self):
+        # task-xyz got past the handler, then the handler was consulted for task-abc and
+        # task-abc archived last: the newest archive is exempt, task-xyz is not.
+        self._bind()
+        self._archived_task(999.0, task_id="task-old")          # before the consult: routed
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1001.0, task_id="task-xyz")
+        self._archived_task(1002.0)                            # task-abc, the exempt one
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+
     def test_bound_rooms_but_a_handler_never_consulted_is_the_alarm(self):
         self._bind()
         self._archived_task(1000.0)
