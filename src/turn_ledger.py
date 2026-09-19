@@ -28,10 +28,12 @@ this agent:
     half-written file as a reply;
   • a line in `<workspace>/state/room-actions.jsonl` newer than the previous
     Stop — written by the desktop app's ag2-space MCP proxy after each
-    SUCCESSFUL `room.action.execute`, whatever the action. The proxy serves
-    Claude and Codex alike and knows nothing of this rule; it records facts,
-    this module decides what they mean. Reads never land there, and neither
-    do failed calls. The proxy owns that file's bound: it rotates it to
+    SUCCESSFUL `room.action.execute`. The proxy serves Claude and Codex alike
+    and knows nothing of this rule; it records facts, this module decides what
+    they mean. Reads never land there, and neither do failed calls. Every
+    action counts except a reaction (`NOT_A_REPLY`): the 🫡 pickup
+    acknowledgement is a reaction, and counting it would pass a turn that
+    acknowledged a task and then said nothing. The proxy owns that file's bound: it rotates it to
     `room-actions.jsonl.1`, so both are read. Its lines carry no session and
     therefore count for every session, like an untagged ledger line.
 
@@ -111,6 +113,7 @@ STOP_NAME = "turn-stop.json"
 TURN_NAME = "turn-reminder.json"
 # Written by the desktop's MCP proxy, not by this module; see the docstring.
 ROOM_ACTIONS_NAME = "room-actions.jsonl"
+NOT_A_REPLY = frozenset({"room.message.react", "room.message.unreact"})
 
 # An entry is ~90 bytes and the only question ever asked of this file is "since
 # the last Stop", so the cap is about unbounded growth, not retention depth.
@@ -380,7 +383,8 @@ def _room_action_after(ts: float, workspace: Path | str | None = None) -> dict |
     """The newest successful MCP room action newer than `ts`, or None."""
     path = room_actions_path(workspace)
     newer = [e for p in (path.with_name(path.name + ".1"), path) for e in _read_jsonl(p)
-             if e.get("kind") == "room-action" and float(e["ts"]) > ts]
+             if e.get("kind") == "room-action" and e.get("action")
+             and e["action"] not in NOT_A_REPLY and float(e["ts"]) > ts]
     if not newer:
         return None
     last = max(newer, key=lambda e: float(e["ts"]))

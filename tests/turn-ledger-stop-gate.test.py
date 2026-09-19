@@ -409,14 +409,28 @@ def _proxy_room_action(ws: pathlib.Path, ts: float | None = None, name: str = "r
 
 def test_an_mcp_room_action_lets_the_turn_end() -> None:
     """The only evidence is the proxy's line — the reported MCP-reply case."""
-    with tempfile.TemporaryDirectory() as tmp:
-        ws = _workspace(tmp)
-        _arm(ws)
-        _hook(ws)
-        _proxy_room_action(ws, action="dev.pr.review.publish")
-        decision = _hook(ws)
-        check("a fresh room action ends the turn through the real hook", decision == {},
-              repr(decision))
+    for action in ("room.message.send", "dev.pr.review.publish"):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            _arm(ws)
+            _hook(ws)
+            _proxy_room_action(ws, action=action)
+            decision = _hook(ws)
+            check(f"a fresh {action} ends the turn through the real hook", decision == {},
+                  repr(decision))
+
+
+def test_a_reaction_is_not_a_reply() -> None:
+    """The pickup 🫡 is a reaction; a turn that only reacted has said nothing."""
+    for action in ("room.message.react", "room.message.unreact", None):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            _arm(ws)
+            _hook(ws)
+            _proxy_room_action(ws, action=action)
+            decision = _hook(ws)
+            check(f"a lone {action} still leaves the turn silent", _blocked(decision),
+                  repr(decision))
 
 
 def test_a_room_action_before_the_boundary_is_not_this_turns() -> None:
@@ -525,6 +539,7 @@ def main() -> int:
         test_trim_survives_an_unwritable_state_dir,
         test_result_after_skips_an_entry_whose_stat_races_away,
         test_an_mcp_room_action_lets_the_turn_end,
+        test_a_reaction_is_not_a_reply,
         test_a_room_action_before_the_boundary_is_not_this_turns,
         test_a_room_action_past_the_window_is_reminded,
         test_room_action_reader_edges,
