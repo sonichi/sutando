@@ -116,6 +116,19 @@ class Asking(Base):
             pa.ask(self.ws, "core", "?")            # asked from the core
         self.assertEqual(list((self.ws / "tasks").iterdir()), [], "a refused ask wrote a task")
 
+    def test_relayed_content_keeps_its_own_tier_and_names_its_origin(self):
+        out = pa.ask(self.ws, "alpha", "can you look at #9?", tier="guest", relayed_from="@visitor:x")
+        text = (self.ws / "tasks" / f"{out['task_id']}.txt").read_text()
+        head = text.split("\ntask:")[0]
+        self.assertIn("access_tier: guest", head)
+        self.assertIn("relayed_from: @visitor:x", head)
+        self.assertNotIn("collaborator: true", head, "relayed content is not the collaborator")
+        self.assertIn("[pool-ask from core, relaying @visitor:x]", text)
+
+    def test_owner_is_never_a_tier_an_ask_can_claim(self):
+        with self.assertRaises(ValueError):
+            pa.compose("task-1", "core", "q", sender="w1", wait=False, tier="owner")
+
     def test_an_ambiguous_label_is_refused_not_guessed(self):
         make_worker(self.ws, "alpha")             # a second worker with the same label
         with self.assertRaises(ValueError):
@@ -169,6 +182,11 @@ class TheCommandLine(Base):
         self.assertEqual(self._run("--to", "alpha")[0], 2)
         self.assertEqual(self._run("--ask", "x")[0], 2)
         self.assertEqual(self._run()[0], 2)
+
+    def test_a_lowered_tier_needs_an_origin(self):
+        self.assertEqual(self._run("--to", "alpha", "--ask", "?", "--tier", "guest")[0], 2)
+        rc, _, _ = self._run("--to", "alpha", "--ask", "?", "--tier", "guest", "--relayed-from", "@v:x")
+        self.assertEqual(rc, 0)
 
     def test_an_unknown_recipient_is_a_refusal_on_stderr(self):
         rc, _, err = self._run("--to", "nobody", "--ask", "?")

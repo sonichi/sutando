@@ -46,6 +46,9 @@ sup = _sibling("pool_supervise")
 
 SOURCE = "pool-ask"
 NO_SEND = "[no-send]"
+# An ask never claims owner authority: the asker is an instance, and relayed content
+# keeps the tier of whoever wrote it. `owner` is deliberately not offered.
+TIERS = ("team", "other", "guest")
 
 
 def whoami() -> str:
@@ -87,24 +90,32 @@ def resolve(workspace, name: str) -> str:
     return rid
 
 
-def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool) -> str:
+def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
+            tier: str = "team", relayed_from: "str | None" = None) -> str:
     """The task file. `task:` is the LAST header: everything below it is body."""
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}: {tier!r}")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reply = (f"Reply by writing results/{task_id}.txt whose FIRST line is {NO_SEND} "
              f"(the asker reads the file directly; nothing is posted to a room).")
-    # The asker is another instance, not the owner: a collaborator at team tier, so
-    # cron-gate and the shepherds do not read a standing ask as an owner waiting.
+    # A collaborator at team tier by default, so cron-gate and the shepherds never
+    # read a standing ask as the owner waiting; relayed content keeps its own tier.
     lines = [f"id: {task_id}", f"timestamp: {ts}", f"source: {SOURCE}",
              f"sender_name: {sender}", f"reply_to_instance: {sender}",
-             "access_tier: team", "collaborator: true", "priority: low"]
+             f"access_tier: {tier}", "priority: low"]
+    if relayed_from:
+        lines.append(f"relayed_from: {relayed_from.strip()}")
+    elif tier == "team":
+        lines.append("collaborator: true")
     if to != pr.CORE:
         lines.append(f"requested_worker: {to}")
-    lines.append(f"task: [pool-ask from {sender}] {question.strip()}\n\n{reply}")
+    origin = f"[pool-ask from {sender}" + (f", relaying {relayed_from.strip()}" if relayed_from else "") + "]"
+    lines.append(f"task: {origin} {question.strip()}\n\n{reply}")
     return "\n".join(lines) + "\n"
 
 
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
-        sleep=time.sleep) -> dict:
+        sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None) -> dict:
     ws = Path(workspace)
     rid = resolve(ws, to)
     sender = whoami()
@@ -114,8 +125,8 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     tasks = ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
-    tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0),
-                   encoding="utf-8")
+    tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0,
+                           tier=tier, relayed_from=relayed_from), encoding="utf-8")
     os.replace(tmp, tasks / f"{task_id}.txt")
     out = {"task_id": task_id, "to": rid, "from": sender, "task_file": str(tasks / f"{task_id}.txt")}
     if rid != pr.CORE:
@@ -150,6 +161,9 @@ def main(argv=None) -> int:
     p.add_argument("--to")
     p.add_argument("--ask")
     p.add_argument("--wait", type=float, default=0.0, help="seconds to wait for the reply")
+    p.add_argument("--relayed-from", help="who the question really comes from, when it is not you")
+    p.add_argument("--tier", choices=TIERS, default="team",
+                   help="the tier of relayed content (never owner); default team")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     if a.who == bool(a.to or a.ask):
@@ -167,7 +181,9 @@ def main(argv=None) -> int:
                     me = "  (you)" if r["me"] else ""
                     print(f"{r['label']:24} {r['id'][:8]:8} {alive:5} rooms={','.join(r['rooms']) or '-'}{me}")
             return 0
-        out = ask(a.workspace, a.to, a.ask, wait_s=a.wait)
+        if a.tier != "team" and not a.relayed_from:
+            p.error("--tier below team needs --relayed-from: whose content is it?")
+        out = ask(a.workspace, a.to, a.ask, wait_s=a.wait, tier=a.tier, relayed_from=a.relayed_from)
     except (ValueError, OSError, rt.RouterRefused) as e:
         print(f"pool_ask: {e}", file=sys.stderr)
         return 2

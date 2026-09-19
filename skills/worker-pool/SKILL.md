@@ -75,6 +75,11 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 - An ask carries `access_tier: team` + `collaborator: true` + `priority: low`: the asker is
   another instance, not the owner, so a standing ask never reads as an owner waiting to
   `scripts/cron-gate.sh` or the shepherds (measured: an owner-tier ask deferred `sync-workspace`).
+- **Relaying someone else's question** — a peer's, a guest's — is `--relayed-from <who>
+  --tier <team|other|guest>`: the task keeps *their* tier and carries `relayed_from:` for the
+  receiver to key on. `owner` is never a tier an ask can claim, and non-owner content must
+  never be relayed as your own: the tier must say where the question came from, not who ran
+  the script.
 - Refused, never guessed: an unknown name, a label two workers share, and asking yourself.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the
