@@ -259,8 +259,12 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     if abnormal:
         return Verdict("abnormal", ",".join(abnormal))
     joined = "\n".join(lines)
-    line = prompt_line(joined, adapter)
-    gate = _gate(joined, tail, line, adapter)
+    # FULL capture, not the TAIL_LINES tail: a wrapped draft past that window
+    # loses its own glyph line to truncation and the footer reads as empty.
+    line = prompt_line(capture, adapter)
+    # _gate's after_prompt() must see the same capture line was found in, or
+    # it computes "below" from a view that never contained that line at all.
+    gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
     if line is not None and line.text:

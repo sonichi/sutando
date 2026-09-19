@@ -328,6 +328,32 @@ class WrappedComposerIsStillTheComposer(unittest.TestCase):
         self.assertEqual(pg.after_prompt("\u203a hi\nGATE?\n", pg.CODEX, 40), "GATE?")
 
 
+class ClassifyPaneSeesPastTheTailTruncation(unittest.TestCase):
+    """classify_pane read only the last TAIL_LINES rows before searching for the
+    prompt glyph, so a draft with more continuation rows than that lost its own
+    glyph line to truncation -- the footer beneath it then read as an empty,
+    idle composer, and a notifier would type the next task over the unsubmitted
+    draft and press Enter (keweichen, #4320 review, live capture with 20+ rows).
+    """
+
+    def test_a_draft_wrapped_past_the_tail_window_is_still_pending_not_idle(self):
+        self.assertGreater(24, pg.TAIL_LINES,
+                            "fixture no longer exceeds TAIL_LINES \u2014 it would no longer reach the bug")
+        rows = "\n".join(f"continuation row {i}" for i in range(24))
+        capture = f"\u203a owner draft starts\n{rows}\n{FOOTER}\n"
+        v = pg.classify_pane(capture, pg.CODEX)
+        self.assertEqual(v.state, "pending")
+        self.assertEqual(v.pending, "owner draft starts")
+
+    def test_control_the_same_capture_truncated_to_the_tail_loses_the_glyph(self):
+        # Proves the fixture actually exercises truncation, not some other path.
+        rows = "\n".join(f"continuation row {i}" for i in range(24))
+        capture = f"\u203a owner draft starts\n{rows}\n{FOOTER}\n"
+        lines = pg._tail_lines(capture)
+        self.assertIsNone(pg.prompt_line("\n".join(lines), pg.CODEX),
+                           "control invalid: the truncated tail still contains the glyph line")
+
+
 class CliExitCodesAreTheContract(unittest.TestCase):
     """Callers are shell. They branch on the exit code, so each one is pinned here."""
 
