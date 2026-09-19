@@ -152,6 +152,9 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("install", "--workspace", str(self.ws), "--repo", str(REPO))
         self.assertEqual(rc, 0)
         self.assertIn("loaded: True", out)
+        self.assertIn("bootstrap", [a[1] for a in self.lc.calls],
+                      "the CLI reached the REAL launchctl: a def-time `runner=subprocess.run` "
+                      "default ignores the patch and bootstraps a temp plist under the live label")
         rc, out, _ = self._run("status")
         self.assertIn("installed: True", out)
         self.assertIn("interval_s: 300", out)

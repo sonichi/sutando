@@ -68,15 +68,17 @@ def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
     }
 
 
-def _launchctl(argv, runner=subprocess.run):
-    return runner(["launchctl", *argv], capture_output=True, text=True)
+def _launchctl(argv, runner=None):
+    # Resolved at call time, so a test that patches `subprocess.run` is honoured;
+    # a def-time default would bind the real one and reach the live launchd domain.
+    return (runner or subprocess.run)(["launchctl", *argv], capture_output=True, text=True)
 
 
-def is_loaded(runner=subprocess.run) -> bool:
+def is_loaded(runner=None) -> bool:
     return _launchctl(["print", service_target()], runner).returncode == 0
 
 
-def bootout(runner=subprocess.run, *, sleep=time.sleep) -> None:
+def bootout(runner=None, *, sleep=time.sleep) -> None:
     if not is_loaded(runner):
         return
     _launchctl(["bootout", service_target()], runner)
@@ -88,7 +90,7 @@ def bootout(runner=subprocess.run, *, sleep=time.sleep) -> None:
 
 
 def install(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S, python=None,
-            launch_agents: Path | None = None, runner=subprocess.run,
+            launch_agents: Path | None = None, runner=None,
             sleep=time.sleep) -> dict:
     job = render(workspace, repo, interval_s=interval_s, python=python)
     dest = plist_path(launch_agents)
@@ -107,7 +109,7 @@ def install(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S, python=Non
             "log": job["StandardOutPath"], "loaded": is_loaded(runner)}
 
 
-def uninstall(*, launch_agents: Path | None = None, runner=subprocess.run,
+def uninstall(*, launch_agents: Path | None = None, runner=None,
               sleep=time.sleep) -> dict:
     bootout(runner, sleep=sleep)
     dest = plist_path(launch_agents)
@@ -116,7 +118,7 @@ def uninstall(*, launch_agents: Path | None = None, runner=subprocess.run,
     return {"plist": str(dest), "removed": removed, "loaded": is_loaded(runner)}
 
 
-def status(*, launch_agents: Path | None = None, runner=subprocess.run) -> dict:
+def status(*, launch_agents: Path | None = None, runner=None) -> dict:
     dest = plist_path(launch_agents)
     out = {"plist": str(dest), "installed": dest.exists(), "loaded": is_loaded(runner)}
     if out["installed"]:
