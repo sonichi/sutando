@@ -1,0 +1,7 @@
+{
+  "name": "worker-pool",
+  "description": "One core plus N workers: a roster, owner-authored bindings, and a router that delivers a bound room's work to its worker.",
+  "config": {
+    "SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/pool_route_handler.py"
+  }
+}
