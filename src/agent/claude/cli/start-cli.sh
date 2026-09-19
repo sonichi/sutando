@@ -783,6 +783,7 @@ ensure_task_notifier() {
   # publisher installed, removed or duplicated must replace a running watcher.
   handler_rc=0
   if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    ensure_task_event_handlers_published "$REPO"
     SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
     [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
   fi

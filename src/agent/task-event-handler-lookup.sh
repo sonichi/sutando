@@ -19,3 +19,15 @@ resolve_task_event_handler() {
     *) printf 'task-event-handler: %s skills publish one (%s); set SUTANDO_TASK_EVENT_HANDLER explicitly\n' "$#" "$*" >&2; return 2 ;;
   esac
 }
+
+# A publisher created only at worker-registration time never re-runs for a pool
+# that already existed before this repo stopped shipping the file, so each
+# skill gets one chance, here, to republish before every resolution. Names no
+# skill: `skills/*/task-event-handler-ensure`, same neutral glob as above.
+ensure_task_event_handlers_published() {
+  local repo="$1" ensure
+  for ensure in "$repo"/skills/*/task-event-handler-ensure; do
+    [ -x "$ensure" ] && "$ensure" "$repo"
+  done
+  return 0
+}

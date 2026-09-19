@@ -20,8 +20,15 @@ Three properties, one per defect:
    skill is deleted, so the publisher is created when a pool first exists and is ignored
    by git.
 
-Property 3 is executed against the real `register_worker`; 1 and 2 are read off both
-launcher scripts, since driving a tmux launcher in a unit test would assert on a mock."""
+4. EXISTING-POOL SELF-HEAL. `register_worker` is the only writer of the publisher, and it
+   only runs at worker creation -- so a pool created before property 3 landed loses its
+   publisher the moment its checkout pulls past that commit (git deletes a file dropped
+   from the tree) and nothing recreates it, silently reopening property 2's fall-through.
+   Both launchers now call `ensure_task_event_handlers_published` before every resolution.
+
+Properties 3 and 4 are executed against the real `pool_roster` functions; 1, 2 and the
+ordering half of 4 are read off both launcher scripts, since driving a tmux launcher in a
+unit test would assert on a mock."""
 import ast
 import json
 import pathlib
@@ -37,6 +44,7 @@ checks = {}
 
 for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     t = path.read_text()
+    ensure_at = t.find("ensure_task_event_handlers_published \"$REPO\"")
     resolve_at = t.find("resolve_task_event_handler \"$REPO\"")
     ver_at = t.find("expected_version=")
     reuse_at = t.find("SUTANDO_NOTIFIER_VERSION=//p")
@@ -44,6 +52,10 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     checks[f"{name}: resolution precedes the identity computation"] = 0 < resolve_at < ver_at
     checks[f"{name}: resolution precedes the REUSE check, so a publisher change replaces a live watcher"] = \
         0 < resolve_at < reuse_at
+    # An existing pool whose publisher went missing (untracked after shipping stopped)
+    # never re-registers, so nothing else re-creates it -- self-heal before every resolve.
+    checks[f"{name}: gives publishers a chance to self-heal before every resolution"] = \
+        0 < ensure_at < resolve_at
     # The identity must actually carry the resolved outcome, or ordering alone buys nothing.
     ver_line = t[ver_at:t.find("\n", t.find("notifier_py", ver_at)) if name == "claude" else t.find("\"\n", ver_at) + 1]
     checks[f"{name}: the identity includes the resolved handler"] = "SUTANDO_TASK_EVENT_HANDLER" in ver_line
@@ -93,6 +105,22 @@ try:
         pr.register_worker(ws, "x" * 32, "probe-worker-2")
         checks["a second registration leaves the publisher alone"] = \
             link.is_symlink() and link.readlink().name == "pool_route_handler.py"
+
+        # Property 4: SELF-HEAL. An existing pool's publisher can go missing and
+        # nothing re-registers on its own; ensure_task_event_handler_published republishes it.
+        link.unlink()
+        checks["fixture precondition: an existing pool's publisher can go missing"] = not link.exists()
+        pr.ensure_task_event_handler_published(ws)
+        checks["an existing pool's missing publisher is republished"] = \
+            link.is_symlink() and link.readlink().name == "pool_route_handler.py"
+        # Control: a workspace with NO pool at all must stay untouched -- the
+        # unshipped-by-default property (3) must survive this new call path too.
+        link.unlink()
+        ws_nopool = root / "ws-nopool"; (ws_nopool / "state").mkdir(parents=True)
+        pr.ensure_task_event_handler_published(ws_nopool)
+        checks["control: a workspace with no pool gets no publisher from self-heal"] = not link.exists()
+        # Restore for the sections below, which assume ws's publisher exists.
+        pr.ensure_task_event_handler_published(ws)
 
         # A pool registered without a publisher reads to the launcher as NO pool,
         # so worker-bound tasks would reach the unrestricted core. Must abort.
