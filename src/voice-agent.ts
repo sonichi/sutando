@@ -59,6 +59,7 @@ function assertMacOS() {
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, bindSessionContextFrame, sessionRoomNotice } from './task-bridge.js';
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame } from './web-voice-transport.js';
+import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations } from './voice-navigate.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1133,6 +1134,7 @@ async function main() {
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
 			void handleSessionContextFrame(message);
+			resolveUiNavigated(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 		},
 		onClientConnected: () => {
@@ -1144,6 +1146,7 @@ async function main() {
 			// client announces its own (or none, and tasks fall back to the DM).
 			if (getVoiceSessionRoom()) console.log(`${ts()} [SessionRoom] client gone — room released`);
 			setVoiceSessionRoom(null);
+			failPendingNavigations();
 			voiceRecoveryCoordinator?.handleClientDisconnected();
 		},
 		// Whenever the coordinator owns the episode (restarting, waiting-retry,
@@ -1286,6 +1289,12 @@ async function main() {
 	});
 
 	sessionRef = session;
+	// navigate_ui talks to the attached desktop over the session's own client
+	// frame path; with no real client attached the tool answers `unsupported`.
+	installVoiceNavigateClient({
+		attached: () => Boolean(session.clientConnected),
+		send: (frame) => session.sendJsonToClient(frame),
+	});
 
 	// Armed only with the full bodhi recovery surface; anything less falls
 	// back to shadow with a loud line (the design's capability-validation rule).

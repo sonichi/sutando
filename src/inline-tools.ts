@@ -26,6 +26,7 @@ import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, 
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
 import { buildVoiceTaskHeader, getVoiceSessionRoom } from './task-bridge.js';
+import { navigateUiTool } from './voice-navigate.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -1457,7 +1458,7 @@ export const inlineTools = forHostPlatform(assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool, navigateUiTool,
 	joinGmeetTool, lookupMeetingIdTool, callContactTool,
 	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
@@ -1479,7 +1480,7 @@ export const ownerOnlyTools = forHostPlatform([
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool,
+	clipboardTool, cancelTaskTool, toggleTasksTool, navigateUiTool,
 	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
