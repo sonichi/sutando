@@ -141,7 +141,6 @@ export default tseslint.config(
   // enforcement — the linter does not check them.
   {
     files: [
-      'skills/phone-conversation/scripts/conversation-server.ts',      // 14
       'src/browser-tools.ts',                                          // 3
       'src/cartesia-stt-provider.ts',                                  // 1
       'src/observability/claude/jsonl-tail.ts',                        // 2
