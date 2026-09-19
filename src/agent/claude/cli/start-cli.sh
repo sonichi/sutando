@@ -877,6 +877,27 @@ ensure_core_monitor() {
   fi
 }
 
+# The core session arms its own watcher (the documented Monitor path), so the
+# handler must be in ITS env; ensure_task_notifier resolves after it is created.
+core_env_carry_task_event_handler() {
+  local rc=0
+  [ -z "$WORKER_INSTANCE" ] || return 0   # same scope as the notifier
+  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+    return 0
+  fi
+  # Leave it EMPTY on any refusal rather than deciding here: ensure_task_notifier
+  # re-runs this and owns the fail-closed handling (kill the watcher, refuse).
+  ensure_task_event_handlers_published "$REPO" || return 0
+  SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || rc=$?
+  if [ "$rc" != 0 ] || [ -z "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+    SUTANDO_TASK_EVENT_HANDLER=""
+    return 0
+  fi
+  CORE_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+}
+core_env_carry_task_event_handler
+
 # Already running — attach if interactive, else exit cleanly. A managed core is
 # live when the tmux session exists AND a `claude --name sutando-core` process
 # runs under it (tmux_core_session_running). Re-running the script is idempotent:
