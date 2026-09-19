@@ -103,10 +103,8 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reply = (f"Reply by writing results/{task_id}.txt whose FIRST line is {NO_SEND} "
              f"(the asker reads the file directly; nothing is posted to a room).")
-    # A collaborator at team tier by default, so cron-gate and the shepherds never
-    # read a standing ask as the owner waiting; relayed content keeps its own tier.
-    # Branch on INTENT (an origin was supplied), sanitize only for emission: an
-    # origin that flattens to nothing is refused, never silently "no origin".
+    # Team-tier collaborator by default (never an owner waiting); relayed content keeps
+    # its tier. Branch on intent, sanitize for emission: an unnameable origin is refused.
     origin_of = header_safe_value(relayed_from).strip() if relayed_from is not None else None
     if relayed_from is not None and not origin_of:
         raise ValueError("relayed_from names nobody: a relayed ask must say where it came from")
