@@ -132,24 +132,32 @@ def routing_status(workspace) -> dict:
     worker, the failure the pool exists to prevent, and it is silent otherwise.
     """
     roster = pr.load_roster(workspace) or {}
-    bound = sorted(k for k in (roster.get("bindings") or {}) if k != getattr(pr, "CORE", "core"))
+    core = getattr(pr, "CORE", "core")
+    # A binding is {room: target}; a room pinned to the core is not one a worker owes.
+    bound = sorted(room for room, target in (roster.get("bindings") or {}).items()
+                   if any(t != core for t in (target if isinstance(target, list) else [target])))
     receipt = prr.read(workspace)
     consulted = receipt["consulted_at"] if receipt else None
-    newest = None
+    newest, newest_id = None, None
     for f in (Path(workspace) / "tasks" / "archive").glob("task-*.txt"):
         try:
-            newest = max(newest or 0.0, f.stat().st_mtime)
+            mtime = f.stat().st_mtime
         except OSError:
             continue
+        if newest is None or mtime > newest:
+            newest, newest_id = mtime, f.stem
     alarm = None
     if bound and consulted is None:
         alarm = (f"unrouted: {len(bound)} room(s) bound to workers, but the route handler "
                  "has never been consulted on this host — the watcher runs without it")
-    elif bound and newest is not None and consulted < newest:
-        alarm = (f"unrouted: a task arrived at {newest:.0f} after the route handler was "
+    # The receipt is stamped before the task it names is routed, so that task's own
+    # archive is always newer than its consult: only a DIFFERENT task past it is unrouted.
+    elif (bound and newest is not None and consulted < newest
+          and newest_id != receipt.get("task_id")):
+        alarm = (f"unrouted: {newest_id} arrived at {newest:.0f} after the route handler was "
                  f"last consulted at {consulted:.0f} — the core processed it unrouted")
     return {"bound_rooms": bound, "handler_consulted_at": consulted,
-            "newest_task_at": newest, "alarm": alarm}
+            "newest_task_at": newest, "newest_task_id": newest_id, "alarm": alarm}
 
 
 def load_state(workspace) -> ps.SupervisionState:

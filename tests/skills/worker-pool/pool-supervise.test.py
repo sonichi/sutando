@@ -269,11 +269,11 @@ class IsThisHostRouting(Base):
         pr.bind_room(self.ws, "!room:ag2.space", wid)
         return wid
 
-    def _archived_task(self, mtime):
+    def _archived_task(self, mtime, task_id="task-abc"):
         d = self.ws / "tasks" / "archive"
         d.mkdir(parents=True, exist_ok=True)
-        f = d / "task-abc.txt"
-        f.write_text("id: task-abc\ntask: x\n")
+        f = d / f"{task_id}.txt"
+        f.write_text(f"id: {task_id}\ntask: x\n")
         import os
         os.utime(f, (mtime, mtime))
         return f
@@ -281,6 +281,35 @@ class IsThisHostRouting(Base):
     def test_no_bindings_is_never_an_alarm(self):
         make_worker(self.ws)
         self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+
+    def test_a_room_bound_to_the_core_is_not_a_worker_binding(self):
+        # An explicit {room: "core"} pin means the core answers there; nothing is
+        # owed to a worker, so a never-consulted handler is not an alarm.
+        make_worker(self.ws)
+        pr.bind_room(self.ws, "!mine:ag2.space", pr.CORE)
+        self._archived_task(1000.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["bound_rooms"], [])
+        self.assertIsNone(st["alarm"])
+
+    def test_the_consulted_tasks_own_archive_is_not_the_alarm(self):
+        # Real causality: the handler stamps the receipt BEFORE routing task-abc, and
+        # task-abc is archived after it was processed — strictly later than its consult.
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1002.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["newest_task_id"], "task-abc")
+        self.assertIsNone(st["alarm"], "a task the handler routed must not read as unrouted")
+
+    def test_a_different_task_archived_after_the_consult_is_still_the_alarm(self):
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1002.0)
+        self._archived_task(1003.0, task_id="task-xyz")
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+        self.assertIn("processed it unrouted", alarm)
 
     def test_bound_rooms_but_a_handler_never_consulted_is_the_alarm(self):
         self._bind()
