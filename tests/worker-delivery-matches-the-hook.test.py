@@ -13,6 +13,7 @@ Exit: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import errno
+import importlib.util
 import re
 import subprocess
 import sys
@@ -202,6 +203,19 @@ else:
     # a renamed function must not smuggle the suffix set back past this guard.
     stray = sorted(set(re.findall(r"\*(\.[a-z]+)\)", hook)) & set(SENTINEL_SUFFIXES))
     check(not stray, f"the hook spells no sentinel suffix of its own (found {stray})")
+
+print("the two LIVE owners of the suffix set agree")
+# The hook asks task_dispatch.py now, so the second copy is that module's.
+# Nothing else compares the two, and src/ may not import the skill to share one.
+check(re.search(r"task_dispatch\.py\"?\s+owned-by", hook) is not None,
+      "the hook asks task_dispatch.py owned-by for ownership")
+spec = importlib.util.spec_from_file_location(
+    "task_dispatch_suffix_guard", ROOT / "src" / "delivery" / "task_dispatch.py")
+task_dispatch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(task_dispatch)
+check(set(task_dispatch._WORKER_HOLD_SUFFIXES) == set(SENTINEL_SUFFIXES),
+      f"task_dispatch {sorted(task_dispatch._WORKER_HOLD_SUFFIXES)} == "
+      f"worker_delivery {sorted(SENTINEL_SUFFIXES)}")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)
