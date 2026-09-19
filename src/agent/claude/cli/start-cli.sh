@@ -779,6 +779,21 @@ ensure_task_notifier() {
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
   )
+  # The resolved outcome is part of the identity below, so resolve first: a
+  # publisher installed, removed or duplicated must replace a running watcher.
+  handler_rc=0
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
+    [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
+  fi
+  # Fail CLOSED: without the router probe a worker-bound task would fall
+  # through to the unrestricted core, the inheritance the handler prevents.
+  if [ "$handler_rc" = 2 ]; then
+    echo "  ⚠ task notifier not started: several skills publish skills/*/task-event-handler." >&2
+    echo "    Pin one with SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    return 0
+  fi
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
   expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')"
@@ -797,10 +812,6 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
-  # An optional skill may publish the watcher's handler; the lookup names no skill.
-  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || SUTANDO_TASK_EVENT_HANDLER=""
-  fi
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.

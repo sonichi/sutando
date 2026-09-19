@@ -278,6 +278,24 @@ def _publish(workspace, roster: dict) -> None:
         raise PublishError(roster, e) from e
 
 
+def publish_task_event_handler():
+    """Publish this skill's handler where the launcher's neutral lookup finds it.
+
+    Created when a pool first exists rather than shipped in the repo: an install
+    that never made a worker publishes nothing, the lookup finds none, and the
+    watcher behaves exactly as it did before this skill existed -- including
+    after the skill is removed outright.
+    """
+    link = Path(__file__).resolve().parents[1] / "task-event-handler"
+    if link.is_symlink() or link.exists():
+        return link
+    try:
+        link.symlink_to(Path("scripts") / "pool_route_handler.py")
+    except OSError:
+        return None
+    return link
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
@@ -298,6 +316,8 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
             # The next registration reloads bindings.json, not the roster: a
             # binding held only in the compiled roster is discarded by it.
             save_bindings(workspace, bindings)
+        # Inside the lock: publishing and the roster write are one transaction.
+        publish_task_event_handler()
         return compile_roster(workspace, workers, bindings)
 
 
