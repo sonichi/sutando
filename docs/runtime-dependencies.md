@@ -57,7 +57,7 @@ nothing else.
 | Vault sync, self-upgrade, commit provenance | `git` | those features unavailable; everything else runs |
 | Agent-authored PR workflows | `gh` | unavailable |
 | OCR on screen captures | `tesseract` | unavailable |
-| Sutando.app watcher auto-restart | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:613` falls back to a bare `exec claude`; only the auto-restart is lost |
+| Sutando.app watcher auto-restart | `tmux` | **core still starts** — `src/agent/claude/cli/start-cli.sh:973` falls back to a bare `exec claude`; only the auto-restart is lost |
 | Building `Sutando.app` from source | Xcode Command Line Tools | not needed if a prebuilt binary ships |
 
 Two entries worth calling out, because both have been overstated before:
