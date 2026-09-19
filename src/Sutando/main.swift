@@ -2855,23 +2855,91 @@ extension AppDelegate: NSMenuDelegate {
         return pairs.isEmpty ? nil : pairs
     }
 
-    /// The model the switch script last recorded as accepted (state/model-switch.json).
-    func recordedModel() -> String? {
-        guard let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return root["model"] as? String
+    /// Parses either ISO-8601 shape this codebase writes: with fractional seconds
+    /// (`credential-proxy.ts`'s `Date().toISOString()`) or without
+    /// (`switch-model.sh`'s `strftime`). A single `ISO8601DateFormatter` accepts
+    /// only one shape and returns nil on the other; comparing the two AS STRINGS
+    /// instead of parsing them sorts a fractional-second stamp BEFORE a
+    /// whole-second one at the same wall-clock second ('.' < any digit in ASCII),
+    /// inverting the real order right at the race this fix exists to resolve.
+    func parseTimestamp(_ s: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: s) { return d }
+        let whole = ISO8601DateFormatter()
+        whole.formatOptions = [.withInternetDateTime]
+        return whole.date(from: s)
+    }
+
+    /// The model last seen consuming quota on the wire (state/quota-state.json),
+    /// or the model an accepted menu switch recorded (state/model-switch.json) —
+    /// whichever timestamp is more recent, so a switch this menu just completed
+    /// is not shadowed by an older wire snapshot before the next quota-bearing
+    /// request lands (keweichen, #4017 review: reproduced without any other
+    /// client involved). `model-switch.json` alone goes stale the moment
+    /// anything else sets the model — the CLI's own default, or `/model` typed
+    /// directly in the pane — which is why the wire is still the primary source.
+    ///
+    /// NOT fixed here: the proxy is one process shared by every seat on this
+    /// host and a request carries no session identity, so a request from
+    /// ANOTHER seat still updates `last_request` and can still outrank this
+    /// core's own accepted switch (keweichen's other reproduced case, with a
+    /// second client). That needs the proxy to attribute a request to a
+    /// session, not a freshness rule — left open, not silently dropped.
+    func liveModel() -> String? {
+        var wireModel: String? = nil
+        var wireAt: Date? = nil
+        if let data = FileManager.default.contents(atPath: workspace + "/state/quota-state.json"),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let last = root["last_request"] as? [String: Any] {
+            wireModel = last["model"] as? String
+            wireAt = (last["at"] as? String).flatMap(parseTimestamp)
+        }
+        var switchModel: String? = nil
+        var switchAt: Date? = nil
+        if let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           (root["accepted"] as? Bool) == true {
+            switchModel = root["model"] as? String
+            switchAt = (root["ts"] as? String).flatMap(parseTimestamp)
+        }
+        switch (wireAt, switchAt) {
+        case let (w?, s?): return w >= s ? wireModel : switchModel
+        case (nil, _): return switchModel ?? wireModel
+        case (_, nil): return wireModel ?? switchModel
+        }
+    }
+
+    /// (family, version) from either vocabulary: a menu id is a bare family alias or
+    /// a full claude-<family>-<ver> id, optionally context-tagged; the wire always
+    /// carries the full id. An alias has no version, so it matches any version of
+    /// its family; a versioned id must match exactly. Ids stay in the manifest.
+    func modelKey(_ id: String) -> (String, String?) {
+        var t = id
+        if let r = t.range(of: "[1m]") { t.removeSubrange(r) }
+        guard t.hasPrefix("claude-") else { return (t, nil) }
+        let parts = t.dropFirst("claude-".count).split(separator: "-", maxSplits: 1)
+        let fam = String(parts.first ?? "")
+        let ver = parts.count > 1 ? parts[1].replacingOccurrences(of: "-", with: ".") : nil
+        return (fam, ver)
+    }
+
+    func sameModel(_ menuID: String, _ live: String) -> Bool {
+        let (mf, mv) = modelKey(menuID), (lf, lv) = modelKey(live)
+        guard mf == lf else { return false }
+        return mv == nil || mv == lv
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === modelSubmenu else { return }
         menu.removeAllItems()
-        let current = recordedModel()
+        let current = liveModel()
         if let choices = modelChoices() {
             for c in choices {
                 let it = NSMenuItem(title: c.title, action: #selector(switchModel(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = c.id
-                it.state = (c.id == current) ? .on : .off
+                it.state = (current.map { sameModel(c.id, $0) } ?? false) ? .on : .off
                 menu.addItem(it)
             }
         } else {
