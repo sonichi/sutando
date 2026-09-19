@@ -71,7 +71,7 @@ AG2SPACE_PROVENANCE = "a team-tier sender the AG2 Space broker attests as a coll
 # Here so one edit reaches every surface: Discord learned the stdin/exit-code
 # contract and the other adapters did not. Measurement is in the PR.
 SANDBOXED_DELEGATION_CODEX = (
-    "Delegate it to Codex: `codex exec --sandbox read-only --skip-git-repo-check "
+    "Delegate it to Codex: `codex exec --sandbox read-only --disable=apps --skip-git-repo-check "
     "-- \"$(cat <prompt-file>)\" < /dev/null`. The `< /dev/null` is REQUIRED — without it "
     "codex waits on stdin and can hang to a timeout having produced nothing. Then assert the "
     "OUTPUT is non-empty before writing it: codex exits 0 both when it refuses and on a usage "
