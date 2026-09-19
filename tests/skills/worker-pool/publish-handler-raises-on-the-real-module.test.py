@@ -31,7 +31,7 @@ def _publisher_state():
     """Whether the live publisher exists and where it points — nothing else."""
     link = SRC.parent.parent / "task-event-handler"
     return (link.is_symlink(), link.exists(),
-            link.readlink().name if link.is_symlink() else None)
+            str(link.readlink()) if link.is_symlink() else None)
 
 
 _before = _publisher_state()
