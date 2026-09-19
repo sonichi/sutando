@@ -1,11 +1,20 @@
 #!/bin/bash
 # Optional capability lookup for the watcher's task-event handler. A skill that
-# provides one publishes an executable at skills/<skill>/task-event-handler
-# (a symlink to its script is fine). This helper names no skill: exactly one
-# publisher wins; none sets nothing; several is ambiguous and sets nothing,
-# loudly, so the operator pins SUTANDO_TASK_EVENT_HANDLER explicitly.
+# provides one DECLARES it in its own manifest.json:
 #
-# resolve_task_event_handler <repo>  -> prints the path (rc 0) | rc 1 none | rc 2 ambiguous
+#     {"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}
+#
+# skill-relative, and it must stay inside the declaring skill. This helper names
+# no skill: exactly one declarer wins; none sets nothing; several is ambiguous
+# and sets nothing, loudly, so the operator pins SUTANDO_TASK_EVENT_HANDLER.
+#
+# MIGRATION: a published executable at skills/<skill>/task-event-handler was the
+# previous contract and is NO LONGER RESOLVED. It could not be shipped -- it is
+# gitignored and had to be created at runtime -- so a correct checkout resolved
+# nothing until something published it. A skill that still publishes one and
+# declares no config key is named on stderr rather than silently ignored.
+#
+# resolve_task_event_handler <repo>  -> prints the path (rc 0) | rc 1 none | rc 2 cannot tell
 
 TASK_EVENT_HANDLER_CAPABILITY="SUTANDO_TASK_EVENT_HANDLER_SCRIPT"
 
@@ -15,6 +24,7 @@ read -r -d '' __TASK_EVENT_HANDLER_PROG <<'PYPROG' || true
 import json, os, sys
 repo, key = sys.argv[1], sys.argv[2]
 skills = os.path.join(repo, "skills")
+declared_by = set()
 for name in sorted(os.listdir(skills) if os.path.isdir(skills) else []):
     manifest = os.path.join(skills, name, "manifest.json")
     try:
@@ -35,6 +45,12 @@ for name in sorted(os.listdir(skills) if os.path.isdir(skills) else []):
         continue
     if os.access(path, os.X_OK):
         print(path)
+        declared_by.add(name)
+for name in sorted(os.listdir(skills) if os.path.isdir(skills) else []):
+    legacy = os.path.join(skills, name, "task-event-handler")
+    if name not in declared_by and os.path.exists(legacy):
+        print(f"task-event-handler: {legacy}: the published-file contract is no longer "
+              f"resolved; declare {key} in {name}/manifest.json", file=sys.stderr)
 PYPROG
 
 # resolve_task_event_handler <repo> -> path (rc 0) | rc 1 none | rc 2 cannot tell
