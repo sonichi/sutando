@@ -125,9 +125,10 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     root = Path(deliveries_dir)
     try:
         entries = list(root.iterdir())
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return False
     except OSError as exc:
+        # NotADirectoryError included: a root that exists but is not a directory is misconfigured, not absent.
         raise WorkerHoldUnreadable(f"cannot list {root}: {exc}") from exc
     for d in entries:
         for suffix in _WORKER_HOLD_SUFFIXES:

@@ -552,6 +552,17 @@ class PendingCandidatesTest(unittest.TestCase):
             self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir,
                                                 deliveries_dir=deliveries))
 
+    def test_a_root_that_is_not_a_directory_is_unreadable_not_absent(self):
+        # A replaced or misconfigured deliveries path: ownership cannot be checked.
+        self._write_task("task-a.txt")
+        root = Path(self.tmp.name) / "deliveries-file"
+        root.write_text("not a directory\n")
+        with self.assertRaises(WorkerHoldUnreadable):
+            worker_holds(root, "task-a.txt")
+        with mock.patch("sys.stderr", StringIO()):
+            self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir,
+                                                     deliveries_dir=root)), [])
+
     def test_worker_holds_is_false_for_an_absent_deliveries_root_or_a_bad_name(self):
         self.assertFalse(worker_holds(Path(self.tmp.name) / "nope", "task-a.txt"))
         deliveries = self._hold_for_worker("task-a", ".txt")
@@ -721,6 +732,13 @@ class MainDispatchTest(unittest.TestCase):
                                  "--deliveries-dir", str(deliveries))
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("holding task-a.txt", err)
+
+    def test_worker_holds_command_exits_2_on_a_non_directory_root(self):
+        root = Path(self.tmp.name) / "deliveries-file"
+        root.write_text("")
+        rc, _, err = self._run("worker-holds", str(root), "task-a.txt")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot", err)
 
     def test_a_repeated_or_dangling_dir_option_is_a_usage_error(self):
         d = str(self.claims_dir)
