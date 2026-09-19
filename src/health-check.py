@@ -11165,8 +11165,7 @@ def sutando_app_hotkey_detail(workspace_dir) -> str:
         labels = "/".join(e["label"] for e in entries if e.get("label"))
     except (OSError, ValueError, TypeError, AttributeError):
         labels = ""
-    watch = "watcher-watchdog + hotkeys"
-    return f"running ({watch}: {labels})" if labels else f"running ({watch}, none published)"
+    return f"running (hotkeys: {labels})" if labels else "running (hotkeys, none published)"
 
 
 def _outermost_bundle(comm: str) -> Optional[Path]:
@@ -13128,12 +13127,8 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
-            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
-                           "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is recovered by nothing "
-                                     "while the CLI is busy"})
+                           "detail": "not running — hotkeys disabled"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -14337,9 +14332,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -14423,9 +14417,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:

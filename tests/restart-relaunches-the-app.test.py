@@ -46,7 +46,7 @@ class RestartRelaunchesTheApp(unittest.TestCase):
                         "so it can never run")
 
     def test_guarded_against_double_launch(self):
-        """Two app instances mean two checkWatcher timers re-arming one watcher."""
+        """Two app instances mean two menu bars and two health-check timers."""
         head = self.text[:self.text.index('nohup "$APP_BIN"')]
         self.assertIn("pgrep -x Sutando", head,
                       "the launch is not preceded by an already-running guard")
