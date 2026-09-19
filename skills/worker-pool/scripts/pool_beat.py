@@ -83,10 +83,44 @@ def classify(path, now: float, *, stale_s: float = STALE_AFTER_S) -> str:
     return LIVE if age <= stale_s else STALE
 
 
-def run_forever(path, interval: float = BEAT_INTERVAL_S) -> int:
+PARENT_POLL_S = 1.0
+
+
+def parent_gone(parent_pid: int, *, getppid=os.getppid, kill=os.kill) -> bool:
+    """Has the process this beat speaks for died?
+
+    SIGKILL and a crash run no trap, so nobody tells the beat to stop; it has to
+    look. Reparenting counts too, or a recycled pid would read as the parent.
+    """
+    if getppid() != parent_pid:
+        return True
+    try:
+        kill(parent_pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def run_forever(path, interval: float = BEAT_INTERVAL_S, *, parent_pid=None,
+                poll_s: float = PARENT_POLL_S) -> int:
+    if parent_pid is not None and parent_gone(parent_pid):
+        return 0
     touch(path)
     while True:
-        time.sleep(interval)
+        if parent_pid is None:
+            time.sleep(interval)
+        else:
+            # Polled far more often than the beat is refreshed: a dead parent
+            # must not get one more fresh mtime out of a 30 s sleep.
+            waited = 0.0
+            while waited < interval:
+                step = min(poll_s, interval - waited)
+                time.sleep(step)
+                waited += step
+                if parent_gone(parent_pid):
+                    return 0
         touch(path)
 
 
@@ -96,6 +130,8 @@ def main(argv=None) -> int:
     p.add_argument("--kind", required=True, choices=sorted(KINDS))
     p.add_argument("--id", required=True, dest="ident")
     p.add_argument("--interval", type=float, default=BEAT_INTERVAL_S)
+    p.add_argument("--parent-pid", type=int, default=None,
+                   help="exit once this pid is no longer our parent (it died)")
     p.add_argument("--once", action="store_true", help="write one beat and exit")
     p.add_argument("--read", action="store_true", help="print this beat's state and exit")
     a = p.parse_args(argv)
@@ -106,7 +142,7 @@ def main(argv=None) -> int:
     if a.once:
         touch(path)
         return 0
-    return run_forever(path, a.interval)
+    return run_forever(path, a.interval, parent_pid=a.parent_pid)
 
 
 if __name__ == "__main__":
