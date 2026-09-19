@@ -30,6 +30,10 @@ import time
 from pathlib import Path
 
 REPO = "sonichi/sutando"
+# The same checker the Bash hook runs. A `gh issue create` spawned from here is a
+# child process the PreToolUse hook never sees, so this script asks it directly.
+DUP_CHECK = (Path(__file__).resolve().parents[3]
+             / "skills" / "proactive-loop" / "scripts" / "gh-duplicate-check.py")
 REPO_URL = f"https://github.com/{REPO}.git"
 ISSUE_LABEL = "use-case-submission"
 
@@ -127,6 +131,25 @@ def existing_pr_url(slug: str) -> str | None:
         return rows[0]["url"] if rows else None
     except Exception:
         return None
+
+
+def duplicate_check_refusal(title: str) -> str | None:
+    """Reason to refuse filing, or None. Mirrors hooks/gh-policy-gate.py: rc 1
+    refuses, rc 0 clears, anything else warns and does not enforce."""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(DUP_CHECK), "--repo", REPO, "--title", title],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:  # missing checker, timeout: same fail-open as the hook
+        print(f"duplicate-check: did not run ({e}); not enforcing", file=sys.stderr)
+        return None
+    if r.returncode == 1:
+        return r.stdout.strip() or r.stderr.strip() or "candidates named"
+    if r.returncode != 0:
+        print(f"duplicate-check: could not answer (rc={r.returncode}); not enforcing",
+              file=sys.stderr)
+    return None
 
 
 def existing_issue_url(title: str) -> str | None:
@@ -325,6 +348,9 @@ def main():
         existing = existing_issue_url(args.title)
         if existing:
             die(f"existing-issue: open issue with same title already at {existing}")
+        refused = duplicate_check_refusal(args.title)
+        if refused:
+            die(f"duplicate-check: refused — {refused}")
 
     issue_url = None
     if do_issue:
