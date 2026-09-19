@@ -672,9 +672,10 @@ def _is_writer_argv(args: str, script: str) -> bool:
 
 
 def stop_other_writers(timeout_s: float = 5.0) -> int:
-    """SIGTERM the heartbeat writer(s) this checkout's own records name — after proving each pid is an
-    interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
-    is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
+    """SIGTERM the heartbeat writer(s) THIS workspace's own records name for this host — after proving
+    each pid is an interpreter running exactly this script — and wait for exit (SIGKILL past the
+    timeout). Nothing is swept by argv, so a peer workspace's writer (its own record) is never
+    selected, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
     me, parent = os.getpid(), os.getppid()
     script = str(Path(__file__).resolve())
     pids = []
@@ -728,7 +729,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mark-stopped", action="store_true",
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     p.add_argument("--stop", action="store_true",
-                   help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
+                   help="stop the writer this workspace's own records name on this host (pidfile, .alive) and wait "
+                        "for it to exit (restart handoff); never a sweep, so a peer workspace's writer is untouched")
     return p.parse_args(argv)
 
 

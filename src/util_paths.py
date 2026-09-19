@@ -564,6 +564,23 @@ def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
     return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
 
 
+# The workspace-wide intake gate: `--scope all` marks it and every watcher
+# under the state dir consults it. Spelled here and nowhere else.
+SHUTDOWN_GATE_NAME = "shutdown.sentinel"
+
+
+def shutdown_gate_path(state_dir) -> Path:
+    """The intake gate EVERY watcher under `state_dir` consults."""
+    return Path(state_dir) / SHUTDOWN_GATE_NAME
+
+
+def instance_shutdown_gate_path(state_dir, instance=None, agent=None) -> Path:
+    """The intake gate for ONE instance, beside its watcher record and keyed
+    the same way, so a core-scope stop never gates a peer worker's intake."""
+    sentinel = watcher_sentinel_path(state_dir, instance, agent)
+    return sentinel.with_name(sentinel.name[:-len(".pid")] + ".shutdown.sentinel")
+
+
 def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     """Where THIS instance records "my optional handler declined this task".
 
@@ -592,14 +609,91 @@ def watcher_sentinel_paths(state_dir) -> "list[Path]":
     return found + rest
 
 
+# pid_t is a signed 32-bit int on macOS and Linux; a longer digit string is
+# corruption, and int() itself refuses >4300 digits (ValueError).
+_PID_T_MAX = 2**31 - 1
+_PID_MAX_DIGITS = len(str(_PID_T_MAX))
+_SENTINEL_PARSER_KEYS = frozenset({"pid", "pid_line"})
+
+
+def read_sentinel_record(path) -> dict:
+    """The watcher sentinel `src/watcher_sentinel.sh:sentinel_write_record` wrote.
+
+    ONE reader for both on-disk shapes, because both are live during any
+    rolling upgrade: the legacy file is a bare pid, and the record adds
+    `key=value` identity claims (instance, incarnation, code_path, version,
+    started_at, workspace) from line 2 on. A consumer that `int()`s the whole
+    file reads every recorded watcher as unreadable, which is how a healthy
+    watcher came to report `unknown` / `warn — restart the watcher`.
+
+    `{}` when the file is absent or unreadable, and no `pid` key when line 1 is
+    not a usable pid: an unknown must not render as a value (REVIEW.md 13).
+    `pid_line` carries line 1 verbatim (stripped; "" for an empty file) whenever
+    the file could be read, so a consumer can say WHY a sentinel is unusable
+    without re-deriving line 1 for itself. `pid` and `pid_line` are the parser's
+    own: a claim line can never set them, so a malformed line 1 stays pid-less
+    whatever the lines below say. Never raises — a probe is not the place to
+    learn the file is corrupt.
+    """
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except (OSError, ValueError):
+        return {}
+    head = lines[0].strip() if lines else ""
+    out: dict = {"pid_line": head}
+    # 0/negatives name a process GROUP to os.kill/ps, so they are corruption
+    # here; `isascii` too, since "²".isdigit() is True and int("²") raises.
+    if (head.isascii() and head.isdigit() and len(head) <= _PID_MAX_DIGITS
+            and 0 < int(head) <= _PID_T_MAX):
+        out["pid"] = int(head)
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key and key not in _SENTINEL_PARSER_KEYS:
+            out.setdefault(key, value)
+    return out
+
+
+def read_sentinel_pid(path) -> "int | None":
+    """The pid a watcher sentinel names, or None when it names none."""
+    return read_sentinel_record(path).get("pid")
+
+
 if __name__ == "__main__":
     # Path resolution for shell callers, so there is no second implementation
     # of the identity encoding to keep in step with this one.
     if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
-        print(watcher_sentinel_path(sys.argv[2]))
+        # An optional instance names ANOTHER instance's sentinel; omitted, the
+        # identity is resolved from this process's own environment as before.
+        print(watcher_sentinel_path(sys.argv[2],
+                                    instance=(sys.argv[3] if len(sys.argv) > 3 else None)))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "sentinel-pid":
+        # The shell bridge to the ONE record reader: a shell caller that reads
+        # line 1 itself is the second parser this function exists to prevent.
+        _pid = read_sentinel_pid(sys.argv[2])
+        if _pid is None:
+            raise SystemExit(1)
+        print(_pid)
+    elif len(sys.argv) >= 4 and sys.argv[1] == "sentinel-field":
+        # Same bridge for the identity claims on lines 2+, so the shell never
+        # re-spells the grammar. Exit 1 (printing nothing) when the key is absent.
+        _val = read_sentinel_record(sys.argv[2]).get(sys.argv[3])
+        if _val is None:
+            raise SystemExit(1)
+        print(_val)
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "shutdown-gate":
+        print(shutdown_gate_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "instance-shutdown-gate":
+        # Same identity resolution as `watcher-sentinel`: the gate a watcher
+        # consults is keyed exactly like the record it writes.
+        print(instance_shutdown_gate_path(sys.argv[2],
+                                          instance=(sys.argv[3] if len(sys.argv) > 3 else None)))
     else:
-        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+        print("usage: util_paths.py {watcher-sentinel <state-dir> [instance]"
+              "|sentinel-pid <sentinel>|sentinel-field <sentinel> <key>"
+              "|handler-fallbacks-dir <state-dir>|shutdown-gate <state-dir>"
+              "|instance-shutdown-gate <state-dir> [instance]}",
               file=sys.stderr)
         raise SystemExit(2)

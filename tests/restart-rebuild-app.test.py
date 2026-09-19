@@ -29,7 +29,7 @@ class RestartRebuildApp(unittest.TestCase):
         self.assertRegex(self.text, re.compile(r"^#   --rebuild-app ", re.M), "usage header does not list --rebuild-app")
 
     def test_the_flag_arms_the_rebuild(self):
-        self.assertRegex(self.text, r'\[ "\$\{1:-\}" = "--rebuild-app" \] && REBUILD_APP=1')
+        self.assertRegex(self.text, r'--rebuild-app\)\s+REBUILD_APP=1')
 
     def test_the_build_runs_after_the_stop_and_before_the_relaunch(self):
         """Building while the old app still runs replaces a mapped binary; building

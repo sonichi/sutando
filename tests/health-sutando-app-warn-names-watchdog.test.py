@@ -6,8 +6,8 @@ detect the app being down, only that the message says what being down costs.
 
 It exists because the old text — "not running — hotkeys disabled" — names the
 visible consequence and omits the expensive one. The app also runs checkWatcher()
-(src/Sutando/main.swift), which pgreps for the task watcher and pokes the CLI when
-it is gone. On 2026-09-11 the task watcher died twice on a host where the app was
+(src/Sutando/main.swift), which asks the shared ownership policy whether THIS
+install's core watcher is alive and pokes the CLI when it is not. On 2026-09-11 the task watcher died twice on a host where the app was
 down; the probe warned on every pass, and the warn was skipped every time because
 it read as a comfort feature.
 
@@ -81,8 +81,15 @@ for _callee in re.findall(r"\b(\w+)\(\)", body):
     _helper = _isolate(f"func {_callee}()")
     if _helper:
         _probe_scope += _helper
-ck("and it really probes for the watcher via /bin/ps",
-   '"/bin/ps"' in _probe_scope and '"pid,command"' in _probe_scope)
+# THIS install's core watcher, through the shared policy: a host-wide listing
+# (pgrep, an anchored ps scan) reads a peer worker's watcher as the core's.
+ck("and it really probes for the CORE watcher via the shared policy",
+   "watcher_identity.sh" in _probe_scope and '"core-alive"' in _probe_scope)
+# Scoped to the probe itself: cliIsWorking(), also in _probe_scope, pgreps the
+# pane's OWN descendants, which is not a host-wide watcher search.
+_probe_fn = _isolate("func watcherProcessSeen()")
+ck("no host-wide process listing remains in the probe (/bin/ps, pgrep)",
+   bool(_probe_fn) and '"/bin/ps"' not in _probe_fn and "pgrep" not in _probe_fn)
 ck("the loose, unanchored pgrep probe is gone", '"-f", "watch-tasks"' not in _probe_scope)
 ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in the file",
    "if cliIsWorking()" in body)

@@ -679,6 +679,45 @@ class TestHeartbeatCli(unittest.TestCase):
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         self.assertEqual(data["schema_version"], 4)
 
+    @unittest.skipIf(os.name == "nt", "POSIX signal handoff")
+    def test_stop_leaves_a_peer_workspaces_writer_running(self):
+        # Two cores on one host, one checkout, two workspaces: --stop from A ends A's recorded writer and
+        # never B's, whose record lives beside B's .alive. The control runs --stop from B and ends it.
+        script = ROOT / "src" / "core_heartbeat.py"
+        peer_ws = Path(tempfile.mkdtemp(prefix="core-heartbeat-peer-"))
+        env_a = {**self.env, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}
+        env_b = {**env_a, "SUTANDO_WORKSPACE": str(peer_ws)}
+        for ws in (self.tmp, peer_ws):
+            (ws / "state" / "cores").mkdir(parents=True, exist_ok=True)
+        a = subprocess.Popen([sys.executable, str(script), "--interval", "60"], env=env_a,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        b = subprocess.Popen([sys.executable, str(script), "--interval", "60"], env=env_b,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            pid_a = self.tmp / "state" / "cores" / f"{_short_host()}.heartbeat.pid"
+            pid_b = peer_ws / "state" / "cores" / f"{_short_host()}.heartbeat.pid"
+            self.assertIsNotNone(_wait_file(pid_a), "writer A did not record its pid")
+            self.assertIsNotNone(_wait_file(pid_b), "writer B did not record its pid")
+            self.assertEqual(pid_a.read_text().split()[0], str(a.pid))
+            self.assertEqual(pid_b.read_text().split()[0], str(b.pid))
+            r = subprocess.run([sys.executable, str(script), "--stop"], env=env_a, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("stopped 1 writer(s)", r.stdout)
+            self.assertIsNotNone(a.wait(timeout=5), "A's own writer must be gone before --stop returns")
+            time.sleep(0.3)
+            self.assertIsNone(b.poll(), "the peer workspace's writer must survive A's --stop")
+            # CONTROL: the same command from B's workspace does end B — the survival above is selection, not inertia.
+            r = subprocess.run([sys.executable, str(script), "--stop"], env=env_b, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("stopped 1 writer(s)", r.stdout)
+            self.assertIsNotNone(b.wait(timeout=5), "B's writer must be gone once B's own --stop ran")
+        finally:
+            for pr in (a, b):
+                if pr.poll() is None:
+                    pr.kill(); pr.wait()
+            import shutil
+            shutil.rmtree(peer_ws, ignore_errors=True)
+
     @unittest.skipIf(os.name == "nt", "POSIX SIGTERM cleanup")
     def test_sigterm_cleans_up_alive_file(self):
         """Graceful shutdown removes the .alive file so peers see the core

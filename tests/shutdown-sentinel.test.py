@@ -77,6 +77,59 @@ check("main('clear') → 0 and removes sentinel",
 check("main() with no arg defaults to check", sd.main(["shutdown.py"]) == 1)
 check("main('bogus') → 2 usage", sd.main(["shutdown.py", "bogus"]) == 2)
 
+# ── the instance gate: what the default core scope marks ──
+# Derived from the SAME redirected resolver, so it lands in the temp dir too.
+_inst = sd._gate_path("instance")
+check("the instance gate is a different file in the same state dir",
+      _inst != _tmp and _inst.parent == _tmp.parent and _inst.name.endswith(".shutdown.sentinel"))
+sd.clear_shutdown()
+sd.mark_shutdown("restart.sh", gate="instance")
+check("mark --gate instance writes the instance gate, not the workspace one",
+      _inst.exists() and not _tmp.exists())
+check("is_shutting_down sees the instance gate", sd.is_shutting_down() is True)
+check("info comes from the instance gate", sd.shutdown_info().get("reason") == "restart.sh")
+sd.clear_shutdown(gate="workspace")
+check("clear --gate workspace leaves the instance gate alone", _inst.exists())
+sd.clear_shutdown(gate="instance")
+check("clear --gate instance removes it", not _inst.exists() and sd.is_shutting_down() is False)
+sd.mark_shutdown("a", gate="instance"); sd.mark_shutdown("b")
+sd.clear_shutdown()
+check("a bare clear (launcher boot) removes BOTH gates", not _inst.exists() and not _tmp.exists())
+try:
+    sd._gate_path("bogus")
+    check("an unknown gate raises, never resolves to a guess", False)
+except ValueError:
+    check("an unknown gate raises, never resolves to a guess", True)
+# An identity that cannot be resolved must not turn a reader into a crash: the
+# workspace-wide gate still answers.
+_real_igp = sd.instance_shutdown_gate_path
+sd.instance_shutdown_gate_path = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no runtime-api"))
+try:
+    sd.mark_shutdown("ws-only")
+    check("with an unresolvable instance the workspace gate still reads as shutting down",
+          sd.is_shutting_down() is True)
+    check("...and a bare clear still clears the workspace gate", (sd.clear_shutdown() or True)
+          and sd.is_shutting_down() is False)
+finally:
+    sd.instance_shutdown_gate_path = _real_igp
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    _rc = sd.main(["shutdown.py", "mark", "restart.sh --stop-only", "--gate", "instance"])
+check("main('mark --gate instance') → 0 and writes the instance gate", _rc == 0 and _inst.exists())
+check("main('check') → 0 on an instance gate alone", sd.main(["shutdown.py", "check"]) == 0)
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    _rc = sd.main(["shutdown.py", "path", "--gate", "instance"])
+check("main('path --gate instance') prints the instance gate", _rc == 0 and _out.getvalue().strip() == str(_inst))
+check("main('clear --gate instance') → 0 and removes it",
+      sd.main(["shutdown.py", "clear", "--gate", "instance"]) == 0 and not _inst.exists())
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    _rc = sd.main(["shutdown.py", "path", "--state-dir", str(_tmp.parent / "elsewhere")])
+check("main('path --state-dir D') resolves under D, not the ambient workspace",
+      _rc == 0 and _out.getvalue().strip() == str(_tmp.parent / "elsewhere" / "shutdown.sentinel"))
+check("main('mark --gate bogus') → 2 usage", sd.main(["shutdown.py", "mark", "x", "--gate", "bogus"]) == 2)
+
 # `path` is a contract the shell launchers depend on: they stash/restore the
 # sentinel around a launch and must not re-derive its location themselves.
 _out = io.StringIO()

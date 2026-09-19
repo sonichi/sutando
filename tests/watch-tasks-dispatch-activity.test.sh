@@ -34,9 +34,12 @@ rm -rf "$tmp"
 # Behaviour, not text: a grep for the argument NAME cannot tell the resolved
 # variable from a reverted one -- both are plain `"$var"`. Assert the row.
 tmp2="$(mktemp -d)"; log2="$tmp2/bus.log"
+# A pass-through spy, as in the failure case below: the watcher resolves its
+# sentinel path through the interpreter and refuses to start unrecorded.
 cat > "$tmp2/py" << PY
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >> "$log2"
+case " \$* " in *activity_bus.py*) printf '%s\n' "\$*" >> "$log2"; exit 0 ;; esac
+exec python3 "\$@"
 PY
 chmod +x "$tmp2/py"
 ws="$tmp2/ws"; inbox="$ws/deliveries/w-test"
