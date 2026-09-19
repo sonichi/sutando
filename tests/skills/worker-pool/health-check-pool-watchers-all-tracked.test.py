@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location("hc", ROOT / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(_spec)
 sys.modules["hc"] = hc

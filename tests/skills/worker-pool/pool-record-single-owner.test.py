@@ -20,7 +20,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
+_REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "skills" / "worker-pool" / "scripts"))
 sys.path.insert(0, str(_REPO / "tests" / "_helpers"))

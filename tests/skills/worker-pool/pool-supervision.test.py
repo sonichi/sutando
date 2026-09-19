@@ -18,7 +18,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 spec = u.spec_from_file_location(
     "pool_supervision",
-    HERE.parent / "skills" / "worker-pool" / "scripts" / "pool_supervision.py")
+    HERE.parents[2] / "skills" / "worker-pool" / "scripts" / "pool_supervision.py")
 ps = u.module_from_spec(spec)
 # Registered BEFORE exec: @dataclass resolves field types through
 # sys.modules[cls.__module__], which is None for an unregistered spec load.

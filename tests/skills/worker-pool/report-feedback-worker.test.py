@@ -11,7 +11,7 @@ import types
 import unittest
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('feedback_worker', ROOT / 'skills/report-feedback/install-worker.py')
 worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
