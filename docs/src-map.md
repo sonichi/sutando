@@ -157,6 +157,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
+- **`task_body_guard.ts`** — confineUserContent — the ONE TypeScript implementation of the task-body injection guard.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.

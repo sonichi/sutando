@@ -214,6 +214,16 @@
    "canonical_for": "remote gateway wire protocol",
    "last_verified": "2026-08-20"
   },
+  "docs/scp-v0.md": {
+   "title": "SCP — Sutando Client Protocol, v0",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the protocol the Sutando Server runtime-api speaks",
+   "last_verified": "2026-09-18"
+  },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
    "audience": [
