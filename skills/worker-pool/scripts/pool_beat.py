@@ -149,7 +149,8 @@ def target_gone(pid: int, start_time: str, *, kill=os.kill,
         return True
     except PermissionError:
         pass  # it exists; we may just not be allowed to signal it
-    if start_time and lstart(pid) != start_time:
+    current = lstart(pid)
+    if start_time and current and current != start_time:
         return True
     return False
 
@@ -204,6 +205,8 @@ def main(argv=None) -> int:
     if a.once:
         touch(path)
         return 0
+    # Conditional: pool-beat.test.py's existing spy takes no watch_pid kwarg,
+    # and passing it unconditionally would break a suite this touches nothing.
     kwargs = {"parent_pid": a.parent_pid}
     if a.watch_pid is not None:
         kwargs["watch_pid"] = a.watch_pid

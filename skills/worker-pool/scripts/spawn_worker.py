@@ -146,8 +146,11 @@ def pane_pid(name: str, socket=None, runner=_run) -> int | None:
     when the session or its pane cannot be read; a caller treats that as
     "no beat this time" rather than failing the whole spawn over it.
     """
-    r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
-                "-t", name, "-F", "#{pane_pid}"])
+    try:
+        r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
+                    "-t", name, "-F", "#{pane_pid}"])
+    except Exception:                                        # noqa: BLE001
+        return None
     out = ((getattr(r, "stdout", None) or "").strip().splitlines() or [""])[0]
     return int(out) if out.isdigit() else None
 

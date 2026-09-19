@@ -46,6 +46,18 @@ class FakeTmuxWithPane:
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
+class FakeTmuxRaisingOnListPanes(FakeTmuxWithPane):
+    """The session comes up fine; the LATER pane-pid lookup itself raises —
+    the exact scenario from PR #4452 review: a runner exception must not
+    escape and fail a spawn whose session already exists."""
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "tmux" and "list-panes" in argv:
+            self.calls.append(argv)
+            raise OSError("tmux not found")
+        return super().__call__(argv, **kw)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._t = tempfile.TemporaryDirectory()
@@ -66,6 +78,15 @@ class TestPanePid(unittest.TestCase):
 
     def test_none_on_non_numeric_output_rather_than_raising(self):
         got = sw.pane_pid("sess", "/tmp/x.sock", runner=FakeTmuxWithPane("not-a-pid"))
+        self.assertIsNone(got)
+
+    def test_none_when_the_runner_itself_raises(self):
+        """Per review on PR #4452: a raising runner must not escape and fail
+        an otherwise-successful spawn() — same graceful contract as a bad
+        return value, not a different one."""
+        def boom(*a, **k):
+            raise OSError("tmux not found")
+        got = sw.pane_pid("sess", "/tmp/x.sock", runner=boom)
         self.assertIsNone(got)
 
 
@@ -144,6 +165,21 @@ class TestSpawnStartsTheBeat(Base):
         finally:
             sw.start_worker_beat = real
         self.assertEqual(calls["n"], 0)
+        self.assertTrue(got["started"])
+        self.assertFalse(got["beat_started"])
+
+    def test_a_runner_that_raises_during_pane_lookup_does_not_fail_the_spawn(self):
+        """Per review on PR #4452: the session already exists by this point —
+        an exception here must not escape spawn() and orphan a live worker
+        with no record of it, same tolerance as a bad (non-raising) answer."""
+        t = FakeTmuxRaisingOnListPanes()
+        real = sw.start_worker_beat
+        sw.start_worker_beat = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not even try with no pane pid"))
+        try:
+            got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        finally:
+            sw.start_worker_beat = real
         self.assertTrue(got["started"])
         self.assertFalse(got["beat_started"])
 

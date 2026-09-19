@@ -87,6 +87,10 @@ check("a watched pid we may not signal is still there (existence, not permission
       pb.target_gone(7, "T0", kill=_raises(PermissionError()), lstart=lambda p: "T0"), False)
 check("empty start_time (never recorded) skips the reuse check entirely",
       pb.target_gone(7, "", kill=lambda p, s: None, lstart=lambda p: "DIFFERENT"), False)
+print("\n  -- john-the-dev on PR #4452: an unreadable ps must not read as reuse --")
+check("kill(pid,0) SUCCEEDS (pid exists) but ps can't be read: not gone, "
+      "not a false reuse signal off a transient failure",
+      pb.target_gone(7, "T0", kill=lambda p, s: None, lstart=lambda p: ""), False)
 
 print("\n  -- the property this whole feature exists for --")
 check("kill(pid,0) succeeding is NOT enough: a RECYCLED pid still reads gone",
@@ -167,7 +171,7 @@ check("with no --watch-pid the CLI does not pass that kwarg at all "
       "(the untouched --parent-pid path is byte-for-byte unchanged)",
       "watch_pid" in _delegated, False)
 
-print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat --watch-pid ({19} checks)")
+print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_beat --watch-pid ({18} checks)")
 for f in fails:
     print("   ", f)
 sys.exit(1 if fails else 0)
