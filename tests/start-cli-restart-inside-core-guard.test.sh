@@ -101,6 +101,15 @@ for want in "restart core" "Sutando.app" "launchd" "terminal OUTSIDE the core" \
     *) say FAIL "message omits: $want" ;; esac
 done
 
+# The launchd fallback recovers a dead core only when its job carries
+# --recover-core, which the shipped plist omits. Stated unconditionally it sent
+# two readers looking for a net that was not there.
+case "$err" in *"--recover-core"*) say ok "the launchd option names its precondition" ;;
+  *) say FAIL "the launchd option omits --recover-core, so it reads unconditional" ;; esac
+case "$err" in *"recovers it out-of-session."*)
+    say FAIL "the launchd option still promises recovery unconditionally" ;;
+  *) say ok "no unconditional recovery promise" ;; esac
+
 # --- direction 2: no inherited marker -> do NOT refuse --------------------
 run_launcher --restart
 case "$both" in *"$REFUSAL"*)
