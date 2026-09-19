@@ -7,6 +7,7 @@ capability is a module sharing `_gateway.py` (gateway coords + the per-agent gat
 graceful-degrade); this file is the unified CLI that dispatches to them.
 
     python3 room_ops.py read   <room> [--limit N] [--before tok] [--agent mxid]
+    python3 room_ops.py mention <handle> [<handle> ...] <message> <room> [--agent mxid]  # 1+ real @-mentions, one post
     python3 room_ops.py fetch  <ref>  [--room r] [--agent mxid]      # media in
     python3 room_ops.py send   <room> <path> [--caption c] [--agent mxid]  # media out
     python3 room_ops.py react  <room> <event_id> (--ack received|working|done|fail | --key 🎉) [--agent mxid]
@@ -225,8 +226,12 @@ def _main(argv):
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
 
-    p = sub.add_parser("mention", help="@-mention an agent by handle (resolve + post a triggering message)")
-    p.add_argument("handle")
+    p = sub.add_parser("mention", help="@-mention one or more agents by handle "
+                                       "(resolve + post ONE triggering message)")
+    p.add_argument("handle", nargs="+",
+                   help="one or more handles; each resolved independently, one "
+                        "message posted mentioning all of them. Any handle that "
+                        "fails to resolve refuses the whole call, posting nothing.")
     p.add_argument("message")
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
