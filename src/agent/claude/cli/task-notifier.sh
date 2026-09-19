@@ -132,21 +132,6 @@ next_pending_task() {
 # Every pane predicate has a TEXT form so one snapshot can be judged for healthy
 # and composer-empty at once -- two separate reads are two races.
 
-# cli_wedge.py owns the live-banner grammar, both families: parked (a limit, a
-# login prompt, a compaction, an API error) and retrying, each a whole line of a
-# wrap-joined capture. Prose about either is neither.
-pane_text_is_abnormal() {
-  printf '%s' "$1" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("cli_wedge", sys.argv[1])
-wedge = importlib.util.module_from_spec(spec)
-sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
-spec.loader.exec_module(wedge)
-text = sys.stdin.read()
-sys.exit(0 if wedge.live_banner_lines(text) else 1)
-' "$REPO/src/cli_wedge.py"
-}
-
 # core-input-watch.py owns Claude's pane-state patterns; $2 names the predicate.
 pane_text_ciw() {
   printf '%s' "$1" | "$NOTIFIER_PY" -c '
@@ -158,12 +143,12 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 ' "$REPO/src/core-input-watch.py" "$2"
 }
 
-# Healthy = the pane accepts input: a composer with the CLI's own footer, no
-# gate signature, no abnormal banner. A running turn still accepts (it queues).
+# Healthy = the pane accepts input. One verdict from src/delivery/pane_gate.py,
+# the gate every notifier shares: an abnormal banner (parked or retrying, via
+# cli_wedge) or a dialog holds; a running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  pane_text_is_abnormal "$1" && return 1
-  pane_text_ciw "$1" _is_idle_ready
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude >/dev/null 2>&1
 }
 
 pane_text_composer_is_empty() {

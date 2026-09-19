@@ -403,6 +403,74 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class AbnormalIsBothOfCliWedgesFamilies(unittest.TestCase):
+    """The gate is the ONE caller of cli_wedge's single-capture detectors. Before
+    this it read only the line-anchored parked patterns, so a live retry banner
+    ("Retrying in 2s") classified idle-ready and a caller typed into it; the Claude
+    notifier compensated with its own second detector in a second place."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    PARKED = "API Error: 529 Overloaded"
+    PROSE = (
+        "⏺ I once saw a Connection error. Retrying was the fix.",
+        "  ⎿  Connection error. Retrying was the fix.",
+        "⏺ API Error handling is covered by tests.",
+        "  ⎿  Connection error. The fix was retrying",
+        "⏺ I verified the docs that say\n  Connection error handling is covered by tests.",
+    )
+
+    def test_a_live_retry_banner_is_abnormal(self):
+        v = pg.classify_pane(f"{self.RETRY}\n{CLAUDE_IDLE}", pg.CLAUDE)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("retry:retrying", v.reason)
+
+    def test_control_the_same_retry_banner_was_invisible_to_the_parked_patterns(self):
+        # Proves the fixture reaches the family only the banner grammar reads.
+        self.assertEqual(pg.matched_abnormal([self.RETRY]), [])
+
+    def test_a_parked_api_error_banner_is_abnormal(self):
+        v = pg.classify_pane(f"{self.PARKED}\n{CLAUDE_IDLE}", pg.CLAUDE)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("api-error", v.reason)
+
+    def test_prose_about_errors_and_retries_stays_idle_ready(self):
+        for line in self.PROSE:
+            with self.subTest(line=line):
+                self.assertEqual(state(f"{line}\n{CLAUDE_IDLE}", "claude"), "idle-ready")
+
+    def test_accepts_input_is_idle_a_draft_or_a_running_turn_and_nothing_else(self):
+        yes = [pg.Verdict("idle-ready", "idle footer or empty composer", ""),
+               pg.Verdict("pending", "text at the prompt", "draft"),
+               pg.Verdict("busy", "working")]
+        no = [pg.Verdict("busy", "permission"), pg.Verdict("busy", "unlisted"),
+              pg.Verdict("abnormal", "retry:retrying"), pg.Verdict("unknown", "no capture")]
+        for v in yes:
+            self.assertTrue(pg.accepts_input(v), v)
+        for v in no:
+            self.assertFalse(pg.accepts_input(v), v)
+
+    def _healthy(self, stdin):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pg.main(["healthy", "--runtime", "claude"])
+        return code, out.getvalue().strip(), err.getvalue().strip()
+
+    def test_healthy_cli_exits_zero_for_a_running_turn_and_an_idle_composer(self):
+        busy = f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n"
+        self.assertEqual(self._healthy(busy)[:2], (0, "busy"))
+        self.assertEqual(self._healthy(CLAUDE_IDLE)[:2], (0, "idle-ready"))
+
+    def test_healthy_cli_refuses_a_retry_banner_a_dialog_and_an_empty_capture(self):
+        for cap in (f"{self.RETRY}\n{CLAUDE_IDLE}",
+                    "Do you want to proceed?\n❯ 1. Yes\n  2. No\n", ""):
+            with self.subTest(cap=cap[:30]):
+                code, out, err = self._healthy(cap)
+                self.assertEqual(code, pg.EXIT_UNSAFE)
+                self.assertEqual(out, "", "a refusal must print no state on stdout")
+                self.assertIn("not accepting input", err)
+
+
 class CliExitCodesAreTheContract(unittest.TestCase):
     """Callers are shell. They branch on the exit code, so each one is pinned here."""
 
