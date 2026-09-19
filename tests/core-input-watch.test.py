@@ -508,6 +508,40 @@ class TestComposerIsEmpty(unittest.TestCase):
         pane = "❯ stale text\n" + _IDLE
         self.assertTrue(_mod._composer_is_empty(pane))
 
+    # Verbatim `capture-pane -e` composer lines from Claude Code v2.1.276: the
+    # suggested reply is an SGR-2 span, the typed draft carries no escape at all.
+    GHOST = "\x1b[39m❯ \x1b[2myes\x1b[0m"
+    TYPED = "\x1b[39m❯ hello draft"
+
+    def test_dim_ghost_text_is_not_a_draft(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE.replace("❯ ", self.GHOST)))
+
+    def test_a_typed_draft_in_an_escaped_capture_is_not_empty(self):
+        self.assertFalse(_mod._composer_is_empty(_IDLE.replace("❯ ", self.TYPED)))
+
+    def test_typed_text_beside_a_dim_span_is_not_empty(self):
+        mixed = _IDLE.replace("❯ ", "\x1b[39m❯ hel\x1b[2mlo\x1b[0m")
+        self.assertFalse(_mod._composer_is_empty(mixed))
+
+    # A peer build dims with 256-colour grey and never emits SGR 2: its idle line is
+    # the grey glyph, a no-break space and a reset; a suggestion there would be grey text.
+    def test_grey_glyph_only_line_is_empty(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_grey_ghost_text_is_not_a_draft(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m\x1b[38;5;246myes\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_the_queued_messages_line_is_not_a_draft(self):
+        # After Enter on a running turn the composer shows this hint, not our text.
+        pane = _IDLE.replace("❯ ", "❯ Press up to edit queued messages")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_a_grey_colour_outside_the_ramp_is_not_dim(self):
+        pane = _IDLE.replace("❯ ", "\x1b[39m❯ \x1b[38;5;208mdraft\x1b[39m")
+        self.assertFalse(_mod._composer_is_empty(pane))
+
 
 class TestComposerText(unittest.TestCase):
     """_composer_text: the composer's dewrapped content for EXACT-equality

@@ -641,6 +641,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkWatcher() {
+        // Both halves of this check are Claude-only: the probe looks for
+        // watch-tasks-stream.sh, and the remedy is a word the Claude CLI parses
+        // as a restart prompt. A Codex core runs neither, so the probe can only
+        // ever report "dead" and the nudge is a meaningless prompt — a no-op
+        // loop every 300s, not an incident. Skip only on a runtime we positively
+        // recognise as non-Claude; an unresolvable one keeps the historical path,
+        // where the send-side --refuse-if-pending still guards an unsent draft.
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not typing into a pane whose parser is unknown")
+            return
+        }
+        if rt != "claude" { return }
+
         switch watcherProcessSeen() {
         case .some(true): return  // watcher alive
         case .none:
@@ -675,7 +688,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // — so the watcher's stdout routes through the task-notification
         // pipe correctly. Any externally-started watcher (nohup etc.)
         // has stdout → /dev/null and is useless.
-        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
+        // Resolve the session's real runtime rather than taking the sender's
+        // Claude default: on a Codex core this watchdog would otherwise append
+        // `watcher` to an operator's unsent draft and press Enter.
+        // --refuse-if-pending holds recovery for one 300s tick; overwriting a
+        // draft is not recoverable. Nil runtime keeps the refuse-on-any-pending
+        // policy, which is the safe read on either pane.
+        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher",
+                              runtime: sessionCoreRuntime(),
+                              refuseIfPending: true)
+        if rc == 5 {
+            logToFile("watcher dead; core pane carries unsent text — not sending 'watcher' this tick")
+            return
+        }
         if rc == 6 {
             logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
             return
@@ -848,6 +873,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return String(data: outData, encoding: .utf8)
     }
 
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
+    }
+
     /// True if Claude Code in the sutando-core tmux pane has any running
     /// child process — indicating an active Bash/Tool call. False if only
     /// the claude process itself is running (idle, waiting on stdin) or
@@ -940,11 +971,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// (`scripts/tmux-send-line.sh`), which owns the session check, the
     /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
     /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
-    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
+    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil,
+                      runtime: String? = nil, refuseIfPending: Bool = false) -> Int32 {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
         if let w = skipIfQueued { args += ["--skip-if-queued", w] }
+        // Without --runtime the sender parses the pane as Claude, so a Codex
+        // composer's `›` line reads as empty and typed text is overwritten.
+        if let r = runtime { args += ["--runtime", r] }
+        if refuseIfPending { args += ["--refuse-if-pending"] }
         proc.arguments = args
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice

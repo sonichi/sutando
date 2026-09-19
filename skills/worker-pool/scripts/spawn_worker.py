@@ -252,9 +252,10 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     if state != "absent":
         raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
                            f"({detail}); refusing rather than minting a worker over one")
+    run = None
     if resumed_id:
-        wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
-                             tmux_session=name)
+        run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
+                                   tmux_session=name)
         rec = {"worker_id": worker_id}
     else:
         rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
@@ -290,6 +291,8 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         # exactly what this call minted.
         # A resumed worker existed before this call: its records and inbox are
         # not ours to remove, only the run we failed to start.
+        if run is not None:
+            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
         if not resumed_id:
             shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
