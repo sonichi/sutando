@@ -278,21 +278,30 @@ def _publish(workspace, roster: dict) -> None:
         raise PublishError(roster, e) from e
 
 
+class HandlerPublishError(RosterError):
+    """The handler could not be published, so no pool may be registered.
+
+    The launcher reads zero publishers as the ordinary no-pool case, so a pool
+    that exists without one is indistinguishable from no pool at all -- and
+    worker-bound tasks would fall through to the unrestricted core.
+    """
+
+
 def publish_task_event_handler():
     """Publish this skill's handler where the launcher's neutral lookup finds it.
 
     Created when a pool first exists rather than shipped in the repo: an install
     that never made a worker publishes nothing, the lookup finds none, and the
-    watcher behaves exactly as it did before this skill existed -- including
-    after the skill is removed outright.
+    watcher behaves exactly as it did before this skill existed.
     """
     link = Path(__file__).resolve().parents[1] / "task-event-handler"
     if link.is_symlink() or link.exists():
         return link
     try:
         link.symlink_to(Path("scripts") / "pool_route_handler.py")
-    except OSError:
-        return None
+    except OSError as e:
+        raise HandlerPublishError(
+            f"cannot publish the task-event handler at {link}: {e}") from e
     return link
 
 
@@ -306,6 +315,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
     drops one of them from the result.
     """
     with _locked(workspace):
+        # Before any durable write: a registration that survived a failed publish
+        # would leave a real pool the launcher cannot distinguish from no pool.
+        publish_task_event_handler()
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
         if runtime:
@@ -316,8 +328,6 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
             # The next registration reloads bindings.json, not the roster: a
             # binding held only in the compiled roster is discarded by it.
             save_bindings(workspace, bindings)
-        # Inside the lock: publishing and the roster write are one transaction.
-        publish_task_event_handler()
         return compile_roster(workspace, workers, bindings)
 
 

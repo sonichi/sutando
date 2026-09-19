@@ -93,6 +93,34 @@ try:
         pr.register_worker(ws, "x" * 32, "probe-worker-2")
         checks["a second registration leaves the publisher alone"] = \
             link.is_symlink() and link.readlink().name == "pool_route_handler.py"
+
+        # A pool registered without a publisher reads to the launcher as NO pool,
+        # so worker-bound tasks would reach the unrestricted core. Must abort.
+        ws2 = root / "ws2"; (ws2 / "state").mkdir(parents=True)
+        link.unlink()
+        real_symlink = pathlib.Path.symlink_to
+
+        def refuse(self, target, target_is_directory=False):
+            raise OSError(30, "Read-only file system")
+
+        pathlib.Path.symlink_to = refuse
+        try:
+            raised = None
+            try:
+                pr.register_worker(ws2, "y" * 32, "probe-worker-3")
+            except Exception as exc:  # noqa: BLE001
+                raised = exc
+            checks["a failed publish RAISES instead of returning None"] = \
+                raised is not None and type(raised).__name__ == "HandlerPublishError"
+            checks["a failed publish leaves NO publisher behind"] = not link.exists()
+            checks["a failed publish writes NO roster, so no pool exists without a handler"] = \
+                not (pr.roster_path(ws2)).exists()
+        finally:
+            pathlib.Path.symlink_to = real_symlink
+        # Control: the same call succeeds once symlink_to works again.
+        pr.register_worker(ws2, "y" * 32, "probe-worker-3")
+        checks["control: registration succeeds again once publishing can succeed"] = \
+            link.is_symlink() and pr.roster_path(ws2).exists()
 except Exception as e:  # noqa: BLE001
     checks[f"register_worker publish path is importable and runnable ({e})"] = False
 
