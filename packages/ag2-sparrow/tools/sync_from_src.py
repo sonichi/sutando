@@ -29,9 +29,7 @@ import sys
 from pathlib import Path
 
 # repo-relative source path (resolved against REPO_ROOT) -> package module
-# (hyphen→underscore for the bridge). Explicit paths, not a bare filename
-# inferred against one fixed directory, so a source outside src/ (e.g. a
-# skill script) is expressible the same way as a src/ one.
+# (hyphen→underscore for the bridge); not inferred against one fixed directory.
 MAP = {
     "src/task_archive.py": "task_archive.py",
     "src/local_task_protocol.py": "local_task_protocol.py",

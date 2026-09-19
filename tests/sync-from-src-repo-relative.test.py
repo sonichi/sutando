@@ -14,9 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 TOOL = REPO / "packages" / "ag2-sparrow" / "tools" / "sync_from_src.py"
 
-# A real, already-tracked file outside src/ — exactly the kind of source this
-# capability exists to make expressible (skills/worker-pool owns pool_delivery.py,
-# not src/).
+# A real, tracked file outside src/ — the kind of source this makes expressible.
 SKILL_SOURCE = "skills/worker-pool/scripts/pool_delivery.py"
 
 
