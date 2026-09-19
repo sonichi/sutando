@@ -245,6 +245,9 @@ On each proactive loop pass, check the per-host `pending-questions.md` (`<worksp
 **Call notify BEFORE doing any work** — the notification must be the first thing the user sees
 after sending a task, not silence followed by a result minutes later.
 
+AG2 Space is the exception: there the 🫡 reaction on the source message is the
+pickup acknowledgement and no notify message is sent.
+
 **Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
 10–30 seconds — the user should never wait in silence while you transcribe.
 - See `[File attached: ...]` in task → notify "Got your voice message, give me a moment." → THEN transcribe

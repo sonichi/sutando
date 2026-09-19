@@ -28,25 +28,114 @@ fi
 
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
+DELIVERIES_DIR="$WORKSPACE/deliveries"
+
+# Worker-pool awareness (sonichi/sutando#4281, #4338). An optional router,
+# injected at the adapter edge (never named here — see
+# docs/architecture-boundaries.md "Optional adapter capabilities"), delegates
+# a task by writing a SENTINEL into deliveries/<recipient>/<task-id><stage>, whose
+# stage suffixes are task_dispatch.py's contract and are not repeated in this
+# file — the payload itself never leaves tasks/, by design (the
+# recipient reads it from there via the inbox resolver). Two different
+# sessions read this state, and each asks a different question:
+#   - the core asks "is this still mine to report?" — no, once ANY worker
+#     holds a sentinel for it, even unaccepted, the router already made it
+#     that worker's, not a core orphan.
+#   - a worker (SUTANDO_INSTANCE_ID set) asks "do I still owe a reply?" —
+#     answered from its OWN deliveries folder only, never the core's tasks/
+#     queue, which is not this session's to report on.
+owned_task_ids() {
+  # What THIS worker was handed. Same owner as claimed_by_a_worker's contract
+  # (src/delivery/task_dispatch.py), so the sentinel suffixes are spelled there
+  # and never here. rc 2 = cannot decide: reported, never silently skipped.
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" owned-by "$DELIVERIES_DIR" "$1"
+}
+
+claimed_by_a_worker() {
+  # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
+  # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
+  local task_id="$1" rc
+  [ -n "$PYBIN" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
+  # 2 = cannot decide (root unreadable): hold, never report it to the core.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
+}
+
+# A delivered result is claimed out of results/ within about a second
+# (proactive-loop's own documented poller latency) — by the time this hook
+# next runs, `results/<id>.txt` is routinely already gone even though the
+# reply went out. Checking only the live path reads a correctly finished task
+# as still open forever. There is no cheaper true-done signal:
+# `state/workers/<id>/done/<task-id>.flag` (pool_delivery.mark_done) exists as a
+# concept but nothing in the current production path calls the writer, so gating
+# on it would report every task as unfinished instead.
+#
+# "Ready result, live or in any archive layout" is owned by
+# src/delivery/task_dispatch.py:has_ready_result (sonichi/sutando#4317) — the
+# same policy every task-notifier now shares. A local re-implementation here
+# drifted twice already (missed the month-bucket layout, then the
+# archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
+# own test suite pins), which is exactly the duplicated-policy failure mode
+# the shared owner exists to close off.
+already_delivered() {
+  local task_id="$1"
+  [ -n "$PYBIN" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" >/dev/null 2>&1
+}
 
 UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
-for f in "$TASKS_DIR"/*.txt; do
-  BASENAME=$(basename "$f")
-  # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
-  # consumer uses; a local re-implementation drifts from what will actually be sent.
-  if [ -f "$RESULTS_DIR/$BASENAME" ]; then
-    if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$BASENAME" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then continue; fi
-    UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  # Worker mode: judge only this instance's own folder, never the core's queue.
+  # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
+  # captured first and a non-zero status reports rather than skips.
+  OWNED="$(owned_task_ids "$SUTANDO_INSTANCE_ID" 2>/dev/null)"; OWNED_RC=$?
+  if [ "$OWNED_RC" -ne 0 ]; then
+    UNPROCESSED+="--- deliveries/$SUTANDO_INSTANCE_ID/ could not be read (task_dispatch rc $OWNED_RC) — cannot tell what this worker owes ---
 
 "
-    continue
   fi
-  UNPROCESSED+="--- $BASENAME ---
+  for TASK_ID in $OWNED; do
+    already_delivered "$TASK_ID" && continue
+    if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
+      UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+      continue
+    fi
+    PAYLOAD="$TASKS_DIR/$TASK_ID.txt"
+    UNPROCESSED+="--- $TASK_ID.txt ---
+$( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)" )
+
+"
+  done
+else
+  # Core mode: the queue is tasks/, minus anything the router already handed
+  # to a worker.
+  for f in "$TASKS_DIR"/*.txt; do
+    BASENAME=$(basename "$f")
+    TASK_ID="${BASENAME%.txt}"
+    claimed_by_a_worker "$TASK_ID" && continue
+    already_delivered "$TASK_ID" && continue
+    if [ -f "$RESULTS_DIR/$BASENAME" ]; then
+      UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+      continue
+    fi
+    UNPROCESSED+="--- $BASENAME ---
 $(cat "$f")
 
 "
-done
+  done
+fi
+
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+  BLOCK_REASON="Unprocessed deliveries in deliveries/$SUTANDO_INSTANCE_ID/"
+else
+  BLOCK_REASON="Unprocessed tasks in tasks/"
+fi
 
 if [ -n "$UNPROCESSED" ] && [ -z "$PYBIN" ]; then
   # Encoding needs an interpreter the resolver would not supply. Say so on stderr
@@ -57,7 +146,7 @@ if [ -n "$UNPROCESSED" ] && [ -z "$PYBIN" ]; then
 elif [ -n "$UNPROCESSED" ]; then
   # A real JSON encoder: hand-rolled escaping put a raw newline inside a string
   # value, so every block decision was unparseable and the guard never fired.
-  SUTANDO_HOOK_BODY="$UNPROCESSED" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}, separators=(",",":"), ensure_ascii=False))'
+  SUTANDO_BLOCK_REASON="$BLOCK_REASON" SUTANDO_HOOK_BODY="$UNPROCESSED" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ.get("SUTANDO_BLOCK_REASON"),"additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}, separators=(",",":"), ensure_ascii=False))'
   exit 0
 fi
 

@@ -243,19 +243,20 @@ def main(argv=None) -> int:
     rollup = None if j is None else j.get("statusCheckRollup")
     red = None if j is None else failing_checks(a.pr, run, a.repo, rollup)
     if red is None:
-        print("ci-triage: could not read checks (gh failed) — UNKNOWN, not 'none failing'")
+        print(f"ci-triage: could not read {a.repo}#{a.pr} checks (gh failed) "
+              "— UNKNOWN, not 'none failing'")
         return 0
     if not red:
         waiting = incomplete_checks(a.pr, run, a.repo, rollup)
         if waiting:
-            print(f"ci-triage: no failing checks on #{a.pr}, but "
+            print(f"ci-triage: no failing checks on {a.repo}#{a.pr}, but "
                   f"{len(waiting)} not yet green — the merge is still gated:")
             for n in waiting:
                 print(f"  … {n}")
         else:
-            print(f"ci-triage: no failing checks on #{a.pr}")
+            print(f"ci-triage: no failing checks on {a.repo}#{a.pr}")
         return 0
-    print(f"ci-triage: {len(red)} failing check(s) on #{a.pr}:")
+    print(f"ci-triage: {len(red)} failing check(s) on {a.repo}#{a.pr}:")
     for n in red:
         print(f"  ✖ {n}")
 
