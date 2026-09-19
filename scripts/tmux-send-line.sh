@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# tmux-send-line.sh <session> <line> [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
+# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
 # The ONE sender for a line typed into a Sutando core pane: has-session, read
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
 # Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused).
 set -u -o pipefail
-SESSION="${1:?session}"; LINE="${2:?line}"; shift 2
+SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME=claude
 SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --refuse-if-pending) REFUSE=1;; --skip-if-queued) SKIPWORD="${2:?}"; shift;;
-  --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+  --runtime) RUNTIME="${2:?}"; shift;; --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
+case "$RUNTIME" in claude|codex) ;; *) echo "tmux-send-line: unknown --runtime '$RUNTIME' (claude|codex)" >&2; exit 2;; esac
 # A launchd-launched caller (the menu-bar app) has a bare PATH; path_helper
 # restores /etc/paths.d, where Homebrew registers itself — no literal prefix.
 TMUX="$(command -v tmux 2>/dev/null)"
@@ -22,21 +23,104 @@ PY="$(bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/sutando-config.sh" python-
 LOCK="${TMPDIR:-/tmp}/tmux-send-line.$(printf '%s' "$SOCK:$SESSION" | "$PY" -c 'import sys,hashlib;print(hashlib.sha1(sys.stdin.read().encode()).hexdigest()[:12])').lock"
 exec 9>"$LOCK"
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "tmux-send-line: could not take the send lock" >&2; exit 7; }
-# The current prompt is the LAST line starting with ❯ (scrollback holds old
-# ones); its input is what follows the glyph and one optional space/nbsp.
+# The current prompt is the LAST line starting with the runtime's glyph (Claude \u276f,
+# Codex \u203a; scrollback holds old ones); its input is what follows the glyph and one
+# optional space/nbsp. Both CLIs draw hints in the composer -- Codex a DIM placeholder,
+# Claude a grey ghost suggestion -- while typed text is unstyled, so the pane is always
+# read with -e and any styled run after the glyph is dropped before deciding "pending".
 # A failed capture or parse is UNKNOWN, never "empty": refuse rather than send.
-CAP="$("$TMUX" -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null)" || { echo "tmux-send-line: capture-pane failed — prompt unknown, not sending" >&2; exit 7; }
-PENDING="$(printf '%s\n' "$CAP" | "$PY" -c 'import sys
-last=""
-for l in sys.stdin.read().splitlines():
-    s=l.lstrip(" \t")
-    if s.startswith("\u276f"):
-        r=s[1:]
-        if r[:1] in (" ", "\u00a0"): r=r[1:]
-        last=r.rstrip()
-print(last)')" || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
+# One capture+parse, reused for the initial read and Codex's post-delay recheck below.
+_capture() {
+  "$TMUX" -S "$SOCK" capture-pane -e -p -t "$SESSION" 2>/dev/null
+}
+# Pane width. A composer line longer than this wraps onto rows with no prompt glyph;
+# without it they cannot be told apart from content below the prompt.
+_width() {
+  "$TMUX" -S "$SOCK" display-message -p -t "$SESSION" '#{pane_width}' 2>/dev/null | tr -dc '0-9'
+}
+# The parsed text at the current prompt line (as before), from an ALREADY-captured pane.
+_pending() {
+  printf '%s\n' "$1" | "$PY" -c 'import sys,re
+rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
+SGR=re.compile(r"\x1b\[[0-9;]*m")
+# dim (2) or the xterm greyscale ramp (232-255), up to the reset/normal-intensity code
+# that ends it. 200-231 are colour-cube entries a real draft can legitimately use.
+GHOST=re.compile(r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
+W=int(sys.argv[2]) if len(sys.argv)>2 and sys.argv[2].isdigit() else 0
+lines=sys.stdin.read().splitlines()
+last_i=-1
+for i,l in enumerate(lines):
+    if SGR.sub("",l).lstrip(" \t").startswith(glyph): last_i=i
+if last_i<0:
+    print(""); raise SystemExit
+l=lines[last_i]; idx=l.find(glyph)
+raw=[l[idx+len(glyph):]]
+if W>0:
+    prev_full=len(SGR.sub("",l))>=W
+    for nxt in lines[last_i+1:]:
+        if not prev_full: break
+        plain=SGR.sub("",nxt)
+        if plain.lstrip(" \t").startswith(glyph): break
+        raw.append(nxt)
+        prev_full=len(plain)>=W
+# A ghost run opened on the prompt row stays open across the wrap and its continuation
+# rows carry no SGR, so join the RAW rows and strip once -- per-row stripping keeps the tail.
+r=SGR.sub("",GHOST.sub("","".join(raw)))
+if r[:1] in (" ", "\u00a0"): r=r[1:]
+print(r.rstrip())' "$RUNTIME" "$WIDTH"
+}
+# Everything BELOW the current prompt line, stripped of colour -- a fingerprint of what the
+# rest of the pane shows. A stale prompt line matching the staged payload proves nothing if
+# a gate/dialog has appeared beneath it; unchanged AFTER content is what proves it is live.
+_after() {
+  printf '%s\n' "$1" | "$PY" -c 'import sys,re
+rt=sys.argv[1]; glyph={"claude":"\u276f","codex":"\u203a"}[rt]
+SGR=re.compile(r"\x1b\[[0-9;]*m")
+lines=sys.stdin.read().splitlines()
+W=int(sys.argv[2]) if len(sys.argv)>2 and sys.argv[2].isdigit() else 0
+last_i=-1
+for i,l in enumerate(lines):
+    if SGR.sub("",l).lstrip(" \t").startswith(glyph): last_i=i
+if last_i<0:
+    print(""); raise SystemExit
+end=last_i
+if W>0:
+    prev_full=len(SGR.sub("",lines[last_i]))>=W
+    for j in range(last_i+1,len(lines)):
+        if not prev_full: break
+        plain=SGR.sub("",lines[j])
+        if plain.lstrip(" \t").startswith(glyph): break
+        end=j
+        prev_full=len(plain)>=W
+print("\n".join(SGR.sub("",x).strip() for x in lines[end+1:]))' "$RUNTIME" "$WIDTH"
+}
+WIDTH="$(_width)"
+CAP="$(_capture)"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: capture failed — prompt unknown, not sending" >&2; exit 7; }
+PENDING="$(_pending "$CAP")"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: prompt parse failed — not sending" >&2; exit 7; }
+AFTER_BASELINE="$(_after "$CAP")"; RC=$?
+[ $RC -eq 0 ] || { echo "tmux-send-line: after-prompt parse failed — not sending" >&2; exit 7; }
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
-"$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" && "$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+"$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+# Codex reads an Enter within 120ms of a typed burst as a pasted newline (PASTE_ENTER_SUPPRESS_WINDOW), not a submit.
+[ "$RUNTIME" = codex ] && sleep 0.25
+# The lock excludes cooperating senders, not operator keystrokes: a picker or dialog
+# can appear in the pane during Codex's delay. Re-read and only Enter if the composer
+# still shows exactly the payload THIS invocation staged; otherwise abort without Enter.
+if [ "$RUNTIME" = codex ]; then
+  RECAP="$(_capture)"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: capture failed during the delay — Enter withheld" >&2; exit 7; }
+  RECHECK="$(_pending "$RECAP")"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
+  if [ "$RECHECK" != "$LINE" ]; then echo "tmux-send-line: pane changed during the paste-burst delay (composer now '${RECHECK:0:60}', expected '$LINE') — Enter withheld" >&2; exit 5; fi
+  # A matching prompt LINE is not proof the composer is still live: it can be a stale line
+  # from before a gate/dialog appeared beneath it. Nothing may have changed below it either.
+  AFTER_NOW="$(_after "$RECAP")"; RC=$?
+  [ $RC -eq 0 ] || { echo "tmux-send-line: after-prompt parse failed during the delay — Enter withheld" >&2; exit 7; }
+  if [ "$AFTER_NOW" != "$AFTER_BASELINE" ]; then echo "tmux-send-line: pane state changed below the prompt during the delay (was '${AFTER_BASELINE:0:60}', now '${AFTER_NOW:0:60}') — Enter withheld" >&2; exit 5; fi
+fi
+"$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
 echo "sent '$LINE' to $SESSION"

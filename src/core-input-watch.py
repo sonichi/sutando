@@ -158,7 +158,12 @@ _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
 # The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
 # on the first typed character, so it is never a draft. Plain capture loses its dimming.
-_COMPOSER_PLACEHOLDER = re.compile(r'^\s*❯\s*Try "[^"\n]*"\s*$')
+_COMPOSER_PLACEHOLDER = re.compile(
+    r'^\s*❯\s*(?:Try "[^"\n]*"|Press up to edit queued messages)\s*$')
+# With `capture-pane -e` the CLI's ghost text (that hint, a suggested reply) is dimmed:
+# SGR 2 on some builds, a 256-colour grey (232-255) on others. Typed text never is.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_DIM_SPAN = re.compile(r"\x1b\[(?:2|38;5;2(?:3[2-9]|4\d|5[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40
 
@@ -256,9 +261,12 @@ def _composer_is_empty(pane: str) -> bool:
     non-empty content after stripping the marker means a draft is staged). No
     ❯ line at all is NOT verifiably empty — fails closed (False), never assumed.
     """
-    for ln in reversed([ln for ln in pane.splitlines() if ln.strip()]):
+    for raw in reversed([ln for ln in pane.splitlines() if ln.strip()]):
+        ln = _ANSI_SGR.sub("", raw)
         if _PROMPT_LINE.match(ln):
-            return bool(_COMPOSER_PLACEHOLDER.match(ln)) or not ln.strip().lstrip("❯").strip()
+            undimmed = _ANSI_SGR.sub("", _DIM_SPAN.sub("", raw))
+            return (bool(_COMPOSER_PLACEHOLDER.match(ln))
+                    or not undimmed.strip().lstrip("❯").strip())
     return False
 
 

@@ -362,6 +362,71 @@ enum SutandoConfig {
         return proc.terminationStatus == 0
     }
 
+    /// The selected persistent core CLI runtime, mirroring
+    /// `src/sutando_config.py:resolve_core_runtime` and resolving from the same
+    /// merged config this type already loads: `$SUTANDO_CORE_RUNTIME` first,
+    /// else `core.runtime`, else "claude".
+    ///
+    /// An unrecognised value returns nil rather than raising: a caller choosing
+    /// a pane parser must not send with a guessed runtime, and nil lets it fall
+    /// back to a policy that is safe on either.
+    static func resolveCoreRuntime(
+        repoRoot explicitRoot: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        let env = (environment["SUTANDO_CORE_RUNTIME"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        let configured: String
+        if !env.isEmpty {
+            configured = env
+        } else {
+            let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
+            let core = cfg["core"] as? [String: Any] ?? [:]
+            configured = ((core["runtime"] as? String) ?? "claude")
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return supportedCoreRuntimes.contains(configured) ? configured : nil
+    }
+
+    /// The runtime the LIVE tmux session was launched as, mirroring
+    /// `src/core_heartbeat.py:_session_runtime`: `start-cli.sh` exports
+    /// SUTANDO_CORE_RUNTIME into the session at creation, so the session outranks
+    /// config, which an invocation-scoped trial never writes.
+    static func sessionCoreRuntime(
+        socket: String,
+        session: String = "sutando-core",
+        repoRoot: String? = nil,
+        tmuxPath: String? = nil
+    ) -> String? {
+        let candidates = tmuxPath.map { [$0] }
+            ?? ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+        guard let bin = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            return resolveCoreRuntime(repoRoot: repoRoot)
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["-S", socket, "show-environment", "-t", "=" + session, "SUTANDO_CORE_RUNTIME"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return resolveCoreRuntime(repoRoot: repoRoot) }
+        p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // tmux prints `-NAME` when the variable is unset in that session.
+        if p.terminationStatus == 0, out.hasPrefix("SUTANDO_CORE_RUNTIME=") {
+            let v = String(out.dropFirst("SUTANDO_CORE_RUNTIME=".count))
+                .trimmingCharacters(in: .whitespaces)
+            if supportedCoreRuntimes.contains(v) { return v }
+            if !v.isEmpty { return nil }   // session names a runtime we cannot parse
+        }
+        return resolveCoreRuntime(repoRoot: repoRoot)
+    }
+
+    /// Keep in step with `_SUPPORTED_CORE_RUNTIMES` in src/sutando_config.py and
+    /// the `--runtime` validation in scripts/tmux-send-line.sh.
+    static let supportedCoreRuntimes: Set<String> = ["claude", "codex"]
+
     /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
     /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
     static func resolvePython(

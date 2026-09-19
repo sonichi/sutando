@@ -12,6 +12,8 @@ else
 fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+# The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
+DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
@@ -171,7 +173,7 @@ next_pending_task() {
     return 0
   done < <(
     "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
-      --claims-dir "$TASK_HANDLER_CLAIMS_DIR"
+      --claims-dir "$TASK_HANDLER_CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR"
   )
   return 1
 }
