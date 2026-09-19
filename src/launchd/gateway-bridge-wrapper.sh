@@ -29,11 +29,18 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
-# $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
-# config helper falls back to ~/.claude otherwise.
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+# `.env` first, unchanged: it may carry channel POLICY (tier, marker) and shell-
+# form credentials this file must keep honouring, token or not.
+if _DOT_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)" \
+   && [ -n "$_DOT_ENV" ] && [ -f "$_DOT_ENV" ]; then
+    set -a; . "$_DOT_ENV"; set +a;
+fi
+# Only if that left no token: some hosts keep it in a sibling. Resolved by
+# CONTENT, so the lookup cannot be fooled by a blank `.env` of the right name.
+if [ -z "${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}" ] \
+   && _RELAY_ENV="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" \
+   && [ -n "$_RELAY_ENV" ] && [ -f "$_RELAY_ENV" ] && [ "$_RELAY_ENV" != "$_DOT_ENV" ]; then
+    set -a; . "$_RELAY_ENV"; set +a;
 fi
 
 # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).

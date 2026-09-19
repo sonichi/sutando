@@ -291,8 +291,10 @@ try:
           rh._gateway_configured() is None)
     with tempfile.TemporaryDirectory() as cfg:
         os.environ["CLAUDE_CONFIG_DIR"] = cfg
-        check("_gateway_configured: config dir, no .env -> None",
-              rh._gateway_configured() is None)
+        # No ag2space channel is a definitive "not provisioned" — the answer
+        # health-check gives; None is reserved for "cannot tell".
+        check("_gateway_configured: config dir, no channel -> False",
+              rh._gateway_configured() is False)
         ch = os.path.join(cfg, "channels", "ag2space")
         os.makedirs(ch)
         open(os.path.join(ch, ".env"), "w").write("OTHER=1\n")
