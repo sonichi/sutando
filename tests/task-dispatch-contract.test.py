@@ -718,6 +718,38 @@ class MainDispatchTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
 
+    def test_owned_by_command_prints_one_id_per_line(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        (deliveries / "w1" / "task-a.txt").write_text("")
+        (deliveries / "w1" / "task-a.accepted").write_text("")
+        (deliveries / "w1" / "task-b.claimed").write_text("")
+        rc, out, _ = self._run("owned-by", str(deliveries), "w1")
+        self.assertEqual((rc, out.split()), (0, ["task-a", "task-b"]))
+
+    def test_owned_by_command_is_zero_and_silent_for_an_undelivered_recipient(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        deliveries.mkdir()
+        rc, out, _ = self._run("owned-by", str(deliveries), "never")
+        self.assertEqual((rc, out.strip()), (0, ""))
+
+    def test_owned_by_command_exits_2_on_an_unreadable_folder(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        os.chmod(deliveries / "w1", 0)
+        self.addCleanup(os.chmod, deliveries / "w1", 0o755)
+        rc, out, err = self._run("owned-by", str(deliveries), "w1")
+        # 1 would read as "this worker owes nothing" and end the turn.
+        self.assertEqual((rc, out.strip()), (2, ""))
+        self.assertIn("owned-by", err)
+
+    def test_owned_by_command_rejects_extra_arguments(self):
+        rc, _, err = self._run("owned-by", str(self.tmp.name), "w1", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
     def test_worker_holds_command_exits_2_on_an_unreadable_root(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory modes")
