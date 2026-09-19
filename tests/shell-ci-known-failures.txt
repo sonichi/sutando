@@ -14,5 +14,4 @@
 # quarantining, not an entry here.
 #
 # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
-tests/sutando-migrate.test.sh
 tests/sync-workspace.test.sh
