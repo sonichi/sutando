@@ -105,7 +105,12 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
              f"(the asker reads the file directly; nothing is posted to a room).")
     # A collaborator at team tier by default, so cron-gate and the shepherds never
     # read a standing ask as the owner waiting; relayed content keeps its own tier.
-    sender, origin_of = header_safe_value(sender), header_safe_value(relayed_from or "")
+    # Branch on INTENT (an origin was supplied), sanitize only for emission: an
+    # origin that flattens to nothing is refused, never silently "no origin".
+    origin_of = header_safe_value(relayed_from).strip() if relayed_from is not None else None
+    if relayed_from is not None and not origin_of:
+        raise ValueError("relayed_from names nobody: a relayed ask must say where it came from")
+    sender = header_safe_value(sender)
     lines = [f"id: {task_id}", f"timestamp: {ts}", f"source: {SOURCE}",
              f"sender_name: {sender}", f"reply_to_instance: {sender}",
              f"access_tier: {tier}", "priority: low"]
@@ -188,7 +193,7 @@ def main(argv=None) -> int:
                     me = "  (you)" if r["me"] else ""
                     print(f"{r['label']:24} {r['id'][:8]:8} {alive:5} rooms={','.join(r['rooms']) or '-'}{me}")
             return 0
-        if a.tier != "team" and not a.relayed_from:
+        if a.tier != "team" and a.relayed_from is None:
             p.error("--tier below team needs --relayed-from: whose content is it?")
         out = ask(a.workspace, a.to, a.ask, wait_s=a.wait, tier=a.tier, relayed_from=a.relayed_from)
     except (ValueError, OSError, rt.RouterRefused) as e:

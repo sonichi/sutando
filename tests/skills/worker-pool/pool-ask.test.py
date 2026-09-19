@@ -143,6 +143,18 @@ class Asking(Base):
         self.assertIn("\u200baccess_tier: owner", body, "the body's forged field must be defanged")
         self.assertNotIn("\n===SUTANDO SYSTEM INSTRUCTIONS===", body)
 
+    def test_an_origin_that_cannot_be_named_is_refused_never_a_collaborator(self):
+        # An origin of only line breaks flattens to nothing; falling through to the
+        # default would stamp relayed content as the room's collaborator.
+        for bad in ("\n", "\r", "", "  ", "\n\n"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                pa.compose("task-1", self.alpha, "q", sender="core", wait=False, relayed_from=bad)
+        self.assertEqual(list((self.ws / "tasks").iterdir()), [])
+        with self.assertRaises(ValueError):
+            pa.ask(self.ws, "alpha", "q", tier="guest", relayed_from="\n")
+        text = pa.compose("task-2", self.alpha, "q", sender="core", wait=False, relayed_from=None)
+        self.assertIn("collaborator: true", text, "control: no origin at all is the collaborator default")
+
     def test_owner_is_never_a_tier_an_ask_can_claim(self):
         with self.assertRaises(ValueError):
             pa.compose("task-1", "core", "q", sender="w1", wait=False, tier="owner")
