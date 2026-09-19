@@ -331,9 +331,10 @@ exit 0
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("#!/bin/sh\nexit 0\n")
         script.chmod(0o755)
-        link = self.root / "skills" / "pool" / "task-event-handler"
-        link.symlink_to("scripts/route_handler.py")
-        return link
+        (script.parent.parent / "manifest.json").write_text(
+            '{"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}\n')
+        # realpath: the resolver resolves symlinks, and /tmp is one on macOS.
+        return Path(os.path.realpath(script))
 
     def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
         p = self._install_pool_skill()
