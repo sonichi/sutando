@@ -1126,7 +1126,7 @@ exit 0
         (workspace / "state" / "core-status.json").write_text('{"status":"idle","ts":1}\n')
         (tasks / "task-owner.txt").write_text("task: deliver me\n")
         scratch = Path(self.tmp.name)
-        clock, buf, emits = scratch / "clock", scratch / "buf", scratch / "emits"
+        count, buf, emits = scratch / "count", scratch / "buf", scratch / "emits"
         # ONE event, then hold the fifo open: only the retry timer can wake the loop.
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
@@ -1136,20 +1136,18 @@ exit 0
             "sleep 9\n"
         )
         watcher.chmod(0o755)
+        # Transition by CAPTURE COUNT, not elapsed time — deterministic regardless
+        # of machine speed (see the commit body for why call 1 is idle, 2-45 unsafe).
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 _last="${@: -1}"
 for _a in "$@"; do
   case "$_a" in
     capture-pane)
-      # First read is clean, so the core-idle gate opens; the pane then goes
-      # unsafe, which is the only way to reach deliver_prompt's refusal.
-      if [ ! -f "$PANE_CLOCK" ]; then
-        date +%s > "$PANE_CLOCK"
+      n=$(( $(cat "$CALL_COUNT" 2>/dev/null || echo 0) + 1 )); printf %s "$n" > "$CALL_COUNT"
+      if [ "$n" -eq 1 ]; then
         printf '› \n← for agents\n'
-        exit 0
-      fi
-      if [ $(( $(date +%s) - $(cat "$PANE_CLOCK") )) -lt 2 ]; then
+      elif [ "$n" -le 45 ]; then
         printf '› half typed\n← for agents\n'
       else
         printf '› %s\n← for agents\n' "$(cat "$PANE_BUF" 2>/dev/null)"
@@ -1172,7 +1170,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            PANE_CLOCK=str(clock),
+            CALL_COUNT=str(count),
             PANE_BUF=str(buf),
             EMITS=str(emits),
             SUTANDO_TMUX_SOCKET="/tmp/test.sock",
@@ -1188,7 +1186,6 @@ exit 0
         result = subprocess.run(
             ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=30
         )
-
         stderr = result.stderr
         # Phase 2: the unsafe pane refused to take the prompt, and said so.
         self.assertIn("refusing to type task-owner.txt", stderr, stderr)
