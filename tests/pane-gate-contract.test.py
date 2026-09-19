@@ -403,6 +403,28 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class ARetryIsAbnormalEvenInsideARunningTurn(unittest.TestCase):
+    """Owner's rule: retry means abnormal. The interrupt affordance stays on screen
+    while the CLI retries, so "esc to interrupt" cannot vouch for a served turn --
+    a line typed then queues into a turn that is not being served. Pinned in both
+    orderings because the first draft ranked the affordance above the banner."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    INTERRUPT = "✻ Thinking… (12s · esc to interrupt)"
+
+    def test_control_the_affordance_alone_is_a_running_turn_that_accepts_input(self):
+        v = pg.classify_pane(f"{self.INTERRUPT}\n{CLAUDE_IDLE}", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason, pg.accepts_input(v)), ("busy", "working", True))
+
+    def test_a_retry_beside_the_affordance_holds_whichever_comes_first(self):
+        for order in ((self.INTERRUPT, self.RETRY), (self.RETRY, self.INTERRUPT)):
+            with self.subTest(order=order):
+                v = pg.classify_pane("\n".join(order) + f"\n{CLAUDE_IDLE}", pg.CLAUDE)
+                self.assertEqual(v.state, "abnormal")
+                self.assertIn("retry:retrying", v.reason)
+                self.assertFalse(pg.accepts_input(v))
+
+
 class AbnormalIsBothOfCliWedgesFamilies(unittest.TestCase):
     """The gate is the ONE caller of cli_wedge's single-capture detectors. Before
     this it read only the line-anchored parked patterns, so a live retry banner

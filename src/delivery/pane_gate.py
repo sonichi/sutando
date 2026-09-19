@@ -307,8 +307,9 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
 
 def banner_abnormal_names(tail: str) -> List[str]:
     """cli_wedge's whole-line banner families -- the only reader of a live
-    "Retrying in Ns" line. Checked AFTER the gate signatures: its quota-limit
-    line also matches the Fable-consent dialog, which is a named gate first."""
+    "Retrying in Ns" line. The retry family outranks everything; the parked
+    family waits for the gate signatures, since its quota-limit line also
+    matches the Fable-consent dialog, which is a named gate first."""
     names: List[str] = []
     for family, name, _line in live_banner_lines(tail):
         tag = f"{family}:{name}" if family == "retry" else name
@@ -334,6 +335,11 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
         return Verdict("unknown", "empty pane")
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
+    # A retry is abnormal even mid-turn: the interrupt affordance stays up while
+    # the CLI retries, and a line typed then queues into a turn that is not served.
+    retrying = [t for t in banner_abnormal_names(tail) if t.startswith("retry:")]
+    if retrying:
+        return Verdict("abnormal", ",".join(retrying))
     if adapter.busy.search(tail):
         return Verdict("busy", "working")
     abnormal = matched_abnormal([tail])
