@@ -11132,7 +11132,7 @@ def _is_electron_impostor(comm: str) -> bool:
     The desktop UI also installs as "Sutando.app", and its main binary lives
     at the same …/Contents/MacOS/Sutando suffix the sutando-app pgrep pattern
     matches — so the probe reported "running" while the actual Swift menu-bar
-    app (the contextual-chips writer + watcher-auto-restart owner) was dead
+    app (the contextual-chips writer) was dead
     (#2038, 2026-07-09). Electron bundles are distinguishable on disk: they
     ship Contents/Frameworks/Sutando Helper.app; the Swift app has no helper
     frameworks.
