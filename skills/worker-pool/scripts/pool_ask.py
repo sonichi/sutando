@@ -92,9 +92,11 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool) ->
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reply = (f"Reply by writing results/{task_id}.txt whose FIRST line is {NO_SEND} "
              f"(the asker reads the file directly; nothing is posted to a room).")
+    # The asker is another instance, not the owner: a collaborator at team tier, so
+    # cron-gate and the shepherds do not read a standing ask as an owner waiting.
     lines = [f"id: {task_id}", f"timestamp: {ts}", f"source: {SOURCE}",
              f"sender_name: {sender}", f"reply_to_instance: {sender}",
-             "access_tier: owner", "priority: normal"]
+             "access_tier: team", "collaborator: true", "priority: low"]
     if to != pr.CORE:
         lines.append(f"requested_worker: {to}")
     lines.append(f"task: [pool-ask from {sender}] {question.strip()}\n\n{reply}")

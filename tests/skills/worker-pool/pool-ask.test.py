@@ -84,6 +84,9 @@ class Asking(Base):
         self.assertEqual(headers["requested_worker"], self.alpha, "addressed by id, not label")
         self.assertEqual(headers["source"], pa.SOURCE)
         self.assertEqual(headers["reply_to_instance"], pr.CORE)
+        self.assertEqual((headers["access_tier"], headers["collaborator"], headers["priority"]),
+                         ("team", "true", "low"),
+                         "an ask is not an owner waiting: owner tier would defer every gated cron")
         self.assertIn("task: [pool-ask from core] what is the status of #1?", text)
         self.assertIn(f"results/{tid}.txt", text, "the answerer must be told how to reply")
         self.assertTrue((self.ws / "deliveries" / self.alpha / f"{tid}.txt").exists(),

@@ -72,6 +72,9 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 - **To answer an ask**, write `results/<task id>.txt` whose first line is `[no-send]`
   — the asker reads the file (with `--wait`, as soon as it lands) and nothing is
   posted to any room. The ask's body says so, so an answerer needs no other briefing.
+- An ask carries `access_tier: team` + `collaborator: true` + `priority: low`: the asker is
+  another instance, not the owner, so a standing ask never reads as an owner waiting to
+  `scripts/cron-gate.sh` or the shepherds (measured: an owner-tier ask deferred `sync-workspace`).
 - Refused, never guessed: an unknown name, a label two workers share, and asking yourself.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the
