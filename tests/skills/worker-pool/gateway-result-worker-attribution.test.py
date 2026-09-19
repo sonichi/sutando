@@ -35,7 +35,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
+_REPO = Path(__file__).resolve().parents[3]
 _SRC = _REPO / "src" / "remote-gateway-bridge.py"
 _POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
 

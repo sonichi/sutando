@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 TMP = tempfile.mkdtemp(prefix="outbound-worker-test-")
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SUTANDO_WORKSPACE"] = TMP

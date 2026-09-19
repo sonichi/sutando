@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)

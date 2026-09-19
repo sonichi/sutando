@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
 from worker_delivery import SENTINEL_SUFFIXES, _is_dir, holder_of  # noqa: E402
 
