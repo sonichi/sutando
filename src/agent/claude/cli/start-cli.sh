@@ -692,6 +692,14 @@ if [ -n "$RESTART_REQUESTED" ]; then
       exit 1
     fi
   fi
+  # The writer is not the pane's child, so it outlives the kill and records the NEW pane's pid
+  # into the old file: hand it over here, or the fresh core never gets a writer of its own.
+  if [ -n "$PY" ] && _hb_out="$("$PY" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null)"; then
+    log_restart_attempt "heartbeat handoff: ${_hb_out:-no output}"
+  else
+    echo "  WARN heartbeat handoff (--stop) failed — the old writer may still be running" >&2
+    log_restart_attempt "heartbeat handoff FAILED: --stop did not run clean; the old writer may still be running"
+  fi
   log_restart_attempt "kill-complete; creating fresh core"
 fi
 

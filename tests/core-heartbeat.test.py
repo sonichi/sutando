@@ -454,6 +454,11 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIn("has-session -t =<session>", doc)
         self.assertNotIn("answers with the **server's own socket path and that session name**", doc)
         self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
+        claude = (ROOT / "src" / "agent" / "claude" / "cli" / "start-cli.sh").read_text()
+        stop = claude.index('"$PY" "$REPO/src/core_heartbeat.py" --stop')
+        self.assertLess(claude.index('log_restart_attempt "begin'), stop)
+        self.assertLess(stop, claude.index('log_restart_attempt "kill-complete; creating fresh core"'))
+        self.assertIn('log_restart_attempt "heartbeat handoff: ', claude)
 
     def test_recording_the_writer_pid_never_creates_the_cores_dir(self):
         # An EMPTY state/cores reads as "every core offline" to signal_room_tasks.core_is_alive, so a
@@ -497,6 +502,11 @@ class TestHeartbeatWrite(unittest.TestCase):
             self.assertTrue(core_heartbeat._is_writer_argv(
                 f"/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python {script} --interval 60", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"bash {script}", script))
+            # An unrelated command whose LATER operand is `python3 <script>` is not the writer.
+            self.assertFalse(core_heartbeat._is_writer_argv(f"observer.py python3 {script}", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"/usr/bin/env observer python3 {script}", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(
+                f"/Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python {script}", script))
             self.assertFalse(core_heartbeat._is_writer_argv(f"python3 {script}x", script))
         finally:
             for pr in (old, bystander):
@@ -610,6 +620,95 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertFalse(cores_dir.exists())
         core_heartbeat.write_beat()
         self.assertTrue(cores_dir.is_dir())
+
+
+class TestBeatOnlyWhenObserved(unittest.TestCase):
+    """#4213: a dead core read fresh for 8 h because the loop kept refreshing
+    .alive on beats where the pane was NOT observed. Only an observed core
+    refreshes the file; an absent or unobserved beat lets it age."""
+    setUp = TestHeartbeatWrite.setUp
+    tearDown = TestHeartbeatWrite.tearDown
+
+    def _drive(self, probes):
+        """Run the loop through `probes`: each entry is (pid_or_None, observed)
+        and the loop shuts down after the last. Returns .alive mtimes per beat."""
+        import core_heartbeat
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        seen = []
+        script = iter(probes)
+        last = {"pid": None}
+
+        def fake_core_pid(socket_path=None, session=None):
+            if socket_path is not None or session is not None:
+                # write_beat's own lookup: answer it, do not consume a probe.
+                return last["pid"]
+            try:
+                pid, observed = next(script)
+            except StopIteration:
+                core_heartbeat._SHUTDOWN_REQUESTED = True
+                return None
+            core_heartbeat._LAST_SESSION_PROBE = observed if observed else None
+            seen.append(alive.stat().st_mtime if alive.exists() else None)
+            last["pid"] = pid
+            return pid
+
+        orig = core_heartbeat.core_pid
+        core_heartbeat.core_pid = fake_core_pid
+        core_heartbeat._SHUTDOWN_REQUESTED = False
+        try:
+            rc = core_heartbeat.run_forever(interval=0.01)
+        finally:
+            core_heartbeat.core_pid = orig
+            core_heartbeat._SHUTDOWN_REQUESTED = False
+        return rc, seen, alive
+
+    def test_an_observed_absence_does_not_refresh_but_an_unobserved_probe_does(self):
+        rc, seen, alive = self._drive([(4242, True), (4242, True), (None, True), (None, True),
+                                       (None, False), (4242, True)])
+        self.assertEqual(rc, 0)
+        # beat 3 saw beat 2's write; beats 4 and 5 saw the same mtime (two observed
+        # absences refreshed nothing); beat 6 saw beat 5's unobserved refresh.
+        self.assertIsNotNone(seen[2])
+        self.assertEqual(seen[2], seen[3])
+        self.assertEqual(seen[3], seen[4])
+        self.assertGreater(seen[5], seen[4])
+        self.assertTrue(alive.exists(), "two observed absences do not remove the file")
+
+    def test_a_long_unobserved_run_stops_refreshing_after_the_cap(self):
+        import core_heartbeat
+        cap = core_heartbeat.UNOBSERVED_BEATS_BEFORE_STALE
+        probes = [(4242, True)] + [(None, False)] * (cap + 3) + [(4242, True)]
+        rc, seen, alive = self._drive(probes)
+        self.assertEqual(rc, 0)
+        # within the cap every unobserved beat refreshed; past it, nothing did.
+        self.assertGreater(seen[cap], seen[1])
+        self.assertEqual(seen[cap + 1], seen[cap + 2])
+        self.assertEqual(seen[cap + 2], seen[cap + 3])
+        self.assertTrue(alive.exists(), "unobserved never unlinks; the file ages instead")
+
+    def test_three_observed_absences_still_remove_the_file(self):
+        rc, seen, alive = self._drive([(4242, True), (None, True), (None, True), (None, True), (4242, True)])
+        self.assertEqual(rc, 0)
+        self.assertFalse(alive.exists())
+
+    def test_a_writer_from_another_checkout_is_a_writer(self):
+        import core_heartbeat
+        here = "/Users/x/github/sutando-core-main/src/core_heartbeat.py"
+        other = "/usr/bin/python3 /Users/x/github/sutando/src/core_heartbeat.py --interval 30"
+        self.assertTrue(core_heartbeat._is_writer_argv(other, here))
+        # step 5.5 starts it by a repo-relative path; a restart's --stop must still see it
+        self.assertTrue(core_heartbeat._is_writer_argv("python3 src/core_heartbeat.py", here))
+        self.assertFalse(core_heartbeat._is_writer_argv("python3 notsrc/core_heartbeat.py", here))
+        self.assertFalse(core_heartbeat._is_writer_argv("python3 -c 'import x' /a/src/core_heartbeat.py", here))
+        self.assertFalse(core_heartbeat._is_writer_argv("bash -c sleep 60", here))
+
+    def test_startup_stops_recorded_writers_before_its_guard(self):
+        text = (Path(__file__).resolve().parents[1] / "src" / "startup.sh").read_text()
+        stop = text.index('core_heartbeat.py" --stop')
+        guard = text.index('if pgrep -f "src/core_heartbeat.py"')
+        self.assertLess(stop, guard, "the recorded writer is stopped before the survivor check")
+        self.assertIn("NOT started: an unrecorded writer", text)
+        self.assertNotIn("core heartbeat (already running)", text)
 
 
 class TestHeartbeatCli(unittest.TestCase):
