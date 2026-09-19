@@ -105,6 +105,62 @@ def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> d
     return pr.register_worker(workspace, worker_id, label, room, runtime=runtime)
 
 
+class CreatedUnrostered(Exception):
+    """The worker exists but the roster does not name it, so nothing routes to it."""
+
+    def __init__(self, worker_id: str, cause: Exception):
+        super().__init__(f"worker {worker_id} was created, but the roster could not "
+                         f"be compiled: {cause}")
+        self.worker_id = worker_id
+
+
+def adopt(workspace, worker_id: str, *, socket=None) -> "dict | None":
+    """A worker an interrupted run already made, if it is whole: rostered live
+    AND its tmux session exists. None when nothing was made; `CreatedUnrostered`
+    when an identity exists without a live session (left for a human)."""
+    exists = sw.wi.worker_dir(workspace, worker_id).exists()
+    roster = pr.load_roster(workspace) or {}
+    row = (roster.get("workers") or {}).get(worker_id)
+    state, _detail = sw.session_probe(sw.wi.tmux_session_name(worker_id),
+                                      socket or sw.default_socket())
+    if row and row.get("state") == "live" and state == "exists":
+        return {"worker_id": worker_id, "roster_version": roster.get("version"),
+                "advertisement": "published",
+                "delivery_dir": str(sw.pd.deliveries_dir(workspace, worker_id)),
+                "tmux": {"socket": socket or sw.default_socket(),
+                         "session_name": sw.wi.tmux_session_name(worker_id)}}
+    if exists or row:
+        raise CreatedUnrostered(worker_id, RuntimeError(
+            f"identity={'yes' if exists else 'no'} roster={'yes' if row else 'no'} "
+            f"tmux={state}: a half-made worker; not adopting"))
+    return None
+
+
+def create(workspace, repo, *, label: str = "", room=None, runtime=None,
+           folder: str = "", socket=None, worker_id=None) -> dict:
+    """The whole command as one call, for a caller that already holds the intent.
+
+    Refusals raise before anything is made. After the spawn, a compile failure
+    raises `CreatedUnrostered` naming the worker; a publish failure returns the
+    worker with `advertisement: "unpublished"`, because it IS routable by then.
+    """
+    preflight(workspace, repo, room)
+    rt = sw.resolve_runtime(repo, runtime or None)
+    made = sw.spawn(workspace, repo, runtime=rt, cwd=folder, socket=socket or None,
+                    label=label, worker_id=worker_id)
+    advertisement = "published"
+    try:
+        roster = compile_with(workspace, made["worker_id"], label, room,
+                              runtime=made.get("runtime"))
+    except pr.PublishError as e:
+        roster, advertisement = e.roster, "unpublished"
+    except (pr.RosterError, OSError) as e:
+        raise CreatedUnrostered(made["worker_id"], e) from e
+    return {**made, "roster_version": roster["version"], "room": room,
+            "advertisement": advertisement,
+            "unrostered_records": unrostered(workspace, roster.get("workers") or {})}
+
+
 def report(made: dict, roster: dict, room, orphans: list) -> str:
     # Read through .get: spawn()'s contract is these keys, but a partial
     # report beats a KeyError when a caller upstream reshapes its extras.
