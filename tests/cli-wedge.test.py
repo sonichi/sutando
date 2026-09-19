@@ -1196,6 +1196,16 @@ class FrameAbnormalRanksOneCaptureAsTheWindowRanksASample(unittest.TestCase):
         self.assertEqual((v.kind, v.retrying), ("abnormal", True))
         self.assertEqual(set(v.names), {"retry:retrying", "api-error"})
 
+    def test_a_family_only_the_anchored_patterns_see_still_reaches_the_verdict(self):
+        # ABNORMAL_PATTERNS is line-anchored and looser than the whole-line banner
+        # grammar, so a long parked line reaches the verdict through it alone.
+        long_line = ("Compacting context and this line runs on well past forty characters "
+                     "so the banner grammar will not take it")
+        self.assertEqual(w.live_banner_lines(long_line), [])          # control
+        self.assertEqual(w.matched_abnormal([long_line]), ["compacting"])
+        v = w.frame_abnormal(long_line)
+        self.assertEqual((v.kind, v.names, v.retrying), ("abnormal", ("compacting",), False))
+
     def test_a_provider_limit_outranks_a_retry(self):
         v = w.frame_abnormal(f"{self.RETRY}\n{self.QUOTA}")
         self.assertEqual((v.kind, v.retrying), ("provider-limit", True))

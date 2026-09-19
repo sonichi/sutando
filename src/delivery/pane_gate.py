@@ -305,12 +305,6 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     return None
 
 
-def banner_abnormal_names(tail: str) -> List[str]:
-    """The abnormal family names cli_wedge reads in one capture, retry tagged."""
-    abn = frame_abnormal(tail)
-    return list(abn.names) if abn else []
-
-
 # A working turn queues typed input (the Claude notifier delivers like the Monitor
 # tool); a dialog, a parked banner or an unreadable pane does not.
 def accepts_input(verdict: Verdict) -> bool:
