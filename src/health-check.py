@@ -9623,7 +9623,15 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     someone who ran the CLI by hand."""
     name = "outbox-parked"
     results = Path(workspace_dir or WORKSPACE_DIR) / "results"
-    roots = sorted(results.glob(".outbox*"))
+    # glob and is_dir() answer [] / False on EACCES, judging an unreadable tree
+    # clean; iterdir raises, and only ENOENT here means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
     if not roots:
         return {"name": name, "status": "ok",
                 "detail": "no outbox root — nothing to park (this 0 is untestable)"}
@@ -9635,15 +9643,16 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     parked: list[str] = []
     unreadable: list[str] = []
     for root in roots:
-        # `list_items` globs an unreadable dir to [], so its empty list cannot
-        # tell clean from unjudgeable; the listing is attempted here first.
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
         items_dir = outbox._items_dir(Path(root))
-        if items_dir.is_dir():
-            try:
-                list(items_dir.iterdir())
-            except OSError as exc:
-                unreadable.append(f"{root.name} ({exc})")
-                continue
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
         for d in outbox.list_items(root, status="PARKED"):
             parked.append(str(d.get("item_id") or "?"))
     if unreadable:
