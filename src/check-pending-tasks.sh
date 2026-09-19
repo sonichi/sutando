@@ -33,8 +33,9 @@ DELIVERIES_DIR="$WORKSPACE/deliveries"
 # Worker-pool awareness (sonichi/sutando#4281, #4338). An optional router,
 # injected at the adapter edge (never named here — see
 # docs/architecture-boundaries.md "Optional adapter capabilities"), delegates
-# a task by writing a SENTINEL into deliveries/<recipient>/<task-id>{.txt,.accepted,
-# .claimed} — the payload itself never leaves tasks/, by design (the
+# a task by writing a SENTINEL into deliveries/<recipient>/<task-id><stage>, whose
+# stage suffixes are task_dispatch.py's contract and are not repeated in this
+# file — the payload itself never leaves tasks/, by design (the
 # recipient reads it from there via the inbox resolver). Two different
 # sessions read this state, and each asks a different question:
 #   - the core asks "is this still mine to report?" — no, once ANY worker
@@ -43,13 +44,11 @@ DELIVERIES_DIR="$WORKSPACE/deliveries"
 #   - a worker (SUTANDO_INSTANCE_ID set) asks "do I still owe a reply?" —
 #     answered from its OWN deliveries folder only, never the core's tasks/
 #     queue, which is not this session's to report on.
-sentinel_task_id() {
-  case "$1" in
-    *.accepted) printf '%s' "${1%.accepted}" ;;
-    *.claimed)  printf '%s' "${1%.claimed}" ;;
-    *.txt)      printf '%s' "${1%.txt}" ;;
-    *)          return 1 ;;
-  esac
+owned_task_ids() {
+  # What THIS worker was handed. Same owner as claimed_by_a_worker's contract
+  # (src/delivery/task_dispatch.py), so the sentinel suffixes are spelled there
+  # and never here. rc 2 = cannot decide: reported, never silently skipped.
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" owned-by "$DELIVERIES_DIR" "$1"
 }
 
 claimed_by_a_worker() {
@@ -89,9 +88,15 @@ shopt -s nullglob 2>/dev/null
 
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
-  for f in "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.txt "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.accepted "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.claimed; do
-    SNAME=$(basename "$f")
-    TASK_ID="$(sentinel_task_id "$SNAME")" || continue
+  # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
+  # captured first and a non-zero status reports rather than skips.
+  OWNED="$(owned_task_ids "$SUTANDO_INSTANCE_ID" 2>/dev/null)"; OWNED_RC=$?
+  if [ "$OWNED_RC" -ne 0 ]; then
+    UNPROCESSED+="--- deliveries/$SUTANDO_INSTANCE_ID/ could not be read (task_dispatch rc $OWNED_RC) — cannot tell what this worker owes ---
+
+"
+  fi
+  for TASK_ID in $OWNED; do
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
       UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
