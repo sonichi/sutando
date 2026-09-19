@@ -40,6 +40,11 @@ def _sibling(name):
 
 
 sys.path.insert(0, str(_HERE))
+# The task-body guard is the core's: a question is user content, and the file
+# it lands in is parsed for headers. Repo root is parents[3] from here.
+sys.path.insert(0, str(_HERE.parents[2] / "src"))
+from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
+
 pr = _sibling("pool_roster")
 rt = _sibling("pool_router")
 sup = _sibling("pool_supervise")
@@ -100,17 +105,19 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
              f"(the asker reads the file directly; nothing is posted to a room).")
     # A collaborator at team tier by default, so cron-gate and the shepherds never
     # read a standing ask as the owner waiting; relayed content keeps its own tier.
+    sender, origin_of = header_safe_value(sender), header_safe_value(relayed_from or "")
     lines = [f"id: {task_id}", f"timestamp: {ts}", f"source: {SOURCE}",
              f"sender_name: {sender}", f"reply_to_instance: {sender}",
              f"access_tier: {tier}", "priority: low"]
-    if relayed_from:
-        lines.append(f"relayed_from: {relayed_from.strip()}")
+    if origin_of:
+        lines.append(f"relayed_from: {origin_of}")
     elif tier == "team":
         lines.append("collaborator: true")
     if to != pr.CORE:
         lines.append(f"requested_worker: {to}")
-    origin = f"[pool-ask from {sender}" + (f", relaying {relayed_from.strip()}" if relayed_from else "") + "]"
-    lines.append(f"task: {origin} {question.strip()}\n\n{reply}")
+    origin = f"[pool-ask from {sender}" + (f", relaying {origin_of}" if origin_of else "") + "]"
+    body = confine_user_content(question.strip())
+    lines.append(f"task: {origin} {body}\n\n{reply}")
     return "\n".join(lines) + "\n"
 
 
