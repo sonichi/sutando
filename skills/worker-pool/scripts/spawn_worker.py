@@ -137,6 +137,54 @@ def session_state(name: str, socket=None, runner=_run) -> str:
     return session_probe(name, socket, runner)[0]
 
 
+def pane_pid(name: str, socket=None, runner=_run) -> int | None:
+    """The pid of the process tmux is running in this session's one pane.
+
+    With the core's own launch command (`new-session ... claude --name ...`,
+    no wrapper shell in between), this IS the agent process itself — verified
+    live on a running worker before this was trusted, not assumed. `None`
+    when the session or its pane cannot be read; a caller treats that as
+    "no beat this time" rather than failing the whole spawn over it.
+    """
+    r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
+                "-t", name, "-F", "#{pane_pid}"])
+    out = ((getattr(r, "stdout", None) or "").strip().splitlines() or [""])[0]
+    return int(out) if out.isdigit() else None
+
+
+def start_worker_beat(workspace, worker_id: str, watch_pid: int, *,
+                      repo=None, popen=subprocess.Popen) -> bool:
+    """Fire-and-forget `state/workers/<id>.alive`, watching the agent pid by
+    signal rather than by parentage.
+
+    Why not `--parent-pid`: nothing this module can spawn is born (and STAYS)
+    a direct OS child of the tmux pane's process — the pid `popen` returns
+    here is a child of THIS process, spawn_worker.py, which exits once the
+    caller's CLI invocation is done; the beat writer is then reparented to
+    PID 1 within moments. `--watch-pid` doesn't care: it asks about
+    `watch_pid` by signal, not about its own ancestry, so that reparenting is
+    harmless — proven live in tests/worker-writes-its-beat.test.sh (spawned
+    the same detached way, SIGKILL of the watched pid, beat writer exits
+    within ~2s; SIGKILL of the beat writer alone leaves the watched pid
+    untouched).
+
+    Never raises: a beat that fails to start is a `state: live, beat: absent`
+    worker, which the roster's own three-state design already tolerates —
+    not a reason to roll back an otherwise-successful spawn.
+    """
+    script = Path(repo or _REPO) / "skills" / "worker-pool" / "scripts" / "pool_beat.py"
+    if not script.is_file():
+        return False
+    try:
+        popen([sys.executable, str(script), "--workspace", str(workspace),
+              "--kind", "worker", "--id", worker_id, "--watch-pid", str(watch_pid)],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
 def session_exists(name: str, socket=None, runner=_run) -> bool:
     """Kept for callers that only ask the yes/no question; "unknown" is not a
     "no", so it answers True and they refuse rather than proceed."""
@@ -298,7 +346,15 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
-    return {**p, **rec, "runtime_session_id": session_id, "started": True}
+    # Best-effort: a beat that fails to start is `state: live, beat: absent`,
+    # which the roster's own three-state design already tolerates.
+    beat_started = False
+    watch_pid = pane_pid(name, socket, runner)
+    if watch_pid is not None:
+        beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
+
+    return {**p, **rec, "runtime_session_id": session_id, "started": True,
+            "beat_started": beat_started}
 
 
 def main(argv=None) -> int:
