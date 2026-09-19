@@ -68,6 +68,26 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     checks[f"{name}: the refusal tells the operator how to pin it"] = \
         bool(m) and "SUTANDO_TASK_EVENT_HANDLER" in m.group(1)
 
+# Property 4a: the self-heal gate, against the canonical module (a copy
+# misattributes coverage); publish is mocked so this touches no real file.
+import importlib.util as _ilu
+import unittest.mock as _mock
+_spec = _ilu.spec_from_file_location(
+    "pool_roster_canonical", REPO / "skills/worker-pool/scripts/pool_roster.py")
+_canonical = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_canonical)
+with tempfile.TemporaryDirectory() as _d:
+    _ws_pool = pathlib.Path(_d) / "ws-pool"; (_ws_pool / "state").mkdir(parents=True)
+    _canonical._write_atomic(_canonical.roster_path(_ws_pool),
+                              {"version": 1, "workers": {"w1": {"state": "live", "label": "w1"}}})
+    with _mock.patch.object(_canonical, "publish_task_event_handler") as _pub:
+        _canonical.ensure_task_event_handler_published(_ws_pool)
+        checks["canonical: a pool with a worker calls publish"] = _pub.called
+    _ws_empty = pathlib.Path(_d) / "ws-empty"; (_ws_empty / "state").mkdir(parents=True)
+    with _mock.patch.object(_canonical, "publish_task_event_handler") as _pub2:
+        _canonical.ensure_task_event_handler_published(_ws_empty)
+        checks["canonical: no pool never calls publish"] = not _pub2.called
+
 # Property 3a: the publisher is not shipped.
 tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", "skills/worker-pool/task-event-handler"],
                          capture_output=True, text=True).stdout.strip()
