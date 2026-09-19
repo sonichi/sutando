@@ -133,6 +133,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
+- **`pool_bindings_declared.py`** — Does <state>/bindings.json declare a worker binding?
 - **`pool_record.py`** — Worker-pool completion record: who may hold one, and what one *is*.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
@@ -179,6 +180,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
+- **`skill_manifest_capability.py`** — Which installed skill provides a named capability?
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.

@@ -1,0 +1,19 @@
+{
+  "name": "worker-pool",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "One core plus N workers: a roster, owner-authored bindings, and a router that delivers a bound room's work to its worker. Config: SUTANDO_TASK_EVENT_HANDLER_SCRIPT declares this skill's router as the task-event handler the core's watcher arms when a worker is declared and nothing set SUTANDO_TASK_EVENT_HANDLER (env override wins, per skills/MANIFEST.md).",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "./scripts/pool_route_handler.py"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
