@@ -31,6 +31,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
 from delivery.readiness import read_ready_result
+from file_lock import locked_file
 from local_task_protocol import (KNOWN_HEADER_KEYS, find_archived_task,  # noqa: E402
                                  find_result,
                                  parse_task_headers_lenient)
@@ -115,29 +116,33 @@ class TasksView:
         receipt_dir = self.tasks_dir / _IDEMPOTENCY_DIR
         receipt_dir.mkdir(parents=True, exist_ok=True)
         receipt = receipt_dir / f"{digest}.task"
-        content = self._submission_text(task_id, text, priority)
-        self._create_receipt(receipt, content)
-        self._check_record(receipt, task_id, text, priority)
+        # Serialize receipt-to-public publication so a retry cannot miss a
+        # concurrent bare-to-claimed rename and recreate the bare queue entry.
+        with locked_file(receipt_dir / ".publish.lock", create_mode=0o600):
+            content = self._submission_text(task_id, text, priority)
+            self._create_receipt(receipt, content)
+            self._check_record(receipt, task_id, text, priority)
 
-        public = self.tasks_dir / f"{task_id}.txt"
-        task_record = (find_task_file(self.tasks_dir, task_id)
-                       or find_archived_task(self.tasks_dir, task_id))
-        if task_record is not None:
-            self._check_record(task_record, task_id, text, priority,
-                               canonical=receipt)
-        elif find_result(self.results_dir, task_id) is None:
-            try:
-                os.link(receipt, public)
-            except FileExistsError:
-                winner = (find_task_file(self.tasks_dir, task_id)
-                          or find_archived_task(self.tasks_dir, task_id))
-                if winner is not None:
-                    self._check_record(winner, task_id, text, priority,
-                                       canonical=receipt)
-                elif find_result(self.results_dir, task_id) is None:
-                    raise RuntimeError(
-                        "idempotent task publication outcome is unknown")
-        return {"taskId": task_id, "state": self.status(task_id)["state"]}
+            public = self.tasks_dir / f"{task_id}.txt"
+            task_record = (find_task_file(self.tasks_dir, task_id)
+                           or find_archived_task(self.tasks_dir, task_id))
+            if task_record is not None:
+                self._check_record(task_record, task_id, text, priority,
+                                   canonical=receipt)
+            elif find_result(self.results_dir, task_id) is None:
+                try:
+                    os.link(receipt, public)
+                except FileExistsError:
+                    winner = (find_task_file(self.tasks_dir, task_id)
+                              or find_archived_task(self.tasks_dir, task_id))
+                    if winner is not None:
+                        self._check_record(winner, task_id, text, priority,
+                                           canonical=receipt)
+                    elif find_result(self.results_dir, task_id) is None:
+                        raise RuntimeError(
+                            "idempotent task publication outcome is unknown")
+            return {"taskId": task_id,
+                    "state": self.status(task_id)["state"]}
 
     def _validated_submission(self, task_text: str, priority: str) -> str:
         text = _one_line(task_text)

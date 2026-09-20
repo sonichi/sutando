@@ -389,6 +389,59 @@ class TasksViewIdempotencyTests(unittest.TestCase):
         self.assertEqual(len(self._public_tasks()), 1)
         self.assertEqual(len(self._receipts()), 1)
 
+    def test_retry_cannot_republish_while_first_copy_is_claimed(self):
+        import tasks_view as tasks_view_module
+
+        real_find = tasks_view_module.find_task_file
+        real_link = tasks_view_module.os.link
+        roles = threading.local()
+        publisher_at_link = threading.Event()
+        retry_scanned = threading.Event()
+        publisher_claimed = threading.Event()
+
+        def coordinated_find(tasks_dir, task_id):
+            found = real_find(tasks_dir, task_id)
+            if getattr(roles, "name", "") == "retry" and not publisher_claimed.is_set():
+                retry_scanned.set()
+                if not publisher_claimed.wait(3):
+                    raise RuntimeError("publisher did not reach the claimed state")
+            return found
+
+        def publish_then_claim(source, destination):
+            destination = Path(destination)
+            if destination.parent == self.tasks and getattr(roles, "name", "") == "publisher":
+                publisher_at_link.set()
+                retry_scanned.wait(0.5)
+                real_link(source, destination)
+                destination.rename(destination.with_name(
+                    f"{destination.stem}.claimed-core-1.txt"))
+                publisher_claimed.set()
+                return
+            return real_link(source, destination)
+
+        def submit(role):
+            roles.name = role
+            return TasksView(
+                self.tasks, self.results,
+                "@owner:example.org").submit_idempotent(
+                    "one action", idempotency_key="claim-transition")
+
+        with unittest.mock.patch.object(tasks_view_module, "find_task_file",
+                                         coordinated_find), \
+                unittest.mock.patch.object(tasks_view_module.os, "link",
+                                           publish_then_claim), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            publisher = pool.submit(submit, "publisher")
+            self.assertTrue(publisher_at_link.wait(3))
+            retry = pool.submit(submit, "retry")
+            first, second = publisher.result(4), retry.result(4)
+
+        self.assertEqual(first["taskId"], second["taskId"])
+        claimed = self.tasks / f"{first['taskId']}.claimed-core-1.txt"
+        self.assertTrue(claimed.is_file())
+        self.assertFalse((self.tasks / f"{first['taskId']}.txt").exists())
+        self.assertEqual(len(list(self.tasks.glob(f"{first['taskId']}.*"))), 1)
+
     def test_concurrent_key_collision_fails_closed(self):
         start = threading.Barrier(2)
 
