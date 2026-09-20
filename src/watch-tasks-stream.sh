@@ -80,6 +80,8 @@ source "$__SCRIPT_DIR/watcher_sentinel.sh"
 source "$__SCRIPT_DIR/task-emit.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
+# shellcheck source=agent/task-event-handler-lookup.sh
+source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -259,6 +261,23 @@ publish_terminal_failure() {
   [ "$rc" -eq 0 ] && settle_worker_record "$filename"
   return "$rc"
 }
+
+# Only core makes a routing decision (should this task go to a bound worker);
+# a worker's own inbox already IS that decision, made by whoever delivered the
+# sentinel there (#4502). So a worker never probes a handler, regardless of
+# SUTANDO_TASK_EVENT_HANDLER, and only core's branch resolves one at all.
+#
+# Core resolves it here, in-process, on every watcher start instead of relying
+# on a value inherited from launch: a manual re-arm (e.g. Monitor's 30-min
+# expiry) starts a fresh subprocess whose env does not reliably carry whatever
+# start-cli.sh exported at the original launch, and a forgotten pin silently
+# misroutes every task to the live core (#4502's live incident).
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    ensure_task_event_handlers_published "$__REPO_ROOT" || true
+    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$__REPO_ROOT")" || SUTANDO_TASK_EVENT_HANDLER=""
+  fi
+fi
 
 if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
