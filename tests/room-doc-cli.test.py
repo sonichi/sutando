@@ -216,6 +216,59 @@ def test_doctor_names_the_refusal_as_the_connect_step():
     assert rc == 2 and "FAIL  connect  refused (403)" in out, out
 
 
+def test_doctor_stops_at_missing_deps_and_says_how_to_install():
+    """A None entry in sys.modules makes `import websockets` raise ImportError,
+    which is what a bare interpreter without the requirements does."""
+    import sys
+    saved = sys.modules.get("websockets")
+    sys.modules["websockets"] = None  # type: ignore[assignment]
+    try:
+        rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "REMOTE_TASK_URL": "https://h/relay"})
+    finally:
+        if saved is None:
+            sys.modules.pop("websockets", None)
+        else:
+            sys.modules["websockets"] = saved
+    assert rc == 2 and "FAIL  deps" in out and "requirements.txt" in out, out
+    assert "token" not in out, "stops at the first failing step"
+
+
+def test_run_dispatches_doctor_before_opening_any_socket():
+    """`run()` must answer doctor without a connection: that is the command
+    an agent runs BEFORE it knows whether a connection is possible."""
+    import asyncio
+    import contextlib
+    import io
+    import types
+
+    import room_doc_client
+    real = room_doc_client.open_room_doc
+    calls = []
+
+    @contextlib.asynccontextmanager
+    async def opener(url, room, token, kind=None, insecure=False):
+        calls.append(room)
+        yield _Doc()
+
+    room_doc_client.open_room_doc = opener
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k in room_doc.TOKEN_VARS + room_doc.URL_VARS}
+    os.environ["REMOTE_TASK_TOKEN"] = "t"
+    os.environ["REMOTE_TASK_URL"] = "https://h/relay"
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = asyncio.run(room_doc.run(types.SimpleNamespace(
+                command="doctor", room="!r:x", kind="markdown", token=None, url=None,
+                insecure=False, name=None, user_id=None, json=False, settle=0,
+                with_authors=False)))
+    finally:
+        room_doc_client.open_room_doc = real
+        for k in room_doc.TOKEN_VARS + room_doc.URL_VARS:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+    assert rc == 0 and calls == ["!r:x"], (rc, calls, out.getvalue())
+
+
 def test_a_missing_url_names_its_variables():
     clear_env()
     try:
