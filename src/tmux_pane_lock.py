@@ -4,13 +4,17 @@ scripts/tmux-pane-lock.sh stays the single owner of the lock-path derivation, so
 Python writer and a shell writer contend for the same file.
 """
 
-import fcntl
 import os
 import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # Windows: this pane-writer lock is POSIX/tmux-only, but
+    fcntl = None             # health-check.py and core-input-watch.py import it unconditionally.
 
 REPO_ROOT = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — locates the CODE script scripts/tmux-pane-lock.sh
 DEFAULT_TIMEOUT = 5.0
@@ -34,6 +38,8 @@ def flock_fd(fd: int, timeout: Optional[float] = None) -> bool:
     The one acquisition for every pane writer: scripts/tmux-pane-lock.bash calls this
     via the CLI below on a caller-chosen fd, so shell and Python cannot drift apart.
     """
+    if fcntl is None:
+        return False  # Windows: no tmux pane to hold this lock for; never claim one
     if timeout is None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return True
