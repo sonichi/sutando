@@ -144,10 +144,9 @@ class RoomDoc:
         Read-only on purpose: this map is the server's, and a client that wrote
         to it would be claiming an identity rather than reporting one.
         """
-        try:
-            authors = self._doc.get(AUTHORS_KEY, type=Map)
-        except Exception:  # noqa: BLE001 - an absent map is simply no attribution
-            return {}
+        # No guard needed: resolving the key as a Map never raises, even when it
+        # holds another type, and a non-dict value is filtered below.
+        authors = self._doc.get(AUTHORS_KEY, type=Map)
         return {str(k): dict(v) for k, v in authors.items() if isinstance(v, dict)}
 
     def wrote(self, client_id: int | str) -> dict | None:

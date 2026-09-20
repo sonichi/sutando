@@ -27,8 +27,9 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-doc kanban convergence: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_kanban import (CARDS_KEY, changed, delete_card, in_column,  # noqa: E402
-                         is_card, is_newer, live_cards, orphaned_cards)
+from room_kanban import (CARDS_KEY, changed, delete_card,  # noqa: E402
+                         describe_invalid, in_column, is_card, is_column,
+                         is_newer, live_cards, orphaned_cards)
 
 FAILS = []
 
@@ -249,6 +250,54 @@ def test_no_columns_at_all_makes_every_live_card_an_orphan():
     empty, every card is unreachable and all of them must be reported."""
     cards = [("c1", card("todo", 1, "@a")), ("c2", card("doing", 1, "@a", ident="c2"))]
     assert {c["id"] for c in orphaned_cards(cards, [])} == {"c1", "c2"}
+
+
+def test_every_way_a_card_can_be_refused():
+    """An agent writes this map directly, so each rejection is a real guard:
+    one malformed record reaches the panel as a card it cannot draw."""
+    ok = card("todo", 1, "@a")
+    assert not is_card({**ok, "id": ""}), "empty id"
+    assert not is_card({**ok, "id": 7}), "non-string id"
+    assert not is_card(ok, "other"), "id must equal its key"
+    assert not is_card({**ok, "column": ""}), "a card must live somewhere"
+    assert not is_card({**ok, "column": None}), "non-string column"
+    assert not is_card({**ok, "text": 7}), "text must be a string when present"
+    assert not is_card({**ok, "assignee": []}), "assignee must be a string"
+    assert not is_card({**ok, "by": {}}), "by must be a string"
+    assert not is_card({**ok, "order": "first"}), "order must be a number"
+    assert not is_card("not a dict") and not is_card(None)
+    # and the control: none of those rejections came from the base card
+    assert is_card(ok, "c1")
+
+
+def test_optional_card_fields_may_be_absent_or_null():
+    """Rejecting a null optional would refuse cards the panel writes."""
+    bare = {"id": "c1", "column": "todo", "updated": 1}
+    assert is_card(bare, "c1")
+    assert is_card({**bare, "text": None, "assignee": None, "by": None, "order": None})
+
+
+def test_every_way_a_column_can_be_refused():
+    good = {"id": "todo", "title": "To do", "updated": 1}
+    assert is_column(good, "todo")
+    assert not is_column({**good, "id": ""}), "empty id"
+    assert not is_column(good, "other"), "id must equal its key"
+    assert not is_column({**good, "title": 7}), "title must be a string"
+    assert not is_column({k: v for k, v in good.items() if k != "updated"}), "needs updated"
+    assert not is_column({**good, "updated": "soon"}), "updated must be ms"
+    assert not is_column(None) and not is_column([])
+
+
+def test_describe_invalid_names_the_reason_for_each_refusal():
+    """A silent drop is the failure this module exists to prevent, so the
+    caller gets a reason it can print rather than a bare False."""
+    ok = card("todo", 1, "@a")
+    assert "not an object" in describe_invalid("nope")
+    assert "id" in describe_invalid({**ok, "id": ""})
+    assert "does not match its key" in describe_invalid(ok, "other")
+    assert "column" in describe_invalid({**ok, "column": ""})
+    assert "INTEGER milliseconds" in describe_invalid({**ok, "updated": "soon"})
+    assert describe_invalid(ok, "c1") == "valid", "a control: a good card says so"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
