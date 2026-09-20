@@ -83,6 +83,34 @@ python3 $P --name mars read '!room:server'            # publish presence while c
 
 Add `--insecure` only for a local rig with a self-signed certificate.
 
+## Staying in the document
+
+A `read` or `append` connects, acts and leaves. To be **in** the document the
+way a person is — told the moment a new line names you, with nobody pinging
+you in the room — hold it open:
+
+```bash
+python3 $P watch '!room:server' --for mars --for '@you:server'   # one line per new mention
+#   MENTION<TAB>@mars can you take the second section?
+```
+
+It prints nothing until something addressed to you lands, and exits (rc 2,
+with the reason) only when the session ends — so silence means "nothing yet",
+never "not watching". Run it under a monitor and act on each line; reply with
+`append` from another invocation, or from the library:
+
+```python
+async with open_room_doc(url, room_id, token) as doc:
+    seen = doc.text
+    async for text in doc.changes():          # every REMOTE edit, as the text after it
+        for line in addressed_to(new_lines(seen, text), ["mars"]):
+            ...                                # act, then doc.append(...) your reply
+        seen = text
+```
+
+Your own writes are not reported. A bare name in prose ("for mars") is not a
+mention; the `@` is what addresses you, and the summon always writes it.
+
 ## The whiteboard is a different document
 
 A room's board is a second document kind — `?kind=board` — and it holds a **map

@@ -199,6 +199,22 @@ async def doctor(args: argparse.Namespace) -> int:
         say("connect", False, str(exc))
         return 2
     print("  all steps passed — connected and read; writes go over this same connection")
+
+
+async def watch(doc, args: argparse.Namespace) -> int:
+    """Hold the document open and print each new line addressed to `--for`,
+    one per line, as it lands. Exits only when the session ends (rc 2)."""
+    from room_doc_watch import addressed_to, new_lines
+
+    handles = args.handles or []
+    seen = doc.text
+    print(f"watching {args.room} for {handles or 'every new line'} "
+          f"({len(seen)} chars now)", flush=True)
+    async for text in doc.changes():
+        fresh = new_lines(seen, text)
+        seen = text
+        for line in (addressed_to(fresh, handles) if handles else fresh):
+            print(f"MENTION\t{line}" if handles else f"LINE\t{line}", flush=True)
     return 0
 
 
@@ -249,6 +265,9 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "watch":
+            return await watch(doc, args)
+
         before = len(doc.text)
         if args.command == "append":
             await doc.append(args.text)
@@ -282,6 +301,11 @@ def build_parser() -> argparse.ArgumentParser:
                             ("doctor", "check deps, credential, URL and connection, step by step")):
         s = sub.add_parser(name, help=help_text)
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("watch", help="hold the document open; print new lines naming --for")
+    s.add_argument("room")
+    s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
+                   help="a name or @mxid to watch for (repeatable); none = every new line")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")

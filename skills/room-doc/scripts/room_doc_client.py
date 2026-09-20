@@ -366,6 +366,39 @@ class RoomDoc:
         except RoomDocError:
             pass
 
+    async def changes(self) -> AsyncIterator[str]:
+        """Every remote edit to the text, yielded as the text after it landed.
+
+        The connection is held for as long as the caller iterates. Local
+        writes are not reported: the caller made them. Ends when the session
+        does, by raising the close reason rather than stopping quietly — a
+        watcher that exits silently looks exactly like one that saw nothing.
+        """
+        text = self._require_text("watch text")
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def on_text(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin != LOCAL_ORIGIN:
+                queue.put_nowait(str(text))
+
+        sub = text.observe(on_text)
+        ended = asyncio.ensure_future(self._ended)
+        try:
+            while True:
+                got = asyncio.ensure_future(queue.get())
+                done, _ = await asyncio.wait({got, ended}, return_when=asyncio.FIRST_COMPLETED)
+                if got in done:
+                    yield got.result()
+                else:
+                    got.cancel()
+                    raise RoomDocError(
+                        f"the document session has ended: {close_reason(ended.result())}")
+        finally:
+            text.unobserve(sub)
+            if not ended.done():
+                ended.cancel()
+
     async def reconcile(self, elements: list[dict] | None = None) -> int:
         """Re-assert elements now. Rarely needed by hand — `put_elements` arms
         an observer that does this on every remote change."""
