@@ -263,19 +263,6 @@ publish_terminal_failure() {
 # shellcheck source=agent/task-event-handler-lookup.sh
 . "$__REPO_ROOT/src/agent/task-event-handler-lookup.sh"
 
-# Resolved per task, never captured at start: a handler installed, changed or
-# removed after this process booted takes effect on the next task, not a restart.
-task_event_handler() {
-  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    # An explicit pin that is not runnable is an operator error, not "unrouted":
-    # falling back to the lookup would silently route somewhere else.
-    [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
-    printf '%s\n' "$SUTANDO_TASK_EVENT_HANDLER"
-    return 0
-  fi
-  resolve_task_event_handler "$__REPO_ROOT"
-}
-
 # Idempotent, and called both at start (when a handler already resolves) and on
 # the first routed task, so a handler installed later still gets its queue.
 ensure_dispatch_ready() {
@@ -295,7 +282,7 @@ ensure_dispatch_ready() {
 
 # Prepare at start when a handler already resolves, so claims and fallback
 # receipts keep landing under the resolved workspace from the first moment.
-task_event_handler >/dev/null 2>&1 && ensure_dispatch_ready
+task_event_handler "$__REPO_ROOT" >/dev/null 2>&1 && ensure_dispatch_ready
 
 acquire_dispatch_lock() {
   [ -n "$DISPATCH_DIR" ] || return 1
@@ -434,7 +421,7 @@ drain_dispatch_queue() {
     : > "$worker_receipt"
     # Resolved here, not at queue time: a receipt may outlive the handler that
     # queued it, and the task must run under whatever provides one NOW.
-    if ! handler="$(task_event_handler)"; then
+    if ! handler="$(task_event_handler "$__REPO_ROOT")"; then
       release_dispatch_lock
       finish_handler_task "$running_marker" "$task_path" 1
       return
@@ -527,7 +514,7 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  handler="$(task_event_handler)"; hrc=$?
+  handler="$(task_event_handler "$__REPO_ROOT")"; hrc=$?
   if [ "$hrc" -eq 1 ]; then
     # No provider declares one: the ordinary unrouted case, safe for the live core.
     emit_dispatch_task_file "$announce"

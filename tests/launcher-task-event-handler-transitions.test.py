@@ -72,6 +72,15 @@ for name, path in (("claude", CLAUDE), ("codex", CODEX)):
     checks[f"{name}: the refusal tells the operator how to pin it"] = \
         bool(m) and "SUTANDO_TASK_EVENT_HANDLER" in m.group(1)
 
+    # An operator pin and the launcher's own boot-time cache must stay
+    # distinguishable, or only the cache ever reaches the notifier's env.
+    pin_at = t.find("operator_pinned_handler=")
+    checks[f"{name}: captures the operator's own pin before the boot-time resolve"] = \
+        0 < pin_at < resolve_at
+    forward_m = re.search(r'NOTIFIER_ENV_ARGS\+=\(-e "SUTANDO_TASK_EVENT_HANDLER=([^"]+)"\)', t)
+    checks[f"{name}: forwards only the captured operator pin, not the launcher's own resolution"] = \
+        bool(forward_m) and forward_m.group(1) == "$operator_pinned_handler"
+
 # RETIRED proof (was properties 4a/4b): both the self-heal gate and its hook are deleted.
 checks["ensure_task_event_handler_published is removed from pool_roster.py"] = \
     "ensure_task_event_handler_published" not in (REPO / "skills/worker-pool/scripts/pool_roster.py").read_text()

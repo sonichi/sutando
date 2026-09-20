@@ -185,6 +185,9 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
+  # Captured before the resolve-if-unset below overwrites the var: only a
+  # genuine pin, never our own boot-time cache, may reach the notifier's env.
+  local operator_pinned_handler="${SUTANDO_TASK_EVENT_HANDLER:-}"
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
@@ -222,7 +225,9 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # Only a genuine operator pin is forwarded. task-notifier.sh and the
+  # watch-tasks-stream.sh it spawns both re-resolve live when this is unset.
+  [ -n "$operator_pinned_handler" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$operator_pinned_handler")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")

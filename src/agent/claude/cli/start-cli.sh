@@ -764,6 +764,9 @@ resolve_core_target() {
 # pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
 ensure_task_notifier() {
   local expected_version active_version version_files notifier_py
+  # Captured before the resolve-if-unset below overwrites the var: only a
+  # genuine pin, never our own boot-time cache, may reach the notifier's env.
+  local operator_pinned_handler="${SUTANDO_TASK_EVENT_HANDLER:-}"
   [ -z "$WORKER_INSTANCE" ] || return 0   # the notifier serves the core alone
   resolve_core_target
   # The launcher-resolved interpreter or nothing: a bare PATH python3 on a Mac
@@ -812,8 +815,9 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
-  # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # Only a genuine operator pin is forwarded. task-notifier.sh and the
+  # watch-tasks-stream.sh it spawns both re-resolve live when this is unset.
+  [ -n "$operator_pinned_handler" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$operator_pinned_handler")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_WINDOW=${CORE_WINDOW:-0}")
   [ -n "$CORE_PANE" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TMUX_PANE=$CORE_PANE")

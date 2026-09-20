@@ -77,3 +77,17 @@ EOF
     *) printf 'task-event-handler: %s skills declare %s (%s); set SUTANDO_TASK_EVENT_HANDLER explicitly\n' "$#" "$TASK_EVENT_HANDLER_CAPABILITY" "$*" >&2; return 2 ;;
   esac
 }
+
+# task_event_handler <repo> -> path (rc 0) | rc 1 none/broken pin | rc 2 cannot tell
+#
+# Call fresh for every task, never once at process start or cached in a var
+# that outlives the call: an explicit pin always wins over resolution.
+task_event_handler() {
+  local repo="$1"
+  if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 1
+    printf '%s\n' "$SUTANDO_TASK_EVENT_HANDLER"
+    return 0
+  fi
+  resolve_task_event_handler "$repo"
+}
