@@ -88,14 +88,17 @@ def test_truncated_frames_raise_rather_than_short_read():
 
 def test_url_quotes_the_whole_room_id():
     url = doc_socket_url("https://chat.ag2.space", "!abc:ag2.space")
-    assert url == "wss://chat.ag2.space/api/v1/room-doc/%21abc%3Aag2.space/ws", url
+    assert url == "wss://chat.ag2.space/api/v1/room-collab/%21abc%3Aag2.space/ws", url
     assert "!" not in url and ":ag2" not in url, "a bare ! or : would split the path"
 
 
 def test_url_upgrades_the_scheme_and_does_not_double_the_prefix():
     assert doc_socket_url("http://localhost:9996", "!r:s").startswith("ws://")
     assert doc_socket_url("https://h", "!r:s").startswith("wss://")
-    assert doc_socket_url("wss://h/api/v1/room-doc", "!r:s").count("/api/v1/room-doc") == 1
+    assert doc_socket_url("wss://h/api/v1/room-collab", "!r:s").count("/api/v1/room-collab") == 1
+    # An explicit old path is kept as given for the alias window, never doubled.
+    old = doc_socket_url("wss://h/api/v1/room-doc", "!r:s")
+    assert old.startswith("wss://h/api/v1/room-doc/") and "room-collab" not in old, old
 
 
 def test_url_refuses_what_it_cannot_derive_a_socket_from():

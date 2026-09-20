@@ -1,14 +1,14 @@
 {
   "skills/agent-room-ops/doc_sync.py": 9,
   "skills/install.sh": 6,
-  "skills/room-collab/SKILL.md": 5,
+  "skills/room-collab/SKILL.md": 6,
   "skills/room-collab/scripts/room_collab.py": 3,
-  "skills/room-collab/scripts/room_collab_protocol.py": 2,
+  "skills/room-collab/scripts/room_collab_protocol.py": 1,
   "skills/room-collab/scripts/room_doc.py": 2,
   "skills/room-doc/scripts/room_doc.py": 1,
   "tests/room-collab-cli.test.py": 4,
   "tests/room-collab-install-alias.test.py": 15,
   "tests/room-collab-lifecycle.test.py": 1,
-  "tests/room-collab-protocol.test.py": 3,
+  "tests/room-collab-protocol.test.py": 2,
   "tests/room-collab-sync.test.py": 2
 }
