@@ -68,6 +68,15 @@ ensure_task_notifier() {
     || echo "  ⚠ agy task notifier exited immediately after starting — tasks will not reach this session" >&2
 }
 
+attach_or_report_existing() {
+  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+    echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
+    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+  fi
+  echo "$SESSION already running."
+  exit 0
+}
+
 # `agy` exposes no dedicated auth-status subcommand; `agy models` makes one
 # authenticated round trip and doubles as the lightest available probe.
 check_mode() {
@@ -125,12 +134,7 @@ fi
 # starting a duplicate session.
 if session_exists; then
   ensure_task_notifier
-  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
-    echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
-    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
-  fi
-  echo "$SESSION already running."
-  exit 0
+  attach_or_report_existing
 fi
 
 # Onboarding-skip pre-seed (see onboarding_seed.py); non-fatal — a skipped
@@ -142,7 +146,16 @@ else
   echo "  ⚠ no runnable python3 — onboarding-seed NOT applied; first launch may hit the onboarding wizard" >&2
 fi
 
-tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" agy --dangerously-skip-permissions
+# tmux serializes session creation; a nonzero rc here can be a real failure
+# or a peer that won the race above — recheck before treating it as ours.
+if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" agy --dangerously-skip-permissions; then
+  if session_exists; then
+    ensure_task_notifier
+    attach_or_report_existing
+  fi
+  echo "  ⚠ failed to start $SESSION." >&2
+  exit 1
+fi
 
 # new-session rc=0 only means tmux accepted it; poll rather than assume a
 # session whose command exited immediately is actually up.
