@@ -197,6 +197,11 @@ def canonical_shape_failure(rec) -> "dict | None":
     st = [v for v in st if v in _REFERENTS] if isinstance(st, (list, tuple)) else []
     if st:
         out["arbitrated_states"] = sorted(set(st))
+    if out["kind"] in (INVALID_KIND, OVERFLOW_KIND):
+        # Reserved kinds are pathless by design (schema.md) -- also true for a
+        # kind carried in already, not just one downgraded this pass (elif above).
+        out["path"] = None
+        out.pop(PATH_ENCODING_FIELD, None)
     return out
 
 

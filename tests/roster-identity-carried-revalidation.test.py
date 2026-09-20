@@ -16,6 +16,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]
                        / "skills/collaboration-intelligence/scripts"))
 import migrate_roster_identity as m  # noqa: E402
+import roster_identity as ri  # noqa: E402
 
 SCRIPT = (pathlib.Path(__file__).resolve().parents[1]
           / "skills/collaboration-intelligence/scripts/migrate_roster_identity.py")
@@ -114,6 +115,62 @@ class CarriedRevalidation(unittest.TestCase):
     def test_the_second_parser_is_GONE(self):
         """Delegation is the point; a surviving copy would drift again."""
         self.assertFalse(hasattr(m, "_mineable_now"))
+
+
+class ReservedKindsStayPathlessAcrossCanonicalization(unittest.TestCase):
+    """A carried record already marked `kind=invalid`/`arbitration-overflow`
+    kept its readable `path` when THIS pass's `arbitrated_ids` happened to read
+    cleanly — only a record downgraded to a reserved kind IN THE SAME PASS was
+    forced pathless. `must_keep()` says a reserved kind blocks; `_still_unresolved`
+    only consults `must_keep()` for PATHLESS records, so the lingering path routed
+    a still-blocking refusal through the ordinary path-repair check instead, and a
+    clean re-read at that path silently discharged it (keweichen/qingyun-wu,
+    #3537 review at 1c9d05a3d)."""
+
+    def test_a_carried_INVALID_record_stays_pathless_even_when_ids_now_read_clean(self):
+        carried = {"kind": ri.INVALID_KIND, "reason": "previously flagged",
+                   "path": "human.account.user_id", "arbitrated_ids": [H]}
+        out = ri.canonical_shape_failure(carried)
+        self.assertEqual(out["kind"], ri.INVALID_KIND)
+        self.assertIsNone(out["path"])
+        self.assertTrue(ri.must_keep(out))
+
+    def test_a_carried_OVERFLOW_record_stays_pathless_too(self):
+        carried = {"kind": ri.OVERFLOW_KIND, "reason": "aggregated overflow",
+                   "path": "human.account.user_id", "arbitrated_ids": [H]}
+        out = ri.canonical_shape_failure(carried)
+        self.assertEqual(out["kind"], ri.OVERFLOW_KIND)
+        self.assertIsNone(out["path"])
+
+    def test_control_a_NON_reserved_carried_record_keeps_its_path(self):
+        """The fix must not blank every path -- only reserved kinds are pathless."""
+        carried = {"kind": "contested", "reason": "two stands disagree",
+                   "path": "human.account.user_id", "arbitrated_ids": [H]}
+        out = ri.canonical_shape_failure(carried)
+        self.assertEqual(out["path"], "human.account.user_id")
+
+    def test_control_a_FRESH_downgrade_this_pass_still_goes_pathless(self):
+        """The pre-existing elif branch (this pass's own malformed ids) must
+        keep working -- the fix only widens the invariant, not narrows it."""
+        fresh = {"kind": "contested", "reason": "x",
+                 "path": "human.account.user_id", "arbitrated_ids": ""}
+        out = ri.canonical_shape_failure(fresh)
+        self.assertEqual(out["kind"], ri.INVALID_KIND)
+        self.assertIsNone(out["path"])
+
+    def test_end_to_end_a_reserved_kind_does_not_silently_discharge(self):
+        """Practical consequence, through `_still_unresolved`: pre-fix, the
+        readable lingering path made this reserved-kind carried record look
+        like an ordinary repairable finding, and a clean re-read at that path
+        dropped it -- even though nothing about ITS OWN malformed-ids reason was
+        addressed. Post-fix the pathless branch's `must_keep()` keeps it."""
+        entry = {"human": {"provider": "discord", "account": {"user_id": H}}}
+        carried = {"kind": ri.INVALID_KIND, "reason": "previously flagged",
+                   "path": "human.account.user_id", "arbitrated_ids": [H]}
+        canon = ri.canonical_shape_failure(carried)
+        self.assertTrue(m._still_unresolved(entry, canon, set()),
+                         "a reserved-kind refusal was discharged by an "
+                         "unrelated clean value at its stale lingering path")
 
 
 class ThroughTheCLI(unittest.TestCase):
