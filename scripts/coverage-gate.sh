@@ -25,6 +25,10 @@
 #   bash scripts/coverage-gate.sh                 # gate vs origin/main
 #   BASE_REF=<ref> bash scripts/coverage-gate.sh  # gate vs another base
 #   COVERAGE_GATE_FAIL_UNDER=90 bash scripts/coverage-gate.sh  # override bar
+#   COVERAGE_GATE_PRECOMPUTED=1 bash scripts/coverage-gate.sh
+#       # skip step 1: gate an existing .coverage + coverage.xml in cwd (what
+#       # ci.yml does — its python-standalone-tests job is the one instrumented
+#       # run, and the coverage-gate job downloads its data rather than run again)
 #
 # Deps (dev-only, mirrors detect-secrets handling in ci.yml):
 #   python3 -m pip install coverage diff-cover
@@ -79,6 +83,17 @@ if ! git diff --name-only "$BASE"...HEAD -- '*.py' | grep -q .; then
     exit 0
 fi
 
+# ci.yml runs the suite under instrumentation exactly once and hands the
+# combined data here, so the gate never runs the suite a second time.
+if [ -n "${COVERAGE_GATE_PRECOMPUTED:-}" ]; then
+if [ ! -f .coverage ] || [ ! -f coverage.xml ]; then
+    echo "coverage-gate: COVERAGE_GATE_PRECOMPUTED is set but .coverage / coverage.xml are not both present." >&2
+    echo "  The instrumented suite run must produce and hand over both files." >&2
+    exit 2
+fi
+echo "coverage-gate: using precomputed coverage data (.coverage, coverage.xml)."
+rm -f diff-cover.md
+else
 echo "coverage-gate: running Python suite under instrumentation..."
 rm -f .coverage coverage.xml diff-cover.md
 find . -maxdepth 1 -name '.coverage.*' -delete
@@ -191,6 +206,7 @@ fi
 
 python3 -m coverage combine --quiet
 python3 -m coverage xml --quiet
+fi
 
 echo
 echo "── whole-tree coverage (informational) ─────────────────────────"
