@@ -267,7 +267,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
-- **`task-event-handler-lookup.sh`** — The task-event handler is declared by writing a small JSON config file:
+- **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.
 
 ## `src/agent/claude/cli/`
 
