@@ -88,14 +88,18 @@ IF `$SUTANDO_POOL_BOOT_SWEEP` is set (declared by an installed skill's `manifest
 if [ -n "$SUTANDO_POOL_BOOT_SWEEP" ]; then
   python3 "$SUTANDO_POOL_BOOT_SWEEP" --workspace "$(bash scripts/sutando-config.sh workspace)" --sweep --no-persist
   rc=$?
-  if [ "$rc" -eq 3 ]; then
-    echo "/startup: boot-time pool sweep FAILED to publish a live pool's routing declaration — refusing to start the watcher (a worker-bound task would silently fall through to core). Investigate the sweep's stderr, then re-run /startup." >&2
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 3 ]; then
+      echo "/startup: boot-time pool sweep FAILED to publish a live pool's routing declaration — refusing to start the watcher (a worker-bound task would silently fall through to core). Investigate the sweep's stderr, then re-run /startup." >&2
+    else
+      echo "/startup: boot-time pool sweep exited $rc (not 0) — refusing to start the watcher, since there is no proof a live pool's routing declaration exists. Investigate the sweep's stderr, then re-run /startup." >&2
+    fi
     exit 1
   fi
 fi
 ```
 
-`--no-persist` avoids advancing the recovery ladder from a step whose only job is the backfill. Exit code 3 is the sweep's own distinction between "no live pool" / "backfill already current" (0) and "a live pool exists but its routing declaration could not be published" (3) — the second case is a routing outage in the making, not the ordinary no-pool case, and starting the watcher anyway would silently misroute worker-bound tasks to core. Any other non-zero exit (2 = refused, invalid input) is reported the same way rather than silently ignored.
+`--no-persist` avoids advancing the recovery ladder from a step whose only job is the backfill. ANY non-zero exit refuses to start the watcher — the step has no way to prove a live pool's declaration is correctly published unless the sweep itself says so, so a crash, a refused argument, or a missing interpreter are exactly as unsafe as the sweep's own documented failure (exit 3: "a live pool exists but its routing declaration could not be published"). Only exit 3 gets the more specific diagnostic message; every other non-zero code still fails closed with a generic one, never falls through.
 
 If the variable is unset, skip silently — same contract as step 1.
 
