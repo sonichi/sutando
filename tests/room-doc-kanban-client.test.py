@@ -87,10 +87,11 @@ async def test_add_move_assign_erase_are_each_a_newer_version():
     await board.put_cards([second])
     moved = move_card(card, "doing", order_after_last(board.cards, "doing"), 20, ME)
     assert await board.put_cards([moved]) == 1
-    assert dict(board.cards[0][1])["column"] == "doing"
+    by_id = lambda: {k: dict(v) for k, v in board.cards}   # noqa: E731 — map order is not insertion order everywhere
+    assert by_id()["c1"]["column"] == "doing", by_id()
     assigned = assign_card(moved, "@you:x", 30, ME)
     await board.put_cards([assigned])
-    assert dict(board.cards[0][1])["assignee"] == "@you:x"
+    assert by_id()["c1"]["assignee"] == "@you:x", by_id()
     stale = move_card(card, "done", 0, 5, ME)                 # older than what is stored
     assert await board.put_cards([stale]) == 0, "an older version writes nothing"
 
@@ -98,7 +99,7 @@ async def test_add_move_assign_erase_are_each_a_newer_version():
 async def test_a_card_read_back_is_written_back_with_integers():
     _, board = make()
     await board.put_cards([new_card("c1", "todo", "x", 10, ME, 1024)])
-    stored = dict(board.cards[0][1])
+    stored = {k: dict(v) for k, v in board.cards}["c1"]
     assert isinstance(stored["order"], float), "premise: the CRDT hands back floats"
     await board.put_cards([assign_card(stored, "@you:x", 20, ME)])
     raw = board._doc.get(CARDS_KEY, type=Map)["c1"]
