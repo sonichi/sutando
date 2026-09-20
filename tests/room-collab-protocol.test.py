@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wire format for skills/room-doc: the parts that fail silently.
+"""Wire format for skills/room-collab: the parts that fail silently.
 
 A varint off by one, or a room id quoted wrong, raises nothing — it produces a
 frame the server discards and a document that never syncs. The module under
@@ -9,9 +9,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_doc_protocol import (  # noqa: E402
+from room_collab_protocol import (  # noqa: E402
     CLOSE_BAD_KIND, CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, RoomDocError, close_reason,
     doc_socket_url, explain, read_var_bytes, read_var_uint, write_var_bytes,
     write_var_uint,
@@ -154,8 +154,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc protocol: FAIL")
+    print("room-collab protocol: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc protocol: ok")
+print("room-collab protocol: ok")

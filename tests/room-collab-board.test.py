@@ -7,15 +7,15 @@ disagrees with the web client's loses a shape's newer version instead. Both
 look like nothing happening, which is why they are pinned here.
 
 The module under test imports nothing, so this runs wherever CI runs.
-Run: python3 tests/room-doc-board.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board.test.py  (exit 0 pass / 1 fail)
 """
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_doc_board import (  # noqa: E402
+from room_collab_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, is_newer, live_elements,
     sort_elements,
@@ -184,8 +184,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board rules: FAIL")
+    print("room-collab board rules: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board rules: ok")
+print("room-collab board rules: ok")

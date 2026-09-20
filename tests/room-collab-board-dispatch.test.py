@@ -7,7 +7,7 @@ Getting it wrong is how `peers` ended up refused on a board: the dispatch, not
 the rules, decided it.
 
 A stand-in document stands in for the socket, so no server is needed.
-Run: python3 tests/room-doc-board-dispatch.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-dispatch.test.py  (exit 0 pass / 1 fail)
 """
 import asyncio
 import contextlib
@@ -17,12 +17,12 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-import room_doc  # noqa: E402
-import room_doc_client  # noqa: E402
+import room_collab  # noqa: E402
+import room_collab_client  # noqa: E402
 
-from room_doc_protocol import RoomDocError  # noqa: E402
+from room_collab_protocol import RoomDocError  # noqa: E402
 
 FAILS = []
 
@@ -63,17 +63,17 @@ def run_cli(argv, doc):
         doc.opened_kind = kind
         yield doc
 
-    real = room_doc_client.open_room_doc
-    room_doc_client.open_room_doc = fake_open
+    real = room_collab_client.open_room_collab
+    room_collab_client.open_room_collab = fake_open
     out, err = io.StringIO(), io.StringIO()
     try:
         # main(), not run(): a refusal is turned into an exit code there, and
         # the exit code is what a caller actually sees.
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = room_doc.main(argv)
+            rc = room_collab.main(argv)
         return rc, out.getvalue()
     finally:
-        room_doc_client.open_room_doc = real
+        room_collab_client.open_room_collab = real
 
 
 def check(name, fn):
@@ -186,8 +186,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board dispatch: FAIL")
+    print("room-collab board dispatch: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board dispatch: ok")
+print("room-collab board dispatch: ok")
