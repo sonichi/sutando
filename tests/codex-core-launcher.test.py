@@ -326,22 +326,14 @@ exit 0
             if slave >= 0:
                 os.close(slave)
 
-    def _install_pool_skill(self):
-        script = self.root / "skills" / "pool" / "scripts" / "route_handler.py"
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("#!/bin/sh\nexit 0\n")
-        script.chmod(0o755)
-        link = self.root / "skills" / "pool" / "task-event-handler"
-        link.symlink_to("scripts/route_handler.py")
-        return link
-
-    def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
-        p = self._install_pool_skill()
-        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+    def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
+        # Since #4503 the launcher resolves nothing; only a genuine pin forwards.
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh",
+                                    env_extra={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"-e SUTANDO_TASK_EVENT_HANDLER={p}", self.log.read_text())
+        self.assertIn("-e SUTANDO_TASK_EVENT_HANDLER=/opt/handler", self.log.read_text())
 
-    def test_no_pool_skill_sets_no_handler(self):
+    def test_no_pin_sets_no_handler(self):
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())

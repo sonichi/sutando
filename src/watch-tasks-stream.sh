@@ -874,13 +874,16 @@ shopt -u nullglob
 # dead, the first failed write exits immediately instead of silently
 # buffering ~100 events into the kernel pipe buffer.
 #
-# HANDLER_CONFIG_PATH (core only) rides the SAME fswatch process as a second
-# path: one fswatch, one FIFO, one read-loop -- consistent with how
-# HANDLER_DONE completion signals already share this FIFO with task events.
-# A skill writing a fresh declaration (or an operator editing/removing one)
-# reaches CURRENT_HANDLER on the very next event, no watcher restart.
+# HANDLER_CONFIG_PATH's PARENT DIRECTORY (core only) rides the SAME fswatch
+# process as a second path -- not the file itself, which may not exist yet:
+# inotify (Linux) cannot reliably watch a not-yet-existent path for creation
+# the way FSEvents (macOS) can, so this uses the same directory-plus-filter
+# shape tasks/ already uses below, one fswatch, one FIFO, one read-loop.
 fswatch_paths=("$TASKS_DIR")
-[ -n "$HANDLER_CONFIG_PATH" ] && fswatch_paths+=("$HANDLER_CONFIG_PATH")
+if [ -n "$HANDLER_CONFIG_PATH" ]; then
+  mkdir -p "$(dirname "$HANDLER_CONFIG_PATH")"
+  fswatch_paths+=("$(dirname "$HANDLER_CONFIG_PATH")")
+fi
 fswatch \
   -l 0.5 \
   --event Created \

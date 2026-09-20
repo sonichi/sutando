@@ -1,5 +1,5 @@
 #!/bin/bash
-# The task-event handler is declared by writing a small JSON config file:
+# Reads the task-event handler declared in a small JSON config file.
 #
 #     <workspace>/state/task-event-handler.json   {"handler": "<abs path>"}
 #
