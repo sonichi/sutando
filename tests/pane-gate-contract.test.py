@@ -445,6 +445,18 @@ class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
         self.assertIn("retry:retrying", v.reason)
 
 
+class ANamedLoginGateOutranksCliWedgesNewCoarserLabel(unittest.TestCase):
+    """cli_wedge now recognises the login dialog's title as abnormal/needs-login
+    (a narrower fix, this repo). The gate must still report the SPECIFIC named
+    kind -- HITL's kind-string contract depends on "login", not "needs-login"."""
+
+    def test_the_named_gate_wins(self):
+        dialog = ("Select login method\n  \u276f 1. Log in with browser\n"
+                  "    2. Paste code manually\n  Esc to cancel\n")
+        v = pg.classify_pane(dialog, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "login"))
+
+
 class ARetryIsAbnormalEvenInsideARunningTurn(unittest.TestCase):
     """Owner's rule: retry means abnormal. The interrupt affordance stays on screen
     while the CLI retries, so "esc to interrupt" cannot vouch for a served turn --
