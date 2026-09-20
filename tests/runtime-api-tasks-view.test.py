@@ -12,6 +12,7 @@ Exit: 0 on pass, 1 on fail.
 """
 import asyncio
 import concurrent.futures
+import contextlib
 import sys
 import tempfile
 import threading
@@ -389,29 +390,54 @@ class TasksViewIdempotencyTests(unittest.TestCase):
         self.assertEqual(len(self._public_tasks()), 1)
         self.assertEqual(len(self._receipts()), 1)
 
-    def test_retry_cannot_republish_while_first_copy_is_claimed(self):
+    def test_retry_waits_for_publication_lock_through_claim_transition(self):
         import tasks_view as tasks_view_module
 
-        real_find = tasks_view_module.find_task_file
         real_link = tasks_view_module.os.link
         roles = threading.local()
+        lock_condition = threading.Condition()
+        lock_owner = {"role": None}
         publisher_at_link = threading.Event()
-        retry_scanned = threading.Event()
+        retry_contended = threading.Event()
+        retry_acquired_lock = threading.Event()
+        retry_acquired_before_claim = threading.Event()
         publisher_claimed = threading.Event()
 
-        def coordinated_find(tasks_dir, task_id):
-            found = real_find(tasks_dir, task_id)
-            if getattr(roles, "name", "") == "retry" and not publisher_claimed.is_set():
-                retry_scanned.set()
-                if not publisher_claimed.wait(3):
-                    raise RuntimeError("publisher did not reach the claimed state")
-            return found
+        @contextlib.contextmanager
+        def controlled_lock(path, *args, **kwargs):
+            self.assertEqual(
+                Path(path),
+                self.tasks / ".runtime-api-idempotency" / ".publish.lock")
+            role = getattr(roles, "name", "")
+            with lock_condition:
+                if role == "retry" and lock_owner["role"] is not None:
+                    retry_contended.set()
+                if not lock_condition.wait_for(
+                        lambda: lock_owner["role"] is None, timeout=3):
+                    raise RuntimeError("publication lock did not become available")
+                lock_owner["role"] = role
+            try:
+                if role == "retry":
+                    retry_acquired_lock.set()
+                    if not publisher_claimed.is_set():
+                        retry_acquired_before_claim.set()
+                yield
+            finally:
+                with lock_condition:
+                    lock_owner["role"] = None
+                    lock_condition.notify_all()
 
         def publish_then_claim(source, destination):
             destination = Path(destination)
             if destination.parent == self.tasks and getattr(roles, "name", "") == "publisher":
                 publisher_at_link.set()
-                retry_scanned.wait(0.5)
+                if not retry_contended.wait(3):
+                    raise RuntimeError("retry did not contend on the publication lock")
+                if retry_acquired_lock.is_set():
+                    raise RuntimeError("retry acquired the publication lock too early")
+                with lock_condition:
+                    if lock_owner["role"] != "publisher":
+                        raise RuntimeError("publisher lost the lock before claiming")
                 real_link(source, destination)
                 destination.rename(destination.with_name(
                     f"{destination.stem}.claimed-core-1.txt"))
@@ -426,8 +452,8 @@ class TasksViewIdempotencyTests(unittest.TestCase):
                 "@owner:example.org").submit_idempotent(
                     "one action", idempotency_key="claim-transition")
 
-        with unittest.mock.patch.object(tasks_view_module, "find_task_file",
-                                         coordinated_find), \
+        with unittest.mock.patch.object(tasks_view_module, "locked_file",
+                                         controlled_lock), \
                 unittest.mock.patch.object(tasks_view_module.os, "link",
                                            publish_then_claim), \
                 concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -437,6 +463,9 @@ class TasksViewIdempotencyTests(unittest.TestCase):
             first, second = publisher.result(4), retry.result(4)
 
         self.assertEqual(first["taskId"], second["taskId"])
+        self.assertTrue(retry_contended.is_set())
+        self.assertTrue(retry_acquired_lock.is_set())
+        self.assertFalse(retry_acquired_before_claim.is_set())
         claimed = self.tasks / f"{first['taskId']}.claimed-core-1.txt"
         self.assertTrue(claimed.is_file())
         self.assertFalse((self.tasks / f"{first['taskId']}.txt").exists())
