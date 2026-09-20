@@ -126,6 +126,149 @@ def test_a_compound_token_alone_is_enough_to_find_the_service():
         clear_env()
 
 
+def test_doctor_names_the_source_and_shape_but_never_the_secret():
+    """A new agent's first failure is discovery: WHICH variable, WHICH shape,
+    WHICH host. The report answers those and must not echo the token."""
+    env = {"REMOTE_TASK_TOKEN": "https://chat.example/relay|s3cretvalue"}
+    rows = {step: (ok, detail) for step, ok, detail in room_doc.credential_report(None, None, env)}
+    assert rows["token"][0] and "REMOTE_TASK_TOKEN" in rows["token"][1]
+    assert "compound" in rows["token"][1] and "11 chars" in rows["token"][1]
+    assert "s3cretvalue" not in rows["token"][1], "the secret leaked into the report"
+    assert rows["url"][0] and "compound token" in rows["url"][1], \
+        "with no URL variable the compound token's origin is the source"
+
+
+def test_doctor_reports_each_missing_piece_on_its_own_row():
+    rows = {step: ok for step, ok, _ in room_doc.credential_report(None, None, {})}
+    assert rows == {"token": False, "url": False}
+    rows = {step: ok for step, ok, _ in room_doc.credential_report("t", None, {"AG2_API_ROOT": "x"})}
+    assert rows == {"token": True, "url": True}
+
+
+def _run_doctor(env, opener=None, kind="markdown"):
+    """doctor() with a scripted opener, stdout captured, env isolated."""
+    import asyncio
+    import contextlib
+    import io
+    import types
+
+    import room_doc_client
+    saved = {k: os.environ.pop(k) for k in list(os.environ)
+             if k in room_doc.TOKEN_VARS + room_doc.URL_VARS}
+    os.environ.update(env)
+    real = room_doc_client.open_room_doc
+    if opener is not None:
+        room_doc_client.open_room_doc = opener
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = asyncio.run(room_doc.doctor(types.SimpleNamespace(
+                room="!r:x", kind=kind, token=None, url=None, insecure=False)))
+    finally:
+        room_doc_client.open_room_doc = real
+        for k in room_doc.TOKEN_VARS + room_doc.URL_VARS:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+    return rc, out.getvalue()
+
+
+def _opener(doc=None, refuse=None):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def open_room_doc(url, room, token, kind=None, insecure=False):
+        if refuse:
+            raise RoomDocError(refuse)
+        yield doc
+
+    return open_room_doc
+
+
+class _Doc:
+    text = "hello"
+    peers = [{"name": "q"}]
+    elements = [1, 2, 3]
+
+
+def test_doctor_reports_every_step_ok_when_all_is_well():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "s3cret", "REMOTE_TASK_URL": "https://h/relay"},
+                          _opener(_Doc()))
+    assert rc == 0, out
+    for step in ("deps", "token", "url", "connect", "read", "peers"):
+        assert f"ok    {step}" in out, out
+    assert "5 chars" in out and "1 present" in out and "s3cret" not in out
+
+
+def test_doctor_reads_elements_on_the_board():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "AG2_API_ROOT": "https://h"},
+                          _opener(_Doc()), kind="board")
+    assert rc == 0 and "3 elements" in out, out
+
+
+def test_doctor_stops_at_the_missing_credential():
+    rc, out = _run_doctor({"REMOTE_TASK_URL": "https://h/relay"}, _opener(_Doc()))
+    assert rc == 2 and "FAIL  token" in out and "connect" not in out, out
+
+
+def test_doctor_names_the_refusal_as_the_connect_step():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "REMOTE_TASK_URL": "https://h/relay"},
+                          _opener(refuse="refused (403) by h: no"))
+    assert rc == 2 and "FAIL  connect  refused (403)" in out, out
+
+
+def test_doctor_stops_at_missing_deps_and_says_how_to_install():
+    """A None entry in sys.modules makes `import websockets` raise ImportError,
+    which is what a bare interpreter without the requirements does."""
+    import sys
+    saved = sys.modules.get("websockets")
+    sys.modules["websockets"] = None  # type: ignore[assignment]
+    try:
+        rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "REMOTE_TASK_URL": "https://h/relay"})
+    finally:
+        if saved is None:
+            sys.modules.pop("websockets", None)
+        else:
+            sys.modules["websockets"] = saved
+    assert rc == 2 and "FAIL  deps" in out and "requirements.txt" in out, out
+    assert "token" not in out, "stops at the first failing step"
+
+
+def test_run_dispatches_doctor_before_opening_any_socket():
+    """`run()` must answer doctor without a connection: that is the command
+    an agent runs BEFORE it knows whether a connection is possible."""
+    import asyncio
+    import contextlib
+    import io
+    import types
+
+    import room_doc_client
+    real = room_doc_client.open_room_doc
+    calls = []
+
+    @contextlib.asynccontextmanager
+    async def opener(url, room, token, kind=None, insecure=False):
+        calls.append(room)
+        yield _Doc()
+
+    room_doc_client.open_room_doc = opener
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k in room_doc.TOKEN_VARS + room_doc.URL_VARS}
+    os.environ["REMOTE_TASK_TOKEN"] = "t"
+    os.environ["REMOTE_TASK_URL"] = "https://h/relay"
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = asyncio.run(room_doc.run(types.SimpleNamespace(
+                command="doctor", room="!r:x", kind="markdown", token=None, url=None,
+                insecure=False, name=None, user_id=None, json=False, settle=0,
+                with_authors=False)))
+    finally:
+        room_doc_client.open_room_doc = real
+        for k in room_doc.TOKEN_VARS + room_doc.URL_VARS:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+    assert rc == 0 and calls == ["!r:x"], (rc, calls, out.getvalue())
+
+
 def test_a_missing_url_names_its_variables():
     clear_env()
     try:

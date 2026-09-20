@@ -10,7 +10,9 @@ Imports nothing: the rules are pure, so they are testable without pycrdt.
 """
 from __future__ import annotations
 
+import random
 import re
+import time
 from typing import Any, Callable, Iterable
 
 BOARD_KIND = "board"
@@ -108,6 +110,65 @@ def changed_elements(elements: Iterable[dict],
             current = None
         if is_newer(element, current):
             out.append(element)
+    return out
+
+
+# What Excalidraw's own restoreElement() fills in; the panel hands the map to
+# the editor without it, so an element missing any of these crashes selection.
+ELEMENT_DEFAULTS: dict[str, Any] = {
+    "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent",
+    "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 1,
+    "opacity": 100, "groupIds": [], "frameId": None, "roundness": None,
+    "boundElements": [], "link": None, "locked": False, "isDeleted": False,
+}
+TEXT_DEFAULTS: dict[str, Any] = {
+    "text": "", "fontSize": 20, "fontFamily": 1, "textAlign": "left",
+    "verticalAlign": "top", "lineHeight": 1.25, "containerId": None, "autoResize": True,
+}
+LINEAR_DEFAULTS: dict[str, Any] = {
+    "startBinding": None, "endBinding": None, "lastCommittedPoint": None,
+    "startArrowhead": None, "endArrowhead": None,
+}
+
+
+def complete_element(element: dict, now_ms: int | None = None,
+                     base: dict | None = None) -> dict:
+    """The element with every field the editor reads present. Nothing given is
+    changed; only absent keys are filled, so a complete element passes through
+    equal to itself and a minimal one becomes drawable AND selectable.
+
+    `base` is the stored copy, if any: identity fields (seed, nonce, updated)
+    come from it before any default, so re-asserting a minimal element does
+    not mint a new nonce and win a tie it should have drawn."""
+    out = dict(element)
+    if base:
+        # Identity only: `updated` is this write's time, not the old one's.
+        for key in ("seed", "versionNonce"):
+            if key not in out and key in base:
+                out[key] = base[key]
+    for key, value in ELEMENT_DEFAULTS.items():
+        if key not in out or out[key] is None and key in ("groupIds", "boundElements"):
+            out[key] = list(value) if isinstance(value, list) else value
+    out.setdefault("seed", random.randint(1, 2**31 - 1))
+    out.setdefault("versionNonce", random.randint(1, 2**31 - 1))
+    out.setdefault("updated", int(time.time() * 1000) if now_ms is None else now_ms)
+    if out.get("type") == "text":
+        for key, value in TEXT_DEFAULTS.items():
+            out.setdefault(key, value)
+        out.setdefault("originalText", out["text"])
+    if out.get("type") in ("arrow", "line"):
+        for key, value in LINEAR_DEFAULTS.items():
+            out.setdefault(key, value)
+        if out.get("type") == "arrow" and out["endArrowhead"] is None and "endArrowhead" not in element:
+            out["endArrowhead"] = "arrow"
+        out.setdefault("points", [[0, 0], [out.get("width", 0), out.get("height", 0)]])
+    if out.get("type") == "freedraw":
+        # The editor measures a freedraw by points.length BEFORE restoring it,
+        # so one without points throws for the whole batch, not just itself.
+        out.setdefault("points", [[0, 0]])
+        out.setdefault("pressures", [])
+        out.setdefault("simulatePressure", True)
+        out.setdefault("lastCommittedPoint", None)
     return out
 
 

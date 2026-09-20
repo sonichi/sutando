@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from room_doc_protocol import RoomDocError  # noqa: E402
+from room_doc_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
 
 TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
               "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
@@ -64,6 +64,36 @@ def resolve_url(explicit: str | None) -> str:
         if origin:
             return origin
     raise RoomDocError("no service URL. Pass --url, or set one of: " + ", ".join(URL_VARS) + ".")
+
+
+def credential_report(explicit_token: str | None, explicit_url: str | None,
+                      environ: dict | None = None) -> list[tuple[str, bool, str]]:
+    """Where the token and URL would come from, without printing the secret.
+
+    A new agent's first failure is discovery, not authorization: which variable,
+    which shape, which host. Each row names one step so the failing one is
+    visible on its own.
+    """
+    env = os.environ if environ is None else environ
+    rows: list[tuple[str, bool, str]] = []
+    src = "--token" if explicit_token else next((v for v in TOKEN_VARS if env.get(v)), None)
+    if not src:
+        rows.append(("token", False, "none found; set one of " + ", ".join(TOKEN_VARS)))
+    else:
+        raw = explicit_token or env[src]
+        origin, secret = split_compound(raw)
+        shape = f"compound (url|secret, relay {origin})" if origin else "bare"
+        rows.append(("token", True, f"from {src}, {shape}, {len(secret)} chars"))
+    url_src = "--url" if explicit_url else next((v for v in URL_VARS if env.get(v)), None)
+    if url_src:
+        rows.append(("url", True, f"from {url_src}"))
+    else:
+        compound = next((v for v in TOKEN_VARS if split_compound(env.get(v, ""))[0]), None)
+        if compound:
+            rows.append(("url", True, f"origin of the compound token in {compound}"))
+        else:
+            rows.append(("url", False, "none found; set one of " + ", ".join(URL_VARS)))
+    return rows
 
 
 def parse_elements(raw: str) -> list:
@@ -134,6 +164,83 @@ def render(command: str, *, text: str = "", peers: list | None = None,
     raise RoomDocError(f"no output defined for {command!r}")
 
 
+async def doctor(args: argparse.Namespace) -> int:
+    """Every step a first connection needs, reported one line each and stopped
+    at the first failure — so the failing STEP is the answer, not a symptom."""
+    from room_doc_client import open_room_doc
+
+    def say(step: str, ok: bool, detail: str) -> None:
+        print(f"  {'ok  ' if ok else 'FAIL'}  {step:<8} {detail}")
+
+    print(f"room-doc doctor: {args.room} (kind {args.kind})")
+    try:
+        import pycrdt  # noqa: F401
+        import websockets  # noqa: F401
+        say("deps", True, "pycrdt + websockets importable")
+    except ImportError as exc:
+        say("deps", False, f"{exc}; pip install -r skills/room-doc/requirements.txt")
+        return 2
+    rows = credential_report(args.token, args.url)
+    for step, ok, detail in rows:
+        say(step, ok, detail)
+    if not all(ok for _, ok, _ in rows):
+        return 2
+    token, url = resolve_token(args.token), resolve_url(args.url)
+    try:
+        async with open_room_doc(url, args.room, token, kind=args.kind,
+                                 insecure=args.insecure) as doc:
+            say("connect", True, f"{url} accepted the socket")
+            if args.kind == DEFAULT_KIND:
+                say("read", True, f"{len(doc.text)} chars in the document")
+            else:
+                say("read", True, f"{len(doc.elements)} elements")
+            say("peers", True, f"{len(doc.peers)} present")
+    except RoomDocError as exc:
+        say("connect", False, str(exc))
+        return 2
+    print("  all steps passed — connected and read; writes go over this same connection")
+    return 0
+
+
+
+async def watch(args: argparse.Namespace, token: str, url: str) -> int:
+    """Hold the document open and print one line per event that concerns
+    `--for`, as it lands. Comes back from a service restart with the last
+    snapshot in hand, so what landed meanwhile is reported, not skipped.
+    Exits (rc 2) only on a refusal or after --max-reconnects failures."""
+    from room_doc_client import open_room_doc
+    from room_doc_protocol import RECONNECT_CODES
+
+    handles = args.handles or []
+    since = None
+    failures = 0
+    print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
+          f"reporting after {args.settle}s of quiet", flush=True)
+    while True:
+        try:
+            async with open_room_doc(url, args.room, token, kind=args.kind,
+                                     insecure=args.insecure) as doc:
+                if args.name:
+                    await doc.set_presence(args.name, user_id=args.user_id)
+                if since is not None:
+                    print("RECONNECTED\tcatching up on what landed meanwhile", flush=True)
+                async for ev in doc.events(handles, settle=args.settle, since=since):
+                    failures = 0              # a socket that carries an event is a real one
+                    kind = ev.pop("kind")
+                    detail = ev.pop("text", None)
+                    rest = " ".join(f"{k}={v}" for k, v in ev.items() if v not in (None, ""))
+                    print(f"EVENT\t{kind}\t{rest}" + (f"\t{detail}" if detail else ""), flush=True)
+                return 0                      # a clean end is an end, not a reconnect
+        except RoomDocError as exc:
+            since = getattr(exc, "snapshot", since)
+            if exc.code not in RECONNECT_CODES or failures >= args.max_reconnects:
+                raise
+            failures += 1
+            wait = min(2 ** failures, 30)
+            print(f"RECONNECTING\tcode={exc.code} attempt={failures} in {wait}s", flush=True)
+            await asyncio.sleep(wait)
+
+
 async def run(args: argparse.Namespace) -> int:
     # Imported here, not at module scope: the rules above are pure, and a test
     # of them must not need pycrdt installed.
@@ -141,7 +248,13 @@ async def run(args: argparse.Namespace) -> int:
 
     from room_doc_board import BOARD_KIND, place_clear
 
+    if args.command == "doctor":
+        return await doctor(args)
+
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "watch":
+        return await watch(args, token, url)
+
     async with open_room_doc(url, args.room, token, kind=args.kind,
                              insecure=args.insecure) as doc:
         if args.name:
@@ -193,8 +306,8 @@ async def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="room_doc", description=__doc__)
-    p.add_argument("--url", help="API root or ws(s) URL (else $AG2_ROOM_DOC_URL / $AG2_API_ROOT)")
-    p.add_argument("--token", help="Matrix access token (else $AG2_MATRIX_TOKEN)")
+    p.add_argument("--url", help="service origin (else $AG2_ROOM_DOC_URL, $AG2_API_ROOT, or the relay's)")
+    p.add_argument("--token", help="bearer; the relay token works (else the env, see SKILL.md)")
     p.add_argument("--name", help="presence name to publish while connected")
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
@@ -207,9 +320,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also report who wrote with each Yjs client id")
     sub = p.add_subparsers(dest="command", required=True)
 
-    for name, help_text in (("read", "print the document"), ("peers", "who is present")):
+    for name, help_text in (("read", "print the document"), ("peers", "who is present"),
+                            ("doctor", "check deps, credential, URL and connection, step by step")):
         s = sub.add_parser(name, help=help_text)
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("watch", help="hold the document open; print each event that concerns --for")
+    s.add_argument("room")
+    s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
+                   help="a name or @mxid to watch for (repeatable)")
+    s.add_argument("--max-reconnects", type=int, default=20,
+                   help="give up after this many consecutive failed reconnects")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")

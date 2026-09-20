@@ -26,7 +26,21 @@ CLOSE_REASONS = {
 
 
 class RoomDocError(RuntimeError):
-    """A refusal or protocol failure the caller can report verbatim."""
+    """A refusal or protocol failure the caller can report verbatim.
+    `code` is the websocket close code when one ended the session, else None."""
+
+    code: int | None = None
+
+
+# "The service went away, not you" — a restart, a proxy leaving, an abnormal
+# drop. A watcher comes back from these; a 4xxx refusal is about the agent.
+RECONNECT_CODES = frozenset({1001, 1006, 1011, 1012, 1013, 1014})
+
+
+def close_code(exc: BaseException | None) -> int | None:
+    if exc is None:
+        return None
+    return getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
 
 
 def write_var_uint(n: int) -> bytes:
@@ -90,20 +104,45 @@ def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str
     return url
 
 
+def _body_text(exc: Exception) -> str:
+    body = getattr(getattr(exc, "response", None), "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    return (body or "").strip()
+
+
 def explain(exc: Exception, url: str) -> str:
-    """Turn the transport's error into the reason a caller can act on."""
+    """Turn the transport's error into the reason a caller can act on.
+
+    Each status is a different problem with a different owner, and three of
+    them look alike from outside: a service that has no record of the agent
+    (401), a room that refuses it (403), and an edge proxy refusing before the
+    service ever saw the request (also 403). Each line ends with who fixes it.
+    """
     status = getattr(getattr(exc, "response", None), "status_code", None)
+    body = _body_text(exc)
+    if status == 401:
+        return (f"unknown to the service (401) at {url}: {body or 'the bearer was rejected'}\n"
+                "The token was presented; this deployment has no record of the agent behind "
+                "it. That is provisioning, not room permission — ask whoever runs this "
+                "deployment to register the agent. A different deployment may accept the "
+                "same token.")
+    if status == 403 and "error code: 1010" in body:
+        return (f"refused by the edge (403, Cloudflare 1010) in front of {url}\n"
+                "core-api never saw this request, so it says nothing about room access. "
+                "The socket path is the supported one; a plain HTTP probe of a websocket "
+                "route trips this.")
     if status == 403:
-        return (f"refused (403) by {url}\n"
-                "The document has the room's own ACL, and the bearer must authorize THIS "
-                "agent for documents: a Matrix access token, or an AG2 ticket carrying the "
-                "doc.write grant. A member below write power level also gets 403.")
+        return (f"refused (403) by {url}: {body or 'no detail given'}\n"
+                "The service knows this agent and the room refuses it: below write power, "
+                "or not authorized for documents. A room admin fixes this, not a token.")
     if status == 404:
         return (f"not found (404) at {url}\n"
                 "Either the room id is wrong or this account is not a member — "
-                "non-members are told 404 so a room's existence stays hidden.")
-    if status == 401:
-        return f"unauthenticated (401) at {url}: no usable bearer was presented."
+                "non-members are told 404 so a room's existence stays hidden. Check the "
+                "id, then ask for an invite.")
+    if status == 426:
+        return f"{url} answers websocket only (426): use the client, not an HTTP probe."
     return f"cannot open {url}: {type(exc).__name__}: {exc}"
 
 
@@ -115,7 +154,7 @@ def close_reason(exc: BaseException | None) -> str:
     """
     if exc is None:
         return "the server closed the connection"
-    code = getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
+    code = close_code(exc)
     if code in CLOSE_REASONS:
         return CLOSE_REASONS[code]
     if code:
