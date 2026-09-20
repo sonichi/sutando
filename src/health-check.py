@@ -9640,7 +9640,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[str] = []
+    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9654,18 +9654,21 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append(str(d.get("item_id") or "?"))
+            parked.append((root.name, str(d.get("item_id") or "?")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
-        shown = ", ".join(sorted(parked)[:4])
+        parked.sort()
+        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                           for root_name, item_id in parked[:4])
         more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
         return {"name": name, "status": "warn",
                 "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
                           f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                          f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
