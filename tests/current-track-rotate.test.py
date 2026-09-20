@@ -757,5 +757,34 @@ class PinVocabularyDiscriminates(unittest.TestCase):
 
 
 
+class TheCliRefusesANonHostAnchor(unittest.TestCase):
+    """The rotate CLI's NotAHostAnchor catch runs in-process: rc 2, a named refusal, nothing touched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.cli = Cli(load(ROTATE))
+
+    def test_a_collapsed_anchor_is_refused_with_rc_2_and_left_alone(self):
+        collapsed = Path(self.tmp.name) / "hosts" / "current-track.md"
+        collapsed.parent.mkdir(parents=True)
+        pre, entries = fixture(n_entries=40, size=600)
+        body = pre + "".join(entries)
+        collapsed.write_text(body, encoding="utf-8")
+        r = self.cli(collapsed, "--keep-bytes", 4096)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("current-track-rotate:", r.stderr)
+        self.assertIn("host", r.stderr.lower(), "the refusal names the rule, not a generic error")
+        self.assertEqual(collapsed.read_text(encoding="utf-8"), body, "a refused rotate rewrites nothing")
+        self.assertFalse(collapsed.with_name("current-track-archive.md").exists(), "and archives nothing")
+
+    def test_the_positive_control_a_host_anchor_of_the_same_size_rotates(self):
+        anchor = _host_anchor(self.tmp.name)
+        pre, entries = fixture(n_entries=40, size=600)
+        anchor.write_text(pre + "".join(entries), encoding="utf-8")
+        r = self.cli(anchor, "--keep-bytes", 4096)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(anchor.with_name("current-track-archive.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
