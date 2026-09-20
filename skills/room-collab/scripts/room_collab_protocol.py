@@ -138,9 +138,9 @@ def explain(exc: Exception, url: str) -> str:
     body = _body_text(exc)
     if status in RECONNECT_STATUSES:
         return (f"not being served right now ({status}) at {url}\n"
-                "The edge answered for a service that is restarting or being rolled out. "
-                "Nobody fixes this: a watcher retries on its own, a one-shot command "
-                "is run again in a minute.")
+                "The edge answered for a service that is restarting, being rolled out, "
+                "or (504) too slow to answer. Nobody fixes this: a watcher retries on "
+                "its own, a one-shot command is run again in a minute.")
     if status == 401:
         return (f"unknown to the service (401) at {url}: {body or 'the bearer was rejected'}\n"
                 "The token was presented; this deployment has no record of the agent behind "
