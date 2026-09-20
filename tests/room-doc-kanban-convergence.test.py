@@ -28,7 +28,7 @@ except ImportError as exc:  # pragma: no cover
     sys.exit(1)
 
 from room_kanban import (CARDS_KEY, changed, delete_card, in_column,  # noqa: E402
-                         is_card, is_newer, live_cards)
+                         is_card, is_newer, live_cards, orphaned_cards)
 
 FAILS = []
 
@@ -209,6 +209,46 @@ def test_deleting_wins_over_an_older_concurrent_edit():
     assert is_newer(gone, edit), "a later deletion must beat an earlier move"
     later_edit = card("doing", 300, "@someone")
     assert is_newer(later_edit, gone), "and a later move must beat the deletion"
+
+
+def test_a_card_whose_column_is_gone_is_surfaced_not_lost():
+    """Deleting a column does not delete its cards. Filtering on an unknown
+    column leaves the card in the document and visible nowhere — an agent
+    listing work would report it as done."""
+    cols = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    cards = [("c1", card("todo", 100, "@a")),
+             ("c2", card("archived", 100, "@a", ident="c2"))]
+    assert [c["id"] for c in in_column(cards, "todo")] == ["c1"]
+    assert [c["id"] for c in orphaned_cards(cards, cols)] == ["c2"], \
+        "the card naming a deleted column must be surfaced"
+
+
+def test_a_deleted_orphan_stays_deleted():
+    """An orphan is still subject to its tombstone — surfacing lost cards must
+    not resurrect deleted ones."""
+    cols = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    gone = delete_card(card("archived", 100, "@a"), 200, "@b")
+    assert orphaned_cards([("c1", gone)], cols) == []
+
+
+def test_a_malformed_column_does_not_make_its_key_known():
+    """The panel validates columns before drawing them, so a junk entry is not
+    a column there. Counting its key as known here would hide a card the panel
+    shows as orphaned — the two surfaces would disagree about what exists."""
+    junk = [("todo", {"id": "todo"}),                    # no title, no updated
+            ("doing", {"nope": True})]                   # not a column at all
+    cards = [("c1", card("todo", 1, "@a")), ("c2", card("doing", 1, "@a", ident="c2"))]
+    assert {c["id"] for c in orphaned_cards(cards, junk)} == {"c1", "c2"}
+    # control: a well-formed column DOES make its key known
+    good = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    assert [c["id"] for c in orphaned_cards(cards, good)] == ["c2"]
+
+
+def test_no_columns_at_all_makes_every_live_card_an_orphan():
+    """The degenerate case is the one that hides work: with the column map
+    empty, every card is unreachable and all of them must be reported."""
+    cards = [("c1", card("todo", 1, "@a")), ("c2", card("doing", 1, "@a", ident="c2"))]
+    assert {c["id"] for c in orphaned_cards(cards, [])} == {"c1", "c2"}
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

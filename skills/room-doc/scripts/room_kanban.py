@@ -133,6 +133,18 @@ def delete_card(card: dict, now: int, by: str) -> dict:
     return {**card, "deleted": True, "updated": int(now), "by": by}
 
 
+def orphaned_cards(cards: Iterable[tuple[str, Any]],
+                   columns: Iterable[tuple[str, Any]]) -> list[dict]:
+    """Live cards naming a column this board does not have.
+
+    Deleting a column does not delete its cards, and a card filtered on an
+    unknown column is in the document and visible nowhere — so an agent listing
+    work would report it as done. The panel shows them under "No column".
+    """
+    known = {k for k, v in columns if is_column(v, k)}
+    return [c for c in live_cards(cards) if c.get("column") not in known]
+
+
 def in_column(cards: Iterable[tuple[str, Any]], column: str) -> list[dict]:
     """The cards of one column, in the panel's order. Tombstones excluded."""
     rows = [v for k, v in cards
