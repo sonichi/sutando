@@ -531,6 +531,15 @@ dispatch_task() {
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
+  # One shared dedupe set for every dispatch entry point (startup sweep, the
+  # per-file fswatch arm, the directory-level fallback arm) -- a task already
+  # dispatched and still in flight (file not yet archived/answered) must not
+  # be re-dispatched just because a later event re-observes the same file.
+  mkdir -p "$WATCH_RUNTIME_DIR/dispatched"
+  if [ -e "$WATCH_RUNTIME_DIR/dispatched/$filename" ]; then
+    return 0
+  fi
+  : > "$WATCH_RUNTIME_DIR/dispatched/$filename"
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
@@ -915,17 +924,15 @@ while true; do
       ;;
     "$TASKS_DIR"|"$TASKS_DIR_ABS")
       # Same poll_monitor quirk as above, for the tasks dir itself: sweep for
-      # any *.txt this path hasn't dispatched yet (marker avoids re-dispatch
-      # on every later poll of a task still pending/archiving).
+      # any *.txt still pending. dispatch_task itself is the dedupe set now
+      # (WATCH_RUNTIME_DIR/dispatched), shared with the startup sweep and the
+      # *.txt) arm below, so re-observing a file already in flight is a no-op
+      # here rather than a second dispatch.
       if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
         continue
       fi
-      mkdir -p "$WATCH_RUNTIME_DIR/dir-swept"
       shopt -s nullglob
       for f in "$TASKS_DIR"/*.txt; do
-        fn="$(basename "$f")"
-        [ -e "$WATCH_RUNTIME_DIR/dir-swept/$fn" ] && continue
-        : > "$WATCH_RUNTIME_DIR/dir-swept/$fn"
         dispatch_task "$f"
       done
       shopt -u nullglob
