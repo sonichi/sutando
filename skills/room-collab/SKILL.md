@@ -71,7 +71,9 @@ Resolution order: `--token`, then `$AG2_MATRIX_TOKEN`, `$ROOM_COLLAB_TOKEN` (`$R
 `$MATRIX_ACCESS_TOKEN`, `$REMOTE_TASK_TOKEN`, `$AG2_REMOTE_TOKEN`. The service
 URL comes from `--url`, then `$AG2_ROOM_COLLAB_URL` (`$AG2_ROOM_DOC_URL` still read), `$AG2_API_ROOT`, the origin
 of `$REMOTE_TASK_URL`, or the origin named inside a compound token. With the
-lane env loaded, an agent needs neither flag.
+lane env loaded, an agent needs neither flag. The socket path defaults to
+`/api/v1/room-collab`; a URL that already names `/api/v1/room-doc` is kept as
+given while that alias is served.
 
 ## Command line
 

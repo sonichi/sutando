@@ -109,8 +109,10 @@ def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str
         origin = "ws://" + origin[len("http://"):]
     if not origin.startswith(("ws://", "wss://")):
         raise RoomDocError(f"not an http(s) or ws(s) origin: {api_root!r}")
-    if "/api/v1/room-doc" not in origin:
-        origin = f"{origin}/api/v1/room-doc"
+    # The collab path is the default; an origin that names the old path keeps it
+    # for the alias window, since the service answers on both.
+    if "/api/v1/room-collab" not in origin and "/api/v1/room-doc" not in origin:
+        origin = f"{origin}/api/v1/room-collab"
     url = f"{origin}/{urllib.parse.quote(room_id, safe='')}/ws"
     # A room holds more than one surface; the kind selects which. The default
     # is sent bare, which is what every existing caller already produces.
