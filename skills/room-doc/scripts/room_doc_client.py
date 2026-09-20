@@ -186,12 +186,15 @@ class RoomDoc:
         document stop seeing it, while the socket and the editing carry on.
         """
         def on_change(kind: str, changes: tuple) -> None:
-            if kind != "update":
+            # Only our OWN state, changed locally. Re-sending a peer's update
+            # makes this socket a holder of that peer's id, so it never expires.
+            if kind != "update" or changes[1] != "local":
                 return
-            ids = [i for group in changes[0].values() for i in group]
-            if ids:
-                update = self._awareness.encode_awareness_update(ids)
-                asyncio.ensure_future(self._ws.send(create_awareness_message(update)))
+            mine = self._awareness.client_id
+            if mine not in [i for group in changes[0].values() for i in group]:
+                return
+            update = self._awareness.encode_awareness_update([mine])
+            asyncio.ensure_future(self._ws.send(create_awareness_message(update)))
 
         self._awareness_sub = self._awareness.observe(on_change)
         self._awareness_task = asyncio.create_task(self._awareness.start())
