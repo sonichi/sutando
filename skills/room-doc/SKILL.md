@@ -48,7 +48,6 @@ Resolution order: `--token`, then `$AG2_MATRIX_TOKEN`, `$ROOM_DOC_TOKEN`,
 ```bash
 P=skills/room-doc/scripts/room_doc.py
 python3 $P read   '!room:server'                      # print the document
-python3 $P --kind board read '!room:server'           # a room holds several documents
 python3 $P peers  '!room:server'                      # who is present
 python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
@@ -56,6 +55,34 @@ python3 $P --name mars read '!room:server'            # publish presence while c
 ```
 
 Add `--insecure` only for a local rig with a self-signed certificate.
+
+## The whiteboard is a different document
+
+A room's board is a second document kind — `?kind=board` — and it holds a **map
+of drawing elements**, not text. The text commands refuse on it rather than
+answering: `read` on a board used to print an empty string, which is
+indistinguishable from an empty whiteboard, and `append` used to succeed while
+writing text no Excalidraw client ever reads.
+
+```bash
+python3 $P --kind board read  '!room:server'          # list elements in drawing order
+python3 $P --kind board draw  '!room:server' '[{"id":"r1","type":"rectangle","x":0,"y":0,"width":100,"height":60,"version":1}]'
+python3 $P --kind board erase '!room:server' 'r1'     # marks isDeleted, the editor's own deletion
+python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
+```
+
+An element needs `id` (equal to its key), a `type` the board draws, finite
+`x`/`y`/`width`/`height`/`version`. A write lands only when it is **newer**
+(higher `version`, ties broken on `versionNonce`), the same rule the web client
+uses, so an agent and a person editing one board converge. Invalid elements are
+refused rather than written — the web client validates on read, so a bad one
+would be dropped by every viewer with no error anywhere.
+
+Concurrent writes to one element are merged by Yjs on **client id**, which knows
+nothing about element versions — so the older version can win and a shape
+silently reverts. `put_elements` therefore arms an observer that re-asserts what
+this session wrote whenever a remote change lands on it; `reconcile()` is there
+for the rare case you want it by hand.
 
 ## Collaborating, rather than submitting
 
