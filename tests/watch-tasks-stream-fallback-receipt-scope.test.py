@@ -85,7 +85,9 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-HANDLED = ["probe", "probe", "handle"]  # enqueue-time probe, then drain's own re-probe
+# Single probe now: no queue between probe and run to guard against a stale
+# enqueue-time handler reference (see PR body for the old async shape).
+HANDLED = ["probe", "handle"]
 BYPASSED = ["probe"]
 NO_HANDLER_CALL = []  # a worker never probes: not even a bare "probe" entry
 
