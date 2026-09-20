@@ -119,12 +119,13 @@ def test_junk_in_the_batch_passes_through_unmoved():
     assert placed[1]["y"] >= 60 + PLACE_GAP
 
 
-# --- the wire: canonical JSON has no floats, and that failure is invisible
+# --- the offset is an int, so a caller's y keeps whatever precision it had
 
-def test_a_moved_y_is_an_integer():
-    existing = [el("p1", 0, 0, 100, 60.5)]
-    placed = place_clear([el("q1", 0, 0)], existing)
+def test_the_offset_keeps_the_callers_precision():
+    existing = [el("p1", 0, 0, 100, 60)]
+    placed = place_clear([el("q1", 0, 0), el("q2", 0, 10.7)], existing)
     assert isinstance(placed[0]["y"], int), type(placed[0]["y"])
+    assert placed[1]["y"] == placed[0]["y"] + 10.7, placed[1]["y"]
     assert isinstance(PLACE_GAP, int)
 
 
