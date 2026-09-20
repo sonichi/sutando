@@ -449,6 +449,13 @@ class TasksViewIdempotencyTests(unittest.TestCase):
             self.view.submit_idempotent(
                 "original", idempotency_key="extra-header")
 
+    def test_unreadable_receipt_fails_closed(self):
+        self.view.submit_idempotent("original", idempotency_key="unreadable")
+        self._receipts()[0].write_bytes(b"\xff")
+
+        with self.assertRaisesRegex(RuntimeError, "record is unreadable"):
+            self.view.submit_idempotent("original", idempotency_key="unreadable")
+
     def test_publication_race_revalidates_the_winning_task(self):
         import tasks_view as tasks_view_module
         real_link = tasks_view_module.os.link
@@ -493,6 +500,23 @@ class TasksViewIdempotencyTests(unittest.TestCase):
         self.assertEqual(out["state"], "done")
         self.assertEqual(self._public_tasks(), [])
 
+    def test_publication_race_with_no_observable_winner_fails_closed(self):
+        import tasks_view as tasks_view_module
+        real_link = tasks_view_module.os.link
+
+        def vanished_publish(source, destination):
+            if Path(destination).parent == self.tasks:
+                raise FileExistsError(destination)
+            return real_link(source, destination)
+
+        with unittest.mock.patch.object(tasks_view_module.os, "link",
+                                         vanished_publish):
+            with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+                self.view.submit_idempotent(
+                    "original", idempotency_key="vanished-race")
+        self.assertEqual(self._public_tasks(), [])
+        self.assertEqual(len(self._receipts()), 1)
+
     def test_legacy_submit_remains_non_idempotent(self):
         first = self.view.submit("same text")
         second = self.view.submit("same text")
@@ -505,6 +529,11 @@ class TasksViewIdempotencyTests(unittest.TestCase):
             with self.subTest(key=repr(key)[:20]):
                 with self.assertRaises(ValueError):
                     self.view.submit_idempotent("work", idempotency_key=key)
+        self.assertFalse(self.tasks.exists())
+
+    def test_non_utf8_idempotency_key_publishes_nothing(self):
+        with self.assertRaisesRegex(ValueError, "valid UTF-8"):
+            self.view.submit_idempotent("work", idempotency_key="\ud800")
         self.assertFalse(self.tasks.exists())
 
 
