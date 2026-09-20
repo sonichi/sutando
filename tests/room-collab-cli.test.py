@@ -269,6 +269,23 @@ def test_run_dispatches_doctor_before_opening_any_socket():
     assert rc == 0 and calls == ["!r:x"], (rc, calls, out.getvalue())
 
 
+def test_the_collab_names_lead_and_the_doc_names_are_still_read():
+    """The rename must not strand an install that set the ROOM_DOC_* names:
+    they are read after the collab names, for one release."""
+    clear_env()
+    try:
+        os.environ["ROOM_DOC_TOKEN"] = "old"
+        assert room_collab.resolve_token(None) == "old"
+        os.environ["ROOM_COLLAB_TOKEN"] = "new"
+        assert room_collab.resolve_token(None) == "new", "the collab name wins when both are set"
+        os.environ["AG2_ROOM_DOC_URL"] = "https://old.example"
+        assert room_collab.resolve_url(None) == "https://old.example"
+        os.environ["AG2_ROOM_COLLAB_URL"] = "https://new.example"
+        assert room_collab.resolve_url(None) == "https://new.example"
+    finally:
+        clear_env()
+
+
 def test_a_missing_url_names_its_variables():
     clear_env()
     try:

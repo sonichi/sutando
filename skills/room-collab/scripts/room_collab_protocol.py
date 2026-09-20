@@ -87,7 +87,7 @@ def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str
     """
     origin = (api_root or "").rstrip("/")
     if not origin:
-        raise RoomDocError("no API root given (pass --url or set AG2_ROOM_DOC_URL)")
+        raise RoomDocError("no API root given (pass --url or set AG2_ROOM_COLLAB_URL)")
     if origin.startswith("https://"):
         origin = "wss://" + origin[len("https://"):]
     elif origin.startswith("http://"):
