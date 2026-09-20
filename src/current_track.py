@@ -106,27 +106,33 @@ def require_host_anchor(path: Path) -> Path:
 
 @contextmanager
 def locked(path: Path):
+    """Yield the RESOLVED destination; every side effect must use it.
+
+    An alias (a symlink, `hosts/../`) validates as the anchor it resolves to, so
+    the lock, the temp file and the archive must land beside that file too, or
+    two spellings of one anchor take two locks and rotation can drop an append.
+    """
     # Validate BEFORE mkdir and before the lock file: a refused write leaves no
     # directory, no lock and no anchor behind.
-    require_host_anchor(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with locked_file(lock_path(path), create_mode=0o600):
-        yield
+    dest = require_host_anchor(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(lock_path(dest), create_mode=0o600):
+        yield dest
 
 
 def append(path: Path, text: str) -> None:
     """Append under the writer lock; O_APPEND keeps the write a single record."""
-    with locked(path):
-        with open(path, "a", encoding="utf-8") as f:
+    with locked(path) as dest:
+        with open(dest, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
 
 
 def replace(path: Path, text: str) -> None:
     """Create or rewrite the whole head under the writer lock, atomically (temp + os.replace)."""
-    with locked(path):
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with locked(path) as dest:
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
         tmp.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        os.replace(tmp, dest)
 
 
 def split(text: str) -> tuple[str, list[str]]:
@@ -253,17 +259,17 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
 def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
            pin=PIN_DEFAULT, _between_read_and_replace=None) -> RotateResult:
     """Rotate under the writer lock. `_between_read_and_replace` is a test seam."""
-    with locked(path):
-        text = path.read_text(encoding="utf-8")
+    with locked(path) as dest:
+        text = dest.read_text(encoding="utf-8")
         r = plan(text, keep_bytes, pin)
         if _between_read_and_replace:
             _between_read_and_replace()
         if dry_run or not r.archived:
             return r
-        archive = path.with_name(path.stem + "-archive.md")
+        archive = dest.with_name(dest.stem + "-archive.md")
         with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
             f.write(r.archived)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
         tmp.write_text(r.head, encoding="utf-8")
-        os.replace(tmp, path)
+        os.replace(tmp, dest)
         return r

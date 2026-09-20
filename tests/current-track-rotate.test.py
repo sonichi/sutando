@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -784,6 +785,66 @@ class TheCliRefusesANonHostAnchor(unittest.TestCase):
         r = self.cli(anchor, "--keep-bytes", 4096)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(anchor.with_name("current-track-archive.md").exists())
+
+
+class AnAliasIsOneDestination(unittest.TestCase):
+    """Two spellings of one anchor share one lock, one archive, one file.
+
+    A symlink `hosts/current-track.md -> <label>/current-track.md` validates as
+    the host anchor it resolves to; every side effect must land beside THAT file.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.anchor = _host_anchor(self.tmp.name)                     # hosts/TestHost/current-track.md
+        pre, entries = fixture(n_entries=40, size=600)
+        self.anchor.write_text(pre + "".join(entries), encoding="utf-8")
+        self.alias = Path(self.tmp.name) / "hosts" / "current-track.md"
+        self.alias.symlink_to(self.anchor)                            # the collapsed spelling, as a link
+
+    def test_the_alias_and_the_anchor_take_the_same_lock(self):
+        with ct.locked(self.alias) as via_alias:
+            self.assertEqual(via_alias, self.anchor.resolve())
+        with ct.locked(self.anchor) as via_anchor:
+            self.assertEqual(via_alias, via_anchor)
+        self.assertEqual(ct.lock_path(via_alias), ct.lock_path(self.anchor.resolve()))
+        self.assertFalse(self.alias.with_name(self.alias.name + ".lock").exists(),
+                         "no lock beside the alias: that is the second lock the block names")
+
+    def test_append_through_the_alias_lands_in_the_anchor_and_replace_keeps_the_link(self):
+        ct.append(self.alias, "## 2026-09-20T00:00Z — via alias\nbody\n")
+        self.assertIn("via alias", self.anchor.read_text(encoding="utf-8"))
+        ct.replace(self.alias, "# head\n\n## 2026-09-20T00:01Z — replaced\n")
+        self.assertTrue(self.alias.is_symlink(), "replace must swap the FILE, not turn the alias into a copy")
+        self.assertEqual(self.anchor.read_text(encoding="utf-8"), "# head\n\n## 2026-09-20T00:01Z — replaced\n")
+        self.assertFalse(list(Path(self.tmp.name, "hosts").glob(".current-track.md.*.tmp")),
+                         "no temp file beside the alias")
+
+    def test_rotate_through_the_alias_archives_beside_the_anchor(self):
+        r = ct.rotate(self.alias, keep_bytes=4096)
+        self.assertTrue(r.archived)
+        self.assertTrue(self.anchor.with_name("current-track-archive.md").exists(), "archive beside the anchor")
+        self.assertFalse(self.alias.with_name("current-track-archive.md").exists(), "not beside the alias")
+        self.assertTrue(self.alias.is_symlink())
+
+    def test_an_append_through_the_alias_during_rotation_is_not_lost(self):
+        """The seam runs between rotation's read and its replace, while the lock is
+        held: an append through the OTHER spelling must wait for the lock, not
+        write into the file rotation is about to overwrite."""
+        marker = "## 2026-09-20T00:02Z — landed during rotation\n"
+        outcome = {}
+        def appender():
+            t0 = time.monotonic()
+            ct.append(self.alias, marker)
+            outcome["waited"] = time.monotonic() - t0
+        t = threading.Thread(target=appender)
+        def seam():
+            t.start(); time.sleep(0.4)          # give the appender time to block on the lock
+        ct.rotate(self.anchor, keep_bytes=4096, _between_read_and_replace=seam)
+        t.join(5)
+        self.assertFalse(t.is_alive(), "appender never got the lock")
+        self.assertGreater(outcome["waited"], 0.3, "the append did not wait for rotation's lock")
+        self.assertIn(marker, self.anchor.read_text(encoding="utf-8"), "the append landed after rotation, not under it")
 
 
 if __name__ == "__main__":
