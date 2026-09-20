@@ -144,6 +144,36 @@ async def test_a_deletion_survives_a_concurrent_older_write():
     await board._stop()
 
 
+async def test_reconcile_by_hand_re_asserts_what_this_session_wrote():
+    """The manual door: no argument means everything this session claimed."""
+    board, doc = make()
+    await board.put_elements([el(4, id="a"), el(4, id="b")])
+    peer = Doc()
+    peer.get(ELEMENTS_KEY, type=Map)
+    peer.apply_update(doc.get_update())
+    pm = peer.get(ELEMENTS_KEY, type=Map)
+    pm["a"] = el(1, id="a")
+    pm["b"] = el(1, id="b")
+    doc.apply_update(peer.get_update(doc.get_state()))
+    for _ in range(6):
+        await asyncio.sleep(0)
+    assert await board.reconcile() == 0, "the observer already restored them"
+    assert {e["version"] for e in board.elements} == {4}
+    # and an explicit list is still honoured
+    assert await board.reconcile([el(9, id="a")]) == 1
+    await board._stop()
+
+
+async def test_a_background_re_assert_after_the_session_ends_is_swallowed():
+    """The observer fires from a callback; by then the socket may be gone, and
+    an exception there has nowhere to go but the event loop."""
+    board, _ = make()
+    await board.put_elements([el(1)])
+    board._ended.set_result(None)          # the session has ended
+    await board._reassert([el(2)])         # must not raise
+    await board._stop()
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 
