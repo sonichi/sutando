@@ -159,3 +159,67 @@ def describe_invalid(value: Any, key: str | None = None) -> str:
     if "index" in value and value["index"] is not None and not isinstance(value["index"], str):
         return "'index' must be a string when present"
     return "valid"
+
+
+# Vertical room left between a drawing and the next one placed under it.
+PLACE_GAP = 40
+
+
+def bounding_box(elements: Iterable[dict]) -> tuple[int, int, int, int] | None:
+    """(left, top, right, bottom) around every element, or None for nothing.
+    A negative width or height (Excalidraw allows them) still covers the
+    span it covers."""
+    box = None
+    for e in elements:
+        x, y, w, h = e["x"], e["y"], e["width"], e["height"]
+        left, right = sorted((x, x + w))
+        top, bottom = sorted((y, y + h))
+        if box is None:
+            box = [left, top, right, bottom]
+        else:
+            box = [min(box[0], left), min(box[1], top), max(box[2], right), max(box[3], bottom)]
+    return None if box is None else tuple(box)
+
+
+def _intersects(a: tuple, b: tuple) -> bool:
+    # Touching edges do not overlap: a drawing placed exactly under another
+    # with zero gap is adjacent, not on top of it.
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def place_clear(incoming: list[dict], occupied: Iterable[dict],
+                gap: int = PLACE_GAP) -> list[dict]:
+    """The incoming elements, moved below everything already on the board IF
+    they would land on it; untouched otherwise.
+
+    Two things this must not do. It must not move an agent's own elements
+    when the agent re-asserts them (same ids, newer version): those overlap
+    their previous position by definition, and shifting them would walk the
+    drawing down the board on every write. So the ids being written are not
+    part of what counts as occupied. And it must not punish a caller that
+    looked first: coordinates that already sit in clear space stay exactly as
+    given.
+
+    Only y moves, and by an integer: canonical JSON has no floats, and the
+    failure is invisible — the UI looks right and nothing reaches the wire.
+    """
+    ids = {e.get("id") for e in incoming}
+    others = [e for e in occupied if is_board_element(e) and not e.get("isDeleted")
+              and e.get("id") not in ids]
+    valid = [e for e in incoming if is_board_element(e)]
+    # Overlap is judged element against element, not hull against hull: a
+    # drawing arranged AROUND what is there touches nothing and stays put.
+    if not any(_intersects(bounding_box([m]), bounding_box([o]))
+               for m in valid for o in others):
+        return incoming
+    mine, theirs = bounding_box(valid), bounding_box(others)
+    dy = int(theirs[3] + gap - mine[1])
+    out = []
+    for e in incoming:
+        if not is_board_element(e):
+            out.append(e)
+            continue
+        moved = dict(e)
+        moved["y"] = int(e["y"] + dy)
+        out.append(moved)
+    return out

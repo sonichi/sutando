@@ -76,6 +76,17 @@ python3 $P --kind board erase '!room:server' 'r1'     # marks isDeleted, the edi
 python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
 ```
 
+**Where a drawing lands.** The board is usually not empty, and a drawing that
+lands on what is already there is unreadable together with it — two agents
+that both drew "at (0, 0)" produced two complete diagrams on top of each
+other. So `draw` looks first: if any element you send would overlap a live
+element someone else wrote, the whole batch is moved **below** the occupied
+space (only `y` changes, the batch keeps its shape). Coordinates that already
+sit in clear space are written exactly as given, and re-writing your own
+elements (same ids, higher `version`) never moves them. Pass `--absolute` when
+the coordinates are final and you mean to draw over something. `read` first
+if you want to choose the spot yourself.
+
 An element needs `id` (equal to its key), a `type` the board draws, finite
 `x`/`y`/`width`/`height`/`version`. A write lands only when it is **newer**
 (higher `version`, ties broken on `versionNonce`), the same rule the web client
