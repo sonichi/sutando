@@ -10,6 +10,7 @@
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -99,7 +100,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker', 'hitl_click',
+	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -192,6 +193,37 @@ const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
  * non-voice tasks. */
+// Cache of tasks/archive/'s month-shaped (YYYY-MM) subdirectory names,
+// invalidated by the archive root's own mtime — which changes whenever an
+// entry (most relevantly a new month's subdir) is added. Without this,
+// _readTaskHeader's caller (the 2s-interval result watcher) re-globbed the
+// whole archive root, thousands of legacy loose files included, on every
+// invocation — pinning a CPU core once that directory grew large.
+let _archiveMonthCache: { mtimeMs: number; dirs: string[] } | null = null;
+export let _archiveScanCount = 0; // test-only: counts real readdirSync(archiveRoot) calls
+
+function _archiveMonthDirs(archiveRoot: string): string[] {
+	// Stat BEFORE readdir: a subdir created mid-scan then gets cached
+	// against a stale-low mtime (extra re-scan next time, never stale).
+	let mtimeMs: number;
+	try {
+		mtimeMs = statSync(archiveRoot).mtimeMs;
+	} catch {
+		return [];
+	}
+	if (_archiveMonthCache && _archiveMonthCache.mtimeMs === mtimeMs) {
+		return _archiveMonthCache.dirs;
+	}
+	let dirs: string[] = [];
+	try {
+		_archiveScanCount++;
+		// Only month-shaped names (YYYY-MM); skip stray legacy files.
+		dirs = readdirSync(archiveRoot).filter((entry) => /^\d{4}-\d{2}$/.test(entry));
+	} catch {}
+	_archiveMonthCache = { mtimeMs, dirs };
+	return dirs;
+}
+
 /** Header lines of a task, located across every archive layout. Returns null
  *  when no copy of the task survives. */
 export function _readTaskHeader(taskId: string): string[] | null {
@@ -208,13 +240,9 @@ export function _readTaskHeader(taskId: string): string[] | null {
 	// boundaries.
 	const archiveRoot = join(TASK_DIR, 'archive');
 	if (existsSync(archiveRoot)) {
-		try {
-			for (const entry of readdirSync(archiveRoot)) {
-				// Only month-shaped names (YYYY-MM); skip stray files.
-				if (!/^\d{4}-\d{2}$/.test(entry)) continue;
-				candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
-			}
-		} catch {}
+		for (const entry of _archiveMonthDirs(archiveRoot)) {
+			candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
+		}
 	}
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;
@@ -409,8 +437,10 @@ export const workTool: ToolDefinition = {
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
+		// Skipped on Windows: shells out to /bin/sh + bash + invokes a .sh skill
+		// that isn't ported yet. The slow file-bridge path below still works.
 		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
-		if (concatMatch) {
+		if (concatMatch && process.platform !== 'win32') {
 			try {
 				const { execFileSync } = await import('node:child_process');
 				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
@@ -426,13 +456,30 @@ export const workTool: ToolDefinition = {
 			} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
 		}
 
-		// Check if the watcher (Claude Code brain) is running
+		// Check if the watcher (Claude Code brain) is running. The historic probe
+		// uses `pgrep -f watch-tasks` (POSIX only). On Windows we fall back to a
+		// PID-file sentinel written by src/watch-tasks-stream.ps1.
 		let watcherOnline = false;
 		try {
-			const { execFileSync } = await import('node:child_process');
-			// execFileSync argv array — no shell interpolation (fixes #1451)
-			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-			watcherOnline = !!watcherRunning;
+			if (process.platform === 'win32') {
+				const { existsSync, readFileSync } = await import('node:fs');
+				const pidFile = join(REPO_DIR, 'state', 'watch-tasks-stream.pid');
+				if (existsSync(pidFile)) {
+					const pid = parseInt(readFileSync(pidFile, 'utf-8').trim());
+					if (pid > 0) {
+						try {
+							// `process.kill(pid, 0)` is a liveness probe (signal 0); throws if process is gone.
+							process.kill(pid, 0);
+							watcherOnline = true;
+						} catch {}
+					}
+				}
+			} else {
+				const { execFileSync } = await import('node:child_process');
+				// execFileSync argv array — no shell interpolation (fixes #1451)
+				const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+				watcherOnline = !!watcherRunning;
+			}
 		} catch {
 			// pgrep returns exit code 1 if no match
 		}
@@ -626,7 +673,7 @@ export function getRecentConversation(count = 10): string {
 }
 
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
-const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
+const NOTE_VIEWING_FILE = join(tmpdir(), 'sutando-note-viewing.json');
 
 /**
  * Watch for context-drop.txt and inject into Gemini conversation.

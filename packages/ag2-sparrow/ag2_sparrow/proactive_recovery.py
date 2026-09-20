@@ -11,6 +11,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
+try:
+    from .outbox import OwnerState, process_identity
+except ImportError:
+    from outbox import OwnerState, process_identity
+
 # A claim this process took but had not finished when it died.
 _PRIVATE_CLAIM_RE = re.compile(r"^(proactive-.*\.sending)\.recover-(\d+)-\d+$")
 
@@ -62,21 +67,17 @@ def _recovery_target(name: str) -> Optional[str]:
     return base[: -len(".sending")] + ".txt"
 
 
+def claim_owner_may_be_alive(pid: int) -> bool:
+    """Only confirmed process death authorizes reclaiming its in-flight body."""
+    return process_identity(pid).state != OwnerState.DEAD
+
+
 def _holder_is_live(name: str) -> bool:
-    """True if a private claim names a still-running OTHER process."""
+    """True if a private claim's owner is alive or cannot be inspected."""
     match = _PRIVATE_CLAIM_RE.match(name)
     if not match:
         return False
-    pid = int(match.group(2))
-    if pid == os.getpid():
-        return True
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, ValueError):
-        return False
-    except PermissionError:
-        return True
-    return True
+    return claim_owner_may_be_alive(int(match.group(2)))
 
 
 def recover_orphan_sending_files(results_dir: Path) -> int:

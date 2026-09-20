@@ -115,7 +115,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-doc/requirements.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -162,6 +162,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
@@ -287,7 +288,7 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-doc/requirements.txt
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
@@ -305,10 +306,18 @@ jobs:
           RECDIR="$(mktemp -d)"
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
-          find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # `skills` too: a skill owns its own tests/, so a suite that moves into one
+          # keeps running; the root is optional, so it is added only when present.
+          bash scripts/discover-python-tests.sh > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
+          # A zero-file discovery is never legitimate on this repo; treat it as
+          # the runner never reaching the discovery call, not an empty suite.
+          if [ "$N" -eq 0 ]; then
+            echo "::error::discover-python-tests.sh found 0 files — refusing rather than silently passing an empty suite"
+            exit 1
+          fi
           # Per-file cap: without it one hung suite burns the job budget and
           # the job is CANCELED mid-suite.
 

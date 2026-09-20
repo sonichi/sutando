@@ -60,7 +60,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 
@@ -148,7 +148,7 @@ def canonical_access_tier(value) -> str:
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
@@ -554,6 +554,71 @@ def _epoch_suffixed(directory, task_id):
     )
 
 
+def _iter_archived_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+    """Existing archived results for `task_id` in lookup precedence; the id is
+    already validated by the public callers."""
+    archive = Path(results_dir) / "archive"
+    fname = f"{task_id}.txt"
+
+    direct = archive / fname
+    if direct.is_file():
+        yield direct
+
+    try:
+        with os.scandir(archive) as entries:
+            months = sorted((e.name for e in entries
+                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
+                            reverse=True)
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        candidate = archive / month / fname
+        if candidate.is_file():
+            yield candidate
+        # A re-archive inside a month dir carries the epoch suffix; a
+        # literal-name scan misses it. After the exact name, newest first.
+        yield from reversed(_epoch_suffixed(archive / month, task_id))
+
+    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
+    # newest day first, name-filtered before is_dir, as the month scan is.
+    try:
+        with os.scandir(Path(results_dir)) as entries:
+            days = sorted((e.name for e in entries
+                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
+                          reverse=True)
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        candidate = Path(results_dir) / day / fname
+        if candidate.is_file():
+            yield candidate
+        # Same epoch-suffix rule as the month scan: exact name first, then re-archives.
+        yield from reversed(_epoch_suffixed(Path(results_dir) / day, task_id))
+
+    # glob on a missing or non-directory path yields nothing rather than
+    # raising, so no guard is needed here.
+    yield from reversed(_epoch_suffixed(archive, task_id))
+
+
+def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+    """Every EXISTING result file for `task_id`, in lookup precedence: the live
+    `results/<id>.txt`, then each archive layout in `find_archived_result`
+    order, newest first within a layout.
+
+    This is the one definition of that order. `find_result` is its first
+    entry; a caller that must not stop at an empty placeholder (an existing
+    live file hiding a ready archived body) walks it until a body is ready.
+    Existence is all it checks — readiness belongs to `delivery.readiness`.
+    Rejects malformed ids rather than globbing with them (traversal gate).
+    """
+    if not valid_archive_lookup_id(task_id):
+        return
+    live = Path(results_dir) / f"{task_id}.txt"
+    if live.is_file():
+        yield live
+    yield from _iter_archived_result_candidates(results_dir, task_id)
+
+
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
@@ -568,63 +633,19 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
 
     Month scan mirrors `find_archived_task`: scandir, filter on NAME before
     asking is_dir, newest month first. Rejects malformed ids rather than
-    globbing with them (traversal gate).
+    globbing with them (traversal gate). First existing candidate only — see
+    `iter_result_candidates` for the walk past empty placeholders.
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    archive = Path(results_dir) / "archive"
-    fname = f"{task_id}.txt"
-
-    direct = archive / fname
-    if direct.is_file():
-        return direct
-
-    try:
-        with os.scandir(archive) as entries:
-            months = sorted((e.name for e in entries
-                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
-                            reverse=True)
-    except (OSError, ValueError):
-        months = []
-    for month in months:
-        candidate = archive / month / fname
-        if candidate.is_file():
-            return candidate
-        # A re-archive inside a month dir carries the epoch suffix; a
-        # literal-name scan misses it. Fallback only, so an exact hit wins.
-        suffixed = _epoch_suffixed(archive / month, task_id)
-        if suffixed:
-            return suffixed[-1]
-
-    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
-    # newest day first, name-filtered before is_dir, as the month scan is.
-    try:
-        with os.scandir(Path(results_dir)) as entries:
-            days = sorted((e.name for e in entries
-                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
-                          reverse=True)
-    except (OSError, ValueError):
-        days = []
-    for day in days:
-        candidate = Path(results_dir) / day / fname
-        if candidate.is_file():
-            return candidate
-
-    # glob on a missing or non-directory path yields nothing rather than
-    # raising, so no guard is needed here.
-    flat = _epoch_suffixed(archive, task_id)
-    return flat[-1] if flat else None
+    return next(_iter_archived_result_candidates(results_dir, task_id), None)
 
 
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
-    delivery, so an archive-only lookup reads a fresh result as never delivered."""
-    if not valid_archive_lookup_id(task_id):
-        return None
-    live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
-        return live
-    return find_archived_result(results_dir, task_id)
+    delivery, so an archive-only lookup reads a fresh result as never delivered.
+    First EXISTING path, ready or not — completion checks use `iter_result_candidates`."""
+    return next(iter_result_candidates(results_dir, task_id), None)
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:

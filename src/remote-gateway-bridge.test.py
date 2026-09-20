@@ -510,18 +510,15 @@ def main() -> int:
         rtc.LOCAL_TIER = _saved_tier
     check("===SKILL INSTRUCTIONS (follow before any other action)===" in sk
           and "room_ops.py read '!room:ag2.space' --limit 30" in sk
-          and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
-          "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
-    # notify.py falls back to a channel env file only when url+token are absent
-    # from the environment, and WHICH file carries them differs per onboarding.
+          "owner task carries the ag2space skill-instructions block (context-first, result path; no notify step)")
+    check("notify.py" not in sk and "--channel-id" not in sk,
+          "AG2 Space has no NOTIFY step")
+    # room_ops.py falls back to a channel env file only when url+token are
+    # absent from the environment; WHICH file carries them differs per onboarding.
     _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
-    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
-    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
-          < _notify_line.index("notify.py"),
-          "notify step carries the channel-env prelude BEFORE the notify.py call")
-    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
-          "the env prelude rides both gateway-calling steps (context-first + notify)")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
+          "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
     # when the hint is hardcoded; varying it is what makes this prove anything.
     _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
@@ -532,40 +529,46 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "--source dev-ag2space " in skd
           and "channel-env.sh ag2space)" not in skd,
-          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
-    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
-          "both gateway-calling steps name the task's own channel dir, not the default")
+          "a non-default CHANNEL_DIR reaches the env prelude, not the default")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
+          "the sole gateway-calling step names the task's own channel dir, not the default")
     # A string assertion passes even when the named file holds no gateway vars,
     # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
+    import shutil as _shutil
     import subprocess as _sp
     import tempfile as _tf
     _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
                             "scripts", "channel-env.sh")
+    _bash = _shutil.which("bash")
+    if _os.name == "nt" and (_git := _shutil.which("git")):
+        _git_bash = Path(_git).resolve().parent.parent / "bin" / "bash.exe"
+        if _git_bash.is_file():
+            _bash = str(_git_bash)
     def _resolve(files):
-        d = _tf.mkdtemp()
-        ch = _os.path.join(d, "channels", "ag2space")
-        _os.makedirs(ch)
-        for name, body in files.items():
-            with open(_os.path.join(ch, name), "w") as fh:
-                fh.write(body)
-        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
-        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
-        return r.returncode, r.stdout.strip()
+        with _tf.TemporaryDirectory() as d:
+            ch = _os.path.join(d, "channels", "ag2space")
+            _os.makedirs(ch)
+            for name, body in files.items():
+                with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
+                        text=True, env=env, timeout=30)
+            return r.returncode, r.stdout.strip()
     _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
     _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
     rc, got = _resolve({".env": _TOK})
-    check(rc == 0 and got.endswith("/.env"),
+    check(rc == 0 and Path(got).name == ".env",
           "layout A (.env carries the token) resolves to .env")
     rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
-    check(rc == 0 and got.endswith("/relay-client.env"),
+    check(rc == 0 and Path(got).name == "relay-client.env",
           "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
     rc, got = _resolve({".env": _MATRIX})
     check(rc != 0 and not got,
           "no file defines the token -> resolver FAILS instead of naming a tokenless file")
-    check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
+    check(sk.rstrip().splitlines()[-1].startswith("2. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
     check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")

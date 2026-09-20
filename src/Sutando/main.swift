@@ -567,19 +567,99 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
+    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
+    /// fail-opened on any argv merely mentioning the substring (review #4269,
+    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
+    /// boundary check (`watcherLineMatches`) to keep correct, not two.
+    func watcherProcessSeen() -> Bool? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        // pid,command (not bare command): excluding OUR OWN pid needs it, since
+        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
+        ps.arguments = ["-axo", "pid,command"]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        ps.waitUntilExit()
+        // A failed ps must read as unknown -- an empty listing from a
+        // non-zero exit is not a clean "no match" (the sysmond-unreachable
+        // case this whole probe exists to not misread as "dead", #4269).
+        if ps.terminationStatus != 0 {
+            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            return nil
+        }
+        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        // A definite match short-circuits alive; an undecidable line must not
+        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
+        var sawUndecidable = false
+        for line in listing.split(separator: "\n") {
+            switch watcherLineMatches(line, excluding: selfPID) {
+            case .some(true): return true
+            case .none: sawUndecidable = true
+            case .some(false): continue
+            }
+        }
+        return sawUndecidable ? nil : false
+    }
+
+    /// True when `s` contains the watcher script's name at a path/whitespace
+    /// boundary on both sides.
+    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
+        let marker = "watch-tasks-stream.sh"
+        var searchRange = s.startIndex..<s.endIndex
+        while let r = s.range(of: marker, range: searchRange) {
+            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
+            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
+            if before && after { return true }
+            searchRange = r.upperBound..<s.endIndex
+        }
+        return false
+    }
+
+    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
+    /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
+        let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
+        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return false }
+        guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
+        guard !parts[1].hasPrefix("-") else { return false }
+        // A match here is definite only at exactly 2 tokens -- more tokens could
+        // be a real pathname continuing past a space, so that's undecidable.
+        if matchesWatcherScriptAtBoundary(parts[1]) {
+            return parts.count == 2 ? true : nil
+        }
+        if parts.count == 2 { return false }
+        // A spaced script path is indistinguishable from a script plus arguments.
+        return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
     func checkWatcher() {
-        // pgrep -f watch-tasks
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        proc.arguments = ["-f", "watch-tasks"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return }
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return  // watcher alive
+        // Both halves of this check are Claude-only: the probe looks for
+        // watch-tasks-stream.sh, and the remedy is a word the Claude CLI parses
+        // as a restart prompt. A Codex core runs neither, so the probe can only
+        // ever report "dead" and the nudge is a meaningless prompt — a no-op
+        // loop every 300s, not an incident. Skip only on a runtime we positively
+        // recognise as non-Claude; an unresolvable one keeps the historical path,
+        // where the send-side --refuse-if-pending still guards an unsent draft.
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not typing into a pane whose parser is unknown")
+            return
+        }
+        if rt != "claude" { return }
+
+        switch watcherProcessSeen() {
+        case .some(true): return  // watcher alive
+        case .none:
+            logToFile("checkWatcher: ps could not answer — not alerting on an unknown")
+            return
+        case .some(false): break
         }
 
         // Read CLI's REAL status BEFORE alerting. If Claude Code is currently
@@ -608,7 +688,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // — so the watcher's stdout routes through the task-notification
         // pipe correctly. Any externally-started watcher (nohup etc.)
         // has stdout → /dev/null and is useless.
-        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
+        // Resolve the session's real runtime rather than taking the sender's
+        // Claude default: on a Codex core this watchdog would otherwise append
+        // `watcher` to an operator's unsent draft and press Enter.
+        // --refuse-if-pending holds recovery for one 300s tick; overwriting a
+        // draft is not recoverable. Nil runtime keeps the refuse-on-any-pending
+        // policy, which is the safe read on either pane.
+        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher",
+                              runtime: sessionCoreRuntime(),
+                              refuseIfPending: true)
+        if rc == 5 {
+            logToFile("watcher dead; core pane carries unsent text — not sending 'watcher' this tick")
+            return
+        }
         if rc == 6 {
             logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
             return
@@ -781,6 +873,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return String(data: outData, encoding: .utf8)
     }
 
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
+    }
+
     /// True if Claude Code in the sutando-core tmux pane has any running
     /// child process — indicating an active Bash/Tool call. False if only
     /// the claude process itself is running (idle, waiting on stdin) or
@@ -873,11 +971,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// (`scripts/tmux-send-line.sh`), which owns the session check, the
     /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
     /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
-    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
+    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil,
+                      runtime: String? = nil, refuseIfPending: Bool = false) -> Int32 {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
         if let w = skipIfQueued { args += ["--skip-if-queued", w] }
+        // Without --runtime the sender parses the pane as Claude, so a Codex
+        // composer's `›` line reads as empty and typed text is overwritten.
+        if let r = runtime { args += ["--runtime", r] }
+        if refuseIfPending { args += ["--refuse-if-pending"] }
         proc.arguments = args
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
@@ -1744,6 +1847,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // via voice-processing IO unit fails to initialize the output node on
         // this hardware (-10875). Re-enable once that's resolved.
         httpToggle(endpoint: "toggle")
+        openWebUI()
     }
 
     @objc func toggleMute() {

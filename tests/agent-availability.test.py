@@ -162,9 +162,9 @@ class WorkSignal(unittest.TestCase):
     fresh. The CLI wedge detector's reading is the primary input; the heartbeat is the fallback."""
 
     def test_verdict_kinds_fold_to_the_three_signals(self):
-        for kind, sig in (("working", "working"), ("clock-only", "working"), ("idle", "idle"),
+        for kind, sig in (("working", "working"), ("idle", "idle"),
                           ("static-with-work", "wedged"), ("retry-loop", "wedged"), ("provider-limit", "wedged"),
-                          ("low-novelty", "wedged"), ("unknown", "unknown"), ("cadence-too-sparse", "unknown")):
+                          ("abnormal", "wedged"), ("unknown", "unknown"), ("cadence-too-sparse", "unknown")):
             self.assertEqual(av.work_signal_from_verdict({"kind": kind, "confidence": "high"}), sig, kind)
         self.assertEqual(av.work_signal_from_verdict(None), "unknown")
         self.assertEqual(av.work_signal_from_verdict("garbage"), "unknown")
@@ -344,7 +344,7 @@ class WedgeFoldIsTotal(unittest.TestCase):
         import re
         import cli_wedge
         emitted = set(re.findall(r'"kind":\s*"([a-z-]+)"', inspect.getsource(cli_wedge)))
-        self.assertGreaterEqual(len(emitted), 9, "the detector's kinds were not found in its source")
+        self.assertGreaterEqual(len(emitted), 7, "the detector's kinds were not found in its source")
         self.assertEqual(emitted - set(av._WEDGE_KIND_TO_SIGNAL), set(), "unmapped kinds")
         self.assertEqual(set(av._WEDGE_KIND_TO_SIGNAL.values()) - {"working", "idle", "wedged", "unknown"}, set())
 
