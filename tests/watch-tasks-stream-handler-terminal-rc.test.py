@@ -144,6 +144,76 @@ def restart_witness():
     return first_pid, second.pid, emitted, published, body
 
 
+
+def run_ambiguous_lookup(second_manifest: bool):
+    """Two skills declaring the capability makes resolve_task_event_handler
+    return rc 2 -- "cannot tell", not "no pool". Temp skill dirs inside the
+    REAL checkout (like every other test here uses REPO as cwd), never a
+    synthetic repo tree -- the resolver's own dependency chain is the repo's,
+    not something a fixture should have to reassemble by hand.
+    Returns (emitted-to-core, results-written)."""
+    tmp = Path(tempfile.mkdtemp(prefix="term-rc-ambig-"))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    feed = tmp / "feed"; feed.write_text("")
+    b = tmp / "bin"; b.mkdir()
+    (b / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {feed}\n")
+    (b / "fswatch").chmod(0o755)
+
+    # worker-pool already declares this, so 0 extra IS the single-declarer case;
+    # any temp skill makes two -- ambiguous, which is only wanted for the second.
+    names = [f"zzz-term-rc-test-{tmp.name}-b"] if second_manifest else []
+    made = []
+    try:
+        for name in names:
+            skill_dir = REPO / "skills" / name
+            (skill_dir / "scripts").mkdir(parents=True)
+            made.append(skill_dir)
+            script = skill_dir / "scripts" / "route_handler.py"
+            script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+            script.chmod(0o755)
+            (skill_dir / "manifest.json").write_text(
+                '{"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}\n')
+
+        (ws / "tasks" / "task-ambig.txt").write_text("id: task-ambig\naccess_tier: owner\ntask: probe\n")
+        env = dict(os.environ)
+        env["PATH"] = f"{b}:{env['PATH']}"
+        env["TMPDIR"] = str(tmp)
+        env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+        env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        env.pop("SUTANDO_INSTANCE_ID", None)
+        p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")],
+                             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        out, t0 = [], time.time()
+        try:
+            os.set_blocking(p.stdout.fileno(), False)
+            while time.time() - t0 < 10:
+                time.sleep(0.3)
+                try:
+                    c = p.stdout.read()
+                    if c:
+                        out.append(c)
+                except Exception:
+                    pass
+                if any("TASK_FILE" in c for c in out) or list((ws / "results").glob("*.txt")):
+                    break
+        finally:
+            try:
+                os.killpg(os.getpgid(p.pid), 15)
+            except Exception:
+                pass
+            p.wait(timeout=5)
+        emitted = any("TASK_FILE" in c for c in out)
+        published = sorted(q.name for q in (ws / "results").glob("*.txt"))
+        return emitted, published
+    finally:
+        import shutil
+        for d in made:
+            shutil.rmtree(d, ignore_errors=True)
+
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
@@ -175,6 +245,19 @@ print(f"    result body: {body_r.strip()[:120]!r}")
 check("restart: the restarted watcher does NOT hand the task to the core", not emitted_r)
 check("restart: the restarted watcher publishes a terminal failure", published_r != [],
       "no result file, so the task is neither delivered nor failed")
+
+
+# keweichen's finding on #4472: rc 2 ("cannot tell", two providers declare the
+# capability) is not rc 1 ("no provider") and must not take the same fallback.
+emitted_ambig, published_ambig = run_ambiguous_lookup(second_manifest=True)
+check("an ambiguous lookup does NOT reach the live core", not emitted_ambig,
+      "rc 2 was treated the same as rc 1 -- the exact fail-open keweichen found")
+check("an ambiguous lookup publishes a terminal failure instead", published_ambig != [],
+      "the task was neither delivered nor failed")
+
+# Control: ONE declaring skill resolves cleanly and is not caught by this branch.
+emitted_one_decl, _ = run_ambiguous_lookup(second_manifest=False)
+check("control: exactly one declaring skill still reaches the live core", emitted_one_decl)
 
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else "PASS — handler terminal rc outranks the probe-time disposition")
 sys.exit(1 if FAILURES else 0)

@@ -260,7 +260,13 @@ publish_terminal_failure() {
   return "$rc"
 }
 
-if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+# shellcheck source=agent/task-event-handler-lookup.sh
+. "$__REPO_ROOT/src/agent/task-event-handler-lookup.sh"
+
+# Idempotent, and called both at start (only for an EXPLICIT pin -- see below)
+# and on the first routed task, so a handler installed later still gets its queue.
+ensure_dispatch_ready() {
+  [ -z "$DISPATCH_DIR" ] || return 0
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
     "$DISPATCH_DIR/workers"
@@ -272,6 +278,12 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
     claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
+}
+
+# An EXPLICIT pin only, never a bare auto-resolution -- every no-pool install
+# auto-resolves the shipped worker-pool skill's dormant handler otherwise.
+if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "${SUTANDO_TASK_EVENT_HANDLER}" ]; then
+  ensure_dispatch_ready
 fi
 
 acquire_dispatch_lock() {
@@ -364,7 +376,7 @@ handler_result_exists() {
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
+  local filename worker_pid handler prc
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -409,8 +421,33 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
+    # Resolved here, not at queue time: a receipt may outlive the handler that
+    # queued it, and the task must run under whatever provides one NOW.
+    if ! handler="$(task_event_handler "$__REPO_ROOT")"; then
+      release_dispatch_lock
+      finish_handler_task "$running_marker" "$task_path" 1
+      return
+    fi
+    # The provider that admitted this task at enqueue time may not be the one
+    # resolved now. An unprobed provider never agreed to it, so it is probed
+    # again here. 0 and 4 are dispatch_task's own "admit" codes (fallback and
+    # must-handle); anything else is a decline or a probe failure, and feeds
+    # the same outranking rule a real run's rc already does.
+    "$handler" \
+      --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+      --workspace "$WORKSPACE_DIR" \
+      --task-file "$task_path" \
+      --results-dir "$RESULTS_DIR" \
+      --repo "$__REPO_ROOT" \
+      --probe >/dev/null
+    prc=$?
+    if [ "$prc" -ne 0 ] && [ "$prc" -ne 4 ]; then
+      release_dispatch_lock
+      finish_handler_task "$running_marker" "$task_path" "$prc"
+      return
+    fi
     SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
-      "$SUTANDO_TASK_EVENT_HANDLER" \
+      "$handler" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
       "$task_path" \
@@ -463,7 +500,7 @@ task_announce() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved
+  local task_path="$1" rc filename announce resolved handler hrc
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   resolved="$(resolve_inbox_entry "$task_path")" || return 0
@@ -479,11 +516,21 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if [ -z "$DISPATCH_DIR" ]; then
+  handler="$(task_event_handler "$__REPO_ROOT")"; hrc=$?
+  if [ "$hrc" -eq 1 ]; then
+    # No provider declares one: the ordinary unrouted case, safe for the live core.
     emit_dispatch_task_file "$announce"
     return
+  elif [ "$hrc" -ne 0 ]; then
+    # Unlike rc 1, this is not "no pool" -- it is "cannot tell" (ambiguous
+    # manifests, or the interpreter that reads them failed), and a task the
+    # live core cannot be shown to be unbound for must never reach it anyway.
+    echo "watch-tasks-stream: handler lookup could not answer (rc $hrc) for $filename; refusing rather than falling through to the live core" >&2
+    publish_terminal_failure "$filename" "cannot determine the required handler" "$task_path" || true
+    return
   fi
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  ensure_dispatch_ready
+  "$handler" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
