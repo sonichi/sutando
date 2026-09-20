@@ -172,6 +172,20 @@ def test_a_card_read_back_from_the_document_is_still_a_card():
     assert is_newer(card("doing", 400, "@b"), stored), "and it still compares"
 
 
+def test_nan_and_infinity_are_REFUSED_not_raised():
+    """is_card exists because an agent writes this map directly, so it must
+    REFUSE junk, never crash on it. `int()` raises on NaN and both infinities,
+    so any guard ordered after an int() call is unreachable for exactly the
+    values it guards — the check has to come first."""
+    inf = float("inf")
+    for bad in (float("nan"), inf, -inf):
+        assert is_card({**card("todo", 1, "@a"), "updated": bad}) is False, bad
+        assert is_card({**card("todo", 1, "@a"), "order": 0, "updated": bad}) is False
+    # and it must not raise through is_newer either, which four call sites use
+    assert is_newer({"updated": float("nan"), "by": "@a"},
+                    {"updated": 1, "by": "@b"}) is False
+
+
 def test_a_non_integral_updated_is_still_refused():
     """Accepting 300.0 must not become accepting 300.5: the schema says ms."""
     assert not is_card({**card("todo", 1, "@a"), "updated": 300.5})

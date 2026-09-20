@@ -32,9 +32,13 @@ def _int(value: Any) -> int | None:
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, float) and value == int(value) and value == value:
-        return int(value)
-    return None
+    if not isinstance(value, float):
+        return None
+    # NaN and the infinities FIRST: int() raises on all three, so any check
+    # ordered after an int() call is unreachable for the values it guards.
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return int(value) if value == int(value) else None
 
 
 def is_card(value: Any, key: str | None = None) -> bool:
