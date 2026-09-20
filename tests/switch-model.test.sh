@@ -157,4 +157,23 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 47 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+
+# --- delegation: the pane lock is taken via the shared pane_lock_take (scripts/tmux-pane-lock.bash),
+# never an independent flock. A collision test alone cannot see a second implementation that locks
+# the same file the "right" way; only intercepting the shared function itself proves delegation.
+rm -f "$T/state/model-switch.json"; : > "$TMUX_LOG"
+T2="$T/delegation-repo"; mkdir -p "$T2"
+for entry in "$HERE"/*; do ln -s "$entry" "$T2/$(basename "$entry")"; done
+rm -f "$T2/scripts"; mkdir -p "$T2/scripts"
+for f in "$HERE"/scripts/*; do bn="$(basename "$f")"; [ "$bn" = "tmux-pane-lock.bash" ] && continue; ln -s "$f" "$T2/scripts/$bn"; done
+TAKE_LOG="$T/pane-lock-take.log"; : > "$TAKE_LOG"
+sed '/^pane_lock_take() {/a\
+  printf "TAKE %s %s %s\\n" "$1" "$2" "$3" >> "'"$TAKE_LOG"'"
+' "$HERE/scripts/tmux-pane-lock.bash" > "$T2/scripts/tmux-pane-lock.bash"
+rc=$(bash "$T2/skills/model-switch/scripts/switch-model.sh" opus --accept-timeout 3 --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 0 ] && grep -Eq "^TAKE .* sutando-core 8$" "$TAKE_LOG" \
+  && ok "34 the pane lock is acquired by calling the shared pane_lock_take (scripts/tmux-pane-lock.bash) on fd 8 — intercepted at the shared function itself, not merely observed as locking behavior a second implementation could also produce" \
+  || fail "34 delegation" "rc=$rc take-log='$(cat "$TAKE_LOG" 2>/dev/null)' $(cat "$T/err")"
+rm -f "$T/state/model-switch.json"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 48 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

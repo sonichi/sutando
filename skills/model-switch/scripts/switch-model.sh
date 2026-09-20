@@ -64,9 +64,10 @@ if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open th
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
 # The pane lock every pane writer flocks is held here for the WHOLE transaction (preflight, /model,
 # both pickers, acceptance), so no other writer's line can land mid-picker; the sender borrows fd 8.
-PANELOCK="$(bash "$REPO/scripts/tmux-pane-lock.sh" "$SOCK" "$SESSION")" || { echo "switch-model: could not derive the pane lock — nothing changed" >&2; exit 7; }
-if ! { exec 8>"$PANELOCK"; } 2>/dev/null; then echo "switch-model: could not open the pane lock ($PANELOCK) — nothing changed" >&2; exit 7; fi
-"$PY" -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX)' || { echo "switch-model: could not take the pane lock — nothing changed" >&2; exit 7; }
+# scripts/tmux-pane-lock.bash owns acquisition (src/tmux_pane_lock.py underneath); this
+# script must not derive the path or flock an fd itself, or a shell/Python writer can drift.
+. "$REPO/scripts/tmux-pane-lock.bash"
+pane_lock_take "$SOCK" "$SESSION" 8 || { echo "switch-model: could not take the pane lock — nothing changed" >&2; exit 7; }
 # Preflight the live pane before any write through the ONE sender
 # (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the
 # socket lock and refuses (5) on pending text, (7) on a failed inspection.

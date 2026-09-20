@@ -27,6 +27,7 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+. "$REPO/scripts/tmux-pane-lock.bash"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
@@ -289,10 +290,23 @@ warn_if_capture_truncated() {
   log_notifier "prompt for $filename may exceed the capture window (effective cap $(effective_scrollback_lines) lines = min(CAPTURE_SCROLLBACK_LINES=$CAPTURE_SCROLLBACK_LINES, the pane's own #{history_limit}); pane #{history_size}=$(pane_history_field history_size)) -- no composer marker found; raising CAPTURE_SCROLLBACK_LINES will not help past the pane's own history-limit"
 }
 
+# One writer owns the pane from the paste through the confirmed submit: a key typed
+# between them lands in this composer, or drives another writer's open picker.
+deliver_prompt() {
+  local filename="$1" prompt="$2" rc=0
+  if ! pane_lock_take "$TMUX_SOCKET" "$SESSION" 8; then
+    log_notifier "could not take the pane lock for $SESSION; NOT typing $filename"
+    return 1
+  fi
+  deliver_prompt_locked "$filename" "$prompt"; rc=$?
+  pane_lock_release 8
+  return "$rc"
+}
+
 # Type + verify staged, then C-m + verify submitted; both halves retry.
 # A running turn is not a gate: the line queues behind it, as the Monitor
 # tool's own notification does. Only an unhealthy pane or a draft holds.
-deliver_prompt() {
+deliver_prompt_locked() {
   local filename="$1" prompt="$2" type_tries=0 staged=0
   local baseline_esc baseline_raw staged_raw="" incarnation=""
   if ! wait_for_core_healthy; then

@@ -8,7 +8,8 @@ records every key, while an independent owner holds the lock the way
 `switch-model.sh` holds it across the Codex picker transaction.
 
 Writers covered: `src/health-check.py` (cron nudge), `src/core-input-watch.py`
-(auto-answer keypress), `src/agent/codex/cli/task-notifier.sh` (task delivery).
+(auto-answer keypress), `src/agent/codex/cli/task-notifier.sh` and
+`src/agent/claude/cli/task-notifier.sh` (task delivery).
 
 Run: python3 tests/pane-lock-collision.test.py
 """
@@ -242,10 +243,117 @@ def case_task_notifier_delivery() -> list[str]:
     return fails
 
 
+def _claude_notifier_repo(td: Path) -> Path:
+    """A fixture repo holding only what the Claude task-notifier loads at startup."""
+    root = td / "repo"
+    for rel in (
+        "src/agent/claude/cli/task-notifier.sh",
+        "src/agent/task-event-handler-lookup.sh",
+        "src/core-input-watch.py",
+        "src/gateway_serving.py",
+        "src/prompt_excerpt.py",
+        "src/sutando_config.py",
+        "src/workspace_default.py",
+        "src/util_paths.py",
+        "src/local_task_protocol.py",
+        "src/task_priority.py",
+        "src/runtime-api/instance_key.py",
+        "src/runtime-api/rundir.py",
+        "scripts/sutando-config.sh",
+        "scripts/python-binary.sh",
+        "scripts/tmux-pane-lock.sh",
+        "scripts/tmux-pane-lock.bash",
+        "src/tmux_pane_lock.py",
+        "src/delivery/__init__.py",
+        "src/delivery/pane_gate.py",
+        "src/delivery/task_dispatch.py",
+        "src/delivery/readiness.py",
+        "src/cli_wedge.py",
+        "src/file_lock.py",
+        "src/sutando_platform.py",
+    ):
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / rel, target)
+    (root / "workspace" / "tasks").mkdir(parents=True, exist_ok=True)
+    (root / "workspace" / "results").mkdir(parents=True, exist_ok=True)
+    (root / "workspace" / "tasks" / "task-collision.txt").write_text("task: hello\n")
+    return root
+
+
+def _fake_tmux_claude_notifier(td: Path) -> tuple[Path, Path]:
+    """Like `_fake_tmux_notifier`, plus the `display-message` fields the Claude
+    notifier reads for its incarnation marker and scrollback sizing -- without
+    them it fails closed on an unreadable incarnation before ever typing, which
+    would make the collision case pass for the wrong reason (never sending
+    anything, lock or no lock)."""
+    log = td / "tmux.log"
+    log.unlink(missing_ok=True)
+    script = td / "tmux"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{log}"\n'
+        'case "$*" in\n'
+        '  *capture-pane*) printf "%s\\n%s\\n" "⏵⏵ bypass permissions on" "❯ " ;;\n'
+        '  *"#{pane_pid}"*) printf "12345\\n" ;;\n'
+        '  *"#{history_limit}"*) printf "2000\\n" ;;\n'
+        '  *"#{history_size}"*) printf "5\\n" ;;\n'
+        '  *"#{pane_id}"*) printf "%%1\\n" ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    return script, log
+
+
+def case_claude_task_notifier_delivery() -> list[str]:
+    """Same transaction shape as `case_task_notifier_delivery`, for the Claude
+    notifier's own writer (`deliver_prompt` -> `deliver_prompt_locked`, a
+    separate implementation from Codex's, guarded by the same shared lock)."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        root = _claude_notifier_repo(tdp)
+        tmux, log = _fake_tmux_claude_notifier(tdp)
+        env = dict(os.environ)
+        env["PATH"] = f"{tdp}{os.pathsep}{env['PATH']}"
+        env["SUTANDO_TEST_MODE"] = "1"
+        env["SUTANDO_WORKSPACE"] = str(root / "workspace")
+        env["SUTANDO_TMUX_SOCKET"] = SOCK
+        env["SUTANDO_TMUX_SESSION"] = SESSION
+        env["SUTANDO_NOTIFIER_POLL_INTERVAL"] = "0.1"
+        env["SUTANDO_NOTIFIER_SUBMIT_RETRIES"] = "1"
+        env["SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT"] = "1"
+        cmd = ["bash", str(root / "src/agent/claude/cli/task-notifier.sh"),
+               "--event", "task-collision.txt"]
+        with PaneOwner() as owner:
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                if _keys(log):
+                    fails.append(f"claude task-notifier: typed into an owned pane: {_keys(log)}")
+                    break
+                time.sleep(0.2)
+            if proc.poll() is not None and not _keys(log):
+                fails.append("claude task-notifier: exited without delivering instead of waiting for the pane")
+            owner.release()
+            try:
+                proc.wait(timeout=40)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                fails.append("claude task-notifier: still running well after the pane was released")
+        sent = _keys(log)
+        if not any("task-collision.txt" in ln for ln in sent):
+            fails.append(f"claude task-notifier: never delivered after the pane was released (control), log: {sent}")
+    return fails
+
+
 CASES = (
     ("health-check cron nudge", case_health_check_cron_nudge),
     ("core-input-watch keypress", case_core_input_watch_keypress),
     ("task-notifier delivery", case_task_notifier_delivery),
+    ("claude task-notifier delivery", case_claude_task_notifier_delivery),
 )
 
 
