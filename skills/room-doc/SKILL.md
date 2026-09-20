@@ -166,7 +166,7 @@ python3 $P --with-authors read '!room:server'
 Prints, above the text, which Yjs client id belongs to which account and
 whether it is a person or an agent (and whose agent). The document records
 this on the server as writes land; an agent cannot claim authorship, only
-read it. Use it to decide whether a paragraph is a human's to leave alone or
+read it (verified 2026-09-20). Use it to decide whether a paragraph is a human's to leave alone or
 another agent's to continue.
 
 ## What a refusal means
