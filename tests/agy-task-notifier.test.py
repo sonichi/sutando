@@ -82,6 +82,15 @@ case "$cmd" in
     exit 1
     ;;
   capture-pane)
+    # capture-pane's OWN -S <start-line> may appear among the remaining
+    # args ("-p -t SESSION" or "-p -t SESSION -S -500") -- distinct from
+    # the top-level socket -S already stripped above.
+    CAPTURE_START=""
+    prev=""
+    for a in "$@"; do
+      [ "$prev" = -S ] && CAPTURE_START="$a"
+      prev="$a"
+    done
     hist=""
     [ -f "{self.pane_file}" ] && hist="$(cat "{self.pane_file}")"
     composer="$(cat "{self.composer_file}" 2>/dev/null)"
@@ -93,11 +102,22 @@ case "$cmd" in
     else
       combined="$composer"
     fi
+    # -S -N asks for N lines of SCROLLBACK ahead of the fixed viewport, like
+    # real tmux history -- without it this stub only ever returns the last
+    # FIXED_ROWS, which is exactly the bug: a marker that wrapped off the
+    # visible page is invisible to the caller even though it was typed.
+    rows="$FIXED_ROWS"
+    case "$CAPTURE_START" in
+      -*)
+        req="${{CAPTURE_START#-}}"
+        case "$req" in ''|*[!0-9]*) : ;; *) [ "$req" -gt "$rows" ] && rows="$req" ;; esac
+        ;;
+    esac
     n=$(printf '%s\\n' "$combined" | wc -l | tr -d ' ')
-    if [ "$n" -gt "$FIXED_ROWS" ]; then
-      printf '%s\\n' "$combined" | tail -n "$FIXED_ROWS"
+    if [ "$n" -gt "$rows" ]; then
+      printf '%s\\n' "$combined" | tail -n "$rows"
     else
-      pad=$((FIXED_ROWS - n))
+      pad=$((rows - n))
       i=0
       while [ "$i" -lt "$pad" ]; do printf '\\n'; i=$((i + 1)); done
       printf '%s\\n' "$combined"
@@ -230,6 +250,30 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(type_calls, 1,
                           f"expected exactly one type attempt, got {type_calls}:\n{log}")
 
+    def test_narrow_pane_scrolling_the_marker_off_screen_still_stages_once(self):
+        # A narrow pane (width=20) wraps the leading marker past the fixed
+        # viewport; staging must still detect it via scrollback, not retype.
+        self.pane_width = 20
+        self._write_fake_tmux()
+        filename = "task-cron-sutando-life-kewei-overview-hourly-screenshot-1787587200.txt"
+        self.write_task(filename)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result(filename)
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event(filename)
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        type_calls = log.count(f"TYPE Sutando task ready: {filename}")
+        self.assertEqual(type_calls, 1,
+                          f"expected exactly one type attempt, got {type_calls}:\n{log}")
+
     def test_busy_pane_blocks_dispatch_until_idle(self):
         self.write_task("task-c.txt")
         self.pane_file.write_text(BUSY_MARKER + "\n")
@@ -256,6 +300,16 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(violation, [])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TYPE Sutando task ready: task-c.txt", self.sendkeys_log_text())
+
+    def test_busy_pane_beyond_ready_timeout_sends_nothing(self):
+        # A permanently busy pane times out wait_for_core_idle; delivery
+        # must be refused outright, never fall through to send-keys.
+        self.write_task("task-h.txt")
+        self.pane_file.write_text(BUSY_MARKER + "\n")
+        result = self.run_event("task-h.txt", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sendkeys_log_text(), "",
+                          "a failed idle wait must never send-keys into a busy pane")
 
     def test_dropped_paste_is_retyped(self):
         self.write_task("task-d.txt")
