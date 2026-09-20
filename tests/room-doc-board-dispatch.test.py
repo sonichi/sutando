@@ -81,6 +81,10 @@ def check(name, fn):
         fn()
     except AssertionError as e:
         FAILS.append(f"{name}: {e}")
+    except SystemExit as e:
+        # argparse rejects an unknown flag by exiting; that is this case's
+        # failure, not a reason for the whole suite to stop unreported.
+        FAILS.append(f"{name}: the CLI exited {e.code} instead of running")
     except Exception as e:  # noqa: BLE001
         FAILS.append(f"{name}: unexpected {type(e).__name__}: {e}")
 
