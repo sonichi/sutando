@@ -42,6 +42,26 @@ def resolve_url(explicit: str | None) -> str:
     raise RoomDocError("no service URL. Pass --url, or set one of: " + ", ".join(URL_VARS) + ".")
 
 
+def parse_elements(raw: str) -> list:
+    """The `draw` argument, turned into elements or a readable refusal.
+
+    Left to json itself this raises JSONDecodeError and the CLI prints a
+    traceback, which no other error path here does.
+    """
+    try:
+        elements = json.loads(raw)
+    except ValueError as exc:
+        raise RoomDocError(
+            f"elements must be a JSON array, and this did not parse: {exc}\n"
+            'e.g. \'[{"id":"r1","type":"rectangle","x":0,"y":0,'
+            '"width":100,"height":60,"version":1}]\'') from exc
+    if not isinstance(elements, list):
+        raise RoomDocError(
+            f"elements must be a JSON ARRAY, got {type(elements).__name__}. "
+            "One element still goes in a list.")
+    return elements
+
+
 def render(command: str, *, text: str = "", peers: list | None = None,
            as_json: bool = False, before: int | None = None,
            elements: list | None = None, written: int | None = None) -> str:
@@ -94,9 +114,14 @@ async def run(args: argparse.Namespace) -> int:
             await doc.set_presence(args.name, user_id=args.user_id)
 
         if args.kind == BOARD_KIND:
+            # Presence is its own channel and belongs to no document kind, so
+            # `peers` is answered here exactly as it is for a text document.
+            if args.command == "peers":
+                print(render("peers", peers=doc.peers, as_json=args.json))
+                return 0
             written = None
             if args.command == "draw":
-                written = await doc.put_elements(json.loads(args.elements))
+                written = await doc.put_elements(parse_elements(args.elements))
                 await doc.settle(args.settle)
             elif args.command == "erase":
                 await doc.delete_element(args.element_id)
@@ -105,7 +130,7 @@ async def run(args: argparse.Namespace) -> int:
             elif args.command != "read":
                 raise RoomDocError(
                     f"{args.command!r} is a text command; the board holds elements. "
-                    "Use read, draw or erase.")
+                    "Use read, draw, erase or peers.")
             print(render(args.command, peers=doc.peers, as_json=args.json,
                          elements=doc.elements, written=written))
             return 0

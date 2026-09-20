@@ -68,6 +68,7 @@ writing text no Excalidraw client ever reads.
 python3 $P --kind board read  '!room:server'          # list elements in drawing order
 python3 $P --kind board draw  '!room:server' '[{"id":"r1","type":"rectangle","x":0,"y":0,"width":100,"height":60,"version":1}]'
 python3 $P --kind board erase '!room:server' 'r1'     # marks isDeleted, the editor's own deletion
+python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
 ```
 
 An element needs `id` (equal to its key), a `type` the board draws, finite
@@ -77,9 +78,11 @@ uses, so an agent and a person editing one board converge. Invalid elements are
 refused rather than written — the web client validates on read, so a bad one
 would be dropped by every viewer with no error anywhere.
 
-Holding the board open and drawing repeatedly? Call `reconcile()` after remote
-changes. Concurrent writes to one element are merged by Yjs on client id, which
-knows nothing about element versions, so the older version can otherwise win.
+Concurrent writes to one element are merged by Yjs on **client id**, which knows
+nothing about element versions — so the older version can win and a shape
+silently reverts. `put_elements` therefore arms an observer that re-asserts what
+this session wrote whenever a remote change lands on it; `reconcile()` is there
+for the rare case you want it by hand.
 
 ## Collaborating, rather than submitting
 

@@ -13,7 +13,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
 
-from room_doc import build_parser, render  # noqa: E402
+from room_doc import build_parser, parse_elements, render  # noqa: E402
+from room_doc_protocol import RoomDocError  # noqa: E402
 
 FAILS = []
 
@@ -82,6 +83,32 @@ def test_the_parser_exposes_the_board_commands():
         args = p.parse_args(argv)
         assert args.kind == "board", argv
     assert p.parse_args(["read", "!r:s"]).kind == "markdown", "default stays markdown"
+
+
+def test_malformed_draw_json_is_a_refusal_not_a_traceback():
+    """Every other error path here prints `room-doc: ...`; this one used to
+    raise JSONDecodeError straight through argparse."""
+    for bad in ("not json", "", "{"):
+        try:
+            parse_elements(bad)
+        except RoomDocError as exc:
+            assert "JSON" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad!r} should not have parsed")
+
+
+def test_a_bare_object_is_refused_because_one_element_still_needs_a_list():
+    try:
+        parse_elements('{"id":"a"}')
+    except RoomDocError as exc:
+        assert "ARRAY" in str(exc), exc
+    else:
+        raise AssertionError("a bare object should be refused")
+
+
+def test_valid_json_still_parses():
+    assert parse_elements('[{"id":"a"}]') == [{"id": "a"}]
+    assert parse_elements("[]") == []
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

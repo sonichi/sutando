@@ -45,6 +45,8 @@ from room_doc_protocol import (  # noqa: E402
 )
 
 SYNC_TIMEOUT_S = 20.0
+# Marks a transaction as ours, so the reconcile observer can ignore its own writes.
+LOCAL_ORIGIN = "room-doc-client"
 
 
 class RoomDoc:
@@ -66,6 +68,10 @@ class RoomDoc:
         self._reader: asyncio.Task | None = None
         self._awareness_task: asyncio.Task | None = None
         self._awareness_sub: Any = None
+        # What this session has claimed, so a concurrent merge that replaces one
+        # of ours with an older version can be answered.
+        self._asserted: dict[str, dict] = {}
+        self._elements_sub: Any = None
 
     @property
     def kind(self) -> str:
@@ -200,6 +206,12 @@ class RoomDoc:
         self._awareness_task = asyncio.create_task(self._awareness.start())
 
     async def _stop(self) -> None:
+        if self._elements_sub is not None:
+            try:
+                self._doc.get(ELEMENTS_KEY, type=Map).unobserve(self._elements_sub)
+            except Exception:  # noqa: BLE001 - teardown must not mask the real error
+                pass
+            self._elements_sub = None
         if self._awareness_sub is not None:
             self._awareness.unobserve(self._awareness_sub)
             self._awareness_sub = None
@@ -239,7 +251,8 @@ class RoomDoc:
         """Apply a local change and put only the delta on the wire."""
         self._require_live()
         before = self._doc.get_state()
-        mutate()
+        with self._doc.transaction(origin=LOCAL_ORIGIN):
+            mutate()
         await self._send(create_update_message(self._doc.get_update(before)))
 
     async def append(self, addition: str) -> None:
@@ -265,6 +278,11 @@ class RoomDoc:
                     "Nothing was written.")
         stored = dict(self._items(ymap))
         changed = changed_elements(elements, stored.get)
+        # Remembered even when nothing is written: a concurrent merge can still
+        # replace a value we already agreed with, and then it needs re-asserting.
+        for element in elements:
+            self._asserted[element["id"]] = dict(element)
+        self._watch_for_regression()
         if not changed:
             return 0
 
@@ -287,14 +305,42 @@ class RoomDoc:
         gone["version"] = int(stored.get("version", 0)) + 1
         await self.put_elements([gone])
 
-    async def reconcile(self, elements: list[dict]) -> int:
-        """Re-assert local elements after a remote change, and NOT optional.
+    def _watch_for_regression(self) -> None:
+        """Re-assert our elements whenever a REMOTE change lands on one.
 
         Concurrent writes to one key are merged by Yjs on client id, which knows
-        nothing of element versions, so the older version can win; re-applying
-        makes the newer one causally later and it wins everywhere.
+        nothing of element versions, so the older version can win. Re-applying
+        makes ours causally later and it wins everywhere; when theirs is
+        genuinely newer this writes nothing.
         """
-        return await self.put_elements(elements)
+        if self._elements_sub is not None or self._kind != BOARD_KIND:
+            return
+        ymap, _ = self._require_board("watch elements")
+
+        def on_map(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin == LOCAL_ORIGIN:
+                return
+            touched = set(getattr(event, "keys", None) or {})
+            mine = [e for i, e in self._asserted.items() if i in touched]
+            if mine:
+                asyncio.ensure_future(self._reassert(mine))
+
+        self._elements_sub = ymap.observe(on_map)
+
+    async def _reassert(self, elements: list[dict]) -> None:
+        # A background re-assert must never raise into the event loop: the
+        # session can end between the remote change and this running.
+        try:
+            await self.put_elements(elements)
+        except RoomDocError:
+            pass
+
+    async def reconcile(self, elements: list[dict] | None = None) -> int:
+        """Re-assert elements now. Rarely needed by hand — `put_elements` arms
+        an observer that does this on every remote change."""
+        return await self.put_elements(
+            elements if elements is not None else list(self._asserted.values()))
 
     async def replace(self, old: str, new: str) -> None:
         """Replace the first occurrence. Refuses when absent, so a caller never
