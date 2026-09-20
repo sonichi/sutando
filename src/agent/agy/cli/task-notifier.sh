@@ -32,6 +32,10 @@ CORE_READY_TIMEOUT="${SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_AGY_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 # Ticks (of POLL_INTERVAL) to wait for a paste to visibly stage before retyping.
 TYPE_CONFIRM_TIMEOUT_TICKS="${SUTANDO_AGY_NOTIFIER_TYPE_CONFIRM_TICKS:-8}"
+# Scrollback depth for staging checks: a long prompt in a narrow pane can wrap
+# its leading marker above the visible viewport; the viewport alone then
+# misses it and retypes a duplicate. Deep enough to hold the whole prompt.
+PANE_HISTORY_LINES="${SUTANDO_AGY_NOTIFIER_PANE_HISTORY_LINES:-500}"
 
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
@@ -108,7 +112,7 @@ wait_for_core_idle() {
 }
 
 pane_capture() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" -S "-$PANE_HISTORY_LINES" 2>/dev/null
 }
 
 # `capture-pane -p` returns the pane's fixed row count regardless of typed
@@ -129,7 +133,9 @@ prompt_is_staged() {
 # into a duplicate, verified live), then Enter + verify submitted.
 deliver_prompt() {
   local filename="$1" prompt="$2" type_tries=0 staged=0 waited=0 baseline
-  wait_for_core_idle || true
+  # A failed idle wait must never fall through to send-keys: that's the
+  # fail-open bug -- a busy pane still gets typed into and Entered.
+  wait_for_core_idle || { log_notifier "core not idle -- refusing to send for $filename"; return 1; }
   while :; do
     baseline="$(pane_capture)"
     tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" -l -- "$prompt"
@@ -170,7 +176,9 @@ submit_task() {
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
-  deliver_prompt "$filename" "$prompt"
+  # Nothing was sent if delivery refused -- the task stays pending in
+  # TASKS_DIR and next_pending_task picks it up again on a later event.
+  deliver_prompt "$filename" "$prompt" || return 1
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
@@ -184,7 +192,8 @@ submit_task() {
 
 if [ "${1:-}" = "--event" ]; then
   [ -n "${2:-}" ] || { echo "agy-task-notifier: --event requires a filename" >&2; exit 2; }
-  submit_task "$2"
+  # A deferred delivery (core busy) is not a script failure under set -e.
+  submit_task "$2" || true
   exit 0
 fi
 
@@ -205,7 +214,9 @@ while IFS= read -r event; do
       next_pending_task >/dev/null || continue
       wait_for_core_idle || exit 1
       filename="$(next_pending_task)" || continue
-      submit_task "$filename"
+      # A deferred delivery (core busy) leaves the task pending for the
+      # next event, not a reason to kill the persistent watcher.
+      submit_task "$filename" || true
       ;;
   esac
 done < "$event_dir/events"
