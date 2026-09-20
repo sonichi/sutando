@@ -115,7 +115,9 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        # room-doc's deps are installed here, not optional: its lifecycle suite
+        # fails rather than skips in CI, so a missing wheel is a red job.
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-doc/requirements.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -288,7 +290,9 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        # room-doc's deps are installed here, not optional: its lifecycle suite
+        # fails rather than skips in CI, so a missing wheel is a red job.
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-doc/requirements.txt
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge

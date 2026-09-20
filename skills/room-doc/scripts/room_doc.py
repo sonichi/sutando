@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""CLI over the room-doc client: read, append, replace, peers.
+
+Every subcommand opens the document, does one thing and closes. A long-lived
+collaborating agent should import `room_doc_client` instead and hold the
+connection open, so its presence stays visible between edits.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from room_doc_protocol import RoomDocError  # noqa: E402
+
+TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN")
+URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT")
+
+
+def resolve_token(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for var in TOKEN_VARS:
+        if os.environ.get(var):
+            return os.environ[var]
+    raise RoomDocError(
+        "no credential. Pass --token, or set one of: " + ", ".join(TOKEN_VARS) + ".\n"
+        "It must authorize THIS agent for documents: a Matrix access token, or an AG2 "
+        "agent ticket carrying the doc.write grant. A ticket minted only to pull tasks "
+        "is refused by design."
+    )
+
+
+def resolve_url(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for var in URL_VARS:
+        if os.environ.get(var):
+            return os.environ[var]
+    raise RoomDocError("no service URL. Pass --url, or set one of: " + ", ".join(URL_VARS) + ".")
+
+
+def render(command: str, *, text: str = "", peers: list | None = None,
+           as_json: bool = False, before: int | None = None) -> str:
+    """What the CLI prints, decided without a socket in hand.
+
+    Kept pure so the output contract is testable anywhere: a caller parsing
+    stdout as JSON must not find out in production that a mode prints prose.
+    """
+    peers = peers or []
+    if command == "read":
+        if as_json:
+            return json.dumps({"chars": len(text), "peers": peers, "text": text},
+                              ensure_ascii=False, indent=2)
+        return text
+    if command == "peers":
+        return json.dumps(peers, ensure_ascii=False, indent=2)
+    if command == "append":
+        return json.dumps({"ok": True, "before": before, "after": len(text)})
+    if command == "replace":
+        return json.dumps({"ok": True, "chars": len(text)})
+    raise RoomDocError(f"no output defined for {command!r}")
+
+
+async def run(args: argparse.Namespace) -> int:
+    # Imported here, not at module scope: the rules above are pure, and a test
+    # of them must not need pycrdt installed.
+    from room_doc_client import open_room_doc
+
+    token, url = resolve_token(args.token), resolve_url(args.url)
+    async with open_room_doc(url, args.room, token, kind=args.kind,
+                             insecure=args.insecure) as doc:
+        if args.name:
+            await doc.set_presence(args.name, user_id=args.user_id)
+        before = len(doc.text)
+        if args.command == "append":
+            await doc.append(args.text)
+            await doc.settle(args.settle)
+        elif args.command == "replace":
+            await doc.replace(args.old, args.new)
+            await doc.settle(args.settle)
+        print(render(args.command, text=doc.text, peers=doc.peers,
+                     as_json=args.json, before=before))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="room_doc", description=__doc__)
+    p.add_argument("--url", help="API root or ws(s) URL (else $AG2_ROOM_DOC_URL / $AG2_API_ROOT)")
+    p.add_argument("--token", help="Matrix access token or AG2 ticket with doc.write "
+                   "(else $AG2_MATRIX_TOKEN)")
+    p.add_argument("--name", help="presence name to publish while connected")
+    p.add_argument("--user-id", dest="user_id", default=None,
+                   help="this agent's mxid, so the roster can show its avatar")
+    p.add_argument("--kind", default="markdown",
+                   help="which of the room's documents (e.g. board); default markdown")
+    p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
+    p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    for name, help_text in (("read", "print the document"), ("peers", "who is present")):
+        s = sub.add_parser(name, help=help_text)
+        s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("append", help="append text to the end")
+    s.add_argument("room")
+    s.add_argument("text")
+
+    s = sub.add_parser("replace", help="replace the first occurrence of some text")
+    s.add_argument("room")
+    s.add_argument("old")
+    s.add_argument("new")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return asyncio.run(run(args))
+    except RoomDocError as exc:
+        print(f"room-doc: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
