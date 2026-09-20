@@ -225,12 +225,13 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
                     await doc.set_presence(args.name, user_id=args.user_id)
                 if since is not None:
                     print("RECONNECTED\tcatching up on what landed meanwhile", flush=True)
-                failures = 0
                 async for ev in doc.events(handles, settle=args.settle, since=since):
+                    failures = 0              # a socket that carries an event is a real one
                     kind = ev.pop("kind")
                     detail = ev.pop("text", None)
                     rest = " ".join(f"{k}={v}" for k, v in ev.items() if v not in (None, ""))
                     print(f"EVENT\t{kind}\t{rest}" + (f"\t{detail}" if detail else ""), flush=True)
+                return 0                      # a clean end is an end, not a reconnect
         except RoomDocError as exc:
             since = getattr(exc, "snapshot", since)
             if exc.code not in RECONNECT_CODES or failures >= args.max_reconnects:

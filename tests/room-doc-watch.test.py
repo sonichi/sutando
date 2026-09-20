@@ -112,6 +112,8 @@ def test_assignee_matches_with_or_without_the_at_and_case():
     after = {"c": {"id": "c", "column": "x", "assignee": "Mars"}}
     assert kanban_changes({}, after, ["@mars"])[0]["kind"] == "assigned"
     assert kanban_changes({}, after, ["marshall"]) == []
+    junk = {"c": "not a card", "d": {"id": "d", "column": "x", "assignee": 7}}
+    assert kanban_changes({}, junk, ["mars"]) == [], "junk in the map is skipped, not raised on"
 
 
 def test_peers_arriving_and_leaving_by_identity_not_device():
@@ -352,10 +354,12 @@ async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
 
 
 def test_a_refusal_is_never_a_reconnect():
+    from room_doc_protocol import close_code
     for refusal in (4400, 4403, 4404):
         assert refusal not in RECONNECT_CODES
     for restart in (1001, 1006, 1012):
         assert restart in RECONNECT_CODES
+    assert close_code(None) is None and close_code(_Closed(1012)) == 1012
 
 
 async def test_a_carried_snapshot_reports_what_landed_in_the_gap():
@@ -398,6 +402,106 @@ async def test_presence_stops_renewing_once_the_socket_is_dead():
     live._ws = DeadWS()
     await live._send_quietly(b"x")                                # not ended: tried, and quiet
     assert live._ws.calls == 1
+
+
+# --- the CLI loop: prints events, comes back from a restart, stops on a refusal
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+import types  # noqa: E402
+
+import room_doc as cli  # noqa: E402
+
+
+class _Session:
+    """A stand-in for RoomDoc: yields scripted events, then ends the way the
+    script says — a restart code, a refusal, or a clean stop."""
+
+    def __init__(self, script, end_code):
+        self.script, self.end_code = script, end_code
+        self.presence = None
+
+    async def set_presence(self, name, user_id=None):
+        self.presence = name
+
+    async def events(self, handles, settle=1.0, since=None):
+        for ev in self.script:
+            yield dict(ev)
+        if self.end_code is None:
+            return
+        err = RoomDocError(f"ended {self.end_code}")
+        err.code = self.end_code
+        err.snapshot = {"peers": [], "text": "carried"}
+        raise err
+
+
+def _fake_opener(sessions):
+    """Each call opens the next scripted session; records the `since` it got."""
+    calls = []
+
+    @contextlib.asynccontextmanager
+    async def open_room_doc(url, room, token, kind=None, insecure=False):
+        calls.append((url, room, kind))
+        yield sessions.pop(0)
+
+    return open_room_doc, calls
+
+
+def _args(**over):
+    base = dict(room="!r:x", kind="markdown", handles=["mars"], settle=0.01, name="mars",
+                user_id=None, insecure=False, max_reconnects=3)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+async def _run_watch(sessions, **over):
+    opener, calls = _fake_opener(sessions)
+    out = io.StringIO()
+    import room_doc_client
+    real = room_doc_client.open_room_doc
+    room_doc_client.open_room_doc = opener
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = await cli.watch(_args(**over), "tok", "https://h")
+    except RoomDocError as e:
+        rc = e
+    finally:
+        room_doc_client.open_room_doc = real
+    return rc, out.getvalue(), calls
+
+
+async def test_watch_prints_one_line_per_event_and_stops_cleanly():
+    rc, out, calls = await _run_watch([_Session(
+        [{"kind": "mention", "where": "text", "text": "@mars hi"},
+         {"kind": "assigned", "where": "kanban", "card": "c1", "column": "todo", "text": "do"}],
+        None)])
+    assert rc == 0 and len(calls) == 1
+    assert "EVENT\tmention\twhere=text\t@mars hi" in out, out
+    assert "EVENT\tassigned\twhere=kanban card=c1 column=todo\tdo" in out, out
+
+
+async def test_watch_comes_back_from_a_restart_and_carries_the_snapshot():
+    first = _Session([{"kind": "mention", "where": "text", "text": "@mars before"}], 1012)
+    second = _Session([{"kind": "mention", "where": "text", "text": "@mars after"}], None)
+    rc, out, calls = await _run_watch([first, second])
+    assert rc == 0 and len(calls) == 2, "one reconnect, then a clean end"
+    assert "RECONNECTING\tcode=1012 attempt=1" in out and "RECONNECTED" in out, out
+    assert out.index("@mars before") < out.index("RECONNECTING") < out.index("@mars after")
+    assert second.presence == "mars", "presence is re-published on the new socket"
+
+
+async def test_watch_does_not_retry_a_refusal():
+    rc, out, calls = await _run_watch([_Session([], 4403)])
+    assert isinstance(rc, RoomDocError) and rc.code == 4403 and len(calls) == 1
+    assert "RECONNECTING" not in out
+
+
+async def test_watch_gives_up_after_max_reconnects():
+    sessions = [_Session([], 1012) for _ in range(5)]
+    rc, out, calls = await _run_watch(sessions, max_reconnects=2)
+    assert isinstance(rc, RoomDocError) and rc.code == 1012
+    assert len(calls) == 3, "the first open plus two reconnects, then stop"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
