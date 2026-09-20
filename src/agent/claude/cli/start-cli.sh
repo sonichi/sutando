@@ -742,6 +742,34 @@ watcher_session_exists() {
   tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null
 }
 
+# The version fingerprint says the session was CORRECTLY configured at some
+# point; it says nothing about whether watch-tasks-stream.sh is still running
+# right now. task-notifier-supervisor.sh restarts a crashed notifier on its
+# own, but only while its own process is alive -- a hung supervisor, or a gap
+# inside its RESTART_DELAY, leaves the session looking healthy (right version,
+# session present) while no watcher process actually exists. Without this
+# check, ensure_task_notifier's version-match shortcut is a no-op for exactly
+# the condition its caller (checkWatcher) exists to repair (#4451 review).
+#
+# Scoped to CORE's own sentinel PID file (util_paths.py watcher-sentinel), the
+# same mechanism watch-tasks-stream.sh's own PID_FILE uses -- a bare `pgrep -f
+# watch-tasks-stream.sh` matches EVERY worker's watcher on a shared host too,
+# which is exactly the unscoped-substring failure mode this repo already paid
+# for once tonight (an unscoped pkill collaterally killed other sessions'
+# production watchers). One instance's liveness must never be answered by
+# another instance's process.
+watcher_process_alive() {
+  local sentinel pid ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
+  [ -n "$ws" ] || return 1
+  # shellcheck source=../../../watcher_sentinel.sh
+  . "$REPO/src/watcher_sentinel.sh" || return 1
+  sentinel="$(sentinel_path_for "$ws/state")" || return 1
+  [ -f "$sentinel" ] || return 1
+  pid="$(cat "$sentinel" 2>/dev/null)"
+  [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && kill -0 "$pid" 2>/dev/null
+}
+
 # The live core's own window and pane, read from the pane that runs it: a heal
 # may have placed it off index 0, and a plain rerun must not forget that.
 resolve_core_target() {
@@ -790,7 +818,12 @@ ensure_task_notifier() {
         SUTANDO_NOTIFIER_VERSION 2>/dev/null \
         | sed -n 's/^SUTANDO_NOTIFIER_VERSION=//p' || true
     )"
-    [ "$active_version" = "$expected_version" ] && return 0
+    # A version match alone means the session was once configured correctly,
+    # not that its watcher process is running now -- confirm liveness too, or
+    # this shortcut is a no-op for the exact absence it exists to repair.
+    if [ "$active_version" = "$expected_version" ] && watcher_process_alive; then
+      return 0
+    fi
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
