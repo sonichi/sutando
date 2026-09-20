@@ -290,6 +290,13 @@ jobs:
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-doc/requirements.txt
 
+      # watch-tasks-stream-config-hot-reload.test.py exercises the real
+      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # fswatch, so that test silently exercised nothing (its subprocess died
+      # at exec with no writer, indistinguishable from "no event" downstream).
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
       # access tiers, result-markers, secret-scanner, and more. See #897.
