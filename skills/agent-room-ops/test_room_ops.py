@@ -1704,5 +1704,6 @@ class DegradeReasonFromTests(unittest.TestCase):
         self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
 
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
