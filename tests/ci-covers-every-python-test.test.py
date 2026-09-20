@@ -101,12 +101,14 @@ def _dquote_join(parts: list[str]) -> str:
             continue
         if out is None:
             out = "\n" * blanks
-        elif blanks:
-            out += "\n" * blanks
         else:
             trailing = len(out) - len(out.rstrip("\\"))
             if trailing % 2 == 1:
-                out = out[:-1]
+                # round 37 (#4391): an escaped break consumes its `\` even when
+                # blank physical lines follow -- the two folds are independent.
+                out = out[:-1] + "\n" * blanks
+            elif blanks:
+                out += "\n" * blanks
             else:
                 out += " "
         blanks = 0
@@ -399,6 +401,25 @@ class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
         separated from a preceding inert command by a blank line, must
         still be named -- the old space-join buried it as an argument."""
         wf = 'steps:\n  - run: "echo inert\n\n          python3 packages/x/test_real.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_an_escaped_break_still_consumes_its_backslash_before_a_blank_run(self):
+        """#4391 round 37 (kewei's Codex automation): an escaped double-quoted
+        break followed by a blank physical line used to skip the trailing-`\\`
+        consumption entirely (the `elif blanks:` branch never checked it),
+        leaving the backslash in the joined string -- confirmed against
+        PyYAML, which decodes this to 'python3\\npackages/...' (backslash
+        gone, one newline from the blank run). Bash then runs `python3` with
+        no args on its own line and the bare path names nothing."""
+        bs = chr(92)
+        wf = f'steps:\n  - run: "python3 {bs}\n\n          packages/x/test_dead.py"\n'
+        self.assertEqual(_named_in(wf), set())
+
+    def test_an_escaped_break_before_a_blank_run_the_reverse_direction_still_names_it(self):
+        """Mirror of the case above: the invocation that DOES run must still
+        be named once the backslash is correctly consumed."""
+        bs = chr(92)
+        wf = f'steps:\n  - run: "echo inert {bs}\n\n          python3 packages/x/test_real.py"\n'
         self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
 
 
