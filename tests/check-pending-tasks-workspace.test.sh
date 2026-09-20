@@ -349,6 +349,52 @@ else
 fi
 rm -f "$WS/tasks/$PROBE"
 
+# 8b. THE WORKER CARVE-OUT (P1 regression, sonichi/sutando#4323 review). An
+# ENROLLED WORKER (SUTANDO_INSTANCE_ID set) in a genuinely foreign worktree
+# must NOT take case 7's guest exit -- its own delivery gate still applies
+# regardless of cwd (skills/worker-pool/scripts/spawn_worker.py explicitly
+# supports a foreign --cwd; src/agent/claude/cli/start-cli.sh too).
+WORKER_FOREIGN_REPO="$(mktemp -d)"
+_git_fixture_repo "$WORKER_FOREIGN_REPO"
+WFR_WORKER="worker-foreign-$$"
+WFR_PROBE="task-wfr-hooktest-$$"
+mkdir -p "$WS/deliveries/$WFR_WORKER"
+: > "$WS/deliveries/$WFR_WORKER/$WFR_PROBE.txt"
+printf 'id: %s\ntask: worker-foreign-probe\n' "$WFR_PROBE" > "$WS/tasks/$WFR_PROBE.txt"
+WFR_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
+case "$WFR_OUT" in
+  *'"decision":"block"'*) ok "an enrolled worker in a foreign worktree still blocks on its own pending delivery" ;;
+  *) bad "an enrolled worker in a foreign worktree still blocks on its own pending delivery" "got: ${WFR_OUT:0:160}" ;;
+esac
+case "$WFR_OUT" in
+  *"$WFR_PROBE"*) ok "the foreign-worker block payload names its own task" ;;
+  *) bad "the foreign-worker block payload names its own task" "payload omits $WFR_PROBE" ;;
+esac
+
+# 8c. ...clears once that same worker's result is ready -- proves 8b is the
+# real delivery gate, not a stuck-open one.
+printf 'done\n' > "$WS/results/$WFR_PROBE.txt"
+record_delivery
+WFR_CLEAR_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
+case "$WFR_CLEAR_OUT" in
+  '{}') ok "the foreign-worker block clears once its own result is ready" ;;
+  *) bad "the foreign-worker block clears once its own result is ready" "got: ${WFR_CLEAR_OUT:0:160}" ;;
+esac
+rm -f "$WS/results/$WFR_PROBE.txt" "$WS/deliveries/$WFR_WORKER/$WFR_PROBE.txt" "$WS/tasks/$WFR_PROBE.txt"
+rmdir "$WS/deliveries/$WFR_WORKER" 2>/dev/null || true
+
+# 8d. CONTROL FOR 8b/8c. An ORDINARY GUEST (no SUTANDO_INSTANCE_ID) in the
+# SAME foreign repo must still take the fast guest exit -- proves 8b/8c is
+# keyed on being an enrolled worker, not on this particular repo.
+printf 'id: probe\ntask: guest-not-worker-probe\n' > "$WS/tasks/$PROBE"
+WFR_GUEST_OUT="$(cd "$WORKER_FOREIGN_REPO" && bash "$HOOK" 2>&1)"
+case "$WFR_GUEST_OUT" in
+  '{}') ok "an ordinary (non-worker) session in the same foreign repo still gets the guest exit" ;;
+  *) bad "an ordinary (non-worker) session in the same foreign repo still gets the guest exit" "got: ${WFR_GUEST_OUT:0:120}" ;;
+esac
+rm -f "$WS/tasks/$PROBE"
+rm -rf "$WORKER_FOREIGN_REPO"
+
 # 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX. A shipped app bundle has no
 # .git at all, so REPO_COMMON_DIR is empty by design -- pin both adjacent cases.
 BUNDLE="$(mktemp -d)"

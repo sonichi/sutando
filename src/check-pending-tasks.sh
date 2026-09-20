@@ -12,8 +12,8 @@
 # Resolve through the same helper every other service uses, so a configured
 # workspace (sutando.config.local.json) is honored rather than assumed.
 
-# A session whose cwd is an unrelated repo's worktree that merely inherited
-# this CLAUDE.md is a guest, not the core -- its Stop must not gate on our queue.
+# A foreign-cwd session is a guest, not the core, unless it's an enrolled
+# worker (SUTANDO_INSTANCE_ID) -- that gate applies regardless of cwd.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # A bare `git` can be the macOS CLT stub (REVIEW.md lesson 7) — resolve
 # through the same rules src/git_binary.py uses, not PATH directly.
@@ -57,7 +57,8 @@ if [ -n "$GIT_BIN" ]; then
     *) REPO_CONFIRMED_ABSENT="" ;;
   esac
   if [ -n "$REPO_COMMON_DIR" ]; then
-    if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ]; then
+    if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ] \
+       && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
       echo '{}'
       exit 0
     fi
@@ -65,7 +66,8 @@ if [ -n "$GIT_BIN" ]; then
     : # a real answer that then failed to canonicalize -- ambiguous, fall through to gate
   elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
     : # marker present, probe still failed -- ambiguous, fall through to gate
-  elif [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_CONFIRMED_ABSENT" ]; then
+  elif [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_CONFIRMED_ABSENT" ] \
+       && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
     # Both probes failed AND git itself confirmed no repo -- not just an
     # unresolved probe on a markerless child that IS still ours.
     echo '{}'
@@ -117,9 +119,8 @@ claimed_by_a_worker() {
   # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
   local task_id="$1" rc
   [ -n "$PYBIN" ] || return 1
-  # A minimal bundle (no src/delivery/ at all) has no worker-pool capability,
-  # so nothing can be "held" -- python's rc 2 for a missing script must not
-  # collapse into the SAME code path as "deliveries root unreadable" below.
+  # A missing script (minimal bundle) can hold nothing -- its rc 2 must not
+  # collapse into the same code path as "deliveries root unreadable" below.
   [ -f "$REPO_DIR/src/delivery/task_dispatch.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
   # 2 = cannot decide (root unreadable): hold, never report it to the core.
@@ -164,10 +165,8 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   for TASK_ID in $OWNED; do
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
-      # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
-      # consumer uses; a local re-implementation drifts from what will actually be sent.
-      # No interpreter to ask readiness.py -- existence is not readiness (its own
-      # contract), so this stays UNPROCESSED rather than silently read as done.
+      # Readiness is owned by src/delivery/readiness.py; existence is not
+      # readiness, so with no interpreter to ask, this stays UNPROCESSED.
       if [ -z "$PYBIN" ]; then
         UNPROCESSED+="--- $TASK_ID.txt (readiness unknown — no interpreter to check) ---
 
@@ -197,10 +196,8 @@ else
     claimed_by_a_worker "$TASK_ID" && continue
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
-      # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
-      # consumer uses; a local re-implementation drifts from what will actually be sent.
-      # No interpreter to ask readiness.py -- existence is not readiness (its own
-      # contract), so this stays UNPROCESSED rather than silently read as done.
+      # Readiness is owned by src/delivery/readiness.py; existence is not
+      # readiness, so with no interpreter to ask, this stays UNPROCESSED.
       if [ -z "$PYBIN" ]; then
         UNPROCESSED+="--- $BASENAME (readiness unknown — no interpreter to check) ---
 
