@@ -1,6 +1,6 @@
 """The board document's rules, ported from the web client's boardDoc.ts.
 
-A room's whiteboard is a SECOND document kind — its own Yjs doc reached with
+A room's whiteboard is a SECOND surface — its own Yjs doc reached with
 `?kind=board` — holding a map of elements keyed by id, not a text. The
 convergence rule (`is_newer`) and the validity rule (`is_board_element`) must
 match the web client exactly, or an agent and a person editing one board

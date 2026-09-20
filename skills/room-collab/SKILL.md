@@ -1,21 +1,22 @@
 ---
 name: room-collab
-description: Read and write a room's LIVE collaborative documents (Room Doc — the Yjs/CRDT documents behind the Doc tab, and the other kinds a room holds such as the whiteboard, selected with --kind). Use this when asked to write into, read, or collaborate in a room's document. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
+description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, the kanban (Yjs/CRDT state, one surface per --kind). Use this when asked to write into, read, or collaborate in a room's document. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
 ---
 
 > Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban; every wire key, URL path and environment variable is unchanged, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
 
-# Room Doc
+# Room Collab
 
-A room's **live collaborative document**: the one a person sees in the Doc tab and
-types into. Several writers edit it at once, merged character by character, with
-each other's cursors visible.
+A room's **live collaborative surfaces**: the document a person sees in the Doc
+tab and types into, the whiteboard, the kanban. Each is one CRDT state that
+several writers edit at once, merged change by change, with each other's
+presence visible. `--kind` names the surface; the document is the default.
 
 ## Not to be confused with the Context-document folder
 
 | You want | Use |
 |---|---|
-| The live document people co-edit (Doc tab, whiteboard, deck) | **this skill** |
+| The live surfaces people co-edit (document, whiteboard, kanban, deck) | **this skill** |
 | A room's stored Context files (`get`/`put`/`rm` by name) | `room_ops context` (formerly `room_ops doc`) |
 
 Two different stores. Writing to one never shows up in the other. This has already
@@ -53,7 +54,7 @@ pip install -r skills/room-collab/requirements.txt
 
 **The agent's ordinary relay token works.** The one every agent already holds
 in `channels/<lane>/.env` as `REMOTE_TASK_TOKEN` (or `AG2_REMOTE_TOKEN`) opens
-a room's documents; the service resolves it to the agent's own Matrix id. No
+a room's surfaces; the service resolves it to the agent's own Matrix id. No
 per-agent Matrix token and no extra grant are needed. A Matrix access token
 also works.
 
@@ -127,9 +128,9 @@ mention; the `@` is what addresses you, and the summon always writes it. Not
 yet an event, because it needs the server's authorship record: someone editing
 a paragraph *you* wrote.
 
-## The whiteboard is a different document
+## The whiteboard is a different surface
 
-A room's board is a second document kind — `?kind=board` — and it holds a **map
+A room's board is a second surface — `?kind=board` — and it holds a **map
 of drawing elements**, not text. The text commands refuse on it rather than
 answering: `read` on a board used to print an empty string, which is
 indistinguishable from an empty whiteboard, and `append` used to succeed while
@@ -174,7 +175,7 @@ silently reverts. `put_elements` therefore arms an observer that re-asserts what
 this session wrote whenever a remote change lands on it; `reconcile()` is there
 for the rare case you want it by hand.
 
-## The kanban is the third document
+## The kanban is the third surface
 
 A room's board of cards — `?kind=kanban` — holds two maps: `columns` and
 `cards`. When a person assigns you a card, the message you receive already

@@ -21,7 +21,7 @@ CLOSE_REASONS = {
     CLOSE_FORBIDDEN: ("access refused or withdrawn (4403): this credential is not authorized "
                       "for the document, or membership/write power changed. It can also mean "
                       "core-api was briefly unreachable, so one 4403 is not proof of revocation"),
-    CLOSE_BAD_KIND: "the document kind is malformed (4404)",
+    CLOSE_BAD_KIND: "the surface kind is malformed (4404)",
 }
 
 
@@ -112,7 +112,7 @@ def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str
     if "/api/v1/room-doc" not in origin:
         origin = f"{origin}/api/v1/room-doc"
     url = f"{origin}/{urllib.parse.quote(room_id, safe='')}/ws"
-    # A room holds more than one document; the kind selects which. The default
+    # A room holds more than one surface; the kind selects which. The default
     # is sent bare, which is what every existing caller already produces.
     if kind and kind != DEFAULT_KIND:
         url += f"?kind={urllib.parse.quote(kind, safe='')}"

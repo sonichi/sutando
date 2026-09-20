@@ -354,7 +354,7 @@ async def run(args: argparse.Namespace) -> int:
             return await kanban(doc, args)
 
         if args.kind == BOARD_KIND:
-            # Presence is its own channel and belongs to no document kind, so
+            # Presence is its own channel and belongs to no surface, so
             # `peers` is answered here exactly as it is for a text document.
             if args.command == "peers":
                 print(render("peers", peers=doc.peers, as_json=args.json))
@@ -405,7 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's documents (e.g. board); default markdown")
+                   help="which of the room's surfaces (markdown, board, kanban); default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")

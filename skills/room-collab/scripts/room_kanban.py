@@ -1,6 +1,6 @@
 """A room's Kanban board as a Yjs document, for agents.
 
-A third document kind — `?kind=kanban` — holding two maps: `cards` keyed by
+A third surface — `?kind=kanban` — holding two maps: `cards` keyed by
 card id, and `columns` keyed by column id. The schema and the convergence rule
 are the web panel's, not invented here, so an agent and a person moving the
 same card agree about which move won.

@@ -620,8 +620,8 @@ async def open_room_collab(api_root: str, room_id: str, token: str, *,
                         kind: str = DEFAULT_KIND,
                         text_name: str = DEFAULT_TEXT_NAME,
                         insecure: bool = False) -> AsyncIterator[RoomDoc]:
-    """Open one of a room's documents. `kind` selects which — the default
-    markdown document, or a separate one such as the board."""
+    """Open one of a room's surfaces. `kind` selects which — the default
+    markdown document, or another surface such as the board or the kanban."""
     url = doc_socket_url(api_root, room_id, kind=kind)
     sslctx = None
     if url.startswith("wss://"):
