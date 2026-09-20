@@ -330,7 +330,7 @@ SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
   local task_path="$1" disposition="${2:-fallback}" filename announce handler_rc verdict claim_settled
-  local handler_pid watchdog_pid
+  local handler_pid watchdog_pid timeout_flag timed_out
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
@@ -338,6 +338,7 @@ run_handler_now() {
     return 0
   fi
   activity_transition RUNNING "$task_path"
+  timed_out=0
   # `pending` before the run so a result the live core sees always has
   # attribution beside it; an injected-but-broken writer fails the task
   # instead of racing the handler.
@@ -353,6 +354,7 @@ run_handler_now() {
     # never observed, but is no longer isolated in its own process either
     # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
     # ~250x the measured normal ~35-40ms cost) bounds it regardless.
+    timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/sutando-handler-timeout.XXXXXX")"
     "$CURRENT_HANDLER" \
       --runtime "${SUTANDO_CORE_RUNTIME:-}" \
       --workspace "$WORKSPACE_DIR" \
@@ -362,6 +364,10 @@ run_handler_now() {
     handler_pid=$!
     ( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
       sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
+      # Reaching here (not cancelled by the handler finishing first) means
+      # the timeout genuinely elapsed -- flag it BEFORE killing, so the
+      # caller can tell "we gave up waiting" apart from a real exit/signal.
+      : > "$timeout_flag"
       kill -TERM "$handler_pid" 2>/dev/null; sleep 1
       kill -KILL "$handler_pid" 2>/dev/null ) &
     watchdog_pid=$!
@@ -369,6 +375,10 @@ run_handler_now() {
     handler_rc=$?
     kill -TERM "$watchdog_pid" 2>/dev/null
     wait "$watchdog_pid" 2>/dev/null
+    if [ -f "$timeout_flag" ]; then
+      timed_out=1
+      rm -f "$timeout_flag"
+    fi
     if [ "$handler_rc" -eq 0 ]; then
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
     fi
@@ -376,7 +386,13 @@ run_handler_now() {
 
   if [ "$handler_rc" -ne 0 ] && claim_is_ours "$filename"; then
     claim_settled=1
-    if [ "$handler_rc" -eq 4 ]; then
+    # A watchdog timeout means WE gave up waiting -- the handler may still
+    # be doing legitimate work (e.g. blocked on a real delivery lock), not
+    # declining. Never safe to read that as "optional decline, hand to
+    # core" regardless of the stored disposition: treat it the same
+    # fail-closed way MUST_HANDLE's own rc 4 verdict is treated. Distinct
+    # from the handler's own exit code, which this does not override.
+    if [ "$timed_out" -eq 1 ] || [ "$handler_rc" -eq 4 ]; then
       verdict=0
     else
       claim_disposition "$filename"
@@ -384,10 +400,15 @@ run_handler_now() {
     fi
     case $verdict in
       0)
-        echo "watch-tasks-stream: required Team handler failed for $filename (exit $handler_rc); publishing safe terminal failure" >&2
-        # An unsettled publish leaves the claim held rather than clobbering a
-        # destination this watcher does not own; cross-restart retry is separate.
-        publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
+        if [ "$timed_out" -eq 1 ]; then
+          echo "watch-tasks-stream: handler timed out for $filename after ${SUTANDO_HANDLER_RUN_TIMEOUT}s (still running, not a decline); publishing safe terminal failure rather than assuming core may inherit it" >&2
+          publish_terminal_failure "$filename" "timed out" "$task_path" || claim_settled=0
+        else
+          echo "watch-tasks-stream: required Team handler failed for $filename (exit $handler_rc); publishing safe terminal failure" >&2
+          # An unsettled publish leaves the claim held rather than clobbering a
+          # destination this watcher does not own; cross-restart retry is separate.
+          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
+        fi
         ;;
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
@@ -593,15 +614,43 @@ _tmux_wake() {
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
 #
-# No fallback_outstanding_handlers() anymore: that existed to recover
-# in-flight background --handler-runner subprocesses on shutdown. With
-# run_handler_now() synchronous, a signal either lands between dispatches
-# (nothing in flight to recover) or during the handler call itself, where
-# bash defers delivery until that foreground command returns (bounded by
-# run_handler_now's own 10s timeout) -- there is no async gap left to leave
-# a claim stranded in. The claim system's own staleness sweep
-# (prepare_handler_state, claim_is_live/retire_stale_claim) already covers
-# the one remaining case: a hard SIGKILL that bypasses this trap entirely.
+# Disposition-aware settlement for a claim this watcher still owns when a
+# shutdown signal lands -- operates on CLAIMS_DIR directly, not on wherever
+# run_handler_now() was blocked, since a SIGTERM there interrupts `wait`
+# immediately and run_handler_now() never resumes to settle it itself.
+settle_own_claims_on_shutdown() {
+  local claim filename task_path announce claim_settled verdict
+  [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
+  shopt -s nullglob
+  for claim in "$CLAIMS_DIR"/task-*.txt; do
+    filename="$(basename "$claim")"
+    [ "$(sed -n '2p' "$claim" 2>/dev/null)" = "$WATCHER_ID" ] || continue
+    task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
+    [ -n "$task_path" ] || continue
+    announce="$(task_announce "$task_path")"
+    claim_settled=1
+    claim_disposition "$filename"
+    verdict=$?
+    case $verdict in
+      0)
+        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
+        ;;
+      1)
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
+        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
+        emit_task_file "$announce"
+        ;;
+      *)
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+        ;;
+    esac
+    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+  done
+  shopt -u nullglob
+}
+
 cleanup() {
   [ "${CLEANING_UP:-0}" -eq 0 ] || return
   CLEANING_UP=1
@@ -619,6 +668,7 @@ cleanup() {
   if [ -n "${WATCHER_BEAT_PID:-}" ]; then
     kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
+  settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
     rm -f "$WATCH_RUNTIME_DIR/events"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
