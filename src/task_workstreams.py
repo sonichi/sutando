@@ -114,10 +114,15 @@ class WorkstreamStoreUnreadable(RuntimeError):
 
 
 def _unusable_store_files(workspace: Path) -> list[str]:
-    """Store files that hold bytes the loader could not turn into a store.
+    """Store files that hold content the loader did not accept.
 
-    A file that is absent, or present and empty, is not one of these: an
-    install with no sidecar yet is legitimately empty and must stay writable.
+    Called only when the loader produced nothing, so a file it WOULD accept is
+    a legitimately empty store and stays writable — as do an absent file and an
+    empty object, which hold nothing to lose. Everything else is content we
+    failed to interpret, and unreadable is not the same as unwanted. Checking
+    acceptance rather than enumerating failures is deliberate: the first cut
+    listed OSError, bad JSON and non-dict, and silently let a valid object with
+    a stale `schema_version` through to be saved over.
     """
     unusable = []
     for path in (_store_path(workspace), _legacy_store_path(workspace)):
@@ -137,6 +142,15 @@ def _unusable_store_files(workspace: Path) -> list[str]:
             continue
         if not isinstance(value, dict):
             unusable.append(f"{path}: top level is {type(value).__name__}, not an object")
+            continue
+        if _store_from_raw(value) is not None:
+            continue
+        if not value:
+            continue
+        unusable.append(
+            f"{path}: {len(value)} top-level key(s) the loader did not accept "
+            f"(schema_version={value.get('schema_version')!r}, expected {SCHEMA_VERSION!r})"
+        )
     return unusable
 
 
@@ -187,14 +201,14 @@ def _atomic_json(path: Path, value: dict) -> None:
             pass
 
 
-def load_workstream_store(workspace: Path) -> dict:
-    """Load the sidecar fail-open, including the pre-workstream schema."""
-    workspace = Path(workspace)
-    raw = _read_json(_store_path(workspace), {})
+def _store_from_raw(raw) -> Optional[dict]:
+    """The store `raw` yields, or None when it is not one.
+
+    None is the only thing separating "not a store" from "an empty store": both
+    reach a reader as `_empty_store()`, and a writer must tell them apart.
+    """
     if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
-        raw = _read_json(_legacy_store_path(workspace), {})
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
-        return _empty_store()
+        return None
     workstreams = raw.get("workstreams")
     if not isinstance(workstreams, dict):
         workstreams = raw.get("projects")
@@ -202,7 +216,7 @@ def load_workstream_store(workspace: Path) -> dict:
     reviews = raw.get("reviews", {})
     context_history = raw.get("context_history", {})
     if not isinstance(workstreams, dict) or not isinstance(assignments, dict):
-        return _empty_store()
+        return None
     if not isinstance(reviews, dict):
         reviews = {}
     if not isinstance(context_history, dict):
@@ -228,6 +242,16 @@ def load_workstream_store(workspace: Path) -> dict:
             if isinstance(entries, list)
         },
     }
+
+
+def load_workstream_store(workspace: Path) -> dict:
+    """Load the sidecar fail-open, including the pre-workstream schema."""
+    workspace = Path(workspace)
+    raw = _read_json(_store_path(workspace), {})
+    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+        raw = _read_json(_legacy_store_path(workspace), {})
+    store = _store_from_raw(raw)
+    return _empty_store() if store is None else store
 
 
 def _header_stop_pattern(keys) -> "re.Pattern[str]":
