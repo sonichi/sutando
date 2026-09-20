@@ -349,11 +349,8 @@ else
 fi
 rm -f "$WS/tasks/$PROBE"
 
-# 8b. THE WORKER CARVE-OUT (P1 regression, sonichi/sutando#4323 review). An
-# ENROLLED WORKER (SUTANDO_INSTANCE_ID set) in a genuinely foreign worktree
-# must NOT take case 7's guest exit -- its own delivery gate still applies
-# regardless of cwd (skills/worker-pool/scripts/spawn_worker.py explicitly
-# supports a foreign --cwd; src/agent/claude/cli/start-cli.sh too).
+# 8b. An ENROLLED WORKER (SUTANDO_INSTANCE_ID set) in a foreign worktree must
+# NOT take case 7's guest exit -- foreign --cwd is a supported worker config.
 WORKER_FOREIGN_REPO="$(mktemp -d)"
 _git_fixture_repo "$WORKER_FOREIGN_REPO"
 WFR_WORKER="worker-foreign-$$"
@@ -383,9 +380,8 @@ esac
 rm -f "$WS/results/$WFR_PROBE.txt" "$WS/deliveries/$WFR_WORKER/$WFR_PROBE.txt" "$WS/tasks/$WFR_PROBE.txt"
 rmdir "$WS/deliveries/$WFR_WORKER" 2>/dev/null || true
 
-# 8d. CONTROL FOR 8b/8c. An ORDINARY GUEST (no SUTANDO_INSTANCE_ID) in the
-# SAME foreign repo must still take the fast guest exit -- proves 8b/8c is
-# keyed on being an enrolled worker, not on this particular repo.
+# 8d. An ORDINARY GUEST (no SUTANDO_INSTANCE_ID) in the SAME foreign repo
+# must still take the fast guest exit -- proves 8b/8c keys on worker status.
 printf 'id: probe\ntask: guest-not-worker-probe\n' > "$WS/tasks/$PROBE"
 WFR_GUEST_OUT="$(cd "$WORKER_FOREIGN_REPO" && bash "$HOOK" 2>&1)"
 case "$WFR_GUEST_OUT" in
