@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
 
-TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
+# The collab names lead; the ROOM_DOC_* spellings are read for one release
+# more so an install that set them keeps working through the rename.
+TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_COLLAB_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
               "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
+URL_VARS = ("AG2_ROOM_COLLAB_URL", "AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
 IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 
 
@@ -295,7 +297,7 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     snapshot in hand, so what landed meanwhile is reported, not skipped.
     Exits (rc 2) only on a refusal or after --max-reconnects failures."""
     from room_collab_client import open_room_collab
-    from room_collab_protocol import RECONNECT_CODES
+    from room_collab_protocol import is_transient
 
     handles = args.handles or []
     since = None
@@ -319,11 +321,12 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
                 return 0                      # a clean end is an end, not a reconnect
         except RoomDocError as exc:
             since = getattr(exc, "snapshot", since)
-            if exc.code not in RECONNECT_CODES or failures >= args.max_reconnects:
+            if not is_transient(exc) or failures >= args.max_reconnects:
                 raise
             failures += 1
             wait = min(2 ** failures, 30)
-            print(f"RECONNECTING\tcode={exc.code} attempt={failures} in {wait}s", flush=True)
+            why = f"code={exc.code}" if exc.code else f"status={exc.status}"
+            print(f"RECONNECTING\t{why} attempt={failures} in {wait}s", flush=True)
             await asyncio.sleep(wait)
 
 
@@ -396,7 +399,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="room_collab", description=__doc__)
-    p.add_argument("--url", help="service origin (else $AG2_ROOM_DOC_URL, $AG2_API_ROOT, or the relay's)")
+    p.add_argument("--url", help="service origin (else $AG2_ROOM_COLLAB_URL, $AG2_API_ROOT, or the relay's)")
     p.add_argument("--token", help="bearer; the relay token works (else the env, see SKILL.md)")
     p.add_argument("--name", help="presence name to publish while connected")
     p.add_argument("--user-id", dest="user_id", default=None,

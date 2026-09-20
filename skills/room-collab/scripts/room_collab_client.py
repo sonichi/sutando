@@ -48,6 +48,7 @@ from room_collab_protocol import (  # noqa: E402
     close_code,
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
+    http_status,
 )
 
 # The server's attribution map. This client reads it and never writes it.
@@ -639,7 +640,9 @@ async def open_room_collab(api_root: str, room_id: str, token: str, *,
     except RoomDocError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise RoomDocError(explain(exc, url)) from exc
+        err = RoomDocError(explain(exc, url))
+        err.status = http_status(exc)      # a watcher decides from this whether to retry
+        raise err from exc
 
     room_collab = RoomDoc(ws, doc, awareness, text_name, kind=kind)
     try:

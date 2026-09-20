@@ -437,15 +437,25 @@ class _Session:
 
 
 def _fake_opener(sessions):
-    """Each call opens the next scripted session; records the `since` it got."""
+    """Each call opens the next scripted session, or raises it when the script
+    queued an exception — a handshake the edge refused."""
     calls = []
 
     @contextlib.asynccontextmanager
     async def open_room_collab(url, room, token, kind=None, insecure=False):
         calls.append((url, room, kind))
-        yield sessions.pop(0)
+        nxt = sessions.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        yield nxt
 
     return open_room_collab, calls
+
+
+def _refused_open(status):
+    err = RoomDocError(f"handshake refused {status}")
+    err.status = status
+    return err
 
 
 def _args(**over):
@@ -502,6 +512,55 @@ async def test_watch_gives_up_after_max_reconnects():
     rc, out, calls = await _run_watch(sessions, max_reconnects=2)
     assert isinstance(rc, RoomDocError) and rc.code == 1012
     assert len(calls) == 3, "the first open plus two reconnects, then stop"
+
+
+async def test_watch_rides_out_a_rejected_handshake_during_a_rollout():
+    # The real sequence from a deploy: the socket closes 1012, the reopen is
+    # refused 502 while the new pod comes up, then the service is back.
+    first = _Session([{"kind": "mention", "where": "text", "text": "@mars before"}], 1012)
+    back = _Session([{"kind": "mention", "where": "text", "text": "@mars after"}], None)
+    rc, out, calls = await _run_watch([first, _refused_open(502), _refused_open(503), back])
+    assert rc == 0 and len(calls) == 4, (rc, calls)
+    assert "RECONNECTING\tcode=1012 attempt=1" in out, out
+    assert "RECONNECTING\tstatus=502 attempt=2" in out, out
+    assert "RECONNECTING\tstatus=503 attempt=3" in out, out
+    assert out.index("@mars before") < out.index("status=502") < out.index("@mars after"), out
+
+
+async def test_watch_does_not_retry_a_refused_handshake_that_is_not_a_rollout():
+    rc, out, calls = await _run_watch([_refused_open(404)])
+    assert isinstance(rc, RoomDocError) and rc.status == 404 and len(calls) == 1
+    assert "RECONNECTING" not in out
+
+
+async def test_a_refused_handshake_carries_its_status_out_of_the_client():
+    # The real opener: websockets rejects the upgrade with the response attached.
+    import room_collab_client
+    from room_collab_client import open_room_collab
+
+    class _Resp:
+        status_code = 503
+        body = b"upstream connect error"
+
+    class _Rejected(Exception):
+        response = _Resp()
+
+    class _Connect:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            raise _Rejected("server rejected WebSocket connection: HTTP 503")
+
+    real = room_collab_client.websockets.connect
+    room_collab_client.websockets.connect = _Connect
+    try:
+        async with open_room_collab("https://h", "!r:x", "tok"):
+            raise AssertionError("opened")
+    except RoomDocError as e:
+        assert e.status == 503 and "not being served right now (503)" in str(e), (e.status, str(e))
+    finally:
+        room_collab_client.websockets.connect = real
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

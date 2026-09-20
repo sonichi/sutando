@@ -66,9 +66,9 @@ The document has exactly the **room's own ACL**. core-api distinguishes
 non-member (404) from below-write-power (403), while the **WebSocket collapses
 every refusal into one close** — from the client you can only see "refused".
 
-Resolution order: `--token`, then `$AG2_MATRIX_TOKEN`, `$ROOM_DOC_TOKEN`,
+Resolution order: `--token`, then `$AG2_MATRIX_TOKEN`, `$ROOM_COLLAB_TOKEN` (`$ROOM_DOC_TOKEN` still read),
 `$MATRIX_ACCESS_TOKEN`, `$REMOTE_TASK_TOKEN`, `$AG2_REMOTE_TOKEN`. The service
-URL comes from `--url`, then `$AG2_ROOM_DOC_URL`, `$AG2_API_ROOT`, the origin
+URL comes from `--url`, then `$AG2_ROOM_COLLAB_URL` (`$AG2_ROOM_DOC_URL` still read), `$AG2_API_ROOT`, the origin
 of `$REMOTE_TASK_URL`, or the origin named inside a compound token. With the
 lane env loaded, an agent needs neither flag.
 

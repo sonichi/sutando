@@ -12,9 +12,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 from room_collab_protocol import (  # noqa: E402
-    CLOSE_BAD_KIND, CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, RoomDocError, close_reason,
-    doc_socket_url, explain, read_var_bytes, read_var_uint, write_var_bytes,
-    write_var_uint,
+    CLOSE_BAD_KIND, CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, RECONNECT_CODES, RECONNECT_STATUSES,
+    RoomDocError, close_reason, doc_socket_url, explain, http_status, is_transient,
+    read_var_bytes, read_var_uint, write_var_bytes, write_var_uint,
 )
 
 
@@ -148,6 +148,29 @@ def test_close_codes_are_translated_not_echoed():
 def test_an_unknown_close_and_a_bare_close_are_distinguished():
     assert "4999" in close_reason(_Closed(4999))
     assert close_reason(None), "a close with no exception still reads as something"
+
+
+def test_a_rollout_handshake_is_transient_and_a_refusal_is_not():
+    # A watcher died on a 502 at handshake during a real deploy: the close codes
+    # were retried, a refused open was not. Both are "the service went away".
+    for status in sorted(RECONNECT_STATUSES):
+        err = RoomDocError(explain(_HttpError(status), "wss://h/ws"))
+        err.status = http_status(_HttpError(status))
+        assert err.status == status and is_transient(err), status
+        assert "not being served right now" in str(err) and "retries" in str(err), str(err)
+    for status in (401, 403, 404, 426):
+        err = RoomDocError("refused")
+        err.status = status
+        assert not is_transient(err), status
+    for code in sorted(RECONNECT_CODES):
+        err = RoomDocError("closed")
+        err.code = code
+        assert is_transient(err), code
+    refused = RoomDocError("refused")
+    refused.code = CLOSE_FORBIDDEN
+    assert not is_transient(refused)
+    assert not is_transient(RoomDocError("no code, no status")) and not is_transient(None)
+    assert http_status(ValueError("no response")) is None
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

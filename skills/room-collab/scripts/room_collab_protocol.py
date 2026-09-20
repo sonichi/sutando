@@ -27,20 +27,35 @@ CLOSE_REASONS = {
 
 class RoomDocError(RuntimeError):
     """A refusal or protocol failure the caller can report verbatim.
-    `code` is the websocket close code when one ended the session, else None."""
+    `code` is the websocket close code when one ended the session, else None;
+    `status` is the HTTP status when the handshake itself was refused, else None."""
 
     code: int | None = None
+    status: int | None = None
 
 
 # "The service went away, not you" — a restart, a proxy leaving, an abnormal
 # drop. A watcher comes back from these; a 4xxx refusal is about the agent.
 RECONNECT_CODES = frozenset({1001, 1006, 1011, 1012, 1013, 1014})
+# The edge answered for a service that was not there: a rollout in progress.
+RECONNECT_STATUSES = frozenset({502, 503, 504})
 
 
 def close_code(exc: BaseException | None) -> int | None:
     if exc is None:
         return None
     return getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
+
+
+def http_status(exc: BaseException | None) -> int | None:
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def is_transient(exc: BaseException | None) -> bool:
+    """A failure a watcher rides out: a restart close, or a handshake the edge
+    refused because the service was mid-rollout. A refusal is never transient."""
+    return (getattr(exc, "code", None) in RECONNECT_CODES
+            or getattr(exc, "status", None) in RECONNECT_STATUSES)
 
 
 def write_var_uint(n: int) -> bytes:
@@ -87,7 +102,7 @@ def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str
     """
     origin = (api_root or "").rstrip("/")
     if not origin:
-        raise RoomDocError("no API root given (pass --url or set AG2_ROOM_DOC_URL)")
+        raise RoomDocError("no API root given (pass --url or set AG2_ROOM_COLLAB_URL)")
     if origin.startswith("https://"):
         origin = "wss://" + origin[len("https://"):]
     elif origin.startswith("http://"):
@@ -119,8 +134,13 @@ def explain(exc: Exception, url: str) -> str:
     (401), a room that refuses it (403), and an edge proxy refusing before the
     service ever saw the request (also 403). Each line ends with who fixes it.
     """
-    status = getattr(getattr(exc, "response", None), "status_code", None)
+    status = http_status(exc)
     body = _body_text(exc)
+    if status in RECONNECT_STATUSES:
+        return (f"not being served right now ({status}) at {url}\n"
+                "The edge answered for a service that is restarting, being rolled out, "
+                "or (504) too slow to answer. Nobody fixes this: a watcher retries on "
+                "its own, a one-shot command is run again in a minute.")
     if status == 401:
         return (f"unknown to the service (401) at {url}: {body or 'the bearer was rejected'}\n"
                 "The token was presented; this deployment has no record of the agent behind "
