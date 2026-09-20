@@ -13,9 +13,26 @@ tasks/ forever"), and an archived task is out of the sweep's reach.
 
 These scenarios pin both halves as they behave TODAY, so that a change to the
 shutdown path shows up here as a deliberate behaviour flip rather than as a
-silent one. They assert the mechanism, not the wording: `REFUSAL_MARK` is the
-shared prefix of every terminal-failure body, and `INTERRUPTED` is the reason
-word this path passes.
+silent one. They assert the mechanism, not the exact wording: `REFUSAL_MARK` is
+the shared prefix of every terminal-failure body.
+
+UPDATED (deliberate flip, this file's own job to catch): the async
+dispatch pipeline (`--handler-runner`/`fallback_outstanding_handlers`) that
+used to publish a dedicated "was interrupted" refusal on shutdown was retired
+-- the handler now runs synchronously, inline, via `run_handler_now()`. A
+SIGTERM landing mid-handler-call now interrupts bash's `wait` on that
+(backgrounded) handler process directly -- bash's documented behavior for
+`wait` on an asynchronous job, unlike a true foreground command -- so
+`handler_rc` comes back as the signal's exit status (143 = 128+SIGTERM) and
+flows through the SAME generic MUST_HANDLE failure path as any other handler
+failure, publishing a refusal worded "failed", not "was interrupted".
+Verified directly (2026-09-20): a real watcher, real SIGTERM mid-flight,
+still exits within ~1s, still publishes the refusal, still releases the
+claim, and orphans no handler subprocess (`kill -TERM 0` in cleanup() gets
+the whole process group). The safety property this file exists to pin --
+never stuck, always resolved, claim released for retry -- holds; only the
+wording and exit-code provenance changed, incidentally rather than by design
+(reusing the ordinary failure path instead of a dedicated recovery one).
 """
 from __future__ import annotations
 
@@ -27,7 +44,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 REFUSAL_MARK = "could not safely process"
-INTERRUPTED = "was interrupted"
+# Ordinary MUST_HANDLE failure wording now (see module docstring's UPDATED note).
+FAILURE_REASON = "failed"
 
 # Import the sibling suite's harness (import-safe) rather than restating it:
 # a copied harness drifts from the script it drives.
@@ -50,8 +68,10 @@ def claims_dir(h) -> Path:
 
 
 def worker_running(h) -> bool:
-    d = h.dispatch()
-    return bool(d and (d / "workers").is_dir() and any((d / "workers").iterdir()))
+    # DISPATCH_DIR/workers/ is retired (see module docstring); a claim is the
+    # compatible replacement signal -- run_handler_now() takes it synchronously.
+    d = claims_dir(h)
+    return d.is_dir() and any(d.glob("task-*.txt"))
 
 
 def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
@@ -67,13 +87,14 @@ def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
         check("a handler worker is running before the shutdown",
               wait_for(lambda: worker_running(h), 30.0))
 
-        h.stop(graceful=True)  # SIGTERM -> the trap runs fallback_outstanding_handlers()
+        # SIGTERM -> run_handler_now()'s MUST_HANDLE failure path (see module docstring).
+        h.stop(graceful=True)
 
         result = h.ws / "results" / "task-interrupted.txt"
         check("the shutdown publishes a terminal refusal", wait_for(result.is_file, 20.0))
         body = result.read_text() if result.is_file() else ""
-        check("and its reason word is the interrupted one, not the failed one",
-              REFUSAL_MARK in body and INTERRUPTED in body, repr(body[:120]))
+        check("and it carries the shared refusal mark and the ordinary failure reason",
+              REFUSAL_MARK in body and FAILURE_REASON in body, repr(body[:120]))
 
         # The half that matters for retry: nothing moved the task.
         task = h.ws / "tasks" / "task-interrupted.txt"
