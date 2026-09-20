@@ -14,6 +14,14 @@ not a copy, against temp skill dirs inside the real checkout -- the same
 pattern watch-tasks-stream-handler-terminal-rc.test.py uses for the resolver
 it wraps.
 
+2026-09-20 UPDATE: each `call()` below is a fresh `bash -c` subprocess, so it
+still passes -- but it no longer represents the real watcher, which sources
+this file ONCE and calls resolve_task_event_handler repeatedly in ONE process.
+Since that date the manifest-scan fallback resolves once per PROCESS and does
+NOT re-check afterward (deliberate; see tests/task-event-handler-cache.test.py
+and PR #4498's follow-up). The pin path below is unaffected either way -- it
+was always, and remains, checked fresh on every call.
+
 Run: python3 tests/task-event-handler-live-resolution.test.py
 """
 import shutil
