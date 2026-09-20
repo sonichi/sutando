@@ -342,12 +342,14 @@ class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
         _, _, env = self.h.watcher()
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
 
-    def test_with_the_skill_the_handler_reaches_the_watcher(self):
-        p = self._install_skill()
+    def test_with_the_skill_the_handler_is_not_forwarded_but_resolves_live(self):
+        """Unpinned: not forwarded to env (that froze it at boot); the watcher
+        resolves it live on its own instead (see task-event-handler-live-resolution.test.py)."""
+        self._install_skill()
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()
-        self.assertIn(f"SUTANDO_TASK_EVENT_HANDLER={p}", env)
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
 
     def test_an_explicit_handler_wins_over_the_skill_default(self):
         self._install_skill()

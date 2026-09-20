@@ -263,8 +263,8 @@ publish_terminal_failure() {
 # shellcheck source=agent/task-event-handler-lookup.sh
 . "$__REPO_ROOT/src/agent/task-event-handler-lookup.sh"
 
-# Idempotent, called lazily from dispatch_task's own first routed task --
-# never eagerly at start, where a resolvable-but-unused handler (every no-pool install ships one) would create these directories for nothing.
+# Idempotent, and called both at start (only for an EXPLICIT pin -- see below)
+# and on the first routed task, so a handler installed later still gets its queue.
 ensure_dispatch_ready() {
   [ -z "$DISPATCH_DIR" ] || return 0
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
@@ -279,6 +279,12 @@ ensure_dispatch_ready() {
   done
   shopt -u nullglob
 }
+
+# An EXPLICIT pin only, never a bare auto-resolution -- every no-pool install
+# auto-resolves the shipped worker-pool skill's dormant handler otherwise.
+if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "${SUTANDO_TASK_EVENT_HANDLER}" ]; then
+  ensure_dispatch_ready
+fi
 
 acquire_dispatch_lock() {
   [ -n "$DISPATCH_DIR" ] || return 1
