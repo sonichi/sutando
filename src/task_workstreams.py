@@ -109,6 +109,59 @@ def _empty_store() -> dict:
     }
 
 
+class WorkstreamStoreUnreadable(RuntimeError):
+    """The sidecar exists but did not yield a store, so a save would erase it."""
+
+
+def _unusable_store_files(workspace: Path) -> list[str]:
+    """Store files that hold bytes the loader could not turn into a store.
+
+    A file that is absent, or present and empty, is not one of these: an
+    install with no sidecar yet is legitimately empty and must stay writable.
+    """
+    unusable = []
+    for path in (_store_path(workspace), _legacy_store_path(workspace)):
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            unusable.append(f"{path}: unreadable ({exc.__class__.__name__})")
+            continue
+        if not text.strip():
+            continue
+        try:
+            value = json.loads(text)
+        except ValueError:
+            unusable.append(f"{path}: not valid JSON ({len(text)} bytes)")
+            continue
+        if not isinstance(value, dict):
+            unusable.append(f"{path}: top level is {type(value).__name__}, not an object")
+    return unusable
+
+
+def load_workstream_store_for_update(workspace: Path) -> dict:
+    """Load the sidecar for a read-modify-write cycle.
+
+    Fail-open is right for a reader and fatal for a writer: every caller that
+    saves what it loaded would persist an empty store over a sidecar it had
+    merely failed to parse, and the save is atomic, so the replacement is
+    complete. Absent and unreadable are the same value to the loader and must
+    not be the same decision here.
+    """
+    workspace = Path(workspace)
+    store = load_workstream_store(workspace)
+    if store != _empty_store():
+        return store
+    unusable = _unusable_store_files(workspace)
+    if unusable:
+        raise WorkstreamStoreUnreadable(
+            "refusing to save over a workstream store that could not be read: "
+            + "; ".join(unusable)
+        )
+    return store
+
+
 def _read_json(path: Path, default):
     try:
         value = json.loads(path.read_text())
@@ -724,7 +777,7 @@ def _apply_inference_locked(
     if not isinstance(groups, list):
         raise ValueError("workstreams must be a list")
     candidates = {row["id"]: row for row in snapshot["tasks"]}
-    store = load_workstream_store(workspace)
+    store = load_workstream_store_for_update(workspace)
     workstreams = store["workstreams"]
     assignments = store["assignments"]
     reviews = store["reviews"]
@@ -814,7 +867,13 @@ def inherit_assignment(workspace: Path, task_id: str, parent_task_id: str) -> bo
 def _inherit_assignment_locked(workspace: Path, task_id: str, parent_task_id: str) -> bool:
     """Mechanically inherit a known parent workstream for an explicit follow-up."""
     workspace = Path(workspace)
-    store = load_workstream_store(workspace)
+    try:
+        store = load_workstream_store_for_update(workspace)
+    except WorkstreamStoreUnreadable as exc:
+        # The one caller is unguarded inside a request handler, so raising here
+        # would cost it the response; declining costs only this inheritance.
+        LOGGER.warning("declining to inherit a workstream: %s", exc)
+        return False
     if task_id in store["assignments"]:
         return True
     parent = store["assignments"].get(parent_task_id)
