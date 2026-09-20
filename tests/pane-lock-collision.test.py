@@ -308,8 +308,9 @@ def _fake_tmux_claude_notifier(td: Path) -> tuple[Path, Path]:
 
 def case_claude_task_notifier_delivery() -> list[str]:
     """Same transaction shape as `case_task_notifier_delivery`, for the Claude
-    notifier's own writer (`deliver_prompt` -> `deliver_prompt_locked`, a
-    separate implementation from Codex's, guarded by the same shared lock)."""
+    notifier's own writer (`submit_task` -> `submit_task_locked` ->
+    `deliver_prompt_locked`, a separate implementation from Codex's, guarded by
+    the same shared lock)."""
     fails = []
     with tempfile.TemporaryDirectory() as td:
         tdp = Path(td)
@@ -349,11 +350,101 @@ def case_claude_task_notifier_delivery() -> list[str]:
     return fails
 
 
+def _fake_tmux_claude_notifier_staged(td: Path, staged_line_file: Path) -> tuple[Path, Path]:
+    """Like `_fake_tmux_claude_notifier`, but the composer already holds a
+    fully-typed, never-entered prompt -- what a crashed or interrupted prior
+    submission leaves behind for the next notifier run to resume."""
+    log = td / "tmux.log"
+    log.unlink(missing_ok=True)
+    script = td / "tmux"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{log}"\n'
+        'case "$*" in\n'
+        '  *capture-pane*)\n'
+        '    printf "%s\\n" "⏵⏵ bypass permissions on"\n'
+        f'    cat "{staged_line_file}"\n'
+        '    printf "\\n"\n'
+        "    ;;\n"
+        '  *"#{pane_pid}"*) printf "12345\\n" ;;\n'
+        '  *"#{history_limit}"*) printf "2000\\n" ;;\n'
+        '  *"#{history_size}"*) printf "5\\n" ;;\n'
+        '  *"#{pane_id}"*) printf "%%1\\n" ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    return script, log
+
+
+def case_claude_task_notifier_staged_resume_collision() -> list[str]:
+    """keweichen round-3: `submit_task`'s staged-resume branch pressed Enter via
+    `press_enter_and_confirm` directly, bypassing the pane lock that the fresh
+    path already took. Same transaction shape as
+    `case_claude_task_notifier_delivery`, but the composer starts pre-staged
+    with the task's own prompt so the notifier takes the resume branch instead
+    of typing fresh -- it must still wait for the independent owner before
+    pressing C-m, and never retype the prompt it finds already staged."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        root = _claude_notifier_repo(tdp)
+        # resolve_workspace() resolves symlinks (e.g. macOS's /var -> /private/var);
+        # the staged text must match exactly what the notifier itself computes.
+        workspace = (root / "workspace").resolve()
+        filename = "task-collision.txt"
+        staged_prompt = (
+            f"Sutando task ready: {filename}. Read {workspace}/tasks/{filename}, "
+            "follow CLAUDE.md, complete the task, and write the result to "
+            f"{workspace}/results/{filename}."
+        )
+        staged_line_file = tdp / "staged_line.txt"
+        staged_line_file.write_text(f"\u276f {staged_prompt}")
+        tmux, log = _fake_tmux_claude_notifier_staged(tdp, staged_line_file)
+        env = dict(os.environ)
+        env["PATH"] = f"{tdp}{os.pathsep}{env['PATH']}"
+        env["SUTANDO_TEST_MODE"] = "1"
+        env["SUTANDO_WORKSPACE"] = str(workspace)
+        env["SUTANDO_TMUX_SOCKET"] = SOCK
+        env["SUTANDO_TMUX_SESSION"] = SESSION
+        env["SUTANDO_NOTIFIER_POLL_INTERVAL"] = "0.1"
+        env["SUTANDO_NOTIFIER_SUBMIT_RETRIES"] = "1"
+        env["SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT"] = "1"
+        cmd = ["bash", str(root / "src/agent/claude/cli/task-notifier.sh"),
+               "--event", filename]
+        with PaneOwner() as owner:
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            # It must WAIT for the pane, not resume into it: a staged prompt is
+            # still a pane write once Enter reaches it.
+            deadline = time.time() + 6
+            while time.time() < deadline and proc.poll() is None:
+                if _keys(log):
+                    fails.append(f"claude task-notifier resume: pressed a key into an owned pane: {_keys(log)}")
+                    break
+                time.sleep(0.2)
+            if proc.poll() is not None and not _keys(log):
+                fails.append("claude task-notifier resume: exited without resuming instead of waiting for the pane")
+            owner.release()
+            try:
+                proc.wait(timeout=40)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                fails.append("claude task-notifier resume: still running well after the pane was released")
+        sent = _keys(log)
+        if not any("C-m" in ln for ln in sent):
+            fails.append(f"claude task-notifier resume: never resumed (pressed Enter) after the pane was released (control), log: {sent}")
+        if any(" -l " in ln for ln in sent):
+            fails.append(f"claude task-notifier resume: retyped an already-staged prompt instead of just pressing Enter: {sent}")
+    return fails
+
+
 CASES = (
     ("health-check cron nudge", case_health_check_cron_nudge),
     ("core-input-watch keypress", case_core_input_watch_keypress),
     ("task-notifier delivery", case_task_notifier_delivery),
     ("claude task-notifier delivery", case_claude_task_notifier_delivery),
+    ("claude task-notifier staged-resume delivery", case_claude_task_notifier_staged_resume_collision),
 )
 
 
