@@ -1,10 +1,6 @@
 #!/bin/bash
 # Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
 # Not wired into core selection — see src/agent/agy/README.md for scope.
-#
-# Usage:
-#   bash src/agent/agy/cli/start-cli.sh           # start (or attach if running)
-#   bash src/agent/agy/cli/start-cli.sh --check   # verify agy + auth, no launch
 set -euo pipefail
 
 # This script lives at src/agent/agy/cli/ — four levels under the repo root.
@@ -37,6 +33,15 @@ EOF
 
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
+
+attach_or_report_existing() {
+  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+    echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
+    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+  fi
+  echo "$SESSION already running."
+  exit 0
+}
 
 # `agy` exposes no dedicated auth-status subcommand; `agy models` makes one
 # authenticated round trip and doubles as the lightest available probe.
@@ -94,12 +99,7 @@ fi
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.
 if session_exists; then
-  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
-    echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
-    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
-  fi
-  echo "$SESSION already running."
-  exit 0
+  attach_or_report_existing
 fi
 
 # Onboarding-skip pre-seed (see onboarding_seed.py); non-fatal — a skipped
@@ -111,7 +111,15 @@ else
   echo "  ⚠ no runnable python3 — onboarding-seed NOT applied; first launch may hit the onboarding wizard" >&2
 fi
 
-tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" agy --dangerously-skip-permissions
+# tmux serializes session creation; a nonzero rc here can be a real failure
+# or a peer that won the race above — recheck before treating it as ours.
+if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" agy --dangerously-skip-permissions; then
+  if session_exists; then
+    attach_or_report_existing
+  fi
+  echo "  ⚠ failed to start $SESSION." >&2
+  exit 1
+fi
 
 # new-session rc=0 only means tmux accepted it; poll rather than assume a
 # session whose command exited immediately is actually up.

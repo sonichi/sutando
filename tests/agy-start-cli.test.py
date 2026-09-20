@@ -14,11 +14,13 @@ Covers what can be tested without a real agy session + real Google auth:
 Does NOT attempt a real agy CLI + real Google auth — that can't run in CI;
 see docs/... sonichi#4272 for how that was verified by hand instead.
 """
+import concurrent.futures
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -103,6 +105,93 @@ class OnboardingSeedTests(unittest.TestCase):
         path = self._path("onboarding.json")
         self.seed.seed(path)
         self.assertFalse(Path(path + ".tmp").exists())
+        leftovers = [p for p in Path(self.tmp.name).iterdir() if p.name != "onboarding.json"]
+        self.assertEqual(leftovers, [], f"stray staging files left behind: {leftovers}")
+
+    def test_concurrent_writers_do_not_collide_on_shared_staging_name(self):
+        # 8-caller repro of the review's shared-`.tmp`-name collision; unique
+        # per-writer staging (mkstemp) must make all 8 succeed.
+        path = self._path("onboarding.json")
+        Path(path).write_text(json.dumps({
+            "consumerOnboardingComplete": False,
+            "unrelatedBigField": "x" * 500_000,
+        }))
+
+        def _call(_):
+            try:
+                self.seed.seed(path)
+                return None
+            except Exception as e:
+                return repr(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            errors = list(ex.map(_call, range(8)))
+        failures = [e for e in errors if e is not None]
+        self.assertEqual(failures, [], f"concurrent seed() callers must not raise: {failures}")
+
+        data = json.loads(Path(path).read_text())
+        self.assertEqual(len(data["unrelatedBigField"]), 500_000)
+        for field in self.seed.FIELDS:
+            self.assertIs(data[field], True, field)
+
+    def test_concurrency_test_would_catch_a_naive_non_atomic_writer(self):
+        # Mutation control: the naive shared-tmp-name writer this replaced
+        # must make the assertion above actually fail.
+        path = self._path("onboarding.json")
+        Path(path).write_text(json.dumps({"consumerOnboardingComplete": False}))
+
+        def naive_seed(p):
+            with open(p) as f:
+                data = json.load(f)
+            for field in self.seed.FIELDS:
+                data[field] = True
+            tmp = p + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, p)
+
+        def _call(_):
+            try:
+                naive_seed(path)
+                return None
+            except Exception as e:
+                return repr(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            errors = list(ex.map(_call, range(8)))
+        failures = [e for e in errors if e is not None]
+        self.assertTrue(
+            failures,
+            "mutation control: the naive shared-staging-name writer should "
+            "race and fail at least once — if it doesn't, this harness "
+            "isn't discriminating atomic from non-atomic writers",
+        )
+
+    def test_seed_preserves_existing_file_mode_under_broad_umask(self):
+        # A restrictive pre-existing cache file must not be broadened by the
+        # writer's own umask when os.replace swaps in the new one.
+        path = self._path("onboarding.json")
+        Path(path).write_text(json.dumps({"keep": "value"}))
+        os.chmod(path, 0o600)
+        old_umask = os.umask(0o022)
+        try:
+            self.seed.seed(path)
+        finally:
+            os.umask(old_umask)
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(oct(mode), oct(0o600))
+        data = json.loads(Path(path).read_text())
+        self.assertEqual(data["keep"], "value")
+
+    def test_seed_creates_new_file_owner_only(self):
+        path = self._path("fresh-onboarding.json")
+        old_umask = os.umask(0o022)
+        try:
+            self.seed.seed(path)
+        finally:
+            os.umask(old_umask)
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(oct(mode), oct(0o600))
 
     def test_default_path_matches_the_documented_agy_cache_location(self):
         # Field names + location verified by reading the real file on disk;
@@ -215,6 +304,33 @@ case "${{1:-}}" in
   new-session)
     touch "{self.tmux_state}"
     exit 0
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+''')
+
+    def _write_racy_fake_tmux(self):
+        # Models tmux's exclusivity for session creation via atomic mkdir —
+        # only one `new-session` for a given session can ever win.
+        lock_dir = self.root / "tmux-session.lock"
+        self._write_exe("tmux", f'''#!/bin/bash
+[ "${{1:-}}" = -S ] && shift 2
+case "${{1:-}}" in
+  has-session)
+    [ -d "{lock_dir}" ] && exit 0
+    exit 1
+    ;;
+  new-session)
+    if mkdir "{lock_dir}" 2>/dev/null; then
+      exit 0
+    fi
+    echo "duplicate session" >&2
+    exit 1
     ;;
   attach)
     exit 0
@@ -340,6 +456,23 @@ esac
             new_session_calls_after_first, new_session_calls_after_second,
             "a second invocation must not start a duplicate session",
         )
+
+    def test_concurrent_launches_all_succeed_with_exactly_one_session(self):
+        # 8-caller repro of the review's TOCTOU race on session creation.
+        self._write_fake_agy(auth_ok=True)
+        self._write_racy_fake_tmux()
+        n = 8
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+            results = list(ex.map(lambda _: self.run_launcher(), range(n)))
+        returncodes = [r.returncode for r in results]
+        failures = [(r.returncode, r.stdout, r.stderr) for r in results if r.returncode != 0]
+        self.assertEqual(
+            returncodes.count(0), n,
+            f"all {n} concurrent launches must succeed (winner starts, "
+            f"losers attach/report): returncodes={returncodes} failures={failures}",
+        )
+        self.assertTrue((self.root / "tmux-session.lock").is_dir(),
+                         "exactly one session should exist after the race")
 
 
 if __name__ == "__main__":
