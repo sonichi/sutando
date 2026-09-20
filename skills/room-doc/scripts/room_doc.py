@@ -11,26 +11,44 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from room_doc_protocol import RoomDocError  # noqa: E402
 
-TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN")
-URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT")
+TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
+              "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
+
+
+def split_compound(value: str) -> tuple[str | None, str]:
+    """`https://host/relay|secret` -> (origin, secret); a bare token -> (None, token).
+
+    The relay token ships in both shapes, under the same variable names, on
+    different installs. Passed whole, the compound form becomes the websocket
+    subprotocol header and is refused as invalid before any auth happens.
+    """
+    head, sep, tail = value.partition("|")
+    if sep and tail and re.match(r"^https?://", head):
+        return _origin(head), tail
+    return None, value
+
+
+def _origin(url: str) -> str:
+    m = re.match(r"^(https?://[^/]+)", url)
+    return m.group(1) if m else url.rstrip("/")
 
 
 def resolve_token(explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    for var in TOKEN_VARS:
-        if os.environ.get(var):
-            return os.environ[var]
-    raise RoomDocError(
-        "no Matrix access token. Pass --token, or set one of: " + ", ".join(TOKEN_VARS) + ".\n"
-        "It must be a MATRIX access token — a gateway/relay token is refused (403) by design."
-    )
+    raw = explicit or next((os.environ[v] for v in TOKEN_VARS if os.environ.get(v)), None)
+    if not raw:
+        raise RoomDocError(
+            "no access token. Pass --token, or set one of: " + ", ".join(TOKEN_VARS) + ".\n"
+            "The agent's ordinary relay token works; a 'url|secret' value is split here."
+        )
+    return split_compound(raw)[1]
 
 
 def resolve_url(explicit: str | None) -> str:
@@ -38,7 +56,13 @@ def resolve_url(explicit: str | None) -> str:
         return explicit
     for var in URL_VARS:
         if os.environ.get(var):
-            return os.environ[var]
+            # The relay URL carries its own path; documents are at its origin.
+            return _origin(os.environ[var]) if var == "REMOTE_TASK_URL" else os.environ[var]
+    # A compound token names the relay it was minted for; documents live there.
+    for var in TOKEN_VARS:
+        origin, _ = split_compound(os.environ.get(var, ""))
+        if origin:
+            return origin
     raise RoomDocError("no service URL. Pass --url, or set one of: " + ", ".join(URL_VARS) + ".")
 
 
