@@ -161,7 +161,3 @@ coverage-summary.md
 
 # Built locally from a GAIA copy; carries the answer key -- never commit.
 benchmarks/gaia-100.json
-
-# Published by the worker-pool skill when a pool is first created (never shipped):
-# an install with no pool must publish no task-event handler.
-skills/worker-pool/task-event-handler
