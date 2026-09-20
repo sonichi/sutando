@@ -39,7 +39,10 @@ from room_doc_board import (complete_element, # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
-from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
+from room_kanban import (  # noqa: E402
+    CARDS_KEY, COLUMNS_KEY, KANBAN_KIND, changed as changed_cards, describe_invalid as describe_bad_card,
+    is_card, is_column, normalized,
+)
 
 from room_doc_protocol import (  # noqa: E402
     close_code,
@@ -518,6 +521,65 @@ class RoomDoc:
             self._awareness.unobserve(aw_sub)
             if not ended.done():
                 ended.cancel()
+
+    # --- the kanban: cards and columns, the panel's rules
+
+    def _require_kanban(self, what: str) -> tuple:
+        if self._kind != KANBAN_KIND:
+            raise RoomDocError(
+                f"cannot {what} on the {self._kind!r} document: cards live on the "
+                f"kanban. Open it with kind={KANBAN_KIND!r}.")
+        return (self._doc.get(CARDS_KEY, type=Map), self._doc.get(COLUMNS_KEY, type=Map))
+
+    @property
+    def cards(self) -> list[tuple[str, dict]]:
+        """Every well-formed card, tombstones included, as (id, card)."""
+        cards, _ = self._require_kanban("read cards")
+        return [(k, v) for k, v in self._items(cards) if is_card(v, k)]
+
+    @property
+    def columns(self) -> list[dict]:
+        """The columns in board order."""
+        _, columns = self._require_kanban("read columns")
+        rows = [v for k, v in self._items(columns) if is_column(v, k)]
+        return sorted(rows, key=lambda c: (c["order"], c["id"]))
+
+    async def put_cards(self, cards: list[dict]) -> int:
+        """Write cards that are newer than what is stored. Returns how many.
+        Refuses a card the panel would drop, rather than writing it."""
+        ymap, _ = self._require_kanban("write cards")
+        cards = [normalized(c) if isinstance(c, dict) else c for c in cards]
+        for card in cards:
+            if not is_card(card):
+                raise RoomDocError(f"not a kanban card: {describe_bad_card(card)}. Nothing was written.")
+        stored = dict(self._items(ymap))
+        todo = changed_cards(cards, stored.get)
+        if not todo:
+            return 0
+
+        def mutate() -> None:
+            for card in todo:
+                ymap[card["id"]] = dict(card)
+
+        await self._commit(mutate)
+        return len(todo)
+
+    async def put_columns(self, columns: list[dict]) -> int:
+        _, ymap = self._require_kanban("write columns")
+        for col in columns:
+            if not is_column(col):
+                raise RoomDocError(f"not a kanban column: {col!r}. Nothing was written.")
+        stored = dict(self._items(ymap))
+        todo = changed_cards(columns, stored.get, valid=is_column)
+        if not todo:
+            return 0
+
+        def mutate() -> None:
+            for col in todo:
+                ymap[col["id"]] = dict(col)
+
+        await self._commit(mutate)
+        return len(todo)
 
     async def reconcile(self, elements: list[dict] | None = None) -> int:
         """Re-assert elements now. Rarely needed by hand — `put_elements` arms

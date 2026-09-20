@@ -45,7 +45,7 @@ def check(name, fn):
 
 def card(column, updated, by, ident="c1"):
     return {"id": ident, "column": column, "order": 0, "text": "the card",
-            "assignee": None, "updated": updated, "by": by}
+            "assignee": "", "updated": updated, "by": by}
 
 
 def sync(a: Doc, b: Doc) -> None:
@@ -230,7 +230,7 @@ def test_a_card_whose_column_is_gone_is_surfaced_not_lost():
     """Deleting a column does not delete its cards. Filtering on an unknown
     column leaves the card in the document and visible nowhere — an agent
     listing work would report it as done."""
-    cols = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    cols = [("todo", {"id": "todo", "title": "To do", "order": 0, "updated": 1, "by": "@a"})]
     cards = [("c1", card("todo", 100, "@a")),
              ("c2", card("archived", 100, "@a", ident="c2"))]
     assert [c["id"] for c in in_column(cards, "todo")] == ["c1"]
@@ -241,7 +241,7 @@ def test_a_card_whose_column_is_gone_is_surfaced_not_lost():
 def test_a_deleted_orphan_stays_deleted():
     """An orphan is still subject to its tombstone — surfacing lost cards must
     not resurrect deleted ones."""
-    cols = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    cols = [("todo", {"id": "todo", "title": "To do", "order": 0, "updated": 1, "by": "@a"})]
     gone = delete_card(card("archived", 100, "@a"), 200, "@b")
     assert orphaned_cards([("c1", gone)], cols) == []
 
@@ -255,7 +255,7 @@ def test_a_malformed_column_does_not_make_its_key_known():
     cards = [("c1", card("todo", 1, "@a")), ("c2", card("doing", 1, "@a", ident="c2"))]
     assert {c["id"] for c in orphaned_cards(cards, junk)} == {"c1", "c2"}
     # control: a well-formed column DOES make its key known
-    good = [("todo", {"id": "todo", "title": "To do", "updated": 1})]
+    good = [("todo", {"id": "todo", "title": "To do", "order": 0, "updated": 1, "by": "@a"})]
     assert [c["id"] for c in orphaned_cards(cards, good)] == ["c2"]
 
 
@@ -284,16 +284,26 @@ def test_every_way_a_card_can_be_refused():
     assert is_card(ok, "c1")
 
 
-def test_optional_card_fields_may_be_absent_or_null():
-    """Rejecting a null optional would refuse cards the panel writes."""
-    bare = {"id": "c1", "column": "todo", "updated": 1}
-    assert is_card(bare, "c1")
-    assert is_card({**bare, "text": None, "assignee": None, "by": None, "order": None})
+def test_a_card_the_panel_would_drop_is_refused_here_too():
+    """The panel's isKanbanCard fails closed: text, assignee, by and order are
+    required strings/integers, and '' is how "nobody" is spelled. Accepting
+    less here writes a card every viewer silently drops."""
+    ok = card("todo", 1, "@a")
+    assert is_card(ok, "c1")
+    assert is_card({**ok, "assignee": ""}), "'' is nobody, and valid"
+    for missing in ("text", "assignee", "by", "order"):
+        bare = {k: v for k, v in ok.items() if k != missing}
+        assert not is_card(bare, "c1"), f"a card without {missing} is not a card"
+        assert not is_card({**ok, missing: None}, "c1"), f"null {missing} is not a card"
+    assert not is_card({**ok, "text": "x" * 4001}), "text is capped at 4000"
+    assert not is_card({**ok, "updated": -1}), "updated cannot be negative"
 
 
 def test_every_way_a_column_can_be_refused():
-    good = {"id": "todo", "title": "To do", "updated": 1}
+    good = {"id": "todo", "title": "To do", "order": 0, "updated": 1, "by": "@a"}
     assert is_column(good, "todo")
+    assert not is_column({k: v for k, v in good.items() if k != "by"}), "by is required"
+    assert not is_column({k: v for k, v in good.items() if k != "order"}), "order is required"
     assert not is_column({**good, "id": ""}), "empty id"
     assert not is_column(good, "other"), "id must equal its key"
     assert not is_column({**good, "title": 7}), "title must be a string"

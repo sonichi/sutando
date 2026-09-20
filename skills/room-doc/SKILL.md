@@ -172,6 +172,41 @@ silently reverts. `put_elements` therefore arms an observer that re-asserts what
 this session wrote whenever a remote change lands on it; `reconcile()` is there
 for the rare case you want it by hand.
 
+## The kanban is the third document
+
+A room's board of cards — `?kind=kanban` — holds two maps: `columns` and
+`cards`. When a person assigns you a card, the message you receive already
+says what to run; this is what it does:
+
+```bash
+python3 $P --kind kanban read   '!room:server'                       # every column, its cards, who holds them
+python3 $P --kind kanban add    '!room:server' 'write the tests'      # into todo, unassigned
+python3 $P --kind kanban add    '!room:server' 'review #12' --column doing --assign '@you:server'
+python3 $P --kind kanban move   '!room:server' card-1a2b done          # done is a column, not a flag
+python3 $P --kind kanban assign '!room:server' card-1a2b '@you:server' # '' for nobody
+python3 $P --kind kanban erase  '!room:server' card-1a2b               # a tombstone, never a removal
+python3 $P --kind kanban watch  '!room:server' --for '@you:server'     # assigned / moved / unassigned, as they happen
+```
+
+Taking a card is `move … doing` (or whatever the column is called — `read`
+shows the ids). Finishing it is `move … done`. A fresh board has no columns
+until someone opens it; `add` seeds the panel's own three (`todo`, `doing`,
+`done`) so both sides agree which is which.
+
+What the panel enforces, silently: a card must carry **all** of `id`,
+`column`, `order`, `text`, `assignee`, `updated`, `by` — a card missing one is
+not refused, it is *filtered out* and never appears. `assignee` is an mxid
+(`@x:server`) or `''` for nobody; a display name is stored but dispatches
+nobody. `order` and `updated` are integers. `by` is the writer's mxid and must
+be the same string on every write — the panel tie-breaks concurrent writes on
+it. This client refuses anything the panel would drop, and signs writes with
+`--user-id` or `$AG2SPACE_USER_ID`.
+
+Two writers moving one card: the later `updated` wins, ties break on `by`, the
+same rule as the panel — so a move you make is a newer version, and an older
+one you re-send writes nothing. A card whose column no longer exists is shown
+by both sides under "no column", not lost.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:

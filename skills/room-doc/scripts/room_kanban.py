@@ -42,8 +42,8 @@ def _int(value: Any) -> int | None:
 
 
 def is_card(value: Any, key: str | None = None) -> bool:
-    """What the cards map may hold. An agent writes this map directly, so one
-    malformed record would reach the panel as a card it cannot draw."""
+    """Exactly what the panel accepts — it fails closed, so a card missing
+    `text`, `assignee` or `by` is dropped by every viewer with no error."""
     if not isinstance(value, dict):
         return False
     ident = value.get("id")
@@ -53,13 +53,16 @@ def is_card(value: Any, key: str | None = None) -> bool:
         return False
     if not isinstance(value.get("column"), str) or not value["column"]:
         return False
-    if _int(value.get("updated")) is None:
+    if _int(value.get("order")) is None:
         return False
-    for field in ("text", "assignee", "by"):
-        if field in value and value[field] is not None and not isinstance(value[field], str):
-            return False
-    if "order" in value and value["order"] is not None \
-            and not isinstance(value["order"], (int, float)):
+    if not isinstance(value.get("text"), str) or len(value["text"]) > 4000:
+        return False
+    if not isinstance(value.get("assignee"), str) or len(value["assignee"]) > 255:
+        return False
+    updated = _int(value.get("updated"))
+    if updated is None or updated < 0:
+        return False
+    if not isinstance(value.get("by"), str):
         return False
     # A tombstone is still a card. Spelling differs from the board's `isDeleted`.
     if "deleted" in value and value["deleted"] is not None \
@@ -76,9 +79,14 @@ def is_column(value: Any, key: str | None = None) -> bool:
         return False
     if key is not None and ident != key:
         return False
-    if not isinstance(value.get("title"), str):
+    if not isinstance(value.get("title"), str) or len(value["title"]) > 200:
         return False
-    return _int(value.get("updated")) is not None
+    if _int(value.get("order")) is None:
+        return False
+    updated = _int(value.get("updated"))
+    if updated is None or updated < 0:
+        return False
+    return isinstance(value.get("by"), str)
 
 
 def is_newer(incoming: dict, stored: dict | None) -> bool:
@@ -155,3 +163,55 @@ def in_column(cards: Iterable[tuple[str, Any]], column: str) -> list[dict]:
             if is_card(v, k) and v.get("column") == column and not v.get("deleted")]
     return sorted(rows, key=lambda c: (c.get("order") if isinstance(
         c.get("order"), (int, float)) else float("inf"), c.get("id") or ""))
+
+
+# The panel's defaults for a fresh board, and its spacing between positions.
+DEFAULT_COLUMNS = (("todo", "To do"), ("doing", "Doing"), ("done", "Done"))
+ORDER_GAP = 1024
+
+
+def order_between(before: int | None, after: int | None) -> int:
+    """A position between two neighbours, the panel's rule: gaps of ORDER_GAP
+    so an insert needs no renumbering, a midpoint when squeezed between."""
+    if before is None and after is None:
+        return 0
+    if before is None:
+        return int(after) - ORDER_GAP
+    if after is None:
+        return int(before) + ORDER_GAP
+    return (int(before) + int(after)) // 2
+
+
+def order_after_last(cards: Iterable[tuple[str, Any]], column: str) -> int:
+    rows = in_column(cards, column)
+    return order_between(int(rows[-1]["order"]) if rows else None, None)
+
+
+def new_card(ident: str, column: str, text: str, now: int, by: str,
+             order: int, assignee: str = "") -> dict:
+    return {"id": ident, "column": column, "order": int(order), "text": text,
+            "assignee": assignee, "updated": int(now), "by": by}
+
+
+def move_card(card: dict, column: str, order: int, now: int, by: str) -> dict:
+    """A move is a newer version, so it wins or loses by the same rule as an edit."""
+    return {**card, "column": column, "order": int(order), "updated": int(now), "by": by}
+
+
+def assign_card(card: dict, assignee: str, now: int, by: str) -> dict:
+    return {**card, "assignee": assignee, "updated": int(now), "by": by}
+
+
+def default_columns(now: int, by: str) -> list[dict]:
+    return [{"id": cid, "title": title, "order": i * ORDER_GAP, "updated": int(now), "by": by}
+            for i, (cid, title) in enumerate(DEFAULT_COLUMNS)]
+
+
+def normalized(card: dict) -> dict:
+    """A card read back from the CRDT carries its integers as floats (pycrdt
+    returns 300 as 300.0); a write carries them back as integers."""
+    out = dict(card)
+    for key in ("order", "updated"):
+        if key in out and isinstance(out[key], float) and out[key] == int(out[key]):
+            out[key] = int(out[key])
+    return out

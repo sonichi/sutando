@@ -21,6 +21,17 @@ from room_doc_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
 TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
               "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
 URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
+IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
+
+
+def resolve_identity(explicit: str | None) -> str:
+    """The mxid a kanban write is signed with (`by`). The panel tie-breaks on
+    it, so it must be the same string on every write from this agent."""
+    who = explicit or next((os.environ[v] for v in IDENTITY_VARS if os.environ.get(v)), None)
+    if not who:
+        raise RoomDocError("no identity for `by`. Pass --user-id, or set one of: "
+                           + ", ".join(IDENTITY_VARS) + ".")
+    return who
 
 
 def split_compound(value: str) -> tuple[str | None, str]:
@@ -199,6 +210,79 @@ async def doctor(args: argparse.Namespace) -> int:
         say("connect", False, str(exc))
         return 2
     print("  all steps passed — connected and read; writes go over this same connection")
+
+
+async def kanban(doc, args: argparse.Namespace) -> int:
+    """The board of cards: read it, or write one card through the panel's
+    own rules. Every write is a newer version signed with this agent's mxid."""
+    import time
+
+    from room_kanban import (assign_card, default_columns, delete_card, in_column, live_cards,
+                             move_card, new_card, order_after_last, orphaned_cards)
+
+    if args.command == "peers":
+        print(render("peers", peers=doc.peers, as_json=args.json))
+        return 0
+    if args.command == "read":
+        cols, cards = doc.columns, doc.cards
+        if args.json:
+            print(json.dumps({"columns": cols, "cards": live_cards(cards),
+                              "orphaned": orphaned_cards(cards, [(c["id"], c) for c in cols]),
+                              "peers": doc.peers}, ensure_ascii=False, indent=2))
+            return 0
+        if not cols and not live_cards(cards):
+            print("(kanban is empty — no columns, no cards)")
+            return 0
+        for col in cols:
+            rows = in_column(cards, col["id"])
+            print(f"## {col['title']}  [{col['id']}]  ({len(rows)})")
+            for c in rows:
+                who = f"  → {c['assignee']}" if c.get("assignee") else ""
+                print(f"  {c['id']}  {c['text']}{who}")
+        lost = orphaned_cards(cards, [(c["id"], c) for c in cols])
+        if lost:
+            print(f"## (no column)  ({len(lost)})")
+            for c in lost:
+                print(f"  {c['id']}  {c['text']}  [column {c['column']!r} does not exist]")
+        return 0
+
+    now = int(time.time() * 1000)
+    by = resolve_identity(args.user_id)
+    stored = {k: v for k, v in doc.cards}
+    if args.command == "add":
+        if not doc.columns:
+            # The panel seeds these on first open; the same ids and order here
+            # mean the two sides agree about which column is which.
+            await doc.put_columns(default_columns(now, by))
+        column = args.column or "todo"
+        if column not in {c["id"] for c in doc.columns}:
+            raise RoomDocError(f"no column {column!r}; the board has: "
+                               + ", ".join(c["id"] for c in doc.columns))
+        ident = args.id or f"card-{now:x}"
+        card = new_card(ident, column, args.text, now, by,
+                        order_after_last(doc.cards, column), args.assign or "")
+        written = await doc.put_cards([card])
+        await doc.settle(args.settle)
+        print(json.dumps({"ok": True, "written": written, "card": card}, ensure_ascii=False))
+        return 0
+    cid = getattr(args, "card_id", None) or getattr(args, "element_id", None)
+    card = stored.get(cid)
+    if card is None or card.get("deleted"):
+        raise RoomDocError(f"no live card {cid!r}")
+    if args.command == "move":
+        if args.column not in {c["id"] for c in doc.columns}:
+            raise RoomDocError(f"no column {args.column!r}")
+        nxt = move_card(card, args.column, order_after_last(doc.cards, args.column), now, by)
+    elif args.command == "assign":
+        nxt = assign_card(card, args.assignee, now, by)
+    elif args.command == "erase":
+        nxt = delete_card(card, now, by)
+    else:
+        raise RoomDocError(f"{args.command!r} is not a kanban command; use read, add, move, "
+                           "assign, erase, watch or peers.")
+    written = await doc.put_cards([nxt])
+    await doc.settle(args.settle)
+    print(json.dumps({"ok": True, "written": written, "card": nxt}, ensure_ascii=False))
     return 0
 
 
@@ -247,6 +331,7 @@ async def run(args: argparse.Namespace) -> int:
     from room_doc_client import open_room_doc
 
     from room_doc_board import BOARD_KIND, place_clear
+    from room_kanban import KANBAN_KIND
 
     if args.command == "doctor":
         return await doctor(args)
@@ -259,6 +344,9 @@ async def run(args: argparse.Namespace) -> int:
                              insecure=args.insecure) as doc:
         if args.name:
             await doc.set_presence(args.name, user_id=args.user_id)
+
+        if args.kind == KANBAN_KIND:
+            return await kanban(doc, args)
 
         if args.kind == BOARD_KIND:
             # Presence is its own channel and belongs to no document kind, so
@@ -347,9 +435,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--absolute", action="store_true",
                    help="write the coordinates as given, even onto existing drawings")
 
-    s = sub.add_parser("erase", help="mark a board element deleted (needs --kind board)")
+    s = sub.add_parser("erase", help="mark a board element or kanban card deleted")
     s.add_argument("room")
     s.add_argument("element_id")
+
+    s = sub.add_parser("add", help="add a kanban card (needs --kind kanban)")
+    s.add_argument("room")
+    s.add_argument("text")
+    s.add_argument("--column", help="column id; default todo")
+    s.add_argument("--assign", metavar="MXID", help="who it is for")
+    s.add_argument("--id", help="card id; default generated")
+
+    s = sub.add_parser("move", help="move a kanban card to a column (needs --kind kanban)")
+    s.add_argument("room")
+    s.add_argument("card_id")
+    s.add_argument("column")
+
+    s = sub.add_parser("assign", help="assign a kanban card (needs --kind kanban)")
+    s.add_argument("room")
+    s.add_argument("card_id")
+    s.add_argument("assignee", help="an mxid, or '' for nobody")
     return p
 
 
