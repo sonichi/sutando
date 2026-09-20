@@ -57,6 +57,10 @@ def is_card(value: Any, key: str | None = None) -> bool:
     if "order" in value and value["order"] is not None \
             and not isinstance(value["order"], (int, float)):
         return False
+    # A tombstone is still a card. Spelling differs from the board's `isDeleted`.
+    if "deleted" in value and value["deleted"] is not None \
+            and not isinstance(value["deleted"], bool):
+        return False
     return True
 
 
@@ -117,8 +121,21 @@ def describe_invalid(value: Any, key: str | None = None) -> str:
     return "valid"
 
 
+def live_cards(cards: Iterable[tuple[str, Any]]) -> list[dict]:
+    """Cards still on the board. A tombstone is a card the panel does not draw,
+    so an agent listing work must not offer one back."""
+    return [v for k, v in cards if is_card(v, k) and not v.get("deleted")]
+
+
+def delete_card(card: dict, now: int, by: str) -> dict:
+    """A deletion is a newer WRITE, not a removal: removing the key loses to a
+    concurrent write, and the card comes back."""
+    return {**card, "deleted": True, "updated": int(now), "by": by}
+
+
 def in_column(cards: Iterable[tuple[str, Any]], column: str) -> list[dict]:
-    """The cards of one column, in the panel's order."""
-    rows = [v for k, v in cards if is_card(v, k) and v.get("column") == column]
+    """The cards of one column, in the panel's order. Tombstones excluded."""
+    rows = [v for k, v in cards
+            if is_card(v, k) and v.get("column") == column and not v.get("deleted")]
     return sorted(rows, key=lambda c: (c.get("order") if isinstance(
         c.get("order"), (int, float)) else float("inf"), c.get("id") or ""))

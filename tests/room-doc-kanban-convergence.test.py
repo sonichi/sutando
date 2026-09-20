@@ -27,7 +27,8 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-doc kanban convergence: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_kanban import CARDS_KEY, changed, is_card, is_newer  # noqa: E402
+from room_kanban import (CARDS_KEY, changed, delete_card, in_column,  # noqa: E402
+                         is_card, is_newer, live_cards)
 
 FAILS = []
 
@@ -181,6 +182,33 @@ def test_changed_refuses_a_malformed_card_rather_than_writing_it():
     stored = {}
     assert changed([{"id": "x"}], stored.get) == [], "a card with no column is not a card"
     assert len(changed([card("todo", 1, "@a")], stored.get)) == 1
+
+
+def test_a_tombstone_is_still_a_card_but_not_a_live_one():
+    """The panel keeps deleted cards in the map — removing the key loses to a
+    concurrent write. So an agent must read the flag, not the key's absence."""
+    gone = delete_card(card("todo", 100, "@a"), 200, "@b")
+    assert is_card(gone, "c1"), "a tombstone is still a well-formed card"
+    assert gone["deleted"] is True and gone["updated"] == 200
+    items = [("c1", gone), ("c2", card("todo", 100, "@a", ident="c2"))]
+    assert [c["id"] for c in live_cards(items)] == ["c2"]
+    assert [c["id"] for c in in_column(items, "todo")] == ["c2"], \
+        "a deleted card must not be offered back as work"
+
+
+def test_a_junk_deleted_flag_is_not_a_card():
+    assert not is_card({**card("todo", 1, "@a"), "deleted": "yes"})
+    assert not is_card({**card("todo", 1, "@a"), "deleted": 1})
+    assert is_card({**card("todo", 1, "@a"), "deleted": False})
+
+
+def test_deleting_wins_over_an_older_concurrent_edit():
+    """The reason it is a write: it has to be able to win a race."""
+    edit = card("doing", 150, "@someone")
+    gone = delete_card(card("todo", 100, "@a"), 200, "@b")
+    assert is_newer(gone, edit), "a later deletion must beat an earlier move"
+    later_edit = card("doing", 300, "@someone")
+    assert is_newer(later_edit, gone), "and a later move must beat the deletion"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
