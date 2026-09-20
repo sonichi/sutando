@@ -145,6 +145,77 @@ def test_doctor_reports_each_missing_piece_on_its_own_row():
     assert rows == {"token": True, "url": True}
 
 
+def _run_doctor(env, opener=None, kind="markdown"):
+    """doctor() with a scripted opener, stdout captured, env isolated."""
+    import asyncio
+    import contextlib
+    import io
+    import types
+
+    import room_doc_client
+    saved = {k: os.environ.pop(k) for k in list(os.environ)
+             if k in room_doc.TOKEN_VARS + room_doc.URL_VARS}
+    os.environ.update(env)
+    real = room_doc_client.open_room_doc
+    if opener is not None:
+        room_doc_client.open_room_doc = opener
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = asyncio.run(room_doc.doctor(types.SimpleNamespace(
+                room="!r:x", kind=kind, token=None, url=None, insecure=False)))
+    finally:
+        room_doc_client.open_room_doc = real
+        for k in room_doc.TOKEN_VARS + room_doc.URL_VARS:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+    return rc, out.getvalue()
+
+
+def _opener(doc=None, refuse=None):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def open_room_doc(url, room, token, kind=None, insecure=False):
+        if refuse:
+            raise RoomDocError(refuse)
+        yield doc
+
+    return open_room_doc
+
+
+class _Doc:
+    text = "hello"
+    peers = [{"name": "q"}]
+    elements = [1, 2, 3]
+
+
+def test_doctor_reports_every_step_ok_when_all_is_well():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "s3cret", "REMOTE_TASK_URL": "https://h/relay"},
+                          _opener(_Doc()))
+    assert rc == 0, out
+    for step in ("deps", "token", "url", "connect", "read", "peers"):
+        assert f"ok    {step}" in out, out
+    assert "5 chars" in out and "1 present" in out and "s3cret" not in out
+
+
+def test_doctor_reads_elements_on_the_board():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "AG2_API_ROOT": "https://h"},
+                          _opener(_Doc()), kind="board")
+    assert rc == 0 and "3 elements" in out, out
+
+
+def test_doctor_stops_at_the_missing_credential():
+    rc, out = _run_doctor({"REMOTE_TASK_URL": "https://h/relay"}, _opener(_Doc()))
+    assert rc == 2 and "FAIL  token" in out and "connect" not in out, out
+
+
+def test_doctor_names_the_refusal_as_the_connect_step():
+    rc, out = _run_doctor({"REMOTE_TASK_TOKEN": "t", "REMOTE_TASK_URL": "https://h/relay"},
+                          _opener(refuse="refused (403) by h: no"))
+    assert rc == 2 and "FAIL  connect  refused (403)" in out, out
+
+
 def test_a_missing_url_names_its_variables():
     clear_env()
     try:
