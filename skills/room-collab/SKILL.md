@@ -1,7 +1,9 @@
 ---
-name: room-doc
+name: room-collab
 description: Read and write a room's LIVE collaborative documents (Room Doc — the Yjs/CRDT documents behind the Doc tab, and the other kinds a room holds such as the whiteboard, selected with --kind). Use this when asked to write into, read, or collaborate in a room's document. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
 ---
+
+> Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban; every wire key, URL path and environment variable is unchanged, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
 
 # Room Doc
 
@@ -22,7 +24,7 @@ sent one agent to the wrong place, which is why the warning is here and not furt
 ## First contact — if you were @-mentioned and have never done this
 
 ```bash
-P=skills/room-doc/scripts/room_doc.py
+P=skills/room-collab/scripts/room_collab.py
 python3 $P doctor '!room:server'                       # 1. every setup step, one line each
 python3 $P read   '!room:server'                       # 2. find the line that names you
 python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 3. answer UNDER it, signed
@@ -37,14 +39,14 @@ typing, and the merge keeps everyone's characters. `replace` is for editing a
 sentence you own.
 
 **Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
-`--json` belong to the program, not the command: `room_doc.py --kind board
-read <room>` works, `room_doc.py read <room> --kind board` is refused as
+`--json` belong to the program, not the command: `room_collab.py --kind board
+read <room>` works, `room_collab.py read <room> --kind board` is refused as
 "unrecognized arguments".
 
 ## Requirements
 
 ```bash
-pip install -r skills/room-doc/requirements.txt
+pip install -r skills/room-collab/requirements.txt
 ```
 
 ## Credential
@@ -73,7 +75,7 @@ lane env loaded, an agent needs neither flag.
 ## Command line
 
 ```bash
-P=skills/room-doc/scripts/room_doc.py
+P=skills/room-collab/scripts/room_collab.py
 python3 $P read   '!room:server'                      # print the document
 python3 $P peers  '!room:server'                      # who is present
 python3 $P append '!room:server' 'text to add'        # add at the end
@@ -108,7 +110,7 @@ the reason) only when the session ends: silence means "nothing yet", never
 `append` from another invocation, or from the library:
 
 ```python
-async with open_room_doc(url, room_id, token) as doc:
+async with open_room_collab(url, room_id, token) as doc:
     async for ev in doc.events(["mars", "@you:server"]):   # every kind, one loop
         if ev["kind"] == "mention": ...                     # act, then doc.append(...)
 ```
@@ -212,9 +214,9 @@ by both sides under "no column", not lost.
 For anything beyond one edit, import the library and **hold the connection**:
 
 ```python
-from room_doc_client import open_room_doc
+from room_collab_client import open_room_collab
 
-async with open_room_doc(url, room_id, token) as doc:
+async with open_room_collab(url, room_id, token) as doc:
     await doc.set_presence("mars")       # otherwise you edit invisibly
     print(doc.text, doc.peers)
     await doc.append("...")
@@ -260,7 +262,7 @@ as an HTTP status:
 | HTTP 401 "bearer is not a valid Matrix user session" | The service has no record of this agent's token — a provisioning gap on that deployment (the local rig, typically), not a room permission. A different problem from 4403; ask whoever runs that deployment. (verified 2026-09-20) |
 
 Each row carries the date it was last measured against the service, and
-`tests/room-doc-skill-claims-expire.test.py` fails once a row is older than
+`tests/room-collab-skill-claims-expire.test.py` fails once a row is older than
 30 days: a sentence about what the service refuses is an observation with a
 shelf life, not a rule. Re-measure and move the date; do not delete the date.
 

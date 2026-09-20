@@ -13,18 +13,18 @@ panel reconciles then that agent's newer move is silently lost. Both cases are
 below, with the client ids forced so the race is decided rather than lucky.
 
 Pure: two documents synced by hand, no server and no panel.
-Run: python3 tests/room-doc-kanban-convergence.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-kanban-convergence.test.py  (exit 0 pass / 1 fail)
 """
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
     from pycrdt import Doc, Map
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc kanban convergence: FAIL — dependencies missing ({exc}).")
+    print(f"room-collab kanban convergence: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
 from room_kanban import (CARDS_KEY, changed, delete_card,  # noqa: E402
@@ -328,11 +328,11 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc kanban convergence: FAIL")
+    print("room-collab kanban convergence: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc kanban convergence: ok")
+print("room-collab kanban convergence: ok")
 _h, _l = globals().get("_NO_RECONCILE", ("?", "?"))
 print("  finding — agent's move is NEWER in both rounds, and with NO re-assertion:")
 print(f"    agent holds the higher client id -> kept {_h!r}  (agent won)")

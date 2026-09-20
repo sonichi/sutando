@@ -7,15 +7,15 @@ other, and the owner saw two complete diagrams overlaid at the same origin.
 The failure is silent: both drawings converge correctly, they are just
 unreadable together.
 
-Run: python3 tests/room-doc-board-place.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-place.test.py  (exit 0 pass / 1 fail)
 """
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_doc_board import PLACE_GAP, bounding_box, place_clear  # noqa: E402
+from room_collab_board import PLACE_GAP, bounding_box, place_clear  # noqa: E402
 
 FAILS = []
 
@@ -148,8 +148,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board placement: FAIL")
+    print("room-collab board placement: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board placement: ok")
+print("room-collab board placement: ok")

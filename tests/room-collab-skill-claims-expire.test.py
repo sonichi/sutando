@@ -9,7 +9,7 @@ sentence written on one day was still there the day after the service
 changed. A dated claim is an observation with a shelf life; an undated one is
 a rule nobody owns.
 
-Run: python3 tests/room-doc-skill-claims-expire.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-skill-claims-expire.test.py  (exit 0 pass / 1 fail)
 """
 import datetime as dt
 import re
@@ -17,11 +17,11 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 from skill_claims import MAX_AGE_DAYS, refusal_claims, stale_claims  # noqa: E402
 
-SKILL = REPO / "skills" / "room-doc" / "SKILL.md"
+SKILL = REPO / "skills" / "room-collab" / "SKILL.md"
 FAILS = []
 
 
@@ -83,8 +83,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc skill claims expire: FAIL")
+    print("room-collab skill claims expire: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc skill claims expire: ok")
+print("room-collab skill claims expire: ok")

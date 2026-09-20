@@ -4,17 +4,17 @@
 `render()` is pure so this needs no pycrdt and no socket. The property that
 matters: a board read must never fall through to the text shape, where an
 empty string means "empty board" and "this is not a text document" alike.
-Run: python3 tests/room-doc-board-cli.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-cli.test.py  (exit 0 pass / 1 fail)
 """
 import json
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_doc import build_parser, parse_elements, render  # noqa: E402
-from room_doc_protocol import RoomDocError  # noqa: E402
+from room_collab import build_parser, parse_elements, render  # noqa: E402
+from room_collab_protocol import RoomDocError  # noqa: E402
 
 FAILS = []
 
@@ -86,7 +86,7 @@ def test_the_parser_exposes_the_board_commands():
 
 
 def test_malformed_draw_json_is_a_refusal_not_a_traceback():
-    """Every other error path here prints `room-doc: ...`; this one used to
+    """Every other error path here prints `room-collab: ...`; this one used to
     raise JSONDecodeError straight through argparse."""
     for bad in ("not json", "", "{"):
         try:
@@ -115,8 +115,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board CLI: FAIL")
+    print("room-collab board CLI: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board CLI: ok")
+print("room-collab board CLI: ok")

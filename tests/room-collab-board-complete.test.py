@@ -9,15 +9,15 @@ a live board tonight, all written by the skill's own minimal example.
 
 The fill mirrors what Excalidraw's restoreElement() does, so an element that
 went through this is what the editor would have made of it. Pure: no pycrdt.
-Run: python3 tests/room-doc-board-complete.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-complete.test.py  (exit 0 pass / 1 fail)
 """
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_doc_board import (ELEMENT_DEFAULTS, complete_element,  # noqa: E402
+from room_collab_board import (ELEMENT_DEFAULTS, complete_element,  # noqa: E402
                             is_board_element)
 
 FAILS = []
@@ -129,8 +129,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board complete: FAIL")
+    print("room-collab board complete: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board complete: ok")
+print("room-collab board complete: ok")

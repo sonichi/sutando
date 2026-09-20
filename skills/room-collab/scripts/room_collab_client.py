@@ -31,11 +31,11 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
-        f"room-doc client needs its dependencies: {exc}\n"
-        "install them with: pip install -r skills/room-doc/requirements.txt"
+        f"room-collab client needs its dependencies: {exc}\n"
+        "install them with: pip install -r skills/room-collab/requirements.txt"
     ) from exc
 
-from room_doc_board import (complete_element, # noqa: E402
+from room_collab_board import (complete_element, # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
@@ -44,7 +44,7 @@ from room_kanban import (  # noqa: E402
     is_card, is_column, normalized,
 )
 
-from room_doc_protocol import (  # noqa: E402
+from room_collab_protocol import (  # noqa: E402
     close_code,
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
@@ -54,11 +54,11 @@ from room_doc_protocol import (  # noqa: E402
 AUTHORS_KEY = "authors"
 SYNC_TIMEOUT_S = 20.0
 # Marks a transaction as ours, so the reconcile observer can ignore its own writes.
-LOCAL_ORIGIN = "room-doc-client"
+LOCAL_ORIGIN = "room-collab-client"
 
 
 class RoomDoc:
-    """One open document. Use `open_room_doc()` rather than constructing it."""
+    """One open document. Use `open_room_collab()` rather than constructing it."""
 
     def __init__(self, ws: Any, doc: Doc, awareness: Awareness, text_name: str,
                  kind: str = DEFAULT_KIND):
@@ -459,7 +459,7 @@ class RoomDoc:
         `since` is a snapshot from an earlier session: on reconnect, what
         landed while the socket was down is diffed too, not silently skipped.
         """
-        from room_doc_watch import (addressed_to, board_mentions, kanban_changes,
+        from room_collab_watch import (addressed_to, board_mentions, kanban_changes,
                                     new_lines, peer_changes)
         queue: asyncio.Queue[None] = asyncio.Queue()
 
@@ -615,7 +615,7 @@ class RoomDoc:
 
 
 @asynccontextmanager
-async def open_room_doc(api_root: str, room_id: str, token: str, *,
+async def open_room_collab(api_root: str, room_id: str, token: str, *,
                         kind: str = DEFAULT_KIND,
                         text_name: str = DEFAULT_TEXT_NAME,
                         insecure: bool = False) -> AsyncIterator[RoomDoc]:
@@ -641,14 +641,14 @@ async def open_room_doc(api_root: str, room_id: str, token: str, *,
     except Exception as exc:  # noqa: BLE001
         raise RoomDocError(explain(exc, url)) from exc
 
-    room_doc = RoomDoc(ws, doc, awareness, text_name, kind=kind)
+    room_collab = RoomDoc(ws, doc, awareness, text_name, kind=kind)
     try:
-        await room_doc._start()
+        await room_collab._start()
     except BaseException:
         await connection.__aexit__(*sys.exc_info())
         raise
     try:
-        yield room_doc
+        yield room_collab
     finally:
-        await room_doc._stop()
+        await room_collab._stop()
         await connection.__aexit__(None, None, None)

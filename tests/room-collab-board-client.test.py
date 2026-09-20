@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The board half of the room-doc client, against a real pycrdt document.
+"""The board half of the room-collab client, against a real pycrdt document.
 
 The behaviour under test is a REFUSAL, and refusals are what this client keeps
 getting wrong in the same way: before this, opening the board and asking for
@@ -9,7 +9,7 @@ client ever reads. Both are silent. Both are pinned here.
 
 No socket: the client is constructed directly around a stand-in that records
 frames, so this exercises the shipped methods without a server.
-Run: python3 tests/room-doc-board-client.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-client.test.py  (exit 0 pass / 1 fail)
 """
 import asyncio
 import inspect
@@ -17,20 +17,20 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
     from pycrdt import Awareness, Doc
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc board client: FAIL — dependencies missing ({exc}).")
-    print("  CI installs skills/room-doc/requirements.txt; a skip here would")
+    print(f"room-collab board client: FAIL — dependencies missing ({exc}).")
+    print("  CI installs skills/room-collab/requirements.txt; a skip here would")
     print("  make this suite green without running, which is the bug it guards.")
     sys.exit(1)
 
-from room_doc_board import BOARD_KIND  # noqa: E402
-from room_doc_client import RoomDoc  # noqa: E402
+from room_collab_board import BOARD_KIND  # noqa: E402
+from room_collab_client import RoomDoc  # noqa: E402
 
-from room_doc_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError  # noqa: E402
+from room_collab_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError  # noqa: E402
 
 FAILS = []
 
@@ -191,8 +191,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board client: FAIL")
+    print("room-collab board client: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board client: ok")
+print("room-collab board client: ok")

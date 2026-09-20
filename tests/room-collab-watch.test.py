@@ -6,29 +6,29 @@ nothing else; a person has to ping it in the room. Two halves: the pure rules
 that find new lines and the ones addressed to a handle, and the client's
 `changes()` iterator that feeds them from a live document.
 
-Run: python3 tests/room-doc-watch.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-watch.test.py  (exit 0 pass / 1 fail)
 """
 import asyncio
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
     from pycrdt import Awareness, Doc, Map, Text
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc watch: FAIL — dependencies missing ({exc}).")
+    print(f"room-collab watch: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_doc_client import RoomDoc  # noqa: E402
-from room_doc_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
+from room_collab_client import RoomDoc  # noqa: E402
+from room_collab_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
 
-from room_doc_protocol import (DEFAULT_KIND, DEFAULT_TEXT_NAME, RECONNECT_CODES,  # noqa: E402
+from room_collab_protocol import (DEFAULT_KIND, DEFAULT_TEXT_NAME, RECONNECT_CODES,  # noqa: E402
                                RoomDocError)
 from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
 
-from room_doc_watch import (addressed_to, board_mentions, kanban_changes,  # noqa: E402
+from room_collab_watch import (addressed_to, board_mentions, kanban_changes,  # noqa: E402
                             new_lines, peer_changes)
 
 FAILS = []
@@ -354,7 +354,7 @@ async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
 
 
 def test_a_refusal_is_never_a_reconnect():
-    from room_doc_protocol import close_code
+    from room_collab_protocol import close_code
     for refusal in (4400, 4403, 4404):
         assert refusal not in RECONNECT_CODES
     for restart in (1001, 1006, 1012):
@@ -411,7 +411,7 @@ import io  # noqa: E402
 
 import types  # noqa: E402
 
-import room_doc as cli  # noqa: E402
+import room_collab as cli  # noqa: E402
 
 
 class _Session:
@@ -441,11 +441,11 @@ def _fake_opener(sessions):
     calls = []
 
     @contextlib.asynccontextmanager
-    async def open_room_doc(url, room, token, kind=None, insecure=False):
+    async def open_room_collab(url, room, token, kind=None, insecure=False):
         calls.append((url, room, kind))
         yield sessions.pop(0)
 
-    return open_room_doc, calls
+    return open_room_collab, calls
 
 
 def _args(**over):
@@ -458,16 +458,16 @@ def _args(**over):
 async def _run_watch(sessions, **over):
     opener, calls = _fake_opener(sessions)
     out = io.StringIO()
-    import room_doc_client
-    real = room_doc_client.open_room_doc
-    room_doc_client.open_room_doc = opener
+    import room_collab_client
+    real = room_collab_client.open_room_collab
+    room_collab_client.open_room_collab = opener
     try:
         with contextlib.redirect_stdout(out):
             rc = await cli.watch(_args(**over), "tok", "https://h")
     except RoomDocError as e:
         rc = e
     finally:
-        room_doc_client.open_room_doc = real
+        room_collab_client.open_room_collab = real
     return rc, out.getvalue(), calls
 
 
@@ -508,8 +508,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc watch: FAIL")
+    print("room-collab watch: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc watch: ok")
+print("room-collab watch: ok")
