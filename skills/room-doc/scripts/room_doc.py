@@ -210,6 +210,7 @@ async def doctor(args: argparse.Namespace) -> int:
         say("connect", False, str(exc))
         return 2
     print("  all steps passed — connected and read; writes go over this same connection")
+    return 0
 
 
 async def kanban(doc, args: argparse.Namespace) -> int:
