@@ -39,7 +39,7 @@ from room_doc_board import (complete_element, # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
-from room_kanban import KANBAN_KIND  # noqa: E402
+from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
 
 from room_doc_protocol import (  # noqa: E402
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
@@ -411,6 +411,88 @@ class RoomDoc:
                 pending = None
         finally:
             text.unobserve(sub)
+            if not ended.done():
+                ended.cancel()
+
+    def snapshot(self) -> dict:
+        """What this document looks like right now, for whichever kind it is,
+        plus who is present — the unit `events()` diffs."""
+        snap: dict = {"peers": list(self.peers)}
+        if self._kind == DEFAULT_KIND:
+            snap["text"] = self.text
+        elif self._kind == BOARD_KIND:
+            snap["elements"] = self.elements
+        elif self._kind == KANBAN_KIND:
+            snap["cards"] = {k: v for k, v in self._items(self._doc.get(CARDS_KEY, type=Map))
+                             if isinstance(v, dict)}
+        return snap
+
+    async def events(self, handles: list[str], settle: float = 1.0) -> AsyncIterator[dict]:
+        """What happened that concerns `handles`, as it happens: a text or board
+        line that @-mentions one, a kanban card assigned to or moved for one,
+        a peer arriving or leaving. One stream for every kind, so an agent
+        holds one connection and one loop.
+
+        Snapshots are taken after `settle` seconds of quiet (a keystroke is a
+        push), diffed against the last one emitted, and the differences that
+        concern the handles are yielded. Ends by raising the close reason.
+        """
+        from room_doc_watch import (addressed_to, board_mentions, kanban_changes,
+                                    new_lines, peer_changes)
+        queue: asyncio.Queue[None] = asyncio.Queue()
+
+        def poke(*_: Any) -> None:
+            queue.put_nowait(None)
+
+        def on_doc(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin != LOCAL_ORIGIN:
+                poke()
+
+        subs = []
+        if self._kind == DEFAULT_KIND:
+            subs.append((self._text, self._text.observe(on_doc)))
+        elif self._kind == BOARD_KIND:
+            m = self._doc.get(ELEMENTS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        elif self._kind == KANBAN_KIND:
+            m = self._doc.get(CARDS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        aw_sub = self._awareness.observe(lambda *_: poke())
+        ended = asyncio.ensure_future(asyncio.shield(self._ended))
+        last = self.snapshot()
+        dirty = False
+        try:
+            while True:
+                got = asyncio.ensure_future(queue.get())
+                done, _ = await asyncio.wait({got, ended}, timeout=settle if dirty else None,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if ended in done:
+                    got.cancel()
+                    raise RoomDocError(
+                        f"the document session has ended: {close_reason(ended.result())}")
+                if got in done:
+                    dirty = True
+                    continue
+                got.cancel()
+                dirty = False
+                now = self.snapshot()
+                out: list[dict] = []
+                if "text" in now:
+                    for line in addressed_to(new_lines(last["text"], now["text"]), handles):
+                        out.append({"kind": "mention", "where": "text", "text": line})
+                if "elements" in now:
+                    out += board_mentions(last["elements"], now["elements"], handles)
+                if "cards" in now:
+                    out += kanban_changes(last["cards"], now["cards"], handles)
+                out += peer_changes(last["peers"], now["peers"])
+                last = now
+                for ev in out:
+                    yield ev
+        finally:
+            for obj, sub in subs:
+                obj.unobserve(sub)
+            self._awareness.unobserve(aw_sub)
             if not ended.done():
                 ended.cancel()
 

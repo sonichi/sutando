@@ -16,15 +16,19 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
 
 try:
-    from pycrdt import Awareness, Doc, Text
+    from pycrdt import Awareness, Doc, Map, Text
 except ImportError as exc:  # pragma: no cover
     print(f"room-doc watch: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
 from room_doc_client import RoomDoc  # noqa: E402
-from room_doc_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError  # noqa: E402
+from room_doc_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
 
-from room_doc_watch import addressed_to, new_lines  # noqa: E402
+from room_doc_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError  # noqa: E402
+from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
+
+from room_doc_watch import (addressed_to, board_mentions, kanban_changes,  # noqa: E402
+                            new_lines, peer_changes)
 
 FAILS = []
 
@@ -72,6 +76,51 @@ def test_cjk_and_spaces_in_a_handle_match_literally():
 
 def test_no_handles_means_no_lines_not_all_lines():
     assert addressed_to(["@a", "@b"], []) == []
+
+
+# --- the other documents and presence, pure
+
+def test_a_board_label_that_newly_names_me_is_a_mention_and_a_moved_one_is_not():
+    before = [{"id": "t1", "type": "text", "text": "@mars here", "x": 0},
+              {"id": "r1", "type": "rectangle"}]
+    after = [{"id": "t1", "type": "text", "text": "@mars here", "x": 50},
+             {"id": "t2-new", "type": "text", "text": "ask @mars about this"},
+             {"id": "t3-not-me", "type": "text", "text": "@marshall"},
+             {"id": "t4-gone", "type": "text", "text": "@mars", "isDeleted": True}]
+    got = board_mentions(before, after, ["mars"])
+    assert [e["element"] for e in got] == ["t2-new"], got
+    assert got[0]["kind"] == "mention" and got[0]["where"] == "board"
+
+
+def test_a_card_assigned_to_me_moved_or_taken_away():
+    me = "@mars:x"
+    before = {"c1": {"id": "c1", "column": "todo", "assignee": me},
+              "c2": {"id": "c2", "column": "todo", "assignee": "@other:x"},
+              "c3": {"id": "c3", "column": "doing", "assignee": me}}
+    after = {"c1": {"id": "c1", "column": "doing", "assignee": me},
+             "c2": {"id": "c2", "column": "todo", "assignee": me},
+             "c3": {"id": "c3", "column": "doing", "assignee": me, "deleted": True},
+             "c4-not-mine": {"id": "c4", "column": "todo", "assignee": "@other:x"}}
+    kinds = {e["card"]: e["kind"] for e in kanban_changes(before, after, [me])}
+    assert kinds == {"c1": "moved", "c2": "assigned", "c3": "unassigned"}, kinds
+    moved = [e for e in kanban_changes(before, after, [me]) if e["kind"] == "moved"][0]
+    assert (moved["from"], moved["to"]) == ("todo", "doing")
+
+
+def test_assignee_matches_with_or_without_the_at_and_case():
+    after = {"c": {"id": "c", "column": "x", "assignee": "Mars"}}
+    assert kanban_changes({}, after, ["@mars"])[0]["kind"] == "assigned"
+    assert kanban_changes({}, after, ["marshall"]) == []
+
+
+def test_peers_arriving_and_leaving_by_identity_not_device():
+    before = [{"id": "@q:x", "name": "qingyun"}]
+    after = [{"id": "@q:x", "name": "qingyun"}, {"id": "@q:x", "name": "qingyun (phone)"},
+             {"id": "@e:x", "name": "echo"}]
+    got = peer_changes(before, after)
+    assert [(e["kind"], e["who"]) for e in got] == [("peer_joined", "@e:x")], got
+    assert [(e["kind"], e["who"]) for e in peer_changes(after, [])] == \
+        [("peer_left", "@q:x"), ("peer_left", "@e:x")]
 
 
 # --- the live half: changes() on a document edited by a remote peer
@@ -209,6 +258,73 @@ async def test_new_lines_through_changes_find_the_mention():
     remote_append(doc, "line one\n@mars line two\n@other line three")
     text = await asyncio.wait_for(nxt, 2)
     assert addressed_to(new_lines(seen, text), ["mars"]) == ["@mars line two"]
+    await agen.aclose()
+
+
+# --- events(): one stream, every kind
+
+def make_kind(kind):
+    doc = Doc()
+    if kind == DEFAULT_KIND:
+        doc.get(DEFAULT_TEXT_NAME, type=Text)
+    elif kind == BOARD_KIND:
+        doc.get(ELEMENTS_KEY, type=Map)
+    else:
+        doc.get(CARDS_KEY, type=Map)
+    return doc, RoomDoc(FakeWS(), doc, Awareness(doc), DEFAULT_TEXT_NAME, kind=kind)
+
+
+def remote_set(local: Doc, key: str, ident: str, value: dict) -> None:
+    peer = Doc()
+    peer.apply_update(local.get_update())
+    peer.get(key, type=Map)[ident] = value
+    local.apply_update(peer.get_update(local.get_state()))
+
+
+async def first_event(room, handles, act):
+    agen = room.events(handles, settle=0.05)
+    nxt = asyncio.ensure_future(agen.__anext__())
+    await asyncio.sleep(0)
+    act()
+    ev = await asyncio.wait_for(nxt, 2)
+    await agen.aclose()
+    return ev
+
+
+async def test_events_on_text_yields_a_mention():
+    doc, room = make_kind(DEFAULT_KIND)
+    ev = await first_event(room, ["mars"], lambda: remote_append(doc, "hi\n@mars look"))
+    assert ev == {"kind": "mention", "where": "text", "text": "@mars look"}, ev
+
+
+async def test_events_on_the_board_yields_a_label_mention():
+    doc, room = make_kind(BOARD_KIND)
+    el = {"id": "t1", "type": "text", "x": 0, "y": 0, "width": 10, "height": 10,
+          "version": 1, "text": "cc @mars"}
+    ev = await first_event(room, ["mars"], lambda: remote_set(doc, ELEMENTS_KEY, "t1", el))
+    assert ev["kind"] == "mention" and ev["where"] == "board" and ev["element"] == "t1", ev
+
+
+async def test_events_on_the_kanban_yields_an_assignment():
+    doc, room = make_kind(KANBAN_KIND)
+    card = {"id": "c1", "column": "todo", "assignee": "@mars:x", "updated": 1, "text": "do it"}
+    ev = await first_event(room, ["@mars:x"], lambda: remote_set(doc, CARDS_KEY, "c1", card))
+    assert ev["kind"] == "assigned" and ev["card"] == "c1" and ev["text"] == "do it", ev
+
+
+async def test_events_yields_nothing_for_edits_that_do_not_concern_me():
+    doc, room = make_kind(DEFAULT_KIND)
+    agen = room.events(["mars"], settle=0.05)
+    nxt = asyncio.ensure_future(agen.__anext__())
+    await asyncio.sleep(0)
+    remote_append(doc, "@other please look")
+    await asyncio.sleep(0.3)
+    assert not nxt.done(), "an edit for someone else must not wake the watcher"
+    nxt.cancel()
+    try:
+        await nxt
+    except asyncio.CancelledError:
+        pass
     await agen.aclose()
 
 

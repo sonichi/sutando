@@ -202,19 +202,16 @@ async def doctor(args: argparse.Namespace) -> int:
 
 
 async def watch(doc, args: argparse.Namespace) -> int:
-    """Hold the document open and print each new line addressed to `--for`,
-    one per line, as it lands. Exits only when the session ends (rc 2)."""
-    from room_doc_watch import addressed_to, new_lines
-
+    """Hold the document open and print one line per event that concerns
+    `--for`, as it lands. Exits only when the session ends (rc 2)."""
     handles = args.handles or []
-    seen = doc.text
-    print(f"watching {args.room} for {handles or 'every new line'} "
-          f"({len(seen)} chars now; reporting after {args.settle}s of quiet)", flush=True)
-    async for text in doc.changes(settle=args.settle):
-        fresh = new_lines(seen, text)
-        seen = text
-        for line in (addressed_to(fresh, handles) if handles else fresh):
-            print(f"MENTION\t{line}" if handles else f"LINE\t{line}", flush=True)
+    print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
+          f"reporting after {args.settle}s of quiet", flush=True)
+    async for ev in doc.events(handles, settle=args.settle):
+        kind = ev.pop("kind")
+        detail = ev.pop("text", None)
+        rest = " ".join(f"{k}={v}" for k, v in ev.items() if v not in (None, ""))
+        print(f"EVENT\t{kind}\t{rest}" + (f"\t{detail}" if detail else ""), flush=True)
     return 0
 
 
@@ -233,6 +230,9 @@ async def run(args: argparse.Namespace) -> int:
                              insecure=args.insecure) as doc:
         if args.name:
             await doc.set_presence(args.name, user_id=args.user_id)
+
+        if args.command == "watch":
+            return await watch(doc, args)
 
         if args.kind == BOARD_KIND:
             # Presence is its own channel and belongs to no document kind, so
@@ -265,9 +265,6 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
-        if args.command == "watch":
-            return await watch(doc, args)
-
         before = len(doc.text)
         if args.command == "append":
             await doc.append(args.text)
@@ -302,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
         s = sub.add_parser(name, help=help_text)
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
-    s = sub.add_parser("watch", help="hold the document open; print new lines naming --for")
+    s = sub.add_parser("watch", help="hold the document open; print each event that concerns --for")
     s.add_argument("room")
     s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
                    help="a name or @mxid to watch for (repeatable); none = every new line")
