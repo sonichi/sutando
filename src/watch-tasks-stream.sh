@@ -387,7 +387,7 @@ handler_result_exists() {
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid handler
+  local filename worker_pid handler prc
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -437,6 +437,24 @@ drain_dispatch_queue() {
     if ! handler="$(task_event_handler)"; then
       release_dispatch_lock
       finish_handler_task "$running_marker" "$task_path" 1
+      return
+    fi
+    # The provider that admitted this task at enqueue time may not be the one
+    # resolved now. An unprobed provider never agreed to it, so it is probed
+    # again here. 0 and 4 are dispatch_task's own "admit" codes (fallback and
+    # must-handle); anything else is a decline or a probe failure, and feeds
+    # the same outranking rule a real run's rc already does.
+    "$handler" \
+      --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+      --workspace "$WORKSPACE_DIR" \
+      --task-file "$task_path" \
+      --results-dir "$RESULTS_DIR" \
+      --repo "$__REPO_ROOT" \
+      --probe >/dev/null
+    prc=$?
+    if [ "$prc" -ne 0 ] && [ "$prc" -ne 4 ]; then
+      release_dispatch_lock
+      finish_handler_task "$running_marker" "$task_path" "$prc"
       return
     fi
     SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
