@@ -21,8 +21,8 @@ from pathlib import Path
 # Case-insensitive so the env aliases (ROOM_DOC_TOKEN, AG2_ROOM_DOC_URL) count too.
 PATTERN = re.compile(r"room-doc|room_doc|space\.ag2\.doc\b", re.IGNORECASE)
 BASELINE_REL = Path("scripts") / "old-collab-literals.baseline.json"
-# Text files only; the baseline itself and this script are not evidence.
-SKIP = {str(BASELINE_REL), "scripts/lint-old-collab-literals.py"}
+# Text files only; the baseline, this script and its test's fixture text are not evidence.
+SKIP = {str(BASELINE_REL), "scripts/lint-old-collab-literals.py", "tests/lint-old-collab-literals.test.py"}
 
 
 def repo_root() -> Path:
