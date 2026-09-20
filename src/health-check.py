@@ -3454,16 +3454,16 @@ def _git_dir(repo: Path) -> "Path | None":
     env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_SELECTION_ENV}
     try:
         r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
-                    capture_output=True, text=True, timeout=20, env=env)
+                    capture_output=True, timeout=20, env=env)
     except (OSError, ValueError, _sp.SubprocessError):
         return None
-    # Only the record terminator comes off: a trailing space in the path is
-    # significant, and stripping it names a different directory.
-    raw = r.stdout.removesuffix("\n")
+    # Bytes, not text: universal newlines would fold a CR in the NAME into
+    # "\n", and only the record terminator comes off — a trailing space stays.
+    raw = r.stdout.removesuffix(b"\n")
     if r.returncode != 0 or not raw:
         return None
     try:
-        g = Path(raw)
+        g = Path(os.fsdecode(raw))
         return g if g.is_dir() else None
     except (ValueError, OSError, RuntimeError):
         return None

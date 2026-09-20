@@ -396,5 +396,37 @@ class TargetMustBelongToThisCheckout(unittest.TestCase):
         self.assertNotIn("in flight", r["detail"])
 
 
+class ANameWithACarriageReturnIsItsOwnRepository(unittest.TestCase):
+    """Universal-newline decoding turned a CR in the repository's NAME into LF,
+    so `a\rb/.git` read as `a\nb/.git`: the CR repo was reported clean off its
+    sibling's state, or told to remove the sibling's lock."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.cr = Path(self.tmp.name) / "repo\rname"      # CR in the name
+        self.lf = Path(self.tmp.name) / "repo\nname"      # the sibling text-mode would confuse it with
+        for d in (self.cr, self.lf):
+            d.mkdir()
+            subprocess.run(["git", "init", "-q", str(d)], check=True, capture_output=True)
+        (self.lf / ".git" / "index.lock").write_text("stale")   # a lock on the SIBLING only
+
+    def test_the_cr_repo_resolves_to_its_own_git_dir(self):
+        gd = hc._git_dir(self.cr)
+        self.assertEqual(gd, (self.cr / ".git").resolve() if gd and gd.is_absolute() else self.cr / ".git")
+        self.assertNotEqual(gd, self.lf / ".git", "text-mode decoding names the LF sibling")
+        self.assertIn("\r", str(gd))
+
+    def test_crlf_in_the_name_survives_too(self):
+        crlf = Path(self.tmp.name) / "repo\r\nname"; crlf.mkdir()
+        subprocess.run(["git", "init", "-q", str(crlf)], check=True, capture_output=True)
+        gd = hc._git_dir(crlf)
+        self.assertIsNotNone(gd); self.assertIn("\r\n", str(gd))
+
+    def test_the_cr_repo_is_not_advised_about_the_siblings_lock(self):
+        gd = hc._git_dir(self.cr)
+        self.assertIsNotNone(gd)
+        self.assertFalse((gd / "index.lock").exists(), "the CR repo has no lock; a hit here is the sibling's")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
