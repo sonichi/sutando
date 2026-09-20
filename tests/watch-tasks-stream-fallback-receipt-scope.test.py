@@ -6,7 +6,7 @@ emitting the task straight to its own live core. Measured against the real
 watcher with a stub fswatch and a logging handler:
 
     FOREIGN receipt -> stdout=[TASK_FILE: task-demo.txt]  handler=[probe]
-    scoped receipt  -> stdout=[]                          handler=[probe, probe, handle]
+    scoped receipt  -> stdout=[]                          handler=[probe, handle]
 
 The own-receipt cases are the negative control: bypassing on your OWN receipt is
 the feature, and a fix that broke it would pass a foreign-receipt test alone.
@@ -79,7 +79,7 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-HANDLED = ["probe", "probe", "handle"]  # enqueue-time probe, then drain's own re-probe
+HANDLED = ["probe", "handle"]
 BYPASSED = ["probe"]
 
 so, hl = run(None, None)

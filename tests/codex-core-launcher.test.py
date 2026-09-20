@@ -331,18 +331,15 @@ exit 0
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("#!/bin/sh\nexit 0\n")
         script.chmod(0o755)
-        (script.parent.parent / "manifest.json").write_text(
-            '{"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}\n')
-        # realpath: the resolver resolves symlinks, and /tmp is one on macOS.
-        return Path(os.path.realpath(script))
+        link = self.root / "skills" / "pool" / "task-event-handler"
+        link.symlink_to("scripts/route_handler.py")
+        return link
 
-    def test_pool_route_handler_is_not_forwarded_but_resolves_live(self):
-        """Unpinned: not forwarded to env (that froze it at boot); the watcher
-        resolves it live on its own instead (see task-event-handler-live-resolution.test.py)."""
-        self._install_pool_skill()
+    def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
+        p = self._install_pool_skill()
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
+        self.assertIn(f"-e SUTANDO_TASK_EVENT_HANDLER={p}", self.log.read_text())
 
     def test_no_pool_skill_sets_no_handler(self):
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")

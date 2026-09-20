@@ -185,9 +185,6 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
-  # Captured before the resolve-if-unset below overwrites the var: only a
-  # genuine pin, never our own boot-time cache, may reach the notifier's env.
-  local operator_pinned_handler="${SUTANDO_TASK_EVENT_HANDLER:-}"
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
@@ -197,6 +194,15 @@ ensure_task_notifier() {
   # publisher installed, removed or duplicated must replace a running watcher.
   handler_rc=0
   if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    # A self-heal that could not confirm "no pool" and could not repair one
+    # either must refuse -- resolving anyway would read its own failure as
+    # the ordinary no-publisher case and start unrestricted (fail OPEN).
+    if ! ensure_task_event_handlers_published "$REPO"; then
+      echo "  ⚠ task notifier not started: a task-event-handler publisher could not self-heal." >&2
+      echo "    Fix the error above, or pin SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+      return 0
+    fi
     SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
     [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
   fi
@@ -225,9 +231,7 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  # Only a genuine operator pin is forwarded. task-notifier.sh and the
-  # watch-tasks-stream.sh it spawns both re-resolve live when this is unset.
-  [ -n "$operator_pinned_handler" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$operator_pinned_handler")
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")

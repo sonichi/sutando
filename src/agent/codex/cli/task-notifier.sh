@@ -43,22 +43,11 @@ watcher_pid=""
 event_dir=""
 workstream_context_file=""
 
-# shellcheck source=../../task-event-handler-lookup.sh
-. "$REPO/src/agent/task-event-handler-lookup.sh"
-
 probe_optional_task_handler() {
-  local filename="$1" handler hrc rc
-  handler="$(task_event_handler "$REPO")"; hrc=$?
-  if [ "$hrc" -eq 1 ]; then
-    return 3
-  fi
-  if [ "$hrc" -ne 0 ]; then
-    # Ambiguous or a broken pin: fail closed rather than falling through to
-    # the unrestricted live core, same as the launcher's own start-time gate.
-    echo "task-notifier: handler lookup could not answer (rc $hrc) for $filename; holding rather than falling through to the live core" >&2
-    return 0
-  fi
-  "$handler" \
+  local filename="$1" rc
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
+  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
+  "$SUTANDO_TASK_EVENT_HANDLER" \
     --runtime codex \
     --workspace "$(dirname "$TASKS_DIR")" \
     --task-file "$TASKS_DIR/$filename" \
