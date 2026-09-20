@@ -1,0 +1,123 @@
+"""The wire format, with no dependencies and no I/O.
+
+Separate from the client because these are the parts that fail *silently*: a
+varint off by one, or a room id quoted wrong, raises nothing — it produces a
+frame the server discards and a document that simply never syncs. Keeping them
+importable without pycrdt or websockets is what lets CI exercise them.
+"""
+from __future__ import annotations
+
+import urllib.parse
+
+DEFAULT_TEXT_NAME = "markdown"
+DEFAULT_KIND = "markdown"
+
+# The service accepts the socket and THEN closes with one of these, because a
+# close before accept cannot carry a code the client can read.
+CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, CLOSE_BAD_KIND = 4400, 4403, 4404
+
+CLOSE_REASONS = {
+    CLOSE_BAD_ROOM: "the room id is malformed (4400) — this is a refusal, not an empty document",
+    CLOSE_FORBIDDEN: ("access refused or withdrawn (4403): this credential is not authorized "
+                      "for the document, or membership/write power changed. It can also mean "
+                      "core-api was briefly unreachable, so one 4403 is not proof of revocation"),
+    CLOSE_BAD_KIND: "the document kind is malformed (4404)",
+}
+
+
+class RoomDocError(RuntimeError):
+    """A refusal or protocol failure the caller can report verbatim."""
+
+
+def write_var_uint(n: int) -> bytes:
+    if n < 0:
+        raise ValueError("var uint is unsigned")
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def read_var_uint(data: bytes, i: int) -> tuple[int, int]:
+    n = shift = 0
+    while True:
+        if i >= len(data):
+            raise RoomDocError("truncated varint")
+        b = data[i]
+        i += 1
+        n |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return n, i
+        shift += 7
+
+
+def write_var_bytes(b: bytes) -> bytes:
+    return write_var_uint(len(b)) + b
+
+
+def read_var_bytes(data: bytes, i: int) -> tuple[bytes, int]:
+    n, i = read_var_uint(data, i)
+    if i + n > len(data):
+        raise RoomDocError("truncated payload")
+    return data[i:i + n], i + n
+
+
+def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str:
+    """`https://host` (or ws(s)://) + a room id -> the document's socket URL.
+
+    The room id is one path segment and carries `!` and `:` by grammar, so it
+    is quoted whole; a bare one would split the path.
+    """
+    origin = (api_root or "").rstrip("/")
+    if not origin:
+        raise RoomDocError("no API root given (pass --url or set AG2_ROOM_DOC_URL)")
+    if origin.startswith("https://"):
+        origin = "wss://" + origin[len("https://"):]
+    elif origin.startswith("http://"):
+        origin = "ws://" + origin[len("http://"):]
+    if not origin.startswith(("ws://", "wss://")):
+        raise RoomDocError(f"not an http(s) or ws(s) origin: {api_root!r}")
+    if "/api/v1/room-doc" not in origin:
+        origin = f"{origin}/api/v1/room-doc"
+    url = f"{origin}/{urllib.parse.quote(room_id, safe='')}/ws"
+    # A room holds more than one document; the kind selects which. The default
+    # is sent bare, which is what every existing caller already produces.
+    if kind and kind != DEFAULT_KIND:
+        url += f"?kind={urllib.parse.quote(kind, safe='')}"
+    return url
+
+
+def explain(exc: Exception, url: str) -> str:
+    """Turn the transport's error into the reason a caller can act on."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403:
+        return (f"refused (403) by {url}\n"
+                "The document has the room's own ACL, and the bearer must authorize THIS "
+                "agent for documents: a Matrix access token, or an AG2 ticket carrying the "
+                "doc.write grant. A member below write power level also gets 403.")
+    if status == 404:
+        return (f"not found (404) at {url}\n"
+                "Either the room id is wrong or this account is not a member — "
+                "non-members are told 404 so a room's existence stays hidden.")
+    if status == 401:
+        return f"unauthenticated (401) at {url}: no usable bearer was presented."
+    return f"cannot open {url}: {type(exc).__name__}: {exc}"
+
+
+def close_reason(exc: BaseException | None) -> str:
+    """Name what ended a session, in the client's own terms.
+
+    The transport reports a number; a caller needs to know whether to fix the
+    room id, the credential, or nothing at all.
+    """
+    if exc is None:
+        return "the server closed the connection"
+    code = getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
+    if code in CLOSE_REASONS:
+        return CLOSE_REASONS[code]
+    if code:
+        return f"the server closed the connection with code {code}"
+    return f"{type(exc).__name__}: {exc}"

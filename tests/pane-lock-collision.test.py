@@ -54,6 +54,31 @@ def _fake_tmux(td: Path) -> tuple[Path, Path]:
     return script, log
 
 
+def _fake_tmux_notifier(td: Path) -> tuple[Path, Path]:
+    """Like `_fake_tmux`, but `capture-pane` answers with an idle Codex footer.
+
+    src/delivery/pane_gate.py classifies the pane before the notifier will type
+    into it (keweichen round-4): a blank capture reads as UNREADABLE, which is
+    refused, not "safe to send". The footer text is what CLAUDE_IDLE (shared by
+    the Codex adapter) matches, so the composer reads as idle-ready once the
+    pane lock is free -- the same shape a live Codex/Claude pane prints between
+    turns.
+    """
+    log = td / "tmux.log"
+    log.unlink(missing_ok=True)
+    script = td / "tmux"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{log}"\n'
+        'case "$*" in\n'
+        '  *capture-pane*) printf "%s\\n" "⏵⏵ bypass permissions on" ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    return script, log
+
+
 def _lock_path() -> str:
     r = subprocess.run(["bash", str(REPO / "scripts" / "tmux-pane-lock.sh"), SOCK, SESSION],
                        capture_output=True, text=True, timeout=30)
@@ -152,6 +177,16 @@ def _notifier_repo(td: Path) -> Path:
         # tmux-pane-lock.bash delegates the acquisition here; without it every
         # take fails and the notifier looks like it declined rather than could not.
         "src/tmux_pane_lock.py",
+        # Sourced unconditionally at startup (optional task-handler capability lookup);
+        # missing it kills the script under `set -e` before it ever reaches the lock.
+        "src/agent/task-event-handler-lookup.sh",
+        # pane_gate.py owns the composer-safety verdict deliver_prompt now checks
+        # (keweichen round-4); cli_wedge.py and its own deps are its capture path.
+        "src/delivery/__init__.py",
+        "src/delivery/pane_gate.py",
+        "src/cli_wedge.py",
+        "src/file_lock.py",
+        "src/sutando_platform.py",
     ):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +204,7 @@ def case_task_notifier_delivery() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         tdp = Path(td)
         root = _notifier_repo(tdp)
-        tmux, log = _fake_tmux(tdp)
+        tmux, log = _fake_tmux_notifier(tdp)
         env = dict(os.environ)
         env["PATH"] = f"{tdp}{os.pathsep}{env['PATH']}"
         # Without the sanctioned test hatch the fixture resolves the HOST workspace,

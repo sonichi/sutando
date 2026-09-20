@@ -33,8 +33,9 @@ DELIVERIES_DIR="$WORKSPACE/deliveries"
 # Worker-pool awareness (sonichi/sutando#4281, #4338). An optional router,
 # injected at the adapter edge (never named here — see
 # docs/architecture-boundaries.md "Optional adapter capabilities"), delegates
-# a task by writing a SENTINEL into deliveries/<recipient>/<task-id>{.txt,.accepted,
-# .claimed} — the payload itself never leaves tasks/, by design (the
+# a task by writing a SENTINEL into deliveries/<recipient>/<task-id><stage>, whose
+# stage suffixes are task_dispatch.py's contract and are not repeated in this
+# file — the payload itself never leaves tasks/, by design (the
 # recipient reads it from there via the inbox resolver). Two different
 # sessions read this state, and each asks a different question:
 #   - the core asks "is this still mine to report?" — no, once ANY worker
@@ -43,26 +44,21 @@ DELIVERIES_DIR="$WORKSPACE/deliveries"
 #   - a worker (SUTANDO_INSTANCE_ID set) asks "do I still owe a reply?" —
 #     answered from its OWN deliveries folder only, never the core's tasks/
 #     queue, which is not this session's to report on.
-sentinel_task_id() {
-  case "$1" in
-    *.accepted) printf '%s' "${1%.accepted}" ;;
-    *.claimed)  printf '%s' "${1%.claimed}" ;;
-    *.txt)      printf '%s' "${1%.txt}" ;;
-    *)          return 1 ;;
-  esac
+owned_task_ids() {
+  # What THIS worker was handed. Same owner as claimed_by_a_worker's contract
+  # (src/delivery/task_dispatch.py), so the sentinel suffixes are spelled there
+  # and never here. rc 2 = cannot decide: reported, never silently skipped.
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" owned-by "$DELIVERIES_DIR" "$1"
 }
 
 claimed_by_a_worker() {
-  # True if some worker's own deliveries/ folder holds a sentinel for this
-  # task id — the router already routed it away from the core.
-  local task_id="$1" d
-  for d in "$DELIVERIES_DIR"/*/; do
-    [ -d "$d" ] || continue
-    if [ -e "${d}${task_id}.txt" ] || [ -e "${d}${task_id}.accepted" ] || [ -e "${d}${task_id}.claimed" ]; then
-      return 0
-    fi
-  done
-  return 1
+  # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
+  # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
+  local task_id="$1" rc
+  [ -n "$PYBIN" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
+  # 2 = cannot decide (root unreadable): hold, never report it to the core.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
 }
 
 # A delivered result is claimed out of results/ within about a second
@@ -92,9 +88,15 @@ shopt -s nullglob 2>/dev/null
 
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
-  for f in "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.txt "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.accepted "$DELIVERIES_DIR/$SUTANDO_INSTANCE_ID"/*.claimed; do
-    SNAME=$(basename "$f")
-    TASK_ID="$(sentinel_task_id "$SNAME")" || continue
+  # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
+  # captured first and a non-zero status reports rather than skips.
+  OWNED="$(owned_task_ids "$SUTANDO_INSTANCE_ID" 2>/dev/null)"; OWNED_RC=$?
+  if [ "$OWNED_RC" -ne 0 ]; then
+    UNPROCESSED+="--- deliveries/$SUTANDO_INSTANCE_ID/ could not be read (task_dispatch rc $OWNED_RC) — cannot tell what this worker owes ---
+
+"
+  fi
+  for TASK_ID in $OWNED; do
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
       UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
@@ -161,7 +163,9 @@ STOP_RC=$?
 # Fail OPEN on anything but an explicit refusal (rc 1 AND a reason): a gate that
 # cannot run must never wedge the agent into a turn it has no way to end.
 if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
-  SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Turn is ending without a message or an explicit no-send","additionalContext":os.environ.get("SUTANDO_HOOK_REASON","")}, separators=(",",":"), ensure_ascii=False))'
+  # `reason` is what a blocking Stop delivers to the model; the guidance used to
+  # ride a top-level additionalContext, which this event does not read.
+  SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ.get("SUTANDO_HOOK_REASON") or "Turn is ending without a message or an explicit no-send"}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'
 fi

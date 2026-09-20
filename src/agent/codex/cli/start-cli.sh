@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/task-event-handler-lookup.sh"
 
 # This runtime has no worker mode: everything below is the canonical core's
 # ceremony, so an instance launch is refused before the first step of it.
@@ -184,15 +185,33 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
+  # Captured before the resolve-if-unset below overwrites the var: only a
+  # genuine pin, never our own boot-time cache, may reach the notifier's env.
+  local operator_pinned_handler="${SUTANDO_TASK_EVENT_HANDLER:-}"
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
   )
+  # The resolved outcome is part of the identity below, so resolve first: a
+  # publisher installed, removed or duplicated must replace a running watcher.
+  handler_rc=0
+  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
+    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
+    [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
+  fi
+  # Fail CLOSED: without the router probe a worker-bound task would fall
+  # through to the unrestricted core, the inheritance the handler prevents.
+  if [ "$handler_rc" = 2 ]; then
+    echo "  ⚠ task notifier not started: several skills publish skills/*/task-event-handler." >&2
+    echo "    Pin one with SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    return 0
+  fi
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -206,7 +225,9 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # Only a genuine operator pin is forwarded. task-notifier.sh and the
+  # watch-tasks-stream.sh it spawns both re-resolve live when this is unset.
+  [ -n "$operator_pinned_handler" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$operator_pinned_handler")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")

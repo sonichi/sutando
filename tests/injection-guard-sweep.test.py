@@ -353,6 +353,9 @@ _GUARDED_PY_WRITERS = {
     # parser can never promote body content to a header.
     "src/local_task_protocol.py",
     "skills/schedule-crons/scripts/codex-scheduler.py",
+    # pool_ask: the question goes through confine(), sender/origin through
+    # header_safe_value(), and task: is written last.
+    "skills/worker-pool/scripts/pool_ask.py",
     "src/discord-bridge.py",
     "src/telegram-bridge.py",
     "src/slack-bridge.py",

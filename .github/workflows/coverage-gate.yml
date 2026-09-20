@@ -47,7 +47,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install coverage tooling + test deps
-        run: python3 -m pip install coverage diff-cover 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        # pycrdt/websockets join discord.py here for the same reason: a skill's
+        # code cannot be measured in an environment where it cannot import.
+        run: python3 -m pip install coverage diff-cover 'detect-secrets>=1.5.0' 'discord.py>=2.3' 'pycrdt>=0.14,<0.15' 'websockets>=13'
 
       - name: Run coverage gate
         env:
