@@ -215,9 +215,13 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     cadence: the two samplers share `last_sample_at`, so any gap the sweep can
     explain is normal — a faster delivery-time check only shortens it.
     """
-    # Backfill BEFORE the routing alarm below reads it -- self-heals on the
-    # sweep's own cadence, no new worker registration needed.
-    pr.ensure_task_event_handler(workspace)
+    # Backfill BEFORE the routing alarm below reads it. A failed publish on
+    # an existing pool must be told apart from the ordinary no-pool case.
+    handler_error = None
+    try:
+        pr.ensure_task_event_handler(workspace)
+    except pr.HandlerPublishError as e:
+        handler_error = str(e)
     state = load_state(workspace)
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
@@ -230,7 +234,8 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused} for w, o in obs.items()},
-            "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
+            "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period),
+            "handler_backfill_error": handler_error}
 
 
 def main(argv=None) -> int:
@@ -264,6 +269,11 @@ def main(argv=None) -> int:
             print("resumed: this sample was discarded as evidence (host slept)")
         if out["routing"]["alarm"]:
             print(out["routing"]["alarm"])
+    # A distinct exit code so a caller (the boot-time sweep) fails closed
+    # instead of starting a watcher that will silently misroute.
+    if out["handler_backfill_error"]:
+        print(f"handler backfill FAILED: {out['handler_backfill_error']}", file=sys.stderr)
+        return 3
     return 0
 
 

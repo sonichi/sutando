@@ -80,6 +80,25 @@ If the skill is not installed, skip silently. `/startup` works without it — ev
 
 Note: this step runs BEFORE step 2 so that the watcher (started by step 2's downstream) doesn't pick up an orphan task before recovery has classified it.
 
+### Step 1.7 — Optional boot-time pool sweep (fails closed)
+
+IF `$SUTANDO_POOL_BOOT_SWEEP` is set (declared by an installed skill's `manifest.json` `config` block — see `skills/MANIFEST.md`; a core install without that skill never has it set), run it once, synchronously, before the watcher starts:
+
+```bash
+if [ -n "$SUTANDO_POOL_BOOT_SWEEP" ]; then
+  python3 "$SUTANDO_POOL_BOOT_SWEEP" --workspace "$(bash scripts/sutando-config.sh workspace)" --sweep --no-persist
+  rc=$?
+  if [ "$rc" -eq 3 ]; then
+    echo "/startup: boot-time pool sweep FAILED to publish a live pool's routing declaration — refusing to start the watcher (a worker-bound task would silently fall through to core). Investigate the sweep's stderr, then re-run /startup." >&2
+    exit 1
+  fi
+fi
+```
+
+`--no-persist` avoids advancing the recovery ladder from a step whose only job is the backfill. Exit code 3 is the sweep's own distinction between "no live pool" / "backfill already current" (0) and "a live pool exists but its routing declaration could not be published" (3) — the second case is a routing outage in the making, not the ordinary no-pool case, and starting the watcher anyway would silently misroute worker-bound tasks to core. Any other non-zero exit (2 = refused, invalid input) is reported the same way rather than silently ignored.
+
+If the variable is unset, skip silently — same contract as step 1.
+
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
@@ -133,6 +152,8 @@ session start
 /startup
     │
     ├─► step 1:  /task-orphan-check (optional) ──► classifies + archives orphan tasks
+    │
+    ├─► step 1.7: optional boot-time pool sweep (fails closed) ──► $SUTANDO_POOL_BOOT_SWEEP, BEFORE the watcher starts
     │
     ├─► step 2:  /schedule-crons ──┬─► step 1.5 (start watch-tasks-stream.sh via Monitor — FIRST, before registration)
     │                               ├─► step 2-3 (register crons.json entries)

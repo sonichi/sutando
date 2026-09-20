@@ -1,0 +1,14 @@
+{
+  "name": "worker-pool",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Declares the boot-time pool-supervision sweep script for the core's own startup sequence, so /startup can run it without naming this skill by path (core-never-names-a-concrete-skill).",
+  "config": {
+    "SUTANDO_POOL_BOOT_SWEEP": "skills/worker-pool/scripts/pool_supervise.py"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

@@ -151,5 +151,69 @@ class BootTimeSweepBackfillsBeforeDispatch(Base):
         self.assertFalse(cfg_path(self.ws).exists())
 
 
+class FailClosedOnBackfillFailure(Base):
+    """A live pool whose declaration cannot be published is a routing outage
+    in the making, not the ordinary no-pool case: keweichen's review on
+    PR #4503 (Qingyun's Personal Codex) named this exact gap in the reverted
+    Step 1.7 -- 'distinguish the benign no-skill/no-roster case from a failed
+    required backfill, and fail closed instead of starting the watcher when
+    backfill for an existing pool cannot complete.'"""
+
+    def _break_state_dir(self):
+        state = self.ws / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        state.chmod(0o500)  # read+execute, no write
+
+    def tearDown(self):
+        (self.ws / "state").chmod(0o700)  # so tempfile cleanup can remove it
+        super().tearDown()
+
+    def test_tick_surfaces_the_error_instead_of_raising(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+        self._break_state_dir()
+
+        out = sup.tick(self.ws, 1000.0, worker_ids=None, persist=False)
+
+        self.assertIsNotNone(out["handler_backfill_error"])
+        self.assertIn("task-event-handler.json", out["handler_backfill_error"])
+
+    def test_a_successful_backfill_reports_no_error(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+
+        out = sup.tick(self.ws, 1000.0, worker_ids=None, persist=False)
+
+        self.assertIsNone(out["handler_backfill_error"])
+        self.assertTrue(cfg_path(self.ws).exists())
+
+    def test_main_returns_a_distinct_code_and_does_not_crash(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+        self._break_state_dir()
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 3, "a failed backfill on an existing pool must fail "
+                                 "closed with its own code, not the ordinary 0")
+
+    def test_main_still_returns_0_when_there_is_no_pool_to_backfill(self):
+        self._break_state_dir()
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 0, "an unwritable state dir with no live worker is "
+                                 "not a backfill failure -- there is nothing to publish")
+
+    def test_main_still_returns_0_on_an_ordinary_successful_backfill(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(cfg_path(self.ws).exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

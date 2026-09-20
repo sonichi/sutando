@@ -425,7 +425,8 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised", "routing"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing",
+                          "handler_backfill_error"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
