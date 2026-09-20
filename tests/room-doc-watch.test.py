@@ -24,7 +24,8 @@ except ImportError as exc:  # pragma: no cover
 from room_doc_client import RoomDoc  # noqa: E402
 from room_doc_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
 
-from room_doc_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError  # noqa: E402
+from room_doc_protocol import (DEFAULT_KIND, DEFAULT_TEXT_NAME, RECONNECT_CODES,  # noqa: E402
+                               RoomDocError)
 from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
 
 from room_doc_watch import (addressed_to, board_mentions, kanban_changes,  # noqa: E402
@@ -326,6 +327,77 @@ async def test_events_yields_nothing_for_edits_that_do_not_concern_me():
     except asyncio.CancelledError:
         pass
     await agen.aclose()
+
+
+# --- coming back from a restart: a deploy closed a held connection at t+27m (1012)
+
+class _Closed(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
+    doc, room = make_kind(DEFAULT_KIND)
+    agen = room.events(["mars"], settle=0.05)
+    nxt = asyncio.ensure_future(agen.__anext__())
+    await asyncio.sleep(0)
+    room._ended.set_result(_Closed(1012))
+    try:
+        await asyncio.wait_for(nxt, 2)
+    except RoomDocError as e:
+        assert e.code == 1012 and e.code in RECONNECT_CODES
+        assert e.snapshot == {"peers": [], "text": ""}, "the snapshot travels with the error"
+    else:
+        raise AssertionError("must raise")
+
+
+def test_a_refusal_is_never_a_reconnect():
+    for refusal in (4400, 4403, 4404):
+        assert refusal not in RECONNECT_CODES
+    for restart in (1001, 1006, 1012):
+        assert restart in RECONNECT_CODES
+
+
+async def test_a_carried_snapshot_reports_what_landed_in_the_gap():
+    """The watcher's document AFTER the restart already holds the line that
+    arrived while it was down. Diffing against the carried snapshot, not the
+    fresh one, is what reports it instead of skipping it."""
+    doc, room = make_kind(DEFAULT_KIND)
+    remote_append(doc, "@mars this landed during the deploy")   # present at reconnect
+    before = {"peers": [], "text": ""}                             # what the old session had
+    agen = room.events(["mars"], settle=0.05, since=before)
+    ev = await asyncio.wait_for(agen.__anext__(), 2)
+    assert ev["text"] == "@mars this landed during the deploy", ev
+    await agen.aclose()
+    fresh = room.events(["mars"], settle=0.05)                     # control: no carry, no event
+    nxt = asyncio.ensure_future(fresh.__anext__())
+    await asyncio.sleep(0.3)
+    assert not nxt.done(), "without a carried snapshot the same line is old news"
+    nxt.cancel()
+    try:
+        await nxt
+    except asyncio.CancelledError:
+        pass
+    await fresh.aclose()
+
+
+async def test_presence_stops_renewing_once_the_socket_is_dead():
+    """After a close, the renewal loop sent on the dead socket every tick and
+    logged a traceback each time — ten of them in the two minutes measured."""
+    doc, room = make_kind(DEFAULT_KIND)
+    class DeadWS:
+        def __init__(self): self.calls = 0
+        async def send(self, payload):
+            self.calls += 1
+            raise ConnectionError("closed")
+    room._ws = DeadWS()
+    room._ended.set_result(_Closed(1012))
+    await room._send_quietly(b"x")
+    assert room._ws.calls == 0, "nothing is sent once the session has ended"
+    live_doc, live = make_kind(DEFAULT_KIND)
+    live._ws = DeadWS()
+    await live._send_quietly(b"x")                                # not ended: tried, and quiet
+    assert live._ws.calls == 1
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

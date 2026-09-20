@@ -26,7 +26,21 @@ CLOSE_REASONS = {
 
 
 class RoomDocError(RuntimeError):
-    """A refusal or protocol failure the caller can report verbatim."""
+    """A refusal or protocol failure the caller can report verbatim.
+    `code` is the websocket close code when one ended the session, else None."""
+
+    code: int | None = None
+
+
+# "The service went away, not you" — a restart, a proxy leaving, an abnormal
+# drop. A watcher comes back from these; a 4xxx refusal is about the agent.
+RECONNECT_CODES = frozenset({1001, 1006, 1011, 1012, 1013, 1014})
+
+
+def close_code(exc: BaseException | None) -> int | None:
+    if exc is None:
+        return None
+    return getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
 
 
 def write_var_uint(n: int) -> bytes:
@@ -115,7 +129,7 @@ def close_reason(exc: BaseException | None) -> str:
     """
     if exc is None:
         return "the server closed the connection"
-    code = getattr(exc, "code", None) or getattr(getattr(exc, "rcvd", None), "code", None)
+    code = close_code(exc)
     if code in CLOSE_REASONS:
         return CLOSE_REASONS[code]
     if code:

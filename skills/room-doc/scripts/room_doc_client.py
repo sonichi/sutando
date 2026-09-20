@@ -42,6 +42,7 @@ from room_doc_board import (complete_element, # noqa: E402
 from room_kanban import CARDS_KEY, KANBAN_KIND  # noqa: E402
 
 from room_doc_protocol import (  # noqa: E402
+    close_code,
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
 )
@@ -168,6 +169,16 @@ class RoomDoc:
         self._require_live()
         await self._ws.send(payload)
 
+    async def _send_quietly(self, payload: bytes) -> None:
+        """Presence renewal after the socket died is not an error worth a
+        traceback per tick; the session's end is reported once, by _ended."""
+        if self._ended.done():
+            return
+        try:
+            await self._ws.send(payload)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _handle(self, data: bytes) -> None:
         if data[0] == YMessageType.SYNC:
             reply = handle_sync_message(data[1:], self._doc)
@@ -190,6 +201,9 @@ class RoomDoc:
         finally:
             if not self._ended.done():
                 self._ended.set_result(ended)
+            # Nothing renews presence on a dead socket.
+            if self._awareness_task:
+                self._awareness_task.cancel()
 
     async def _start(self) -> None:
         self._reader = asyncio.create_task(self._read_loop())
@@ -227,7 +241,7 @@ class RoomDoc:
             if mine not in [i for group in changes[0].values() for i in group]:
                 return
             update = self._awareness.encode_awareness_update([mine])
-            asyncio.ensure_future(self._ws.send(create_awareness_message(update)))
+            asyncio.ensure_future(self._send_quietly(create_awareness_message(update)))
 
         self._awareness_sub = self._awareness.observe(on_change)
         self._awareness_task = asyncio.create_task(self._awareness.start())
@@ -427,7 +441,8 @@ class RoomDoc:
                              if isinstance(v, dict)}
         return snap
 
-    async def events(self, handles: list[str], settle: float = 1.0) -> AsyncIterator[dict]:
+    async def events(self, handles: list[str], settle: float = 1.0,
+                     since: dict | None = None) -> AsyncIterator[dict]:
         """What happened that concerns `handles`, as it happens: a text or board
         line that @-mentions one, a kanban card assigned to or moved for one,
         a peer arriving or leaving. One stream for every kind, so an agent
@@ -435,7 +450,11 @@ class RoomDoc:
 
         Snapshots are taken after `settle` seconds of quiet (a keystroke is a
         push), diffed against the last one emitted, and the differences that
-        concern the handles are yielded. Ends by raising the close reason.
+        concern the handles are yielded. Ends by raising the close reason,
+        with `.code` set so a caller can tell a restart from a refusal.
+
+        `since` is a snapshot from an earlier session: on reconnect, what
+        landed while the socket was down is diffed too, not silently skipped.
         """
         from room_doc_watch import (addressed_to, board_mentions, kanban_changes,
                                     new_lines, peer_changes)
@@ -460,8 +479,9 @@ class RoomDoc:
             subs.append((m, m.observe(on_doc)))
         aw_sub = self._awareness.observe(lambda *_: poke())
         ended = asyncio.ensure_future(asyncio.shield(self._ended))
-        last = self.snapshot()
-        dirty = False
+        last = since if since is not None else self.snapshot()
+        # A carried snapshot is compared at once: the gap may hold a mention.
+        dirty = since is not None
         try:
             while True:
                 got = asyncio.ensure_future(queue.get())
@@ -469,8 +489,11 @@ class RoomDoc:
                                              return_when=asyncio.FIRST_COMPLETED)
                 if ended in done:
                     got.cancel()
-                    raise RoomDocError(
+                    err = RoomDocError(
                         f"the document session has ended: {close_reason(ended.result())}")
+                    err.code = close_code(ended.result())
+                    err.snapshot = last
+                    raise err
                 if got in done:
                     dirty = True
                     continue

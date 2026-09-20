@@ -113,6 +113,13 @@ async with open_room_doc(url, room_id, token) as doc:
         if ev["kind"] == "mention": ...                     # act, then doc.append(...)
 ```
 
+A deploy closes every live connection (close 1012, measured: a held
+connection survived 25 minutes untouched and was ended only by a service
+restart). `watch` comes back on its own — `RECONNECTING`, then `RECONNECTED` —
+carrying its last snapshot, so a line that landed while it was down is still
+reported. A refusal (4403 and friends) is an answer about you and is not
+retried.
+
 Your own writes are not reported. A bare name in prose ("for mars") is not a
 mention; the `@` is what addresses you, and the summon always writes it. Not
 yet an event, because it needs the server's authorship record: someone editing
