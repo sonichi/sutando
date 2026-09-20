@@ -295,7 +295,7 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     snapshot in hand, so what landed meanwhile is reported, not skipped.
     Exits (rc 2) only on a refusal or after --max-reconnects failures."""
     from room_collab_client import open_room_collab
-    from room_collab_protocol import RECONNECT_CODES
+    from room_collab_protocol import is_transient
 
     handles = args.handles or []
     since = None
@@ -319,11 +319,12 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
                 return 0                      # a clean end is an end, not a reconnect
         except RoomDocError as exc:
             since = getattr(exc, "snapshot", since)
-            if exc.code not in RECONNECT_CODES or failures >= args.max_reconnects:
+            if not is_transient(exc) or failures >= args.max_reconnects:
                 raise
             failures += 1
             wait = min(2 ** failures, 30)
-            print(f"RECONNECTING\tcode={exc.code} attempt={failures} in {wait}s", flush=True)
+            why = f"code={exc.code}" if exc.code else f"status={exc.status}"
+            print(f"RECONNECTING\t{why} attempt={failures} in {wait}s", flush=True)
             await asyncio.sleep(wait)
 
 
