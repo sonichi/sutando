@@ -113,5 +113,43 @@ class TickBackfillsOnItsOwnSweep(Base):
         self.assertTrue(cfg_path(self.ws).exists())
 
 
+class BootTimeSweepBackfillsBeforeDispatch(Base):
+    """The exact command skills/startup/SKILL.md step 1.5 runs, synchronously,
+    before the watcher starts -- an existing pool that upgraded without a new
+    worker registration must not have a window where a bound task can reach
+    core because the declaration hasn't been written yet. Reviewed by
+    qingyun-wu on PR #4503: the sweep-timer-only backfill left exactly that
+    gap open until the worker-pool skill's own five-minute sweep first fired."""
+
+    def test_the_startup_command_backfills_an_existing_pool(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+        self.assertFalse(cfg_path(self.ws).exists())
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(cfg_path(self.ws).exists(),
+                         "the boot-time sweep did not backfill the declaration "
+                         "before a task could be dispatched")
+
+    def test_no_persist_still_backfills_but_does_not_advance_the_ladder(self):
+        make_worker(self.ws)
+        cfg_path(self.ws).unlink()
+        before = sup.state_path(self.ws).exists()
+
+        sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertTrue(cfg_path(self.ws).exists())
+        self.assertEqual(sup.state_path(self.ws).exists(), before,
+                          "--no-persist must not be what makes the backfill run "
+                          "-- it must run regardless, only the ladder is skipped")
+
+    def test_an_empty_workspace_with_no_roster_is_a_clean_noop(self):
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(cfg_path(self.ws).exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
