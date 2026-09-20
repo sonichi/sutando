@@ -146,12 +146,14 @@ WATCHER_ID="$$-${RANDOM:-0}"
 # it (e.g. worker-pool's register_worker()); this process fswatches it below
 # and reloads CURRENT_HANDLER the moment it changes -- no restart needed.
 HANDLER_CONFIG_PATH=""
+HANDLER_CONFIG_DIR=""
 CURRENT_HANDLER=""
 if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
   HANDLER_CONFIG_PATH="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
     echo "watch-tasks-stream: could not resolve the task-event-handler config path" >&2
     exit 1
   }
+  HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
 fi
 
 reload_current_handler() {
@@ -860,23 +862,37 @@ shopt -u nullglob
 # dead, the first failed write exits immediately instead of silently
 # buffering ~100 events into the kernel pipe buffer.
 #
-# HANDLER_CONFIG_PATH's PARENT DIRECTORY (core only) rides the SAME fswatch
-# process as a second path -- not the file itself, which may not exist yet:
-# inotify (Linux) cannot reliably watch a not-yet-existent path for creation
-# the way FSEvents (macOS) can, so this uses the same directory-plus-filter
-# shape tasks/ already uses below, one fswatch, one FIFO, one read-loop.
+# HANDLER_CONFIG_DIR (core only) rides the SAME fswatch process as a second
+# path -- not the file itself, which inotify/poll_monitor can't watch reliably before it exists.
 fswatch_paths=("$TASKS_DIR")
-if [ -n "$HANDLER_CONFIG_PATH" ]; then
-  mkdir -p "$(dirname "$HANDLER_CONFIG_PATH")"
-  fswatch_paths+=("$(dirname "$HANDLER_CONFIG_PATH")")
+if [ -n "$HANDLER_CONFIG_DIR" ]; then
+  mkdir -p "$HANDLER_CONFIG_DIR"
+  fswatch_paths+=("$HANDLER_CONFIG_DIR")
 fi
 fswatch \
   -l 0.5 \
   --event Created \
   --event Renamed \
+  --event Updated \
   "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
-while IFS= read -r path; do
+# -t bounds the read so a stretch with no fswatch event still gets a periodic,
+# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
+# event shape the platform's fswatch monitor backend turns out to use.
+while true; do
+  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
+  read_rc=$?
+  if [ "$read_rc" -gt 128 ]; then
+    if [ -n "$HANDLER_CONFIG_PATH" ]; then
+      reload_current_handler
+      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+    fi
+    continue
+  elif [ "$read_rc" -ne 0 ]; then
+    # EOF: fswatch died and closed its end of the pipe. Fall through to the
+    # script's normal exit path rather than spinning on a dead FIFO.
+    break
+  fi
   case "$path" in
     "HANDLER_DONE: "*)
       completion="${path#HANDLER_DONE: }"
@@ -891,12 +907,28 @@ while IFS= read -r path; do
         finish_handler_task "$running_marker" "$task_path" "$handler_rc"
       fi
       ;;
-    "$HANDLER_CONFIG_PATH")
-      # Reload only: the next task (already fswatched separately, on tasks/)
-      # sees the new CURRENT_HANDLER in dispatch_task(); nothing here is
-      # queued yet, so there is nothing to drain on a bare config change.
+    "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR")
+      # Matches the file OR its bare dir -- poll_monitor reports the watched
+      # DIRECTORY, not the file, on a rename-into-place (measured locally).
       reload_current_handler
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+      ;;
+    "$TASKS_DIR"|"$TASKS_DIR_ABS")
+      # Same poll_monitor quirk as above, for the tasks dir itself: sweep for
+      # any *.txt this path hasn't dispatched yet (marker avoids re-dispatch
+      # on every later poll of a task still pending/archiving).
+      if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
+        continue
+      fi
+      mkdir -p "$WATCH_RUNTIME_DIR/dir-swept"
+      shopt -s nullglob
+      for f in "$TASKS_DIR"/*.txt; do
+        fn="$(basename "$f")"
+        [ -e "$WATCH_RUNTIME_DIR/dir-swept/$fn" ] && continue
+        : > "$WATCH_RUNTIME_DIR/dir-swept/$fn"
+        dispatch_task "$f"
+      done
+      shopt -u nullglob
       ;;
     *.txt)
       parent="$(dirname "$path")"
