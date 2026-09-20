@@ -266,6 +266,10 @@ async def kanban(doc, args: argparse.Namespace) -> int:
         await doc.settle(args.settle)
         print(json.dumps({"ok": True, "written": written, "card": card}, ensure_ascii=False))
         return 0
+    # The verb before the card, so a text command is refused by name.
+    if args.command not in ("move", "assign", "erase"):
+        raise RoomDocError(f"{args.command!r} is not a kanban command; use read, add, move, "
+                           "assign, erase, watch or peers.")
     cid = getattr(args, "card_id", None) or getattr(args, "element_id", None)
     card = stored.get(cid)
     if card is None or card.get("deleted"):
@@ -276,11 +280,8 @@ async def kanban(doc, args: argparse.Namespace) -> int:
         nxt = move_card(card, args.column, order_after_last(doc.cards, args.column), now, by)
     elif args.command == "assign":
         nxt = assign_card(card, args.assignee, now, by)
-    elif args.command == "erase":
-        nxt = delete_card(card, now, by)
     else:
-        raise RoomDocError(f"{args.command!r} is not a kanban command; use read, add, move, "
-                           "assign, erase, watch or peers.")
+        nxt = delete_card(card, now, by)
     written = await doc.put_cards([nxt])
     await doc.settle(args.settle)
     print(json.dumps({"ok": True, "written": written, "card": nxt}, ensure_ascii=False))
