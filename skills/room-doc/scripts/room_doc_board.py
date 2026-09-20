@@ -119,7 +119,7 @@ ELEMENT_DEFAULTS: dict[str, Any] = {
     "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent",
     "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 1,
     "opacity": 100, "groupIds": [], "frameId": None, "roundness": None,
-    "boundElements": None, "link": None, "locked": False, "isDeleted": False,
+    "boundElements": [], "link": None, "locked": False, "isDeleted": False,
 }
 TEXT_DEFAULTS: dict[str, Any] = {
     "text": "", "fontSize": 20, "fontFamily": 1, "textAlign": "left",
@@ -142,11 +142,12 @@ def complete_element(element: dict, now_ms: int | None = None,
     not mint a new nonce and win a tie it should have drawn."""
     out = dict(element)
     if base:
-        for key in ("seed", "versionNonce", "updated"):
+        # Identity only: `updated` is this write's time, not the old one's.
+        for key in ("seed", "versionNonce"):
             if key not in out and key in base:
                 out[key] = base[key]
     for key, value in ELEMENT_DEFAULTS.items():
-        if key not in out or out[key] is None and key in ("groupIds",):
+        if key not in out or out[key] is None and key in ("groupIds", "boundElements"):
             out[key] = list(value) if isinstance(value, list) else value
     out.setdefault("seed", random.randint(1, 2**31 - 1))
     out.setdefault("versionNonce", random.randint(1, 2**31 - 1))
@@ -161,6 +162,13 @@ def complete_element(element: dict, now_ms: int | None = None,
         if out.get("type") == "arrow" and out["endArrowhead"] is None and "endArrowhead" not in element:
             out["endArrowhead"] = "arrow"
         out.setdefault("points", [[0, 0], [out.get("width", 0), out.get("height", 0)]])
+    if out.get("type") == "freedraw":
+        # The editor measures a freedraw by points.length BEFORE restoring it,
+        # so one without points throws for the whole batch, not just itself.
+        out.setdefault("points", [[0, 0]])
+        out.setdefault("pressures", [])
+        out.setdefault("simulatePressure", True)
+        out.setdefault("lastCommittedPoint", None)
     return out
 
 

@@ -95,9 +95,27 @@ def test_re_asserting_a_minimal_element_keeps_the_stored_identity():
     stored = complete_element(minimal(), now_ms=1_000)
     again = complete_element(minimal(), base=stored, now_ms=5_000)
     assert again["seed"] == stored["seed"] and again["versionNonce"] == stored["versionNonce"]
-    assert again["updated"] == stored["updated"], "identity comes from the stored copy"
+    assert again["updated"] == 5_000, "updated is THIS write's time, not the stored one's"
     fresh = complete_element(minimal("other"), now_ms=5_000)
     assert fresh["updated"] == 5_000, "with no stored copy the defaults apply"
+
+
+def test_a_freedraw_gets_points_before_the_editor_measures_it():
+    """restoreElements calls isInvisiblySmallElement first, which reads
+    points.length on linear AND freedraw elements; one freedraw without
+    points throws for the whole batch."""
+    out = complete_element(minimal("f", "freedraw"), now_ms=1)
+    assert out["points"] == [[0, 0]] and out["pressures"] == [] and out["simulatePressure"] is True
+    assert out["lastCommittedPoint"] is None
+    given = complete_element({**minimal("f2", "freedraw"), "points": [[0, 0], [5, 5]]}, now_ms=1)
+    assert given["points"] == [[0, 0], [5, 5]]
+
+
+def test_bound_elements_default_matches_the_editors_restore():
+    """restoreElement fills `boundElements ?? []`; a None here would make the
+    editor's own restore a non-identity on our output."""
+    assert complete_element(minimal(), now_ms=1)["boundElements"] == []
+    assert complete_element({**minimal(), "boundElements": None}, now_ms=1)["boundElements"] == []
 
 
 def test_the_default_set_is_the_editors_not_a_guess():
