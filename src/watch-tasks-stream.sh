@@ -463,10 +463,24 @@ task_announce() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved
+  local task_path="$1" rc filename announce resolved attempt
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
-  resolved="$(resolve_inbox_entry "$task_path")" || return 0
+  #
+  # A sentinel can be visible to fswatch before its payload's own write is —
+  # two separate files, no ordering guarantee between them — so one failed
+  # resolve is retried briefly rather than treated as permanent. Same bounded
+  # shape as acquire_task_claim's lock race, applied to filesystem visibility
+  # instead of lock contention.
+  attempt=0
+  until resolved="$(resolve_inbox_entry "$task_path")"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 3 ]; then
+      echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
+      return 0
+    fi
+    sleep 0.2
+  done
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
