@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -258,6 +259,146 @@ class ItNeverRemedies(Base):
         self.assertEqual(len(wi.incarnations(self.ws, wid)), 1, "it started a run")
 
 
+class IsThisHostRouting(Base):
+    """Bindings say tasks must reach workers; only the handler's receipt says the
+    watcher ever consults it. The gap between the two is a host whose core answers
+    for its workers, silently."""
+
+    def _bind(self):
+        wid = make_worker(self.ws)
+        pr.bind_room(self.ws, "!room:ag2.space", wid)
+        return wid
+
+    def _archived_task(self, mtime, task_id="task-abc"):
+        d = self.ws / "tasks" / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{task_id}.txt"
+        f.write_text(f"id: {task_id}\ntask: x\n")
+        import os
+        os.utime(f, (mtime, mtime))
+        return f
+
+    def test_no_bindings_is_never_an_alarm(self):
+        make_worker(self.ws)
+        self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+
+    def test_a_room_bound_to_the_core_is_not_a_worker_binding(self):
+        # An explicit {room: "core"} pin means the core answers there; nothing is
+        # owed to a worker, so a never-consulted handler is not an alarm.
+        make_worker(self.ws)
+        pr.bind_room(self.ws, "!mine:ag2.space", pr.CORE)
+        self._archived_task(1000.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["bound_rooms"], [])
+        self.assertIsNone(st["alarm"])
+
+    def test_the_consulted_tasks_own_archive_is_not_the_alarm(self):
+        # Real causality: the handler stamps the receipt BEFORE routing task-abc, and
+        # task-abc is archived after it was processed — strictly later than its consult.
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1002.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["newest_task_id"], "task-abc")
+        self.assertIsNone(st["alarm"], "a task the handler routed must not read as unrouted")
+
+    def test_a_different_task_archived_after_the_consult_is_still_the_alarm(self):
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1002.0)
+        self._archived_task(1003.0, task_id="task-xyz")
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+        self.assertIn("processed it unrouted", alarm)
+
+    def test_a_different_task_tied_with_the_consulted_one_on_mtime_is_still_the_alarm(self):
+        # Same clock tick for both archives is routine on coarse filesystems; the
+        # consulted task's exemption must not shadow the other task, whatever the glob order.
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        for tid in ("task-abc", "task-xyz", "task-aaa"):
+            self._archived_task(1002.0, task_id=tid)
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("processed it unrouted", alarm)
+        self.assertNotIn("task-abc", alarm, "the exempt task must not be the one named")
+
+    def test_an_unrouted_task_older_than_the_newest_routed_one_is_still_the_alarm(self):
+        # task-xyz got past the handler, then the handler was consulted for task-abc and
+        # task-abc archived last: the newest archive is exempt, task-xyz is not.
+        self._bind()
+        self._archived_task(999.0, task_id="task-old")          # before the consult: routed
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1001.0, task_id="task-xyz")
+        self._archived_task(1002.0)                            # task-abc, the exempt one
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+
+    def test_bound_rooms_but_a_handler_never_consulted_is_the_alarm(self):
+        self._bind()
+        self._archived_task(1000.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["bound_rooms"], ["!room:ag2.space"])
+        self.assertIsNone(st["handler_consulted_at"])
+        self.assertIn("never been consulted", st["alarm"] or "")
+
+    def test_a_task_that_arrived_after_the_last_consult_is_the_alarm(self):
+        self._bind()
+        sup.prr.record(self.ws, mode="probe", task_id="task-old", now=1000.0)
+        self._archived_task(2000.0)
+        self.assertIn("processed it unrouted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_a_consult_newer_than_every_task_is_quiet(self):
+        self._bind()
+        self._archived_task(1000.0)
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1001.0)
+        st = sup.routing_status(self.ws)
+        self.assertIsNone(st["alarm"])
+        self.assertEqual(st["handler_consulted_at"], 1001.0)
+
+    def test_a_corrupt_receipt_is_no_evidence(self):
+        self._bind()
+        sup.prr.receipt_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        sup.prr.receipt_path(self.ws).write_text("{not json")
+        self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_a_well_formed_receipt_of_the_wrong_shape_is_no_evidence_either(self):
+        # The shape a half-written or schema-drifted receipt actually has: it parses,
+        # but `consulted_at` is not a number (or the document is not an object).
+        self._bind()
+        path = sup.prr.receipt_path(self.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for bad in ('{"consulted_at": "07:20"}', "[]", '{"mode": "probe"}'):
+            path.write_text(bad)
+            self.assertIsNone(sup.prr.read(self.ws), bad)
+            self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "", bad)
+
+    def test_an_archived_task_that_cannot_be_stated_is_skipped_not_fatal(self):
+        self._bind()
+        self._archived_task(1000.0)
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=2000.0)
+        real = Path.stat
+
+        def flaky(self_, *a, **k):
+            if self_.name == "task-abc.txt":
+                raise OSError(5, "Input/output error")
+            return real(self_, *a, **k)
+        with patch.object(Path, "stat", flaky):
+            st = sup.routing_status(self.ws)
+        self.assertIsNone(st["newest_task_at"], "an unreadable task must not become a timestamp")
+        self.assertIsNone(st["alarm"])
+
+    def test_the_sweep_prints_the_alarm_and_carries_it_in_json(self):
+        self._bind()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+        self.assertIn("unrouted:", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist", "--json"])
+        self.assertIn("never been consulted", json.loads(out.getvalue())["routing"]["alarm"])
+
+
 class TheCommandLine(Base):
     def _run(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -284,7 +425,7 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

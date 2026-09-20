@@ -9615,6 +9615,61 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
             "detail": "no migrated outbox roots — dual-read window not active"}
 
 
+
+def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
+    """A PARKED outbound item is a reply the owner never received, and nothing
+    retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
+    that nothing in production could lift. Until now it was visible only to
+    someone who ran the CLI by hand."""
+    name = "outbox-parked"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
+    if not roots:
+        return {"name": name, "status": "ok",
+                "detail": "no outbox root — nothing to park (this 0 is untestable)"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
+    parked: list[str] = []
+    unreadable: list[str] = []
+    for root in roots:
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
+        items_dir = outbox._items_dir(Path(root))
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
+        for d in outbox.list_items(root, status="PARKED"):
+            parked.append(str(d.get("item_id") or "?"))
+    if unreadable:
+        return {"name": name, "status": "warn",
+                "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
+                          + "; ".join(unreadable)}
+    if parked:
+        shown = ", ".join(sorted(parked)[:4])
+        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+        return {"name": name, "status": "warn",
+                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
+                          f"nothing retries them: {shown}{more}. Recover with "
+                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+    return {"name": name, "status": "ok",
+            "detail": f"no parked replies across {len(roots)} outbox root(s)"}
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """A claim whose task file still exists is queued or running, so no age condemns it;
     one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
@@ -13114,6 +13169,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
+    checks.append(check_outbox_parked())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())

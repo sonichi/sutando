@@ -29,6 +29,7 @@ INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
+PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
@@ -131,21 +132,6 @@ next_pending_task() {
 # Every pane predicate has a TEXT form so one snapshot can be judged for healthy
 # and composer-empty at once -- two separate reads are two races.
 
-# cli_wedge.py owns the live-banner grammar, both families: parked (a limit, a
-# login prompt, a compaction, an API error) and retrying, each a whole line of a
-# wrap-joined capture. Prose about either is neither.
-pane_text_is_abnormal() {
-  printf '%s' "$1" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("cli_wedge", sys.argv[1])
-wedge = importlib.util.module_from_spec(spec)
-sys.modules["cli_wedge"] = wedge   # its dataclasses resolve the module by name
-spec.loader.exec_module(wedge)
-text = sys.stdin.read()
-sys.exit(0 if wedge.live_banner_lines(text) else 1)
-' "$REPO/src/cli_wedge.py"
-}
-
 # core-input-watch.py owns Claude's pane-state patterns; $2 names the predicate.
 pane_text_ciw() {
   printf '%s' "$1" | "$NOTIFIER_PY" -c '
@@ -157,12 +143,12 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 ' "$REPO/src/core-input-watch.py" "$2"
 }
 
-# Healthy = the pane accepts input: a composer with the CLI's own footer, no
-# gate signature, no abnormal banner. A running turn still accepts (it queues).
+# Healthy = the pane accepts input. One verdict from src/delivery/pane_gate.py,
+# the gate every notifier shares: an abnormal banner (parked or retrying, via
+# cli_wedge) or a dialog holds; a running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  pane_text_is_abnormal "$1" && return 1
-  pane_text_ciw "$1" _is_idle_ready
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude >/dev/null 2>&1
 }
 
 pane_text_composer_is_empty() {
@@ -241,16 +227,11 @@ strip_sgr() {
   LC_ALL=C sed $'s#\x1b\\[[0-9;?]*[ -/]*[@-~]##g'
 }
 
-# Delegates to core-input-watch.py's _composer_text (dewrapped, footer/gate
-# lines stripped) so exact-equality never sees the status bar or a stale marker.
+# The prompt row's own text, dewrapped -- src/delivery/pane_gate.py's
+# composer_text() owns the parse (glyph, box frame, footer/tip rows) so
+# exact-equality never sees the status bar or a stale marker.
 composer_text() {
-  printf '%s' "$1" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
-ciw = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ciw)
-print(ciw._composer_text(sys.stdin.read()) or "")
-' "$REPO/src/core-input-watch.py"
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-text --runtime claude 2>/dev/null || true
 }
 
 # Staged = the composer holds EXACTLY our prompt (not merely our marker as a
@@ -275,14 +256,10 @@ composer_holds_prompt() {
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
 # count -- blank rows occupy history too) is at the cap: the env var alone cannot fix it.
 # A visible empty marker is a marker; "no marker at all" is the only truncation shape.
+# pane_gate's "composer-text" exits EXIT_UNSAFE only when no glyph line was found
+# at all; an empty-but-present composer still exits 0.
 composer_has_marker() {
-  printf '%s' "$1" | "$NOTIFIER_PY" -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("core_input_watch", sys.argv[1])
-ciw = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ciw)
-sys.exit(0 if ciw._composer_text(sys.stdin.read()) is not None else 1)
-' "$REPO/src/core-input-watch.py"
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-text --runtime claude >/dev/null 2>&1
 }
 
 capture_may_be_truncated() {

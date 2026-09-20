@@ -32,6 +32,7 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
         sys.path.insert(0, _p)
 
 import pool_delivery as pd  # noqa: E402
+import pool_remedy_timer as prt  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import tmux_probe  # noqa: E402
@@ -258,6 +259,33 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     }
 
 
+def ensure_remedy_timer(workspace, repo, *, runner=None,
+                        launch_agents=None) -> dict:
+    """Make the unattended remedy exist on a host as soon as a worker does.
+
+    Installing it was a hand-run step, so a host that never ran it spawned
+    workers nothing would ever resume; the mechanism shipped, the deployment
+    did not. Never raises: the worker is already alive by the time this runs,
+    and a timer that could not be installed must not make a live worker read
+    as a failed spawn.
+    """
+    if sys.platform != "darwin":
+        return {"ensured": False, "why": "launchd is macOS-only"}
+    try:
+        st = prt.status(launch_agents=launch_agents, runner=runner)
+        # `pool_remedy` calls spawn() from inside this job, so re-installing
+        # a healthy timer would bootout the job currently running.
+        if st.get("installed") and st.get("loaded"):
+            return {"ensured": False, "why": "already installed",
+                    "plist": st.get("plist")}
+        out = prt.install(workspace, repo, launch_agents=launch_agents,
+                          runner=runner)
+        return {"ensured": True, "plist": out.get("plist"),
+                "interval_s": out.get("interval_s"), "loaded": out.get("loaded")}
+    except (RuntimeError, OSError, ValueError) as e:
+        return {"ensured": False, "why": f"{type(e).__name__}: {e}"}
+
+
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
           require_sentinel: bool = True, resume: str = "") -> dict:
@@ -356,8 +384,9 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     if watch_pid is not None:
         beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
 
+    remedy = ensure_remedy_timer(workspace, repo, runner=runner)
     return {**p, **rec, "runtime_session_id": session_id, "started": True,
-            "beat_started": beat_started}
+            "beat_started": beat_started, "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:

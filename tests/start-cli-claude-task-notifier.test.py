@@ -316,6 +316,63 @@ class WatcherIdentityTests(unittest.TestCase):
             h.close()
 
 
+class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
+    """The launcher defaults the watcher's task-event handler from the optional
+    worker-pool skill, so a restart never arms a watcher that routes nothing."""
+
+    def setUp(self):
+        self.h = Harness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def _install_skill(self, name="pool"):
+        script = self.h.root / "skills" / name / "scripts" / "route_handler.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        link = self.h.root / "skills" / name / "task-event-handler"
+        link.symlink_to("scripts/route_handler.py")
+        return link
+
+    def test_without_the_skill_no_handler_is_set(self):
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
+
+    def test_with_the_skill_the_handler_reaches_the_watcher(self):
+        p = self._install_skill()
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertIn(f"SUTANDO_TASK_EVENT_HANDLER={p}", env)
+
+    def test_an_explicit_handler_wins_over_the_skill_default(self):
+        self._install_skill()
+        run = self.h.launch(extra_env={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertIn("SUTANDO_TASK_EVENT_HANDLER=/opt/handler", env)
+
+    def test_two_publishing_skills_are_ambiguous_and_set_nothing(self):
+        self._install_skill("pool-a")
+        self._install_skill("pool-b")
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("2 skills publish one", run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
+
+    def test_a_non_executable_skill_file_sets_nothing(self):
+        p = self._install_skill()
+        os.chmod(p.parent / "scripts" / "route_handler.py", 0o644)
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
+
+
 class WorkerLaunchStartsNoNotifier(unittest.TestCase):
     def test_worker_instance_gets_no_watcher_session(self):
         h = Harness()

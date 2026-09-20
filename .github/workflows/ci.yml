@@ -115,7 +115,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -145,6 +145,8 @@ jobs:
         run: |
           timeout -k 5 120 python3 scripts/lint-skill.test.py
           timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
+          # The rename keeps a few old spellings alive on purpose; this refuses NEW ones.
+          timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
@@ -288,7 +290,7 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge

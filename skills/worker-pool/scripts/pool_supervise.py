@@ -36,6 +36,7 @@ ps = _sibling("pool_supervision")
 pb = _sibling("pool_beat")
 pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
+prr = _sibling("pool_routing_receipt")
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -124,6 +125,45 @@ def observe(workspace, now: float, *, worker_ids=None,
     return obs
 
 
+def routing_status(workspace) -> dict:
+    """Is this host routing at all? Bindings say it should; the handler's receipt
+    says whether the watcher ever consults it. A task the core processed after
+    the last receipt went past the handler — which is the core answering for a
+    worker, the failure the pool exists to prevent, and it is silent otherwise.
+    """
+    roster = pr.load_roster(workspace) or {}
+    core = getattr(pr, "CORE", "core")
+    # A binding is {room: target}; a room pinned to the core is not one a worker owes.
+    bound = sorted(room for room, target in (roster.get("bindings") or {}).items()
+                   if any(t != core for t in (target if isinstance(target, list) else [target])))
+    receipt = prr.read(workspace)
+    consulted = receipt["consulted_at"] if receipt else None
+    newest, newest_id = None, None
+    # The receipt is stamped before the task it names is routed, so that task's own
+    # archive is always newer than its consult; every OTHER task past it is unrouted.
+    own = receipt.get("task_id") if receipt else None
+    unrouted = None
+    for f in (Path(workspace) / "tasks" / "archive").glob("task-*.txt"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest, newest_id = mtime, f.stem
+        if (consulted is not None and mtime > consulted and f.stem != own
+                and (unrouted is None or mtime > unrouted[0])):
+            unrouted = (mtime, f.stem)
+    alarm = None
+    if bound and consulted is None:
+        alarm = (f"unrouted: {len(bound)} room(s) bound to workers, but the route handler "
+                 "has never been consulted on this host — the watcher runs without it")
+    elif bound and unrouted is not None:
+        alarm = (f"unrouted: {unrouted[1]} arrived at {unrouted[0]:.0f} after the route handler "
+                 f"was last consulted at {consulted:.0f} — the core processed it unrouted")
+    return {"bound_rooms": bound, "handler_consulted_at": consulted,
+            "newest_task_at": newest, "newest_task_id": newest_id, "alarm": alarm}
+
+
 def load_state(workspace) -> ps.SupervisionState:
     try:
         raw = json.loads(state_path(workspace).read_text())
@@ -183,6 +223,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
         save_state(workspace, new_state)
     asked = list(worker_ids or [])
     return {"decisions": decisions,
+            "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused} for w, o in obs.items()},
@@ -218,6 +259,8 @@ def main(argv=None) -> int:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
+        if out["routing"]["alarm"]:
+            print(out["routing"]["alarm"])
     return 0
 
 
