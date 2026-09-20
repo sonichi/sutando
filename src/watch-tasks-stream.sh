@@ -510,11 +510,16 @@ dispatch_task() {
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
   handler="$(task_event_handler)"; hrc=$?
-  if [ "$hrc" -ne 0 ]; then
-    # rc 1 is "nobody provides one", the ordinary unrouted case. Anything else
-    # means the lookup could not answer, which must be visible, never silent.
-    [ "$hrc" -eq 1 ] || echo "watch-tasks-stream: handler lookup could not answer (rc $hrc) for $filename; falling back to the live core" >&2
+  if [ "$hrc" -eq 1 ]; then
+    # No provider declares one: the ordinary unrouted case, safe for the live core.
     emit_dispatch_task_file "$announce"
+    return
+  elif [ "$hrc" -ne 0 ]; then
+    # Unlike rc 1, this is not "no pool" -- it is "cannot tell" (ambiguous
+    # manifests, or the interpreter that reads them failed), and a task the
+    # live core cannot be shown to be unbound for must never reach it anyway.
+    echo "watch-tasks-stream: handler lookup could not answer (rc $hrc) for $filename; refusing rather than falling through to the live core" >&2
+    publish_terminal_failure "$filename" "cannot determine the required handler" "$task_path" || true
     return
   fi
   ensure_dispatch_ready
