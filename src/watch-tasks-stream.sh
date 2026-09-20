@@ -891,15 +891,19 @@ FSWATCH_PID=$!
 while true; do
   IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
   read_rc=$?
-  if [ "$read_rc" -gt 128 ]; then
-    if [ -n "$HANDLER_CONFIG_PATH" ]; then
-      reload_current_handler
-      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+  if [ "$read_rc" -ne 0 ]; then
+    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
+    # exit code alone can't distinguish them -- ask whether fswatch is still
+    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
+    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
+      if [ -n "$HANDLER_CONFIG_PATH" ]; then
+        reload_current_handler
+        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+      fi
+      continue
     fi
-    continue
-  elif [ "$read_rc" -ne 0 ]; then
-    # EOF: fswatch died and closed its end of the pipe. Fall through to the
-    # script's normal exit path rather than spinning on a dead FIFO.
+    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
+    # to the script's normal exit path rather than spinning on a dead FIFO.
     break
   fi
   case "$path" in
