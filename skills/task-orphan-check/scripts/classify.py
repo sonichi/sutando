@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Step 2 of /task-orphan-check, as a script: classify every live task in
-`<workspace>/tasks/` as done / fresh / orphan / import-resume, read-only.
+`<workspace>/tasks/` as done / worker-held / fresh / orphan / import-resume, read-only.
 
 The skill was prose-only ("marker-or-not + age-vs-5min"); its own note said to
 promote the classification to a script once the rules grew past that. They
@@ -20,6 +20,15 @@ Verdicts (first match wins):
                   (`done`, `staged`, `discarded`, `forgot`) — the run this
                   task started reached its end; a staged digest waits on an
                   owner reply, which arrives as a new task.
+  worker-held     a worker seat holds a router sentinel for it
+                  (deliveries/<recipient>/<id>{.txt,.accepted,.claimed},
+                  skills/worker-pool/scripts/worker_delivery.py): the task is that worker's to
+                  answer, not a core orphan — left in tasks/ (the worker
+                  reads the payload from there), never archived, never DM'd.
+  unknown         deliveries/ could not be read, so whether a worker holds
+                  the task is unknowable: never archived, listed in the DM.
+                  Reading an unreadable deliveries/ as "nobody holds it" is
+                  what hands a worker's task to the core.
   import-stalled  an import task whose bound run is at a resumable phase but
                   whose status.json has not moved for IMPORT_STALL_S
                   (3600 s): left in tasks/ (the watcher's sweep still resumes
@@ -70,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -83,6 +93,21 @@ if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+
+# The worker-pool skill is optional: without it there is no router, so nobody can
+# hold a task. Any stat failure but ENOENT propagates — unreadable is not absent.
+_POOL_SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
+
+
+def _holder_of(workspace: Path, task_id: str) -> str | None:
+    try:
+        os.stat(_POOL_SCRIPTS / "worker_delivery.py")
+    except FileNotFoundError:
+        return None
+    if str(_POOL_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(_POOL_SCRIPTS))
+    import worker_delivery  # noqa: E402
+    return worker_delivery.holder_of(workspace, task_id)
 
 FRESH_AGE_S = 300
 IMPORT_FRESH_AGE_S = 1800
@@ -223,6 +248,23 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     marker = completion_marker(workspace / "results", task_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
+        return row
+
+    # holder_of raises on any stat failure but ENOENT; an unreadable deliveries/
+    # must not read as "nobody holds it".
+    try:
+        holder = _holder_of(workspace, task_id)
+    except OSError as exc:
+        row.update(verdict="unknown",
+                   reason=f"deliveries/ unreadable ({exc}); cannot tell whether a worker holds "
+                          "this task — left in tasks/, never archived, list it in the recovery DM")
+        return row
+    if holder is not None:
+        row["holder"] = holder
+        row.update(verdict="worker-held",
+                   reason=f"router sentinel held by worker {holder} (deliveries/{holder}/); the "
+                          "task is that worker's to answer — left in tasks/, never archived, "
+                          "never listed in the recovery DM")
         return row
 
     intent = import_intent(headers, parsed.body)

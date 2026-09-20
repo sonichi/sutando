@@ -164,14 +164,18 @@ def _main(argv):
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("doc", help="read/write/delete a room Context document")
-    p.add_argument("action", choices=["get", "put", "rm"])
-    p.add_argument("room")
-    p.add_argument("--folder", default="room-live-context")
-    p.add_argument("--name", help="document filename (e.g. TODO.md)")
-    p.add_argument("--file", help="put: local file to upload (else stdin)")
-    p.add_argument("--message", help="put: commit message")
-    p.add_argument("--agent")
+    # `context` and its old name `doc`. "doc" said nothing about WHICH store,
+    # and agents looking for the live collaborative document landed here.
+    for _name, _help in (("context", "read/write/delete a room Context document"),
+                         ("doc", "deprecated alias for `context` (NOT the live Room Doc)")):
+        p = sub.add_parser(_name, help=_help)
+        p.add_argument("action", choices=["get", "put", "rm"])
+        p.add_argument("room")
+        p.add_argument("--folder", default="room-live-context")
+        p.add_argument("--name", help="document filename (e.g. TODO.md)")
+        p.add_argument("--file", help="put: local file to upload (else stdin)")
+        p.add_argument("--message", help="put: commit message")
+        p.add_argument("--agent")
 
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
@@ -269,8 +273,11 @@ def _main(argv):
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
         res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
-    elif a.cmd == "doc":
+    elif a.cmd in ("context", "doc"):
         import doc as _doc
+        if a.cmd == "doc":
+            print("note: `room_ops doc` is now `room_ops context`. This is the room's\n      Context-document FOLDER. The live collaborative document (Doc tab,\n      whiteboard, deck) is a different store — see the room-doc skill.",
+                  file=__import__("sys").stderr)
         if a.action == "get":
             res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)
         elif a.action == "put":
