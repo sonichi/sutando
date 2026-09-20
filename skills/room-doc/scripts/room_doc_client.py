@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import websockets
     from pycrdt import (
-        Awareness, Doc, Text, YMessageType, YSyncMessageType,
+        Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
@@ -35,6 +35,10 @@ except ImportError as exc:  # pragma: no cover - import guard
         "install them with: pip install -r skills/room-doc/requirements.txt"
     ) from exc
 
+from room_doc_board import (  # noqa: E402
+    BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
+    elements_from_map, is_board_element, is_board_file, live_elements,
+)
 from room_doc_protocol import (  # noqa: E402
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
@@ -46,11 +50,16 @@ SYNC_TIMEOUT_S = 20.0
 class RoomDoc:
     """One open document. Use `open_room_doc()` rather than constructing it."""
 
-    def __init__(self, ws: Any, doc: Doc, awareness: Awareness, text_name: str):
+    def __init__(self, ws: Any, doc: Doc, awareness: Awareness, text_name: str,
+                 kind: str = DEFAULT_KIND):
         self._ws = ws
         self._doc = doc
         self._awareness = awareness
-        self._text = doc.get(text_name, type=Text)
+        self._kind = kind
+        self._text_name = text_name
+        # A board is a map of elements, not a text. Resolving the text on one
+        # would materialise an empty key that reads exactly like an empty board.
+        self._text = None if kind == BOARD_KIND else doc.get(text_name, type=Text)
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
         self._ended: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -59,8 +68,56 @@ class RoomDoc:
         self._awareness_sub: Any = None
 
     @property
+    def kind(self) -> str:
+        return self._kind
+
+    def _require_text(self, what: str) -> Any:
+        """A text operation on a board is refused, never answered with "".
+
+        Returning empty here is the exact failure this client was written to
+        prevent elsewhere: a refusal that reads as an empty document.
+        """
+        if self._text is None:
+            raise RoomDocError(
+                f"cannot {what} on the {self._kind!r} document: it holds a map of "
+                f"elements under {ELEMENTS_KEY!r}, not text. Use the element API "
+                "(elements / put_elements / delete_element), or open the markdown "
+                "document instead.")
+        return self._text
+
+    @property
     def text(self) -> str:
-        return str(self._text)
+        return str(self._require_text("read text"))
+
+    def _require_board(self, what: str) -> tuple:
+        if self._kind != BOARD_KIND:
+            raise RoomDocError(
+                f"cannot {what} on the {self._kind!r} document: elements live on the "
+                f"board. Open it with kind={BOARD_KIND!r}.")
+        return (self._doc.get(ELEMENTS_KEY, type=Map),
+                self._doc.get(FILES_KEY, type=Map))
+
+    @staticmethod
+    def _items(ymap: Any) -> list:
+        # A pycrdt Map is dict-like; snapshot it so callers cannot mutate the CRDT.
+        return [(k, dict(v) if isinstance(v, dict) else v) for k, v in ymap.items()]
+
+    @property
+    def elements(self) -> list[dict]:
+        """Every valid element, deleted ones included, in drawing order."""
+        elements, _ = self._require_board("read elements")
+        return elements_from_map(self._items(elements))
+
+    @property
+    def live_elements(self) -> list[dict]:
+        """Only what is still on the canvas."""
+        elements, _ = self._require_board("read elements")
+        return live_elements(self._items(elements))
+
+    @property
+    def files(self) -> list[dict]:
+        _, files = self._require_board("read files")
+        return [v for k, v in self._items(files) if is_board_file(v, k)]
 
     @property
     def peers(self) -> list[dict]:
@@ -183,21 +240,72 @@ class RoomDoc:
         await self._send(create_update_message(self._doc.get_update(before)))
 
     async def append(self, addition: str) -> None:
-        await self._commit(lambda: self._text.__iadd__(addition))
+        text = self._require_text("append text")
+        await self._commit(lambda: text.__iadd__(addition))
 
     async def insert(self, index: int, addition: str) -> None:
-        await self._commit(lambda: self._text.insert(index, addition))
+        text = self._require_text("insert text")
+        await self._commit(lambda: text.insert(index, addition))
+
+    async def put_elements(self, elements: list[dict]) -> int:
+        """Write elements that are newer than what is stored. Returns how many.
+
+        Refuses an invalid element rather than writing it: the web client
+        validates on read, so a bad one would be dropped by every viewer with
+        no error anywhere.
+        """
+        ymap, _ = self._require_board("write elements")
+        for element in elements:
+            if not is_board_element(element):
+                raise RoomDocError(
+                    f"not a board element: {describe_invalid(element)}. "
+                    "Nothing was written.")
+        stored = dict(self._items(ymap))
+        changed = changed_elements(elements, stored.get)
+        if not changed:
+            return 0
+
+        def mutate() -> None:
+            for element in changed:
+                ymap[element["id"]] = dict(element)
+
+        await self._commit(mutate)
+        return len(changed)
+
+    async def delete_element(self, element_id: str) -> None:
+        """Mark an element deleted — a newer write, not a removal, because that
+        is how the editor reconciles a deletion."""
+        ymap, _ = self._require_board("delete an element")
+        stored = dict(self._items(ymap)).get(element_id)
+        if not is_board_element(stored, element_id):
+            raise RoomDocError(f"no such element on the board: {element_id!r}")
+        gone = dict(stored)
+        gone["isDeleted"] = True
+        gone["version"] = int(stored.get("version", 0)) + 1
+        await self.put_elements([gone])
+
+    async def reconcile(self, elements: list[dict]) -> int:
+        """Re-assert local elements after a remote change, and NOT optional.
+
+        Concurrent writes to one key are merged by Yjs on client id, which knows
+        nothing of element versions, so the older version can win; re-applying
+        makes the newer one causally later and it wins everywhere.
+        """
+        return await self.put_elements(elements)
 
     async def replace(self, old: str, new: str) -> None:
         """Replace the first occurrence. Refuses when absent, so a caller never
         silently writes nothing."""
+        self._require_text("replace text")
         at = self.text.find(old)
         if at < 0:
             raise RoomDocError(f"text to replace is not in the document: {old[:60]!r}")
 
+        text = self._require_text("replace text")
+
         def mutate() -> None:
-            del self._text[at:at + len(old)]
-            self._text.insert(at, new)
+            del text[at:at + len(old)]
+            text.insert(at, new)
 
         await self._commit(mutate)
 
@@ -234,7 +342,7 @@ async def open_room_doc(api_root: str, room_id: str, token: str, *,
     except Exception as exc:  # noqa: BLE001
         raise RoomDocError(explain(exc, url)) from exc
 
-    room_doc = RoomDoc(ws, doc, awareness, text_name)
+    room_doc = RoomDoc(ws, doc, awareness, text_name, kind=kind)
     try:
         await room_doc._start()
     except BaseException:

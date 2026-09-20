@@ -43,13 +43,29 @@ def resolve_url(explicit: str | None) -> str:
 
 
 def render(command: str, *, text: str = "", peers: list | None = None,
-           as_json: bool = False, before: int | None = None) -> str:
+           as_json: bool = False, before: int | None = None,
+           elements: list | None = None, written: int | None = None) -> str:
     """What the CLI prints, decided without a socket in hand.
 
     Kept pure so the output contract is testable anywhere: a caller parsing
     stdout as JSON must not find out in production that a mode prints prose.
     """
     peers = peers or []
+    if elements is not None:
+        # A board read never falls back to the text shape: an empty string
+        # there is indistinguishable from an empty board.
+        if command == "read":
+            if as_json:
+                return json.dumps({"elements": elements, "count": len(elements),
+                                   "peers": peers}, ensure_ascii=False, indent=2)
+            if not elements:
+                return "(board is empty — 0 elements)"
+            return "\n".join(
+                f"{e.get('index') or '-':>6}  {e.get('type','?'):<10} {e.get('id','?')}"
+                f"  v{e.get('version','?')}" + ("  [deleted]" if e.get("isDeleted") else "")
+                for e in elements)
+        if command in ("draw", "erase"):
+            return json.dumps({"ok": True, "written": written, "count": len(elements)})
     if command == "read":
         if as_json:
             return json.dumps({"chars": len(text), "peers": peers, "text": text},
@@ -69,11 +85,34 @@ async def run(args: argparse.Namespace) -> int:
     # of them must not need pycrdt installed.
     from room_doc_client import open_room_doc
 
+    from room_doc_board import BOARD_KIND
+
     token, url = resolve_token(args.token), resolve_url(args.url)
     async with open_room_doc(url, args.room, token, kind=args.kind,
                              insecure=args.insecure) as doc:
         if args.name:
             await doc.set_presence(args.name, user_id=args.user_id)
+
+        if args.kind == BOARD_KIND:
+            written = None
+            if args.command == "draw":
+                written = await doc.put_elements(json.loads(args.elements))
+                await doc.settle(args.settle)
+            elif args.command == "erase":
+                await doc.delete_element(args.element_id)
+                await doc.settle(args.settle)
+                written = 1
+            elif args.command != "read":
+                raise RoomDocError(
+                    f"{args.command!r} is a text command; the board holds elements. "
+                    "Use read, draw or erase.")
+            print(render(args.command, peers=doc.peers, as_json=args.json,
+                         elements=doc.elements, written=written))
+            return 0
+
+        if args.command in ("draw", "erase"):
+            raise RoomDocError(
+                f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
         before = len(doc.text)
         if args.command == "append":
             await doc.append(args.text)
@@ -112,6 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("old")
     s.add_argument("new")
+
+    s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
+    s.add_argument("room")
+    s.add_argument("elements", help="JSON array of Excalidraw-shaped elements")
+
+    s = sub.add_parser("erase", help="mark a board element deleted (needs --kind board)")
+    s.add_argument("room")
+    s.add_argument("element_id")
     return p
 
 
