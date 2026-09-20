@@ -42,9 +42,7 @@ def start_watcher(ws, instance=None):
     else:
         env.pop("SUTANDO_INSTANCE_ID", None)
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)  # no operator pin -- config file only
-    # TEMP diagnostics for CI check (2), remove once root-caused:
-    env["SUTANDO_WATCHER_DEBUG"] = "1"
-    env["SUTANDO_HANDLER_POLL_INTERVAL"] = "2"
+    env["SUTANDO_WATCHER_DEBUG"] = "1"  # TEMP: CI diagnosis for check (2), remove once root-caused
     return subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

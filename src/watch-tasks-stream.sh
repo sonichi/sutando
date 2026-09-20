@@ -883,33 +883,13 @@ if [ -n "$HANDLER_CONFIG_DIR" ]; then
   mkdir -p "$HANDLER_CONFIG_DIR"
   fswatch_paths+=("$HANDLER_CONFIG_DIR")
 fi
-if [ -n "${SUTANDO_WATCHER_DEBUG:-}" ]; then
-  fswatch \
-    -l 0.5 \
-    --event Created \
-    --event Renamed \
-    --event Updated \
-    "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>"$WATCH_RUNTIME_DIR/fswatch.err" &
-else
-  fswatch \
-    -l 0.5 \
-    --event Created \
-    --event Renamed \
-    --event Updated \
-    "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
-fi
+fswatch \
+  -l 0.5 \
+  --event Created \
+  --event Renamed \
+  --event Updated \
+  "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
-if [ -n "${SUTANDO_WATCHER_DEBUG:-}" ]; then
-  echo "WATCHER_DEBUG fswatch_pid=$FSWATCH_PID fswatch_paths=[${fswatch_paths[*]}]" >&2
-  ( sleep 3
-    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      echo "WATCHER_DEBUG fswatch_pid=$FSWATCH_PID still alive after 3s" >&2
-    else
-      echo "WATCHER_DEBUG fswatch_pid=$FSWATCH_PID DIED within 3s, stderr follows:" >&2
-      cat "$WATCH_RUNTIME_DIR/fswatch.err" >&2 2>/dev/null
-    fi
-  ) &
-fi
 # -t bounds the read so a stretch with no fswatch event still gets a periodic,
 # core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
 # event shape the platform's fswatch monitor backend turns out to use.
@@ -917,7 +897,6 @@ while true; do
   IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
   read_rc=$?
   if [ "$read_rc" -gt 128 ]; then
-    [ -n "${SUTANDO_WATCHER_DEBUG:-}" ] && echo "WATCHER_DEBUG timeout-heartbeat CURRENT_HANDLER=[$CURRENT_HANDLER]" >&2
     if [ -n "$HANDLER_CONFIG_PATH" ]; then
       reload_current_handler
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
