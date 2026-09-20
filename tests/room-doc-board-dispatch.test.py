@@ -40,6 +40,7 @@ class FakeDoc:
 
     async def put_elements(self, elements):
         self.calls.append(("put", [e.get("id") for e in elements]))
+        self.written = elements
         return len(elements)
 
     async def delete_element(self, element_id):
@@ -80,6 +81,10 @@ def check(name, fn):
         fn()
     except AssertionError as e:
         FAILS.append(f"{name}: {e}")
+    except SystemExit as e:
+        # argparse rejects an unknown flag by exiting; that is this case's
+        # failure, not a reason for the whole suite to stop unreported.
+        FAILS.append(f"{name}: the CLI exited {e.code} instead of running")
     except Exception as e:  # noqa: BLE001
         FAILS.append(f"{name}: unexpected {type(e).__name__}: {e}")
 
@@ -103,6 +108,40 @@ def test_draw_parses_then_writes_and_settles():
     assert ("put", ["z"]) in doc.calls, doc.calls
     assert any(c[0] == "settle" for c in doc.calls), "a write must settle"
     assert json.loads(out)["ok"] is True
+
+
+ON_TOP = ('[{"id":"z","type":"rectangle","x":0,"y":0,'
+          '"width":10,"height":10,"version":1}]')
+
+
+def test_draw_moves_a_drawing_off_what_is_already_there():
+    """The stand-in board holds one element at (0,0); a draw at (0,0) without
+    looking is exactly the owner's overlaid-diagrams screenshot."""
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", ON_TOP], doc)
+    assert rc == 0
+    assert doc.written[0]["y"] > 1, f"still on top: {doc.written[0]}"
+    assert doc.written[0]["x"] == 0, "only y moves"
+    assert isinstance(doc.written[0]["y"], int)
+
+
+def test_absolute_writes_the_coordinates_as_given():
+    """The escape for a caller that looked: what it asked for is what lands."""
+    doc = FakeDoc()
+    rc, _ = run_cli(
+        BASE + ["--kind", "board", "draw", "--absolute", "!r:s", ON_TOP], doc)
+    assert rc == 0
+    assert doc.written[0]["y"] == 0, doc.written[0]
+
+
+def test_draw_reads_the_board_before_deciding():
+    """Control for the above: with nothing on the board, nothing moves — so
+    the shift in the first case came from what was read, not from a constant."""
+    doc = FakeDoc()
+    doc.elements = []
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", ON_TOP], doc)
+    assert rc == 0
+    assert doc.written[0]["y"] == 0
 
 
 def test_erase_deletes_by_id():
