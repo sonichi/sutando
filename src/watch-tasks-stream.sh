@@ -907,6 +907,7 @@ while true; do
     # script's normal exit path rather than spinning on a dead FIFO.
     break
   fi
+  [ -n "${SUTANDO_WATCHER_DEBUG:-}" ] && echo "WATCHER_DEBUG raw_path=[$path] HANDLER_CONFIG_PATH=[$HANDLER_CONFIG_PATH] HANDLER_CONFIG_DIR=[$HANDLER_CONFIG_DIR] TASKS_DIR=[$TASKS_DIR] TASKS_DIR_ABS=[$TASKS_DIR_ABS]" >&2
   case "$path" in
     "HANDLER_DONE: "*)
       completion="${path#HANDLER_DONE: }"
