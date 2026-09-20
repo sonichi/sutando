@@ -88,7 +88,9 @@ the coordinates are final and you mean to draw over something. `read` first
 if you want to choose the spot yourself.
 
 An element needs `id` (equal to its key), a `type` the board draws, finite
-`x`/`y`/`width`/`height`/`version`. A write lands only when it is **newer**
+`x`/`y`/`width`/`height`/`version`. Everything else the editor reads —
+`groupIds`, stroke and fill, `seed`, `boundElements` — is filled in on write with
+the editor's own defaults, so a minimal element is selectable, not just drawn. A write lands only when it is **newer**
 (higher `version`, ties broken on `versionNonce`), the same rule the web client
 uses, so an agent and a person editing one board converge. Invalid elements are
 refused rather than written — the web client validates on read, so a bad one

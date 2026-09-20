@@ -111,6 +111,23 @@ async def test_a_written_element_reads_back():
     assert [e["id"] for e in board.elements] == ["a"]
 
 
+async def test_a_minimal_element_is_stored_complete():
+    """The editor reads groupIds on EVERY element when anything is selected,
+    so one minimal element anywhere makes the whole board unselectable. The
+    writer fills what the editor's own restore step would."""
+    board = make(BOARD_KIND)
+    await board.put_elements([el()])
+    stored = board.elements[0]
+    for key in ("groupIds", "boundElements", "strokeColor", "seed", "versionNonce", "updated"):
+        assert key in stored, f"{key} missing from the stored element"
+    assert stored["groupIds"] == []
+    # Re-asserting the same minimal element inherits the stored identity, so
+    # the version tie-break has nothing random to decide on.
+    before = len(board._ws.sent)
+    assert await board.put_elements([el()]) == 0
+    assert len(board._ws.sent) == before
+
+
 async def test_an_invalid_element_is_refused_and_nothing_is_written():
     board = make(BOARD_KIND)
     await expect_refusal(lambda: board.put_elements([el(), el(id="b", type="iframe")]),

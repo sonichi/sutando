@@ -35,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - import guard
         "install them with: pip install -r skills/room-doc/requirements.txt"
     ) from exc
 
-from room_doc_board import (  # noqa: E402
+from room_doc_board import (complete_element, # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
@@ -303,7 +303,10 @@ class RoomDoc:
                 raise RoomDocError(
                     f"not a board element: {describe_invalid(element)}. "
                     "Nothing was written.")
+        # Filled here, at the one writer: the panel hands the map to the editor
+        # as-is, and a minimal element throws inside its selection handler.
         stored = dict(self._items(ymap))
+        elements = [complete_element(e, base=stored.get(e.get("id"))) for e in elements]
         changed = changed_elements(elements, stored.get)
         # Remembered even when nothing is written: a concurrent merge can still
         # replace a value we already agreed with, and then it needs re-asserting.
