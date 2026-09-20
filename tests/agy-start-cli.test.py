@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(os.environ.get(
@@ -192,6 +193,21 @@ class OnboardingSeedTests(unittest.TestCase):
             os.umask(old_umask)
         mode = stat.S_IMODE(os.stat(path).st_mode)
         self.assertEqual(oct(mode), oct(0o600))
+
+    def test_write_failure_cleans_up_staging_file_and_reraises(self):
+        path = self._path("onboarding.json")
+        with unittest.mock.patch.object(self.seed.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.seed.seed(path)
+        leftovers = list(Path(self.tmp.name).iterdir())
+        self.assertEqual(leftovers, [], f"a failed write must not leave a staging file: {leftovers}")
+
+    def test_write_failure_reraises_original_even_if_cleanup_also_fails(self):
+        path = self._path("onboarding.json")
+        with unittest.mock.patch.object(self.seed.os, "replace", side_effect=OSError("boom")), \
+             unittest.mock.patch.object(self.seed.os, "unlink", side_effect=OSError("cleanup failed")):
+            with self.assertRaisesRegex(OSError, "boom"):
+                self.seed.seed(path)
 
     def test_default_path_matches_the_documented_agy_cache_location(self):
         # Field names + location verified by reading the real file on disk;
