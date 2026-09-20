@@ -18,22 +18,28 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-BASELINE = REPO / "scripts" / "old-collab-literals.baseline.json"
-PATTERN = re.compile(r"room-doc|room_doc|space\.ag2\.doc\b")
+# Case-insensitive so the env aliases (ROOM_DOC_TOKEN, AG2_ROOM_DOC_URL) count too.
+PATTERN = re.compile(r"room-doc|room_doc|space\.ag2\.doc\b", re.IGNORECASE)
+BASELINE_REL = Path("scripts") / "old-collab-literals.baseline.json"
 # Text files only; the baseline itself and this script are not evidence.
-SKIP = {str(BASELINE.relative_to(REPO)), "scripts/lint-old-collab-literals.py"}
+SKIP = {str(BASELINE_REL), "scripts/lint-old-collab-literals.py"}
 
 
-def counts() -> dict[str, int]:
-    files = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True).stdout.split("\n")
+def repo_root() -> Path:
+    # The tree git tracks, wherever this script was invoked from.
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=Path(__file__).parent,
+                         capture_output=True, text=True, check=True).stdout.strip()
+    return Path(top)
+
+
+def counts(repo: Path) -> dict[str, int]:
+    files = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True, text=True).stdout.split("\n")
     out: dict[str, int] = {}
     for rel in files:
         if not rel or rel in SKIP:
             continue
-        p = REPO / rel
         try:
-            text = p.read_text(encoding="utf-8")
+            text = (repo / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
         n = len(PATTERN.findall(text))
@@ -42,13 +48,15 @@ def counts() -> dict[str, int]:
     return out
 
 
-def main(argv: list[str]) -> int:
-    now = counts()
+def main(argv: list[str], repo: Path | None = None) -> int:
+    repo = repo or repo_root()
+    baseline = repo / BASELINE_REL
+    now = counts(repo)
     if "--update" in argv:
-        BASELINE.write_text(json.dumps(now, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        baseline.write_text(json.dumps(now, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"baseline written: {len(now)} files, {sum(now.values())} occurrences")
         return 0
-    base = json.loads(BASELINE.read_text(encoding="utf-8")) if BASELINE.exists() else {}
+    base = json.loads(baseline.read_text(encoding="utf-8")) if baseline.exists() else {}
     grew = {f: (base.get(f, 0), n) for f, n in now.items() if n > base.get(f, 0)}
     if grew:
         print("old-collab-literals: FAIL — retired spellings grew (baseline -> now):")
