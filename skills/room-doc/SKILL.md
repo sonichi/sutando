@@ -27,21 +27,26 @@ pip install -r skills/room-doc/requirements.txt
 
 ## Credential
 
-The bearer must authorize **this agent** for documents:
+**The agent's ordinary relay token works.** The one every agent already holds
+in `channels/<lane>/.env` as `REMOTE_TASK_TOKEN` (or `AG2_REMOTE_TOKEN`) opens
+a room's documents; the service resolves it to the agent's own Matrix id. No
+per-agent Matrix token and no extra grant are needed. A Matrix access token
+also works.
 
-- a **Matrix access token**, or
-- an **AG2 agent ticket carrying the `doc.write` grant** (see ag2space-backend #1247).
+The relay token ships in two shapes, **under the same variable names, on
+different installs**: bare (`secret`) or compound (`https://host/relay|secret`).
+Both are accepted here — the value is inspected, never the name. Passed to
+anything else, the compound form must be split on `|`.
 
-An AG2 ticket minted only to pull tasks (`events.pull`) is refused — that is
-deliberate, not a misconfiguration. The document has exactly the **room's own
-ACL**, but note the difference between the policy and what you can observe:
-core-api distinguishes non-member (404) from below-write-power (403), while the
-**WebSocket collapses every refusal into one close**. From the client you cannot
-tell "not a member" from "not enough power" — only "refused".
+The document has exactly the **room's own ACL**. core-api distinguishes
+non-member (404) from below-write-power (403), while the **WebSocket collapses
+every refusal into one close** — from the client you can only see "refused".
 
 Resolution order: `--token`, then `$AG2_MATRIX_TOKEN`, `$ROOM_DOC_TOKEN`,
-`$MATRIX_ACCESS_TOKEN`. The service URL comes from `--url`, then
-`$AG2_ROOM_DOC_URL`, then `$AG2_API_ROOT`.
+`$MATRIX_ACCESS_TOKEN`, `$REMOTE_TASK_TOKEN`, `$AG2_REMOTE_TOKEN`. The service
+URL comes from `--url`, then `$AG2_ROOM_DOC_URL`, `$AG2_API_ROOT`, the origin
+of `$REMOTE_TASK_URL`, or the origin named inside a compound token. With the
+lane env loaded, an agent needs neither flag.
 
 ## Command line
 

@@ -373,15 +373,20 @@ class RoomDoc:
         """Replace the first occurrence. Refuses when absent, so a caller never
         silently writes nothing."""
         self._require_text("replace text")
-        at = self.text.find(old)
+        current = self.text
+        at = current.find(old)
         if at < 0:
             raise RoomDocError(f"text to replace is not in the document: {old[:60]!r}")
 
         text = self._require_text("replace text")
+        # pycrdt indexes Text by UTF-8 BYTES; str.find counts characters. Every
+        # multi-byte character before the match would otherwise shift the write.
+        start = len(current[:at].encode("utf-8"))
+        width = len(old.encode("utf-8"))
 
         def mutate() -> None:
-            del text[at:at + len(old)]
-            text.insert(at, new)
+            del text[start:start + width]
+            text.insert(start, new)
 
         await self._commit(mutate)
 

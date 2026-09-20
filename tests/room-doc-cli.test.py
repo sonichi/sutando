@@ -57,7 +57,9 @@ def test_env_vars_are_tried_in_declared_order():
         clear_env()
 
 
-def test_a_missing_credential_says_what_to_set_and_that_a_relay_token_will_not_do():
+def test_a_missing_credential_says_what_to_set_and_does_not_warn_off_the_relay_token():
+    """The old error said a relay token "is refused (403) by design". Three
+    agents read that and skipped the one credential they held that works."""
     clear_env()
     try:
         room_doc.resolve_token(None)
@@ -66,7 +68,62 @@ def test_a_missing_credential_says_what_to_set_and_that_a_relay_token_will_not_d
         text = str(e)
         for var in room_doc.TOKEN_VARS:
             assert var in text, f"the error must name {var}"
-        assert "MATRIX" in text, "the error must say which credential kind is wanted"
+        assert "refused" not in text and "by design" not in text, text
+
+
+def test_the_relay_token_is_read_in_either_shape():
+    """Same secret ships bare on one install and as url|secret on another,
+    under the SAME variable name. The name must not be trusted to imply the
+    format; the value decides."""
+    clear_env()
+    try:
+        os.environ["REMOTE_TASK_TOKEN"] = "s3cret"
+        assert room_doc.resolve_token(None) == "s3cret"
+        os.environ["REMOTE_TASK_TOKEN"] = "https://chat.example/relay|s3cret"
+        assert room_doc.resolve_token(None) == "s3cret", "the compound form must be split"
+    finally:
+        clear_env()
+
+
+def test_an_explicit_compound_token_is_split_too():
+    """--token copied straight out of a .env line is the realistic input."""
+    assert room_doc.resolve_token("https://h/relay|abc") == "abc"
+    assert room_doc.resolve_token("plain|not-a-url") == "plain|not-a-url", \
+        "only a URL prefix marks the compound form"
+
+
+def test_the_relay_variables_come_after_the_document_specific_ones():
+    clear_env()
+    try:
+        os.environ["REMOTE_TASK_TOKEN"] = "relay"
+        os.environ["ROOM_DOC_TOKEN"] = "specific"
+        assert room_doc.resolve_token(None) == "specific"
+    finally:
+        clear_env()
+
+
+def test_the_url_falls_back_to_the_relay_origin():
+    """Every agent has REMOTE_TASK_URL; none had AG2_API_ROOT. One guessed the
+    host from it by hand and happened to be right."""
+    clear_env()
+    try:
+        os.environ["REMOTE_TASK_URL"] = "https://chat.example/relay"
+        assert room_doc.resolve_url(None) == "https://chat.example", "path stripped, origin kept"
+        os.environ["AG2_API_ROOT"] = "https://api.example/v"
+        assert room_doc.resolve_url(None) == "https://api.example/v", \
+            "an explicit api root wins and keeps its path"
+    finally:
+        clear_env()
+
+
+def test_a_compound_token_alone_is_enough_to_find_the_service():
+    clear_env()
+    try:
+        os.environ["AG2_REMOTE_TOKEN"] = "https://chat.example/relay|s3cret"
+        assert room_doc.resolve_url(None) == "https://chat.example"
+        assert room_doc.resolve_token(None) == "s3cret"
+    finally:
+        clear_env()
 
 
 def test_a_missing_url_names_its_variables():
