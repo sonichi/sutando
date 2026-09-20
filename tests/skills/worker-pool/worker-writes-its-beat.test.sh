@@ -17,6 +17,8 @@ trap cleanup EXIT
 WORKSPACE_DIR="$SB/ws"
 mkdir -p "$WORKSPACE_DIR/state"
 BEAT_SCRIPT="$REPO/skills/worker-pool/scripts/pool_beat.py"
+# Portable mtime: GNU `stat -f %m` prints filesystem status, not a number.
+mtime() { python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$1" 2>/dev/null || echo 0; }
 check "the beat script exists" '[ -f "$BEAT_SCRIPT" ]'
 
 # ============================================================================
@@ -50,9 +52,9 @@ BEAT_PPID="$(ps -o ppid= -p "$BEAT_PID" 2>/dev/null | tr -d ' ')"
 check "it HAS been reparented away from the subshell that spawned it (ppid=${BEAT_PPID:-?}, proving --parent-pid tracking could not work here — that subshell no longer exists)" \
       '[ -n "$BEAT_PPID" ] && ! kill -0 "$BEAT_PPID" 2>/dev/null'
 
-_before="$(stat -f %m "$BEAT1" 2>/dev/null || echo 0)"
+_before="$(mtime "$BEAT1")"
 sleep 2
-_mid="$(stat -f %m "$BEAT1" 2>/dev/null || echo 0)"
+_mid="$(mtime "$BEAT1")"
 check "beat is still advancing after 2s (writer keeps running despite the reparenting)" '[ "$_mid" -ge "$_before" ]'
 
 # --- SIGKILL the WATCHED pid only — the beat must notice within ~2s --------
@@ -68,7 +70,7 @@ check "beat writer exited once its watched pid was SIGKILLed" '! kill -0 "$BEAT_
 check "...within the ~2s budget the design asks for (measured ${_elapsed}s)" '[ "$_elapsed" -le 3 ]'
 
 sleep 2
-_after="$(stat -f %m "$BEAT1" 2>/dev/null || echo 0)"
+_after="$(mtime "$BEAT1")"
 check "beat stopped advancing once the writer exited" '[ "$_mid" = "$_after" ]'
 check "beat FILE itself is left behind, for a post-restart recency read" '[ -f "$BEAT1" ]'
 
