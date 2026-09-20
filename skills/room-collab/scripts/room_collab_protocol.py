@@ -17,9 +17,9 @@ DEFAULT_KIND = "markdown"
 CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, CLOSE_BAD_KIND = 4400, 4403, 4404
 
 CLOSE_REASONS = {
-    CLOSE_BAD_ROOM: "the room id is malformed (4400) — this is a refusal, not an empty document",
+    CLOSE_BAD_ROOM: "the room id is malformed (4400) — this is a refusal, not an empty surface",
     CLOSE_FORBIDDEN: ("access refused or withdrawn (4403): this credential is not authorized "
-                      "for the document, or membership/write power changed. It can also mean "
+                      "for the room's surfaces, or membership/write power changed. It can also mean "
                       "core-api was briefly unreachable, so one 4403 is not proof of revocation"),
     CLOSE_BAD_KIND: "the surface kind is malformed (4404)",
 }
@@ -95,7 +95,7 @@ def read_var_bytes(data: bytes, i: int) -> tuple[bytes, int]:
 
 
 def doc_socket_url(api_root: str, room_id: str, kind: str = DEFAULT_KIND) -> str:
-    """`https://host` (or ws(s)://) + a room id -> the document's socket URL.
+    """`https://host` (or ws(s)://) + a room id -> the surface's socket URL.
 
     The room id is one path segment and carries `!` and `:` by grammar, so it
     is quoted whole; a bare one would split the path.
@@ -157,7 +157,7 @@ def explain(exc: Exception, url: str) -> str:
     if status == 403:
         return (f"refused (403) by {url}: {body or 'no detail given'}\n"
                 "The service knows this agent and the room refuses it: below write power, "
-                "or not authorized for documents. A room admin fixes this, not a token.")
+                "or not authorized for the room's surfaces. A room admin fixes this, not a token.")
     if status == 404:
         return (f"not found (404) at {url}\n"
                 "Either the room id is wrong or this account is not a member — "

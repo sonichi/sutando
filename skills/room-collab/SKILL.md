@@ -1,9 +1,9 @@
 ---
 name: room-collab
-description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, the kanban (Yjs/CRDT state, one surface per --kind). Use this when asked to write into, read, or collaborate in a room's document. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
+description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, the kanban (Yjs/CRDT state, one surface per --kind). Use this when asked to write into, read, watch, or collaborate in any of a room's surfaces. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
 ---
 
-> Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban; every wire key, URL path and environment variable is unchanged, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
+> Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban. The `room-collab` names lead (`ROOM_COLLAB_TOKEN`, `AG2_ROOM_COLLAB_URL`, `/api/v1/room-collab`); the `room-doc` spellings are still read and served for one release, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
 
 # Room Collab
 
@@ -63,7 +63,7 @@ different installs**: bare (`secret`) or compound (`https://host/relay|secret`).
 Both are accepted here — the value is inspected, never the name. Passed to
 anything else, the compound form must be split on `|`.
 
-The document has exactly the **room's own ACL**. core-api distinguishes
+Every surface has exactly the **room's own ACL**. core-api distinguishes
 non-member (404) from below-write-power (403), while the **WebSocket collapses
 every refusal into one close** — from the client you can only see "refused".
 
@@ -88,9 +88,9 @@ python3 $P --name mars read '!room:server'            # publish presence while c
 
 Add `--insecure` only for a local rig with a self-signed certificate.
 
-## Staying in the document
+## Staying in a surface
 
-A `read` or `append` connects, acts and leaves. To be **in** the document the
+A `read` or `append` connects, acts and leaves. To be **in** a surface the
 way a person is — told the moment something concerns you, with nobody pinging
 you in the room — hold it open:
 
@@ -232,7 +232,7 @@ Three things that matter more than they look:
    you — the person sharing it sees text appear from nowhere. Pass `user_id`
    (this agent's mxid) to get an avatar: the roster resolves faces by id, never
    by display name, so without it you appear by name with no face.
-2. **One connection per agent per document.** Each connection is a separate peer:
+2. **One connection per agent per surface.** Each connection is a separate peer:
    open a new one per edit and you appear in the presence list several times, as
    several people. Hold the context manager open instead.
 3. **Send deltas, not the document.** `append`/`insert`/`replace` put only the change
@@ -260,7 +260,7 @@ as an HTTP status:
 | Close | Meaning |
 |---|---|
 | 4400 | The room id is malformed. **Not** "a room that exists and is empty". (verified 2026-09-20) |
-| 4404 | The document kind is malformed. (verified 2026-09-20) |
+| 4404 | The surface kind is malformed. (verified 2026-09-20) |
 | 4403 | Refused or withdrawn: not authorized for documents, or membership/write power changed. It can *also* mean core-api was briefly unreachable, so one 4403 is not proof of revocation. (verified 2026-09-20) |
 | HTTP 401 "bearer is not a valid Matrix user session" | The service has no record of this agent's token — a provisioning gap on that deployment (the local rig, typically), not a room permission. A different problem from 4403; ask whoever runs that deployment. (verified 2026-09-20) |
 

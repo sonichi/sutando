@@ -292,7 +292,7 @@ async def kanban(doc, args: argparse.Namespace) -> int:
 
 
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
-    """Hold the document open and print one line per event that concerns
+    """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
     snapshot in hand, so what landed meanwhile is reported, not skipped.
     Exits (rc 2) only on a refusal or after --max-reconnects failures."""
@@ -418,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
         s = sub.add_parser(name, help=help_text)
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
-    s = sub.add_parser("watch", help="hold the document open; print each event that concerns --for")
+    s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")
     s.add_argument("room")
     s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
                    help="a name or @mxid to watch for (repeatable)")

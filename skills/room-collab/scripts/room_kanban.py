@@ -25,7 +25,7 @@ def _int(value: Any) -> int | None:
     """Integer milliseconds, however the CRDT gave them back.
 
     pycrdt returns a stored `300` as `300.0`, so rejecting floats outright
-    refuses every card that has been through the document — including ones this
+    refuses every card that has been through the board — including ones this
     client wrote. A non-integral value is still refused: the schema says ms.
     """
     if isinstance(value, bool):  # bool is an int; a True timestamp is not one
@@ -150,7 +150,7 @@ def orphaned_cards(cards: Iterable[tuple[str, Any]],
     """Live cards naming a column this board does not have.
 
     Deleting a column does not delete its cards, and a card filtered on an
-    unknown column is in the document and visible nowhere — so an agent listing
+    unknown column is in the board and visible nowhere — so an agent listing
     work would report it as done. The panel shows them under "No column".
     """
     known = {k for k, v in columns if is_column(v, k)}

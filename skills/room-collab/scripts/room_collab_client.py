@@ -167,7 +167,7 @@ class RoomDoc:
 
     def _require_live(self) -> None:
         if self._ended.done():
-            raise RoomDocError(f"the document session has ended: {close_reason(self._ended.result())}")
+            raise RoomDocError(f"the surface session has ended: {close_reason(self._ended.result())}")
 
     async def _send(self, payload: bytes) -> None:
         self._require_live()
@@ -214,7 +214,7 @@ class RoomDoc:
         try:
             await self._ws.send(create_sync_message(self._doc))
         except Exception as exc:  # noqa: BLE001 - a refusal arrives as a close
-            raise RoomDocError(f"the document did not open: {close_reason(exc)}") from exc
+            raise RoomDocError(f"the surface did not open: {close_reason(exc)}") from exc
         waiter = asyncio.ensure_future(self._synced.wait())
         try:
             await asyncio.wait({waiter, self._ended}, timeout=SYNC_TIMEOUT_S,
@@ -227,8 +227,8 @@ class RoomDoc:
         if self._ended.done():
             # The service accepts and THEN closes for a bad room or kind, so a
             # refusal arrives here rather than at the handshake.
-            raise RoomDocError(f"the document did not open: {close_reason(self._ended.result())}")
-        raise RoomDocError(f"connected but the document never synced within {SYNC_TIMEOUT_S:g}s")
+            raise RoomDocError(f"the surface did not open: {close_reason(self._ended.result())}")
+        raise RoomDocError(f"connected but the surface never synced within {SYNC_TIMEOUT_S:g}s")
 
     def _start_presence_renewal(self) -> None:
         """Forward local awareness changes, and keep the renewal loop running.
@@ -417,7 +417,7 @@ class RoomDoc:
                 if ended in done:
                     got.cancel()
                     raise RoomDocError(
-                        f"the document session has ended: {close_reason(ended.result())}")
+                        f"the surface session has ended: {close_reason(ended.result())}")
                 if got in done:
                     if settle > 0:
                         pending = got.result()      # keep the newest; wait for quiet
@@ -494,7 +494,7 @@ class RoomDoc:
                 if ended in done:
                     got.cancel()
                     err = RoomDocError(
-                        f"the document session has ended: {close_reason(ended.result())}")
+                        f"the surface session has ended: {close_reason(ended.result())}")
                     err.code = close_code(ended.result())
                     err.snapshot = last
                     raise err
