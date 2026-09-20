@@ -200,8 +200,8 @@ def place_clear(incoming: list[dict], occupied: Iterable[dict],
     looked first: coordinates that already sit in clear space stay exactly as
     given.
 
-    Only y moves, and by an integer: canonical JSON has no floats, and the
-    failure is invisible — the UI looks right and nothing reaches the wire.
+    Only y moves, and by an integer offset, so a caller's coordinates keep
+    whatever precision they had.
     """
     ids = {e.get("id") for e in incoming}
     others = [e for e in occupied if is_board_element(e) and not e.get("isDeleted")
@@ -220,6 +220,6 @@ def place_clear(incoming: list[dict], occupied: Iterable[dict],
             out.append(e)
             continue
         moved = dict(e)
-        moved["y"] = int(e["y"] + dy)
+        moved["y"] = e["y"] + dy
         out.append(moved)
     return out
