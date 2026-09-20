@@ -191,6 +191,61 @@ def case_close_failure_is_swallowed() -> list[str]:
     return fails
 
 
+def case_flock_fd_blocks_indefinitely_when_timeout_is_none() -> list[str]:
+    """timeout=None takes a plain blocking LOCK_EX, not the poll-until-deadline loop.
+
+    Covers src/tmux_pane_lock.py's `if timeout is None: fcntl.flock(...)` branch.
+    Uncontended here, so the "blocking" call returns immediately with True.
+    """
+    fails: list[str] = []
+    mod = _load("tmux_pane_lock", "src/tmux_pane_lock.py")
+    with tempfile.TemporaryDirectory() as t:
+        fd = os.open(str(Path(t) / "pane.lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            if mod.flock_fd(fd, timeout=None) is not True:
+                fails.append("flock_fd(timeout=None) on an uncontended fd must return True")
+        finally:
+            os.close(fd)
+    return fails
+
+
+def case_windows_import_falls_back_and_flock_refuses() -> list[str]:
+    """No fcntl (Windows) must not crash the import, and flock_fd must refuse.
+
+    Covers src/tmux_pane_lock.py's `except ModuleNotFoundError: fcntl = None` and
+    flock_fd's `if fcntl is None: return False` -- health-check.py and
+    core-input-watch.py import this module unconditionally at load time, so a
+    platform without fcntl must still be able to import it rather than crash
+    every test/script that transitively imports either of those two modules.
+    """
+    fails: list[str] = []
+    real_fcntl_module = sys.modules.get("fcntl")
+    real_tmux_pane_lock = sys.modules.get("tmux_pane_lock")
+    sys.modules["fcntl"] = None  # a None entry makes `import fcntl` raise ModuleNotFoundError
+    sys.modules.pop("tmux_pane_lock", None)
+    try:
+        mod = _load("tmux_pane_lock", "src/tmux_pane_lock.py")
+        if mod.fcntl is not None:
+            fails.append(f"control: expected fcntl to be None after the forced import failure, got {mod.fcntl!r}")
+            return fails
+        with tempfile.TemporaryDirectory() as t:
+            fd = os.open(str(Path(t) / "pane.lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                if mod.flock_fd(fd) is not False:
+                    fails.append("flock_fd must return False (never claim a lock it cannot take) without fcntl")
+            finally:
+                os.close(fd)
+    finally:
+        if real_fcntl_module is None:
+            sys.modules.pop("fcntl", None)
+        else:
+            sys.modules["fcntl"] = real_fcntl_module
+        sys.modules.pop("tmux_pane_lock", None)
+        if real_tmux_pane_lock is not None:
+            sys.modules["tmux_pane_lock"] = real_tmux_pane_lock
+    return fails
+
+
 def case_send_keys_reports_false_when_tmux_raises() -> list[str]:
     """send_keys must return False when the tmux call raises, never True.
 
@@ -239,6 +294,8 @@ CASES = [
     ("an underivable lock path refuses rather than guessing", case_undecidable_lock_refuses),
     ("a failing unlock is swallowed by cleanup", case_unlock_failure_is_swallowed),
     ("a failing close is swallowed by cleanup", case_close_failure_is_swallowed),
+    ("flock_fd(timeout=None) blocks (uncontended -> True immediately)", case_flock_fd_blocks_indefinitely_when_timeout_is_none),
+    ("no fcntl (Windows): import falls back, flock_fd refuses", case_windows_import_falls_back_and_flock_refuses),
     ("send_keys reports False when tmux raises", case_send_keys_reports_false_when_tmux_raises),
 ]
 
