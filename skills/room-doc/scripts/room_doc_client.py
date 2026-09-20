@@ -366,13 +366,17 @@ class RoomDoc:
         except RoomDocError:
             pass
 
-    async def changes(self) -> AsyncIterator[str]:
+    async def changes(self, settle: float = 0.0) -> AsyncIterator[str]:
         """Every remote edit to the text, yielded as the text after it landed.
 
         The connection is held for as long as the caller iterates. Local
         writes are not reported: the caller made them. Ends when the session
         does, by raising the close reason rather than stopping quietly — a
         watcher that exits silently looks exactly like one that saw nothing.
+
+        `settle` > 0 coalesces: the server forwards one push per keystroke
+        (measured), so a person typing "@mars please" is a dozen pushes. With
+        settle the text is yielded once, `settle` seconds after the last one.
         """
         text = self._require_text("watch text")
         queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -383,17 +387,28 @@ class RoomDoc:
                 queue.put_nowait(str(text))
 
         sub = text.observe(on_text)
-        ended = asyncio.ensure_future(self._ended)
+        # shield: cancelling this waiter must not cancel the session's own future.
+        ended = asyncio.ensure_future(asyncio.shield(self._ended))
+        pending: str | None = None
         try:
             while True:
                 got = asyncio.ensure_future(queue.get())
-                done, _ = await asyncio.wait({got, ended}, return_when=asyncio.FIRST_COMPLETED)
-                if got in done:
-                    yield got.result()
-                else:
+                timeout = settle if (settle > 0 and pending is not None) else None
+                done, _ = await asyncio.wait({got, ended}, timeout=timeout,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if ended in done:
                     got.cancel()
                     raise RoomDocError(
                         f"the document session has ended: {close_reason(ended.result())}")
+                if got in done:
+                    if settle > 0:
+                        pending = got.result()      # keep the newest; wait for quiet
+                        continue
+                    yield got.result()
+                    continue
+                got.cancel()                        # quiet for `settle`: emit once
+                yield pending
+                pending = None
         finally:
             text.unobserve(sub)
             if not ended.done():

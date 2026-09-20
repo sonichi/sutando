@@ -209,8 +209,8 @@ async def watch(doc, args: argparse.Namespace) -> int:
     handles = args.handles or []
     seen = doc.text
     print(f"watching {args.room} for {handles or 'every new line'} "
-          f"({len(seen)} chars now)", flush=True)
-    async for text in doc.changes():
+          f"({len(seen)} chars now; reporting after {args.settle}s of quiet)", flush=True)
+    async for text in doc.changes(settle=args.settle):
         fresh = new_lines(seen, text)
         seen = text
         for line in (addressed_to(fresh, handles) if handles else fresh):

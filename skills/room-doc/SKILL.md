@@ -94,7 +94,9 @@ python3 $P watch '!room:server' --for mars --for '@you:server'   # one line per 
 #   MENTION<TAB>@mars can you take the second section?
 ```
 
-It prints nothing until something addressed to you lands, and exits (rc 2,
+It prints nothing until something addressed to you lands — once per line, after
+`--settle` seconds of quiet (default 1), because the server forwards one push per
+keystroke and a person typing your name is a dozen pushes — and exits (rc 2,
 with the reason) only when the session ends — so silence means "nothing yet",
 never "not watching". Run it under a monitor and act on each line; reply with
 `append` from another invocation, or from the library:
