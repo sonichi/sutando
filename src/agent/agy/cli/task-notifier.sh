@@ -32,9 +32,8 @@ CORE_READY_TIMEOUT="${SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_AGY_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 # Ticks (of POLL_INTERVAL) to wait for a paste to visibly stage before retyping.
 TYPE_CONFIRM_TIMEOUT_TICKS="${SUTANDO_AGY_NOTIFIER_TYPE_CONFIRM_TICKS:-8}"
-# Scrollback depth for staging checks: a long prompt in a narrow pane can wrap
-# its leading marker above the visible viewport; the viewport alone then
-# misses it and retypes a duplicate. Deep enough to hold the whole prompt.
+# Scrollback depth for staging checks -- a wrapped marker can scroll above a
+# narrow pane's viewport, so retyping needs deeper history to see it.
 PANE_HISTORY_LINES="${SUTANDO_AGY_NOTIFIER_PANE_HISTORY_LINES:-500}"
 
 # shellcheck source=../../../../scripts/python-binary.sh
@@ -212,7 +211,11 @@ while IFS= read -r event; do
   case "$event" in
     "TASK_FILE: "*)
       next_pending_task >/dev/null || continue
-      wait_for_core_idle || exit 1
+      # A busy pane must not kill the persistent watcher: keep re-waiting
+      # (no second task-file event needed) until idle or the session is gone.
+      while ! wait_for_core_idle; do
+        tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || continue 2
+      done
       filename="$(next_pending_task)" || continue
       # A deferred delivery (core busy) leaves the task pending for the
       # next event, not a reason to kill the persistent watcher.

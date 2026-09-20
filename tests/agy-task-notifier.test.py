@@ -82,9 +82,8 @@ case "$cmd" in
     exit 1
     ;;
   capture-pane)
-    # capture-pane's OWN -S <start-line> may appear among the remaining
-    # args ("-p -t SESSION" or "-p -t SESSION -S -500") -- distinct from
-    # the top-level socket -S already stripped above.
+    # capture-pane's own -S <start-line> can appear among the remaining args,
+    # distinct from the top-level socket -S already stripped above.
     CAPTURE_START=""
     prev=""
     for a in "$@"; do
@@ -102,10 +101,8 @@ case "$cmd" in
     else
       combined="$composer"
     fi
-    # -S -N asks for N lines of SCROLLBACK ahead of the fixed viewport, like
-    # real tmux history -- without it this stub only ever returns the last
-    # FIXED_ROWS, which is exactly the bug: a marker that wrapped off the
-    # visible page is invisible to the caller even though it was typed.
+    # -S -N asks for N lines of scrollback ahead of the fixed viewport, like
+    # real tmux history -- needed so a wrapped-off marker stays visible.
     rows="$FIXED_ROWS"
     case "$CAPTURE_START" in
       -*)
@@ -446,6 +443,59 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_busy_then_idle_pane_dispatches_without_a_second_task_file_event(self):
+        # A permanently-busy pane must not kill the persistent main loop, and
+        # once idle the pending task must dispatch WITHOUT a second fs event.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        self.pane_file.write_text(BUSY_MARKER + "\n")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.write_task("task-busy-recover.txt")
+            # CORE_READY_TIMEOUT is 5s in this harness; outlive one full
+            # timed-out idle-wait cycle while the pane stays busy throughout.
+            time.sleep(6)
+            self.assertIsNone(proc.poll(),
+                               "the persistent watcher must survive an idle-wait timeout, not exit")
+            self.assertEqual(self.sendkeys_log_text(), "",
+                              "must not dispatch while the pane is still busy")
+            self.pane_file.write_text(IDLE_MARKER + "\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-busy-recover.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("notifier never dispatched the pending task once idle, with no "
+                          "second task-file event:\n" + self.sendkeys_log_text())
+            self.write_result("task-busy-recover.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
     def test_spawned_watcher_gets_a_distinct_sentinel_not_the_canonical_one(self):
         # Without a bound instance id the agy watcher's sentinel collides with
         # a canonical watcher's on the same host (both resolve to the bare name).
@@ -545,6 +595,87 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 proc.wait(timeout=5)
 
 
+class RestartHandoffTest(FakeTmuxHarness):
+    """A stranded task (dispatched, never completed, because the core it was
+    sent to crashed) must be redispatched by the NEXT watcher generation's
+    own initial sweep -- and exactly once, never zero times, never twice."""
+
+    def _spawn(self):
+        return subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+    def _terminate(self, proc):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
+
+    def test_stranded_task_is_redispatched_exactly_once_by_the_next_generation(self):
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        gen1 = self._spawn()
+        try:
+            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.write_task("task-handoff.txt")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-handoff.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("generation 1 never dispatched the task:\n" + self.sendkeys_log_text())
+            # The core crashes before completing (no result lands) and its
+            # tmux session disappears while gen1's own process survives.
+            self.session_flag.unlink()
+            time.sleep(1.0)  # let gen1 notice the dead session and drop cleanly
+        finally:
+            self._terminate(gen1)  # start-cli.sh would kill the stale generation here
+
+        # A real restart gives a fresh pane and a fresh core session: no
+        # memory of gen1's dispatch attempt.
+        self.sendkeys_log.write_text("")
+        self.session_flag.write_text("up")
+        self.pane_file.write_text(IDLE_MARKER + "\n")
+
+        gen2 = self._spawn()
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-handoff.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("generation 2's initial sweep never re-armed the stranded task:\n"
+                          + self.sendkeys_log_text())
+            self.write_result("task-handoff.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and gen2.poll() is None:
+                time.sleep(0.2)
+            type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-handoff.txt")
+            self.assertEqual(
+                type_calls, 1,
+                f"exactly one post-restart dispatch expected, got {type_calls}:\n"
+                + self.sendkeys_log_text())
+        finally:
+            self._terminate(gen2)
+
+
 class StartCliNotifierWiringTest(unittest.TestCase):
     """start-cli.sh's ensure_task_notifier: does a launch actually start the
     watcher session, and does a second invocation avoid a duplicate. Needs a
@@ -607,6 +738,11 @@ case "$cmd" in
       prev="$a"
     done
     [ -n "$name" ] && touch "{self.sessions_dir}/$name"
+    exit 0
+    ;;
+  kill-session)
+    name="${{2#=}}"
+    rm -f "{self.sessions_dir}/$name"
     exit 0
     ;;
   attach)
@@ -685,6 +821,48 @@ esac
             new_session_calls_after_first, new_session_calls_after_second,
             "a second invocation must not start a duplicate watcher session",
         )
+
+    def test_crash_restart_recycles_the_stale_watcher_exactly_once(self):
+        # Core crash: SESSION's tmux session dies but WATCHER_SESSION survives
+        # (it runs in its own tmux session, independent of the core's).
+        first = self.run_launcher()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        core_marker = self.sessions_dir / "sutando-agy-wiretest"
+        watcher_marker = self.sessions_dir / "sutando-agy-wiretest-watcher"
+        self.assertTrue(core_marker.exists())
+        self.assertTrue(watcher_marker.exists())
+
+        core_marker.unlink()  # the core's tmux session died; the watcher's did not
+
+        second = self.run_launcher()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertTrue(watcher_marker.exists(),
+                         "a fresh watcher must be running after the crash-restart handoff")
+
+        log_lines = self.tmux_log.read_text().splitlines()
+        # Each line is "-S <socket> <cmd> ...", so match the command as a
+        # substring rather than a prefix.
+        kill_lines = [ln for ln in log_lines
+                      if "kill-session" in ln and "sutando-agy-wiretest-watcher" in ln]
+        self.assertEqual(len(kill_lines), 1,
+                          f"exactly one stale watcher must be terminated on a real core restart: {log_lines}")
+        watcher_new_session_lines = [ln for ln in log_lines
+                                      if "new-session" in ln and "task-notifier.sh" in ln]
+        self.assertEqual(
+            len(watcher_new_session_lines), 2,
+            f"exactly one fresh notifier must start per launch, none skipped or doubled: {log_lines}")
+
+    def test_normal_reattach_does_not_recycle_a_live_watcher(self):
+        # No crash: the same core session is still alive, so the watcher must
+        # be left running untouched, not killed and restarted on re-invocation.
+        first = self.run_launcher()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self.run_launcher()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        kill_lines = [ln for ln in self.tmux_log.read_text().splitlines()
+                      if "kill-session" in ln]
+        self.assertEqual(kill_lines, [],
+                          "a live watcher must never be killed on a plain re-attach")
 
 
 if __name__ == "__main__":
