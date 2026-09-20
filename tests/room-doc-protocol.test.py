@@ -24,8 +24,9 @@ class _Resp:
 
 
 class _HttpError(Exception):
-    def __init__(self, status):
+    def __init__(self, status, body=b""):
         self.response = _Resp(status)
+        self.response.body = body
 
 
 class _Closed(Exception):
@@ -102,10 +103,23 @@ def test_url_refuses_what_it_cannot_derive_a_socket_from():
         raises(RoomDocError, lambda b=bad: doc_socket_url(b, "!r:s"))
 
 
-def test_a_refusal_names_the_credential_kind_not_just_the_number():
-    text = explain(_HttpError(403), "wss://h/ws")
-    assert "403" in text and "doc.write" in text, text
-    assert "Matrix access token" in text, "it must say which credentials qualify"
+def test_each_rung_names_a_different_owner():
+    """401, 403 and an edge 403 look alike from outside and are fixed by three
+    different people. Three agents chased the wrong one tonight; the text must
+    make the ladder visible, not just echo the number."""
+    unknown = explain(_HttpError(401, b"bearer is not a valid Matrix user session"), "wss://h/ws")
+    assert "401" in unknown and "provisioning" in unknown, unknown
+    assert "bearer is not a valid Matrix user session" in unknown, "the service's own words survive"
+    assert "register" in unknown, "it says who fixes it"
+
+    room = explain(_HttpError(403, b'{"code":"forbidden"}'), "wss://h/ws")
+    assert "403" in room and "room admin" in room, room
+    assert "doc.write" not in room and "Matrix access token" not in room, \
+        "the retired credential model must not be re-taught"
+
+    edge = explain(_HttpError(403, b"error code: 1010"), "wss://h/ws")
+    assert "Cloudflare" in edge and "never saw" in edge, edge
+    assert "room admin" not in edge, "an edge refusal is not a room answer"
 
 
 def test_a_404_explains_that_non_members_are_hidden():
@@ -113,10 +127,13 @@ def test_a_404_explains_that_non_members_are_hidden():
     assert "404" in text and "member" in text, text
 
 
-def test_a_401_and_an_unknown_error_still_say_something_usable():
-    assert "401" in explain(_HttpError(401), "wss://h/ws")
+def test_a_426_says_to_use_the_client():
+    assert "websocket only" in explain(_HttpError(426), "https://h/authz")
+
+
+def test_an_unknown_error_still_says_something_usable():
     other = explain(ValueError("boom"), "wss://h/ws")
-    assert "ValueError" in other and "boom" in other, other
+    assert "boom" in other and "wss://h/ws" in other
 
 
 def test_close_codes_are_translated_not_echoed():

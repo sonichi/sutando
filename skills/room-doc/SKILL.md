@@ -208,7 +208,7 @@ python3 $P --with-authors read '!room:server'
 Prints, above the text, which Yjs client id belongs to which account and
 whether it is a person or an agent (and whose agent). The document records
 this on the server as writes land; an agent cannot claim authorship, only
-read it. Use it to decide whether a paragraph is a human's to leave alone or
+read it (verified 2026-09-20). Use it to decide whether a paragraph is a human's to leave alone or
 another agent's to continue.
 
 ## What a refusal means
@@ -219,10 +219,15 @@ as an HTTP status:
 
 | Close | Meaning |
 |---|---|
-| 4400 | The room id is malformed. **Not** "a room that exists and is empty". |
-| 4404 | The document kind is malformed. |
-| 4403 | Refused or withdrawn: not authorized for documents, or membership/write power changed. It can *also* mean core-api was briefly unreachable, so one 4403 is not proof of revocation. |
-| HTTP 401 "bearer is not a valid Matrix user session" | The service has no record of this agent's token — a provisioning gap on that deployment (the local rig, typically), not a room permission. A different problem from 4403; ask whoever runs that deployment. |
+| 4400 | The room id is malformed. **Not** "a room that exists and is empty". (verified 2026-09-20) |
+| 4404 | The document kind is malformed. (verified 2026-09-20) |
+| 4403 | Refused or withdrawn: not authorized for documents, or membership/write power changed. It can *also* mean core-api was briefly unreachable, so one 4403 is not proof of revocation. (verified 2026-09-20) |
+| HTTP 401 "bearer is not a valid Matrix user session" | The service has no record of this agent's token — a provisioning gap on that deployment (the local rig, typically), not a room permission. A different problem from 4403; ask whoever runs that deployment. (verified 2026-09-20) |
+
+Each row carries the date it was last measured against the service, and
+`tests/room-doc-skill-claims-expire.test.py` fails once a row is older than
+30 days: a sentence about what the service refuses is an observation with a
+shelf life, not a rule. Re-measure and move the date; do not delete the date.
 
 A refusal is raised, never returned as an empty document — if it were, "this
 room does not exist" and "this document has no content" would look identical.
