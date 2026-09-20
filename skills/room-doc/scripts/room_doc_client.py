@@ -39,6 +39,7 @@ from room_doc_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
+from room_kanban import KANBAN_KIND  # noqa: E402
 
 from room_doc_protocol import (  # noqa: E402
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
@@ -62,9 +63,9 @@ class RoomDoc:
         self._awareness = awareness
         self._kind = kind
         self._text_name = text_name
-        # A board is a map of elements, not a text. Resolving the text on one
-        # would materialise an empty key that reads exactly like an empty board.
-        self._text = None if kind == BOARD_KIND else doc.get(text_name, type=Text)
+        # ONLY the markdown document is a text; naming the non-text kinds
+        # instead lets the next one read empty and accept unseen writes.
+        self._text = doc.get(text_name, type=Text) if kind == DEFAULT_KIND else None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
         self._ended: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -81,17 +82,17 @@ class RoomDoc:
         return self._kind
 
     def _require_text(self, what: str) -> Any:
-        """A text operation on a board is refused, never answered with "".
-
-        Returning empty here is the exact failure this client was written to
-        prevent elsewhere: a refusal that reads as an empty document.
-        """
+        """A text operation on a structured document is refused, never answered
+        with "". An empty string reads as an empty document, and a write that
+        lands where nothing reads it is worse than an error."""
         if self._text is None:
+            where = {BOARD_KIND: f"elements under {ELEMENTS_KEY!r}",
+                     KANBAN_KIND: "cards and columns"}.get(
+                         self._kind, "structured data")
             raise RoomDocError(
-                f"cannot {what} on the {self._kind!r} document: it holds a map of "
-                f"elements under {ELEMENTS_KEY!r}, not text. Use the element API "
-                "(elements / put_elements / delete_element), or open the markdown "
-                "document instead.")
+                f"cannot {what} on the {self._kind!r} document: it holds {where}, "
+                f"not text. Only the {DEFAULT_KIND!r} document is a text — open "
+                "that, or use the API for this kind.")
         return self._text
 
     @property

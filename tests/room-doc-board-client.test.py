@@ -150,6 +150,26 @@ async def test_deleting_an_absent_element_refuses():
 
 
 
+async def test_every_non_markdown_kind_refuses_text_not_just_the_board():
+    """The board fix named ONE kind, so kanban inherited the whole defect:
+    `read` answered "" and `append` succeeded, writing text into a board of
+    cards. A kind nobody has built yet must refuse too — the next surface
+    should not have to rediscover this."""
+    for kind in ("kanban", "slides", "sheet", "anything-later"):
+        doc = make(kind)
+        await expect_refusal(lambda d=doc: d.text, kind)
+        await expect_refusal(lambda d=doc: d.append("x"), kind)
+        assert doc._ws.sent == [], f"{kind}: a refused write reached the wire"
+
+
+async def test_the_markdown_document_is_still_the_one_text():
+    """Control: inverting the check must not refuse the document that IS text."""
+    doc = make(DEFAULT_KIND)
+    assert doc.text == ""
+    await doc.append("hello")
+    assert doc.text == "hello"
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 
