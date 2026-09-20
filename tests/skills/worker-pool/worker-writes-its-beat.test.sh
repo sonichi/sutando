@@ -6,7 +6,7 @@
 # --watch-pid exists for exactly that: it tracks an arbitrary pid by signal,
 # not by parentage, so the beat writer's own reparenting is harmless.
 set -u
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 fails=0
 check() { if eval "$2"; then echo "  ok: $1"; else echo "  FAIL: $1"; fails=$((fails+1)); fi; }
 

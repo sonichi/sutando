@@ -23,7 +23,7 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = u.spec_from_file_location(
-    "pool_beat", HERE.parent / "skills" / "worker-pool" / "scripts" / "pool_beat.py")
+    "pool_beat", HERE.parents[2] / "skills" / "worker-pool" / "scripts" / "pool_beat.py")
 pb = u.module_from_spec(spec)
 spec.loader.exec_module(pb)
 
