@@ -19,6 +19,28 @@ each other's cursors visible.
 Two different stores. Writing to one never shows up in the other. This has already
 sent one agent to the wrong place, which is why the warning is here and not further down.
 
+## First contact — if you were @-mentioned and have never done this
+
+```bash
+P=skills/room-doc/scripts/room_doc.py
+python3 $P doctor '!room:server'                       # 1. every setup step, one line each
+python3 $P read   '!room:server'                       # 2. find the line that names you
+python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 3. answer UNDER it, signed
+```
+
+Then say one line in the room ("replied in the doc") — the person who called
+you is watching the room, not the document. With the lane env loaded no flag
+is needed; `doctor` tells you which step fails if one does.
+
+Use `append` to reply, not `replace`: your text lands where nobody else is
+typing, and the merge keeps everyone's characters. `replace` is for editing a
+sentence you own.
+
+**Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
+`--json` belong to the program, not the command: `room_doc.py --kind board
+read <room>` works, `room_doc.py read <room> --kind board` is refused as
+"unrecognized arguments".
+
 ## Requirements
 
 ```bash
@@ -70,9 +92,14 @@ indistinguishable from an empty whiteboard, and `append` used to succeed while
 writing text no Excalidraw client ever reads.
 
 ```bash
-python3 $P --kind board read  '!room:server'          # list elements in drawing order
-python3 $P --kind board draw  '!room:server' '[{"id":"r1","type":"rectangle","x":0,"y":0,"width":100,"height":60,"version":1}]'
-python3 $P --kind board erase '!room:server' 'r1'     # marks isDeleted, the editor's own deletion
+python3 $P --kind board read  '!room:server'          # FIRST: what is already there, and where
+python3 $P --kind board --json read '!room:server'    # …with x/y/width/height, to find free space
+# A labelled box below whatever occupied y ≤ 400 — a box and its label are two elements:
+python3 $P --kind board draw '!room:server' '[
+  {"id":"w1","type":"rectangle","x":40,"y":460,"width":220,"height":80,"version":1},
+  {"id":"w1t","type":"text","x":56,"y":488,"width":188,"height":24,"version":1,
+   "text":"Worker 1","fontSize":20,"fontFamily":1,"textAlign":"left","verticalAlign":"top"}]'
+python3 $P --kind board erase '!room:server' 'w1'     # marks isDeleted, the editor's own deletion
 python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
 ```
 
@@ -85,7 +112,8 @@ space (only `y` changes, the batch keeps its shape). Coordinates that already
 sit in clear space are written exactly as given, and re-writing your own
 elements (same ids, higher `version`) never moves them. Pass `--absolute` when
 the coordinates are final and you mean to draw over something. `read` first
-if you want to choose the spot yourself.
+if you want to choose the spot yourself. Use ids of your own (a prefix that is
+yours) — a write to an existing id is an edit of that element, not a new one.
 
 An element needs `id` (equal to its key), a `type` the board draws, finite
 `x`/`y`/`width`/`height`/`version`. A write lands only when it is **newer**
@@ -127,6 +155,18 @@ Three things that matter more than they look:
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
 
+## Who wrote what
+
+```bash
+python3 $P --with-authors read '!room:server'
+```
+
+Prints, above the text, which Yjs client id belongs to which account and
+whether it is a person or an agent (and whose agent). The document records
+this on the server as writes land; an agent cannot claim authorship, only
+read it. Use it to decide whether a paragraph is a human's to leave alone or
+another agent's to continue.
+
 ## What a refusal means
 
 The service **accepts the socket and only then closes** with a code, because a
@@ -138,6 +178,7 @@ as an HTTP status:
 | 4400 | The room id is malformed. **Not** "a room that exists and is empty". |
 | 4404 | The document kind is malformed. |
 | 4403 | Refused or withdrawn: not authorized for documents, or membership/write power changed. It can *also* mean core-api was briefly unreachable, so one 4403 is not proof of revocation. |
+| HTTP 401 "bearer is not a valid Matrix user session" | The service has no record of this agent's token — a provisioning gap on that deployment (the local rig, typically), not a room permission. A different problem from 4403; ask whoever runs that deployment. |
 
 A refusal is raised, never returned as an empty document — if it were, "this
 room does not exist" and "this document has no content" would look identical.

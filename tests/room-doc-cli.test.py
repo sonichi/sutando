@@ -126,6 +126,25 @@ def test_a_compound_token_alone_is_enough_to_find_the_service():
         clear_env()
 
 
+def test_doctor_names_the_source_and_shape_but_never_the_secret():
+    """A new agent's first failure is discovery: WHICH variable, WHICH shape,
+    WHICH host. The report answers those and must not echo the token."""
+    env = {"REMOTE_TASK_TOKEN": "https://chat.example/relay|s3cretvalue"}
+    rows = {step: (ok, detail) for step, ok, detail in room_doc.credential_report(None, None, env)}
+    assert rows["token"][0] and "REMOTE_TASK_TOKEN" in rows["token"][1]
+    assert "compound" in rows["token"][1] and "11 chars" in rows["token"][1]
+    assert "s3cretvalue" not in rows["token"][1], "the secret leaked into the report"
+    assert rows["url"][0] and "compound token" in rows["url"][1], \
+        "with no URL variable the compound token's origin is the source"
+
+
+def test_doctor_reports_each_missing_piece_on_its_own_row():
+    rows = {step: ok for step, ok, _ in room_doc.credential_report(None, None, {})}
+    assert rows == {"token": False, "url": False}
+    rows = {step: ok for step, ok, _ in room_doc.credential_report("t", None, {"AG2_API_ROOT": "x"})}
+    assert rows == {"token": True, "url": True}
+
+
 def test_a_missing_url_names_its_variables():
     clear_env()
     try:
