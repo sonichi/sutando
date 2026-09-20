@@ -39,11 +39,14 @@ from room_doc_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
+
 from room_doc_protocol import (  # noqa: E402
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
 )
 
+# The server's attribution map. This client reads it and never writes it.
+AUTHORS_KEY = "authors"
 SYNC_TIMEOUT_S = 20.0
 # Marks a transaction as ours, so the reconcile observer can ignore its own writes.
 LOCAL_ORIGIN = "room-doc-client"
@@ -132,6 +135,30 @@ class RoomDoc:
             if isinstance(state, dict) and isinstance(state.get("user"), dict):
                 out.append(state["user"])
         return out
+
+    @property
+    def authors(self) -> dict[str, dict]:
+        """Who wrote with each Yjs client id, as the SERVER recorded it.
+
+        Read-only on purpose: this map is the server's, and a client that wrote
+        to it would be claiming an identity rather than reporting one.
+        """
+        try:
+            authors = self._doc.get(AUTHORS_KEY, type=Map)
+        except Exception:  # noqa: BLE001 - an absent map is simply no attribution
+            return {}
+        return {str(k): dict(v) for k, v in authors.items() if isinstance(v, dict)}
+
+    def wrote(self, client_id: int | str) -> dict | None:
+        """The author behind one client id, or None when unknown or disputed.
+
+        A disputed id answers None rather than picking a claimant: two accounts
+        used it, and guessing between them would invent the answer.
+        """
+        row = self.authors.get(str(client_id))
+        if not row or "disputed" in row:
+            return None
+        return row
 
     def _require_live(self) -> None:
         if self._ended.done():

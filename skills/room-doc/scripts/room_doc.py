@@ -64,7 +64,8 @@ def parse_elements(raw: str) -> list:
 
 def render(command: str, *, text: str = "", peers: list | None = None,
            as_json: bool = False, before: int | None = None,
-           elements: list | None = None, written: int | None = None) -> str:
+           elements: list | None = None, written: int | None = None,
+           authors: dict | None = None) -> str:
     """What the CLI prints, decided without a socket in hand.
 
     Kept pure so the output contract is testable anywhere: a caller parsing
@@ -88,8 +89,17 @@ def render(command: str, *, text: str = "", peers: list | None = None,
             return json.dumps({"ok": True, "written": written, "count": len(elements)})
     if command == "read":
         if as_json:
-            return json.dumps({"chars": len(text), "peers": peers, "text": text},
-                              ensure_ascii=False, indent=2)
+            payload = {"chars": len(text), "peers": peers, "text": text}
+            if authors is not None:
+                payload["authors"] = authors
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if authors:
+            # Named above the text, because an agent decides whether to trust
+            # or edit the content by WHO produced it.
+            lines = [f"{c}: {a.get('mxid','?')} ({a.get('kind','?')}"
+                     + (f", agent of {a['owner_mxid']}" if a.get("owner_mxid") else "") + ")"
+                     for c, a in sorted(authors.items())]
+            return "authors:\n  " + "\n  ".join(lines) + "\n\n" + text
         return text
     if command == "peers":
         return json.dumps(peers, ensure_ascii=False, indent=2)
@@ -132,7 +142,8 @@ async def run(args: argparse.Namespace) -> int:
                     f"{args.command!r} is a text command; the board holds elements. "
                     "Use read, draw, erase or peers.")
             print(render(args.command, peers=doc.peers, as_json=args.json,
-                         elements=doc.elements, written=written))
+                         elements=doc.elements, written=written,
+                         authors=doc.authors if args.with_authors else None))
             return 0
 
         if args.command in ("draw", "erase"):
@@ -146,7 +157,8 @@ async def run(args: argparse.Namespace) -> int:
             await doc.replace(args.old, args.new)
             await doc.settle(args.settle)
         print(render(args.command, text=doc.text, peers=doc.peers,
-                     as_json=args.json, before=before))
+                     as_json=args.json, before=before,
+                     authors=doc.authors if args.with_authors else None))
     return 0
 
 
@@ -162,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--with-authors", dest="with_authors", action="store_true",
+                   help="also report who wrote with each Yjs client id")
     sub = p.add_subparsers(dest="command", required=True)
 
     for name, help_text in (("read", "print the document"), ("peers", "who is present")):
