@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
 
-TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
+# The collab names lead; the ROOM_DOC_* spellings are read for one release
+# more so an install that set them keeps working through the rename.
+TOKEN_VARS = ("AG2_MATRIX_TOKEN", "ROOM_COLLAB_TOKEN", "ROOM_DOC_TOKEN", "MATRIX_ACCESS_TOKEN",
               "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-URL_VARS = ("AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
+URL_VARS = ("AG2_ROOM_COLLAB_URL", "AG2_ROOM_DOC_URL", "AG2_API_ROOT", "REMOTE_TASK_URL")
 IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 
 
@@ -397,7 +399,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="room_collab", description=__doc__)
-    p.add_argument("--url", help="service origin (else $AG2_ROOM_DOC_URL, $AG2_API_ROOT, or the relay's)")
+    p.add_argument("--url", help="service origin (else $AG2_ROOM_COLLAB_URL, $AG2_API_ROOT, or the relay's)")
     p.add_argument("--token", help="bearer; the relay token works (else the env, see SKILL.md)")
     p.add_argument("--name", help="presence name to publish while connected")
     p.add_argument("--user-id", dest="user_id", default=None,

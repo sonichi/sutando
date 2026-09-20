@@ -145,6 +145,8 @@ jobs:
         run: |
           timeout -k 5 120 python3 scripts/lint-skill.test.py
           timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
+          # The rename keeps a few old spellings alive on purpose; this refuses NEW ones.
+          timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
