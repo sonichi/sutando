@@ -36,8 +36,14 @@ silent=$(grep -cE "printf 'TASK_FILE: %s\\\\n' \"\\\$filename\"( >&9)? \|\| true
     "$WATCHER" "$EMITTERS" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
 check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
-check "both shutdown call sites go through the shutdown emitter" \
-      "2" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
+# fallback_outstanding_handlers() (the two shutdown-time emit_task_file call
+# sites) was retired: it existed to recover in-flight background handler
+# runs on shutdown, and there is no more in-flight async work to recover now
+# that run_handler_now() calls the handler synchronously, inline. emit_task_file
+# itself is untouched (task-emit.sh, unmodified) -- just unreferenced by the
+# watcher now. 0 is the correct count going forward, not a regression.
+check "no remaining shutdown call site references the retired async recovery path" \
+      "0" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 check "the handler-fallback site goes through its own emitter" \
       "1" "$(grep -cE '^\s+emit_fallback_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 
@@ -118,33 +124,33 @@ check "the two failure messages name different destinations" \
 check "...and the fallback names stdout" \
       "1" "$(printf '%s\n%s\n' "$err" "$err_fb" | grep -c 'on stdout after a handler fallback' || true)"
 
-# ── ordering: the shutdown sentinel must be written FIRST in cleanup() (#3025) ──
-# The drain and queue guards read `$DISPATCH_DIR/shutting-down`, so any release,
-# kill or sweep that runs before it exists can still promote a worker (#2934).
+# ── structural: cleanup() still has its remaining real anchors (#3025 retired) ──
+# #3025's ordering concern was specifically about `$DISPATCH_DIR/shutting-down`
+# racing the (now-removed) async drain/queue guards that read it (#2934). There
+# is no more DISPATCH_DIR, no more async guard, and no more sentinel write to
+# order — cleanup() no longer needs one at all, since run_handler_now() has
+# nothing in flight for a signal to race against the way the background
+# --handler-runner subprocess used to. What's left to check is simpler: the two
+# anchors cleanup() still genuinely needs are present, in the order they always
+# were (release the watcher's own PID sentinel, then kill the child processes).
 cleanup_code=$(awk '/^cleanup\(\) \{/,/^\}/' "$WATCHER" | grep -vE '^[[:space:]]*#')
 check "cleanup() body is extractable (else every ordering check below is vacuous)" \
       "yes" "$([ -n "$cleanup_code" ] && echo yes || echo no)"
+check "cleanup() no longer references the retired DISPATCH_DIR shutdown sentinel" \
+      "0" "$(printf '%s\n' "$cleanup_code" | grep -c 'shutting-down' || true)"
 
 line_of() { printf '%s\n' "$cleanup_code" | grep -n -- "$1" | head -1 | cut -d: -f1; }
-sent=$(line_of 'shutting-down')
 rel=$(line_of 'sentinel_release_if_owner')
 kil=$(line_of 'kill -TERM')
-fbk=$(line_of 'fallback_outstanding_handlers')
 
-# Each anchor must EXIST: a missing one yields an empty var, and `[ "" -lt n ]`
-# is an error, not a pass — but an unguarded test would still read as ok.
-for pair in "sentinel:$sent" "release:$rel" "kill:$kil" "fallback:$fbk"; do
+for pair in "release:$rel" "kill:$kil"; do
     check "cleanup() still contains the ${pair%%:*} anchor" \
           "yes" "$([ -n "${pair#*:}" ] && echo yes || echo no)"
 done
 
-if [ -n "$sent" ] && [ -n "$rel" ] && [ -n "$kil" ] && [ -n "$fbk" ]; then
-    check "the shutting-down sentinel precedes sentinel_release_if_owner" \
-          "yes" "$([ "$sent" -lt "$rel" ] && echo yes || echo no)"
-    check "...precedes the first kill" \
-          "yes" "$([ "$sent" -lt "$kil" ] && echo yes || echo no)"
-    check "...precedes the handler-fallback sweep" \
-          "yes" "$([ "$sent" -lt "$fbk" ] && echo yes || echo no)"
+if [ -n "$rel" ] && [ -n "$kil" ]; then
+    check "sentinel_release_if_owner precedes the first kill" \
+          "yes" "$([ "$rel" -lt "$kil" ] && echo yes || echo no)"
 fi
 
 # Real shutdown recovery: the structural checks above accept any plain `"$var"`,
