@@ -38,9 +38,21 @@ session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SE
 watcher_session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null; }
 
 # Starts task-notifier.sh in its own tmux session, once per core session.
-# No crash-restart supervision — a dead watcher is recreated on next launch.
+# fresh_core=1 recycles a surviving-but-stale watcher; its initial sweep re-arms durable pending work.
 ensure_task_notifier() {
-  watcher_session_exists && return 0
+  local fresh_core="${1:-0}"
+  if watcher_session_exists; then
+    [ "$fresh_core" = 1 ] || return 0
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    for _ in $(seq 1 25); do
+      watcher_session_exists || break
+      sleep 0.2
+    done
+    if watcher_session_exists; then
+      echo "  ⚠ stale agy task notifier would not terminate — leaving it running, tasks may lag" >&2
+      return 0
+    fi
+  fi
   [ -x "$NOTIFIER" ] || { echo "  ⚠ agy task notifier not found/executable: $NOTIFIER — tasks will not reach this session" >&2; return 0; }
   # task-notifier.sh hard-requires fswatch; without it the pane process dies
   # within ~1s, so a tmux new-session that "succeeds" leaves nothing alive.
@@ -169,7 +181,7 @@ if ! session_exists; then
   exit 1
 fi
 
-ensure_task_notifier
+ensure_task_notifier 1
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"

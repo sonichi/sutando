@@ -114,6 +114,12 @@ class NotifierDependencyGateTest(unittest.TestCase):
         fswatch_path = shutil.which("fswatch")
         if fswatch_path is None:
             self.skipTest("fswatch not installed on this host")
+        # Symlink tmux in too, same as the negative arm — on a packaged host
+        # tmux is not guaranteed to live under /usr/bin or /bin either.
+        tmux_path = shutil.which("tmux")
+        if tmux_path is None:
+            self.skipTest("tmux not installed on this host")
+        self._symlink_only("tmux", tmux_path)
         path = f"{self.bin}:{os.path.dirname(fswatch_path)}:/usr/bin:/bin"
         result = self._run_launcher(path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
