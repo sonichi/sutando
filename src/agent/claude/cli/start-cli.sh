@@ -21,7 +21,6 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
-. "$REPO/src/agent/task-event-handler-lookup.sh"
 
 # Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
 # fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
@@ -779,30 +778,9 @@ ensure_task_notifier() {
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
   )
-  # The resolved outcome is part of the identity below, so resolve first: a
-  # publisher installed, removed or duplicated must replace a running watcher.
-  handler_rc=0
-  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    # A self-heal that could not confirm "no pool" and could not repair one
-    # either must refuse -- resolving anyway would read its own failure as
-    # the ordinary no-publisher case and start unrestricted (fail OPEN).
-    if ! ensure_task_event_handlers_published "$REPO"; then
-      echo "  ⚠ task notifier not started: a task-event-handler publisher could not self-heal." >&2
-      echo "    Fix the error above, or pin SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
-      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-      return 0
-    fi
-    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
-    [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
-  fi
-  # Fail CLOSED: without the router probe a worker-bound task would fall
-  # through to the unrestricted core, the inheritance the handler prevents.
-  if [ "$handler_rc" = 2 ]; then
-    echo "  ⚠ task notifier not started: several skills publish skills/*/task-event-handler." >&2
-    echo "    Pin one with SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
-    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    return 0
-  fi
+  # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
+  # itself and fswatches it for changes, so the launcher forwards only a genuine
+  # operator pin (if one is already set) and nothing computed.
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
   expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')"

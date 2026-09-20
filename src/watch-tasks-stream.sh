@@ -141,6 +141,24 @@ FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fall
 }
 WATCHER_ID="$$-${RANDOM:-0}"
 
+# Core only: a worker's own inbox is already the routing decision (#4502), so
+# it never reads or watches this file. A skill declares the handler by writing
+# it (e.g. worker-pool's register_worker()); this process fswatches it below
+# and reloads CURRENT_HANDLER the moment it changes -- no restart needed.
+HANDLER_CONFIG_PATH=""
+CURRENT_HANDLER=""
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  HANDLER_CONFIG_PATH="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
+    echo "watch-tasks-stream: could not resolve the task-event-handler config path" >&2
+    exit 1
+  }
+fi
+
+reload_current_handler() {
+  CURRENT_HANDLER="$(task_event_handler "$HANDLER_CONFIG_PATH")" || CURRENT_HANDLER=""
+}
+[ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
+
 claim_is_live() {
   local claim="$1" owner_pid
   [ -f "$claim" ] || return 1
@@ -265,21 +283,13 @@ publish_terminal_failure() {
 # Only core makes a routing decision (should this task go to a bound worker);
 # a worker's own inbox already IS that decision, made by whoever delivered the
 # sentinel there (#4502). So a worker never probes a handler, regardless of
-# SUTANDO_TASK_EVENT_HANDLER, and only core's branch resolves one at all.
+# CURRENT_HANDLER, and only core's branch ever calls this.
 #
-# Core resolves it here, in-process, on every watcher start instead of relying
-# on a value inherited from launch: a manual re-arm (e.g. Monitor's 30-min
-# expiry) starts a fresh subprocess whose env does not reliably carry whatever
-# start-cli.sh exported at the original launch, and a forgotten pin silently
-# misroutes every task to the live core (#4502's live incident).
-if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
-  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    ensure_task_event_handlers_published "$__REPO_ROOT" || true
-    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$__REPO_ROOT")" || SUTANDO_TASK_EVENT_HANDLER=""
-  fi
-fi
-
-if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+# Idempotent, and called both here (only when a handler is already declared at
+# startup) and lazily from dispatch_task() on the first routed task, so a
+# handler declared later still gets its queue with no restart.
+ensure_dispatch_ready() {
+  [ -z "$DISPATCH_DIR" ] || return 0
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
     "$DISPATCH_DIR/workers"
@@ -291,6 +301,10 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
     claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
+}
+
+if [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ]; then
+  ensure_dispatch_ready
 fi
 
 acquire_dispatch_lock() {
@@ -383,7 +397,7 @@ handler_result_exists() {
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
+  local filename worker_pid reprobe_rc
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -428,8 +442,34 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
+    # Re-checked here, not trusted from enqueue time: a receipt may outlive
+    # the handler that admitted it (a config change since it was queued), and
+    # CURRENT_HANDLER is already the live value -- fswatch keeps it current,
+    # so this costs a variable read, not a subprocess. finish_handler_task
+    # re-enters drain_dispatch_queue itself, so the lock must be released
+    # first and this call must return, never loop, to avoid a self-deadlock.
+    if [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+      release_dispatch_lock
+      DRAIN_ACTIVE=""
+      finish_handler_task "$running_marker" "$task_path" 1
+      return
+    fi
+    "$CURRENT_HANDLER" \
+      --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+      --workspace "$WORKSPACE_DIR" \
+      --task-file "$task_path" \
+      --results-dir "$RESULTS_DIR" \
+      --repo "$__REPO_ROOT" \
+      --probe >/dev/null
+    reprobe_rc=$?
+    if [ "$reprobe_rc" -ne 0 ] && [ "$reprobe_rc" -ne 4 ]; then
+      release_dispatch_lock
+      DRAIN_ACTIVE=""
+      finish_handler_task "$running_marker" "$task_path" "$reprobe_rc"
+      return
+    fi
     SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
-      "$SUTANDO_TASK_EVENT_HANDLER" \
+      "$CURRENT_HANDLER" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
       "$task_path" \
@@ -512,11 +552,16 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if [ -z "$DISPATCH_DIR" ]; then
+  # Only core makes a routing decision; a worker's own inbox already IS that
+  # decision (#4502). CURRENT_HANDLER is never populated for a worker (see the
+  # SUTANDO_INSTANCE_ID gate at its assignment above), so this is enforced
+  # structurally too, not just by this early return.
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
     emit_dispatch_task_file "$announce"
     return
   fi
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  ensure_dispatch_ready
+  "$CURRENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
@@ -828,11 +873,19 @@ shopt -u nullglob
 # Mode A fix (#1088): `|| exit 0` on printf — if the consumer pipe is
 # dead, the first failed write exits immediately instead of silently
 # buffering ~100 events into the kernel pipe buffer.
+#
+# HANDLER_CONFIG_PATH (core only) rides the SAME fswatch process as a second
+# path: one fswatch, one FIFO, one read-loop -- consistent with how
+# HANDLER_DONE completion signals already share this FIFO with task events.
+# A skill writing a fresh declaration (or an operator editing/removing one)
+# reaches CURRENT_HANDLER on the very next event, no watcher restart.
+fswatch_paths=("$TASKS_DIR")
+[ -n "$HANDLER_CONFIG_PATH" ] && fswatch_paths+=("$HANDLER_CONFIG_PATH")
 fswatch \
   -l 0.5 \
   --event Created \
   --event Renamed \
-  "$TASKS_DIR" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
 while IFS= read -r path; do
   case "$path" in
@@ -848,6 +901,13 @@ while IFS= read -r path; do
         task_path="$(cat "$running_marker")"
         finish_handler_task "$running_marker" "$task_path" "$handler_rc"
       fi
+      ;;
+    "$HANDLER_CONFIG_PATH")
+      # Reload only: the next task (already fswatched separately, on tasks/)
+      # sees the new CURRENT_HANDLER in dispatch_task(); nothing here is
+      # queued yet, so there is nothing to drain on a bare config change.
+      reload_current_handler
+      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
       ;;
     *.txt)
       parent="$(dirname "$path")"

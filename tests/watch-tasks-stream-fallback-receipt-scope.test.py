@@ -6,10 +6,16 @@ emitting the task straight to its own live core. Measured against the real
 watcher with a stub fswatch and a logging handler:
 
     FOREIGN receipt -> stdout=[TASK_FILE: task-demo.txt]  handler=[probe]
-    scoped receipt  -> stdout=[]                          handler=[probe, handle]
+    scoped receipt  -> stdout=[]                          handler=[probe, probe, handle]
 
 The own-receipt cases are the negative control: bypassing on your OWN receipt is
 the feature, and a fix that broke it would pass a foreign-receipt test alone.
+
+A pool worker (SUTANDO_INSTANCE_ID set) is a separate case, not a receipt-scope
+variant of it: since #4502/#4503, a worker never consults a handler OR a receipt
+at all -- its own inbox already is the routing decision, made by whoever
+delivered the sentinel there. So a worker bypasses unconditionally, with the
+handler never even probed, regardless of which receipt (if any) exists.
 """
 import os
 import subprocess
@@ -79,8 +85,9 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-HANDLED = ["probe", "handle"]
+HANDLED = ["probe", "probe", "handle"]  # enqueue-time probe, then drain's own re-probe
 BYPASSED = ["probe"]
+NO_HANDLER_CALL = []  # a worker never probes: not even a bare "probe" entry
 
 so, hl = run(None, None)
 check("no receipt: the handler handles it", hl == HANDLED and not so, f"{so} {hl}")
@@ -90,12 +97,16 @@ check("own receipt: the watcher still bypasses to its core",
       hl == BYPASSED and any("TASK_FILE" in s for s in so), f"{so} {hl}")
 
 so, hl = run("worker-1", "default")
-check("a FOREIGN receipt does not bypass this instance's handler",
-      hl == HANDLED and not so, f"{so} {hl}")
+check("a worker bypasses unconditionally, even with someone else's receipt on disk",
+      hl == NO_HANDLER_CALL and any("TASK_FILE" in s for s in so), f"{so} {hl}")
 
 so, hl = run("worker-1", "worker-1")
-check("worker-1 still bypasses on its OWN receipt",
-      hl == BYPASSED and any("TASK_FILE" in s for s in so), f"{so} {hl}")
+check("a worker bypasses unconditionally on its own receipt too -- the receipt is irrelevant",
+      hl == NO_HANDLER_CALL and any("TASK_FILE" in s for s in so), f"{so} {hl}")
+
+so, hl = run("worker-1", None)
+check("a worker bypasses unconditionally with NO receipt at all",
+      hl == NO_HANDLER_CALL and any("TASK_FILE" in s for s in so), f"{so} {hl}")
 
 # STATE_DIR once re-resolved the CHECKOUT workspace while every other state path
 # followed argv-derived WORKSPACE_DIR, so this test deleted a live sentinel.
@@ -118,5 +129,6 @@ check("the canonical CHECKOUT sentinel is unchanged (read-only check)",
       f"before={_before!r} after={_after!r} -- either this test wrote it, or a real "
       f"watcher started mid-run; both are worth a human look")
 
-print(f"watch-tasks-stream-fallback-receipt-scope: {5 - len(FAILURES)}/5 passed")
+_TOTAL = 6
+print(f"watch-tasks-stream-fallback-receipt-scope: {_TOTAL - len(FAILURES)}/{_TOTAL} passed")
 sys.exit(1 if FAILURES else 0)
