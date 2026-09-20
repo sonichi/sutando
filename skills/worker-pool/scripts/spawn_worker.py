@@ -222,9 +222,8 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
         return {"ensured": False, "why": "launchd is macOS-only"}
     try:
         st = prt.status(launch_agents=launch_agents, runner=runner)
-        # Installed AND loaded is the whole job done. Returning here is also
-        # what keeps `pool_remedy` safe: it calls spawn() from inside the timer,
-        # and re-installing would bootout the job currently running.
+        # `pool_remedy` calls spawn() from inside this job, so re-installing
+        # a healthy timer would bootout the job currently running.
         if st.get("installed") and st.get("loaded"):
             return {"ensured": False, "why": "already installed",
                     "plist": st.get("plist")}

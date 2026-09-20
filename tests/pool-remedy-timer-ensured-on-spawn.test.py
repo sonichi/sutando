@@ -112,8 +112,7 @@ else:
     fail(f"never bootstrapped: {lc.argv}")
 
 # --- already installed: do NOT re-install ------------------------------------
-# pool_remedy calls spawn() from INSIDE this launchd job; re-installing would
-# bootout the job that is running.
+# pool_remedy calls spawn() from INSIDE this job; re-installing would bootout it.
 out, lc, _ = case("installed", loaded=True)
 if out.get("ensured") is False and out.get("why") == "already installed":
     ok("an installed+loaded timer is left alone")
@@ -143,8 +142,7 @@ else:
     fail(f"called launchctl off macOS: {lc.argv}")
 
 # --- the wiring: spawn() must actually call it -------------------------------
-# The helper existing is not the fix; a spawn that never calls it leaves the
-# host exactly as broken.
+# The helper existing is not the fix; an uncalled one leaves the host broken.
 src = (SCRIPTS / "spawn_worker.py").read_text()
 body = src[src.index("def spawn(workspace, repo"):src.index("def main(")]
 if "ensure_remedy_timer(" in body:
