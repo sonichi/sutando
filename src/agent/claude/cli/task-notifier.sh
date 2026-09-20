@@ -28,8 +28,15 @@ INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
+SUTANDO_PY_BIN="$NOTIFIER_PY"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
+# shellcheck source=../../task-event-handler-lookup.sh
+. "$REPO/src/agent/task-event-handler-lookup.sh"
+HANDLER_CONFIG_PATH="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
+  echo "task-notifier: could not resolve the task-event-handler config path" >&2
+  exit 1
+}
 TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
@@ -53,10 +60,12 @@ event_dir=""
 # A FRESH per-candidate probe, not a claims-dir file's existence, so a
 # required handler that hasn't published its claim yet still blocks dispatch.
 probe_optional_task_handler() {
-  local filename="$1" rc
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
-  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  local filename="$1" rc handler
+  # task_event_handler re-reads the JSON declaration fresh every call (an env
+  # pin still wins, live) -- the same source watch-tasks-stream.sh reads, so
+  # a worker registered after this notifier's process started is still seen.
+  handler="$(task_event_handler "$HANDLER_CONFIG_PATH")" || return 3
+  "$handler" \
     --runtime claude \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$TASKS_DIR/$filename" \

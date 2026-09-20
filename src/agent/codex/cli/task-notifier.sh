@@ -19,8 +19,15 @@ DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
+SUTANDO_PY_BIN="$NOTIFIER_PY"
 TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
+# shellcheck source=../../task-event-handler-lookup.sh
+. "$REPO/src/agent/task-event-handler-lookup.sh"
+HANDLER_CONFIG_PATH="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" task-event-handler-config-path "$(dirname "$TASKS_DIR")/state")" || {
+  echo "task-notifier: could not resolve the task-event-handler config path" >&2
   exit 1
 }
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
@@ -44,10 +51,12 @@ event_dir=""
 workstream_context_file=""
 
 probe_optional_task_handler() {
-  local filename="$1" rc
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
-  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  local filename="$1" rc handler
+  # task_event_handler re-reads the JSON declaration fresh every call (an env
+  # pin still wins, live) -- the same source watch-tasks-stream.sh reads, so
+  # a worker registered after this notifier's process started is still seen.
+  handler="$(task_event_handler "$HANDLER_CONFIG_PATH")" || return 3
+  "$handler" \
     --runtime codex \
     --workspace "$(dirname "$TASKS_DIR")" \
     --task-file "$TASKS_DIR/$filename" \
