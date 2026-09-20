@@ -203,6 +203,8 @@ let _archiveMonthCache: { mtimeMs: number; dirs: string[] } | null = null;
 export let _archiveScanCount = 0; // test-only: counts real readdirSync(archiveRoot) calls
 
 function _archiveMonthDirs(archiveRoot: string): string[] {
+	// Stat BEFORE readdir: a subdir created mid-scan then gets cached
+	// against a stale-low mtime (extra re-scan next time, never stale).
 	let mtimeMs: number;
 	try {
 		mtimeMs = statSync(archiveRoot).mtimeMs;
