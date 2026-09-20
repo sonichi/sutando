@@ -80,25 +80,6 @@ If the skill is not installed, skip silently. `/startup` works without it — ev
 
 Note: this step runs BEFORE step 2 so that the watcher (started by step 2's downstream) doesn't pick up an orphan task before recovery has classified it.
 
-### Step 1.7 — Worker-pool handler backfill (optional)
-
-IF `skills/worker-pool/` is installed, run its sweep once, synchronously, before the watcher starts:
-
-```bash
-python3 skills/worker-pool/scripts/pool_supervise.py --workspace "$(bash scripts/sutando-config.sh workspace)" --sweep --no-persist >/dev/null 2>&1 || true
-```
-
-`tick()`'s first action is `pool_roster.ensure_task_event_handler()` — it (re)publishes
-`state/task-event-handler.json` when a live worker exists and the declaration is missing or stale,
-which is the only case an EXISTING pool (no new registration since upgrading to this mechanism) ever
-gets it written. Run here, this closes the exact gap the watcher's core-only scoping created:
-without it, the config is absent until the worker-pool skill's own five-minute sweep timer first
-fires, and any task landing on the watcher before then falls straight to core, unrouted — silently,
-because "no config" and "no pool" read identically to both the watcher and the standby notifier.
-`--no-persist` avoids advancing the recovery ladder from a step whose only job is the backfill.
-
-If the skill is not installed, skip silently — same contract as step 1.
-
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
@@ -152,8 +133,6 @@ session start
 /startup
     │
     ├─► step 1:  /task-orphan-check (optional) ──► classifies + archives orphan tasks
-    │
-    ├─► step 1.7: worker-pool handler backfill (optional) ──► pool_supervise.py --sweep, BEFORE the watcher starts
     │
     ├─► step 2:  /schedule-crons ──┬─► step 1.5 (start watch-tasks-stream.sh via Monitor — FIRST, before registration)
     │                               ├─► step 2-3 (register crons.json entries)
