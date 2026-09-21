@@ -2,7 +2,7 @@
 # One SERIAL worker per git worktree: worker w takes lines w, w+W, w+2W... so a
 # worktree never holds two suites at once — exclusivity is structural, not a lock.
 # usage: parallel-suite-lane.sh <workers> <files-list> <recdir> <cmd-prefix...>
-# Records land as <recdir>/<line-index>.{out,rc}; aggregation stays the caller's.
+# Records land as <recdir>/<line-index>.{out,rc,time}; aggregation stays the caller's.
 set -uo pipefail
 WORKERS="$1"; FILES="$2"; RECDIR="$3"; shift 3
 N="$(wc -l < "$FILES" | tr -d ' ')"
@@ -29,9 +29,11 @@ for _w in $(seq 1 "$WORKERS"); do
         while [ "$idx" -le "$N" ]; do
             f="$(sed -n "${idx}p" "$FILES")"
             rec="$RECDIR/$idx"
+            _t0=$SECONDS
             out="$(cd "$WTDIR/$_w" && "$@" "$f" 2>&1 < /dev/null)" && rc=0 || rc=$?
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
+            printf "%s\n" "$(( SECONDS - _t0 ))" > "$rec.time"
             idx=$((idx + WORKERS))
         done
     ) &

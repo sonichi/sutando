@@ -231,19 +231,20 @@ jobs:
           # order: the environment these suites had before lanes existed.
           _s=0
           while IFS= read -r f; do
-            _s=$((_s + 1))
+            _s=$((_s + 1)); _t0=$SECONDS
             # </dev/null: a suite that reads stdin must not eat the rest of the list.
             if timeout -k 5 300 bash "$f" < /dev/null > "$RECDIR/serial-rec/$_s.out" 2>&1; then
               echo 0 > "$RECDIR/serial-rec/$_s.rc"
             else
               echo $? > "$RECDIR/serial-rec/$_s.rc"
             fi
+            echo $(( SECONDS - _t0 )) > "$RECDIR/serial-rec/$_s.time"
           done < "$RECDIR/serial"
           _idx=0; _rec="$RECDIR"
           while IFS= read -r f; do
             if [ "$f" = "--serial--" ]; then _idx=0; _rec="$RECDIR/serial-rec"; continue; fi
-            echo "→ $f"
             _idx=$((_idx + 1))
+            echo "→ $f ($(cat "$_rec/$_idx.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$_rec/$_idx.rc" 2>/dev/null || echo 1)"
             output="$(cat "$_rec/$_idx.out" 2>/dev/null || true)"
             if [ "$rc" -ne 0 ]; then
@@ -299,8 +300,14 @@ jobs:
           exit "$failed"
 
   python-standalone-tests:
-    name: python standalone tests
+    name: python standalone tests (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
+    # Two runners, each half the files by discovery order: 1,027 files at ~2s
+    # each is breadth, and the coverage-gate job combines both halves' data.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -341,6 +348,8 @@ jobs:
       # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           # Records are collected per file and replayed SERIALLY in sorted
           # order below, so `failed_files` keeps its order.
@@ -352,7 +361,9 @@ jobs:
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
-          bash scripts/discover-python-tests.sh > "$RECDIR/files"
+          bash scripts/discover-python-tests.sh > "$RECDIR/all"
+          # Line parity of the sorted discovery: every file lands in exactly one leg.
+          awk -v s="${SHARD:-1}" 'NR % 2 == s % 2' "$RECDIR/all" > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
@@ -379,9 +390,9 @@ jobs:
             timeout -k 5 -s ABRT "$FILE_TIMEOUT" python3 -m coverage run --rcfile=.coveragerc
           _idx=0
           while IFS= read -r f; do
-            echo "→ $f"
             _idx=$((_idx + 1))
             rec="$RECDIR/$_idx"
+            echo "→ $f ($(cat "$rec.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
             output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
@@ -409,19 +420,17 @@ jobs:
             printf '  %s\n' "${failed_files[@]}"
             exit "$failed"
           fi
-          # Green suite: merge the per-file fragments once, here, so the
-          # diff-coverage job measures this run instead of repeating it.
+          # Green leg: merge the per-file fragments once, here; the
+          # diff-coverage job combines the legs and measures this run.
           python3 -m coverage combine --quiet
-          python3 -m coverage xml --quiet
+          mv .coverage ".coverage.shard${SHARD:-1}"
 
       # `.coverage` is a dotfile, which upload-artifact v4 skips by default.
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-data
-          path: |
-            .coverage
-            coverage.xml
+          name: coverage-data-${{ matrix.shard }}
+          path: .coverage.shard${{ matrix.shard }}
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
@@ -450,7 +459,8 @@ jobs:
       - name: Download coverage data
         uses: actions/download-artifact@v4
         with:
-          name: coverage-data
+          pattern: coverage-data-*
+          merge-multiple: true
 
       - name: Run coverage gate
         env:
