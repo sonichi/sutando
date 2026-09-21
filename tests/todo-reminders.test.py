@@ -42,6 +42,7 @@ def good(**over):
         "importance": "should",
         "urgency": "soon",
         "size": "M",
+        "status": "approved",
     }
     record.update(over)
     return record
@@ -63,6 +64,55 @@ def test_refuses_bad_values_and_a_multiline_brief():
     assert any("one line" in p for p in todo.validate(good(brief="first\nsecond")))
     assert any("when must be" in p for p in todo.validate(good(when=["when i feel like it"])))
     assert any("due_at" in p for p in todo.validate(good(due_at="tomorrow")))
+
+
+def test_the_lifecycle_is_checked_and_a_blocked_item_must_say_what_it_waits_on():
+    assert any("status" in p for p in todo.validate(good(status="nearly-done")))
+    blocked = todo.validate(good(status="blocked"))
+    assert any("blocked_note" in p for p in blocked), blocked
+    assert todo.validate(good(status="blocked", blocked_note="waiting on #4550 to land")) == []
+
+
+def test_only_an_approved_item_is_picked_up(tmp):
+    """The owner's lifecycle gates pickup: an agent may propose anything, but
+    nothing is worked on before she approves it."""
+    proposed = todo.add(good(status="proposed", when=[]), workspace=tmp, now=1)
+    assert proposed["status"] == "proposed", "filing defaults to proposed, never approved"
+    assert not todo.is_ready(proposed, 100, {}), "a proposed item must not be picked up"
+    for held in ("blocked", "in_progress", "completion_declared", "confirmed"):
+        row = good(status=held, when=[], blocked_note="x")
+        assert not todo.is_ready(row, 100, {}), f"{held} must not be offered for pickup"
+    assert todo.is_ready(good(status="approved", when=[]), 100, {})
+
+
+def test_a_proposed_item_is_surfaced_to_the_owner_not_silently_held(tmp):
+    """If `proposed` gated pickup with nothing showing her the queue, filing a
+    TODO would be the same as dropping it."""
+    mine = todo.add(good(brief="needs her nod", status="proposed"), workspace=tmp, now=1)
+    todo.add(good(brief="already approved", status="approved"), workspace=tmp, now=2)
+    declared = todo.add(good(brief="says it is done", status="completion_declared"), workspace=tmp, now=3)
+    briefs = {r["brief"] for r in todo.awaiting_owner(tmp)}
+    assert briefs == {"needs her nod", "says it is done"}, briefs
+    assert mine["id"] in {r["id"] for r in todo.awaiting_owner(tmp)}
+    assert declared["id"] in {r["id"] for r in todo.awaiting_owner(tmp)}
+
+
+def test_set_status_moves_it_and_confirming_closes_it(tmp):
+    row = todo.add(good(), workspace=tmp)
+    assert todo.set_status(row["id"], "in_progress", workspace=tmp) is True
+    assert todo.load(tmp)[0]["status"] == "in_progress"
+    assert todo.set_status("todo-nope", "approved", workspace=tmp) is False
+    try:
+        todo.set_status(row["id"], "blocked", workspace=tmp)
+        raise AssertionError("blocked with no note was accepted")
+    except ValueError as exc:
+        assert "note" in str(exc), exc
+    assert todo.set_status(row["id"], "blocked", "waiting on review", workspace=tmp)
+    assert todo.load(tmp)[0]["blocked_note"] == "waiting on review"
+    # Confirming closes it, so status and state can never disagree.
+    assert todo.set_status(row["id"], "confirmed", workspace=tmp)
+    assert todo.load(tmp) == [], "a confirmed item is no longer open"
+    assert todo.load(tmp, state="done")[0]["status"] == "confirmed"
 
 
 def test_how_to_open_is_required_so_a_later_agent_can_find_the_doc():
@@ -207,7 +257,7 @@ def test_cli_refuses_then_files_and_lists(tmp):
             "add",
             "--room", "!r:x", "--note", "## TODO", "--how-to-open", "room_collab.py read '!r:x'",
             "--brief", "one line", "--importance", "must", "--urgency", "now", "--size", "S",
-            "--when", "idle",
+            "--when", "idle", "--status", "approved",
         ],
         capture_output=True, text=True, env=env,
     )
@@ -230,6 +280,27 @@ def test_cli_refuses_then_files_and_lists(tmp):
     assert row["id"] not in subprocess.run(
         base + ["list"], capture_output=True, text=True, env=env
     ).stdout
+    # A proposed item waits for her instead of being picked up.
+    prop = subprocess.run(
+        base + [
+            "add", "--room", "!r:x", "--note", "## TODO", "--how-to-open", "read '!r:x'",
+            "--brief", "needs a nod", "--importance", "nice", "--urgency", "soon", "--size", "S",
+        ],
+        capture_output=True, text=True, env=env,
+    )
+    assert prop.returncode == 0, prop.stderr
+    pid = json.loads(prop.stdout)["id"]
+    assert pid not in subprocess.run(
+        base + ["ready", "--idle"], capture_output=True, text=True, env=env
+    ).stdout, "a proposed item must not be ready"
+    assert pid in subprocess.run(
+        base + ["awaiting"], capture_output=True, text=True, env=env
+    ).stdout, "a proposed item must be shown to the owner"
+    moved = subprocess.run(
+        base + ["status", pid, "blocked"], capture_output=True, text=True, env=env
+    )
+    assert moved.returncode == 2 and "note" in moved.stderr, moved.stderr
+
     # Everything this test wrote went to its own workspace.
     assert (tmp / "state" / "todo-reminders.json").exists()
 
@@ -241,10 +312,16 @@ def main():
         check("an unusable record is refused, with every problem at once", test_refuses_an_unusable_record)
         check("bad values and a multi-line brief are refused", test_refuses_bad_values_and_a_multiline_brief)
         check("how_to_open is required", test_how_to_open_is_required_so_a_later_agent_can_find_the_doc)
+        check("the lifecycle is checked and a blocked item says what it waits on",
+              test_the_lifecycle_is_checked_and_a_blocked_item_must_say_what_it_waits_on)
         for name, fn in (
             ("add stores a good record and refuses a sloppy one", test_add_stores_and_refuses),
             ("a worker is named only when the filer names one", test_a_worker_is_named_only_when_the_filer_names_one),
             ("ready for a worker includes the unaddressed ones", test_ready_for_a_worker_includes_the_unaddressed),
+            ("only an approved item is picked up", test_only_an_approved_item_is_picked_up),
+            ("a proposed item is surfaced to the owner, not silently held",
+             test_a_proposed_item_is_surfaced_to_the_owner_not_silently_held),
+            ("set_status moves it, and confirming closes it", test_set_status_moves_it_and_confirming_closes_it),
             ("conditions stack (AND), not any-of", test_conditions_stack),
             ("credit_for_size defers a big item on light credit", test_credit_for_size_defers_the_big_item_not_the_small_one),
             ("the canonical how-to-open note is built for the filer", test_the_note_is_built_so_a_filer_need_not_remember_it),

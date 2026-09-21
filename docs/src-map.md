@@ -209,6 +209,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
+- **`todo_reminders.py`** — Durable TODOs an agent can pick up later, and the conditions that say when.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
 - **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.

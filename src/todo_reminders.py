@@ -7,11 +7,11 @@ is right".
 
 Two decisions the shape encodes, both hers:
 
-* The TODO's *content* lives in the room-doc, not here. A record carries where
+* The TODO's *content* lives in the room document, not here. A record carries where
   to find it and how to open it, and the text stays somewhere she can edit.
   `how_to_open` is written into the record on purpose — the agent that picks
   the item up weeks later is not the one that filed it and will not remember
-  which skill opens a room-doc.
+  which skill opens a room document.
 * Filing requires enough to pick the work up cold: a one-line brief, whether it
   must happen or would merely be nice, how urgent it is, and a size. A record
   missing any of those is refused rather than stored, because a TODO nobody can
@@ -42,6 +42,13 @@ IMPORTANCE = ("must", "should", "nice")
 URGENCY = ("now", "soon", "whenever")
 SIZES = ("S", "M", "L", "XL")
 STATES = ("open", "done", "cancelled")
+# The owner's lifecycle. `state` stays the coarse open/done/cancelled a reader
+# filters on; `status` is where an open item actually stands.
+STATUSES = ("proposed", "approved", "blocked", "in_progress", "completion_declared", "confirmed")
+# Only an approved item may be picked up — the others are waiting on someone.
+PICKUP_STATUSES = ("approved",)
+# The two that need the owner herself, so nothing rots unnoticed at "proposed".
+AWAITING_OWNER = ("proposed", "completion_declared")
 # Conditions the proactive loop can evaluate from signals it already computes.
 CONDITIONS = ("idle", "owner_away", "credit_full", "credit_medium_or_better", "credit_for_size")
 
@@ -117,7 +124,7 @@ def validate(record: dict) -> list[str]:
         problems.append(f"size must be one of {', '.join(SIZES)}")
     brief = record.get("brief")
     if isinstance(brief, str) and "\n" in brief:
-        problems.append("brief is one line; put the detail in the room-doc")
+        problems.append("brief is one line; put the detail in the room document")
     when = record.get("when", [])
     if not isinstance(when, list) or any(w not in CONDITIONS for w in when):
         problems.append(f"when must be a list drawn from {', '.join(CONDITIONS)}")
@@ -128,6 +135,14 @@ def validate(record: dict) -> list[str]:
     state = record.get("state", "open")
     if state not in STATES:
         problems.append(f"state must be one of {', '.join(STATES)}")
+    status = record.get("status", "proposed")
+    if status not in STATUSES:
+        problems.append(f"status must be one of {', '.join(STATUSES)}")
+    note = record.get("blocked_note")
+    if status == "blocked" and not (isinstance(note, str) and note.strip()):
+        problems.append("a blocked item needs blocked_note saying what it is waiting on")
+    if note is not None and not isinstance(note, str):
+        problems.append("blocked_note is free text")
     for field in OPTIONAL_TEXT:
         value = record.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -147,6 +162,9 @@ def add(record: dict, workspace: Path | None = None, now: float | None = None) -
     row.setdefault("id", f"todo-{uuid.uuid4().hex[:12]}")
     row.setdefault("created_at", now if now is not None else time.time())
     row.setdefault("state", "open")
+    # Proposed, not approved: an agent may file anything, but the owner decides
+    # what gets worked on. awaiting_owner() is what stops that being a silent hold.
+    row.setdefault("status", "proposed")
     row.setdefault("when", [])
     row.setdefault("due_at", None)
     row.setdefault("not_before", None)
@@ -170,6 +188,36 @@ def close(todo_id: str, state: str = "done", workspace: Path | None = None) -> b
     if hit:
         _write_atomic(path, rows)
     return hit
+
+
+def set_status(todo_id: str, status: str, note: str | None = None,
+               workspace: Path | None = None) -> bool:
+    """Move one item along the lifecycle; returns whether it was there to move.
+    Confirming it also closes it, so `status` and `state` cannot disagree."""
+    if status not in STATUSES:
+        raise ValueError(f"status must be one of {', '.join(STATUSES)}")
+    if status == "blocked" and not (note or "").strip():
+        raise ValueError("a blocked item needs a note saying what it is waiting on")
+    path = store_path(workspace)
+    rows = _read(path)
+    hit = False
+    for row in rows:
+        if row.get("id") != todo_id:
+            continue
+        row["status"], row["status_at"], hit = status, time.time(), True
+        if note is not None:
+            row["blocked_note"] = note
+        if status == "confirmed":
+            row["state"], row["closed_at"] = "done", time.time()
+    if hit:
+        _write_atomic(path, rows)
+    return hit
+
+
+def awaiting_owner(workspace: Path | None = None) -> list[dict]:
+    """The open items that need her: newly proposed, or declared complete and
+    waiting to be confirmed. Without this, `proposed` is where TODOs go to die."""
+    return [r for r in load(workspace) if r.get("status", "proposed") in AWAITING_OWNER]
 
 
 def load(workspace: Path | None = None, state: str | None = "open") -> list[dict]:
@@ -197,6 +245,8 @@ def is_ready(record: dict, now: float, signals: dict) -> bool:
     OR with its conditions met. A deadline overrides the conditions — that is
     what makes it a deadline."""
     if record.get("state", "open") != "open":
+        return False
+    if record.get("status", "proposed") not in PICKUP_STATUSES:
         return False
     not_before = record.get("not_before")
     if isinstance(not_before, (int, float)) and now < not_before:
@@ -259,13 +309,24 @@ def _cli(argv: list[str]) -> int:
     a.add_argument("--not-before", type=float, default=None)
     a.add_argument("--when", action="append", default=[], choices=CONDITIONS)
     a.add_argument("--context", default=None, help="anything the pickup needs that the doc lacks")
+    a.add_argument("--status", default="proposed", choices=STATUSES,
+                   help="lifecycle state; an owner filing her own item means --status approved")
+    a.add_argument("--blocked-note", default=None, help="what a blocked item is waiting on (free text)")
     a.add_argument(
         "--assignee",
         default=None,
         help="the worker meant to pick this up (seat id, mxid or roster name); omit to let the room decide",
     )
 
-    sub.add_parser("list", help="the open TODOs")
+    lister = sub.add_parser("list", help="the open TODOs")
+    lister.add_argument("--status", default=None, choices=STATUSES, help="only this lifecycle state")
+
+    st = sub.add_parser("status", help="move one along the lifecycle")
+    st.add_argument("id")
+    st.add_argument("status", choices=STATUSES)
+    st.add_argument("--note", default=None, help="required when blocking: what it waits on")
+
+    sub.add_parser("awaiting", help="the ones needing the owner: proposed, or completion declared")
     r = sub.add_parser("ready", help="the ones whose moment has come")
     r.add_argument("--idle", action="store_true")
     r.add_argument("--owner-away", action="store_true")
@@ -298,7 +359,10 @@ def _cli(argv: list[str]) -> int:
             "due_at": args.due_at,
             "not_before": args.not_before,
             "when": args.when,
+            "status": args.status,
         }
+        if args.blocked_note:
+            record["blocked_note"] = args.blocked_note
         if args.context:
             record["context"] = args.context
         if args.assignee:
@@ -311,8 +375,22 @@ def _cli(argv: list[str]) -> int:
         print(json.dumps(row, ensure_ascii=False))
         return 0
     if args.cmd == "list":
-        print(json.dumps(load(box), ensure_ascii=False, indent=1))
+        rows = load(box)
+        if args.status:
+            rows = [r for r in rows if r.get("status", "proposed") == args.status]
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
         return 0
+    if args.cmd == "awaiting":
+        print(json.dumps(awaiting_owner(box), ensure_ascii=False, indent=1))
+        return 0
+    if args.cmd == "status":
+        try:
+            moved = set_status(args.id, args.status, args.note, workspace=box)
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        print("moved" if moved else "no such id", file=sys.stderr)
+        return 0 if moved else 1
     if args.cmd == "ready":
         tier = (args.tier or "").upper()
         signals = {
