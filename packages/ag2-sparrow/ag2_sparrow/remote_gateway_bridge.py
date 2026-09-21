@@ -1338,6 +1338,9 @@ POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
 POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+# Backoff alone caps at 60s and never gives up, so a relay that stays down
+# leaves a live process polling into the void. 0 disables the exit.
+POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -4735,6 +4738,29 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _poll_stalled(last_ok: float, now: float,
+                  limit: float = POLL_STALL_EXIT_S) -> bool:
+    """Whether the poll loop has gone `limit` seconds without a success."""
+    return limit > 0 and (now - last_ok) > limit
+
+
+def _abort_if_poll_stalled(last_ok: float) -> None:
+    """Exit non-zero so the supervisor can restart a bridge backoff cannot revive.
+
+    Every poll failure loops instead of exiting, so a wedged-but-alive bridge
+    is invisible to a wrapper that restarts only on exit.
+    """
+    now = time.time()
+    # Pass the limit explicitly: the parameter default binds at def time,
+    # so a reconfigured module global would otherwise never be read.
+    if not _poll_stalled(last_ok, now, POLL_STALL_EXIT_S):
+        return
+    stalled_s = int(now - last_ok)
+    _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+    sys.exit(f"FATAL: no successful poll in {stalled_s}s "
+             f"(limit {POLL_STALL_EXIT_S:g}s) — exiting so the supervisor restarts the bridge.")
+
+
 def main() -> None:
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
@@ -4767,6 +4793,7 @@ def main() -> None:
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
+            _abort_if_poll_stalled(last_poll_ok)
             if not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
