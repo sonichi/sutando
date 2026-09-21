@@ -92,8 +92,13 @@ def supervised_workers(workspace) -> dict:
     roster = pr.load_roster(workspace)
     if not roster:
         return {}
+    workers = roster.get("workers")
+    if not isinstance(workers, dict):
+        # `x or {}` only catches falsey shapes; a truthy-but-wrong type
+        # (a string, a list) would reach `.items()` and raise instead.
+        return {}
     out = {}
-    for wid, row in (roster.get("workers") or {}).items():
+    for wid, row in workers.items():
         if wid == getattr(pr, "CORE", "core"):
             continue
         if not isinstance(row, dict):

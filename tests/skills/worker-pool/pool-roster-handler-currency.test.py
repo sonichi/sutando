@@ -314,6 +314,20 @@ class FailClosedOnBackfillFailure(Base):
         self.assertEqual(rc, 3, "an unreadable roster on an existing pool must "
                                  "fail closed, not read as 'no pool'")
 
+    def test_a_malformed_workers_type_fails_closed_end_to_end_not_a_crash(self):
+        """keweichen's review: ensure_task_event_handler() rejected
+        workers="bogus" correctly, but tick() then continued into
+        observe()/supervised_workers(), which raised a raw AttributeError
+        (exit 1) rather than the intended handled exit 3 -- end to end
+        through main(), not just the backfill call in isolation."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps({"workers": "bogus", "bindings": {}}))
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 3, "a malformed workers type must fail closed "
+                                 "through the whole sweep, not crash with exit 1")
+
     def test_main_still_returns_0_on_an_ordinary_successful_backfill(self):
         make_worker(self.ws)
         cfg_path(self.ws).unlink()

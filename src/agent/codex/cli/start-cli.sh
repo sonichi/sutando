@@ -199,7 +199,7 @@ ensure_task_notifier() {
       # stderr, not exit code -- `return` here would abort the whole launcher
       # under `set -e` at every call site.
       if session_exists "$WATCHER_SESSION"; then
-        if notifier_boot_gate_force_kill_watcher "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"; then
+        if notifier_boot_gate_force_kill_watcher "$(_notifier_boot_gate_workspace)"; then
           echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
         else
           echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
@@ -359,13 +359,8 @@ ensure_durable_schedules
 ensure_codex_scheduler
 resolve_heartbeat_python
 
-# Resolve $SUTANDO_POOL_BOOT_SWEEP ONCE here, at this adapter's own edge, the
-# same way Step 1.7 does (a skill's manifest.json "config" block) -- never
-# inside notifier_boot_gate itself, which would re-glob skills/*/manifest.json
-# and spawn a python3 subprocess on every ensure_task_notifier() call (three
-# call sites below). Set-ness wins, not non-emptiness -- an explicit empty
-# override must not be re-filled from the manifest, matching the Claude
-# launcher's own env-over-manifest handling just above this file's peer.
+# Resolve once here, at this adapter's own edge (never inside
+# notifier_boot_gate, which has three call sites below). Set-ness wins.
 if [ -z "${SUTANDO_POOL_BOOT_SWEEP+x}" ] && declare -F skill_manifest_config_pending >/dev/null; then
   while IFS= read -r -d '' _mcrec; do
     _mck=${_mcrec%%=*}

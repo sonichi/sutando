@@ -118,6 +118,19 @@ class WhoIsSupervised(Base):
         pr.roster_path(self.ws).write_text(json.dumps(roster))
         self.assertEqual(sorted(sup.supervised_workers(self.ws)), [keep])
 
+    def test_a_truthy_non_dict_workers_value_reads_as_nobody_not_a_crash(self):
+        """keweichen's review: `(roster.get("workers") or {}).items()` only
+        catches falsey malformed shapes -- a truthy-but-wrong type (a string)
+        reached `.items()` and raised AttributeError instead of reading as
+        no supervised workers, which crashed tick() with exit 1 instead of
+        the intended handled exit 3."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        for workers_val in ("bogus", ["w1"], 0, ""):
+            with self.subTest(workers=workers_val):
+                pr.roster_path(self.ws).write_text(
+                    json.dumps({"workers": workers_val, "bindings": {}}))
+                self.assertEqual(sup.supervised_workers(self.ws), {})
+
 
 class Observing(Base):
     def test_an_observation_reports_beat_session_and_pause(self):

@@ -129,11 +129,11 @@ mkdir -p "$MANIFEST_SKILL"
 cat > "$MANIFEST_SKILL/manifest.json" << EOF
 {"config": {"SUTANDO_POOL_BOOT_SWEEP": "$SWEEP"}}
 EOF
-out6="$(
-  REPO="$FAKE_REPO"
-  . "$MANIFEST_CONFIG_SRC"
-  unset SUTANDO_POOL_BOOT_SWEEP
-  if [ -z "${SUTANDO_POOL_BOOT_SWEEP:-}" ] && declare -F skill_manifest_config_pending >/dev/null; then
+adapter_resolve() {
+  # Mirrors the REAL top-level block in codex/start-cli.sh exactly -- +x
+  # (set-ness), not -z ...:- (emptiness), so this test breaks if that block
+  # regresses to the old check.
+  if [ -z "${SUTANDO_POOL_BOOT_SWEEP+x}" ] && declare -F skill_manifest_config_pending >/dev/null; then
     while IFS= read -r -d '' _mcrec; do
       _mck=${_mcrec%%=*}
       [ "$_mck" = "SUTANDO_POOL_BOOT_SWEEP" ] || continue
@@ -141,10 +141,28 @@ out6="$(
       break
     done < <(skill_manifest_config_pending "$REPO" "$PY")
   fi
+}
+out6="$(
+  REPO="$FAKE_REPO"
+  . "$MANIFEST_CONFIG_SRC"
+  unset SUTANDO_POOL_BOOT_SWEEP
+  adapter_resolve
   echo "resolved=$SUTANDO_POOL_BOOT_SWEEP"
 )"
 check "adapter-level one-time resolution discovers a manifest-declared var" \
   "$out6" "resolved=$SWEEP"
+
+# --- Case 6b: an EXPLICIT EMPTY override must survive the manifest --
+# keweichen's review, round 9: the +x setness fix had no explicit-empty
+# regression test at this level (only the production-path Python test did). ---
+out6b="$(
+  REPO="$FAKE_REPO"
+  . "$MANIFEST_CONFIG_SRC"
+  export SUTANDO_POOL_BOOT_SWEEP=""
+  adapter_resolve
+  echo "resolved=[$SUTANDO_POOL_BOOT_SWEEP]"
+)"
+check "explicit empty override is not refilled from the manifest" "$out6b" "resolved=[]"
 
 # --- Case 7: notifier_boot_gate_force_kill_watcher actually terminates the
 # real process a launcher's tmux kill-session left alive -- the SAFETY
@@ -196,6 +214,47 @@ else
   FAIL=1
 fi
 kill -9 "$UNRELATED_PID" 2>/dev/null
+
+# --- Case 9: the boot sweep runs against the notifier's ACTUAL workspace,
+# not the configured default, when SUTANDO_WORKSPACE_DIR or SUTANDO_TASKS_DIR
+# overrides which tree the watcher will really admit tasks from. keweichen's
+# review, round 10: the gate approved admission without ever checking the
+# override workspace's own pool declaration. ---
+OVERRIDE_WS="$TD/override-ws"
+mkdir -p "$OVERRIDE_WS"
+cat > "$SWEEP" << 'PYEOF'
+#!/usr/bin/env python3
+import sys
+for i, a in enumerate(sys.argv):
+    if a == "--workspace":
+        open(sys.argv[0] + ".seen-workspace", "w").write(sys.argv[i + 1])
+sys.exit(0)
+PYEOF
+chmod +x "$SWEEP"
+
+out9="$(
+  REPO="$FAKE_REPO"
+  . "$GATE_SRC"
+  export SUTANDO_POOL_BOOT_SWEEP="$SWEEP"
+  export SUTANDO_WORKSPACE_DIR="$OVERRIDE_WS"
+  notifier_boot_gate "$PY"
+  echo "rc=$?"
+)"
+check "SUTANDO_WORKSPACE_DIR override -> sweep sees that workspace" \
+  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
+
+rm -f "$SWEEP.seen-workspace"
+out9b="$(
+  REPO="$FAKE_REPO"
+  . "$GATE_SRC"
+  export SUTANDO_POOL_BOOT_SWEEP="$SWEEP"
+  unset SUTANDO_WORKSPACE_DIR
+  export SUTANDO_TASKS_DIR="$OVERRIDE_WS/tasks"
+  notifier_boot_gate "$PY"
+  echo "rc=$?"
+)"
+check "SUTANDO_TASKS_DIR-only override -> sweep sees its dirname" \
+  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

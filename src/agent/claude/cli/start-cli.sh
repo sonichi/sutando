@@ -778,11 +778,11 @@ ensure_task_notifier() {
   if ! notifier_boot_gate "$PY"; then
     if watcher_session_exists; then
       echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
-      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
       # stderr, not exit code -- `return` here would abort the whole launcher
       # under `set -e` at every call site, some mid-attach.
       if watcher_session_exists; then
-        if notifier_boot_gate_force_kill_watcher "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"; then
+        if notifier_boot_gate_force_kill_watcher "$(_notifier_boot_gate_workspace)"; then
           echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
         else
           echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
