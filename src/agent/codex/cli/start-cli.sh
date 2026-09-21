@@ -6,6 +6,14 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+# Shared with the claude launcher: one owner for the notifier boot-time gate.
+. "$REPO/src/agent/notifier-boot-gate.sh"
+# Any installed skill's manifest.json "config" block (e.g. worker-pool's
+# SUTANDO_POOL_BOOT_SWEEP) -- this launcher never sourced this at all before,
+# so notifier_boot_gate could never discover the sweep path (keweichen's
+# review on PR #4503, round 5).
+# shellcheck source=src/skill-manifest-config.sh
+[ -r "$REPO/src/skill-manifest-config.sh" ] && . "$REPO/src/skill-manifest-config.sh"
 
 # This runtime has no worker mode: everything below is the canonical core's
 # ceremony, so an instance launch is refused before the first step of it.
@@ -184,6 +192,22 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
+  # Same synchronous, fail-closed backfill boundary as core's own /startup
+  # Step 1.7: this notifier starts its OWN watcher below, independent of
+  # whether Step 1.7 has run inside the core session yet. Reuses $_HB_PY
+  # (resolve_heartbeat_python runs once, near the top of this script, well
+  # before any call site here) rather than re-resolving -- a launcher must
+  # resolve its interpreter exactly once in its own shell.
+  # "No new session" is not sufficient on a reuse path -- a watcher already
+  # running from before the sweep started failing must not be left alive to
+  # keep admitting work unprotected (keweichen's review on PR #4503, round 6).
+  if ! notifier_boot_gate "$_HB_PY"; then
+    if session_exists "$WATCHER_SESSION"; then
+      echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    fi
+    return 0
+  fi
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
@@ -334,6 +358,21 @@ ensure_codex_scheduler() {
 ensure_durable_schedules
 ensure_codex_scheduler
 resolve_heartbeat_python
+
+# Resolve $SUTANDO_POOL_BOOT_SWEEP ONCE here, at this adapter's own edge, the
+# same way Step 1.7 does (a skill's manifest.json "config" block) -- never
+# inside notifier_boot_gate itself, which would re-glob skills/*/manifest.json
+# and spawn a python3 subprocess on every ensure_task_notifier() call (three
+# call sites below). A no-op when no skill declares it, or already set.
+if [ -z "${SUTANDO_POOL_BOOT_SWEEP:-}" ] && declare -F skill_manifest_config_pending >/dev/null; then
+  while IFS= read -r -d '' _mcrec; do
+    _mck=${_mcrec%%=*}
+    [ "$_mck" = "SUTANDO_POOL_BOOT_SWEEP" ] || continue
+    export SUTANDO_POOL_BOOT_SWEEP="${_mcrec#*=}"
+    break
+  done < <(skill_manifest_config_pending "$REPO" "$_HB_PY")
+  unset _mcrec _mck
+fi
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true

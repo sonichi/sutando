@@ -340,6 +340,81 @@ class LauncherForwardsOnlyAGenuinePin(unittest.TestCase):
         self.assertIn("SUTANDO_TASK_EVENT_HANDLER=/opt/handler", env)
 
 
+class NotifierBootGateRefusesOnSweepFailure(unittest.TestCase):
+    """keweichen's review on PR #4503 (round 5+6): the notifier starts its OWN
+    watcher independent of core's /startup Step 1.7, so it needs the same
+    fail-closed gate -- and "no NEW session" is not sufficient on a reuse
+    path: an existing watcher must be killed, not left running unprotected."""
+
+    def setUp(self):
+        self.h = Harness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def _fake_sweep(self, rc: int) -> Path:
+        sweep = self.h.td / "fake-sweep.py"
+        sweep.write_text(f"#!/usr/bin/env python3\nimport sys; sys.exit({rc})\n")
+        sweep.chmod(0o755)
+        return sweep
+
+    def test_a_failing_sweep_starts_the_core_but_no_watcher(self):
+        sweep = self._fake_sweep(3)
+        run = self.h.launch(extra_env={"SUTANDO_POOL_BOOT_SWEEP": str(sweep)})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        sessions = self.h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
+        self.assertIn("sutando-core", sessions, "the core itself must still start")
+        self.assertFalse(any(s.endswith("-watcher") for s in sessions),
+                          f"a watcher session started despite a failing boot sweep: {sessions}")
+        # The failure must be OBSERVABLE, not inferable only from an absence.
+        self.assertIn("FATAL notifier-boot-gate", run.stderr,
+                      "a failing sweep produced no explicit fatal diagnostic")
+        self.assertIn("WITHOUT a notifier intake path", run.stderr)
+
+    def test_a_healthy_watcher_then_a_failing_sweep_kills_it_not_just_skips_a_replacement(self):
+        """The reuse path: a watcher already running (matching version) from
+        before the sweep started failing must not be left alive."""
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        exists, _, _ = self.h.watcher()
+        self.assertTrue(exists, "precondition: a healthy watcher must exist before the reuse case")
+
+        sweep = self._fake_sweep(1)
+        run2 = self.h.launch(extra_env={"SUTANDO_POOL_BOOT_SWEEP": str(sweep)})
+        self.assertEqual(run2.returncode, 0, run2.stdout + run2.stderr)
+
+        exists_after, _, _ = self.h.watcher()
+        self.assertFalse(exists_after,
+                          "the watcher session survived a subsequent failing sweep -- "
+                          "'no new session' is not the same as fail-closed")
+
+    def test_a_stale_version_watcher_then_a_failing_sweep_also_kills_it(self):
+        """The stale-version path already kills-and-would-restart; a failing
+        sweep must still leave it dead, not silently restart the old one."""
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        # Force a version mismatch the way a code/env change would.
+        self.h.tm("set-environment", "-t", "=sutando-core-watcher",
+                  "SUTANDO_NOTIFIER_VERSION", "stale-version-marker")
+
+        sweep = self._fake_sweep(1)
+        run2 = self.h.launch(extra_env={"SUTANDO_POOL_BOOT_SWEEP": str(sweep)})
+        self.assertEqual(run2.returncode, 0, run2.stdout + run2.stderr)
+
+        exists_after, _, _ = self.h.watcher()
+        self.assertFalse(exists_after,
+                          "a stale-version watcher survived a failing sweep instead of being killed")
+
+    def test_a_healthy_sweep_still_starts_the_watcher_normally(self):
+        """Negative control: the gate must not be permanently closed -- a
+        passing sweep is the ordinary path, unchanged."""
+        sweep = self._fake_sweep(0)
+        run = self.h.launch(extra_env={"SUTANDO_POOL_BOOT_SWEEP": str(sweep)})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        exists, _, _ = self.h.watcher()
+        self.assertTrue(exists, "a passing sweep must not block the ordinary notifier start")
+
+
 class WorkerLaunchStartsNoNotifier(unittest.TestCase):
     def test_worker_instance_gets_no_watcher_session(self):
         h = Harness()

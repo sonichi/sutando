@@ -68,7 +68,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/notifier-boot-gate.sh",
             "src/agent/task-event-handler-lookup.sh",
+            "src/skill-manifest-config.sh",
             "src/file_lock.py",
             # cli_wedge imports sutando_platform; without it every classify
             # dies on import and the gate reads every pane as unreadable.
@@ -370,6 +372,48 @@ exit 0
         invocation = scheduler_log.read_text()
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
+
+    def _fake_sweep(self, rc: int) -> str:
+        sweep = self.root / "fake-sweep.py"
+        sweep.write_text(f"import sys; sys.exit({rc})\n")
+        return str(sweep)
+
+    def test_a_failing_boot_sweep_starts_no_notifier_watcher(self):
+        """keweichen's review on PR #4503, round 5: this launcher never gated
+        the notifier on the same boot-time sweep Step 1.7 runs."""
+        run = self.run_launcher(env_extra={"SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(3)})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.log.read_text()
+        self.assertIn("new-session -d -s sutando-core", calls,
+                       "the core itself must still start")
+        self.assertNotIn("new-session -d -s sutando-core-watcher", calls,
+                          "a watcher session started despite a failing boot sweep")
+        # The failure must be OBSERVABLE, not inferable only from an absence.
+        self.assertIn("FATAL notifier-boot-gate", run.stderr,
+                      "a failing sweep produced no explicit fatal diagnostic")
+        self.assertIn("WITHOUT a notifier intake path", run.stderr)
+
+    def test_a_failing_boot_sweep_kills_an_existing_watcher_not_just_skips_a_replacement(self):
+        """round 6: 'no new session' is not sufficient on a reuse path -- an
+        already-running watcher must be killed, not left alive unprotected."""
+        run = self.run_launcher(env_extra={
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": "whatever-matches-or-not",
+            "SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(1),
+        })
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.log.read_text()
+        self.assertIn("kill-session -t =sutando-core-watcher", calls,
+                       "an existing watcher was not killed after the boot sweep failed")
+
+    def test_a_healthy_boot_sweep_still_starts_the_watcher_normally(self):
+        """Negative control: the gate must not be permanently closed."""
+        run = self.run_launcher(env_extra={"SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(0)})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.log.read_text()
+        self.assertIn("new-session -d -s sutando-core-watcher", calls,
+                       "a passing sweep must not block the ordinary notifier start")
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """There is no Codex worker mode. Through the dispatcher's --runtime and
         directly, an instance launch is refused, and none of the core's durable

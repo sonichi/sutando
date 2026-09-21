@@ -21,6 +21,8 @@ REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+# Shared with the codex launcher: one owner for the notifier boot-time gate.
+. "$REPO/src/agent/notifier-boot-gate.sh"
 
 # Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
 # fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
@@ -769,6 +771,19 @@ ensure_task_notifier() {
   # without the developer tools is the CLT stub, and the supervisor would run it every second.
   if [ -z "$PY" ]; then
     echo "  ⚠ task notifier not started: no runnable Python interpreter (scripts/python-binary.sh); the health probe will report it missing" >&2
+    return 0
+  fi
+  # Same synchronous, fail-closed backfill boundary as core's own /startup
+  # Step 1.7: this notifier starts its OWN watcher below, independent of
+  # whether Step 1.7 has run inside the core session yet. "No new session" is
+  # not sufficient on a reuse path -- a watcher already running from before
+  # the sweep started failing must not be left alive to keep admitting work
+  # unprotected (keweichen's review on PR #4503, round 6).
+  if ! notifier_boot_gate "$PY"; then
+    if watcher_session_exists; then
+      echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    fi
     return 0
   fi
   notifier_py="$PY"

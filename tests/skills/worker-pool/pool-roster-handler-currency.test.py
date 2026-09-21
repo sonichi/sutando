@@ -49,15 +49,53 @@ class EnsureTaskEventHandler(Base):
         self.assertIsNone(pr.ensure_task_event_handler(self.ws))
         self.assertFalse(cfg_path(self.ws).exists())
 
-    def test_no_live_workers_is_a_noop(self):
-        make_worker(self.ws)
-        roster = json.loads(pr.roster_path(self.ws).read_text())
-        for w in roster["workers"].values():
-            w["state"] = "retired"
-        pr.roster_path(self.ws).write_text(json.dumps(roster))
-        cfg_path(self.ws).unlink()
+    def test_an_empty_workers_dict_is_a_noop(self):
+        """A roster file can exist (bindings compiled it) with zero workers --
+        that is the real no-pool-yet case, distinct from a worker present but
+        not currently live."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps({"workers": {}}))
         self.assertIsNone(pr.ensure_task_event_handler(self.ws))
         self.assertFalse(cfg_path(self.ws).exists())
+
+    def test_liveness_is_not_the_gate_recovering_abandoned_also_backfill(self):
+        """The router never reads `state` (docs/worker-pool-design.md,
+        pool_route_handler.py) -- a recovering or abandoned worker's
+        deliveries still route to it, so ensure_task_event_handler must
+        publish for them too. keweichen's review on PR #4503: the
+        state=='live' gate mistook existing ownership for 'no pool'."""
+        for state in ("recovering", "abandoned"):
+            with self.subTest(state=state):
+                ws = Path(tempfile.mkdtemp())
+                make_worker(ws)
+                roster = json.loads(pr.roster_path(ws).read_text())
+                for w in roster["workers"].values():
+                    w["state"] = state
+                pr.roster_path(ws).write_text(json.dumps(roster))
+                cfg_path(ws).unlink()
+
+                result = pr.ensure_task_event_handler(ws)
+
+                self.assertIsNotNone(result, f"state={state} was not backfilled")
+                self.assertTrue(cfg_path(ws).exists())
+
+    def test_an_unreadable_roster_raises_rather_than_reading_as_no_pool(self):
+        """Absent (no roster file) and UNREADABLE (a roster file that exists
+        but load_roster refuses) are different failures -- collapsing the
+        latter into the former hides an existing pool's ownership. keweichen's
+        review on PR #4503, citing pool_roster.py:321-324 (pre-fix)."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text("not valid json {{{")
+
+        with self.assertRaises(pr.HandlerPublishError):
+            pr.ensure_task_event_handler(self.ws)
+
+    def test_a_malformed_roster_missing_workers_key_also_raises(self):
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps({"not_workers": {}}))
+
+        with self.assertRaises(pr.HandlerPublishError):
+            pr.ensure_task_event_handler(self.ws)
 
     def test_an_existing_pool_that_predates_the_file_is_backfilled(self):
         """register_worker() already wrote it once (this skill's normal path);
@@ -204,6 +242,20 @@ class FailClosedOnBackfillFailure(Base):
 
         self.assertEqual(rc, 0, "an unwritable state dir with no live worker is "
                                  "not a backfill failure -- there is nothing to publish")
+
+    def test_an_unreadable_roster_also_fails_closed_with_the_distinct_code(self):
+        """A roster file that exists but cannot be read is an existing pool
+        whose ownership can't be established -- the same failure class as a
+        write error, not the benign no-pool case. keweichen's review on
+        PR #4503 (round 2): 'corrupt'/'unreadable' roster inputs left
+        sweep_rc==0 and config_written==no, silently."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text("not valid json {{{")
+
+        rc = sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+
+        self.assertEqual(rc, 3, "an unreadable roster on an existing pool must "
+                                 "fail closed, not read as 'no pool'")
 
     def test_main_still_returns_0_on_an_ordinary_successful_backfill(self):
         make_worker(self.ws)

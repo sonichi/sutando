@@ -315,12 +315,28 @@ def ensure_task_event_handler(workspace) -> "Path | None":
     """Backfill for a pool that predates this file (register_worker() is its
     only writer, so an install that upgraded without a new registration since
     never gets it written) or whose declaration has gone stale. Republishes
-    only when needed, so a healthy sweep costs one read. None when the pool
-    has no live worker -- nothing to route to, so nothing to declare.
+    only when needed, so a healthy sweep costs one read. None when there is
+    no roster at all -- nothing to route to, so nothing to declare.
+
+    Liveness is NOT the gate: the router never reads `state`
+    (docs/worker-pool-design.md, pool_route_handler.py) -- a recovering or
+    abandoned worker's deliveries still route to it, so any worker present in
+    the roster needs the handler declared, not only a currently-live one.
+    ABSENT (no roster file) and UNREADABLE (a roster file `load_roster`
+    refuses) are different failures: absent is the ordinary no-pool case,
+    UNREADABLE means an existing pool's ownership can't be established and
+    must fail closed via HandlerPublishError, not collapse to "no pool".
     """
-    roster = load_roster(workspace) or {}
+    if not roster_path(workspace).exists():
+        return None
+    roster = load_roster(workspace)
+    if roster is None:
+        raise HandlerPublishError(
+            f"roster at {roster_path(workspace)} exists but is unreadable or "
+            "malformed -- cannot establish whether an existing pool needs the "
+            "task-event handler declared")
     workers = roster.get("workers") or {}
-    if not any(isinstance(w, dict) and w.get("state") == "live" for w in workers.values()):
+    if not workers:
         return None
     handler = Path(__file__).resolve().parent / "pool_route_handler.py"
     cfg = task_event_handler_config_path(Path(workspace) / "state")
