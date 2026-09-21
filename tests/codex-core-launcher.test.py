@@ -1241,9 +1241,9 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_submits_in_announce_order(self):
-        # The single-decider redesign: the notifier submits in the order its
-        # watcher announces (FIFO), never re-picks by priority itself.
+    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+        # Priority now lives in the watcher's sweep (closes #3017); this stub
+        # emits in that real order (urgent before low), matching a real sweep.
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
         results = workspace / "results"
@@ -1261,7 +1261,7 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
             "#!/bin/bash\n"
-            "printf 'TASK_FILE: task-low.txt\\nTASK_FILE: task-owner.txt\\n'\n"
+            "printf 'TASK_FILE: task-owner.txt\\nTASK_FILE: task-low.txt\\n'\n"
         )
         watcher.chmod(0o755)
         early = Path(self.tmp.name) / "submitted-while-busy"
@@ -1309,8 +1309,7 @@ exit 0
         )
         self.assertFalse(early.exists(), "notifier submitted before core became idle")
         calls = self.log.read_text()
-        self.assertLess(calls.index("task-low.txt"), calls.index("task-owner.txt"),
-                        "the watcher announced task-low.txt first; the notifier must not reorder it")
+        self.assertLess(calls.index("task-owner.txt"), calls.index("task-low.txt"))
         self.assertTrue((results / "task-owner.txt").exists())
         self.assertTrue((results / "task-low.txt").exists())
 

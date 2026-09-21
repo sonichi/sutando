@@ -523,6 +523,12 @@ task_announce() {
   fi
 }
 
+# Order only (urgent > normal > low, mtime FIFO within a tier) -- every
+# *.txt; dispatch_task's own checks still decide eligibility, unchanged.
+priority_sorted_tasks() {
+  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR"
+}
+
 dispatch_task() {
   local task_path="$1" rc filename announce resolved attempt
   # Resolve before anything observes it: claim, handler and emit must all name
@@ -843,13 +849,12 @@ trap cleanup EXIT
 trap 'cleanup; exit 0' HUP INT TERM
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
-# restart gap. Install cleanup first so an immediately exiting fswatch cannot
-# kill a just-started provider before its durable fallback receipt is emitted.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  dispatch_task "$f"
-done
-shopt -u nullglob
+# restart gap, in priority order (closes #3017). Install cleanup first so an
+# immediately exiting fswatch cannot kill a just-started provider before its
+# durable fallback receipt is emitted.
+while IFS= read -r fn; do
+  dispatch_task "$TASKS_DIR/$fn"
+done < <(priority_sorted_tasks)
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file

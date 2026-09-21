@@ -287,6 +287,7 @@ def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
@@ -315,6 +316,16 @@ def _parse_dir_options(rest: list[str]) -> dict:
 
 
 def _main(argv: list[str]) -> int:
+    # A pure sort, no eligibility filtering -- the caller still decides
+    # whether a file is eligible; this only changes the offered order.
+    if argv and argv[0] == "sort-by-priority":
+        if len(argv) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        for name in names:
+            print(name)
+        return 0 if names else 1
     if len(argv) < 3:
         print(_USAGE, file=sys.stderr)
         return 2
