@@ -112,11 +112,16 @@ try:
     tmp_cfg.write_text(json.dumps({"handler": str(handler)}))
     tmp_cfg.replace(cfg)
 
-    # Room for fswatch's -l 0.5 batching window plus FSEvents latency.
+    # Room for fswatch's -l 0.5 batching window plus FSEvents/inotify latency.
+    # CI runners (especially loaded Linux hosts) can take longer than a local
+    # Mac to deliver the notification, so this waits for the actual signal
+    # instead of a fixed sleep, capped generously above the batching window.
+    wait_for(lambda: cfg.exists(), timeout=10)
     time.sleep(1.5)
     out2: list[str] = []
     write_task(ws, "task-two.txt")
-    ok2 = wait_for(lambda: (read_available(p, out2), log.exists() and "handle" in log.read_text())[1])
+    ok2 = wait_for(lambda: (read_available(p, out2), log.exists() and "handle" in log.read_text())[1],
+                    timeout=15)
     check("(2) config written mid-run: the VERY NEXT task is routed through it, no restart",
           ok2 and log.exists() and "handle" in log.read_text(),
           f"out2={out2} log={log.read_text() if log.exists() else None}")
