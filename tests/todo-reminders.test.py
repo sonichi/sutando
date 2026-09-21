@@ -1,0 +1,266 @@
+"""The durable TODO store: what it refuses, when an item is ready, and that a
+reader never sees a half-written file.
+
+Run: python3 tests/todo-reminders.test.py
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+import todo_reminders as todo  # noqa: E402
+
+PASS = 0
+FAIL = []
+
+
+def check(name, fn):
+    global PASS
+    try:
+        fn()
+        PASS += 1
+        print(f"  ok  {name}")
+    except AssertionError as exc:
+        FAIL.append((name, str(exc)))
+        print(f"FAIL  {name}: {exc}")
+
+
+def good(**over):
+    record = {
+        "room_id": "!room:ag2.space",
+        "surface": "markdown",
+        "note": "## TODO → the segmented control line",
+        "how_to_open": "room_collab.py --url https://chat.ag2.space read '!room:ag2.space'",
+        "brief": "swap the three-state view toggle for a segmented control",
+        "importance": "should",
+        "urgency": "soon",
+        "size": "M",
+    }
+    record.update(over)
+    return record
+
+
+def test_refuses_an_unusable_record():
+    problems = todo.validate({"room_id": "!r:x"})
+    for field in ("note", "how_to_open", "brief", "importance", "urgency", "size"):
+        assert any(field in p for p in problems), f"{field} not reported: {problems}"
+    # Every problem at once, not one per attempt.
+    assert len(problems) >= 6, problems
+    assert todo.validate(good()) == []
+
+
+def test_refuses_bad_values_and_a_multiline_brief():
+    assert any("importance" in p for p in todo.validate(good(importance="critical")))
+    assert any("urgency" in p for p in todo.validate(good(urgency="whenever-ish")))
+    assert any("size" in p for p in todo.validate(good(size="huge")))
+    assert any("one line" in p for p in todo.validate(good(brief="first\nsecond")))
+    assert any("when must be" in p for p in todo.validate(good(when=["when i feel like it"])))
+    assert any("due_at" in p for p in todo.validate(good(due_at="tomorrow")))
+
+
+def test_how_to_open_is_required_so_a_later_agent_can_find_the_doc():
+    problems = todo.validate(good(how_to_open="   "))
+    assert any("how_to_open" in p for p in problems), problems
+
+
+def test_add_stores_and_refuses(tmp):
+    row = todo.add(good(), workspace=tmp, now=1000.0)
+    assert row["id"].startswith("todo-")
+    assert row["state"] == "open" and row["created_at"] == 1000.0
+    assert todo.load(tmp)[0]["brief"] == row["brief"]
+    try:
+        todo.add(good(brief=""), workspace=tmp)
+        raise AssertionError("a record with no brief was stored")
+    except ValueError as exc:
+        assert "brief" in str(exc), exc
+    assert len(todo.load(tmp)) == 1, "the refused record must not be in the store"
+
+
+def test_a_worker_is_named_only_when_the_filer_names_one(tmp):
+    """The owner's point: a room may host several workers later, so an explicit
+    addressee has to be possible — but an absent one must make no claim rather
+    than guess a seat the bindings would contradict."""
+    plain = todo.add(good(), workspace=tmp)
+    assert plain["assignee"] is None, plain
+    assert plain["room_id"] == "!room:ag2.space"
+    addressed = todo.add(good(assignee="c8138e81"), workspace=tmp)
+    assert addressed["assignee"] == "c8138e81"
+    assert any("assignee" in p for p in todo.validate(good(assignee="  "))), "blank is worse than absent"
+
+
+def test_ready_for_a_worker_includes_the_unaddressed(tmp):
+    mine = todo.add(good(brief="mine", assignee="c8138e81", when=[]), workspace=tmp, now=1)
+    theirs = todo.add(good(brief="theirs", assignee="39041ce6", when=[]), workspace=tmp, now=2)
+    loose = todo.add(good(brief="loose", when=[]), workspace=tmp, now=3)
+    rows = todo.ready(workspace=tmp, now=10, signals={})
+    ids = {r["id"] for r in rows}
+    assert {mine["id"], theirs["id"], loose["id"]} <= ids, "ready() does not filter; the caller does"
+    for_me = [r["brief"] for r in rows if r.get("assignee") in (None, "c8138e81")]
+    assert sorted(for_me) == ["loose", "mine"], for_me
+
+
+def test_credit_for_size_defers_the_big_item_not_the_small_one(tmp):
+    """The point of a size: LIGHT credit should start a small item and hold a
+    large one, which is what makes her "enough credit" condition mean anything."""
+    small = good(size="S", when=["credit_for_size"])
+    large = good(size="XL", when=["credit_for_size"])
+    assert todo.conditions_met(small, {"tier": "LIGHT"})
+    assert not todo.conditions_met(large, {"tier": "LIGHT"})
+    assert todo.conditions_met(large, {"tier": "FULL"})
+    assert not todo.conditions_met(good(size="M", when=["credit_for_size"]), {"tier": "MINIMAL"})
+    # A missing tier must not stop everything: a lost signal is not a reason to stall.
+    assert todo.conditions_met(large, {})
+
+
+def test_the_note_is_built_so_a_filer_need_not_remember_it(tmp):
+    once = todo.canonical_how_to_open("!r:x", "markdown", "once")
+    hold = todo.canonical_how_to_open("!r:x", "markdown", "hold")
+    assert "room-collab skill" in once and "room_collab.py" in once and "!r:x" in once
+    assert "hold the connection open" in hold, hold
+    assert todo.validate(good(how_to_open=once)) == []
+
+
+def test_conditions_stack(tmp):
+    record = good(when=["idle", "owner_away"])
+    assert todo.conditions_met(record, {"idle": True, "owner_away": True})
+    assert not todo.conditions_met(record, {"idle": True})
+    assert not todo.conditions_met(record, {"idle": True, "owner_away": False})
+    assert todo.conditions_met(good(when=[]), {}), "no conditions means nothing to wait for"
+
+
+def test_ready_respects_floor_deadline_and_state(tmp):
+    now = 2_000.0
+    waiting = todo.add(good(when=["idle"], not_before=now + 60), workspace=tmp)
+    assert not todo.is_ready(waiting, now, {"idle": True}), "not_before must hold it back"
+    assert todo.is_ready(waiting, now + 61, {"idle": True})
+
+    overdue = good(due_at=now - 1, when=["idle"])
+    assert todo.is_ready(overdue, now, {"idle": False}), "a passed deadline overrides conditions"
+
+    assert not todo.is_ready(good(state="done", when=[]), now, {}), "a closed item is never ready"
+
+
+def test_ready_orders_the_most_pressing_first(tmp):
+    now = 5_000.0
+    todo.add(good(brief="nice one", importance="nice", urgency="whenever"), workspace=tmp, now=1)
+    todo.add(good(brief="must one", importance="must", urgency="soon"), workspace=tmp, now=2)
+    todo.add(good(brief="overdue one", importance="nice", due_at=now - 5), workspace=tmp, now=3)
+    order = [r["brief"] for r in todo.ready(workspace=tmp, now=now, signals={})]
+    assert order[0] == "overdue one", order
+    assert order[1] == "must one", order
+
+
+def test_close_marks_and_reports(tmp):
+    row = todo.add(good(), workspace=tmp)
+    assert todo.close(row["id"], "done", workspace=tmp) is True
+    assert todo.load(tmp) == [], "a done item is not open any more"
+    assert todo.load(tmp, state="done")[0]["id"] == row["id"]
+    assert todo.close("todo-nope", "done", workspace=tmp) is False
+
+
+def test_a_reader_never_sees_a_partial_file(tmp):
+    """The store is read by the loop while agents file items; a truncated read
+    would drop every TODO at once, so the write has to be atomic."""
+    todo.add(good(), workspace=tmp)
+    stop = threading.Event()
+    seen = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                raw = todo.store_path(tmp).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            seen.append(json.loads(raw) if raw else {})
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    for i in range(40):
+        todo.add(good(brief=f"item {i}"), workspace=tmp)
+    stop.set()
+    t.join(timeout=5)
+    assert seen, "the reader never got a look"
+    assert all(isinstance(d.get("todos"), list) for d in seen), "a partial read got through"
+
+
+def test_cli_refuses_then_files_and_lists(tmp):
+    # --workspace, not an env var: $SUTANDO_WORKSPACE is not honoured any more,
+    # and an earlier version of this test wrote its rows into the real workspace.
+    script = str(ROOT / "src" / "todo_reminders.py")
+    base = [sys.executable, script, "--workspace", str(tmp)]
+    env = dict(os.environ)
+    # Missing the discipline fields: argparse itself refuses, nothing is stored.
+    bad = subprocess.run(
+        base + ["add", "--room", "!r:x", "--brief", "no other fields"],
+        capture_output=True, text=True, env=env,
+    )
+    assert bad.returncode != 0, bad.stdout
+    ok = subprocess.run(
+        base + [
+            "add",
+            "--room", "!r:x", "--note", "## TODO", "--how-to-open", "room_collab.py read '!r:x'",
+            "--brief", "one line", "--importance", "must", "--urgency", "now", "--size", "S",
+            "--when", "idle",
+        ],
+        capture_output=True, text=True, env=env,
+    )
+    assert ok.returncode == 0, ok.stderr
+    row = json.loads(ok.stdout)
+    assert row["when"] == ["idle"] and row["due_at"] is None
+
+    listed = subprocess.run(base + ["list"], capture_output=True, text=True, env=env)
+    assert row["id"] in listed.stdout, listed.stdout
+
+    idle_ready = subprocess.run(
+        base + ["ready", "--idle"], capture_output=True, text=True, env=env
+    )
+    assert row["id"] in idle_ready.stdout, "an idle TODO should be ready when idle"
+    busy = subprocess.run(base + ["ready"], capture_output=True, text=True, env=env)
+    assert row["id"] not in busy.stdout, "it should wait while not idle"
+
+    done = subprocess.run(base + ["done", row["id"]], capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr
+    assert row["id"] not in subprocess.run(
+        base + ["list"], capture_output=True, text=True, env=env
+    ).stdout
+    # Everything this test wrote went to its own workspace.
+    assert (tmp / "state" / "todo-reminders.json").exists()
+
+
+def main():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        (tmp / "state").mkdir()
+        check("an unusable record is refused, with every problem at once", test_refuses_an_unusable_record)
+        check("bad values and a multi-line brief are refused", test_refuses_bad_values_and_a_multiline_brief)
+        check("how_to_open is required", test_how_to_open_is_required_so_a_later_agent_can_find_the_doc)
+        for name, fn in (
+            ("add stores a good record and refuses a sloppy one", test_add_stores_and_refuses),
+            ("a worker is named only when the filer names one", test_a_worker_is_named_only_when_the_filer_names_one),
+            ("ready for a worker includes the unaddressed ones", test_ready_for_a_worker_includes_the_unaddressed),
+            ("conditions stack (AND), not any-of", test_conditions_stack),
+            ("credit_for_size defers a big item on light credit", test_credit_for_size_defers_the_big_item_not_the_small_one),
+            ("the canonical how-to-open note is built for the filer", test_the_note_is_built_so_a_filer_need_not_remember_it),
+            ("ready respects not_before, due_at and state", test_ready_respects_floor_deadline_and_state),
+            ("ready puts the most pressing first", test_ready_orders_the_most_pressing_first),
+            ("close marks it and says whether it was there", test_close_marks_and_reports),
+            ("a concurrent reader never sees a partial file", test_a_reader_never_sees_a_partial_file),
+            ("the CLI refuses an incomplete file, then files, lists and closes", test_cli_refuses_then_files_and_lists),
+        ):
+            with tempfile.TemporaryDirectory() as fresh:
+                box = Path(fresh)
+                (box / "state").mkdir()
+                check(name, lambda fn=fn, box=box: fn(box))
+    print(f"\ntodo reminders: {PASS} passed, {len(FAIL)} failed")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
