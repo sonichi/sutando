@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# One SERIAL worker per git worktree: worker w takes lines w, w+W, w+2W... so a
-# worktree never holds two suites at once — exclusivity is structural, not a lock.
+# One SERIAL worker per git worktree, all workers pulling from one queue: a
+# worktree never holds two suites at once, and no worker idles while another
+# still has a pile — a fixed stride left the heaviest suites stacked on one worker.
 # usage: parallel-suite-lane.sh <workers> <files-list> <recdir> <cmd-prefix...>
 # Records land as <recdir>/<line-index>.{out,rc,time}; aggregation stays the caller's.
 set -uo pipefail
@@ -19,14 +20,15 @@ _lane_cleanup() {
     for _w in $(seq 1 "$WORKERS"); do
         git worktree remove --force "$WTDIR/$_w" 2>/dev/null || true
     done
-    rm -rf "$WTDIR"
+    rm -rf "$WTDIR" "$RECDIR"/.claim-*
 }
 trap _lane_cleanup EXIT
 
 for _w in $(seq 1 "$WORKERS"); do
     (
-        idx="$_w"
-        while [ "$idx" -le "$N" ]; do
+        for idx in $(seq 1 "$N"); do
+            # mkdir is the atomic claim: exactly one worker creates it, the rest skip.
+            mkdir "$RECDIR/.claim-$idx" 2>/dev/null || continue
             f="$(sed -n "${idx}p" "$FILES")"
             rec="$RECDIR/$idx"
             _t0=$SECONDS
@@ -34,7 +36,6 @@ for _w in $(seq 1 "$WORKERS"); do
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
             printf "%s\n" "$(( SECONDS - _t0 ))" > "$rec.time"
-            idx=$((idx + WORKERS))
         done
     ) &
 done
