@@ -20,6 +20,14 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-role-kill.XXXXXX")"
 SOCK="$WORK/tmux.sock"
 mkdir -p "$WORK/tasks" "$WORK/state"
 
+# The watcher's event source is not under test here, only its startup; a stub
+# fswatch that idles keeps every watcher alive on a host that ships none.
+STUBBIN="$WORK/stubbin"
+mkdir -p "$STUBBIN"
+printf '#!/bin/bash\nexec sleep 100000\n' > "$STUBBIN/fswatch"
+chmod +x "$STUBBIN/fswatch"
+export PATH="$STUBBIN:$PATH"
+
 cleanup_all() {
   tmux -S "$SOCK" kill-server >/dev/null 2>&1 || true
   pkill -9 -f "fswatch.*$WORK" >/dev/null 2>&1 || true
@@ -33,7 +41,6 @@ tmux -S "$SOCK" new-session -d -s "witness-watcher" -c "$REPO" \
   "env -u SUTANDO_INSTANCE_ID SUTANDO_WORKSPACE_DIR=$WORK bash $WATCHER $WORK/tasks > $WORK/standby.log 2>&1"
 
 for i in $(seq 1 50); do
-  [ -f "$WORK"/state/*.pid ] 2>/dev/null && break
   ls "$WORK"/state/*.pid >/dev/null 2>&1 && break
   sleep 0.1
 done

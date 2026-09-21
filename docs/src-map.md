@@ -204,6 +204,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
+- **`tasks-dir-resolve.sh`** — Shared TASKS_DIR resolution — sourceable so watch-tasks-stream.sh and task-notifier-supervisor.sh can never resolve a different inbox for the same instance.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
 - **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
@@ -282,7 +283,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
-- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
+- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives -- but ONLY while no in-session (--role session) watcher already covers this inbox.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
 ## `src/channels/`
