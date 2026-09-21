@@ -789,6 +789,60 @@ exit 0
             "must all derive from the SAME resolution, not independent re-reads",
         )
 
+    def test_a_pipe_in_a_path_component_does_not_collide_with_a_different_triple(self):
+        """keweichen round 20: the earlier `|`-joined serialization of
+        (workspace, tasks, results) is lossy, since `|` is a legal path
+        character. Two DIFFERENT triples that produce the IDENTICAL
+        `|`-joined string must now hash to DIFFERENT restart identities."""
+        collide_a = {
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
+            "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
+        }
+        collide_b = {
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
+            "SUTANDO_TASKS_DIR": "b|/tmp/collide/c",
+            "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
+        }
+        # Both triples join to the identical string under the OLD (buggy)
+        # `|`.join() scheme -- the exact collision this fix must break.
+        old_join_a = "|".join(collide_a[k] for k in
+                               ("SUTANDO_WORKSPACE_DIR", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR"))
+        old_join_b = "|".join(collide_b[k] for k in
+                               ("SUTANDO_WORKSPACE_DIR", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR"))
+        self.assertEqual(old_join_a, old_join_b,
+                          "test setup error: these two triples must collide under `|`.join()")
+
+        version_a = self._notifier_version(env_extra=collide_a)
+        version_b = self._notifier_version(env_extra=collide_b)
+        self.assertNotEqual(
+            version_a, version_b,
+            "two genuinely different (workspace, tasks, results) triples produced the "
+            "SAME restart identity -- the `|` collision is not closed",
+        )
+
+        # Behavioral coverage, not just the hash formula: run the REAL launcher.
+        result = self.run_launcher(env_extra=collide_a)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn('-e SUTANDO_WORKSPACE_DIR=/tmp/collide/a|b', calls)
+        self.assertIn('-e SUTANDO_TASKS_DIR=/tmp/collide/c', calls)
+        self.assertIn('-e SUTANDO_RESULTS_DIR=/tmp/collide/d', calls)
+
+    def test_a_newline_in_a_path_component_also_round_trips(self):
+        """A newline is the tempting alternate delimiter to switch to from
+        `|` -- and a newline is just as legal in a path component. Proves
+        the NUL-delimited scheme survives it too, on the real launcher."""
+        env_extra = {
+            "SUTANDO_WORKSPACE_DIR": "/tmp/nl-ws",
+            "SUTANDO_TASKS_DIR": "/tmp/nl\nline/tasks",
+            "SUTANDO_RESULTS_DIR": "/tmp/nl-results",
+        }
+        result = self.run_launcher(env_extra=env_extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("-e SUTANDO_TASKS_DIR=/tmp/nl\nline/tasks", calls)
+
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
             "TMUX": "/tmp/outer.sock,1,0",

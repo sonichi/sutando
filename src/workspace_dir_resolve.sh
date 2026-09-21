@@ -17,12 +17,12 @@ resolve_workspace_dir_from_tasks_dir() {
   dirname "${tasks_dir/#\~/$HOME}"
 }
 
-# $1: repo root (for the config-default fallback). Prints
-# "WORKSPACE_DIR|TASKS_DIR|RESULTS_DIR", matching exactly what a notifier
-# consumer resolves -- including the unset-override case, where the consumer
-# still lands on a real, config-derived workspace, never a blank value. A
-# caller hashing only the raw SUTANDO_* strings sees a constant when they're
-# unset, even though the CONFIGURED default workspace can itself change.
+# $1: repo root (for the config-default fallback). Prints WORKSPACE_DIR,
+# TASKS_DIR, RESULTS_DIR as three NUL-terminated fields (never a printable
+# delimiter -- a `|` is a legal path character, and keweichen's control showed
+# a path containing one gets silently misparsed into the wrong tasks/results
+# dir). Read with `mapfile -d '' -t fields < <(resolve_effective_workspace_triple ...)`,
+# never `x=$(...)` -- command substitution truncates at the first NUL.
 resolve_effective_workspace_triple() {
   local repo="$1" tasks_dir workspace_dir results_dir
   if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
@@ -32,5 +32,5 @@ resolve_effective_workspace_triple() {
   fi
   workspace_dir="$(resolve_workspace_dir_from_tasks_dir "$tasks_dir")" || return 1
   results_dir="${SUTANDO_RESULTS_DIR:-$workspace_dir/results}"
-  printf '%s|%s|%s' "$workspace_dir" "$tasks_dir" "$results_dir"
+  printf '%s\0%s\0%s\0' "$workspace_dir" "$tasks_dir" "$results_dir"
 }

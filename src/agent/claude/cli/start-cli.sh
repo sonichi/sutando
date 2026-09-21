@@ -781,11 +781,19 @@ ensure_task_notifier() {
   # individually correct.
   # shellcheck source=../../../workspace_dir_resolve.sh
   . "$REPO/src/workspace_dir_resolve.sh"
-  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
-  effective_workspace_dir="${effective_ws_triple%%|*}"
-  effective_rest="${effective_ws_triple#*|}"
-  effective_tasks_dir="${effective_rest%%|*}"
-  effective_results_dir="${effective_rest#*|}"
+  # NUL-delimited, read one field at a time -- `mapfile` needs bash 4+, not
+  # available under macOS's system /bin/bash (3.2); a `|`-joined string was
+  # the earlier design and is lossy, since `|` is a legal path character.
+  # Chained with && so a producer failure (fewer than 3 NUL-terminated
+  # fields) is not silently absorbed into an empty workspace value.
+  if ! {
+    IFS= read -r -d '' effective_workspace_dir &&
+    IFS= read -r -d '' effective_tasks_dir &&
+    IFS= read -r -d '' effective_results_dir
+  } < <(resolve_effective_workspace_triple "$REPO"); then
+    echo "  ✗ FATAL task notifier: could not resolve the effective workspace -- refusing to start the watcher (no notifier intake path)" >&2
+    return 0
+  fi
   # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
   # running from before the sweep started failing must be killed, not reused.
   if ! notifier_boot_gate "$PY" "$effective_workspace_dir"; then
@@ -823,7 +831,7 @@ ensure_task_notifier() {
   # unchanged script tree resolving to a DIFFERENT workspace/tasks/results
   # triple must still force a restart, or the gate validates one tree while
   # the reused notifier keeps watching another.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-e$(printf '%s' "$effective_ws_triple" | cksum | awk '{print $1}')"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-e$(printf '%s\0%s\0%s\0' "$effective_workspace_dir" "$effective_tasks_dir" "$effective_results_dir" | cksum | awk '{print $1}')"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \

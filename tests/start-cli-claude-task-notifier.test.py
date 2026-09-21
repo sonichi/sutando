@@ -340,6 +340,66 @@ class LauncherForwardsOnlyAGenuinePin(unittest.TestCase):
         self.assertIn("SUTANDO_TASK_EVENT_HANDLER=/opt/handler", env)
 
 
+class WorkspaceTripleSurvivesAPipeInAPathComponent(unittest.TestCase):
+    """keweichen round 20: resolve_effective_workspace_triple() used to
+    `|`-join (workspace, tasks, results) -- lossy, since `|` is a legal path
+    character. Real launcher, real tmux: the exact value forwarded to the
+    watcher must match what was requested, unmangled."""
+
+    def setUp(self):
+        self.h = Harness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def test_a_pipe_in_the_workspace_reaches_the_watcher_unmangled(self):
+        run = self.h.launch(extra_env={
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
+            "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
+        })
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        self.assertIn("SUTANDO_WORKSPACE_DIR=/tmp/collide/a|b", env)
+        self.assertIn("SUTANDO_TASKS_DIR=/tmp/collide/c", env)
+        self.assertIn("SUTANDO_RESULTS_DIR=/tmp/collide/d", env)
+
+    def test_two_triples_colliding_under_the_old_pipe_join_get_different_restart_identities(self):
+        """Both triples below `|`.join() to the identical string
+        "/tmp/collide/a|b|/tmp/collide/c|/tmp/collide/d" -- the exact
+        collision this fix must break."""
+        run_a = self.h.launch(extra_env={
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
+            "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
+        })
+        self.assertEqual(run_a.returncode, 0, run_a.stdout + run_a.stderr)
+        _, _, env_a = self.h.watcher()
+        version_a = next(l for l in env_a.splitlines() if l.startswith("SUTANDO_NOTIFIER_VERSION="))
+        self.h.close()
+
+        self.h = Harness()
+        run_b = self.h.launch(extra_env={
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
+            "SUTANDO_TASKS_DIR": "b|/tmp/collide/c",
+            "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
+        })
+        self.assertEqual(run_b.returncode, 0, run_b.stdout + run_b.stderr)
+        _, _, env_b = self.h.watcher()
+        version_b = next(l for l in env_b.splitlines() if l.startswith("SUTANDO_NOTIFIER_VERSION="))
+
+        # Isolate "-e<hash>" -- the full version string can differ between two
+        # Harness setups for unrelated reasons (a resolved python path, a pane id).
+        e_a = version_a.rsplit("-e", 1)[-1]
+        e_b = version_b.rsplit("-e", 1)[-1]
+        self.assertNotEqual(
+            e_a, e_b,
+            "two genuinely different (workspace, tasks, results) triples produced the "
+            "SAME workspace-triple hash component on the real Claude launcher -- "
+            f"the `|` collision is not closed (version_a={version_a!r} version_b={version_b!r})",
+        )
+
+
 class NotifierBootGateRefusesOnSweepFailure(unittest.TestCase):
     """keweichen's review on PR #4503 (round 5+6): the notifier starts its OWN
     watcher independent of core's /startup Step 1.7, so it needs the same
