@@ -69,6 +69,38 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Session hooks: `setup(ctx)` and `voiceSurface()`
+
+A tools entry point may export two optional hooks besides `tools`. Both are
+product-neutral: the host names no skill, and works unchanged when none exports them.
+
+**`setup(ctx)`** runs once per voice session, synchronously, after the session
+exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
+
+| Member | Purpose |
+|---|---|
+| `session`, `injectText(session, text)` | the live session and the realtime text inject |
+| `clientAttached()` | true while a client is attached |
+| `sendClientFrame(frame)` | send one JSON frame to the attached client; `false` when none took it |
+| `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
+| `onClientDisconnected(handler)` | the client left: drop per-client state |
+| `injectContext(text)` | a framed system line the model should know, retried until the session is live |
+| `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
+| `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
+
+A handler that throws or rejects is logged and never reaches another skill's handler.
+
+**`voiceSurface()`** is evaluated once at load and returns what the skill adds to
+the **web voice session only** (`VoiceSurfaceContribution`):
+
+| Field | Effect |
+|---|---|
+| `tools` | declared on the voice session and listed in its prompt; never on the phone tool table. Return `[]` when the install cannot serve them, so the tool is gated at exposure |
+| `promptRules` | lines added to the voice prompt's RULES block |
+| `contextLines()` | lines added to the voice context, re-evaluated at every prompt build |
+
+With no contribution the voice prompt is byte-identical to the default.
+
 ## Config-only manifests (non-tools skills)
 
 A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).

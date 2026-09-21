@@ -45,6 +45,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
+- **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
@@ -243,6 +244,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-silence-recovery-coordinator.ts`** — ACTIVE-silence recovery coordinator (Phase 1 armed mode) — the impure driver around the pure reducer in voice-active-silence-watchdog.ts: executes effects against the bodhi session surface (recoverUpstream, client JSON), owns retry timers, the terminal voice-stalled push/resend, the retry-ack wire, and the reducer↔transport attempt-epoch correlation.
 - **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
 - **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
+- **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.

@@ -1241,7 +1241,9 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+    def test_managed_notifier_waits_for_idle_then_submits_in_watcher_announced_order(self):
+        # Priority now lives in the watcher's sweep (closes #3017); this stub
+        # emits in that real order (urgent before low), matching a real sweep.
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
         results = workspace / "results"
@@ -1259,7 +1261,7 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
             "#!/bin/bash\n"
-            "printf 'TASK_FILE: task-low.txt\\nTASK_FILE: task-owner.txt\\n'\n"
+            "printf 'TASK_FILE: task-owner.txt\\nTASK_FILE: task-low.txt\\n'\n"
         )
         watcher.chmod(0o755)
         early = Path(self.tmp.name) / "submitted-while-busy"

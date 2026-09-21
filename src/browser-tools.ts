@@ -39,6 +39,22 @@ export function injectText(session: any, text: string) {
 	}
 }
 
+/** Send context through `transport.sendContent` with `turnComplete: false`. The pinned Gemini
+ *  transport ignores that flag and sends realtime text, so a spoken reply is still possible. */
+export function injectSilentContext(session: any, text: string): boolean {
+	try {
+		const transport = session?.transport;
+		if (typeof transport?.sendContent === 'function') {
+			transport.sendContent([{ role: 'user', text }], false);
+			return true;
+		}
+		console.warn(`${ts()} [InjectSilent] transport has no sendContent — context dropped`);
+	} catch (err) {
+		console.error(`${ts()} [InjectSilent] Error:`, err);
+	}
+	return false;
+}
+
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
 const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
 

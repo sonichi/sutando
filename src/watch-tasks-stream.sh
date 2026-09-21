@@ -523,6 +523,33 @@ task_announce() {
   fi
 }
 
+# Order only (urgent > normal > low, mtime FIFO within a tier) -- every
+# *.txt; dispatch_task's own checks still decide eligibility, unchanged.
+# Empty output with files present is ambiguous (a real empty dir, or the
+# helper failing silently) -- fall back to mtime-glob order rather than ever
+# silently dropping the backlog; ordering degrades, dispatch never does.
+priority_sorted_tasks() {
+  local out rc=0 had_files=0 f
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" 2>/dev/null)" || rc=$?
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    had_files=1
+    break
+  done
+  shopt -u nullglob
+  [ "$had_files" -eq 1 ] || return 1
+  echo "watch-tasks-stream: priority sort unavailable (rc=$rc); dispatching in mtime order" >&2
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    basename "$f"
+  done
+  shopt -u nullglob
+}
+
 dispatch_task() {
   local task_path="$1" rc filename announce resolved attempt
   # Resolve before anything observes it: claim, handler and emit must all name
@@ -843,13 +870,12 @@ trap cleanup EXIT
 trap 'cleanup; exit 0' HUP INT TERM
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
-# restart gap. Install cleanup first so an immediately exiting fswatch cannot
-# kill a just-started provider before its durable fallback receipt is emitted.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  dispatch_task "$f"
-done
-shopt -u nullglob
+# restart gap, in priority order. Install cleanup first so an immediately
+# exiting fswatch cannot kill a just-started provider before its durable
+# fallback receipt is emitted.
+while IFS= read -r fn; do
+  dispatch_task "$TASKS_DIR/$fn"
+done < <(priority_sorted_tasks)
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
