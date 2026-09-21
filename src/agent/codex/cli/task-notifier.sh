@@ -331,22 +331,6 @@ mkdir -p "$queue_dir"
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
-# The watcher is the sole decider: enqueue exactly the filename it announced,
-# in announce order. No rescan, no priority pick, no handler probe here.
-enqueue_announced_task() {
-  local filename="$1"
-  case "$filename" in ""|*/*|*..*) return 0 ;; esac
-  has_result "$filename" && return 0
-  [ -e "$queue_dir/$filename" ] && return 0
-  : > "$queue_dir/$filename"
-}
-
-# Oldest marker = the head (mtime order == announce order: each marker is
-# created once and never touched again).
-queue_head() {
-  ls -1tr "$queue_dir" 2>/dev/null | tail -1
-}
-
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
 filename_is_worker_held() {
@@ -361,6 +345,34 @@ filename_is_claimed() {
   [ -e "$CLAIMS_DIR/$1" ]
 }
 
+# The watcher is the sole decider: enqueue exactly the filename it announced,
+# in announce order. No rescan, no priority pick, no handler probe here.
+# Checked once, here, not on every retry: a held/claimed filename never
+# occupies the queue at all, so it can never head-of-line-block a later
+# announced task behind it -- the next restart's sweep re-announces it if
+# the hold ever clears, matching this design's no-durable-log recovery.
+enqueue_announced_task() {
+  local filename="$1"
+  case "$filename" in ""|*/*|*..*) return 0 ;; esac
+  has_result "$filename" && return 0
+  [ -e "$queue_dir/$filename" ] && return 0
+  if filename_is_worker_held "$filename"; then
+    log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
+    return 0
+  fi
+  if filename_is_claimed "$filename"; then
+    log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
+    return 0
+  fi
+  : > "$queue_dir/$filename"
+}
+
+# Oldest marker = the head (mtime order == announce order: each marker is
+# created once and never touched again).
+queue_head() {
+  ls -1tr "$queue_dir" 2>/dev/null | head -1
+}
+
 # Retry the SAME head task on every wake, never re-pick; a busy core keeps
 # it queued rather than typing into Codex's non-durable input.
 process_announced_queue() {
@@ -371,14 +383,6 @@ process_announced_queue() {
     if has_result "$filename"; then
       rm -f "$queue_dir/$filename"
       continue
-    fi
-    if filename_is_worker_held "$filename"; then
-      log_notifier "$filename is worker-held per deliveries/; leaving it queued, not typing into the core"
-      return 0
-    fi
-    if filename_is_claimed "$filename"; then
-      log_notifier "$filename has a live task-event-handler claim; leaving it queued, not typing into the core"
-      return 0
     fi
     wait_for_core_idle || exit 1
     submit_task "$filename" 1

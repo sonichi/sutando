@@ -525,8 +525,29 @@ task_announce() {
 
 # Order only (urgent > normal > low, mtime FIFO within a tier) -- every
 # *.txt; dispatch_task's own checks still decide eligibility, unchanged.
+# Empty output with files present is ambiguous (a real empty dir, or the
+# helper failing silently) -- fall back to mtime-glob order rather than ever
+# silently dropping the backlog; ordering degrades, dispatch never does.
 priority_sorted_tasks() {
-  "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR"
+  local out rc=0 had_files=0 f
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" 2>/dev/null)" || rc=$?
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    had_files=1
+    break
+  done
+  shopt -u nullglob
+  [ "$had_files" -eq 1 ] || return 1
+  echo "watch-tasks-stream: priority sort unavailable (rc=$rc); dispatching in mtime order" >&2
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    basename "$f"
+  done
+  shopt -u nullglob
 }
 
 dispatch_task() {

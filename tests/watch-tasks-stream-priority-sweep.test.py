@@ -147,9 +147,44 @@ def test_directory_arm_sweep_also_orders_by_priority():
         h.cleanup()
 
 
+def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlog():
+    """If the priority-sort helper exits 0 with no output (the exact shape a
+    stubbed SUTANDO_PY producing nothing takes), the sweep must still dispatch
+    every task -- in mtime order -- rather than silently announcing none."""
+    h = Harness()
+    try:
+        stub_py = h.tmp / "bin" / "stub-python3"
+        stub_py.write_text("#!/bin/sh\nexit 0\n")
+        stub_py.chmod(0o755)
+        h.task("task-a3.txt", "urgent", age_s=10)
+        h.task("task-b3.txt", "low")
+
+        env = dict(os.environ)
+        env["PATH"] = f"{h.tmp/'bin'}:{env['PATH']}"
+        env["TMPDIR"] = str(h.tmp)
+        env["SUTANDO_RESULTS_DIR"] = str(h.ws / "results")
+        env["SUTANDO_PY"] = str(stub_py)
+        env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        env.pop("SUTANDO_INSTANCE_ID", None)
+        h.proc = subprocess.Popen(
+            ["bash", "src/watch-tasks-stream.sh", str(h.ws / "tasks")],
+            cwd=str(REPO), env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+
+        ok = wait_for(lambda: len(h.announce_order()) >= 2, timeout=15)
+        order = h.announce_order()
+        check("both tasks still announced despite the empty helper output", ok, f"order so far: {order}")
+        check("dispatched in mtime order (fallback, not priority)",
+              ok and set(order[:2]) == {"task-a3.txt", "task-b3.txt"},
+              f"order: {order}")
+    finally:
+        h.cleanup()
+
+
 def main() -> int:
     test_startup_sweep_announces_urgent_before_older_low()
     test_directory_arm_sweep_also_orders_by_priority()
+    test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlog()
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed: {FAILURES}")
         return 1
