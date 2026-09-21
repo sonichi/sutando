@@ -216,15 +216,19 @@ ensure_task_notifier() {
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
   # itself and fswatches it for changes, so the launcher forwards only a genuine
-  # operator pin (if one is already set) and nothing computed. The effective
-  # workspace override is part of the identity too: an unchanged script tree
-  # with a DIFFERENT SUTANDO_WORKSPACE_DIR/TASKS_DIR/RESULTS_DIR must still
-  # force a restart, or the gate validates one tree while the reused notifier
-  # keeps watching another.
+  # operator pin (if one is already set) and nothing computed. The EFFECTIVE
+  # workspace (not the raw override strings, which are constant when unset --
+  # the configured default workspace itself can change too) is part of the
+  # identity: an unchanged script tree resolving to a DIFFERENT workspace/
+  # tasks/results triple must still force a restart, or the gate validates
+  # one tree while the reused notifier keeps watching another.
+  # shellcheck source=../../../workspace_dir_resolve.sh
+  . "$REPO/src/workspace_dir_resolve.sh"
+  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-e$(printf '%s|%s|%s' "${SUTANDO_WORKSPACE_DIR:-}" "${SUTANDO_TASKS_DIR:-}" "${SUTANDO_RESULTS_DIR:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-e$(printf '%s' "$effective_ws_triple" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \

@@ -223,7 +223,8 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler="", workspace_dir="", tasks_dir="", results_dir=""):
+    def _notifier_version(self, handler="", workspace_dir=None, tasks_dir=None,
+                          results_dir=None, env_extra=None):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -233,14 +234,29 @@ exit 0
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
-        # Matches the launcher's own formula: the resolved handler, and the
-        # effective workspace override triple, both fold into the version.
+        # Calls the REAL resolve_effective_workspace_triple rather than
+        # re-deriving a formula here -- that's the exact meta-bug this helper caused once.
         handler_cksum = subprocess.run(
             ["cksum"], input=handler.encode(), capture_output=True,
             check=True, text=False).stdout.decode().split()[0]
+        resolve_env = dict(os.environ)
+        resolve_env["HOME"] = str(Path(self.tmp.name) / "home")
+        resolve_env.update(env_extra or {})
+        if workspace_dir is not None:
+            resolve_env["SUTANDO_WORKSPACE_DIR"] = workspace_dir
+        if tasks_dir is not None:
+            resolve_env["SUTANDO_TASKS_DIR"] = tasks_dir
+        if results_dir is not None:
+            resolve_env["SUTANDO_RESULTS_DIR"] = results_dir
+        triple = subprocess.run(
+            ["bash", "-c",
+             f'. "{self.root}/src/workspace_dir_resolve.sh"; '
+             f'resolve_effective_workspace_triple "{self.root}"'],
+            env=resolve_env, capture_output=True, check=True, text=True,
+        ).stdout
         env_cksum = subprocess.run(
-            ["cksum"], input=f"{workspace_dir}|{tasks_dir}|{results_dir}".encode(),
-            capture_output=True, check=True, text=False).stdout.decode().split()[0]
+            ["cksum"], input=triple.encode(), capture_output=True,
+            check=True, text=False).stdout.decode().split()[0]
         return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-e{env_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
@@ -703,6 +719,38 @@ exit 0
         calls = self.log.read_text()
         self.assertIn("kill-session -t =sutando-core-watcher", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_a_config_only_workspace_change_also_forces_a_restart(self):
+        """The normal path -- no SUTANDO_WORKSPACE_DIR/TASKS_DIR/RESULTS_DIR
+        override set at all -- must still force a restart when the
+        CONFIGURED default workspace itself changes (sutando.config.json's
+        workspace.path, exactly what an operator edits). Hashing only the
+        raw override strings sees a constant "||" in this case and misses it."""
+        config_path = self.root / "sutando.config.json"
+        original_config = json.loads(config_path.read_text())
+        workspace_a = self.root / "workspace-config-a"
+        (workspace_a / "state").mkdir(parents=True)
+        config_a = dict(original_config)
+        config_a["workspace"] = {"path": str(workspace_a)}
+        config_path.write_text(json.dumps(config_a))
+        active_version = self._notifier_version()
+        workspace_b = self.root / "workspace-config-b"
+        (workspace_b / "state").mkdir(parents=True)
+        config_b = dict(original_config)
+        config_b["workspace"] = {"path": str(workspace_b)}
+        config_path.write_text(json.dumps(config_b))
+        try:
+            result = self.run_launcher(env_extra={
+                "TMUX_ACTIVE_RUNTIME": "codex",
+                "TMUX_WATCHER_EXISTS": "1",
+                "TMUX_ACTIVE_NOTIFIER_VERSION": active_version,
+            })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.log.read_text()
+            self.assertIn("kill-session -t =sutando-core-watcher", calls)
+            self.assertIn("new-session -d -s sutando-core-watcher", calls)
+        finally:
+            config_path.write_text(json.dumps(original_config))
 
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={

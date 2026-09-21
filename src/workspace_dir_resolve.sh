@@ -16,3 +16,21 @@ resolve_workspace_dir_from_tasks_dir() {
   [ -n "$tasks_dir" ] || return 1
   dirname "${tasks_dir/#\~/$HOME}"
 }
+
+# $1: repo root (for the config-default fallback). Prints
+# "WORKSPACE_DIR|TASKS_DIR|RESULTS_DIR", matching exactly what a notifier
+# consumer resolves -- including the unset-override case, where the consumer
+# still lands on a real, config-derived workspace, never a blank value. A
+# caller hashing only the raw SUTANDO_* strings sees a constant when they're
+# unset, even though the CONFIGURED default workspace can itself change.
+resolve_effective_workspace_triple() {
+  local repo="$1" tasks_dir workspace_dir results_dir
+  if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+    tasks_dir="${SUTANDO_TASKS_DIR/#\~/$HOME}"
+  else
+    tasks_dir="$(bash "$repo/scripts/sutando-config.sh" workspace 2>/dev/null)/tasks"
+  fi
+  workspace_dir="$(resolve_workspace_dir_from_tasks_dir "$tasks_dir")" || return 1
+  results_dir="${SUTANDO_RESULTS_DIR:-$workspace_dir/results}"
+  printf '%s|%s|%s' "$workspace_dir" "$tasks_dir" "$results_dir"
+}
