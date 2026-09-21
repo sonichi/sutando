@@ -319,6 +319,34 @@ class TestRolePresentInboxAware(unittest.TestCase):
             return subprocess.CompletedProcess(["ps"], 1, "", "")
         self.assertIsNone(wid.role_present("session", inbox=INBOX, run=failing_run))
 
+    def _undecidable_per_pid_run(self, *_a, **_k):
+        """Simulates `ps -p <pid>` succeeding with a flattened, multi-token
+        line that classify_argv cannot decide without an authoritative vector
+        (matches the boundary but has trailing tokens past the script path)."""
+        return subprocess.CompletedProcess(["ps"], 0, CORE_SESSION_FLAT + "\n", "")
+
+    def test_an_undecidable_candidate_with_no_other_match_is_none_not_false(self):
+        """A pid the tree walk flagged watcher-shaped, whose authoritative
+        per-pid argv can't be read, must not be silently skipped into a
+        confident False -- it might have been the match."""
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        self.assertIsNone(wid.role_present("session", inbox=INBOX,
+                                           ps_output=ps_output, argv_vector=unreadable,
+                                           run=self._undecidable_per_pid_run))
+
+    def test_an_undecidable_candidate_does_not_hide_a_real_match_elsewhere(self):
+        """One tree undecidable, a second tree a genuine match: the real
+        True answer still wins over the undecidable one."""
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n  200 1 {WORKER_SESSION_FLAT}\n"
+        def run(argv, **kw):
+            pid = argv[argv.index("-p") + 1] if "-p" in argv else None
+            if pid == "200":
+                return subprocess.CompletedProcess(argv, 0, WORKER_SESSION_FLAT + "\n", "")
+            return self._undecidable_per_pid_run(argv, **kw)
+        vec = vector_for({"200": WORKER_SESSION_ARGS})  # 100 stays unreadable
+        self.assertIs(wid.role_present("session", inbox=WORKER_INBOX,
+                                       ps_output=ps_output, argv_vector=vec, run=run), True)
+
 
 class TestRolePresentCli(unittest.TestCase):
     def _run(self, argv, **patches):

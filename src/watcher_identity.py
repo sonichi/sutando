@@ -267,9 +267,15 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
             return None
         ps_output = result.stdout
     trees = watcher_trees(ps_output, is_watcher)
+    saw_undecidable = False
     for members in trees.values():
         for pid in sorted(members, key=lambda p: int(p) if p.isdigit() else 0):
             seen = inspect_pid(pid, run=run, argv_vector=argv_vector)
+            # Flagged watcher-shaped by the tree walk, but undecidable at the
+            # authoritative per-pid read -- not proven a match or not one.
+            if seen.watcher is None:
+                saw_undecidable = True
+                continue
             if seen.watcher is not True:
                 continue
             if watcher_role(seen.operands) != role:
@@ -277,7 +283,7 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
             if inbox is not None and watcher_inbox(seen.operands) != inbox:
                 continue
             return True
-    return False
+    return None if saw_undecidable else False
 
 
 def main(argv=None) -> int:
