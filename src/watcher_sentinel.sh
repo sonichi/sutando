@@ -47,11 +47,8 @@ sentinel_path_for() {
   printf '%s' "$out"
 }
 
-# The CANONICAL (core) identity's sentinel, explicit -- never the caller's own
-# ambient SUTANDO_INSTANCE_ID. For a caller naming ANOTHER process's path (a
-# host-global operation like restart.sh, which must target core's own watcher
-# even when invoked from a worker's own shell, which carries its own instance
-# id and would otherwise have sentinel_path_for() resolve to itself).
+# The CANONICAL identity's sentinel, never the caller's own ambient
+# SUTANDO_INSTANCE_ID (restart.sh stopping core's watcher from a worker).
 core_sentinel_path_for() {
   local state_dir="$1" here out
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

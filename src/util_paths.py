@@ -606,10 +606,8 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
         print(watcher_sentinel_path(sys.argv[2]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel-default":
-        # The CANONICAL (core) identity's sentinel, explicit -- never the
-        # caller's own ambient SUTANDO_INSTANCE_ID. For a caller naming
-        # another process's path (restart.sh stopping core's watcher, which
-        # must resolve to core even when invoked from a worker's own shell).
+        # The CANONICAL identity's sentinel, explicit -- never the caller's
+        # own ambient SUTANDO_INSTANCE_ID (see stated_default_identity()).
         _default_ident = stated_default_identity(sys.argv[2])
         if _default_ident is None:
             print("util_paths: cannot resolve the canonical default identity",
