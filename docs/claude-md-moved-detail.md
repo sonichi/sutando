@@ -123,3 +123,9 @@ Moved verbatim from CLAUDE.md "Workspace contract" (2026-08-21 context-budget di
 > workspace-tasks/.
 
 Current policy + protection layers: `docs/workspace-config.md`.
+
+## Per-channel pull namespace — existing consumers
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
+
+> Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses.
