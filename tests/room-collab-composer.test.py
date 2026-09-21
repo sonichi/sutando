@@ -15,8 +15,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 from room_composer import (  # noqa: E402
-    ComposerError, EMAIL, LINKEDIN_POST, SCHEMA, X_POST, build, counted_length,
-    feed, over_limit, readable, root_for,
+    ComposerError, DRAFT, DROPPED, EMAIL, LINKEDIN_POST, SCHEMA, SENT, X_POST, build,
+    counted_length, feed, mark, over_limit, readable, root_for, status_of,
 )
 
 FAILS = []
@@ -108,6 +108,34 @@ def test_a_feed_tolerates_what_another_writer_may_have_put_there():
     assert [e["id"] for e in got] == ["1", "2", "3", "4", "5"], got
     assert all(e["created"] is None for e in got), "a bool or a fraction is not a minute"
     assert got[2]["plain"] and "no renderer" in got[2]["why"]
+
+
+def test_a_post_carries_where_it_is_in_its_life_and_an_unknown_one_is_a_draft():
+    assert mark(SENT, 120) == {"status": SENT, "status_at": 120}
+    assert mark(DROPPED) == {"status": DROPPED}, "a mark without a time is still a mark"
+    _refuses(lambda: mark("posted"), "unknown status", "draft, sent, dropped")
+    # The composer does not send, so nothing marks a post finished on its own.
+    # An absent or unrecognised status must read as still needing attention.
+    for row in (None, {}, {"status": None}, {"status": "weird"}, {"status": 7}, "junk"):
+        assert status_of(row) == DRAFT, row
+
+
+def test_archived_posts_are_named_as_such_and_never_inferred():
+    rows = {
+        "1": build(X_POST, created=100),
+        "2": {**build(X_POST, created=101), **mark(SENT, 120)},
+        "3": {**build(EMAIL, {"subject": "s", "to": ["a@b.c"]}, created=102), **mark(DROPPED, 130)},
+        "4": {**build(X_POST, created=103), "status": "weird", "status_at": True},
+    }
+    got = {e["id"]: e for e in feed(rows)}
+    assert [got[i]["status"] for i in ("1", "2", "3", "4")] == [DRAFT, SENT, DROPPED, DRAFT]
+    assert [got[i]["archived"] for i in ("1", "2", "3", "4")] == [False, True, True, False]
+    assert got["2"]["status_at"] == 120 and got["1"]["status_at"] is None
+    assert got["4"]["status_at"] is None, "a bool is not a minute"
+    for entry in got.values():
+        assert "status" not in entry["fields"] and "status_at" not in entry["fields"], \
+            "the lifecycle is read from its own keys, not left among the renderable fields"
+    assert got["3"]["fields"] == {"subject": "s", "to": ["a@b.c"]}, "an archived post keeps its content"
 
 
 # --- what a reader does with a draft it cannot draw

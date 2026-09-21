@@ -71,6 +71,12 @@ ALLOWED_FIELDS: dict[str, tuple[str, ...]] = {
 # which is what a mail client shows and what a person pastes.
 LIST_FIELDS = ("to", "cc")
 
+# Where a post is in its life. Nothing here sends, so without this a post
+# already published is indistinguishable from one still waiting.
+DRAFT, SENT, DROPPED = "draft", "sent", "dropped"
+STATUSES = (DRAFT, SENT, DROPPED)
+ARCHIVED = (SENT, DROPPED)
+
 # What each destination will not publish past. A draft may exceed it while it
 # is being worked on; the renderer shows the overflow, the writer refuses none.
 LIMITS: dict[str, int] = {X_POST: 280, LINKEDIN_POST: 3000}
@@ -83,6 +89,27 @@ WEIGHTED = (X_POST,)
 
 class ComposerError(ValueError):
     """A draft a renderer could not draw, refused where it was written."""
+
+
+def mark(status: str, at: int | None = None) -> dict:
+    """The fields that move a post out of the feed, or back into it."""
+    if status not in STATUSES:
+        raise ComposerError(f"unknown status {status!r}: one of {', '.join(STATUSES)}")
+    out: dict[str, Any] = {"status": status}
+    if at is not None:
+        out["status_at"] = int(at)
+    return out
+
+
+def status_of(row: Any) -> str:
+    """A post's status, defaulting to `draft`.
+
+    An absent or unrecognised status reads as a draft, never as archived: the
+    safe direction is "still needs attention". A post is only out of the feed
+    because someone said so.
+    """
+    value = row.get("status") if isinstance(row, dict) else None
+    return value if value in STATUSES else DRAFT
 
 
 def build(artifact_type: str, fields: dict[str, Any] | None = None,
@@ -139,6 +166,12 @@ def feed(stored: Any) -> list[dict]:
         created = entry["fields"].pop("created", None)
         ok = isinstance(created, (int, float)) and not isinstance(created, bool)
         entry["created"] = int(created) if ok and created == int(created) else None
+        entry["status"] = status_of(row if isinstance(row, dict) else {})
+        entry["archived"] = entry["status"] in ARCHIVED
+        at = entry["fields"].pop("status_at", None)
+        at_ok = isinstance(at, (int, float)) and not isinstance(at, bool)
+        entry["status_at"] = int(at) if at_ok and at == int(at) else None
+        entry["fields"].pop("status", None)
         out.append(entry)
     return sorted(out, key=lambda e: (e["created"] or 0, e["id"]))
 
