@@ -29,7 +29,7 @@ for _w in $(seq 1 "$WORKERS"); do
         while [ "$idx" -le "$N" ]; do
             f="$(sed -n "${idx}p" "$FILES")"
             rec="$RECDIR/$idx"
-            out="$(cd "$WTDIR/$_w" && "$@" "$f" 2>&1)" && rc=0 || rc=$?
+            out="$(cd "$WTDIR/$_w" && "$@" "$f" 2>&1 < /dev/null)" && rc=0 || rc=$?
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
             idx=$((idx + WORKERS))
