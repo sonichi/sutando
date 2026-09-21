@@ -104,22 +104,30 @@ case "$SEQ" in "lit:alpha enter lit:beta enter "|"lit:beta enter lit:alpha enter
 # --- real-tmux leg (optional): the same policy against a real server on a throwaway socket
 if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ]; then
   SOCKW="$T/w.sock"; OUTW="$T/pane.out"
+  # kill-server only signals the server; a new-session that reaches it before it has
+  # exited is turned away ("server exited unexpectedly"), so wait for its pid to go.
+  stop_server() {
+    local _srv _t=0
+    _srv="$(tmux -S "$SOCKW" display-message -p '#{pid}' 2>/dev/null)"
+    tmux -S "$SOCKW" kill-server 2>/dev/null
+    while [ -n "$_srv" ] && kill -0 "$_srv" 2>/dev/null && [ "$_t" -lt 100 ]; do sleep 0.05; _t=$((_t + 1)); done
+  }
   tmux -S "$SOCKW" new-session -d -s probe "cat > $OUTW"; sleep 0.4
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe "hello world" --socket "$SOCKW" > "$T/out" 2> "$T/err"; echo $?); sleep 0.4
   [ "$rc" = 0 ] && [ "$(tr -d '\r' < "$OUTW")" = "hello world" ] && ok "R1 real pane: literal line + Enter delivered" || fail "R1 real pane" "rc=$rc [$(cat "$OUTW")] $(cat "$T/err")"
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" nosuch x --socket "$SOCKW" > /dev/null 2> "$T/err"; echo $?)
   [ "$rc" = 3 ] && ok "R2 real tmux: missing session → exit 3" || fail "R2 no session" "rc=$rc"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
   tmux -S "$SOCKW" new-session -d -s probe 'printf "\xe2\x9d\xaf half typed"; sleep 30'; sleep 0.5
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --refuse-if-pending > /dev/null 2> "$T/err"; echo $?)
   [ "$rc" = 5 ] && grep -q "half typed" "$T/err" && ok "R3 real pane with text after ❯: --refuse-if-pending exits 5 quoting it" || fail "R3 refuse" "rc=$rc $(cat "$T/err")"
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --skip-if-queued "half typed" > /dev/null 2>&1; echo $?)
   [ "$rc" = 6 ] && ok "R4 --skip-if-queued matches the queued word: exit 6, nothing typed" || fail "R4 skip" "rc=$rc"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
   tmux -S "$SOCKW" new-session -d -s probe 'printf "\033[1m\xe2\x80\xba\033[0m \033[2mImprove documentation in @filename\033[0m"; sleep 30'; sleep 0.5
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --runtime codex --refuse-if-pending --dry-run > "$T/out" 2> "$T/err"; echo $?)
   [ "$rc" = 0 ] && grep -q "pending: ''" "$T/out" && ok "R5 real Codex-shaped pane: dim placeholder after › reads as EMPTY" || fail "R5 real placeholder" "rc=$rc $(cat "$T/out" "$T/err")"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
   tmux -S "$SOCKW" new-session -d -s probe 'printf "\xe2\x80\xba half typed"; sleep 30'; sleep 0.5
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --runtime codex --refuse-if-pending > /dev/null 2> "$T/err"; echo $?)
   [ "$rc" = 5 ] && grep -q "half typed" "$T/err" && ok "R6 real Codex-shaped pane with text after ›: --refuse-if-pending exits 5" || fail "R6 real codex refuse" "rc=$rc $(cat "$T/err")"
@@ -131,7 +139,7 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
   [ "$rc" = 5 ] && ok "R7 real pane with unsent text, read as the WRONG runtime: --refuse-if-pending now exits 5 (was 0 — the fail-open)" || fail "R7 default-runtime contrast" "rc=$rc $(cat "$T/out")"
   rc=$(bash "$HERE/scripts/tmux-send-line.sh" probe x --socket "$SOCKW" --dry-run > "$T/out" 2>&1; echo $?)
   [ "$rc" = 0 ] && grep -q "pending: ''" "$T/out" && ok "R7b without the guard, the same pane still reads as no-prompt for claude (glyph is per-runtime)" || fail "R7b runtime contrast" "rc=$rc $(cat "$T/out")"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
   # A REAL tmux server, no shim. The transition is driven by an OBSERVED staged payload, never a
   # sleep: a fixed delay can beat the sender's first capture, and the run then refuses before it
   # reaches the withheld-Enter branch and still passes (keweichen 2026-09-19: 1 pass / 3 fails).
@@ -148,13 +156,13 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
   }
   run_toctou "\r\033[2K  Select Model and Effort\r\n\xe2\x80\xba 4. gpt-5.5 (current)"
   [ "$STAGED" = 1 ] && [ "$RC" = 5 ] && grep -q "pane changed during the paste-burst delay" "$T/err" && ok "R8 real tmux: payload staged FIRST (observed), then a picker appears -> Enter withheld" || fail "R8 real TOCTOU" "staged=$STAGED rc=$RC $(cat "$T/err")"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
   # Real tmux, real timing: the composer keeps showing the SAME typed line (stale, matching
   # the staged payload) but a gate appears BELOW it 300ms in -- must still withhold Enter.
   run_toctou "\r\033[2K\xe2\x80\xba hello\r\nLogin successful. Press Enter to continueâ¦"
   [ "$STAGED" = 1 ] && [ "$RC" = 5 ] && grep -q "pane state changed below the prompt" "$T/err" && ok "R9 real tmux: payload staged FIRST (observed), then a gate appears below -> Enter withheld" || fail "R9 real stale-gate" "staged=$STAGED rc=$RC $(cat "$T/err")"
-  tmux -S "$SOCKW" kill-server 2>/dev/null
-  tmux -S "$SOCKW" kill-server 2>/dev/null
+  stop_server
+  stop_server
   # #4318's R10 (keweichen 5232068159) not ported: pane_gate.py:_read_stdin() already
   # reconfigures UTF-8 errors="replace" and every call here is `||`-checked -- verified rc=0.
 else
