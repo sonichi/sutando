@@ -133,6 +133,12 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         self.assertNotIn(ok.name, self.mod._VOICE_ROOM_HELD)
         dm = self._result("proactive-result-task-6-6.txt", "owner nudge")
         self.assertTrue(self.mod._ag2space_proactive_claim_gate(dm), "no room named: nothing to verify")
+        untagged = self._result("proactive-result-task-9-9.txt", f"[channel: {FORGED_ROOM}]\nthe core's own body")
+        self.assertTrue(self.mod._ag2space_proactive_claim_gate(untagged),
+                        "an untagged forward is never held, whatever its body opens with")
+        self.assertNotIn(untagged.name, self.mod._VOICE_ROOM_HELD)
+        self.assertFalse(any(c[1] == "/v1/room" and (c[2] or {}).get("room_id") == FORGED_ROOM for c in self.gw.calls),
+                         "and its room is not even asked about")
         other = self._result("proactive-7.txt", f"[channel: {FORGED_ROOM}]\nnot a voice result")
         self.assertTrue(self.mod._ag2space_proactive_claim_gate(other),
                         "only the task bridge's proactive-result-* shape is a voice result")

@@ -246,11 +246,13 @@ def _voice_result_room_verified(path: Path) -> bool:
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
-    if path.name.startswith("proactive-result-") and not _voice_result_room_verified(path):
+    dest = proactive_destination(path.name)
+    # Membership gate: only the task bridge's gateway-tagged room shape. An
+    # untagged forward is any bridge's to deliver and is never held here.
+    if dest == _CHANNEL and path.name.startswith("proactive-result-") and not _voice_result_room_verified(path):
         return False
     # A filename destination outranks everything below, incl. the grace:
     # a destined file strands visibly rather than leak to the gateway room.
-    dest = proactive_destination(path.name)
     if dest is not None:
         return dest == _CHANNEL
     state = WS / "state" / "last-owner-activity.json"
