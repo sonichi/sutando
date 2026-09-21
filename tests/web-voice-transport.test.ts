@@ -18,6 +18,7 @@ import {
 	SESSION_CONTEXT_TYPE,
 	buildSessionContextFrame,
 	UI_NAVIGATE_TYPE,
+	TRANSPORT_OWNED_FRAME_TYPES,
 	buildUiNavigateFrame,
 	parseUiNavigateFrame,
 	type VoiceConnectFailure,
@@ -162,7 +163,7 @@ describe('web-voice-transport turn lifecycle', () => {
 		assert.deepEqual(seen, ['image', 'turn.end']);
 	});
 
-	it('onServerFrame receives every JSON frame the agent sends, including ui.navigate', () => {
+	it('onServerFrame receives the frames the transport does not own (ui.navigate, unknown), never the owned ones', () => {
 		const frames: Record<string, unknown>[] = [];
 		let ended = 0;
 		const t = new VoiceTransport({ onServerFrame: (f) => frames.push(f), onTurnEnd: () => ended++ });
@@ -170,9 +171,32 @@ describe('web-voice-transport turn lifecycle', () => {
 		feed(t, nav);
 		feed(t, { type: 'turn.end' });
 		feed(t, { type: 'totally.unknown', x: 1 });
-		assert.deepEqual(frames.map((f) => f.type), [UI_NAVIGATE_TYPE, 'turn.end', 'totally.unknown']);
+		for (const owned of TRANSPORT_OWNED_FRAME_TYPES) feed(t, { type: owned });
+		assert.deepEqual(frames.map((f) => f.type), [UI_NAVIGATE_TYPE, 'totally.unknown']);
 		assert.deepEqual(parseUiNavigateFrame(frames[0]), nav, 'the frame arrives whole, ready for the client parser');
-		assert.equal(ended, 1, 'the transport still interprets the frames it knows');
+		assert.equal(ended, 2, 'the transport still interprets the frames it knows');
+		for (const owned of ['agent.state', 'session.config', 'session.context.ack', 'transcript', 'turn.end', 'turn.interrupted']) {
+			assert.ok(TRANSPORT_OWNED_FRAME_TYPES.has(owned), `${owned} is owned`);
+		}
+		assert.ok(!TRANSPORT_OWNED_FRAME_TYPES.has(UI_NAVIGATE_TYPE));
+	});
+
+	it('onServerFrame runs after the typed dispatch and cannot break it or the raw sink', () => {
+		const order: string[] = [];
+		const t = new VoiceTransport({
+			onServerFrame: (f) => { order.push('hook:' + f.type); throw new Error('surface bug'); },
+			onProtocolMessage: (m) => order.push('raw:' + (m as { type: string }).type),
+			onSessionConfig: () => order.push('typed:session.config'),
+			onTurnEnd: () => order.push('typed:turn.end'),
+		});
+		assert.doesNotThrow(() => feed(t, { type: 'session.config', audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000 } }));
+		assert.doesNotThrow(() => feed(t, { type: 'ui.navigate', version: 1, request_id: 'r', target: 'dm' }));
+		assert.doesNotThrow(() => feed(t, { type: 'turn.end' }));
+		assert.deepEqual(order, [
+			'typed:session.config', 'raw:session.config',
+			'hook:ui.navigate', 'raw:ui.navigate',
+			'typed:turn.end', 'raw:turn.end',
+		]);
 	});
 
 	it('unknown frame types are still ignored by the transport itself (no throw, no callback but the raw sinks)', () => {

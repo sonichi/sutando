@@ -379,11 +379,13 @@ export interface VoiceTransportEvents {
   /** Any non-audio protocol frame (image/video/chat/gui/etc). Surface renders it. */
   onProtocolMessage?(msg: any): void;
   /**
-   * Every JSON frame the agent sends, before the transport interprets it —
-   * the hook for agent-driven control frames the surface acts on (e.g.
-   * `ui.navigate`, answered with `sendClientCommand(buildUiNavigatedFrame(…))`).
-   * Frame types the transport does not know stay ignored here; they only
-   * reach this callback and `onProtocolMessage`.
+   * Agent-driven control frames the surface acts on (e.g. `ui.navigate`,
+   * answered with `sendClientCommand(buildUiNavigatedFrame(…))`). Fires after
+   * the transport's own typed dispatch and only for frame types the transport
+   * does not own (TRANSPORT_OWNED_FRAME_TYPES): a surface hook can neither
+   * pre-empt nor break the transport's handling of session.config, turn.end
+   * and the rest. A throwing hook is contained; `onProtocolMessage` still
+   * sees every frame afterwards.
    */
   onServerFrame?(frame: Record<string, unknown>): void;
   /** Mic failed to start. `friendly` is from classifyMicError. */
@@ -573,6 +575,35 @@ export interface SessionContextFrame {
   room_id: string | null;
   room_name: string | null;
   surface: 'room' | 'dm';
+  /** Additive (v1): the agent-driven control frames this client answers, e.g.
+   *  `['ui.navigate']`. Absent on clients that predate it, which the agent
+   *  reads as "none" — so a tool that needs a capability fails at once
+   *  instead of waiting on a reply the client cannot give. */
+  capabilities?: string[];
+}
+
+/** The capability a client announces when it answers `ui.navigate` frames
+ *  with `ui.navigated`; `navigate_ui` is gated on it. */
+export const UI_NAVIGATE_CAPABILITY = 'ui.navigate';
+/** Bounds on the announced list: names are flattened and capped, the list too. */
+export const SESSION_CONTEXT_CAPABILITY_MAX_CHARS = 64;
+export const SESSION_CONTEXT_MAX_CAPABILITIES = 32;
+
+/** Pure (agent side): the capabilities a `session.context` frame announces —
+ *  strings only, trimmed, deduplicated, bounded; `[]` when the field is
+ *  absent or malformed; undefined when `msg` is not a session.context frame. */
+export function parseSessionContextCapabilities(msg: unknown): string[] | undefined {
+  const m = msg as Record<string, unknown> | null | undefined;
+  if (!m || typeof m !== 'object' || m.type !== SESSION_CONTEXT_TYPE) return undefined;
+  if (!Array.isArray(m.capabilities)) return [];
+  const out: string[] = [];
+  for (const c of m.capabilities) {
+    if (typeof c !== 'string') continue;
+    const name = c.replace(/[\r\n]+/g, ' ').trim().slice(0, SESSION_CONTEXT_CAPABILITY_MAX_CHARS);
+    if (name && !out.includes(name)) out.push(name);
+    if (out.length >= SESSION_CONTEXT_MAX_CAPABILITIES) break;
+  }
+  return out;
 }
 
 /** Agent → client answer to a `session.context` frame: whether the room was
@@ -604,6 +635,18 @@ export function buildSessionContextAckFrame(roomId: string | null, bound: boolea
   if (reason) frame.reason = reason;
   return frame;
 }
+
+/** Frame types the transport interprets itself in handleMessage. The
+ *  surface's `onServerFrame` hook never sees these; they reach the surface
+ *  through the typed callbacks and the raw `onProtocolMessage` sink only. */
+export const TRANSPORT_OWNED_FRAME_TYPES: ReadonlySet<string> = new Set([
+  'agent.state',
+  'session.config',
+  SESSION_CONTEXT_ACK_TYPE,
+  'transcript',
+  'turn.end',
+  'turn.interrupted',
+]);
 
 /** Pure: the frame for a room context, or the DM shape when there is none. */
 export function buildSessionContextFrame(ctx: VoiceRoomContext | null | undefined): SessionContextFrame {
@@ -1798,7 +1841,6 @@ export class VoiceTransport {
       return; // non-JSON text frame — ignore
     }
     this.debug('Recv: ' + JSON.stringify(msg), 'event');
-    if (msg && typeof msg === 'object') this.ev.onServerFrame?.(msg as Record<string, unknown>);
 
     if (msg?.type === 'agent.state') {
       this.handleAgentState(msg as AgentStateV1);
@@ -1823,6 +1865,17 @@ export class VoiceTransport {
       // scheduled playback immediately so it doesn't talk over them.
       this.flushPlayback();
       this.ev.onInterrupted?.();
+    }
+
+    // Surface control frames (ui.navigate …): only after the typed dispatch
+    // above, never for a type the transport owns, and a hook that throws
+    // cannot take the raw sink below with it.
+    if (msg && typeof msg === 'object' && !TRANSPORT_OWNED_FRAME_TYPES.has(String(msg.type))) {
+      try {
+        this.ev.onServerFrame?.(msg as Record<string, unknown>);
+      } catch (e) {
+        this.debug('onServerFrame threw: ' + ((e as Error)?.message ?? String(e)), 'warn');
+      }
     }
 
     // Always forward the raw frame — surfaces render image/video/gui/chat/etc.

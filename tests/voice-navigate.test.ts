@@ -2,23 +2,36 @@
  * navigate_ui — the voice agent moves the desktop by voice.
  *
  * Pins the wire contract shared with the desktop client (frame builders and
- * parsers round-trip, bounds hold), and the tool's every outcome: resolved by
- * the client's reply, timed out cleanly, `unsupported` with no client, failed
- * fast when the client leaves, and a stray reply ignored.
+ * parsers round-trip, bounds hold; the `capabilities` field of session.context
+ * and its parser), the capability gate (an attached client that never said
+ * `ui.navigate` gets `unsupported` at once and no frame), the room-without-
+ * query short-circuit, the tool's every outcome: resolved by the client's
+ * reply, timed out cleanly, `unsupported` with no client, failed fast when the
+ * client leaves, a stray reply ignored — and the voice-agent / inline-tools
+ * wiring by source pin, so the seam cannot silently drop out.
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
 	UI_NAVIGATE_TYPE,
 	UI_NAVIGATED_TYPE,
+	UI_NAVIGATE_CAPABILITY,
 	UI_NAVIGATE_QUERY_MAX_CHARS,
 	UI_NAVIGATED_NAME_MAX_CHARS,
 	UI_NAVIGATED_MAX_CANDIDATES,
+	SESSION_CONTEXT_TYPE,
+	SESSION_CONTEXT_CAPABILITY_MAX_CHARS,
+	SESSION_CONTEXT_MAX_CAPABILITIES,
+	buildSessionContextFrame,
+	parseSessionContextCapabilities,
 	buildUiNavigateFrame,
 	parseUiNavigateFrame,
 	buildUiNavigatedFrame,
 	parseUiNavigatedFrame,
+	type SessionContextFrame,
 } from '../src/web-voice-transport.js';
 import {
 	navigateUi,
@@ -29,7 +42,47 @@ import {
 	pendingNavigationCount,
 	NAVIGATE_UI_TIMEOUT_MS,
 	NAVIGATE_UI_UNSUPPORTED_MESSAGE,
+	NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE,
+	NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE,
 } from '../src/voice-navigate.js';
+
+const src = (rel: string) => readFileSync(fileURLToPath(new URL(`../src/${rel}`, import.meta.url)), 'utf8');
+
+describe('session.context capabilities — how the client says it speaks ui.navigate', () => {
+	it('the capability name is the frame type it answers, and the field is additive on the v1 frame', () => {
+		assert.equal(UI_NAVIGATE_CAPABILITY, UI_NAVIGATE_TYPE);
+		const frame: SessionContextFrame = { ...buildSessionContextFrame(null), capabilities: [UI_NAVIGATE_CAPABILITY] };
+		assert.equal(frame.version, 1, 'still v1: a client that omits the field is a valid v1 sender');
+		assert.deepEqual(parseSessionContextCapabilities(frame), ['ui.navigate']);
+		assert.deepEqual(parseSessionContextCapabilities(JSON.parse(JSON.stringify(frame))), ['ui.navigate']);
+	});
+
+	it('absent, null or malformed capabilities read as none — never as an error', () => {
+		assert.deepEqual(parseSessionContextCapabilities(buildSessionContextFrame(null)), []);
+		assert.deepEqual(parseSessionContextCapabilities({ type: SESSION_CONTEXT_TYPE, version: 1, surface: 'dm', capabilities: null }), []);
+		assert.deepEqual(parseSessionContextCapabilities({ type: SESSION_CONTEXT_TYPE, version: 1, surface: 'dm', capabilities: 'ui.navigate' }), []);
+		assert.deepEqual(parseSessionContextCapabilities({ type: SESSION_CONTEXT_TYPE, version: 1, surface: 'dm', capabilities: [42, null, {}, '  '] }), []);
+	});
+
+	it('undefined for anything that is not a session.context frame', () => {
+		assert.equal(parseSessionContextCapabilities({ type: UI_NAVIGATED_TYPE, capabilities: ['ui.navigate'] }), undefined);
+		assert.equal(parseSessionContextCapabilities(null), undefined);
+		assert.equal(parseSessionContextCapabilities('session.context'), undefined);
+		assert.equal(parseSessionContextCapabilities({}), undefined);
+	});
+
+	it('names are trimmed, flattened, deduplicated and bounded', () => {
+		const caps = parseSessionContextCapabilities({
+			type: SESSION_CONTEXT_TYPE, version: 1, surface: 'dm',
+			capabilities: [' ui.navigate ', 'ui.navigate', 'a\nb', 'x'.repeat(200), ...[...Array(50)].map((_, i) => `c${i}`)],
+		})!;
+		assert.equal(caps[0], 'ui.navigate');
+		assert.equal(caps[1], 'a b');
+		assert.equal(caps[2].length, SESSION_CONTEXT_CAPABILITY_MAX_CHARS);
+		assert.equal(caps.length, SESSION_CONTEXT_MAX_CAPABILITIES);
+		assert.equal(new Set(caps).size, caps.length);
+	});
+});
 
 describe('ui.navigate / ui.navigated frame contract', () => {
 	it('request: builder → parser round trip keeps every field', () => {
@@ -97,12 +150,14 @@ describe('ui.navigate / ui.navigated frame contract', () => {
 describe('navigate_ui tool', () => {
 	const sent: Record<string, unknown>[] = [];
 	let attached = true;
+	let capabilities = new Set<string>([UI_NAVIGATE_CAPABILITY]);
 
 	beforeEach(() => {
 		sent.length = 0;
 		attached = true;
+		capabilities = new Set([UI_NAVIGATE_CAPABILITY]);
 		failPendingNavigations();
-		installVoiceNavigateClient({ attached: () => attached, send: (f) => { sent.push(f); } });
+		installVoiceNavigateClient({ attached: () => attached, supports: (c) => capabilities.has(c), send: (f) => { sent.push(f); } });
 	});
 
 	it('is declared as an inline tool with the shared target enum', () => {
@@ -167,15 +222,59 @@ describe('navigate_ui tool', () => {
 		installVoiceNavigateClient(null);
 		const none = await navigateUi({ target: 'dm' });
 		assert.deepEqual(none, { ok: false, target: 'dm', error: 'unsupported', message: NAVIGATE_UI_UNSUPPORTED_MESSAGE });
-		installVoiceNavigateClient({ attached: () => false, send: (f) => { sent.push(f); } });
+		installVoiceNavigateClient({ attached: () => false, supports: () => true, send: (f) => { sent.push(f); } });
 		const gone = await navigateUi({ target: 'room', query: 'GTM' });
 		assert.equal(gone.ok, false);
 		assert.equal(sent.length, 0, 'nothing is sent to a client that is not there');
 		assert.match(NAVIGATE_UI_UNSUPPORTED_MESSAGE, /desktop app/);
 	});
 
+	it('capability gate: an attached client that never announced ui.navigate gets unsupported at once, and no frame', async () => {
+		capabilities = new Set();
+		const started = Date.now();
+		const r = await navigateUi({ target: 'room', query: 'GTM in Investors' }, { requestId: 'req-old', timeoutMs: 5000 });
+		assert.ok(Date.now() - started < 1000, 'no wait on a reply the client cannot give');
+		assert.deepEqual(r, { ok: false, target: 'room', error: 'unsupported', message: NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE });
+		assert.equal(sent.length, 0, 'nothing on the wire');
+		assert.equal(pendingNavigationCount(), 0);
+		assert.match(NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, /update it/);
+		// Other announced capabilities do not stand in for this one.
+		capabilities = new Set(['something.else']);
+		assert.equal((await navigateUi({ target: 'dm' })).ok, false);
+		assert.equal(sent.length, 0);
+	});
+
+	it('capability gate: with ui.navigate announced the frame goes out and the reply settles it', async () => {
+		capabilities = new Set([UI_NAVIGATE_CAPABILITY, 'other']);
+		const p = navigateUi({ target: 'dm' }, { requestId: 'req-cap' });
+		assert.equal(sent.length, 1);
+		assert.deepEqual(sent[0], buildUiNavigateFrame('req-cap', 'dm'));
+		resolveUiNavigated(buildUiNavigatedFrame('req-cap', {}));
+		assert.deepEqual(await p, { ok: true, target: 'dm' });
+	});
+
+	it('target room with no query is not_found at once, with a prompt for the room, and no frame', async () => {
+		for (const query of [undefined, '', '   ', '\n']) {
+			const r = await navigateUi({ target: 'room', query }, { timeoutMs: 5000 });
+			assert.deepEqual(r, { ok: false, target: 'room', error: 'not_found', message: NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE }, `query=${JSON.stringify(query)}`);
+		}
+		assert.equal(sent.length, 0, 'nothing on the wire');
+		assert.equal(pendingNavigationCount(), 0);
+		assert.match(NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, /which room/);
+		// The same through the tool's execute (the model's path).
+		const viaTool = await (navigateUiTool.execute({ target: 'room' }, {} as never) as Promise<{ ok: boolean; error?: string }>);
+		assert.equal(viaTool.ok, false);
+		assert.equal(viaTool.error, 'not_found');
+		assert.equal(sent.length, 0);
+		// dm / home never needed a query.
+		const home = navigateUi({ target: 'home' }, { requestId: 'req-home' });
+		assert.equal(sent.length, 1);
+		resolveUiNavigated(buildUiNavigatedFrame('req-home', {}));
+		assert.equal((await home).ok, true);
+	});
+
 	it('a send that throws answers unsupported rather than waiting', async () => {
-		installVoiceNavigateClient({ attached: () => true, send: () => { throw new Error('socket closed'); } });
+		installVoiceNavigateClient({ attached: () => true, supports: () => true, send: () => { throw new Error('socket closed'); } });
 		const r = await navigateUi({ target: 'dm' }, { timeoutMs: 5000 });
 		assert.equal(r.ok, false);
 		if (r.ok) return;
@@ -204,5 +303,51 @@ describe('navigate_ui tool', () => {
 		await delay(5);
 		assert.equal(resolveUiNavigated(buildUiNavigatedFrame('live', {})), true);
 		assert.equal((await p).ok, true);
+	});
+});
+
+// The seam between this module and the voice agent is plain function calls
+// in voice-agent.ts, and the tool's place in the model's table is an array
+// literal in inline-tools.ts: neither is reachable from a unit test without
+// starting the agent, so both are pinned by source.
+describe('navigate_ui wiring (source pins)', () => {
+	const agent = src('voice-agent.ts');
+	const tools = src('inline-tools.ts');
+	const between = (text: string, start: string, end: string) => {
+		const a = text.indexOf(start);
+		assert.ok(a >= 0, `missing: ${start}`);
+		const b = text.indexOf(end, a);
+		assert.ok(b > a, `missing after ${start}: ${end}`);
+		return text.slice(a, b);
+	};
+
+	it('onClientCommand routes every client frame through resolveUiNavigated and records capabilities first', () => {
+		const hook = between(agent, 'onClientCommand: (message) => {', 'onClientConnected:');
+		assert.ok(hook.includes('resolveUiNavigated(message);'));
+		assert.ok(hook.includes('recordClientCapabilities(message);'));
+		assert.ok(hook.indexOf('recordClientCapabilities(message);') < hook.indexOf('resolveUiNavigated(message);'));
+	});
+
+	it('capabilities come from parseSessionContextCapabilities and are cleared with the pending requests on detach', () => {
+		assert.ok(agent.includes("import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './web-voice-transport.js';"));
+		assert.ok(agent.includes('const caps = parseSessionContextCapabilities(message);'));
+		const gone = between(agent, 'onClientDisconnected: () => {', 'suppressClientAutoActions:');
+		assert.ok(gone.includes('clientCapabilities = new Set();'));
+		assert.ok(gone.includes('failPendingNavigations();'));
+	});
+
+	it('the installed client is gated on connected AND the announced capability', () => {
+		const install = between(agent, 'installVoiceNavigateClient({', '});');
+		assert.ok(install.includes('attached: () => Boolean(session.clientConnected),'));
+		assert.ok(install.includes('supports: (capability) => clientCapabilities.has(capability),'));
+		assert.ok(install.includes('send: (frame) => session.sendJsonToClient(frame),'));
+	});
+
+	it('navigate_ui sits in both the inline tool table and the owner-only table', () => {
+		assert.ok(tools.includes("import { navigateUiTool } from './voice-navigate.js';"));
+		const inline = between(tools, 'export const inlineTools = forHostPlatform(assertUniqueToolNames([', ']));');
+		assert.ok(inline.includes('navigateUiTool'), 'in the model\'s table');
+		const ownerOnly = between(tools, 'export const ownerOnlyTools = forHostPlatform([', ']);');
+		assert.ok(ownerOnly.includes('navigateUiTool'), 'owner-only: a guest cannot move the owner\'s desktop');
 	});
 });
