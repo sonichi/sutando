@@ -578,6 +578,34 @@ WANT9S_WS="$(cd "$TD/9s-ws" && pwd -P)"
 check "the ordinary absolute-path case still resolves the correct triple" \
   "$GOT9S" "$WANT9S_WS|$WANT9S_WS/tasks|$WANT9S_WS/results"
 
+# --- Case 9t: keweichen's Codex re-review of d20361e77, P1 -- a symlink on
+# the TASKS DIR ITSELF (not an ancestor -- 9f/9h cover that), e.g.
+# alias/tasks -> real/ws/tasks with only SUTANDO_TASKS_DIR=alias/tasks set.
+# resolve_workspace_dir_from_tasks_dir used to take dirname of the LOGICAL
+# tasks path before canonicalizing, deriving workspace=alias/ (empty, the
+# symlink's own logical parent) while the tasks field, canonicalized
+# separately, resolved to real/ws/tasks -- an internally-inconsistent
+# triple where both fields "worked" alone but named different trees. Both
+# launchers then swept the empty alias/ dir and forwarded it, hiding the
+# real pool's declaration. Fix: canonicalize tasks_dir FIRST, take dirname
+# of the physical form. ---
+mkdir -p "$TD/9t-real/ws/tasks"
+mkdir -p "$TD/9t-alias"
+ln -s "$TD/9t-real/ws/tasks" "$TD/9t-alias/tasks"
+WANT9T_WS="$(cd "$TD/9t-real/ws" && pwd -P)"
+GOT9T_WS="$(resolve_workspace_dir_from_tasks_dir "$TD/9t-alias/tasks")"
+check "a symlink on the tasks dir itself derives workspace from its PHYSICAL parent, not the symlink's own logical parent" \
+  "$GOT9T_WS" "$WANT9T_WS"
+GOT9T_TRIPLE="$(
+  unset SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+  if { IFS= read -r -d '' a && IFS= read -r -d '' b && IFS= read -r -d '' c; } \
+      < <(SUTANDO_TASKS_DIR="$TD/9t-alias/tasks" resolve_effective_workspace_triple "$REAL_REPO"); then
+    printf '%s|%s|%s' "$a" "$b" "$c"
+  fi
+)"
+check "the full triple is internally consistent -- workspace, tasks and results all sit under the resolved physical tree, none under the alias" \
+  "$GOT9T_TRIPLE" "$WANT9T_WS|$WANT9T_WS/tasks|$WANT9T_WS/results"
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is

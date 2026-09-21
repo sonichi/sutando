@@ -187,6 +187,35 @@ apply_tmux_defaults() {
   tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 }
 
+# $1: a short reason clause for the log lines. $2: the best workspace value
+# available (may be EMPTY -- the caller may be refusing because resolution
+# itself failed, so there is nothing trustworthy to pass). $3: py.
+#
+# Every admission refusal must close an existing managed intake, not just
+# the one that already ran this (the boot-gate-sweep failure). The earlier
+# two refusals (triple unresolvable; a field present-but-empty) used to
+# `return 0` directly, leaving any already-running watcher untouched --
+# it kept serving tasks against whatever workspace it was launched with,
+# now stale relative to whatever made THIS resolution fail (keweichen,
+# #4503 review, P1). The graceful kill-session below needs no workspace at
+# all (it kills the tmux session by name); only the verified-sentinel
+# force-kill fallback needs one, and it degrades to the same FATAL log the
+# boot-gate-failure branch already used when no workspace is available.
+_teardown_existing_watcher_on_refusal() {
+  local reason="$1" workspace="$2" py="$3"
+  session_exists "$WATCHER_SESSION" || return 0
+  echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while $reason" >&2
+  tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  # stderr, not exit code -- `return` here would abort the whole launcher
+  # under `set -e` at every call site.
+  session_exists "$WATCHER_SESSION" || return 0
+  if notifier_boot_gate_force_kill_watcher "$workspace" "$py"; then
+    echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
+  else
+    echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while $reason" >&2
+  fi
+}
+
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
@@ -209,6 +238,7 @@ ensure_task_notifier() {
     IFS= read -r -d '' effective_results_dir
   } < <(resolve_effective_workspace_triple "$REPO"); then
     echo "  ✗ FATAL task notifier: could not resolve the effective workspace -- refusing to start the watcher (no notifier intake path)" >&2
+    _teardown_existing_watcher_on_refusal "the effective workspace cannot be resolved" "" "$_HB_PY"
     return 0
   fi
   # Defense in depth: the producer already fails closed on an unresolvable
@@ -219,24 +249,13 @@ ensure_task_notifier() {
   # caller's cwd" (keweichen, #4503 review, P1).
   if [ -z "$effective_workspace_dir" ] || [ -z "$effective_tasks_dir" ] || [ -z "$effective_results_dir" ]; then
     echo "  ✗ FATAL task notifier: resolved workspace triple has an EMPTY field -- refusing to start the watcher (no notifier intake path)" >&2
+    _teardown_existing_watcher_on_refusal "the resolved workspace triple has an empty field" "$effective_workspace_dir" "$_HB_PY"
     return 0
   fi
   # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
   # running from before the sweep started failing must be killed, not reused.
   if ! notifier_boot_gate "$_HB_PY" "$effective_workspace_dir"; then   # reuses $_HB_PY, resolved once above
-    if session_exists "$WATCHER_SESSION"; then
-      echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
-      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-      # stderr, not exit code -- `return` here would abort the whole launcher
-      # under `set -e` at every call site.
-      if session_exists "$WATCHER_SESSION"; then
-        if notifier_boot_gate_force_kill_watcher "$effective_workspace_dir" "$_HB_PY"; then
-          echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
-        else
-          echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
-        fi
-      fi
-    fi
+    _teardown_existing_watcher_on_refusal "the boot-time pool sweep is failing" "$effective_workspace_dir" "$_HB_PY"
     return 0
   fi
   version_files=(

@@ -130,16 +130,30 @@ _canonicalize_or_keep() {
 # canonicalization could not validate the resolved path (see
 # _canonicalize_or_keep) -- a caller must never substitute empty output
 # for a real resolution.
+#
+# When deriving from tasks_dir (no SUTANDO_WORKSPACE_DIR override), the
+# LOGICAL tasks_dir is canonicalized to its physical form FIRST, and the
+# parent is taken from THAT -- not the other way around. Taking dirname of
+# the logical path before resolving used to mean a symlink on the tasks
+# dir itself (not just an ancestor -- e.g. alias/tasks -> real/ws/tasks)
+# derived workspace=alias/ (the symlink's own logical parent) while the
+# tasks field, canonicalized separately, resolved to real/ws/tasks -- an
+# internally-inconsistent triple where both fields "worked" alone but
+# disagreed about which tree they described (keweichen's Codex re-review,
+# #4503, P1: reproduced with a symlinked tasks dir and no ancestor
+# involved; both launchers swept the empty alias/ dir and forwarded it,
+# hiding the real pool's declaration).
 resolve_workspace_dir_from_tasks_dir() {
-  local tasks_dir="$1" resolved expanded_tasks_dir
+  local tasks_dir="$1" resolved expanded_tasks_dir canonical_tasks_dir
   if [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
     resolved="$(_wdr_expand_home "$SUTANDO_WORKSPACE_DIR")" || return 1
-  else
-    [ -n "$tasks_dir" ] || return 1
-    expanded_tasks_dir="$(_wdr_expand_home "$tasks_dir")" || return 1
-    resolved="$(_wdr_dirname "$expanded_tasks_dir")"
+    _canonicalize_or_keep "$resolved"
+    return $?
   fi
-  _canonicalize_or_keep "$resolved"
+  [ -n "$tasks_dir" ] || return 1
+  expanded_tasks_dir="$(_wdr_expand_home "$tasks_dir")" || return 1
+  canonical_tasks_dir="$(_canonicalize_or_keep "$expanded_tasks_dir")" || return 1
+  _wdr_dirname "$canonical_tasks_dir"
 }
 
 # $1: repo root (for the config-default fallback). Prints WORKSPACE_DIR,

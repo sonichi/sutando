@@ -483,6 +483,30 @@ class NotifierBootGateRefusesOnSweepFailure(unittest.TestCase):
         exists, _, _ = self.h.watcher()
         self.assertTrue(exists, "a passing sweep must not block the ordinary notifier start")
 
+    def test_a_healthy_watcher_then_an_unresolvable_workspace_refusal_also_kills_it(self):
+        """keweichen's Codex re-review of d20361e77 (P1): the two EARLIER
+        refusal branches (triple unresolvable; a field present-but-empty)
+        used to `return 0` directly with no teardown, unlike the boot-gate-
+        sweep-failure branch tested above -- an already-running watcher was
+        left alive, now stale relative to whatever made resolution fail.
+        A relative SUTANDO_TASKS_DIR makes resolve_effective_workspace_triple
+        fail entirely (the first refusal branch, 'could not resolve the
+        effective workspace'), with no sweep involved at all."""
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        exists, _, _ = self.h.watcher()
+        self.assertTrue(exists, "precondition: a healthy watcher must exist before the refusal case")
+
+        run2 = self.h.launch(extra_env={"SUTANDO_TASKS_DIR": "rel/tasks"})
+        self.assertEqual(run2.returncode, 0, run2.stdout + run2.stderr)
+        self.assertIn("could not resolve the effective workspace", run2.stderr)
+
+        exists_after, _, _ = self.h.watcher()
+        self.assertFalse(exists_after,
+                          "the watcher session survived an unresolvable-workspace refusal -- "
+                          "the resolution-failure branches must tear down an existing watcher "
+                          "exactly like the sweep-failure branch already does")
+
 
 class WorkerLaunchStartsNoNotifier(unittest.TestCase):
     def test_worker_instance_gets_no_watcher_session(self):

@@ -428,6 +428,26 @@ exit 0
         self.assertIn("kill-session -t =sutando-core-watcher", calls,
                        "an existing watcher was not killed after the boot sweep failed")
 
+    def test_a_failing_workspace_resolution_kills_an_existing_watcher_not_just_skips_a_replacement(self):
+        """keweichen's Codex re-review of d20361e77 (P1): the two EARLIER
+        refusal branches (triple unresolvable; a field present-but-empty)
+        used to `return 0` directly with no teardown, unlike the boot-gate-
+        sweep-failure branch tested above -- an already-running watcher was
+        left alive, now stale relative to whatever made resolution fail. No
+        sweep is configured here at all; a relative SUTANDO_TASKS_DIR alone
+        makes resolve_effective_workspace_triple fail entirely."""
+        run = self.run_launcher(env_extra={
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": "whatever-matches-or-not",
+            "SUTANDO_TASKS_DIR": "rel/tasks",
+        })
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("could not resolve the effective workspace", run.stderr)
+        calls = self.log.read_text()
+        self.assertIn("kill-session -t =sutando-core-watcher", calls,
+                       "an existing watcher was not killed after workspace resolution failed "
+                       "with no sweep involved at all")
+
     def test_a_healthy_boot_sweep_still_starts_the_watcher_normally(self):
         """Negative control: the gate must not be permanently closed."""
         run = self.run_launcher(env_extra={"SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(0)})
