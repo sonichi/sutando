@@ -311,6 +311,25 @@ def publish_task_event_handler(workspace):
     return cfg
 
 
+def ensure_task_event_handler(workspace) -> "Path | None":
+    """Backfill for a pool that predates this file (register_worker() is its
+    only writer, so an install that upgraded without a new registration since
+    never gets it written) or whose declaration has gone stale. Republishes
+    only when needed, so a healthy sweep costs one read. None when the pool
+    has no live worker -- nothing to route to, so nothing to declare.
+    """
+    roster = load_roster(workspace) or {}
+    workers = roster.get("workers") or {}
+    if not any(isinstance(w, dict) and w.get("state") == "live" for w in workers.values()):
+        return None
+    handler = Path(__file__).resolve().parent / "pool_route_handler.py"
+    cfg = task_event_handler_config_path(Path(workspace) / "state")
+    current = _read(cfg, None)
+    if isinstance(current, dict) and current.get("handler") == str(handler):
+        return cfg
+    return publish_task_event_handler(workspace)
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.

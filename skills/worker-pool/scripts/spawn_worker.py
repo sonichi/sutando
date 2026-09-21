@@ -280,6 +280,9 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     if state != "absent":
         raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
                            f"({detail}); refusing rather than minting a worker over one")
+    # A resume never passes through register_worker(), so this is the only
+    # path that declares the router for a pool coming back.
+    pr.publish_task_event_handler(workspace)
     run = None
     if resumed_id:
         run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
