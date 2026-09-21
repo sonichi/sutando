@@ -383,7 +383,7 @@ export function _isVoiceTask(taskId: string): boolean {
 	return _headerIsVoice(headerLines);
 }
 
-/** Voice verdict over header lines: `source: voice`. `channel_id` may carry an origin's target and
+/** Voice verdict over header lines: the voice `source` value. `channel_id` may carry an origin's target and
  *  `media_form` is stamped by phone too; the `local-voice` literal covers older archived files. */
 function _headerIsVoice(headerLines: string[]): boolean {
 	return headerLines.some(l => l.startsWith('source: voice') || l.startsWith('channel_id: local-voice'));
