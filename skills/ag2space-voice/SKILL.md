@@ -1,6 +1,6 @@
 ---
 name: ag2space-voice
-description: "AG2 Space voice surface — binds the room the AG2 Space desktop client announces to the voice session's origin, so work delegated by voice in a room is answered in that room."
+description: "AG2 Space voice surface — binds the room the AG2 Space client announces to the voice session's origin, so work delegated by voice in a room is answered in that room, and moves the client by voice (navigate_ui)."
 when_to_use: "Loaded automatically at voice-agent startup as a manifest skill. Not slash-invoked. Only an AG2 Space client sends the frames it handles; on any other install it stays idle."
 ---
 
@@ -18,6 +18,8 @@ top of that. Remove the directory and the engine boots, types and tests unchange
 |---|---|
 | client → engine | `{type:'session.context', version:1, room_id, room_name, surface:'room'\|'dm', capabilities?}` — after `session.config` and on every room change; a DM frame has `room_id: null` |
 | engine → client | `{type:'session.context.ack', version:1, room_id, bound, surface:'dm'\|'room'\|'refused', reason?}` |
+| engine → client | `{type:'ui.navigate', version:1, request_id, target:'dm'\|'room'\|'home', query?}` |
+| client → engine | `{type:'ui.navigated', version:1, request_id, ok, room_id?, room_name?, error?:'not_found'\|'ambiguous'\|'unsupported', candidates?}` |
 
 ## What it does
 
@@ -36,8 +38,19 @@ top of that. Remove the directory and the engine boots, types and tests unchange
   `results/proactive-result-<task>-<ts>.to-ag2space.txt` with `[channel: <room>]` first.
 - **Prompt**: a `ROOM:` context line while docked, and one system notice per actual
   room change.
+- **`navigate.ts` / `navigate-protocol.ts`** — the `navigate_ui` tool ("let's talk in my
+  DM", "take me to GTM in Investors", "go home"). It is contributed through
+  `voiceSurface()`, so it is on the web voice session only, never the phone tool table,
+  and only when this install has the gateway channel (`REMOTE_TASK_TOKEN` /
+  `AG2_REMOTE_TOKEN` in the environment or in `channels/ag2space/.env` under the Claude
+  config dir). Its NAVIGATION prompt rule is present under the same condition. The frame
+  goes only to a client that announced the `ui.navigate` capability; any other attached
+  client gets an immediate "update the app" answer.
 
 Tests: `tests/ag2space-voice-*.test.ts` (skipped when this directory is absent).
+
+Optionality check: move this directory aside, run `npx tsc --noEmit -p .` and
+`npm run test:ts` — both pass, with only the two `ag2space-voice-*` files reporting a skip.
 
 ## Packaged desktop builds
 

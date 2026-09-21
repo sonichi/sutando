@@ -59,8 +59,6 @@ function assertMacOS() {
 	}
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver } from './task-bridge.js';
-import { parseSessionContextCapabilities } from './web-voice-transport.js';
-import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, navigateUiAvailable, navigateUiTool } from './voice-navigate.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -713,9 +711,7 @@ function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
 
-// navigate_ui is declared only where a client can answer it (gateway channel provisioned).
-const VOICE_NAVIGATE_UI = navigateUiAvailable();
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : []), ...personalVoiceSurface.tools];
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...personalVoiceSurface.tools];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -724,7 +720,6 @@ const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
-	navigateUi: VOICE_NAVIGATE_UI,
 	voiceSurface: personalVoiceSurface,
 	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
@@ -1077,20 +1072,6 @@ async function main() {
 		});
 	}
 
-	// What the attached client can answer, from its `session.context` frame
-	// (every desktop sends one per attach and per room change; an older one
-	// sends it without `capabilities`, which reads as none). Cleared when the
-	// client goes, so a later, older client never inherits a newer one's list.
-	let clientCapabilities: ReadonlySet<string> = new Set();
-	function recordClientCapabilities(message: Record<string, unknown>): void {
-		const caps = parseSessionContextCapabilities(message);
-		if (!caps) return;
-		const next = new Set(caps);
-		const same = next.size === clientCapabilities.size && [...next].every((c) => clientCapabilities.has(c));
-		clientCapabilities = next;
-		if (!same) console.log(`${ts()} [SessionRoom] client capabilities: ${caps.length ? caps.join(', ') : 'none'}`);
-	}
-
 	const clientFrames = createClientFrameHub((msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
@@ -1128,8 +1109,6 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
-			recordClientCapabilities(message);
-			resolveUiNavigated(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 			// Frames the core does not own are offered to optional skills' handlers.
 			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
@@ -1142,8 +1121,6 @@ async function main() {
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);
-			clientCapabilities = new Set();
-			failPendingNavigations();
 			clientFrames.disconnected();
 			voiceRecoveryCoordinator?.handleClientDisconnected();
 		},
@@ -1287,16 +1264,6 @@ async function main() {
 	});
 
 	sessionRef = session;
-	// navigate_ui talks to the attached desktop over the session's own client
-	// frame path. Attached alone is not enough: every desktop connects, only
-	// one that announced `ui.navigate` in session.context answers the frame,
-	// so the tool checks `supports` before sending and an older desktop hears
-	// "update it" at once instead of a six-second timeout.
-	installVoiceNavigateClient({
-		attached: () => Boolean(session.clientConnected),
-		supports: (capability) => clientCapabilities.has(capability),
-		send: (frame) => session.sendJsonToClient(frame),
-	});
 
 	// Armed only with the full bodhi recovery surface; anything less falls
 	// back to shadow with a loud line (the design's capability-validation rule).
@@ -1615,6 +1582,7 @@ async function main() {
 	runSkillSetups(personalSkillSetups, {
 		session,
 		injectText,
+		clientAttached: () => Boolean(session.clientConnected),
 		sendClientFrame: (frame) => {
 			try {
 				if (!session.clientConnected) return false;

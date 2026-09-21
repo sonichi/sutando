@@ -141,6 +141,8 @@ test('a manifest skill\'s voiceSurface() reaches the voice prompt and stays off 
 			cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 			env: {
 				...process.env, SUTANDO_TEST_MODE: '1', SUTANDO_WORKSPACE: join(base, 'ws'),
+				// Hermetic: no installed skill sees this machine's own channels or tokens.
+				CLAUDE_CONFIG_DIR: join(base, 'claude-home'), REMOTE_TASK_TOKEN: '', AG2_REMOTE_TOKEN: '',
 				SUTANDO_EXTERNAL_PLUGIN_DIRS: join(base, 'root'),
 				INLINE_TOOLS_URL: pathToFileURL(join(REPO_ROOT, 'src', 'inline-tools.ts')).href,
 				CONFIG_URL: pathToFileURL(join(REPO_ROOT, 'src', 'voice-agent-config.ts')).href,

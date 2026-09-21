@@ -72,7 +72,6 @@ function ctx(overrides: Partial<{ meeting: boolean; googleSearch: boolean }> = {
 		resetNoteViewingDebounce: () => {},
 		getRecentConversation: () => '',
 		getSecondsSinceLastTurn: () => null,
-		getSessionRoom: () => null,
 	};
 }
 const OVERRIDES = {

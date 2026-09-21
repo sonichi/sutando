@@ -8,6 +8,8 @@ import type { VoiceSessionOrigin, VoiceTaskOriginResolver } from './task-bridge.
 export type SkillSetupCtx = {
 	session: unknown;
 	injectText: (session: unknown, text: string) => void;
+	/** True while a client is attached and can receive frames. */
+	clientAttached: () => boolean;
 	/** Send one JSON frame to the attached client; false when none took it. */
 	sendClientFrame: (frame: ClientFrame) => boolean;
 	/** Offered every client JSON frame; return true to claim it. */

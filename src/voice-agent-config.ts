@@ -27,7 +27,6 @@ import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
-import { navigateUiTool } from './voice-navigate.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -40,8 +39,6 @@ export interface VoiceConfigContext {
 	isMeetingActive(): boolean;
 	/** VOICE_AGENT_CONFIG.googleSearch — per-surface config. */
 	googleSearch: boolean;
-	/** navigate_ui is declared on this session (the install has the gateway channel). */
-	navigateUi?: boolean;
 	/** Greeting-side session-gate reset (userTurnCount / userHasInterrupted /
 	 * sessionEnding live in voice-agent.ts; the greeting resets them). */
 	resetSessionGates(): void;
@@ -210,7 +207,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
 	const host = platform() === 'darwin' ? 'Mac' : platform() === 'win32' ? 'Windows' : platform();
 	const surface = ctx.voiceSurface ?? {};
-	const instantTools = [...inlineTools, ...(ctx.navigateUi ? [navigateUiTool] : []), ...(surface.tools ?? [])];
+	const instantTools = [...inlineTools, ...(surface.tools ?? [])];
 	return [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
@@ -297,8 +294,6 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
-		// Present only when navigate_ui is declared, so the default prompt is unchanged.
-		...(ctx.navigateUi ? ['- NAVIGATION: "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", "go home" → call navigate_ui (target dm | room | home; query = the room and space words as spoken) — never work, never press_key. On ok, say ONE short line ("Taking you to GTM.") and carry on; the desktop then sends the new room context, and from there your replies and delegated work follow that room. On error "ambiguous", read the candidates and ask which one ("I found two rooms: GTM and GTM planning — which one?"), then call navigate_ui again with the name they pick. On "not_found", say you could not find a room called that. On "unsupported" or "timeout", say navigation works in the desktop app and move on.'] : []),
 		...(surface.promptRules ?? []),
 		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
 		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',

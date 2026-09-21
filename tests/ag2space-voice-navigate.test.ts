@@ -10,44 +10,36 @@
  * client leaves, a stray reply ignored — and the voice-agent / inline-tools
  * wiring by source pin, so the seam cannot silently drop out.
  */
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-	UI_NAVIGATE_TYPE,
-	UI_NAVIGATED_TYPE,
-	UI_NAVIGATE_CAPABILITY,
-	UI_NAVIGATE_QUERY_MAX_CHARS,
-	UI_NAVIGATED_NAME_MAX_CHARS,
-	UI_NAVIGATED_MAX_CANDIDATES,
-	SESSION_CONTEXT_TYPE,
-	SESSION_CONTEXT_CAPABILITY_MAX_CHARS,
-	SESSION_CONTEXT_MAX_CAPABILITIES,
-	buildSessionContextFrame,
-	parseSessionContextCapabilities,
-	buildUiNavigateFrame,
-	parseUiNavigateFrame,
-	buildUiNavigatedFrame,
-	parseUiNavigatedFrame,
-	type SessionContextFrame,
-} from '../src/web-voice-transport.js';
-import {
-	navigateUi,
-	navigateUiTool,
-	navigateUiAvailable,
-	installVoiceNavigateClient,
-	resolveUiNavigated,
-	failPendingNavigations,
-	pendingNavigationCount,
-	NAVIGATE_UI_TIMEOUT_MS,
-	NAVIGATE_UI_UNSUPPORTED_MESSAGE,
-	NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE,
-	NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE,
-} from '../src/voice-navigate.js';
+
+// The plugin is optional: with skills/ag2space-voice/ removed this file skips.
+const PLUGIN_DIR = join(process.cwd(), 'skills', 'ag2space-voice');
+const PRESENT = existsSync(join(PLUGIN_DIR, 'tools.ts'));
+if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
+
+if (PRESENT) {
+const plugin = (f: string) => import(pathToFileURL(join(PLUGIN_DIR, f)).href);
+const {
+	UI_NAVIGATE_TYPE, UI_NAVIGATED_TYPE, UI_NAVIGATE_CAPABILITY, UI_NAVIGATE_QUERY_MAX_CHARS, UI_NAVIGATED_NAME_MAX_CHARS, UI_NAVIGATED_MAX_CANDIDATES,
+	buildUiNavigateFrame, parseUiNavigateFrame, buildUiNavigatedFrame, parseUiNavigatedFrame,
+} = await plugin('navigate-protocol.ts');
+const { SESSION_CONTEXT_TYPE, SESSION_CONTEXT_CAPABILITY_MAX_CHARS, SESSION_CONTEXT_MAX_CAPABILITIES, parseSessionContextCapabilities } = await plugin('session-context.ts');
+const {
+	navigateUi, navigateUiTool, navigateUiAvailable, installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, pendingNavigationCount,
+	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
+} = await plugin('navigate.ts');
+const pluginTools = await plugin('tools.ts');
+type SessionContextFrame = Record<string, unknown> & { version: number };
+/** The frame the AG2 Space client sends (webapp voiceRoomBinding.ts), before capabilities are added. */
+const buildSessionContextFrame = (ctx: { roomId: string; roomName?: string } | null): SessionContextFrame => ctx
+	? { type: 'session.context', version: 1, room_id: ctx.roomId, room_name: ctx.roomName ?? null, surface: 'room' }
+	: { type: 'session.context', version: 1, room_id: null, room_name: null, surface: 'dm' };
 
 const src = (rel: string) => readFileSync(fileURLToPath(new URL(`../src/${rel}`, import.meta.url)), 'utf8');
 
@@ -309,82 +301,145 @@ describe('navigate_ui tool', () => {
 	});
 });
 
-// The seam between this module and the voice agent is plain function calls
-// in voice-agent.ts, and the tool's place in the model's table is an array
-// literal in inline-tools.ts: neither is reachable from a unit test without
-// starting the agent, so both are pinned by source.
-describe('navigate_ui wiring (source pins)', () => {
-	const agent = src('voice-agent.ts');
-	const tools = src('inline-tools.ts');
-	const between = (text: string, start: string, end: string) => {
-		const a = text.indexOf(start);
-		assert.ok(a >= 0, `missing: ${start}`);
-		const b = text.indexOf(end, a);
-		assert.ok(b > a, `missing after ${start}: ${end}`);
-		return text.slice(a, b);
+// The plugin's setup() is the wiring: driven here through a fake host ctx.
+// The client half ships separately (webapp voiceNavigate.ts / voiceRoomBinding.ts), so the
+// contract is pinned here as literal values, not by importing the other side.
+describe('wire contract literals', () => {
+	it('frame types, version, targets, errors and the capability name', () => {
+		assert.deepEqual([UI_NAVIGATE_TYPE, UI_NAVIGATED_TYPE, UI_NAVIGATE_CAPABILITY, SESSION_CONTEXT_TYPE], ['ui.navigate', 'ui.navigated', 'ui.navigate', 'session.context']);
+		assert.deepEqual(buildUiNavigateFrame('r1', 'room', 'GTM in Investors'), { type: 'ui.navigate', version: 1, request_id: 'r1', target: 'room', query: 'GTM in Investors' });
+		for (const target of ['dm', 'room', 'home']) assert.equal(parseUiNavigateFrame({ type: 'ui.navigate', version: 1, request_id: 'r', target })?.target, target);
+		assert.deepEqual(parseUiNavigatedFrame({ type: 'ui.navigated', version: 1, request_id: 'r1', ok: true, room_id: '!a:s', room_name: 'GTM' }),
+			{ type: 'ui.navigated', version: 1, request_id: 'r1', ok: true, room_id: '!a:s', room_name: 'GTM' });
+		for (const error of ['not_found', 'ambiguous', 'unsupported']) {
+			assert.equal(parseUiNavigatedFrame({ type: 'ui.navigated', version: 1, request_id: 'r1', ok: false, error })?.error, error);
+		}
+		assert.deepEqual(parseUiNavigatedFrame({ type: 'ui.navigated', version: 1, request_id: 'r1', ok: false, error: 'ambiguous', candidates: ['GTM', 'GTM planning'] })?.candidates, ['GTM', 'GTM planning']);
+	});
+});
+
+describe('navigate_ui wiring — setup(ctx) over the plugin seam', () => {
+	const host = () => {
+		const frameHandlers: Array<(f: Record<string, unknown>) => unknown> = [];
+		const goneHandlers: Array<() => void> = [];
+		const sent: Record<string, unknown>[] = [];
+		const state = { attached: true };
+		const ctx = {
+			session: {}, injectText: () => {}, injectContext: () => {},
+			clientAttached: () => state.attached,
+			sendClientFrame: (f: Record<string, unknown>) => { if (!state.attached) return false; sent.push(f); return true; },
+			onClientFrame: (h: (f: Record<string, unknown>) => unknown) => { frameHandlers.push(h); },
+			onClientDisconnected: (h: () => void) => { goneHandlers.push(h); },
+			setVoiceSessionOrigin: () => {}, getVoiceSessionOrigin: () => null, setVoiceTaskOriginResolver: () => {},
+		};
+		pluginTools.setup(ctx);
+		return { sent, state, frame: (f: Record<string, unknown>) => frameHandlers.map(h => h(f)), gone: () => goneHandlers.forEach(h => h()) };
 	};
+	const dmFrame = (capabilities?: string[]) => ({ ...buildSessionContextFrame(null), ...(capabilities ? { capabilities } : {}) });
+	const navFrames = (sent: Record<string, unknown>[]) => sent.filter(f => f.type === UI_NAVIGATE_TYPE);
 
-	it('onClientCommand routes every client frame through resolveUiNavigated and records capabilities first', () => {
-		const hook = between(agent, 'onClientCommand: (message) => {', 'onClientConnected:');
-		assert.ok(hook.includes('resolveUiNavigated(message);'));
-		assert.ok(hook.includes('recordClientCapabilities(message);'));
-		assert.ok(hook.indexOf('recordClientCapabilities(message);') < hook.indexOf('resolveUiNavigated(message);'));
+	it('a client that announced ui.navigate is sent the frame and its reply settles the call', async () => {
+		const h = host();
+		assert.deepEqual(h.frame(dmFrame(['ui.navigate'])), [true], 'the session.context frame is claimed');
+		const p = navigateUi({ target: 'home' }, { requestId: 'wired', timeoutMs: 500 });
+		await delay(5);
+		assert.deepEqual(navFrames(h.sent), [{ type: 'ui.navigate', version: 1, request_id: 'wired', target: 'home' }]);
+		assert.deepEqual(h.frame(buildUiNavigatedFrame('wired', {})), [true]);
+		assert.deepEqual(await p, { ok: true, target: 'home' });
 	});
 
-	it('capabilities come from parseSessionContextCapabilities and are cleared with the pending requests on detach', () => {
-		assert.ok(agent.includes("import { parseSessionContextCapabilities } from './web-voice-transport.js';"));
-		assert.ok(agent.includes('const caps = parseSessionContextCapabilities(message);'));
-		const gone = between(agent, 'onClientDisconnected: () => {', 'suppressClientAutoActions:');
-		assert.ok(gone.includes('clientCapabilities = new Set();'));
-		assert.ok(gone.includes('failPendingNavigations();'));
+	it('an attached client that never announced it hears "update" at once and is sent nothing; none attached hears "no client"', async () => {
+		const h = host();
+		h.frame(dmFrame());
+		const outdated = await navigateUi({ target: 'dm' }, { timeoutMs: 500 });
+		assert.deepEqual([outdated.ok, (outdated as { message: string }).message], [false, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE]);
+		h.state.attached = false;
+		const none = await navigateUi({ target: 'dm' }, { timeoutMs: 500 });
+		assert.equal((none as { message: string }).message, NAVIGATE_UI_UNSUPPORTED_MESSAGE);
+		assert.deepEqual(navFrames(h.sent), []);
 	});
 
-	it('the installed client is gated on connected AND the announced capability', () => {
-		const install = between(agent, 'installVoiceNavigateClient({', '});');
-		assert.ok(install.includes('attached: () => Boolean(session.clientConnected),'));
-		assert.ok(install.includes('supports: (capability) => clientCapabilities.has(capability),'));
-		assert.ok(install.includes('send: (frame) => session.sendJsonToClient(frame),'));
+	it('the client leaving clears its capabilities and fails the in-flight move', async () => {
+		const h = host();
+		h.frame(dmFrame(['ui.navigate']));
+		const p = navigateUi({ target: 'home' }, { requestId: 'leaving', timeoutMs: 2000 });
+		await delay(5);
+		h.gone();
+		assert.equal((await p).ok, false);
+		assert.equal(pendingNavigationCount(), 0);
+		const after = await navigateUi({ target: 'home' }, { timeoutMs: 200 });
+		assert.equal((after as { message: string }).message, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, 'the next client announces its own list');
 	});
 
-	it('the agent declares navigate_ui only behind navigateUiAvailable(), and tells the prompt the same thing', () => {
-		assert.ok(agent.includes('const VOICE_NAVIGATE_UI = navigateUiAvailable();'));
-		assert.ok(agent.includes('...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : []), ...personalVoiceSurface.tools];'));
-		assert.ok(agent.includes('navigateUi: VOICE_NAVIGATE_UI,'));
-		assert.ok(!tools.includes('navigateUiTool'), 'never in the shared tables the phone server pushes');
+	it('a frame that did not go out answers at once', async () => {
+		installVoiceNavigateClient({ attached: () => true, supports: () => true, send: () => false });
+		const r = await navigateUi({ target: 'home' }, { timeoutMs: 2000 });
+		assert.deepEqual([r.ok, (r as { message: string }).message], [false, NAVIGATE_UI_UNSUPPORTED_MESSAGE]);
+		assert.equal(pendingNavigationCount(), 0);
+	});
+
+	it('a host without the seam gets no wiring and no throw', () => {
+		assert.doesNotThrow(() => pluginTools.setup({ session: {}, injectText: () => {} }));
+	});
+
+	it('the core carries none of it', () => {
+		for (const f of ['voice-agent.ts', 'voice-agent-config.ts', 'inline-tools.ts']) {
+			assert.doesNotMatch(src(f), /navigate_ui|navigateUi|ui\.navigate|NAVIGATION:/, f);
+		}
+		assert.ok(!existsSync(fileURLToPath(new URL('../src/voice-navigate.ts', import.meta.url))));
 	});
 });
 
 describe('navigate_ui exposure — declared only where a client can answer it', () => {
-	const ctx = (navigateUi?: boolean) => ({
+	const ctx = (voiceSurface?: unknown) => ({
 		resolveCurrentMode: () => ({ marker: '', isMeeting: false, isPresenter: false }),
 		isMeetingActive: () => false,
 		googleSearch: false,
-		navigateUi,
+		voiceSurface,
 		resetSessionGates: () => {},
 		resetNoteViewingDebounce: () => {},
 		getRecentConversation: () => '',
 		getSecondsSinceLastTurn: () => null,
-		getSessionRoom: () => null,
 	});
 	const OVERRIDES = { standIdentityJson: '{}', voiceContext: '', repoUrl: 'https://example.invalid', voiceAgentContext: '' };
+	const surfaceWith = (env: Record<string, string>) => {
+		const home = mkdtempSync(join(tmpdir(), 'sutando-navigate-surface-'));
+		const saved = { ...process.env };
+		process.env.CLAUDE_CONFIG_DIR = home;
+		for (const k of ['REMOTE_TASK_TOKEN', 'AG2_REMOTE_TOKEN']) delete process.env[k];
+		Object.assign(process.env, env);
+		try { return pluginTools.voiceSurface(); } finally {
+			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			Object.assign(process.env, saved);
+			rmSync(home, { recursive: true, force: true });
+		}
+	};
 
 	it('the shared tool tables never carry it: phone calls and other installs get no such tool', async () => {
 		const { inlineTools, ownerOnlyTools, anyCallerTools } = await import('../src/inline-tools.js');
 		for (const table of [inlineTools, ownerOnlyTools, anyCallerTools]) {
 			assert.ok(!table.some((t: { name: string }) => t.name === 'navigate_ui'));
 		}
+		assert.deepEqual(pluginTools.tools, [], 'the skill adds nothing to the shared tables');
 	});
 
-	it('without the channel the prompt has no NAVIGATION rule and never names the tool; with it, both are there', async () => {
+	it('without the channel the skill contributes no tool and no rule; with it, both reach the prompt', async () => {
 		const { buildInstructions } = await import('../src/voice-agent-config.js');
-		for (const off of [buildInstructions(ctx(false) as never, OVERRIDES), buildInstructions(ctx() as never, OVERRIDES)]) {
+		const offSurface = surfaceWith({});
+		assert.deepEqual([offSurface.tools, offSurface.promptRules], [[], []]);
+		for (const off of [buildInstructions(ctx(offSurface) as never, OVERRIDES), buildInstructions(ctx() as never, OVERRIDES)]) {
 			assert.ok(!off.includes('NAVIGATION:'));
 			assert.ok(!off.includes('navigate_ui'));
 		}
-		const on = buildInstructions(ctx(true) as never, OVERRIDES);
-		assert.equal(on.split('\n').filter(l => l.startsWith('- NAVIGATION: ')).length, 1);
-		assert.ok(on.split('\n').some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
-		assert.ok(on.split('\n').some(l => l.includes(', navigate_ui — call these directly')), 'and in the joined names line');
+		const onSurface = surfaceWith({ REMOTE_TASK_TOKEN: 'tok' });
+		assert.deepEqual(onSurface.tools.map((t: { name: string }) => t.name), ['navigate_ui']);
+		assert.deepEqual(onSurface.promptRules, [NAVIGATION_PROMPT_RULE]);
+		const lines = buildInstructions(ctx(onSurface) as never, OVERRIDES).split('\n');
+		assert.equal(lines.filter(l => l.startsWith('- NAVIGATION: ')).length, 1);
+		const rule = lines.findIndex(l => l.startsWith('- NAVIGATION: '));
+		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- For IN-PLACE EDITS'), 'where the rule has always sat');
+		assert.ok(lines.some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
+		assert.ok(lines.some(l => l.includes(', navigate_ui — call these directly')), 'and in the joined names line');
 	});
 
 	it('navigateUiAvailable: a gateway token in the env or in channels/ag2space/.env, nothing else', () => {
@@ -412,3 +467,4 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 		}
 	});
 });
+}

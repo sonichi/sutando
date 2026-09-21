@@ -80,6 +80,7 @@ exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
 | Member | Purpose |
 |---|---|
 | `session`, `injectText(session, text)` | the live session and the realtime text inject |
+| `clientAttached()` | true while a client is attached |
 | `sendClientFrame(frame)` | send one JSON frame to the attached client; `false` when none took it |
 | `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
 | `onClientDisconnected(handler)` | the client left: drop per-client state |

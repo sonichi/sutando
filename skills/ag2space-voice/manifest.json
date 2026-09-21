@@ -6,7 +6,7 @@
   "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
-  "description": "AG2 Space voice surface: binds the room the desktop client announces (session.context) to the session's origin on the gateway bridge's membership verdict, so delegated work is answered in that room. Optional: the host runs unchanged without it.",
+  "description": "AG2 Space voice surface: binds the room the desktop client announces (session.context) to the session's origin on the gateway bridge's membership verdict, so delegated work is answered in that room; contributes navigate_ui (move the client to the DM, a room or home) to the voice session when the gateway channel is provisioned. Optional: the host runs unchanged without it.",
   "permissions": {
     "network": false,
     "filesystem": "read-write",

@@ -1,26 +1,5 @@
-/**
- * voice-navigate — the `navigate_ui` inline tool: the voice agent asks the
- * attached desktop client to open the DM, a room or home, and waits for the
- * client's `ui.navigated` reply.
- *
- * The client resolves room names (it has the room list and the user's
- * spaces); the agent only carries the spoken words. voice-agent.ts installs
- * the client seam once the session exists, routes every client frame through
- * `resolveUiNavigated`, and fails the in-flight requests when the client goes
- * away. With no seam installed (the phone server, tests) the tool answers
- * `unsupported` at once instead of waiting on a reply that cannot come.
- *
- * Exposure: the tool is not in the shared inline tables. voice-agent.ts
- * declares it, and the prompt carries its NAVIGATION rule, only when
- * `navigateUiAvailable()` says the gateway channel is provisioned.
- *
- * The frame goes out only to a client that announced the `ui.navigate`
- * capability in its `session.context` frame. Every desktop that merely
- * connects satisfies "attached"; only one that speaks the frame can answer
- * it, so an attached-but-silent client (any desktop that predates the
- * client half) gets an immediate `unsupported` telling the owner to update
- * — not six seconds of silence and then a timeout.
- */
+// navigate_ui: the voice agent asks the attached AG2 Space client to open the DM, a
+// room or home, and waits for its `ui.navigated` reply. The client resolves room names.
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -34,8 +13,8 @@ import {
 	type UiNavigatedError,
 	type UiNavigatedFrame,
 	type UiNavigateTarget,
-} from './web-voice-transport.js';
-import { claudeHomePath } from './util_paths.js';
+} from './navigate-protocol.js';
+import { claudeHomePath } from '../../src/util_paths.js';
 
 /** How long the tool waits for the client's `ui.navigated` before giving up. */
 export const NAVIGATE_UI_TIMEOUT_MS = 6000;
@@ -70,10 +49,10 @@ export function navigateUiAvailable(env: NodeJS.ProcessEnv = process.env): boole
 export interface VoiceNavigateClient {
 	/** True while a real client is attached and can receive frames. */
 	attached(): boolean;
-	/** True when the attached client announced `capability` in its
-	 *  `session.context` frame (see parseSessionContextCapabilities). */
+	/** True when the attached client announced `capability` in its `session.context` frame. */
 	supports(capability: string): boolean;
-	send(frame: Record<string, unknown>): void;
+	/** Throwing or returning false means the frame did not go out. */
+	send(frame: Record<string, unknown>): boolean | void;
 }
 
 let _client: VoiceNavigateClient | null = null;
@@ -152,9 +131,11 @@ export async function navigateUi(args: { target: UiNavigateTarget; query?: strin
 			clearTimeout(timer);
 			resolve(r);
 		});
+		let sent = false;
 		try {
-			client.send({ ...frame });
-		} catch {
+			sent = client.send({ ...frame }) !== false;
+		} catch { /* not sent */ }
+		if (!sent) {
 			clearTimeout(timer);
 			_pending.delete(frame.request_id);
 			resolve(null);
@@ -212,3 +193,6 @@ export const navigateUiTool: ToolDefinition = {
 		return result;
 	},
 };
+
+/** The prompt rule that goes with the tool; present only when the tool is declared. */
+export const NAVIGATION_PROMPT_RULE = '- NAVIGATION: "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", "go home" → call navigate_ui (target dm | room | home; query = the room and space words as spoken) — never work, never press_key. On ok, say ONE short line ("Taking you to GTM.") and carry on; the desktop then sends the new room context, and from there your replies and delegated work follow that room. On error "ambiguous", read the candidates and ask which one ("I found two rooms: GTM and GTM planning — which one?"), then call navigate_ui again with the name they pick. On "not_found", say you could not find a room called that. On "unsupported" or "timeout", say navigation works in the desktop app and move on.';
