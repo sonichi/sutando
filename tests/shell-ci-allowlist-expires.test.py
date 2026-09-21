@@ -35,7 +35,8 @@ ALLOWLIST = REPO / "tests" / "shell-ci-known-failures.txt"
 
 
 def loop_body() -> str:
-    """The `run:` script of the 'Run shell standalone tests' step, dedented."""
+    """The `run:` script of the 'Run shell standalone tests' step, dedented.
+    It delegates to scripts/run-shell-suites.sh, which the fixture carries too."""
     text = CI.read_text()
     m = re.search(r"- name: Run shell standalone tests\n\s*run: \|\n(.*?)(?=\n {6}- name:|\n {2}\w|\Z)",
                   text, re.S)
@@ -59,6 +60,9 @@ def run_fixture(tmp: Path, suites: dict[str, bool], listed: list[str]) -> subpro
     (tmp / "scripts").mkdir(exist_ok=True)
     lane = REPO / "scripts" / "parallel-suite-lane.sh"
     (tmp / "scripts" / "parallel-suite-lane.sh").write_bytes(lane.read_bytes())
+    runner = REPO / "scripts" / "run-shell-suites.sh"
+    (tmp / "scripts" / "run-shell-suites.sh").write_bytes(runner.read_bytes())
+    (tmp / "scripts" / "run-shell-suites.sh").chmod(0o755)
     git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
     subprocess.run(git + ["init", "-q"], cwd=tmp, check=True)
     subprocess.run(git + ["add", "-A"], cwd=tmp, check=True)

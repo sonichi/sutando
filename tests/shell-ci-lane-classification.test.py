@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CI = REPO / ".github" / "workflows" / "ci.yml"
+CI = REPO / "scripts" / "run-shell-suites.sh"  # the classifier lives with the runner
 
 # The two suites known to read a PID's own process-table entry via `ps -p`.
 KNOWN_PROCESS_TABLE_SUITES = [
@@ -37,11 +37,11 @@ NEGATIVE_FIXTURE_BODY = "#!/usr/bin/env bash\n# corresponds to the process, not 
 
 
 def extract_pattern() -> str:
-    """The grep -lE pattern the classifier step uses, verbatim from ci.yml."""
+    """The grep pattern the classifier uses, verbatim from scripts/run-shell-suites.sh."""
     text = CI.read_text()
-    m = re.search(r"grep -lE '([^']*)'", text)
+    m = re.search(r"grep -[lq]E '([^']*)'", text)
     if not m:
-        raise AssertionError("could not find the classifier's grep -lE pattern in ci.yml")
+        raise AssertionError("could not find the classifier's grep -lE pattern in scripts/run-shell-suites.sh")
     return m.group(1)
 
 
