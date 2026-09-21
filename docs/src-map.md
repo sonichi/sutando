@@ -25,6 +25,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`archive-transcript.sh`** — Archive the conversation transcript on PreCompact.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
+- **`artifact_surface.py`** — Typed artifacts an agent writes and the client renders — producer side.
 - **`atomic_replace.py`** — Atomic publication with bounded retries for Windows sharing violations.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
