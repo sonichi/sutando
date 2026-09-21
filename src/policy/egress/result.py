@@ -75,6 +75,10 @@ def is_guarded_tier(tier) -> bool:
     return (tier or "").strip().lower() != OWNER_TIER
 
 
+# Not a tier: an unreadable file, kept distinct from a malformed one (`guest`).
+# Outside the legal set, so it guards like every non-owner value and cannot be forged.
+TIER_UNREADABLE = "unreadable"
+
 class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
 
@@ -85,12 +89,14 @@ def resolve_access_tier(task_file) -> str:
     Task-last writers put the trusted tier before ``task:``; prefer that value.
     The remote gateway is task-mid and newline-confines every wire value, so if
     no pre-task tier exists its final tier line is the trusted value.  Missing
-    legacy tiers remain owner; malformed explicit tiers fail closed to guest.
+    legacy tiers remain owner; malformed explicit tiers fail closed to guest, and an
+    UNREADABLE file answers `TIER_UNREADABLE` so a transient I/O failure is never
+    reported as a tier the file does not carry.
     """
     try:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return "guest"
+        return TIER_UNREADABLE
     # LF-only split: the writer strips only \r/\n, so a Unicode line
     # boundary in a field must not forge a header. str.splitlines() would.
     def _tiers(text):
@@ -469,8 +475,10 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
         body, tier, repo, secret_filter, scan_sensitive_data,
         allow_attach=allow_attach, honor_suppressions=honor_suppressions,
         attach_roots=attach_roots)
+    # An unreadable tier is not a decision to record: journalling it can only
+    # fail the same way the tier read did, and its notice replaces the answer.
     if (suppress_journal is not None and is_guarded_tier(tier)
-            and is_suppression_only(body)):
+            and tier != TIER_UNREADABLE and is_suppression_only(body)):
         state_dir, task_id = suppress_journal
         verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
     if (suppress_journal is not None and verdict.kind == VERDICT_LEAK

@@ -164,14 +164,18 @@ def _main(argv):
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("doc", help="read/write/delete a room Context document")
-    p.add_argument("action", choices=["get", "put", "rm"])
-    p.add_argument("room")
-    p.add_argument("--folder", default="room-live-context")
-    p.add_argument("--name", help="document filename (e.g. TODO.md)")
-    p.add_argument("--file", help="put: local file to upload (else stdin)")
-    p.add_argument("--message", help="put: commit message")
-    p.add_argument("--agent")
+    # `context` and its old name `doc`. "doc" said nothing about WHICH store,
+    # and agents looking for the live collaborative document landed here.
+    for _name, _help in (("context", "read/write/delete a room Context document"),
+                         ("doc", "deprecated alias for `context` (NOT the live Room Doc)")):
+        p = sub.add_parser(_name, help=_help)
+        p.add_argument("action", choices=["get", "put", "rm"])
+        p.add_argument("room")
+        p.add_argument("--folder", default="room-live-context")
+        p.add_argument("--name", help="document filename (e.g. TODO.md)")
+        p.add_argument("--file", help="put: local file to upload (else stdin)")
+        p.add_argument("--message", help="put: commit message")
+        p.add_argument("--agent")
 
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
@@ -247,6 +251,14 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--extra-content", dest="extra_content", default=None, metavar="JSON",
+                   help="a JSON object of space.ag2.* keys to carry on the event beside the "
+                        "body (a document comment's anchor, say); other keys are dropped by "
+                        "the gateway")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post IN (rel_type m.thread, built by "
+                        "the gateway): a reply under a document comment, say. Unlike "
+                        "--reply-to, this leaves the main timeline.")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -269,8 +281,11 @@ def _main(argv):
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
         res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
-    elif a.cmd == "doc":
+    elif a.cmd in ("context", "doc"):
         import doc as _doc
+        if a.cmd == "doc":
+            print("note: `room_ops doc` is now `room_ops context`. This is the room's\n      Context-document FOLDER. The live collaborative document (Doc tab,\n      whiteboard, deck) is a different store — see the room-collab skill.",
+                  file=__import__("sys").stderr)
         if a.action == "get":
             res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)
         elif a.action == "put":
@@ -308,6 +323,13 @@ def _main(argv):
         _kw = {"reply_to": a.reply_to}
         if a.worker:
             _kw["worker"] = a.worker
+        if a.extra_content:
+            _extra = json.loads(a.extra_content)
+            if not isinstance(_extra, dict):
+                raise SystemExit("room-ops: --extra-content must be a JSON object")
+            _kw["extra_content"] = _extra
+        if a.thread_root:
+            _kw["thread_root"] = a.thread_root
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
     elif a.cmd == "grant":

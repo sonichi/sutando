@@ -59,7 +59,9 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
     tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not tmux:
         raise unittest.SkipTest("tmux not found")
-    with tempfile.TemporaryDirectory() as td:
+    # A launcher child winding down can still drop __pycache__ into the copied src
+    # while this exits; the property under test is the argv, not the cleanup.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         td = Path(td)
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
@@ -87,18 +89,24 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
                                  env=env, capture_output=True, text=True, timeout=60)
             assert run.returncode == 0, (
                 f"launcher exited {run.returncode}\nstdout: {run.stdout}\nstderr: {run.stderr}")
+            # Every session's panes: the core's own, plus any watcher the launcher
+            # started beside it. The startup command is the one carrying --name.
             argv = []
             for pid in tm("list-panes", "-s", "-a", "-F", "#{pane_pid}").stdout.split():
-                argv += subprocess.run(["ps", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout.split()
-            return argv
+                words = subprocess.run(["ps", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout.split()
+                if "--name" in words:
+                    argv = words
+            sessions = tm("list-sessions", "-F", "#{session_name}").stdout.split()
+            return argv, sessions
         finally:
             tm("kill-server")
 
 
 class TestLauncherGate(unittest.TestCase):
     def test_unset_the_core_launch_keeps_its_owner_surfaces(self):
-        argv = _launch_argv({})
+        argv, sessions = _launch_argv({})
         self.assertTrue(argv, "claude was never exec'd")
+        self.assertIn("sutando-core-watcher", sessions, "the core launch owns a task-notifier watcher")
         self.assertIn("--remote-control", argv)
         self.assertIn("--chrome", argv)
         self.assertNotIn("--session-id", argv)
@@ -108,9 +116,11 @@ class TestLauncherGate(unittest.TestCase):
         self.assertNotIn("--worker", argv)
 
     def test_set_the_worker_launch_drops_them_and_binds_its_session(self):
-        argv = _launch_argv({"SUTANDO_INSTANCE_ID": "a" * 32, "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
+        argv, sessions = _launch_argv({"SUTANDO_INSTANCE_ID": "a" * 32, "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
                              "SUTANDO_TASKS_DIR": "/tmp/never-read", "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
         self.assertTrue(argv, "claude was never exec'd")
+        self.assertFalse([s for s in sessions if s.endswith("-watcher")],
+                         "a worker must launch no owner-only task notifier: " + str(sessions))
         self.assertNotIn("--remote-control", argv)
         self.assertNotIn("--chrome", argv)
         self.assertEqual(argv[argv.index("--session-id") + 1], "11111111-2222-3333-4444-555555555555")

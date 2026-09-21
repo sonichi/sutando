@@ -371,6 +371,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollMuteState()
         }
 
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
+
         // Watcher health: every 5 min, verify the task watcher is running.
         // Bumped from 30s → 300s on 2026-05-14 (Chi greenlit) — with Claude
         // Code's `Monitor` tool now driving `watch-tasks-stream.sh` as the
@@ -380,18 +386,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // human-interactive territory (worst-case lag = ~5 min stale before
         // auto-restart) while cutting 12× the wake-ups.
         //
-        // Original design context (Chi 2026-04-18): "can the app remind the
-        // CLI about watcher" — auto-restart instead of remind, no UX
-        // change beyond cadence.
+        // Recovery shells out to the launcher dispatcher rather than typing a
+        // keystroke into the pane — see checkWatcher() below.
         Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
             self?.checkWatcher()
         }
-
-        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
-        // capture server Darwin-notifies com.sutando.recording.on/.off on
-        // every state change (⌃R, watcher-started sessions, watchdog
-        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
-        registerRecordingStateObservers()
 
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent
@@ -640,7 +639,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return matchesWatcherScriptAtBoundary(command) ? nil : false
     }
 
+    /// Both halves are Claude-only. Dispatching against a live non-Claude
+    /// session isn't a no-op like the old keystroke — the launcher's healing
+    /// path would spawn a second core window.
     func checkWatcher() {
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not repairing a session whose runtime is unknown")
+            return
+        }
+        if rt != "claude" { return }
+
         switch watcherProcessSeen() {
         case .some(true): return  // watcher alive
         case .none:
@@ -649,47 +657,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .some(false): break
         }
 
-        // Read CLI's REAL status BEFORE alerting. If Claude Code is currently
-        // working (has an active Bash/tool child process under its pane),
-        // skip the alert — the CLI will handle the restart in the normal
-        // proactive-loop Step 9 without us spamming its stdin with
-        // 'watcher' keystrokes. Only alert when the CLI is genuinely idle
-        // (waiting on user input). Chi's ask: "does the app read the real
-        // state first? and remind about the watcher only when idle?"
-        if cliIsWorking() {
-            logToFile("watcher dead; CLI is working — skipping alert")
-            return
-        }
-
-        // One sender for lines typed into the core pane: scripts/tmux-send-line.sh
-        // owns has-session, the current-prompt read and the queued-word skip.
-        // (Removed 120s inner throttle 2026-05-14: now strictly dead code under
-        // the 300s outer Timer cadence — two consecutive ticks are always 300s
-        // apart, so the throttle never gated. Flood-protection is now solely
-        // the shared sender's queued-word skip + the Timer interval.)
-
-        // If the core CLI is running inside the `sutando-core` tmux session
-        // (launch via src/agent/start-cli.sh), send the word `watcher` to
-        // its pane as if Chi typed it. The CLI parses that as a restart
-        // prompt and starts the watcher via its own run_in_background Bash
-        // — so the watcher's stdout routes through the task-notification
-        // pipe correctly. Any externally-started watcher (nohup etc.)
-        // has stdout → /dev/null and is useless.
-        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
-        if rc == 6 {
-            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
-            return
-        }
-        if rc == 0 {
-            notify("Sutando", "Task watcher down — sent 'watcher' to sutando-core tmux")
-            logToFile("watcher dead; tmux send-keys to sutando-core")
-            return
-        }
-
-        // Fallback: Claude Code isn't in the expected tmux session.
-        // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/start-cli.sh)")
-        logToFile("watcher dead; notification fired (tmux session not found)")
+        // Pinned to the runtime `rt` just confirmed, so the dispatcher's own
+        // config-drift check can't force a --restart on top of this.
+        logToFile("checkWatcher: watcher dead — repairing via start-cli.sh")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh",
+                      args: ["--runtime", "claude"],
+                      okMessage: "Task watcher was down — repaired via the core launcher.",
+                      failVerb: "Task watcher repair")
     }
 
     /// Per-host label for `hosts/<host>/` paths. Lockstep with `_host_label()`
@@ -848,109 +822,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return String(data: outData, encoding: .utf8)
     }
 
-    /// True if Claude Code in the sutando-core tmux pane has any running
-    /// child process — indicating an active Bash/Tool call. False if only
-    /// the claude process itself is running (idle, waiting on stdin) or
-    /// if the tmux session can't be found.
-    func cliIsWorking() -> Bool {
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        // Get the pane's PID (the interactive shell wrapping claude).
-        // -S sutandoTmuxSocket so we find the same tmux server startup.sh
-        // created (different TMPDIR between shell and sandboxed .app).
-        let list = Process()
-        list.executableURL = URL(fileURLWithPath: tmuxPath)
-        list.arguments = ["-S", sutandoTmuxSocket, "list-panes", "-t", "sutando-core", "-F", "#{pane_pid}"]
-        let pipe = Pipe()
-        list.standardOutput = pipe
-        list.standardError = FileHandle.nullDevice
-        do { try list.run() } catch { return false }
-        list.waitUntilExit()
-        if list.terminationStatus != 0 { return false }
-        let panePid = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if panePid.isEmpty { return false }
-
-        // pgrep descendants of the pane PID. Claude Code itself is a child
-        // of the shell; its tool invocations are grandchildren. We want
-        // any non-claude descendant — a running bash/tool/subprocess.
-        // tmux launches the pane command directly — no intermediate shell.
-        // So `pane_pid` in a startup.sh-wrapped setup IS the claude process,
-        // and its DIRECT children are tool-call subprocesses + long-lived
-        // plugin helpers (sourcekit-lsp, caffeinate, bun, npm exec, etc.).
-        // The age filter distinguishes: a child with etime < 60s is a
-        // fresh tool call; older ones are background services that don't
-        // indicate active work.
-        let list2 = Process()
-        list2.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        list2.arguments = ["-P", panePid]
-        let listPipe = Pipe()
-        list2.standardOutput = listPipe
-        list2.standardError = FileHandle.nullDevice
-        do { try list2.run() } catch { return false }
-        list2.waitUntilExit()
-        let children = String(data: listPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .split(separator: "\n").map(String.init) ?? []
-        for childPid in children where !childPid.isEmpty {
-            if processAgeSeconds(pid: childPid) < 60 {
-                return true  // fresh child under pane_pid → active tool call
-            }
-        }
-        return false
-    }
-
-    /// Parse `ps -o etime= -p <pid>` → seconds. Returns Int.max on any
-    /// parse failure so old processes stay "old" and don't false-trigger
-    /// the cliIsWorking heuristic.
-    func processAgeSeconds(pid: String) -> Int {
-        let ps = Process()
-        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-o", "etime=", "-p", pid]
-        let pipe = Pipe()
-        ps.standardOutput = pipe
-        ps.standardError = FileHandle.nullDevice
-        do { try ps.run() } catch { return Int.max }
-        ps.waitUntilExit()
-        if ps.terminationStatus != 0 { return Int.max }
-        // etime format: [DD-]HH:MM:SS | [HH:]MM:SS | MM:SS
-        var raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.isEmpty { return Int.max }
-        var days = 0
-        var rest = raw
-        if let dashIdx = rest.firstIndex(of: "-") {
-            days = Int(rest[..<dashIdx]) ?? 0
-            rest = String(rest[rest.index(after: dashIdx)...])
-        }
-        let parts = rest.split(separator: ":").compactMap { Int($0) }
-        switch parts.count {
-        case 2: return days * 86400 + parts[0] * 60 + parts[1]
-        case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
-        default: return Int.max
-        }
-    }
-
-    /// Type one line into a core pane through the shared sender
-    /// (`scripts/tmux-send-line.sh`), which owns the session check, the
-    /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
-    /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
-    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
-        if let w = skipIfQueued { args += ["--skip-if-queued", w] }
-        proc.arguments = args
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return 4 }
-        proc.waitUntilExit()
-        return proc.terminationStatus
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
     }
 
     /// Return the avatar image, badged per composite mode:
@@ -1811,6 +1686,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // via voice-processing IO unit fails to initialize the output node on
         // this hardware (-10875). Re-enable once that's resolved.
         httpToggle(endpoint: "toggle")
+        openWebUI()
     }
 
     @objc func toggleMute() {
@@ -2430,7 +2306,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns true if the loop-pause sentinel exists AND its expiry is in
     /// the future. Used by Timers (contextual-chips, health-check) to skip
     /// their body during a pause window — keeps the menu-bar quiet during
-    /// a meeting/dinner break without disabling task watcher restarts.
+    /// a meeting/dinner break without disabling task watcher recovery.
     func pauseSentinelActive() -> Bool {
         let path = workspace + "/state/loop-paused-until.sentinel"
         guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),

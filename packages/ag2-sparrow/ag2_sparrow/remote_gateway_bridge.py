@@ -310,6 +310,7 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
+from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -3960,50 +3961,182 @@ def _assigned_worker(task_id: str) -> str:
     return value if _is_worker_id(value) else ""
 
 
-def _result_worker(task_id: str) -> str:
-    """Attribution for one result: assignment truth first, completion residue
-    only as the migration fallback.
+# The core is a delivery recipient like any worker, but the router records
+# attribution only for workers — so a core sentinel with no record is normal.
+_CORE_RECIPIENT = "core"
+_DELIVERY_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
+def _delivery_recipient(task_id: str) -> tuple[str, bool]:
+    """`(recipient, blind)` — which worker this task was DELIVERED to, read
+    from the pool's delivery sentinel. Used ONLY to tell "this was a worker's
+    task" from "this was the core's" when attribution is missing — never as an
+    attribution source.
+
+    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted,claimed})
+    is owned by the pool's own delivery writer, an optional local skill this
+    standalone package cannot import or name; the test builds its fixtures
+    through that writer so a drift fails there instead of silently reading
+    nothing, and asserts this module's recipient/suffix constants still cover
+    what that writer produces.
+
+    The core NEVER counts as a claimant: the router writes a sentinel for every
+    recipient but records attribution only for workers, so "core sentinel, no
+    record" is the ordinary shape of a task the core answered itself, not an
+    invariant violation.
+
+    `blind` is the second outcome because a read failure and "never delivered"
+    are different facts that both have no recipient, and the caller WITHHOLDS on
+    one and sends on the other. Logging the difference was not enough: the send
+    decision could not see a log. An ABSENT tree is not blind — a host with no
+    pool has no deliveries dir, and that is knowledge, not failure.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return "", False
+    root = _STATE.parent / "deliveries"
+    try:
+        recipients = sorted(p.name for p in root.iterdir())
+    except FileNotFoundError:
+        return "", False
+    except OSError as exc:
+        _log(f"attribution: cannot read {root} ({type(exc).__name__}) - the "
+             f"delivery discriminator is BLIND for {task_id}, which is not the "
+             f"same as this task never having been delivered.")
+        return "", True
+    claimants = set()
+    for name in recipients:
+        if name == _CORE_RECIPIENT:
+            continue
+        for suffix in _DELIVERY_SUFFIXES:
+            try:
+                st = os.lstat(root / name / f"{task_id}{suffix}")
+            except (FileNotFoundError, NotADirectoryError):
+                # Reading through a stray file at the root raises
+                # NotADirectoryError: a non-recipient, not a read failure.
+                continue
+            except OSError as exc:
+                _log(f"attribution: cannot read delivery sentinel for "
+                     f"{task_id} under {name} ({type(exc).__name__}) - the "
+                     f"delivery discriminator is BLIND for this task, which is "
+                     f"not the same as it never having been delivered.")
+                return "", True
+            if not stat.S_ISREG(st.st_mode):
+                # Malformed, not unreadable: the writer would never make one,
+                # so this is refusal to believe it, not absence of a reading.
+                return "", False
+            claimants.add(name)
+            break
+    if len(claimants) == 1:
+        return claimants.pop(), False
+    if claimants:
+        # Sentinels under several recipients prove a worker owned this task
+        # without saying which, which is the refusal condition, not its absence.
+        _log(f"attribution: {task_id} has delivery sentinels under "
+             f"{len(claimants)} recipients ({', '.join(sorted(claimants))}) - "
+             f"ownership is AMBIGUOUS, so refusing rather than relaying a "
+             f"worker's reply as the core's own.")
+        return "", True
+    return "", False
+
+
+def _attribution(task_id: str) -> tuple[str, bool]:
+    """`(worker, refused)` for one result: assignment truth first, completion
+    residue only as the migration fallback.
 
     A task routed before assignment records existed has none, so residue still
     answers for it; once no such task is in flight the residue arm can go. A
     result with residue but no assignment record is precisely the anomaly the
     assignment store exists to surface — an author nobody recorded at routing
     time — so it is logged rather than passed over.
+
+    `refused` is the second outcome, and it is why this returns a pair: a
+    worker's result with no attribution and an ordinary core result BOTH have
+    no worker id, so a bare "" cannot tell a caller to withhold one and send
+    the other. Refused means the sentinel proves a worker owned the task while
+    nothing recorded who — publishing it would relay a worker's reply as the
+    core's own.
     """
     assigned = _assigned_worker(task_id)
     if assigned:
-        return assigned
+        return assigned, False
     residue = _worker_of(task_id)
     if residue:
         _log(f"attribution: {task_id} has no assignment record; using "
              f"completion residue ({residue}). Assignment-time recording "
              f"did not run for this task.")
-    return residue
+        return residue, False
+    # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
+    # so silence here would relay it as if the core had produced it.
+    delivered, blind = _delivery_recipient(task_id)
+    if blind:
+        # The evidence store is exactly what decides worker-vs-core here, so an
+        # unreadable one is not a licence to assume core and send.
+        _log(f"attribution: {task_id} cannot be classified - the delivery "
+             f"evidence is unreadable, so whether a worker owned this task is "
+             f"UNKNOWN. Withholding rather than assuming the core produced it.")
+        return "", True
+    if delivered:
+        _log(f"attribution: {task_id} was DELIVERED to {delivered} but has no "
+             f"assignment record and no completion residue - refusing to stamp "
+             f"rather than attribute it to the core. The record is written under "
+             f"the same lock as the sentinel, so this is an invariant violation.")
+        return "", True
+    return "", False
+
+
+def _result_worker(task_id: str) -> str:
+    """The worker id alone, for callers that only label and never withhold.
+    A refusal reads as "" here, so anything deciding whether to SEND must use
+    _attribution() instead."""
+    return _attribution(task_id)[0]
 
 
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
-    done-flag. `task_id` is the result stem, which already carries the
-    `task-` prefix.
+    completion record. `task_id` is the result stem, prefix included.
 
     SUPERSEDED as the primary signal by _assigned_worker(): this infers the
     author from completion residue after the fact, which is exactly the
     fragility assignment-time provenance removes. Kept as the transition
     fallback in _result_worker() for tasks routed before that record existed.
 
-    Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
-    by the pool's own done_flag()/mark_done() writer, in an optional local
-    skill this standalone PyPI package cannot import or name (see
-    docs/architecture-boundaries.md, "Optional adapter capabilities"). Keep
-    the two in step by hand; tests/gateway-result-worker-attribution.test.py
-    builds its fixtures through that writer's own path function so a future
-    drift between the two fails a test instead of silently returning "".
+    The recipient grammar, the record layout, the stage order and the "is this
+    a record?" predicate all come from pool_record, which the pool's own
+    writer binds too — an optional local skill this standalone package can
+    neither import nor name (docs/architecture-boundaries.md, "Optional
+    adapter capabilities"). No second predicate lives here, so the reader
+    cannot accept state the writer would refuse.
+
+    FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
+    with another worker's identity — so anything unreadable, or any record the
+    writer's own predicate would reject, yields "". Entries PROVEN not to be
+    recipients are skipped instead: a stray file beside the recipient folders
+    is not an unreadable claimant, and must not suppress valid attribution.
+    `Path.glob` is deliberately not used: it reports an unreadable subtree as
+    absent, which would let one unreadable claimant hand the answer to another.
     """
+    root = pool_record.workers_root(_STATE)
     try:
-        hits = sorted((_STATE / "workers").glob(f"*/done/{task_id}.flag"))
-    except OSError:
+        recipients = pool_record.iter_recipients(root)
+    except FileNotFoundError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    except OSError:
+        return ""  # unreadable root: no reading, not "nobody claimed it"
+    claimants = set()
+    for name in recipients:
+        for stage in pool_record.STAGES:
+            try:
+                state = pool_record.read_record_state(
+                    pool_record.record_path(root, name, task_id, stage))
+            except OSError:
+                return ""  # unreadable claim tree: abstain, never fall through
+            if state is pool_record.RecordState.ABSENT:
+                continue
+            if state is not pool_record.RecordState.PRESENT:
+                return ""  # malformed record the writer would itself refuse
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -4019,9 +4152,21 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _result_worker(tid)
+    worker, refused = _attribution(tid)
+    if refused:
+        # ENFORCED, not just logged: this is a worker's reply that nothing
+        # recorded, so sending it would publish it as the core's own.
+        why = ("attribution refused: delivered to a worker but no assignment "
+               "record and no completion residue - withholding rather than "
+               "publishing an unattributed result as the core's own")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} - not published, not delivered")
+        return False
     if worker:
         doc["metadata"] = {"worker_id": worker}
+        _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)

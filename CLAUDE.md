@@ -255,6 +255,9 @@ On each proactive loop pass, check the per-host `pending-questions.md` (`<worksp
 **Call notify BEFORE doing any work** — the notification must be the first thing the user sees
 after sending a task, not silence followed by a result minutes later.
 
+AG2 Space is the exception: there the 🫡 reaction on the source message is the
+pickup acknowledgement and no notify message is sent.
+
 **Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
 10–30 seconds — the user should never wait in silence while you transcribe.
 - See `[File attached: ...]` in task → notify "Got your voice message, give me a moment." → THEN transcribe
@@ -360,7 +363,7 @@ Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
-If Sutando.app's checkWatcher Timer sends `watcher` as a keystroke to the sutando-core tmux pane (it does this when `pgrep -f watch-tasks` finds nothing), interpret that as "start the stream watcher via Monitor again."
+If you notice the stream watcher has stopped, re-arm it yourself via the `Monitor` tool as described above.
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 

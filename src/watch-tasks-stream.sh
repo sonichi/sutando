@@ -80,6 +80,8 @@ source "$__SCRIPT_DIR/watcher_sentinel.sh"
 source "$__SCRIPT_DIR/task-emit.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
+# shellcheck source=agent/task-event-handler-lookup.sh
+source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -138,6 +140,26 @@ FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fall
   exit 1
 }
 WATCHER_ID="$$-${RANDOM:-0}"
+
+# Core only: a worker's own inbox is already the routing decision (#4502), so
+# it never reads or watches this file. A skill declares the handler by writing
+# it (e.g. worker-pool's register_worker()); this process fswatches it below
+# and reloads CURRENT_HANDLER the moment it changes -- no restart needed.
+HANDLER_CONFIG_PATH=""
+HANDLER_CONFIG_DIR=""
+CURRENT_HANDLER=""
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  HANDLER_CONFIG_PATH="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
+    echo "watch-tasks-stream: could not resolve the task-event-handler config path" >&2
+    exit 1
+  }
+  HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+fi
+
+reload_current_handler() {
+  CURRENT_HANDLER="$(task_event_handler "$HANDLER_CONFIG_PATH")" || CURRENT_HANDLER=""
+}
+[ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
 claim_is_live() {
   local claim="$1" owner_pid
@@ -260,7 +282,16 @@ publish_terminal_failure() {
   return "$rc"
 }
 
-if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
+# Only core makes a routing decision (should this task go to a bound worker);
+# a worker's own inbox already IS that decision, made by whoever delivered the
+# sentinel there (#4502). So a worker never probes a handler, regardless of
+# CURRENT_HANDLER, and only core's branch ever calls this.
+#
+# Idempotent, and called both here (only when a handler is already declared at
+# startup) and lazily from dispatch_task() on the first routed task, so a
+# handler declared later still gets its queue with no restart.
+ensure_dispatch_ready() {
+  [ -z "$DISPATCH_DIR" ] || return 0
   DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
   mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
     "$DISPATCH_DIR/workers"
@@ -272,6 +303,10 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
     claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
+}
+
+if [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ]; then
+  ensure_dispatch_ready
 fi
 
 acquire_dispatch_lock() {
@@ -364,7 +399,7 @@ handler_result_exists() {
 
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
+  local filename worker_pid reprobe_rc
   # finish_handler_task ends by calling this function, and the dispatch lock is
   # a mkdir spinlock with no timeout — a nested call would deadlock on it.
   [ -n "${DRAIN_ACTIVE:-}" ] && return
@@ -409,8 +444,34 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
+    # Re-checked here, not trusted from enqueue time: a receipt may outlive
+    # the handler that admitted it (a config change since it was queued), and
+    # CURRENT_HANDLER is already the live value -- fswatch keeps it current,
+    # so this costs a variable read, not a subprocess. finish_handler_task
+    # re-enters drain_dispatch_queue itself, so the lock must be released
+    # first and this call must return, never loop, to avoid a self-deadlock.
+    if [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+      release_dispatch_lock
+      DRAIN_ACTIVE=""
+      finish_handler_task "$running_marker" "$task_path" 1
+      return
+    fi
+    "$CURRENT_HANDLER" \
+      --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+      --workspace "$WORKSPACE_DIR" \
+      --task-file "$task_path" \
+      --results-dir "$RESULTS_DIR" \
+      --repo "$__REPO_ROOT" \
+      --probe >/dev/null
+    reprobe_rc=$?
+    if [ "$reprobe_rc" -ne 0 ] && [ "$reprobe_rc" -ne 4 ]; then
+      release_dispatch_lock
+      DRAIN_ACTIVE=""
+      finish_handler_task "$running_marker" "$task_path" "$reprobe_rc"
+      return
+    fi
     SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
-      "$SUTANDO_TASK_EVENT_HANDLER" \
+      "$CURRENT_HANDLER" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
       "$task_path" \
@@ -463,10 +524,24 @@ task_announce() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved
+  local task_path="$1" rc filename announce resolved attempt
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
-  resolved="$(resolve_inbox_entry "$task_path")" || return 0
+  #
+  # A sentinel can be visible to fswatch before its payload's own write is —
+  # two separate files, no ordering guarantee between them — so one failed
+  # resolve is retried briefly rather than treated as permanent. Same bounded
+  # shape as acquire_task_claim's lock race, applied to filesystem visibility
+  # instead of lock contention.
+  attempt=0
+  until resolved="$(resolve_inbox_entry "$task_path")"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 3 ]; then
+      echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
+      return 0
+    fi
+    sleep 0.2
+  done
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
@@ -479,11 +554,16 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if [ -z "$DISPATCH_DIR" ]; then
+  # Only core makes a routing decision; a worker's own inbox already IS that
+  # decision (#4502). CURRENT_HANDLER is never populated for a worker (see the
+  # SUTANDO_INSTANCE_ID gate at its assignment above), so this is enforced
+  # structurally too, not just by this early return.
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
     emit_dispatch_task_file "$announce"
     return
   fi
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  ensure_dispatch_ready
+  "$CURRENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
@@ -528,6 +608,16 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+WATCHER_BEAT_PID=""
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
 # version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
@@ -727,6 +817,9 @@ cleanup() {
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
+  if [ -n "${WATCHER_BEAT_PID:-}" ]; then
+    kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
+  fi
   if declare -F fallback_outstanding_handlers >/dev/null; then
     fallback_outstanding_handlers
   fi
@@ -782,13 +875,38 @@ shopt -u nullglob
 # Mode A fix (#1088): `|| exit 0` on printf — if the consumer pipe is
 # dead, the first failed write exits immediately instead of silently
 # buffering ~100 events into the kernel pipe buffer.
+#
+# HANDLER_CONFIG_DIR (core only) rides the SAME fswatch process as a second
+# path -- not the file itself, which inotify/poll_monitor can't watch reliably before it exists.
+fswatch_paths=("$TASKS_DIR")
+if [ -n "$HANDLER_CONFIG_DIR" ]; then
+  mkdir -p "$HANDLER_CONFIG_DIR"
+  fswatch_paths+=("$HANDLER_CONFIG_DIR")
+fi
 fswatch \
   -l 0.5 \
   --event Created \
   --event Renamed \
-  "$TASKS_DIR" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  --event Updated \
+  "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
-while IFS= read -r path; do
+# -t bounds the read so a stretch with no fswatch event still gets a periodic,
+# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
+# event shape the platform's fswatch monitor backend turns out to use.
+while true; do
+  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
+  read_rc=$?
+  if [ "$read_rc" -gt 128 ]; then
+    if [ -n "$HANDLER_CONFIG_PATH" ]; then
+      reload_current_handler
+      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+    fi
+    continue
+  elif [ "$read_rc" -ne 0 ]; then
+    # EOF: fswatch died and closed its end of the pipe. Fall through to the
+    # script's normal exit path rather than spinning on a dead FIFO.
+    break
+  fi
   case "$path" in
     "HANDLER_DONE: "*)
       completion="${path#HANDLER_DONE: }"
@@ -802,6 +920,29 @@ while IFS= read -r path; do
         task_path="$(cat "$running_marker")"
         finish_handler_task "$running_marker" "$task_path" "$handler_rc"
       fi
+      ;;
+    "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR")
+      # Matches the file OR its bare dir -- poll_monitor reports the watched
+      # DIRECTORY, not the file, on a rename-into-place (measured locally).
+      reload_current_handler
+      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
+      ;;
+    "$TASKS_DIR"|"$TASKS_DIR_ABS")
+      # Same poll_monitor quirk as above, for the tasks dir itself: sweep for
+      # any *.txt this path hasn't dispatched yet (marker avoids re-dispatch
+      # on every later poll of a task still pending/archiving).
+      if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
+        continue
+      fi
+      mkdir -p "$WATCH_RUNTIME_DIR/dir-swept"
+      shopt -s nullglob
+      for f in "$TASKS_DIR"/*.txt; do
+        fn="$(basename "$f")"
+        [ -e "$WATCH_RUNTIME_DIR/dir-swept/$fn" ] && continue
+        : > "$WATCH_RUNTIME_DIR/dir-swept/$fn"
+        dispatch_task "$f"
+      done
+      shopt -u nullglob
       ;;
     *.txt)
       parent="$(dirname "$path")"

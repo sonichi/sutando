@@ -32,6 +32,7 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
         sys.path.insert(0, _p)
 
 import pool_delivery as pd  # noqa: E402
+import pool_remedy_timer as prt  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import tmux_probe  # noqa: E402
@@ -207,6 +208,33 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     }
 
 
+def ensure_remedy_timer(workspace, repo, *, runner=None,
+                        launch_agents=None) -> dict:
+    """Make the unattended remedy exist on a host as soon as a worker does.
+
+    Installing it was a hand-run step, so a host that never ran it spawned
+    workers nothing would ever resume; the mechanism shipped, the deployment
+    did not. Never raises: the worker is already alive by the time this runs,
+    and a timer that could not be installed must not make a live worker read
+    as a failed spawn.
+    """
+    if sys.platform != "darwin":
+        return {"ensured": False, "why": "launchd is macOS-only"}
+    try:
+        st = prt.status(launch_agents=launch_agents, runner=runner)
+        # `pool_remedy` calls spawn() from inside this job, so re-installing
+        # a healthy timer would bootout the job currently running.
+        if st.get("installed") and st.get("loaded"):
+            return {"ensured": False, "why": "already installed",
+                    "plist": st.get("plist")}
+        out = prt.install(workspace, repo, launch_agents=launch_agents,
+                          runner=runner)
+        return {"ensured": True, "plist": out.get("plist"),
+                "interval_s": out.get("interval_s"), "loaded": out.get("loaded")}
+    except (RuntimeError, OSError, ValueError) as e:
+        return {"ensured": False, "why": f"{type(e).__name__}: {e}"}
+
+
 def spawn(workspace, repo, *, runtime=None, cwd: str = "",
           socket=None, label: str = "", runner=_run,
           require_sentinel: bool = True, resume: str = "") -> dict:
@@ -252,9 +280,10 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     if state != "absent":
         raise SpawnRefused(f"tmux could not say whether session {name!r} exists "
                            f"({detail}); refusing rather than minting a worker over one")
+    run = None
     if resumed_id:
-        wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
-                             tmux_session=name)
+        run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
+                                   tmux_session=name)
         rec = {"worker_id": worker_id}
     else:
         rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
@@ -290,12 +319,16 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         # exactly what this call minted.
         # A resumed worker existed before this call: its records and inbox are
         # not ours to remove, only the run we failed to start.
+        if run is not None:
+            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
         if not resumed_id:
             shutil.rmtree(wi.worker_dir(workspace, rec["worker_id"]), ignore_errors=True)
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
-    return {**p, **rec, "runtime_session_id": session_id, "started": True}
+    remedy = ensure_remedy_timer(workspace, repo, runner=runner)
+    return {**p, **rec, "runtime_session_id": session_id, "started": True,
+            "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:

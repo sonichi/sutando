@@ -189,10 +189,13 @@ ensure_task_notifier() {
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
   )
+  # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
+  # itself and fswatches it for changes, so the launcher forwards only a genuine
+  # operator pin (if one is already set) and nothing computed.
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \

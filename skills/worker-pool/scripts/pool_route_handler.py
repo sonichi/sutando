@@ -34,6 +34,7 @@ import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
 import pool_advertise as pa
+import pool_routing_receipt as prr  # noqa: E402
 
 DECLINE = 3
 MUST_HANDLE = 4
@@ -135,6 +136,11 @@ def main(argv=None) -> int:
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    # First, before anything can fail: the receipt is the only proof outside this
+    # process that the watcher routes at all, and a write failure changes nothing.
+    if ws and not prr.record(ws, mode="probe" if args.probe else "run",
+                             task_id=Path(args.task_file).stem):
+        print("pool_route_handler: routing receipt not written", file=sys.stderr)
     # An inherited roster has no advertisement until something publishes it;
     # the edge is here, and a failure to publish must never stop routing.
     try:

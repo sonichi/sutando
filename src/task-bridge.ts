@@ -250,6 +250,37 @@ const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
  * non-voice tasks. */
+// Cache of tasks/archive/'s month-shaped (YYYY-MM) subdirectory names,
+// invalidated by the archive root's own mtime — which changes whenever an
+// entry (most relevantly a new month's subdir) is added. Without this,
+// _readTaskHeader's caller (the 2s-interval result watcher) re-globbed the
+// whole archive root, thousands of legacy loose files included, on every
+// invocation — pinning a CPU core once that directory grew large.
+let _archiveMonthCache: { mtimeMs: number; dirs: string[] } | null = null;
+export let _archiveScanCount = 0; // test-only: counts real readdirSync(archiveRoot) calls
+
+function _archiveMonthDirs(archiveRoot: string): string[] {
+	// Stat BEFORE readdir: a subdir created mid-scan then gets cached
+	// against a stale-low mtime (extra re-scan next time, never stale).
+	let mtimeMs: number;
+	try {
+		mtimeMs = statSync(archiveRoot).mtimeMs;
+	} catch {
+		return [];
+	}
+	if (_archiveMonthCache && _archiveMonthCache.mtimeMs === mtimeMs) {
+		return _archiveMonthCache.dirs;
+	}
+	let dirs: string[] = [];
+	try {
+		_archiveScanCount++;
+		// Only month-shaped names (YYYY-MM); skip stray legacy files.
+		dirs = readdirSync(archiveRoot).filter((entry) => /^\d{4}-\d{2}$/.test(entry));
+	} catch {}
+	_archiveMonthCache = { mtimeMs, dirs };
+	return dirs;
+}
+
 /** Header lines of a task, located across every archive layout. Returns null
  *  when no copy of the task survives. */
 export function _readTaskHeader(taskId: string): string[] | null {
@@ -266,13 +297,9 @@ export function _readTaskHeader(taskId: string): string[] | null {
 	// boundaries.
 	const archiveRoot = join(TASK_DIR, 'archive');
 	if (existsSync(archiveRoot)) {
-		try {
-			for (const entry of readdirSync(archiveRoot)) {
-				// Only month-shaped names (YYYY-MM); skip stray files.
-				if (!/^\d{4}-\d{2}$/.test(entry)) continue;
-				candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
-			}
-		} catch {}
+		for (const entry of _archiveMonthDirs(archiveRoot)) {
+			candidates.push(join(archiveRoot, entry, `${taskId}.txt`));
+		}
 	}
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;

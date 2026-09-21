@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import os
 import sys
 import tempfile
 import unittest
@@ -38,12 +39,17 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
+    clear_inflight, inflight_is_live, mark_inflight,
     _main,
     find_ready_result,
     find_ready_result_for_filename,
     has_ready_result,
     next_pending_task,
+    owned_task_ids,
+    _WORKER_HOLD_SUFFIXES,
     pending_candidates,
+    worker_holds,
+    WorkerHoldUnreadable,
 )
 
 CLI = REPO / "src" / "delivery" / "task_dispatch.py"
@@ -496,6 +502,75 @@ class PendingCandidatesTest(unittest.TestCase):
         (self.claims_dir / "task-a.txt").write_text("")
         self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-a.txt"])
 
+    def _hold_for_worker(self, task_id, suffix, worker="worker-1"):
+        folder = Path(self.tmp.name) / "deliveries" / worker
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{task_id}{suffix}").write_text("")
+        return folder.parent
+
+    def test_a_worker_held_task_is_held_back_under_every_sentinel_suffix(self):
+        # The router's hand-off leaves the task in tasks/; each sentinel spelling
+        # (fresh, accepted, claimed) must keep it out of the core's pick.
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                for f in self.tasks_dir.glob("*"):
+                    f.unlink()
+                self._write_task("task-held.txt", priority="urgent")
+                self._write_task("task-free.txt")
+                deliveries = self._hold_for_worker("task-held", suffix)
+                self.assertTrue(worker_holds(deliveries, "task-held.txt"))
+                self.assertFalse(worker_holds(deliveries, "task-free.txt"))
+                self.assertEqual(
+                    list(pending_candidates(self.tasks_dir, self.results_dir,
+                                            deliveries_dir=deliveries)),
+                    ["task-free.txt"])
+                self.assertEqual(
+                    next_pending_task(self.tasks_dir, self.results_dir, deliveries_dir=deliveries),
+                    "task-free.txt")
+                for f in (deliveries / "worker-1").glob("*"):
+                    f.unlink()
+
+    def test_without_a_deliveries_dir_worker_holds_are_not_consulted(self):
+        self._write_task("task-held.txt")
+        self._hold_for_worker("task-held", ".claimed")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-held.txt"])
+
+    def test_an_unreadable_deliveries_root_holds_the_task_instead_of_yielding_it(self):
+        # Absent root = no pool (False, control); unreadable root = cannot decide:
+        # worker_holds raises and the queue holds the task rather than delivering it.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        self._write_task("task-a.txt")
+        deliveries = self._hold_for_worker("task-zzz", ".claimed")
+        self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir,
+                                                 deliveries_dir=deliveries)), ["task-a.txt"])
+        os.chmod(deliveries, 0)
+        self.addCleanup(os.chmod, deliveries, 0o755)
+        with self.assertRaises(WorkerHoldUnreadable):
+            worker_holds(deliveries, "task-a.txt")
+        with mock.patch("sys.stderr", StringIO()):
+            self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir,
+                                                     deliveries_dir=deliveries)), [])
+            self.assertIsNone(next_pending_task(self.tasks_dir, self.results_dir,
+                                                deliveries_dir=deliveries))
+
+    def test_a_root_that_is_not_a_directory_is_unreadable_not_absent(self):
+        # A replaced or misconfigured deliveries path: ownership cannot be checked.
+        self._write_task("task-a.txt")
+        root = Path(self.tmp.name) / "deliveries-file"
+        root.write_text("not a directory\n")
+        with self.assertRaises(WorkerHoldUnreadable):
+            worker_holds(root, "task-a.txt")
+        with mock.patch("sys.stderr", StringIO()):
+            self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir,
+                                                     deliveries_dir=root)), [])
+
+    def test_worker_holds_is_false_for_an_absent_deliveries_root_or_a_bad_name(self):
+        self.assertFalse(worker_holds(Path(self.tmp.name) / "nope", "task-a.txt"))
+        deliveries = self._hold_for_worker("task-a", ".txt")
+        self.assertFalse(worker_holds(deliveries, "../task-a.txt"))
+        self.assertFalse(worker_holds(deliveries, ""))
+
     def test_a_directory_matching_the_glob_is_skipped_not_yielded(self):
         (self.tasks_dir / "task-a.txt").mkdir()
         self._write_task("task-b.txt")
@@ -617,6 +692,98 @@ class MainDispatchTest(unittest.TestCase):
                                "--claims-dir", str(self.claims_dir))
         self.assertEqual((rc, out), (1, ""))
 
+    def test_pending_and_next_honour_deliveries_dir_in_either_option_order(self):
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w").mkdir(parents=True)
+        (deliveries / "w" / "task-a.accepted").write_text("")
+        for argv in (["--deliveries-dir", str(deliveries)],
+                     ["--claims-dir", str(self.claims_dir), "--deliveries-dir", str(deliveries)],
+                     ["--deliveries-dir", str(deliveries), "--claims-dir", str(self.claims_dir)]):
+            for cmd in ("pending-candidates", "next-pending"):
+                with self.subTest(cmd=cmd, argv=argv):
+                    rc, out, _ = self._run(cmd, str(self.tasks_dir), str(self.results_dir), *argv)
+                    self.assertEqual((rc, out), (1, ""))
+        # Control: the same task is picked when the option is absent.
+        rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir))
+        self.assertEqual((rc, out), (0, "task-a.txt\n"))
+
+    def test_worker_holds_command_both_outcomes_and_usage(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w").mkdir(parents=True)
+        self.assertEqual(self._run("worker-holds", str(deliveries), "task-a.txt")[0], 1)
+        (deliveries / "w" / "task-a.claimed").write_text("")
+        self.assertEqual(self._run("worker-holds", str(deliveries), "task-a.txt")[0], 0)
+        rc, _, err = self._run("worker-holds", str(deliveries), "task-a.txt", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_owned_by_command_prints_one_id_per_line(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        (deliveries / "w1" / "task-a.txt").write_text("")
+        (deliveries / "w1" / "task-a.accepted").write_text("")
+        (deliveries / "w1" / "task-b.claimed").write_text("")
+        rc, out, _ = self._run("owned-by", str(deliveries), "w1")
+        self.assertEqual((rc, out.split()), (0, ["task-a", "task-b"]))
+
+    def test_owned_by_command_is_zero_and_silent_for_an_undelivered_recipient(self):
+        deliveries = Path(self.tmp.name) / "deliveries"
+        deliveries.mkdir()
+        rc, out, _ = self._run("owned-by", str(deliveries), "never")
+        self.assertEqual((rc, out.strip()), (0, ""))
+
+    def test_owned_by_command_exits_2_on_an_unreadable_folder(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w1").mkdir(parents=True)
+        os.chmod(deliveries / "w1", 0)
+        self.addCleanup(os.chmod, deliveries / "w1", 0o755)
+        rc, out, err = self._run("owned-by", str(deliveries), "w1")
+        # 1 would read as "this worker owes nothing" and end the turn.
+        self.assertEqual((rc, out.strip()), (2, ""))
+        self.assertIn("owned-by", err)
+
+    def test_owned_by_command_rejects_extra_arguments(self):
+        rc, _, err = self._run("owned-by", str(self.tmp.name), "w1", "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_worker_holds_command_exits_2_on_an_unreadable_root(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        deliveries = Path(self.tmp.name) / "deliveries"
+        (deliveries / "w").mkdir(parents=True)
+        (self.tasks_dir / "task-a.txt").write_text("task: x\n")
+        os.chmod(deliveries, 0)
+        self.addCleanup(os.chmod, deliveries, 0o755)
+        rc, _, err = self._run("worker-holds", str(deliveries), "task-a.txt")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot", err)
+        # The pick holds: nothing yielded, rc 1, and the reason is on stderr.
+        rc, out, err = self._run("pending-candidates", str(self.tasks_dir), str(self.results_dir),
+                                 "--deliveries-dir", str(deliveries))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("holding task-a.txt", err)
+
+    def test_worker_holds_command_exits_2_on_a_non_directory_root(self):
+        root = Path(self.tmp.name) / "deliveries-file"
+        root.write_text("")
+        rc, _, err = self._run("worker-holds", str(root), "task-a.txt")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot", err)
+
+    def test_a_repeated_or_dangling_dir_option_is_a_usage_error(self):
+        d = str(self.claims_dir)
+        for extra in (["--deliveries-dir"], ["--deliveries-dir", ""],
+                      ["--claims-dir", d, "--claims-dir", d],
+                      ["--deliveries-dir", d, "--deliveries-dir", d]):
+            with self.subTest(extra=extra):
+                rc, _, err = self._run("next-pending", str(self.tasks_dir), str(self.results_dir), *extra)
+                self.assertEqual(rc, 2)
+                self.assertIn("usage:", err)
+
     def test_malformed_claims_option_is_a_usage_error(self):
         for extra in (["--claims-dir"], ["--claims-dir", ""], ["--bogus", "x"], ["stray"]):
             with self.subTest(extra=extra):
@@ -654,6 +821,175 @@ class CliSmokeTest(unittest.TestCase):
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual((ok.returncode, ok.stdout), (0, f"{results / 'task-a.txt'}\n"))
         self.assertEqual(miss.returncode, 1, miss.stderr)
+
+
+
+class InflightRecordTest(unittest.TestCase):
+    """The at-most-once record between a confirmed submit and a ready result."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "inflight"
+
+    def test_a_marker_is_live_for_its_own_incarnation_only(self):
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertTrue(inflight_is_live(self.dir, "task-a.txt", "4242"))
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "9999"), "a marker from another core held")
+        self.assertFalse((self.dir / "task-a.txt").exists(), "the stale marker was not removed")
+
+    def test_an_unreadable_current_incarnation_keeps_the_marker_live(self):
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertTrue(inflight_is_live(self.dir, "task-a.txt", ""))
+        self.assertTrue((self.dir / "task-a.txt").exists())
+
+    def test_a_blank_marker_already_on_disk_is_corrupt_not_live(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "task-z.txt").write_text("\n")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", "4242"))
+        self.assertFalse((self.dir / "task-z.txt").exists(), "the corrupt marker was left to hold the task")
+        (self.dir / "task-z.txt").write_text("")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", ""), "blank against unreadable must not read as live")
+
+    def test_no_marker_is_not_live_and_clear_is_idempotent(self):
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
+        clear_inflight(self.dir, "task-a.txt")
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        clear_inflight(self.dir, "task-a.txt")
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
+
+    def test_whitespace_in_a_filename_is_identity(self):
+        mark_inflight(self.dir, "task-a b.txt", "4242")
+        self.assertFalse(inflight_is_live(self.dir, "task-ab.txt", "4242"))
+
+    def test_traversal_names_are_refused(self):
+        for bad in ("", "../x.txt", "a/b.txt"):
+            with self.assertRaises(ValueError):
+                mark_inflight(self.dir, bad, "1")
+
+    def test_an_empty_incarnation_is_refused_by_the_writer_and_the_cli(self):
+        with self.assertRaises(ValueError):
+            mark_inflight(self.dir, "task-e.txt", "  ")
+        self.assertFalse((self.dir / "task-e.txt").exists())
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-e.txt", ""]))
+
+    def test_concurrent_writers_never_race_on_a_shared_temp_path(self):
+        import threading
+        errors = []
+        def _w(i):
+            try:
+                mark_inflight(self.dir, "task-c.txt", str(i))
+            except Exception as exc:  # noqa: BLE001 - the point is that none happens
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=_w, args=(i,)) for i in range(128)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual([], errors)
+        self.assertTrue((self.dir / "task-c.txt").read_text().strip().isdigit())
+        self.assertEqual([], list(self.dir.glob(".task-c.txt.*")), "a temp file was left behind")
+
+    def test_cli_arms_in_process(self):
+        # The subprocess round trip proves the exit codes; this hits the same arms
+        # under the coverage tracer.
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-mark", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "2"]))
+        self.assertEqual(0, _main(["inflight-clear", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "../x.txt", "1"]))
+        self.assertEqual(2, _main(["inflight-clear", str(self.dir), "task-p.txt", "extra"]))
+
+    def test_an_unreadable_marker_is_cannot_decide_not_absent(self):
+        import os as _os
+        if _os.geteuid() == 0:
+            self.skipTest("root cannot be denied a read")
+        mark_inflight(self.dir, "task-u.txt", "1")
+        (self.dir / "task-u.txt").chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                inflight_is_live(self.dir, "task-u.txt", "1")
+            self.assertEqual(2, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]))
+        finally:
+            (self.dir / "task-u.txt").chmod(0o644)
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]), "readable again, it is live")
+
+    def test_cli_round_trip(self):
+        script = Path(__file__).resolve().parent.parent / "src" / "delivery" / "task_dispatch.py"
+        def run(*args):
+            return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True)
+        self.assertEqual(1, run("inflight-live", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(0, run("inflight-mark", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(0, run("inflight-live", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(1, run("inflight-live", str(self.dir), "task-c.txt", "2").returncode)
+        self.assertEqual(0, run("inflight-clear", str(self.dir), "task-c.txt").returncode)
+        self.assertEqual(2, run("inflight-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
+        self.assertEqual(2, run("inflight-mark", str(self.dir), "../x.txt", "1").returncode)
+
+
+class OwnedTaskIdsTest(unittest.TestCase):
+    """The worker's own question. `worker_holds` answers the core's; both must
+    read the same sentinel stages, so they share one suffix set."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.deliveries = Path(self.tmp.name) / "deliveries"
+        (self.deliveries / "w1").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, name, recipient="w1"):
+        (self.deliveries / recipient / name).write_text("")
+
+    def test_every_stage_yields_its_task_id_exactly_once(self):
+        self._touch("task-a.txt")
+        self._touch("task-a.accepted")
+        self._touch("task-b.claimed")
+        self.assertEqual(owned_task_ids(self.deliveries, "w1"), ["task-a", "task-b"])
+
+    def test_a_non_sentinel_name_is_ignored(self):
+        self._touch("notes.log")
+        self.assertEqual(owned_task_ids(self.deliveries, "w1"), [])
+
+    def test_absent_folder_is_nothing_owed(self):
+        self.assertEqual(owned_task_ids(self.deliveries, "never-delivered"), [])
+
+    def test_unreadable_folder_is_undecidable_not_empty(self):
+        os.chmod(self.deliveries / "w1", 0o000)
+        try:
+            with self.assertRaises(WorkerHoldUnreadable):
+                owned_task_ids(self.deliveries, "w1")
+        finally:
+            os.chmod(self.deliveries / "w1", 0o755)
+
+    def test_a_traversing_recipient_is_refused(self):
+        self._touch("task-a.txt")
+        self.assertEqual(owned_task_ids(self.deliveries, "../w1"), [])
+
+    def test_it_shares_the_suffix_set_with_worker_holds(self):
+        # A stage added for worker_holds must reach this function too, or the
+        # core and the worker disagree about what was delivered.
+        for suffix in _WORKER_HOLD_SUFFIXES:
+            self._touch(f"task-s{suffix}")
+            self.assertIn("task-s", owned_task_ids(self.deliveries, "w1"))
+            self.assertTrue(worker_holds(self.deliveries, "task-s.txt"))
+            (self.deliveries / "w1" / f"task-s{suffix}").unlink()
+
+    def test_the_cli_prints_one_id_per_line_and_exits_2_when_undecidable(self):
+        self._touch("task-a.txt")
+        r = subprocess.run([sys.executable, str(CLI), "owned-by", str(self.deliveries), "w1"],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.split()), (0, ["task-a"]))
+        os.chmod(self.deliveries / "w1", 0o000)
+        try:
+            r2 = subprocess.run([sys.executable, str(CLI), "owned-by", str(self.deliveries), "w1"],
+                                capture_output=True, text=True)
+        finally:
+            os.chmod(self.deliveries / "w1", 0o755)
+        self.assertEqual(r2.returncode, 2)
+        self.assertIn("owned-by", r2.stderr)
+
 
 
 if __name__ == "__main__":
