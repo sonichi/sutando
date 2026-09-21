@@ -21,6 +21,7 @@ EOF
 cat > "$T/s2.sh" <<'EOF'
 [ -e "$PWD/lane-reset-leftover.txt" ] && echo "untracked-leftover-present"
 git diff --quiet -- README.md || echo "tracked-edit-present"
+[ -L "$PWD/node_modules" ] && echo "node-modules-link-present"
 echo "checked"
 exit 0
 EOF
@@ -42,6 +43,16 @@ case "$out2" in
     *tracked-edit-present*) echo "  FAIL suite 2 saw suite 1's edit to a tracked file"; fail=1 ;;
     *) echo "  ok   suite 1's edit to a tracked file was reverted before suite 2" ;;
 esac
+# The shared node_modules link is a symlink, which .gitignore's `node_modules/`
+# does not cover; the reset must leave it for the next suite.
+if [ -d "$here/node_modules" ]; then
+    case "$out2" in
+        *node-modules-link-present*) echo "  ok   the node_modules link survived the reset" ;;
+        *) echo "  FAIL the reset removed the node_modules link"; fail=1 ;;
+    esac
+else
+    echo "  skip node_modules link check: caller has no node_modules"
+fi
 # Control: suite 1 really did dirty the tree, or the checks above prove nothing.
 out1="$(cat "$T/rec/1.out" 2>/dev/null)"
 case "$out1" in
