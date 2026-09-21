@@ -59,7 +59,9 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
     tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not tmux:
         raise unittest.SkipTest("tmux not found")
-    with tempfile.TemporaryDirectory() as td:
+    # A launcher child winding down can still drop __pycache__ into the copied src
+    # while this exits; the property under test is the argv, not the cleanup.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         td = Path(td)
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)

@@ -1063,7 +1063,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(2)\n",
+            needle + "    import time as _slow_history\n    _slow_history.sleep(4)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1102,7 +1102,8 @@ exit 0
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertLess(elapsed, 1.0, f"unassigned delivery took {elapsed:.2f}s")
+        # Well under the injected 4s scan, well over a loaded runner's own overhead.
+        self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
         calls = self.log.read_text()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
