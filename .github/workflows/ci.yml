@@ -455,5 +455,6 @@ jobs:
             esac
           }
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
+          check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
           exit "$rc"

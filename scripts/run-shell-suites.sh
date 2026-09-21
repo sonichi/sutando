@@ -16,10 +16,11 @@ WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 RECDIR="$(mktemp -d)"
 trap 'rm -rf "$RECDIR"' EXIT
 find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort > "$RECDIR/all"
-# A suite that reads the host process table (pgrep/pkill/ps by pattern)
-# sees sibling lanes' watchers as its own; those run after the lanes,
-# alone. `|| true`: a list with no such suite is not an error.
-{ xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e |-p )' < "$RECDIR/all" || true; } | sort > "$RECDIR/serial"
+# A suite that reads the host process table (pgrep/pkill, ps by pattern or
+# by pid) sees sibling lanes' processes as its own; those run after the lanes,
+# alone. grep's 1 is "no such suite"; anything above is an error, and an error
+# must not read as an empty list that sends those suites into the lanes.
+{ xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e |-p )' < "$RECDIR/all"; _g=$?; [ "$_g" -le 1 ] || exit "$_g"; } | sort > "$RECDIR/serial"
 comm -23 "$RECDIR/all" "$RECDIR/serial" > "$RECDIR/files"
 mkdir -p "$RECDIR/serial-rec"
 # Same scheduler as the Python suite: one SERIAL worker per worktree, so
