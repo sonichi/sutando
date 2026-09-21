@@ -368,8 +368,19 @@ enqueue_announced_task() {
     log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
     return 0
   fi
-  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$TASKS_DIR/$filename" 2>/dev/null)"
-  case "$tier" in urgent|normal|low) ;; *) tier=normal ;; esac
+  # `|| tier=""`: under set -e, a bare `tier="$(...)"` on a failing
+  # subprocess exits the whole notifier before the case below ever runs.
+  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$TASKS_DIR/$filename" 2>/dev/null)" || tier=""
+  case "$tier" in
+    urgent|normal|low) ;;
+    *)
+      if [ -z "${_TIER_READ_WARNED:-}" ]; then
+        log_notifier "priority-tier read failed for $filename; defaulting to normal (further failures this run are not logged again)"
+        _TIER_READ_WARNED=1
+      fi
+      tier=normal
+      ;;
+  esac
   printf '%s' "$tier" > "$queue_dir/$filename"
 }
 

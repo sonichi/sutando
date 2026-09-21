@@ -1241,7 +1241,7 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+    def test_managed_notifier_waits_for_idle_then_submits_in_watcher_announced_order(self):
         # Priority now lives in the watcher's sweep (closes #3017); this stub
         # emits in that real order (urgent before low), matching a real sweep.
         workspace = self.root / "workspace"
