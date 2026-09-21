@@ -354,10 +354,13 @@ export const ROOM_NAME_MAX_CHARS = 120;
 export interface VoiceSessionRoom { id: string; name?: string }
 
 let _voiceSessionRoom: VoiceSessionRoom | null = null;
+// The room released while another room's verdict is pending; change reporting still counts it as left.
+let _releasedRoom: VoiceSessionRoom | null = null;
 
 /** Bind (or, with null, release) the room the live voice session is docked in. */
 export function setVoiceSessionRoom(room: VoiceSessionRoom | null): void {
 	_voiceSessionRoom = room;
+	_releasedRoom = null;
 }
 
 export function getVoiceSessionRoom(): VoiceSessionRoom | null {
@@ -398,8 +401,9 @@ export function applySessionContextFrame(msg: Record<string, unknown> | null | u
 }
 
 function _applyVerifiedRoom(room: VoiceSessionRoom | null): { change: SessionRoomChange; room: VoiceSessionRoom | null } {
-	const prev = _voiceSessionRoom;
+	const prev = _voiceSessionRoom ?? _releasedRoom;
 	_voiceSessionRoom = room;
+	_releasedRoom = null;
 	if (room && room.id !== prev?.id) return { change: 'entered', room };
 	if (!room && prev) return { change: 'left', room: null };
 	return { change: 'none', room };
@@ -503,13 +507,18 @@ let _sessionContextSeq = 0;
 
 /** The live-frame entry point: a DM frame applies at once; a room frame
  *  applies only after the verifier confirms membership, and until then (or on
- *  a refusal) the session stays on the DM. A newer frame that arrives while a
+ *  a refusal) the session is on the DM: a different room bound before the
+ *  frame is released before the wait. A newer frame that arrives while a
  *  verdict is pending wins; the older one then returns `change: 'none'`. */
 export async function bindSessionContextFrame(msg: Record<string, unknown> | null | undefined): Promise<SessionRoomBinding | undefined> {
 	const room = parseSessionContextFrame(msg);
 	if (room === undefined) return undefined;
 	const seq = ++_sessionContextSeq;
 	if (!room) return _applyVerifiedRoom(null);
+	if (_voiceSessionRoom && _voiceSessionRoom.id !== room.id) {
+		_releasedRoom = _voiceSessionRoom;
+		_voiceSessionRoom = null;
+	}
 	let verdict: VoiceRoomVerdict;
 	try {
 		verdict = await _voiceRoomVerifier(room.id);

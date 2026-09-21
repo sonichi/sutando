@@ -452,6 +452,42 @@ describe('bindSessionContextFrame — a forged but valid room id never becomes a
 		assert.equal(getVoiceSessionRoom(), null);
 	});
 
+	it('room to room: while the new room\'s verdict is pending the session is on the DM, never the previous room', async () => {
+		setVoiceSessionRoom(null);
+		const OTHER = '!internal-ops:ag2.space';
+		let release!: () => void;
+		const gate = new Promise<void>(r => { release = r; });
+		setVoiceRoomVerifier(async (room) => { if (room === OTHER) await gate; return verdictFor(room, true); });
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'entered');
+		const moving = bindSessionContextFrame(frame(OTHER));
+		assert.equal(getVoiceSessionRoom(), null, 'the previous room is released before the wait');
+		const t = await delegate('room probe: spoken during the verdict window');
+		written.push(t.taskId);
+		const h = headerOf(t.taskId);
+		assert.ok(h.includes('channel_id: local-voice'), h.join(' | '));
+		assert.ok(!h.some(l => l.includes(VERIFIED)), 'the previous room appears nowhere in the header');
+		release();
+		assert.deepEqual(await moving, { change: 'entered', room: { id: OTHER, name: 'Forged' } });
+		assert.equal(getVoiceSessionRoom()?.id, OTHER);
+	});
+
+	it('room to room refused: reported as left, once; the same room re-announced mid-wait keeps its binding', async () => {
+		setVoiceSessionRoom(null);
+		setVoiceRoomVerifier(vouchForVerifiedOnly);
+		await bindSessionContextFrame(frame(VERIFIED));
+		const refused = await bindSessionContextFrame(frame(FORGED));
+		assert.equal(refused?.change, 'left');
+		assert.equal((await bindSessionContextFrame(frame(FORGED)))?.change, 'none', 'a second refusal is not a second notice');
+		await bindSessionContextFrame(frame(VERIFIED));
+		let release!: () => void;
+		const gate = new Promise<void>(r => { release = r; });
+		setVoiceRoomVerifier(async (room) => { await gate; return verdictFor(room, true); });
+		const again = bindSessionContextFrame(frame(VERIFIED));
+		assert.equal(getVoiceSessionRoom()?.id, VERIFIED, 'a duplicate frame for the bound room releases nothing');
+		release();
+		assert.equal((await again)?.change, 'none');
+	});
+
 	it('the newest frame wins while an older verdict is still pending', async () => {
 		setVoiceSessionRoom(null);
 		let releaseFirst!: () => void;
