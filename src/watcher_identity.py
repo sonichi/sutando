@@ -236,22 +236,46 @@ def watcher_inbox(operands: Optional[List[str]]) -> Optional[str]:
     return None
 
 
+INBOX_TAG_FLAT = re.compile(r"--inbox(?:=|\s+)(.+?)(?=\s+--[a-z]|\s*$)")
+
+
+def canonical_inbox(path: Optional[str]) -> Optional[str]:
+    """One spelling per inbox, so a trailing slash, a doubled slash or a
+    /private symlink prefix cannot make one directory look like two."""
+    if not path:
+        return None
+    return os.path.realpath(os.path.expanduser(path.strip()))
+
+
+def flat_inbox(argv: str) -> Optional[str]:
+    """The `--inbox` value of a FLATTENED argv: runs to the next `--flag` or the
+    end, so a value containing a space (the default desktop root has one) is kept whole."""
+    m = INBOX_TAG_FLAT.search(argv)
+    return m.group(1).strip() if m else None
+
+
 def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str] = None,
                  is_watcher: Optional[Callable] = None,
                  argv_vector: Optional[Callable] = None,
                  run: Callable = subprocess.run) -> Optional[bool]:
-    """Is a watcher with `--role role` (and, when `inbox` is given, matching
-    `--inbox inbox`) present anywhere on the host?
+    """Is a watcher with `--role role` (and, when `inbox` is given, an `--inbox`
+    naming the same directory) present anywhere on the host?
 
     Host-wide `ps`, not tmux/session-scoped: two instances (core and a worker,
     or two workers) can each run a same-`role` watcher for DIFFERENT inboxes at
     once, so a role match alone cannot tell a caller whether ITS OWN inbox is
-    covered -- that was the gap a plain role-only check left (#4477). Passing
-    `inbox` closes it; omitting it preserves the old host-wide behavior for a
-    caller that genuinely wants "is ANY session-role watcher running".
+    covered. Passing `inbox` closes that; omitting it keeps the host-wide answer
+    for a caller that genuinely wants "is ANY session-role watcher running".
 
-    True/False/None, same discipline as `is_watcher_argv`: None means the `ps`
-    snapshot itself was unobservable, never "not present".
+    Every process is classified from the ONE snapshot (plus the authoritative
+    argv vector where one exists); no second per-pid `ps`, which would disagree
+    with the snapshot about anything that exited in between, and which a host
+    with no such pid answers with a failure indistinguishable from "unknown".
+
+    True/False/None: None means the snapshot itself was unobservable, or a
+    watcher-shaped line could not be decided AND could be for this inbox. A
+    line whose tag names a different inbox is decidably not ours, so it never
+    turns a clean answer into "unknown".
     """
     if ps_output is None:
         try:
@@ -266,23 +290,30 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
         if getattr(result, "returncode", None) != 0:
             return None
         ps_output = result.stdout
-    trees = watcher_trees(ps_output, is_watcher)
+    want = canonical_inbox(inbox)
+    me = str(os.getpid())
     saw_undecidable = False
-    for members in trees.values():
-        for pid in sorted(members, key=lambda p: int(p) if p.isdigit() else 0):
-            seen = inspect_pid(pid, run=run, argv_vector=argv_vector)
-            # Flagged watcher-shaped by the tree walk, but undecidable at the
-            # authoritative per-pid read -- not proven a match or not one.
-            if seen.watcher is None:
-                saw_undecidable = True
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me:
+            continue
+        pid, argv = parts[0], parts[2]
+        if is_watcher is not None and is_watcher(argv, as_pid(pid)) is False:
+            continue
+        verdict = classify_argv(argv, as_pid(pid), argv_vector)
+        if verdict.watcher is False:
+            continue
+        if verdict.watcher is None:
+            tagged = canonical_inbox(flat_inbox(argv))
+            if want is not None and tagged is not None and tagged != want:
                 continue
-            if seen.watcher is not True:
-                continue
-            if watcher_role(seen.operands) != role:
-                continue
-            if inbox is not None and watcher_inbox(seen.operands) != inbox:
-                continue
-            return True
+            saw_undecidable = True
+            continue
+        if watcher_role(verdict.operands) != role:
+            continue
+        if want is not None and canonical_inbox(watcher_inbox(verdict.operands)) != want:
+            continue
+        return True
     return None if saw_undecidable else False
 
 

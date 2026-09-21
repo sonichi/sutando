@@ -4,8 +4,9 @@
 # (--role session) watcher for the SAME inbox, must arm after a grace period
 # with none seen, must disarm the moment one appears, must stay disarmed
 # while it persists, must ignore a session-role watcher for a DIFFERENT
-# inbox, and must never arm on an unobservable `ps` snapshot ("unknown" is
-# not "no watcher").
+# inbox, and must treat an unobservable `ps` snapshot as "unknown", not "no
+# watcher": no arming inside the grace period, arming after it rather than
+# leaving the inbox unwatched forever.
 #
 # Uses a stub notifier (SUTANDO_NOTIFIER_SCRIPT override) so this test does
 # not depend on the real task-notifier.sh/pane machinery, which is out of
@@ -35,6 +36,14 @@ trap 'rm -f "$SUTANDO_STUB_MARKER"; exit 0' TERM
 while true; do sleep 1; done
 EOS
 chmod +x "$STUB"
+
+# The watchers' event source is not under test here, only whether they are
+# seen; a stub fswatch that idles keeps them alive on a host that ships none.
+STUBBIN="$WORK/stubbin"
+mkdir -p "$STUBBIN"
+printf '#!/bin/bash\nexec sleep 100000\n' > "$STUBBIN/fswatch"
+chmod +x "$STUBBIN/fswatch"
+export PATH="$STUBBIN:$PATH"
 
 cleanup_all() {
   tmux -S "$SOCK" kill-server >/dev/null 2>&1 || true
@@ -135,7 +144,9 @@ tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
 tmux -S "$SOCK" kill-session -t internal-core2 >/dev/null 2>&1 || true
 sleep 0.3
 
-# --- scenario 5: an unobservable `ps` must never be read as "clear to arm" -
+# --- scenario 5: an unobservable `ps` is not "clear to arm" -- it gets the
+# --- same grace period a clean "no" gets, then arms rather than leaving the
+# --- inbox with no watcher forever.
 FAKE_PS_DIR="$WORK/fakebin"
 mkdir -p "$FAKE_PS_DIR"
 cat > "$FAKE_PS_DIR/ps" <<'EOS'
@@ -144,12 +155,18 @@ exit 1
 EOS
 chmod +x "$FAKE_PS_DIR/ps"
 MARK3="$WORK/notifier3.marker"
-start_supervisor "$WORK/core/tasks" "$MARK3" 2 1 "$FAKE_PS_DIR"
-sleep 4
+start_supervisor "$WORK/core/tasks" "$MARK3" 6 1 "$FAKE_PS_DIR"
+sleep 2
 if [ ! -s "$MARK3" ]; then
-  echo "  PASS: scenario 5 -- an unobservable ps snapshot never armed the notifier"
+  echo "  PASS: scenario 5a -- an unobservable ps snapshot did not arm the notifier inside the grace period"
 else
-  echo "  FAIL: scenario 5 -- notifier armed despite an unobservable ps snapshot (unknown treated as clear)"
+  echo "  FAIL: scenario 5a -- notifier armed at once on an unobservable ps snapshot (unknown treated as clear)"
+  fail=1
+fi
+if wait_for "$MARK3" 120; then
+  echo "  PASS: scenario 5b -- an unobservable ps that persists past the grace period arms rather than never"
+else
+  echo "  FAIL: scenario 5b -- notifier never armed while ps stayed unobservable (an inbox with no watcher, forever)"
   fail=1
 fi
 tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true

@@ -115,30 +115,44 @@ run_notifier_once() {
   return 0
 }
 
+# "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
+# nothing is running to keep, and a host whose ps never answers would otherwise
+# never get a watcher at all -- so an unknown that persists for the whole grace
+# period arms, the same wait a clean "no" gets.
+unknown_since=""
 while target_alive; do
   verdict="$(session_role_verdict)"
-  if [ "$verdict" != "no" ]; then
-    # "yes": a session watcher already covers this inbox, stay in standby.
-    # "unknown": the ps snapshot itself failed -- keep whatever is currently
-    # running (nothing, here), never treat an unobservable host as "clear to arm".
+  if [ "$verdict" = "yes" ]; then
+    unknown_since=""
     sleep "$ROLE_POLL"
     continue
   fi
-  waited=0
-  clear_to_arm=1
-  while [ "$waited" -lt "$GRACE_PERIOD" ]; do
-    target_alive || { clear_to_arm=0; break; }
-    sleep "$ROLE_POLL"
-    waited=$((waited + ROLE_POLL))
-    v="$(session_role_verdict)"
-    if [ "$v" = "yes" ]; then
-      clear_to_arm=0
-      break
+  if [ "$verdict" = "unknown" ]; then
+    now="$(date +%s)"
+    [ -n "$unknown_since" ] || unknown_since="$now"
+    if [ $((now - unknown_since)) -lt "$GRACE_PERIOD" ]; then
+      sleep "$ROLE_POLL"
+      continue
     fi
-    # "unknown" mid-wait: keep waiting rather than reset the timer or arm
-    # early -- a transient ps failure costs time, never coverage either way.
-  done
-  [ "$clear_to_arm" -eq 1 ] || continue
+  else
+    unknown_since=""
+    waited=0
+    clear_to_arm=1
+    while [ "$waited" -lt "$GRACE_PERIOD" ]; do
+      target_alive || { clear_to_arm=0; break; }
+      sleep "$ROLE_POLL"
+      waited=$((waited + ROLE_POLL))
+      v="$(session_role_verdict)"
+      if [ "$v" = "yes" ]; then
+        clear_to_arm=0
+        break
+      fi
+      # "unknown" mid-wait: keep waiting rather than reset the timer or arm
+      # early -- a transient ps failure costs time, never coverage either way.
+    done
+    [ "$clear_to_arm" -eq 1 ] || continue
+  fi
+  unknown_since=""
   while target_alive; do
     run_notifier_once
     rc=$?
