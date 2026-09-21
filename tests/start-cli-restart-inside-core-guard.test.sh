@@ -155,7 +155,7 @@ run_codex() {
   env -i PATH="$BIN:/usr/bin:/bin" HOME="$TD" \
       SESS_MARK="$SESS_MARK" CORE_MARK="$CORE_MARK" \
       SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$TD/workspace" \
-      SUTANDO_TMUX_SOCKET="$TD/sock" "$@" \
+      SUTANDO_TMUX_SOCKET="$TD/sock" SUTANDO_CODEX_WAIT_TIMEOUT=0 "$@" \
       /bin/bash "$CODEX" --restart > "$TD/cout" 2> "$TD/cerr" < /dev/null
   crc=$?
   cerr="$(cat "$TD/cerr")"
