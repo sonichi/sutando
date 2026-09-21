@@ -9244,7 +9244,9 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+                          "restart via Monitor: bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set)"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []

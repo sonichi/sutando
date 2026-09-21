@@ -361,7 +361,7 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past every existing consumer, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
 
-**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
+**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
 If you notice the stream watcher has stopped, re-arm it yourself via the `Monitor` tool as described above.
 
