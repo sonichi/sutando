@@ -242,6 +242,9 @@ ensure_task_notifier() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  # Without this, task-notifier.sh falls back to dirname($SUTANDO_TASKS_DIR)
+  # and can disagree with the gate about which workspace's pool is swept.
+  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }

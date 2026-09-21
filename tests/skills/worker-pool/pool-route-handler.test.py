@@ -239,6 +239,20 @@ class TestClassification(Base):
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
                          h.MUST_HANDLE)
 
+    def test_null_workers_must_be_held_not_routed_at_all(self):
+        """validate_workers(None) itself passes (None means "no workers" to a
+        caller building a fresh roster) -- but a PERSISTED roster with a null
+        `workers` field is never written by compile_roster(), so seeing one
+        here is corruption, exactly like ensure_task_event_handler's own
+        explicit null check at backfill time (pool_roster.py). classify()
+        must hold this the same way, not fall through validate_workers'
+        permissive None handling into DECLINE-to-core."""
+        (self.ws / "state" / "roster.json").write_text(
+            json.dumps({"version": 1, "workers": None, "bindings": {}}))
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.MUST_HANDLE)
+
 
 class TestPickerCommandsStayWithTheController(Base):
     def _picker_file(self, wire=True):

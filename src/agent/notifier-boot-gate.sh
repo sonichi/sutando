@@ -51,6 +51,7 @@ _notifier_boot_gate_await_death() {
 
 # $1: workspace. $2: a runnable python3 (required). Reads $TMUX_SOCKET/
 # $WATCHER_SESSION ambiently. Returns 0 once the watcher pid is confirmed dead.
+# Proves identity+ownership of the sentinel pid before signaling anything.
 notifier_boot_gate_force_kill_watcher() {
   local workspace="$1" py="$2" state_dir sentinel pid verdict supervisor_pid
   [ -n "$workspace" ] || return 1
@@ -59,8 +60,18 @@ notifier_boot_gate_force_kill_watcher() {
   # shellcheck source=watcher_sentinel.sh
   . "$REPO/src/watcher_sentinel.sh" || return 1
 
-  # The supervisor (the watcher session's own pane process) restarts its
-  # watcher on any exit -- kill it too, or the watcher respawns within ~1s.
+  sentinel="$(sentinel_path_for "$state_dir")" || return 1
+  [ -f "$sentinel" ] || return 1
+  pid="$(cat "$sentinel" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  # A pid alone cannot say WHICH process it names (reissued numbers); prove
+  # BOTH watcher argv and sentinel ownership before any signal is sent.
+  verdict="$("$py" -S -I "$REPO/src/watcher_identity.py" "$pid" 2>/dev/null | head -1)"
+  [ "$verdict" = "watcher" ] || return 1
+  sentinel_pid_wrote_file "$pid" "$sentinel" || return 1
+
+  # Only now, with identity+ownership proven: stop the supervisor too, or
+  # it respawns the watcher on the kill below within ~1s.
   if [ -n "${TMUX_SOCKET:-}" ] && [ -n "${WATCHER_SESSION:-}" ]; then
     supervisor_pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
     if [ -n "$supervisor_pid" ]; then
@@ -70,15 +81,6 @@ notifier_boot_gate_force_kill_watcher() {
     fi
   fi
 
-  sentinel="$(sentinel_path_for "$state_dir")" || return 1
-  [ -f "$sentinel" ] || return 1
-  pid="$(cat "$sentinel" 2>/dev/null)"
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  # A pid alone cannot say WHICH process it names (reissued numbers); prove
-  # BOTH that it's a watcher (argv) and that it's THIS sentinel's owner (age).
-  verdict="$("$py" -S -I "$REPO/src/watcher_identity.py" "$pid" 2>/dev/null | head -1)"
-  [ "$verdict" = "watcher" ] || return 1
-  sentinel_pid_wrote_file "$pid" "$sentinel" || return 1
   kill -9 "$pid" 2>/dev/null
   _notifier_boot_gate_await_death "$pid"
 }

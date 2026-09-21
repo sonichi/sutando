@@ -90,9 +90,14 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return DECLINE, [], None
     # A roster corrupted after being written (synced in, hand-edited) must
     # fail closed here too, not only at backfill time.
+    workers_raw = roster.get("workers")
+    if workers_raw is None:
+        # A persisted roster never writes `workers` as null; validate_workers
+        # alone would pass it, so this is a separate, explicit check.
+        return MUST_HANDLE, [], None
     try:
-        pr.validate_workers(roster.get("workers"), check_state=False)
-        pr.validate_bindings(roster.get("workers"), roster.get("bindings"))
+        pr.validate_workers(workers_raw, check_state=False)
+        pr.validate_bindings(workers_raw, roster.get("bindings"))
     except pr.RosterError:
         return MUST_HANDLE, [], None
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",

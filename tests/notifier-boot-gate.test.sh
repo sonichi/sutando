@@ -292,22 +292,64 @@ out9b="$(
 check "SUTANDO_TASKS_DIR-only override -> sweep sees its dirname" \
   "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
 
+# --- Case 9c: the gate and the Codex notifier consumer must resolve the SAME
+# workspace even when SUTANDO_WORKSPACE_DIR and SUTANDO_TASKS_DIR disagree.
+# task-notifier.sh's own WORKSPACE_DIR line is replicated here (rather than
+# sourcing the whole script, which has side effects this case must not
+# trigger) to catch the two formulas drifting apart again. ---
+GATE_WS9C="$(
+  REPO="$FAKE_REPO"
+  . "$GATE_SRC"
+  SUTANDO_WORKSPACE_DIR="/tmp/workspace-A" SUTANDO_TASKS_DIR="/tmp/workspace-B/tasks" \
+    _notifier_boot_gate_workspace
+)"
+CODEX_CONSUMER_WS9C="$(
+  SUTANDO_WORKSPACE_DIR="/tmp/workspace-A" SUTANDO_TASKS_DIR="/tmp/workspace-B/tasks" \
+    bash -c 'TASKS_DIR="$SUTANDO_TASKS_DIR"; echo "${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"'
+)"
+check "gate and Codex notifier consumer agree on the workspace when overrides disagree" \
+  "$GATE_WS9C" "$CODEX_CONSUMER_WS9C"
+
+check "start-cli.sh forwards SUTANDO_WORKSPACE_DIR into the notifier's env" \
+  "$(grep -c 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=\$SUTANDO_WORKSPACE_DIR")' \
+     "$REAL_REPO/src/agent/codex/cli/start-cli.sh")" "1"
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is
 # undone within ~1s in production. Uses a REAL private tmux socket + session
-# so this is the actual shutdown unit, not a simulation of one. ---
+# so this is the actual shutdown unit, not a simulation of one.
+#
+# The pane runs a SUPERVISOR (its own long-lived shell) that spawns the
+# watcher as a CHILD process, matching the real shape (task-notifier-
+# supervisor.sh's pane != the watcher it wraps) -- the sentinel names the
+# CHILD, never the pane, proving the helper still reaches and kills the
+# supervisor once identity+ownership are proven. ---
 if command -v tmux >/dev/null 2>&1; then
   T10_SOCK="$TD/tmux10.sock"
   T10_SESSION="fake-watcher-session-$$"
   WS10="$TD/ws10"
   mkdir -p "$WS10/state"
   FAKE_SCRIPT10="$(_make_fake_watcher_script "$TD/fw10")"
-  tmux -S "$T10_SOCK" new-session -d -s "$T10_SESSION" bash "$FAKE_SCRIPT10"
+  FAKE_SUPERVISOR10="$TD/fake-supervisor10.sh"
+  cat > "$FAKE_SUPERVISOR10" << SCRIPT
+#!/bin/bash
+bash "$FAKE_SCRIPT10" &
+echo \$! > "$TD/fw10-child.pid"
+wait
+SCRIPT
+  chmod +x "$FAKE_SUPERVISOR10"
+  tmux -S "$T10_SOCK" new-session -d -s "$T10_SESSION" bash "$FAKE_SUPERVISOR10"
   SUPERVISOR_PID10="$(tmux -S "$T10_SOCK" list-panes -t "=$T10_SESSION" -F '#{pane_pid}' | head -1)"
-  # No sentinel written -- this case is purely about supervisor teardown;
-  # the function still returns non-zero (no watcher pid to confirm dead),
-  # but the supervisor pane's own process must be gone regardless.
+  # Wait for the child to actually start and record its own pid.
+  _tries=0
+  while [ ! -s "$TD/fw10-child.pid" ] && [ "$_tries" -lt 40 ]; do
+    sleep 0.05
+    _tries=$((_tries + 1))
+  done
+  WATCHER_PID10="$(cat "$TD/fw10-child.pid" 2>/dev/null)"
+  SENTINEL10="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS10/state")"
+  echo "$WATCHER_PID10" > "$SENTINEL10"
   out10="$(
     REPO="$REAL_REPO"
     . "$GATE_SRC"
@@ -322,9 +364,47 @@ if command -v tmux >/dev/null 2>&1; then
   else
     echo "  ok   the supervisor pane process was killed, closing the respawn loop"
   fi
+  if kill -0 "$WATCHER_PID10" 2>/dev/null; then
+    echo "  FAIL the inner watcher child also survived force-kill"
+    FAIL=1
+    kill -9 "$WATCHER_PID10" 2>/dev/null
+  else
+    echo "  ok   the inner watcher child (the sentinel-recorded pid) was killed"
+  fi
   tmux -S "$T10_SOCK" kill-server 2>/dev/null || true
 else
   echo "  skip Case 10 (no tmux on this host)"
+fi
+
+# --- Case 10b: the NEGATIVE of Case 10 -- a non-watcher pid sitting in the
+# sentinel, sharing its pid with the tmux pane's own process. Nothing may be
+# signaled: the pane process must survive, proving identity+ownership are
+# checked before any kill. ---
+if command -v tmux >/dev/null 2>&1; then
+  T10B_SOCK="$TD/tmux10b.sock"
+  T10B_SESSION="fake-nonwatcher-session-$$"
+  WS10B="$TD/ws10b"
+  mkdir -p "$WS10B/state"
+  tmux -S "$T10B_SOCK" new-session -d -s "$T10B_SESSION" sleep 30
+  PANE_PID10B="$(tmux -S "$T10B_SOCK" list-panes -t "=$T10B_SESSION" -F '#{pane_pid}' | head -1)"
+  SENTINEL10B="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS10B/state")"
+  echo "$PANE_PID10B" > "$SENTINEL10B"
+  out10b="$(
+    REPO="$REAL_REPO"
+    . "$GATE_SRC"
+    TMUX_SOCKET="$T10B_SOCK" WATCHER_SESSION="$T10B_SESSION" \
+      notifier_boot_gate_force_kill_watcher "$WS10B" "$PY"
+    echo "rc=$?"
+  )"
+  if kill -0 "$PANE_PID10B" 2>/dev/null; then
+    echo "  ok   non-watcher sentinel+pane pid was correctly refused, nothing signaled"
+  else
+    echo "  FAIL non-watcher sentinel+pane pid was killed before the identity/ownership check refused it"
+    FAIL=1
+  fi
+  tmux -S "$T10B_SOCK" kill-server 2>/dev/null || true
+else
+  echo "  skip Case 10b (no tmux on this host)"
 fi
 
 echo

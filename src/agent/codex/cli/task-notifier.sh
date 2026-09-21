@@ -10,23 +10,27 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
-TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+# Same precedence as watch-tasks-stream.sh's own WORKSPACE_DIR and the
+# shared notifier-boot-gate.sh, so this consumer and the gate can never
+# resolve two different workspaces from the same env.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+TASK_HANDLER_CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
-DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
+DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same per-instance receipt the watcher writes; resolved by its owner so the
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
 SUTANDO_PY_BIN="$NOTIFIER_PY"
-TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
+TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
   exit 1
 }
 # shellcheck source=../../task-event-handler-lookup.sh
 . "$REPO/src/agent/task-event-handler-lookup.sh"
-HANDLER_CONFIG_PATH="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" task-event-handler-config-path "$(dirname "$TASKS_DIR")/state")" || {
+HANDLER_CONFIG_PATH="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
   echo "task-notifier: could not resolve the task-event-handler config path" >&2
   exit 1
 }
@@ -58,7 +62,7 @@ probe_optional_task_handler() {
   handler="$(task_event_handler "$HANDLER_CONFIG_PATH")" || return 3
   "$handler" \
     --runtime codex \
-    --workspace "$(dirname "$TASKS_DIR")" \
+    --workspace "$WORKSPACE_DIR" \
     --task-file "$TASKS_DIR/$filename" \
     --results-dir "$RESULTS_DIR" \
     --repo "$REPO" \
@@ -207,7 +211,7 @@ next_pending_task() {
 # appear. Log to the workspace log dir when it exists, and always to stderr.
 log_notifier() {
   local msg="task-notifier: $*" dir
-  dir="$(dirname "$TASKS_DIR")/logs"
+  dir="$WORKSPACE_DIR/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
 }
