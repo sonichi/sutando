@@ -18,9 +18,13 @@ trap 'rm -rf "$RECDIR"' EXIT
 find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort > "$RECDIR/all"
 # A suite that reads the host process table (pgrep/pkill, ps by pattern or
 # by pid) sees sibling lanes' processes as its own; those run after the lanes,
-# alone. grep's 1 is "no such suite"; anything above is an error, and an error
-# must not read as an empty list that sends those suites into the lanes.
-{ _g=0; xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e |-p )' < "$RECDIR/all" || _g=$?; [ "$_g" -le 1 ] || exit "$_g"; } | sort > "$RECDIR/serial"
+# alone. Per file, grep's own status: 0 selects, 1 is "not one", anything above
+# is an error that must not read as an empty list sending them into the lanes.
+: > "$RECDIR/serial"
+while IFS= read -r _f; do
+  _g=0; grep -qE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e |-p )' "$_f" || _g=$?
+  case "$_g" in 0) echo "$_f" >> "$RECDIR/serial" ;; 1) ;; *) exit "$_g" ;; esac
+done < "$RECDIR/all"
 comm -23 "$RECDIR/all" "$RECDIR/serial" > "$RECDIR/files"
 mkdir -p "$RECDIR/serial-rec"
 # Same scheduler as the Python suite: one SERIAL worker per worktree, so

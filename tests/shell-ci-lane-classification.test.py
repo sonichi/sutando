@@ -37,9 +37,9 @@ NEGATIVE_FIXTURE_BODY = "#!/usr/bin/env bash\n# corresponds to the process, not 
 
 
 def extract_pattern() -> str:
-    """The grep -lE pattern the classifier uses, verbatim from scripts/run-shell-suites.sh."""
+    """The grep pattern the classifier uses, verbatim from scripts/run-shell-suites.sh."""
     text = CI.read_text()
-    m = re.search(r"grep -lE '([^']*)'", text)
+    m = re.search(r"grep -[lq]E '([^']*)'", text)
     if not m:
         raise AssertionError("could not find the classifier's grep -lE pattern in scripts/run-shell-suites.sh")
     return m.group(1)
