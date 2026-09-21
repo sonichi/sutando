@@ -378,6 +378,7 @@ def test_presence_asks_the_service_without_a_socket_and_reads_the_counts():
     def opener(req, timeout=0):
         seen["url"] = req.full_url
         seen["auth"] = req.get_header("Authorization")
+        seen["agent"] = req.get_header("User-agent")
         return _Resp(json.dumps({"room": "!r:x", "surfaces": {
             "markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
             "kanban": {"peers": "junk"}, "weird": "not a dict"}}).encode())
@@ -385,6 +386,8 @@ def test_presence_asks_the_service_without_a_socket_and_reads_the_counts():
     got = room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
     assert seen["url"] == "https://h/api/v1/room-collab/%21r%3Ax/presence", seen
     assert seen["auth"] == "Bearer tok"
+    # The edge refuses urllib's default agent outright, so the read names itself.
+    assert seen["agent"] == room_collab.USER_AGENT and "urllib" not in seen["agent"], seen
     assert got == {"markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
                    "kanban": {"peers": 0, "agents": 0}}, got
     # An origin that already names the path is not doubled.
@@ -403,6 +406,21 @@ def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
     def refuse(req, timeout=0):
         raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, io.BytesIO(b""))
 
+    def edge_refuse(req, timeout=0):
+        # What Cloudflare answers when it dislikes the agent: core-api never saw it.
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {},
+                                     io.BytesIO(b"error code: 1010"))
+
+    def unreadable_body(req, timeout=0):
+        class _Unreadable(io.BytesIO):
+            def read(self, *a):
+                raise OSError("connection reset while reading the body")
+        # A body that cannot be read must not mask the status it came with.
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, _Unreadable(b""))
+
+    def server_error(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b"upstream"))
+
     def garbage(req, timeout=0):
         class _R(io.BytesIO):
             def __enter__(self):
@@ -412,7 +430,11 @@ def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
                 return False
         return _R(b'{"room": "!r:x"}')
 
-    for opener, needle in ((refuse, "presence refused (403)"), (garbage, "without surfaces")):
+    for opener, needle in ((refuse, "not a member, or the token was rejected"),
+                           (edge_refuse, "refused by the edge"),
+                           (unreadable_body, "not a member, or the token was rejected"),
+                           (server_error, "the service did not answer it"),
+                           (garbage, "without surfaces")):
         try:
             room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
         except RoomDocError as e:
