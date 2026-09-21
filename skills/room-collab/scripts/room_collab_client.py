@@ -307,6 +307,10 @@ class RoomDoc:
         self._awareness.set_local_state_field("user", state)
         await self._send(create_awareness_message(
             self._awareness.encode_awareness_update([self._awareness.client_id])))
+        if self._text is not None:
+            # A person's editor shows a caret for as long as it is open; so does
+            # this one — at the end of the text until a write moves it.
+            await self._publish_cursor(len(str(self._text).encode("utf-8")))
 
     async def _commit(self, mutate: Callable[[], None]) -> None:
         """Apply a local change and put only the delta on the wire."""
