@@ -313,8 +313,13 @@ DIRECT_WS9C="$(
 check "gate's wrapper delegates to the real shared resolver, not a re-derived formula" \
   "$GATE_WS9C" "$DIRECT_WS9C"
 
-check "start-cli.sh forwards SUTANDO_WORKSPACE_DIR into the notifier's env" \
-  "$(grep -c 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=\$SUTANDO_WORKSPACE_DIR")' \
+# Round 19 (keweichen, "one resolution snapshot"): the launcher used to
+# forward only a genuine operator override, verbatim; it now forwards the
+# SAME resolved triple the gate swept and the identity hash covered --
+# unconditionally, so the notifier process's own resolution can't diverge
+# from what was actually admitted.
+check "start-cli.sh forwards the resolved workspace into the notifier's env" \
+  "$(grep -c 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=\$effective_workspace_dir")' \
      "$REAL_REPO/src/agent/codex/cli/start-cli.sh")" "1"
 
 # --- Case 9d: keweichen's exact leading-tilde control. A literal ~ in

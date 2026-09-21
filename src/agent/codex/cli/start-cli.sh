@@ -190,16 +190,29 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
+  # ONE resolution snapshot for this whole call: the gate sweep, the restart-
+  # identity hash, and the env this function forwards to the launched
+  # notifier all derive from THIS read, never a fresh one each -- a second,
+  # later resolution can see a different answer than the first if the
+  # underlying config changes between calls, even though each formula is
+  # individually correct.
+  # shellcheck source=../../../workspace_dir_resolve.sh
+  . "$REPO/src/workspace_dir_resolve.sh"
+  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
+  effective_workspace_dir="${effective_ws_triple%%|*}"
+  effective_rest="${effective_ws_triple#*|}"
+  effective_tasks_dir="${effective_rest%%|*}"
+  effective_results_dir="${effective_rest#*|}"
   # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
   # running from before the sweep started failing must be killed, not reused.
-  if ! notifier_boot_gate "$_HB_PY"; then   # reuses $_HB_PY, resolved once above
+  if ! notifier_boot_gate "$_HB_PY" "$effective_workspace_dir"; then   # reuses $_HB_PY, resolved once above
     if session_exists "$WATCHER_SESSION"; then
       echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
       tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
       # stderr, not exit code -- `return` here would abort the whole launcher
       # under `set -e` at every call site.
       if session_exists "$WATCHER_SESSION"; then
-        if notifier_boot_gate_force_kill_watcher "$(_notifier_boot_gate_workspace)" "$_HB_PY"; then
+        if notifier_boot_gate_force_kill_watcher "$effective_workspace_dir" "$_HB_PY"; then
           echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
         else
           echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
@@ -222,9 +235,6 @@ ensure_task_notifier() {
   # identity: an unchanged script tree resolving to a DIFFERENT workspace/
   # tasks/results triple must still force a restart, or the gate validates
   # one tree while the reused notifier keeps watching another.
-  # shellcheck source=../../../workspace_dir_resolve.sh
-  . "$REPO/src/workspace_dir_resolve.sh"
-  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
@@ -249,11 +259,13 @@ ensure_task_notifier() {
   if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
     NOTIFIER_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
   fi
-  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
-  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-  # Without this, task-notifier.sh falls back to dirname($SUTANDO_TASKS_DIR)
-  # and can disagree with the gate about which workspace's pool is swept.
-  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # Forward the SAME resolved triple the gate swept and the identity hashed
+  # -- always, not only when the operator originally set an override -- so
+  # the notifier process's own resolution (a third, later read) is pinned
+  # to this snapshot instead of re-deriving one that could disagree.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$effective_tasks_dir")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$effective_results_dir")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$effective_workspace_dir")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }

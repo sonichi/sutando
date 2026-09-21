@@ -752,6 +752,43 @@ exit 0
         finally:
             config_path.write_text(json.dumps(original_config))
 
+    def test_the_workspace_resolves_exactly_once_per_launch(self):
+        """keweichen round 19, "one resolution snapshot": the gate's own
+        workspace read, the restart-identity hash, and the notifier's
+        forwarded env each called down to the resolver independently --
+        2+ reads per launch, any pair of which could see a different answer
+        if the underlying config changed between them. Instruments the
+        resolver's own leaf function (both the gate and the identity hash
+        bottom out in it) to prove exactly one call happens now, rather than
+        inferring it from reading the diff."""
+        resolver_path = self.root / "src/workspace_dir_resolve.sh"
+        original = resolver_path.read_text()
+        instrumented = original.replace(
+            "resolve_workspace_dir_from_tasks_dir() {",
+            'resolve_workspace_dir_from_tasks_dir() {\n'
+            '  echo call >> "$RESOLVE_CALL_LOG"\n',
+            1,
+        )
+        self.assertNotEqual(instrumented, original,
+                             "instrumentation did not match the real function signature")
+        resolver_path.write_text(instrumented)
+
+        count_log = Path(self.tmp.name) / "resolve-calls.log"
+        run = self.run_launcher(env_extra={
+            "SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(0),
+            "RESOLVE_CALL_LOG": str(count_log),
+        })
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("new-session -d -s sutando-core-watcher", self.log.read_text())
+
+        call_count = count_log.read_text().count("call\n") if count_log.exists() else 0
+        self.assertEqual(
+            call_count, 1,
+            f"expected exactly one workspace resolution per launch, saw {call_count} -- "
+            "the gate sweep, the restart-identity hash, and the notifier's forwarded env "
+            "must all derive from the SAME resolution, not independent re-reads",
+        )
+
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
             "TMUX": "/tmp/outer.sock,1,0",

@@ -773,16 +773,29 @@ ensure_task_notifier() {
     echo "  ⚠ task notifier not started: no runnable Python interpreter (scripts/python-binary.sh); the health probe will report it missing" >&2
     return 0
   fi
+  # ONE resolution snapshot for this whole call: the gate sweep, the restart-
+  # identity hash, and the env this function forwards to the launched
+  # notifier all derive from THIS read, never a fresh one each -- a second,
+  # later resolution can see a different answer than the first if the
+  # underlying config changes between calls, even though each formula is
+  # individually correct.
+  # shellcheck source=../../../workspace_dir_resolve.sh
+  . "$REPO/src/workspace_dir_resolve.sh"
+  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
+  effective_workspace_dir="${effective_ws_triple%%|*}"
+  effective_rest="${effective_ws_triple#*|}"
+  effective_tasks_dir="${effective_rest%%|*}"
+  effective_results_dir="${effective_rest#*|}"
   # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
   # running from before the sweep started failing must be killed, not reused.
-  if ! notifier_boot_gate "$PY"; then
+  if ! notifier_boot_gate "$PY" "$effective_workspace_dir"; then
     if watcher_session_exists; then
       echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
       tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
       # stderr, not exit code -- `return` here would abort the whole launcher
       # under `set -e` at every call site, some mid-attach.
       if watcher_session_exists; then
-        if notifier_boot_gate_force_kill_watcher "$(_notifier_boot_gate_workspace)" "$PY"; then
+        if notifier_boot_gate_force_kill_watcher "$effective_workspace_dir" "$PY"; then
           echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
         else
           echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
@@ -810,9 +823,6 @@ ensure_task_notifier() {
   # unchanged script tree resolving to a DIFFERENT workspace/tasks/results
   # triple must still force a restart, or the gate validates one tree while
   # the reused notifier keeps watching another.
-  # shellcheck source=../../../workspace_dir_resolve.sh
-  . "$REPO/src/workspace_dir_resolve.sh"
-  effective_ws_triple="$(resolve_effective_workspace_triple "$REPO")"
   expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-e$(printf '%s' "$effective_ws_triple" | cksum | awk '{print $1}')"
   if watcher_session_exists; then
     active_version="$(
@@ -826,9 +836,13 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER_SCRIPT")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
-  [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-  [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # Forward the SAME resolved triple the gate swept and the identity hashed
+  # -- always, not only when the operator originally set an override -- so
+  # the notifier process's own resolution (a third, later read) is pinned to
+  # this snapshot instead of re-deriving one that could disagree.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$effective_tasks_dir")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$effective_results_dir")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$effective_workspace_dir")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.

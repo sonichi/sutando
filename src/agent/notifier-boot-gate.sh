@@ -17,13 +17,19 @@ _notifier_boot_gate_workspace() {
     || bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null
 }
 
-# $1: absolute path to a runnable python3 interpreter. Returns 0 to proceed,
-# non-zero to refuse; prints a diagnostic to stderr only on refusal.
+# $1: absolute path to a runnable python3 interpreter. $2 (optional): a
+# workspace ALREADY resolved by the caller -- pass it so the gate sweeps the
+# exact tree the caller's own identity hash and forwarded env agree on,
+# instead of re-resolving independently (a second, later resolution can see
+# a different answer than the first if the underlying config changes
+# between calls -- one snapshot, not three). Returns 0 to proceed, non-zero
+# to refuse; prints a diagnostic to stderr only on refusal.
 notifier_boot_gate() {
-  local py="$1" rc
+  local py="$1" rc ws="${2:-}"
   [ -n "${SUTANDO_POOL_BOOT_SWEEP:-}" ] || return 0
   [ -n "$py" ] || return 0
-  "$py" "$SUTANDO_POOL_BOOT_SWEEP" --workspace "$(_notifier_boot_gate_workspace)" --sweep --no-persist >&2
+  [ -n "$ws" ] || ws="$(_notifier_boot_gate_workspace)"
+  "$py" "$SUTANDO_POOL_BOOT_SWEEP" --workspace "$ws" --sweep --no-persist >&2
   rc=$?
   if [ "$rc" -ne 0 ]; then
     # A caller must not read the launcher's own exit code alone as "fully
