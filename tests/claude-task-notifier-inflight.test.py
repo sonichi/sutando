@@ -593,7 +593,8 @@ esac
     def test_separate_task_inbox_still_probes_the_canonical_workspace(self):
         # A separate task inbox is a supported layout; probed against the inbox's
         # parent instead of the canonical workspace, the handler says "optional".
-        canonical = self.root / "workspace"
+        # realpath(self.root): the resolver now canonicalizes (physical form).
+        canonical = Path(os.path.realpath(self.root)) / "workspace"
         inbox = self.root / "deliveries" / "tasks"
         inbox.mkdir(parents=True)
         seen = self.root / "handler-saw.txt"

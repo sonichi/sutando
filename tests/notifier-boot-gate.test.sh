@@ -260,6 +260,10 @@ kill -9 "$UNRELATED_PID" 2>/dev/null
 # overrides which tree the watcher will really admit tasks from. ---
 OVERRIDE_WS="$TD/override-ws"
 mkdir -p "$OVERRIDE_WS"
+# The resolver now canonicalizes (physical form, keweichen's symlink fix) --
+# realpath the expectation too, so this stays correct whether or not $TD
+# itself sits behind a symlink (e.g. macOS /var -> /private/var).
+OVERRIDE_WS_PHYSICAL="$(cd "$OVERRIDE_WS" && pwd -P)"
 cat > "$SWEEP" << 'PYEOF'
 #!/usr/bin/env python3
 import sys
@@ -279,7 +283,7 @@ out9="$(
   echo "rc=$?"
 )"
 check "SUTANDO_WORKSPACE_DIR override -> sweep sees that workspace" \
-  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
+  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS_PHYSICAL"
 
 rm -f "$SWEEP.seen-workspace"
 out9b="$(
@@ -292,7 +296,7 @@ out9b="$(
   echo "rc=$?"
 )"
 check "SUTANDO_TASKS_DIR-only override -> sweep sees its dirname" \
-  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
+  "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS_PHYSICAL"
 
 # --- Case 9c: the gate's wrapper must actually delegate to the shared
 # resolver (workspace_dir_resolve.sh) rather than re-deriving the formula --
@@ -342,8 +346,9 @@ CODEX_WS9D="$(
 )"
 check "gate resolves a leading-tilde SUTANDO_TASKS_DIR the same as the Codex consumer" \
   "$GATE_WS9D" "$CODEX_WS9D"
+mkdir -p /tmp/h75home/split
 check "the leading-tilde control actually expanded (not left literal)" \
-  "$GATE_WS9D" "/tmp/h75home/split"
+  "$GATE_WS9D" "$(cd /tmp/h75home/split && pwd -P)"
 
 # --- Case 9e: keweichen's SECOND control -- a leading-tilde
 # SUTANDO_WORKSPACE_DIR itself (not SUTANDO_TASKS_DIR), checked against the
@@ -366,6 +371,39 @@ check "gate resolves a leading-tilde SUTANDO_WORKSPACE_DIR the same as the Claud
   "$GATE_WS9E" "$CLAUDE_WS9E"
 check "the Claude consumer actually sources the shared resolver, not its own formula" \
   "$(grep -c 'resolve_workspace_dir_from_tasks_dir' "$REAL_REPO/src/agent/claude/cli/task-notifier.sh")" "1"
+
+# --- Case 9f: the worker's live-PR finding -- a symlinked SUTANDO_TASKS_DIR
+# (or SUTANDO_WORKSPACE_DIR) must resolve to the PHYSICAL path, matching
+# watch-tasks-stream.sh's own `TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"`
+# exactly -- the earlier fix returned SUTANDO_WORKSPACE_DIR verbatim, so
+# fswatch's physical-path events never matched HANDLER_CONFIG_PATH when the
+# override pointed through a symlink (e.g. macOS's default /tmp -> /private/tmp,
+# or an explicit symlinked deployment). Uses a real symlink, not macOS's
+# implicit one, so the control is host-independent. ---
+SYMLINK_REAL="$TD/9f-real-ws"
+SYMLINK_LINK="$TD/9f-link-ws"
+mkdir -p "$SYMLINK_REAL/tasks"
+ln -s "$SYMLINK_REAL" "$SYMLINK_LINK"
+GATE_WS9F="$(
+  . "$REAL_REPO/src/workspace_dir_resolve.sh"
+  SUTANDO_WORKSPACE_DIR="$SYMLINK_LINK" resolve_workspace_dir_from_tasks_dir "$SYMLINK_LINK/tasks"
+)"
+WATCHER_TASKS_DIR_ABS_9F="$(cd "$SYMLINK_LINK/tasks" && pwd -P)"
+WATCHER_WOULD_COMPUTE_9F="$(dirname "$WATCHER_TASKS_DIR_ABS_9F")"
+check "a symlinked SUTANDO_WORKSPACE_DIR resolves to the physical path, matching the watcher's own TASKS_DIR_ABS-derived dirname" \
+  "$GATE_WS9F" "$WATCHER_WOULD_COMPUTE_9F"
+check "the physical resolution is not just the macOS-default /tmp case (proves against a real symlink)" \
+  "$GATE_WS9F" "$(cd "$SYMLINK_REAL" && pwd -P)"
+
+# --- Case 9g: canonicalization must not create anything -- a gate/hash/env
+# read must not materialize a mistyped override into a real directory (the
+# worker's review point: turning a read path into a write would hide a typo
+# instead of the gate refusing on a missing dir). ---
+SYMLINK_NONEXISTENT="$TD/9g-does-not-exist/deeper/still-deeper"
+. "$REAL_REPO/src/workspace_dir_resolve.sh"
+resolve_workspace_dir_from_tasks_dir "$SYMLINK_NONEXISTENT/tasks" >/dev/null
+check "resolving a nonexistent path creates nothing (read path, not a write)" \
+  "$([ -e "$TD/9g-does-not-exist" ] && echo EXISTS || echo ABSENT)" "ABSENT"
 
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh

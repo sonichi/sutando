@@ -353,6 +353,10 @@ class WorkspaceTripleSurvivesAPipeInAPathComponent(unittest.TestCase):
         self.h.close()
 
     def test_a_pipe_in_the_workspace_reaches_the_watcher_unmangled(self):
+        # realpath: values are canonicalized now, correct on macOS and Linux CI.
+        workspace = os.path.realpath("/tmp/collide/a|b")
+        tasks = os.path.realpath("/tmp/collide/c")
+        results = os.path.realpath("/tmp/collide/d")
         run = self.h.launch(extra_env={
             "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
             "SUTANDO_TASKS_DIR": "/tmp/collide/c",
@@ -360,9 +364,9 @@ class WorkspaceTripleSurvivesAPipeInAPathComponent(unittest.TestCase):
         })
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()
-        self.assertIn("SUTANDO_WORKSPACE_DIR=/tmp/collide/a|b", env)
-        self.assertIn("SUTANDO_TASKS_DIR=/tmp/collide/c", env)
-        self.assertIn("SUTANDO_RESULTS_DIR=/tmp/collide/d", env)
+        self.assertIn(f"SUTANDO_WORKSPACE_DIR={workspace}", env)
+        self.assertIn(f"SUTANDO_TASKS_DIR={tasks}", env)
+        self.assertIn(f"SUTANDO_RESULTS_DIR={results}", env)
 
     def test_two_triples_colliding_under_the_old_pipe_join_get_different_restart_identities(self):
         """Both triples below `|`.join() to the identical string

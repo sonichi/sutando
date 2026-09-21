@@ -822,12 +822,13 @@ exit 0
         )
 
         # Behavioral coverage, not just the hash formula: run the REAL launcher.
+        # realpath: values are canonicalized now, correct on macOS and Linux CI.
         result = self.run_launcher(env_extra=collide_a)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
-        self.assertIn('-e SUTANDO_WORKSPACE_DIR=/tmp/collide/a|b', calls)
-        self.assertIn('-e SUTANDO_TASKS_DIR=/tmp/collide/c', calls)
-        self.assertIn('-e SUTANDO_RESULTS_DIR=/tmp/collide/d', calls)
+        self.assertIn(f'-e SUTANDO_WORKSPACE_DIR={os.path.realpath("/tmp/collide/a|b")}', calls)
+        self.assertIn(f'-e SUTANDO_TASKS_DIR={os.path.realpath("/tmp/collide/c")}', calls)
+        self.assertIn(f'-e SUTANDO_RESULTS_DIR={os.path.realpath("/tmp/collide/d")}', calls)
 
     def test_a_newline_in_a_path_component_also_round_trips(self):
         """A newline is the tempting alternate delimiter to switch to from
@@ -841,7 +842,8 @@ exit 0
         result = self.run_launcher(env_extra=env_extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
-        self.assertIn("-e SUTANDO_TASKS_DIR=/tmp/nl\nline/tasks", calls)
+        nl_tasks = os.path.realpath("/tmp/nl\nline/tasks")
+        self.assertIn(f"-e SUTANDO_TASKS_DIR={nl_tasks}", calls)
 
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
