@@ -19,7 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from owner_channel import bound_worker, may_core_speak, worker_alive  # noqa: E402
+from owner_channel import (bound_worker, may_core_speak, worker_alive,  # noqa: E402
+                           worker_liveness, ALIVE, DEAD, UNKNOWN)
 
 FAILED: list[str] = []
 
@@ -60,9 +61,26 @@ check(ok and why == "unbound", "unbound room → allow")
 dead = ws_with({ROOM: WID}, watcher_pid=2**22 - 7)  # no such pid
 ok, why = may_core_speak(dead, ROOM)
 check(ok and "DEAD" in why, f"bound + dead worker → allow, reason names recovery ({why})")
+# A sentinel is written once at startup, so its absence cannot tell "no watcher"
+# from "live watcher, file gone". Only a positively dead pid releases the room.
 nosent = ws_with({ROOM: WID})
-ok, _ = may_core_speak(nosent, ROOM)
-check(ok, "bound + no watcher sentinel at all → worker is dead → allow")
+check(worker_liveness(nosent, WID) == UNKNOWN, "no sentinel → UNKNOWN, not dead")
+ok, why = may_core_speak(nosent, ROOM)
+check(not ok and "UNKNOWN" in why, f"bound + no sentinel → REFUSE, reason says unknown ({why})")
+
+unreadable = ws_with({ROOM: WID})
+(unreadable / "state" / f"watch-tasks-stream-{WID}.pid").write_text("not-a-pid\n")
+check(worker_liveness(unreadable, WID) == UNKNOWN, "unparseable sentinel → UNKNOWN")
+check(not may_core_speak(unreadable, ROOM)[0], "bound + unparseable sentinel → REFUSE")
+
+empty = ws_with({ROOM: WID})
+(empty / "state" / f"watch-tasks-stream-{WID}.pid").write_text("")
+check(worker_liveness(empty, WID) == UNKNOWN, "empty sentinel → UNKNOWN")
+check(not may_core_speak(empty, ROOM)[0], "bound + empty sentinel → REFUSE")
+
+check(worker_liveness(dead, WID) == DEAD, "sentinel naming a dead pid → DEAD")
+check(worker_liveness(ws, WID) == ALIVE, "sentinel naming a live pid → ALIVE (positive control)")
+check(not worker_alive(nosent, WID), "worker_alive() is False on UNKNOWN, not True")
 
 nofile = ws_with(None)
 check(may_core_speak(nofile, ROOM)[0], "absent bindings.json → nothing is bound → allow")

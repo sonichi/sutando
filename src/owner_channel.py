@@ -47,28 +47,53 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def worker_alive(workspace: Path, worker_id: str) -> bool:
-    """A worker is alive while its own task watcher runs: a
-    `state/watch-tasks-stream-*<worker_id>*.pid` sentinel naming a live pid."""
+ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
+
+
+def worker_liveness(workspace: Path, worker_id: str) -> str:
+    """ALIVE / DEAD / UNKNOWN from the worker's own watcher sentinel.
+
+    A sentinel is written once at watcher startup, so its absence cannot
+    distinguish "no watcher" from "a live watcher whose file is gone".
+    """
     state = Path(workspace) / "state"
-    for p in state.glob(f"{WATCHER_SENTINEL_STEM}-*{worker_id}*.pid"):
+    try:
+        sentinels = sorted(state.glob(f"{WATCHER_SENTINEL_STEM}-*{worker_id}*.pid"))
+    except OSError:
+        return UNKNOWN
+    if not sentinels:
+        return UNKNOWN
+    readable = False
+    for p in sentinels:
         try:
             pid = int(p.read_text(encoding="utf-8").split()[0])
         except (OSError, ValueError, IndexError):
             continue
+        readable = True
         if _pid_alive(pid):
-            return True
-    return False
+            return ALIVE
+    return DEAD if readable else UNKNOWN
+
+
+def worker_alive(workspace: Path, worker_id: str) -> bool:
+    """True only for a positively observed live watcher; UNKNOWN is not alive."""
+    return worker_liveness(workspace, worker_id) == ALIVE
 
 
 def may_core_speak(workspace: Path, channel_id: str) -> tuple[bool, str]:
-    """(allowed, reason). Unbound → allowed. Bound to a live worker → refused.
-    Bound to a dead worker → allowed, and the reason names the recovery."""
+    """(allowed, reason). Unbound → allowed. Only a POSITIVELY dead worker
+    releases the room; alive and unknown both refuse, because speaking over a
+    live worker is the harm this gate exists to prevent.
+    """
     worker = bound_worker(workspace, channel_id)
     if worker is None:
         return True, "unbound"
-    if worker_alive(workspace, worker):
+    state = worker_liveness(workspace, worker)
+    if state == ALIVE:
         return False, f"bound to worker {worker[:8]}, which is alive — its voice, not the core's"
+    if state == UNKNOWN:
+        return False, (f"bound to worker {worker[:8]}, liveness UNKNOWN (no readable watcher "
+                       f"sentinel) — refusing; a missing sentinel is not evidence of death")
     return True, f"bound to worker {worker[:8]}, which is DEAD — recovery may speak"
 
 
