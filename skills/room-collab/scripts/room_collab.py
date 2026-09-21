@@ -326,8 +326,6 @@ def render(command: str, *, text: str = "", peers: list | None = None,
 async def doctor(args: argparse.Namespace) -> int:
     """Every step a first connection needs, reported one line each and stopped
     at the first failure — so the failing STEP is the answer, not a symptom."""
-    from room_collab_client import open_room_collab
-
     def say(step: str, ok: bool, detail: str) -> None:
         print(f"  {'ok  ' if ok else 'FAIL'}  {step:<8} {detail}")
 
@@ -339,6 +337,9 @@ async def doctor(args: argparse.Namespace) -> int:
     except ImportError as exc:
         say("deps", False, f"{exc}; pip install -r skills/room-collab/requirements.txt")
         return 2
+    # Imported after the deps check: this module exits at import when the deps
+    # are absent, which would pre-empt the step the check exists to report.
+    from room_collab_client import open_room_collab
     rows = credential_report(args.token, args.url)
     for step, ok, detail in rows:
         say(step, ok, detail)
@@ -478,15 +479,17 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
+    # Dispatched before the imports below: doctor reports missing deps as its
+    # own first step, and importing the client here would exit before it runs.
+    if args.command == "doctor":
+        return await doctor(args)
+
     # Imported here, not at module scope: the rules above are pure, and a test
     # of them must not need pycrdt installed.
     from room_collab_client import open_room_collab
 
     from room_collab_board import BOARD_KIND, place_clear
     from room_kanban import KANBAN_KIND
-
-    if args.command == "doctor":
-        return await doctor(args)
     if args.command == "reply":
         # No document at all: a reply is a room message in the comment's thread.
         body = reply_content(args.text, args.mention)
