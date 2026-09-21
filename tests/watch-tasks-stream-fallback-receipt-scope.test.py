@@ -70,6 +70,9 @@ def run(watcher_instance, receipt_owner, want_state=False):
             # Sample WHILE the watcher lives: its cleanup trap unlinks the
             # sentinel on exit, so a post-hoc listing is always empty.
             seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            # The sweep announces before the sentinel is stamped (the stamp
+            # waits for fswatch to be confirmed up), so keep sampling for it.
+            if want_state and not seen_state: continue
             if log.exists() and "handle" in log.read_text(): break
             if any("TASK_FILE" in c for c in out): break
     finally:
