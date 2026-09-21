@@ -199,6 +199,10 @@ _VOICE_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
 _voice_owner_clock = time.time
 
 
+def _voice_owner_read_failed(err: Exception) -> None:
+    _log(f"voice-room: owner read failed: {err}")  # noqa: F821
+
+
 def _voice_room_owner() -> str:
     """The owner the gateway registry binds to this agent, cached for one TTL.
     Kept apart from _gateway_owner(): that one also rewrites the DM hint global."""
@@ -211,8 +215,8 @@ def _voice_room_owner() -> str:
     identity = _reenroll_identity()  # noqa: F821
     try:
         answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
-    except Exception as e:  # noqa: BLE001 — an unreachable gateway is an unusable reading
-        _log(f"voice-room: owner read failed: {e}")  # noqa: F821
+    except Exception as e:  # noqa: BLE001
+        _voice_owner_read_failed(e)
         answer = None
     agents = answer.get("agents") if isinstance(answer, dict) else None
     row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
