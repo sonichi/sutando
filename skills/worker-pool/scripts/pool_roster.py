@@ -214,10 +214,13 @@ def _load_existing_roster_strict(workspace):
     return raw
 
 
-def validate_workers(workers) -> None:
+def validate_workers(workers, check_state: bool = True) -> None:
     """The roster's type boundary, so every caller refuses the same shapes.
     A row that is not an object would otherwise surface as an AttributeError
-    from whichever reader touched it first."""
+    from whichever reader touched it first. `check_state` is the WRITER's
+    stricter half -- the router deliberately never reads `state` for routing
+    (docs/worker-pool-design.md), so a route-time caller passes False and
+    only the structural checks (needed to avoid a crash) still apply."""
     if workers is not None and not isinstance(workers, dict):
         raise RosterError(f"workers must be an object, got {type(workers).__name__}")
     for wid, row in (workers or {}).items():
@@ -225,20 +228,21 @@ def validate_workers(workers) -> None:
             raise RosterError(f"worker id must match {WORKER_ID_RE.pattern!r}: {wid!r}")
         if not isinstance(row, dict):
             raise RosterError(f"worker {wid!r} row must be an object, got {type(row).__name__}")
-        state = row.get("state")
-        if state not in STATES:
-            raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+        if check_state:
+            state = row.get("state")
+            if state not in STATES:
+                raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
 
 
 def validate_bindings(workers, bindings) -> None:
-    """A binding's type boundary and target existence, so every caller refuses
-    the same shapes -- the whole-roster half of `validate_workers`. Callers
-    that skip this (an earlier `ensure_task_event_handler` did) can publish a
-    handler for a roster whose binding points at a worker that doesn't
-    exist: the router's own DECLINE for that binding then falls through to
-    the unrestricted core, the exact leak this PR closes for other shapes."""
+    """The whole-roster half of `validate_workers`: a binding's own type
+    and whether its target exists, so every caller shares one boundary."""
+    if bindings is not None and not isinstance(bindings, dict):
+        raise RosterError(f"bindings must be an object, got {type(bindings).__name__}")
     known = set(workers or {}) | {CORE}
     for source, bound in (bindings or {}).items():
+        if not isinstance(source, str):
+            raise RosterError(f"binding source must be a string, got {type(source).__name__}")
         members = list(bound) if isinstance(bound, list) else [bound]
         if not members:
             raise RosterError(f"binding {source!r} names no target")
@@ -247,10 +251,13 @@ def validate_bindings(workers, bindings) -> None:
             # finish archives the other's work. Refused until members get their own.
             raise RosterError(f"binding {source!r} names {len(members)} targets; "
                               "fan-out is not supported yet")
-        missing = [m for m in members if m not in known]
-        if missing:
+        target = members[0]
+        if not isinstance(target, str):
+            raise RosterError(f"binding {source!r} names a non-string target "
+                              f"{target!r} ({type(target).__name__})")
+        if target not in known:
             raise RosterError(
-                f"binding {source!r} names {missing} which are not workers — "
+                f"binding {source!r} names {target!r} which is not a worker — "
                 "a binding to a nonexistent target fails every task from that source")
 
 

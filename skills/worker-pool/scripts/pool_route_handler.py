@@ -88,6 +88,13 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
         return DECLINE, [], None
+    # A roster corrupted after being written (synced in, hand-edited) must
+    # fail closed here too, not only at backfill time.
+    try:
+        pr.validate_workers(roster.get("workers"), check_state=False)
+        pr.validate_bindings(roster.get("workers"), roster.get("bindings"))
+    except pr.RosterError:
+        return MUST_HANDLE, [], None
     targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
                              pr.requested_worker_of(task))
     # One question only: is every target on the roster? Anything else -- no

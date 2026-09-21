@@ -380,8 +380,8 @@ exit 0
         return str(sweep)
 
     def test_a_failing_boot_sweep_starts_no_notifier_watcher(self):
-        """keweichen's review on PR #4503, round 5: this launcher never gated
-        the notifier on the same boot-time sweep Step 1.7 runs."""
+        """This launcher never gated the notifier on the same boot-time
+        sweep Step 1.7 runs."""
         run = self.run_launcher(env_extra={"SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(3)})
         self.assertEqual(run.returncode, 0, run.stderr)
         calls = self.log.read_text()
@@ -395,7 +395,7 @@ exit 0
         self.assertIn("WITHOUT a notifier intake path", run.stderr)
 
     def test_a_failing_boot_sweep_kills_an_existing_watcher_not_just_skips_a_replacement(self):
-        """round 6: 'no new session' is not sufficient on a reuse path -- an
+        """'No new session' is not sufficient on a reuse path -- an
         already-running watcher must be killed, not left alive unprotected."""
         run = self.run_launcher(env_extra={
             "TMUX_WATCHER_EXISTS": "1",
@@ -429,12 +429,12 @@ exit 0
                        "a kill that did not remove the session produced no loud diagnostic")
 
     def test_an_explicit_empty_pool_boot_sweep_survives_the_manifest_in_production(self):
-        """keweichen's review, round 9: pin the env-over-manifest precedence
-        fix in a PRODUCTION-PATH test, not just the synthetic gate unit test.
-        A skill manifest declares SUTANDO_POOL_BOOT_SWEEP; the caller sets it
-        explicitly to EMPTY. The launcher must honor the explicit empty
-        override (skip the sweep silently, same as unset) rather than
-        refilling it from the manifest and running that sweep instead."""
+        """Pins the env-over-manifest precedence fix in a PRODUCTION-PATH
+        test, not just the synthetic gate unit test: a skill manifest
+        declares SUTANDO_POOL_BOOT_SWEEP; the caller sets it explicitly to
+        EMPTY. The launcher must honor the explicit empty override (skip the
+        sweep silently, same as unset) rather than refilling it and running
+        that sweep instead."""
         manifest_dir = self.root / "skills" / "worker-pool"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         would_run = self.root / "would-run-if-manifest-won.marker"

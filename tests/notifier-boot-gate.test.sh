@@ -1,9 +1,6 @@
 #!/bin/bash
-# notifier_boot_gate (src/agent/notifier-boot-gate.sh) must apply the SAME
-# synchronous, fail-closed backfill boundary as core's own /startup Step 1.7
-# -- a managed task notifier starts its own watcher independent of whether
-# Step 1.7 has run inside the core session yet, so it needs its own gate.
-# keweichen's review on PR #4503, round 5.
+# notifier_boot_gate must apply the same fail-closed backfill boundary as
+# core's own /startup Step 1.7, since a notifier starts its own watcher.
 #
 # Run: bash tests/notifier-boot-gate.test.sh
 set -u
@@ -152,9 +149,9 @@ out6="$(
 check "adapter-level one-time resolution discovers a manifest-declared var" \
   "$out6" "resolved=$SWEEP"
 
-# --- Case 6b: an EXPLICIT EMPTY override must survive the manifest --
-# keweichen's review, round 9: the +x setness fix had no explicit-empty
-# regression test at this level (only the production-path Python test did). ---
+# --- Case 6b: an EXPLICIT EMPTY override must survive the manifest, at
+# this bash-unit level too (the production-path Python test covers it
+# separately). ---
 out6b="$(
   REPO="$FAKE_REPO"
   . "$MANIFEST_CONFIG_SRC"
@@ -164,13 +161,28 @@ out6b="$(
 )"
 check "explicit empty override is not refilled from the manifest" "$out6b" "resolved=[]"
 
+# A real process whose argv genuinely classifies as "watcher" per
+# watcher_identity.py -- a bare `sleep` does not, so the identity-proof step
+# would (correctly) refuse it. $1: dir to create the fake script in.
+_make_fake_watcher_script() {
+  local dir="$1"
+  mkdir -p "$dir"
+  cat > "$dir/watch-tasks-stream.sh" << 'SCRIPT'
+#!/bin/bash
+sleep 25
+SCRIPT
+  chmod +x "$dir/watch-tasks-stream.sh"
+  printf '%s/watch-tasks-stream.sh' "$dir"
+}
+
 # --- Case 7: notifier_boot_gate_force_kill_watcher actually terminates the
 # real process a launcher's tmux kill-session left alive -- the SAFETY
 # OUTCOME (the watcher can no longer admit a task), not a diagnostic string.
 # Uses REAL_REPO (needs the real util_paths.py/watcher_sentinel.sh). ---
 WS7="$TD/ws7"
 mkdir -p "$WS7/state"
-nohup sleep 25 > /dev/null 2>&1 &
+FAKE_SCRIPT7="$(_make_fake_watcher_script "$TD/fw7")"
+bash "$FAKE_SCRIPT7" > /dev/null 2>&1 &
 FAKE_WATCHER_PID=$!
 disown
 SENTINEL7="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS7/state")"
@@ -178,7 +190,7 @@ echo "$FAKE_WATCHER_PID" > "$SENTINEL7"
 out7="$(
   REPO="$REAL_REPO"
   . "$GATE_SRC"
-  notifier_boot_gate_force_kill_watcher "$WS7"
+  notifier_boot_gate_force_kill_watcher "$WS7" "$PY"
   echo "rc=$?"
 )"
 check "force-kill escalation reports success" "$(grep -o 'rc=[0-9]*' <<<"$out7")" "rc=0"
@@ -190,11 +202,37 @@ else
   echo "  ok   force-kill escalation actually terminates the process"
 fi
 
+# --- Case 7b: a genuinely non-watcher process at the sentinel pid (argv does
+# not match watch-tasks-stream.sh) must be refused, not killed. ---
+WS7b="$TD/ws7b"
+mkdir -p "$WS7b/state"
+nohup sleep 25 > /dev/null 2>&1 &
+NOT_A_WATCHER_PID=$!
+disown
+SENTINEL7b="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS7b/state")"
+echo "$NOT_A_WATCHER_PID" > "$SENTINEL7b"
+out7b="$(
+  REPO="$REAL_REPO"
+  . "$GATE_SRC"
+  notifier_boot_gate_force_kill_watcher "$WS7b" "$PY"
+  echo "rc=$?"
+)"
+check "force-kill escalation refuses a non-watcher process" "$(grep -o 'rc=[0-9]*' <<<"$out7b")" "rc=1"
+if kill -0 "$NOT_A_WATCHER_PID" 2>/dev/null; then
+  echo "  ok   the non-watcher process was correctly left alone"
+else
+  echo "  FAIL the non-watcher process was killed anyway -- identity check bypassed"
+  FAIL=1
+fi
+kill -9 "$NOT_A_WATCHER_PID" 2>/dev/null
+
 # --- Case 8: negative control -- a REISSUED pid (the sentinel's mtime
-# predates the live process's own start) must NEVER be killed. ---
+# predates the live process's own start) must NEVER be killed, even though
+# it IS a genuine watcher-classified process. ---
 WS8="$TD/ws8"
 mkdir -p "$WS8/state"
-nohup sleep 25 > /dev/null 2>&1 &
+FAKE_SCRIPT8="$(_make_fake_watcher_script "$TD/fw8")"
+bash "$FAKE_SCRIPT8" > /dev/null 2>&1 &
 UNRELATED_PID=$!
 disown
 SENTINEL8="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS8/state")"
@@ -203,7 +241,7 @@ touch -t 202001010000 "$SENTINEL8"
 out8="$(
   REPO="$REAL_REPO"
   . "$GATE_SRC"
-  notifier_boot_gate_force_kill_watcher "$WS8"
+  notifier_boot_gate_force_kill_watcher "$WS8" "$PY"
   echo "rc=$?"
 )"
 check "force-kill escalation refuses a reissued pid" "$(grep -o 'rc=[0-9]*' <<<"$out8")" "rc=1"
@@ -217,9 +255,7 @@ kill -9 "$UNRELATED_PID" 2>/dev/null
 
 # --- Case 9: the boot sweep runs against the notifier's ACTUAL workspace,
 # not the configured default, when SUTANDO_WORKSPACE_DIR or SUTANDO_TASKS_DIR
-# overrides which tree the watcher will really admit tasks from. keweichen's
-# review, round 10: the gate approved admission without ever checking the
-# override workspace's own pool declaration. ---
+# overrides which tree the watcher will really admit tasks from. ---
 OVERRIDE_WS="$TD/override-ws"
 mkdir -p "$OVERRIDE_WS"
 cat > "$SWEEP" << 'PYEOF'
@@ -255,6 +291,41 @@ out9b="$(
 )"
 check "SUTANDO_TASKS_DIR-only override -> sweep sees its dirname" \
   "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
+
+# --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
+# killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
+# respawns the watcher on any exit, so killing only the sentinel pid is
+# undone within ~1s in production. Uses a REAL private tmux socket + session
+# so this is the actual shutdown unit, not a simulation of one. ---
+if command -v tmux >/dev/null 2>&1; then
+  T10_SOCK="$TD/tmux10.sock"
+  T10_SESSION="fake-watcher-session-$$"
+  WS10="$TD/ws10"
+  mkdir -p "$WS10/state"
+  FAKE_SCRIPT10="$(_make_fake_watcher_script "$TD/fw10")"
+  tmux -S "$T10_SOCK" new-session -d -s "$T10_SESSION" bash "$FAKE_SCRIPT10"
+  SUPERVISOR_PID10="$(tmux -S "$T10_SOCK" list-panes -t "=$T10_SESSION" -F '#{pane_pid}' | head -1)"
+  # No sentinel written -- this case is purely about supervisor teardown;
+  # the function still returns non-zero (no watcher pid to confirm dead),
+  # but the supervisor pane's own process must be gone regardless.
+  out10="$(
+    REPO="$REAL_REPO"
+    . "$GATE_SRC"
+    TMUX_SOCKET="$T10_SOCK" WATCHER_SESSION="$T10_SESSION" \
+      notifier_boot_gate_force_kill_watcher "$WS10" "$PY"
+    echo "rc=$?"
+  )"
+  if kill -0 "$SUPERVISOR_PID10" 2>/dev/null; then
+    echo "  FAIL the supervisor pane process survived force-kill (still alive) -- the watcher would respawn"
+    FAIL=1
+    kill -9 "$SUPERVISOR_PID10" 2>/dev/null
+  else
+    echo "  ok   the supervisor pane process was killed, closing the respawn loop"
+  fi
+  tmux -S "$T10_SOCK" kill-server 2>/dev/null || true
+else
+  echo "  skip Case 10 (no tmux on this host)"
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

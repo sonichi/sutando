@@ -3,9 +3,9 @@
 that predates this file, or that nobody has re-registered into since an
 upgrade, never gets it (re)declared, so its worker-bound tasks fall straight
 to core instead of being routed. The regression starts with an existing
-pool and requires no new worker registration, per keweichen's review on
-PR #4503: ensure_task_event_handler backfills it, called every tick() so
-the sweep self-heals on its own cadence, never core's.
+pool and requires no new worker registration: ensure_task_event_handler
+backfills it, called every tick() so the sweep self-heals on its own
+cadence, never core's.
 
 Run: python3 tests/skills/worker-pool/pool-roster-handler-currency.test.py
 """
@@ -62,8 +62,7 @@ class EnsureTaskEventHandler(Base):
         """The router never reads `state` (docs/worker-pool-design.md,
         pool_route_handler.py) -- a recovering or abandoned worker's
         deliveries still route to it, so ensure_task_event_handler must
-        publish for them too. keweichen's review on PR #4503: the
-        state=='live' gate mistook existing ownership for 'no pool'."""
+        publish for them too, not only for a currently-live one."""
         for state in ("recovering", "abandoned"):
             with self.subTest(state=state):
                 ws = Path(tempfile.mkdtemp())
@@ -82,8 +81,7 @@ class EnsureTaskEventHandler(Base):
     def test_an_unreadable_roster_raises_rather_than_reading_as_no_pool(self):
         """Absent (no roster file) and UNREADABLE (a roster file that exists
         but load_roster refuses) are different failures -- collapsing the
-        latter into the former hides an existing pool's ownership. keweichen's
-        review on PR #4503, citing pool_roster.py:321-324 (pre-fix)."""
+        latter into the former hides an existing pool's ownership."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         pr.roster_path(self.ws).write_text("not valid json {{{")
 
@@ -98,10 +96,9 @@ class EnsureTaskEventHandler(Base):
             pr.ensure_task_event_handler(self.ws)
 
     def test_a_falsey_non_dict_workers_value_raises_instead_of_reading_as_no_pool(self):
-        """keweichen's review, round 8: `workers = roster.get("workers") or {}`
-        let a falsey-but-invalid shape (an empty list) collapse into "no pool"
-        without ever reaching validation. Exact repro:
-        roster.json={"workers":[],"bindings":{"room-a":"worker-a"}}."""
+        """`workers = roster.get("workers") or {}` let a falsey-but-invalid
+        shape (an empty list) collapse into "no pool" without ever reaching
+        validation. Exact repro: roster.json with a workers list."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         for workers_val in ([], None, "bogus", ["w1"], 0, ""):
             with self.subTest(workers=workers_val):
@@ -119,11 +116,10 @@ class EnsureTaskEventHandler(Base):
             pr.ensure_task_event_handler(self.ws)
 
     def test_a_dangling_binding_raises_with_a_valid_live_worker(self):
-        """keweichen's review, round 9, exact repro: a valid live worker-a
-        plus a binding to a nonexistent worker-b. validate_workers alone
-        passes; without validate_bindings this published a handler anyway,
-        and the router's own DECLINE for the dangling binding then fell
-        through to the unrestricted core -- the exact leak this PR closes."""
+        """A valid live worker-a plus a binding to a nonexistent worker-b.
+        validate_workers alone passes; without validate_bindings this
+        published a handler anyway, and the router's own DECLINE for the
+        dangling binding then fell through to the unrestricted core."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         pr.roster_path(self.ws).write_text(json.dumps(
             {"workers": {"worker-a": {"state": "live"}},
@@ -133,9 +129,8 @@ class EnsureTaskEventHandler(Base):
             pr.ensure_task_event_handler(self.ws)
 
     def test_a_dangling_binding_raises_even_with_empty_workers(self):
-        """keweichen's round-9 second half of the same repro: workers={}
-        does NOT make a dangling binding harmless -- it's still a corrupt
-        roster, not the ordinary no-pool case, so it must also raise."""
+        """An empty workers dict does NOT make a dangling binding harmless
+        -- it's still a corrupt roster, not the ordinary no-pool case."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         pr.roster_path(self.ws).write_text(json.dumps(
             {"workers": {}, "bindings": {"room-a": "worker-b"}}))
@@ -212,9 +207,9 @@ class BootTimeSweepBackfillsBeforeDispatch(Base):
     """The exact command skills/startup/SKILL.md step 1.5 runs, synchronously,
     before the watcher starts -- an existing pool that upgraded without a new
     worker registration must not have a window where a bound task can reach
-    core because the declaration hasn't been written yet. Reviewed by
-    qingyun-wu on PR #4503: the sweep-timer-only backfill left exactly that
-    gap open until the worker-pool skill's own five-minute sweep first fired."""
+    core because the declaration hasn't been written yet. A sweep-timer-only
+    backfill left exactly that gap open until the pool's own periodic sweep
+    first fired."""
 
     def test_the_startup_command_backfills_an_existing_pool(self):
         make_worker(self.ws)
@@ -248,11 +243,10 @@ class BootTimeSweepBackfillsBeforeDispatch(Base):
 
 class FailClosedOnBackfillFailure(Base):
     """A live pool whose declaration cannot be published is a routing outage
-    in the making, not the ordinary no-pool case: keweichen's review on
-    PR #4503 (Qingyun's Personal Codex) named this exact gap in the reverted
-    Step 1.7 -- 'distinguish the benign no-skill/no-roster case from a failed
-    required backfill, and fail closed instead of starting the watcher when
-    backfill for an existing pool cannot complete.'"""
+    in the making, not the ordinary no-pool case: distinguish the benign
+    no-skill/no-roster case from a failed required backfill, and fail closed
+    instead of starting the watcher when backfill for an existing pool
+    cannot complete."""
 
     def _break_state_dir(self):
         state = self.ws / "state"
@@ -303,9 +297,8 @@ class FailClosedOnBackfillFailure(Base):
     def test_an_unreadable_roster_also_fails_closed_with_the_distinct_code(self):
         """A roster file that exists but cannot be read is an existing pool
         whose ownership can't be established -- the same failure class as a
-        write error, not the benign no-pool case. keweichen's review on
-        PR #4503 (round 2): 'corrupt'/'unreadable' roster inputs left
-        sweep_rc==0 and config_written==no, silently."""
+        write error, not the benign no-pool case. A corrupt/unreadable
+        roster must not leave sweep_rc==0 and config_written==no, silently."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         pr.roster_path(self.ws).write_text("not valid json {{{")
 
@@ -315,11 +308,11 @@ class FailClosedOnBackfillFailure(Base):
                                  "fail closed, not read as 'no pool'")
 
     def test_a_malformed_workers_type_fails_closed_end_to_end_not_a_crash(self):
-        """keweichen's review: ensure_task_event_handler() rejected
-        workers="bogus" correctly, but tick() then continued into
-        observe()/supervised_workers(), which raised a raw AttributeError
-        (exit 1) rather than the intended handled exit 3 -- end to end
-        through main(), not just the backfill call in isolation."""
+        """ensure_task_event_handler() rejected workers="bogus" correctly,
+        but tick() then continued into observe()/supervised_workers(), which
+        raised a raw AttributeError (exit 1) rather than the intended
+        handled exit 3 -- end to end through main(), not just the backfill
+        call in isolation."""
         pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
         pr.roster_path(self.ws).write_text(json.dumps({"workers": "bogus", "bindings": {}}))
 

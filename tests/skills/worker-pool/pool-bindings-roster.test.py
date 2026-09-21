@@ -59,6 +59,25 @@ class TestCompile(Base):
         with self.assertRaises(pr.RosterError):
             pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": []})
 
+    def test_a_non_dict_bindings_value_is_refused_not_silently_empty(self):
+        """`(bindings or {}).items()` let []/""/0 collapse to empty and pass
+        silently instead of being refused."""
+        for bad in ([], "", 0):
+            with self.subTest(bindings=bad):
+                with self.assertRaises(pr.RosterError):
+                    pr.validate_bindings({W1: {"state": "live"}}, bad)
+
+    def test_a_truthy_non_dict_binding_value_raises_cleanly_not_attributeerror(self):
+        for bad in ("bogus", ["x", "y", "z"]):
+            with self.subTest(bindings=bad):
+                with self.assertRaises(pr.RosterError):
+                    pr.validate_bindings({W1: {"state": "live"}}, bad)
+
+    def test_an_unhashable_target_raises_cleanly_not_typeerror(self):
+        with self.assertRaises(pr.RosterError):
+            pr.validate_bindings({W1: {"state": "live"}},
+                                 {"room:!x:ag2.space": {"nested": "dict"}})
+
     def test_an_unknown_state_is_refused(self):
         with self.assertRaises(pr.RosterError):
             pr.compile_roster(self.ws, {W1: {"state": "alive"}})

@@ -192,11 +192,24 @@ class TestClassification(Base):
         t = self.task_file("task-1", channel_id="!room:x")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]), 0)
 
-    def test_a_target_not_on_the_roster_goes_to_the_core(self):
-        """A name that was never created is not a routing failure: the core is
-        a real recipient, and holding would strand the work indefinitely."""
+    def test_a_dangling_static_binding_must_be_held_not_sent_to_the_core(self):
+        """A roster whose OWN declared binding names a worker that doesn't
+        exist is corrupt (compile_roster() never writes one), not ordinary
+        config drift -- DECLINE-to-core here was a real fallthrough leak. A
+        per-task AD HOC requested-worker name that doesn't exist is a
+        different, still-benign case, covered separately below."""
         self.roster(bindings={"!room:x": "f" * 32})
         t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.MUST_HANDLE)
+
+    def test_an_explicit_requested_worker_name_that_does_not_exist_still_declines(self):
+        """Distinct from the static-binding case above: a task's OWN
+        requested_worker header is a per-task ad hoc name, never part of the
+        roster's own bindings, so it is not covered by validate_bindings()
+        and a typo'd name still safely falls to the core."""
+        self.roster(bindings={})
+        t = self.task_file("task-1", channel_id="!other:x", requested_worker="never-registered")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
                          h.DECLINE)
 
@@ -213,6 +226,18 @@ class TestClassification(Base):
         t = self.task_file("task-1", channel_id="!room:x")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
                          h.DECLINE)
+
+    def test_a_malformed_workers_type_must_be_held_not_routed_at_all(self):
+        """A roster that PARSES but whose `workers` field is a corrupt type
+        (unreadable only at backfill time, never checked here) still reached
+        targets_for()/unknown_targets() with a truthy-but-wrong value --
+        validate_workers/validate_bindings must run at route time too, not
+        only when writing the roster."""
+        (self.ws / "state" / "roster.json").write_text(
+            json.dumps({"version": 1, "workers": "bogus", "bindings": {}}))
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.MUST_HANDLE)
 
 
 class TestPickerCommandsStayWithTheController(Base):
