@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 from room_composer import (  # noqa: E402
     ComposerError, EMAIL, LINKEDIN_POST, SCHEMA, X_POST, build, counted_length,
-    over_limit, readable,
+    feed, over_limit, readable, root_for,
 )
 
 FAILS = []
@@ -69,6 +69,45 @@ def test_an_address_is_one_plain_string_per_entry():
 
 def test_the_type_set_is_closed_because_the_renderers_are_ours():
     _refuses(lambda: build("bluesky_post"), "unknown draft type", "x_post, linkedin_post, email")
+
+
+# --- a surface holds a feed of posts, each with its own prose
+
+def test_a_post_id_names_a_text_root_so_it_stays_boring():
+    assert root_for("a1") == "post:a1" and root_for("3") == "post:3"
+    for bad in ("", None, "Post1", "post 1", "post/1", "-lead", "x" * 33):
+        _refuses(lambda b=bad: root_for(b), "not a usable post id")
+
+
+def test_the_feed_is_ordered_by_created_then_id_so_every_client_agrees():
+    stored = {
+        "2": build(X_POST, created=1002),
+        "1": build(X_POST, created=1000),
+        # Same minute as "2": an agent filing a batch. The id breaks the tie,
+        # or two clients would order these by map iteration and disagree.
+        "3": build(EMAIL, {"subject": "s", "to": ["a@b.c"]}, created=1002),
+        "9": {"type": X_POST, "schema": SCHEMA},            # no created: sorts to the top, stably
+        "not an id": {"type": X_POST, "schema": SCHEMA},    # not a post: skipped, never raised on
+    }
+    got = feed(stored)
+    assert [e["id"] for e in got] == ["9", "1", "2", "3"], got
+    assert [e["root"] for e in got] == ["post:9", "post:1", "post:2", "post:3"]
+    assert got[0]["created"] is None and got[1]["created"] == 1000
+    assert [e["type"] for e in got] == [X_POST, X_POST, X_POST, EMAIL]
+    assert got[3]["fields"] == {"subject": "s", "to": ["a@b.c"]}, "created is not left in the fields"
+    # Reversing the input cannot change the answer: the order is in the data.
+    assert [e["id"] for e in feed(dict(reversed(list(stored.items()))))] == ["9", "1", "2", "3"]
+
+
+def test_a_feed_tolerates_what_another_writer_may_have_put_there():
+    assert feed(None) == [] and feed("nonsense") == [] and feed({}) == []
+    junk = {"1": None, "2": "not a row", "3": {"type": "future", "schema": 99},
+            "4": {"type": X_POST, "schema": SCHEMA, "created": True},
+            "5": {"type": X_POST, "schema": SCHEMA, "created": 7.5}}
+    got = feed(junk)
+    assert [e["id"] for e in got] == ["1", "2", "3", "4", "5"], got
+    assert all(e["created"] is None for e in got), "a bool or a fraction is not a minute"
+    assert got[2]["plain"] and "no renderer" in got[2]["why"]
 
 
 # --- what a reader does with a draft it cannot draw

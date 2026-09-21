@@ -1,29 +1,50 @@
-"""A draft an agent writes and a client renders as its destination will — rules.
+"""Drafts an agent writes and a client renders as their destination will — rules.
 
-A fourth surface — `?kind=composer` — holding one draft: the PROSE is the
-surface's own text, and a `composer` map beside it carries what the prose is
-for (`type`, `schema`) and the fields prose cannot hold (`subject`, `to`, `cc`).
+A fourth surface — `?kind=composer` — holding a FEED of posts that grows. Each
+post's prose is its own text root, `post:<id>`; a `posts` map carries one row
+per post with what the prose is for (`type`, `schema`, `created`) and the
+fields prose cannot hold (`subject`, `to`, `cc`).
 
-Prose in the text, not in the map, is the whole point. A map value is
-last-writer-wins: a person typing while an agent revises would lose a
-paragraph, silently, which is the defect the collaborative surface exists to
-prevent. Keeping the body in the surface's text also means the caret, the
-authorship ledger, comment anchors and presence work here with no new code —
-they all address the text by name.
+Every level of that is chosen against last-writer-wins, which is the failure a
+collaborative surface exists to prevent:
 
-The other fields stay map values deliberately: a subject line or a recipient
-list has one author at a time, so last-writer-wins is the correct semantics
-for them rather than a compromise.
+  - Prose in a text root, not a map value: otherwise a person typing while an
+    agent revises loses a paragraph. It also means the caret, the authorship
+    ledger and comment anchors work per post with no new code — they address a
+    text by name, and the awareness cursor already names its root (`tname`).
+  - One map KEY per post, not one value holding every post: a whole-value write
+    is last-writer-wins, so two concurrent adds would drop one post entirely.
+  - Order derived from `created`, not stored in a list: an `order` array as a
+    map value loses a write the same way. Manual reordering would need a Yjs
+    array, which merges per element — worth adding when someone asks to drag a
+    post, not before.
+
+A post's own fields stay map values deliberately: a subject line has one author
+at a time, so last-writer-wins is correct there rather than a compromise.
 
 Imports nothing: the rules are pure, so they are testable without pycrdt.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 COMPOSER_KIND = "composer"
-COMPOSER_KEY = "composer"
+POSTS_KEY = "posts"
 SCHEMA = 1
+
+# A post id becomes a text root name and travels as `tname` in an awareness
+# cursor, so it stays short and boring: no separators, no case games.
+POST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def root_for(post_id: str) -> str:
+    """The text root holding one post's prose."""
+    if not POST_ID_RE.fullmatch(str(post_id or "")):
+        raise ComposerError(
+            f"{post_id!r} is not a usable post id: lowercase letters, digits and dashes, "
+            "up to 32 — it becomes the name of a text root and travels in a caret.")
+    return f"post:{post_id}"
 
 X_POST = "x_post"
 LINKEDIN_POST = "linkedin_post"
@@ -64,11 +85,13 @@ class ComposerError(ValueError):
     """A draft a renderer could not draw, refused where it was written."""
 
 
-def build(artifact_type: str, fields: dict[str, Any] | None = None) -> dict:
-    """The `composer` map for a draft of `artifact_type`.
+def build(artifact_type: str, fields: dict[str, Any] | None = None,
+          created: int | None = None) -> dict:
+    """One post's row for the `posts` map.
 
-    The prose is NOT in here — it is the surface's text. This is only what the
-    text cannot say about itself.
+    The prose is NOT in here — it is that post's text root. This is only what
+    the text cannot say about itself. `created` orders the feed; it is whole
+    UTC minutes, the same unit the write-time ledger uses.
     """
     if artifact_type not in TYPES:
         raise ComposerError(
@@ -87,9 +110,37 @@ def build(artifact_type: str, fields: dict[str, Any] | None = None) -> dict:
                 f"{artifact_type} needs {key!r}. An absent field is the writer's bug: a "
                 "renderer must never have to guess whether it is missing or merely empty.")
     out: dict[str, Any] = {"type": artifact_type, "schema": SCHEMA}
+    if created is not None:
+        out["created"] = int(created)
     for key, value in given.items():
         out[key] = _as_list(value) if key in LIST_FIELDS else value
     return out
+
+
+def feed(stored: Any) -> list[dict]:
+    """Every post in the surface, oldest first, each as `readable()` describes it.
+
+    Ordered by `(created, id)`. The id is the tiebreak, and it is load-bearing:
+    an agent filing a batch gives several posts the same minute, and `created`
+    alone would leave their order to each client's map iteration — so two people
+    would see the same feed differently, intermittently. A missing or malformed
+    `created` counts as 0, which puts it at the top and keeps it there rather
+    than moving between renders. A row that is not a post is skipped rather than
+    raised on: this reads other writers' data.
+    """
+    rows = stored.items() if hasattr(stored, "items") else []
+    out = []
+    for post_id, row in rows:
+        if not POST_ID_RE.fullmatch(str(post_id or "")):
+            continue
+        entry = readable(row)
+        entry["id"] = str(post_id)
+        entry["root"] = f"post:{post_id}"
+        created = entry["fields"].pop("created", None)
+        ok = isinstance(created, (int, float)) and not isinstance(created, bool)
+        entry["created"] = int(created) if ok and created == int(created) else None
+        out.append(entry)
+    return sorted(out, key=lambda e: (e["created"] or 0, e["id"]))
 
 
 def _empty(value: Any) -> bool:
