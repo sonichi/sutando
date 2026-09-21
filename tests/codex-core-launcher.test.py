@@ -1241,7 +1241,9 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+    def test_managed_notifier_waits_for_idle_then_submits_in_announce_order(self):
+        # The single-decider redesign: the notifier submits in the order its
+        # watcher announces (FIFO), never re-picks by priority itself.
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
         results = workspace / "results"
@@ -1307,7 +1309,8 @@ exit 0
         )
         self.assertFalse(early.exists(), "notifier submitted before core became idle")
         calls = self.log.read_text()
-        self.assertLess(calls.index("task-owner.txt"), calls.index("task-low.txt"))
+        self.assertLess(calls.index("task-low.txt"), calls.index("task-owner.txt"),
+                        "the watcher announced task-low.txt first; the notifier must not reorder it")
         self.assertTrue((results / "task-owner.txt").exists())
         self.assertTrue((results / "task-low.txt").exists())
 
