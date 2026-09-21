@@ -90,10 +90,7 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
-# Optional task handlers run synchronously, inline, the moment a probe admits
-# a task (measured ~35-40ms/call, dominated by interpreter startup -- cheap
-# enough at this system's human-paced traffic that async execution bought
-# nothing but a real race (see prepare_handler_state/run_handler_now below).
+# Optional task handlers run synchronously, inline -- see run_handler_now().
 HANDLER_STATE_READY=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -256,13 +253,8 @@ publish_terminal_failure() {
 # sentinel there (#4502). So a worker never probes a handler, regardless of
 # CURRENT_HANDLER, and only core's branch ever calls this.
 #
-# Idempotent, and called both here (only when a handler is already declared at
-# startup), lazily from run_handler_now on first use, and from the fswatch
-# read-loop's config-change case, so a handler declared later still works with
-# no restart. No DISPATCH_DIR anymore: handler runs are synchronous now, so
-# there is no async queue to house -- just the claim bookkeeping that protects
-# against two overlapping watcher processes racing the same task, which is
-# orthogonal to sync vs async and stays exactly as it was.
+# Idempotent, so a handler declared later still works with no restart; only
+# the claim bookkeeping remains -- handler runs are synchronous, no queue.
 prepare_handler_state() {
   [ -z "$HANDLER_STATE_READY" ] || return 0
   mkdir -p "$CLAIMS_DIR" "$FALLBACKS_DIR"
@@ -308,24 +300,11 @@ handler_result_exists() {
   "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$filename" 2>/dev/null
 }
 
-# Runs the real (non-probe) handler synchronously, inline, right here -- no
-# background subprocess, no completion FIFO, no reap-loop guessing whether a
-# quietly-exited process finished or crashed. Replaces
-# queue_handler_task+drain_dispatch_queue+--handler-runner+finish_handler_task
-# (#2603-era async machinery) after two things were established: (1) the
-# handler's real cost is ~35-40ms, dominated by interpreter startup, and
-# synchronous is imperceptible at this system's human-paced traffic; (2) that
-# async machinery's own reap-loop had a genuine race -- kill -0 cannot tell "a
-# worker crashed" from "a worker finished successfully and exited, FIFO
-# message not read yet" -- reproduced live (21/100 false failures across 5
-# stress-test trials). A synchronous call has no such gap: the handler's rc is
-# known the instant this function returns, so that whole bug class is now
-# structurally impossible, not just patched.
+# Runs the real (non-probe) handler synchronously, inline: the rc is known
+# the instant this returns, so no reap-loop can misjudge crashed-vs-finished.
 #
-# Preserves the exact disposition/safety contract finish_handler_task had:
-# ACCEPT's failure may safely fall back to the live core; MUST_HANDLE's
-# failure never may (rc 4 always outranks the stored disposition -- the
-# handler is saying the live core must not inherit this task).
+# MUST_HANDLE's failure never falls back to the live core (rc 4 always
+# outranks the stored disposition); ACCEPT's failure safely may.
 SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
@@ -614,10 +593,8 @@ _tmux_wake() {
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
 #
-# Disposition-aware settlement for a claim this watcher still owns when a
-# shutdown signal lands -- operates on CLAIMS_DIR directly, not on wherever
-# run_handler_now() was blocked, since a SIGTERM there interrupts `wait`
-# immediately and run_handler_now() never resumes to settle it itself.
+# SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
+# to settle its own claim -- this settles directly from CLAIMS_DIR instead.
 settle_own_claims_on_shutdown() {
   local claim filename task_path announce claim_settled verdict
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
