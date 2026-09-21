@@ -57,10 +57,9 @@ def worker_liveness(workspace: Path, worker_id: str) -> str:
     distinguish "no watcher" from "a live watcher whose file is gone".
     """
     state = Path(workspace) / "state"
-    try:
-        sentinels = sorted(state.glob(f"{WATCHER_SENTINEL_STEM}-*{worker_id}*.pid"))
-    except OSError:
-        return UNKNOWN
+    # glob swallows a permission error and yields nothing, so an unreadable
+    # state dir arrives here as "no sentinels" — already UNKNOWN, not dead.
+    sentinels = sorted(state.glob(f"{WATCHER_SENTINEL_STEM}-*{worker_id}*.pid"))
     if not sentinels:
         return UNKNOWN
     readable = False

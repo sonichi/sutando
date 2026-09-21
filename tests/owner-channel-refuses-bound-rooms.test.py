@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 from owner_channel import (bound_worker, may_core_speak, worker_alive,  # noqa: E402
-                           worker_liveness, ALIVE, DEAD, UNKNOWN)
+                           worker_liveness, main, ALIVE, DEAD, UNKNOWN)
 
 FAILED: list[str] = []
 
@@ -111,6 +111,57 @@ src, ch = csr.resolve_active_target(str(dead / "state" / "last-owner-activity.js
 check(ch == ROOM, "relay: a dead worker's room still resolves (recovery may speak)")
 src, ch = csr.resolve_active_target(str(bad / "state" / "last-owner-activity.json"))
 check((src, ch) == ("", ""), "relay: unreadable bindings → no target, never a guess")
+
+print("uncovered branches the coverage gate named")
+
+# line 35: valid JSON, wrong shape — distinct from the `{not json` case above,
+# which raises inside json.loads before this guard is reached.
+shape = ws_with({ROOM: WID})
+(shape / "state" / "bindings.json").write_text(json.dumps({"bindings": "notadict"}))
+try:
+    bound_worker(shape, ROOM)
+    check(False, "a bindings value that is not a dict must raise")
+except ValueError as e:
+    check("expected" in str(e), "non-dict bindings raises with the shape in the message")
+
+# _pid_alive's PermissionError arm: pid 1 exists and we may not signal it, the
+# "alive but not ours" case a bare ProcessLookupError check would call dead.
+priv = ws_with({ROOM: WID}, watcher_pid=1)
+check(worker_liveness(priv, WID) == ALIVE, "a sentinel naming an unsignalable live pid is ALIVE")
+check(not may_core_speak(priv, ROOM)[0], "bound + unsignalable live worker -> REFUSE")
+
+# main() in-process: the subprocess CLI checks above contribute nothing to this
+# run's coverage, because a child process is not measured by it.
+import contextlib
+import io
+
+
+def run_main(argv):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue().strip()
+
+
+rc, out = run_main(["--workspace", str(ws), "--channel", ROOM])
+check(rc == 3 and out.startswith("refuse"), "main(): live worker's room -> rc 3 refuse")
+rc, out = run_main(["--workspace", str(ws), "--channel", OTHER])
+check(rc == 0 and out.startswith("allow"), "main(): unbound room -> rc 0 allow")
+rc, out = run_main(["--workspace", str(dead), "--channel", ROOM])
+check(rc == 0 and "DEAD" in out, "main(): dead worker's room -> rc 0 allow")
+
+# --channel omitted falls back to last-owner-activity.json, which ws_with writes
+rc, out = run_main(["--workspace", str(ws)])
+check(rc == 3 and ROOM in out, "main(): no --channel reads the owner's last-active channel")
+
+# unreadable or absent, it refuses rather than guessing a channel
+nochan = ws_with({ROOM: WID}, watcher_pid=os.getpid())
+(nochan / "state" / "last-owner-activity.json").write_text("{not json")
+rc, out = run_main(["--workspace", str(nochan)])
+check(rc == 3 and "no owner channel recorded" in out, "main(): malformed activity file -> refuse, no guess")
+(nochan / "state" / "last-owner-activity.json").unlink()
+rc, out = run_main(["--workspace", str(nochan)])
+check(rc == 3 and "no owner channel recorded" in out, "main(): absent activity file -> refuse, no guess")
 
 print(f"\n{'FAILED: ' + '; '.join(FAILED) if FAILED else 'all checks passed'}")
 sys.exit(1 if FAILED else 0)
