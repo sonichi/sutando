@@ -209,7 +209,7 @@ jobs:
           # A suite that reads the host process table (pgrep/pkill/ps by pattern)
           # sees sibling lanes' watchers as its own; those run after the lanes,
           # alone. `|| true`: a list with no such suite is not an error.
-          { xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e )' < "$RECDIR/all" || true; } | sort > "$RECDIR/serial"
+          { xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e |-p )' < "$RECDIR/all" || true; } | sort > "$RECDIR/serial"
           comm -23 "$RECDIR/all" "$RECDIR/serial" > "$RECDIR/files"
           mkdir -p "$RECDIR/serial-rec"
           # Same scheduler as the Python suite: one SERIAL worker per worktree, so
