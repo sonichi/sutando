@@ -247,7 +247,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- Self-introduction ("who are you", "introduce yourself", "what can you do") — use the context above',
 		'- Yes/no acknowledgments',
 		'- Asking the user a clarifying question',
-		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — say yes and switch at once; then call work exactly once with "remember my language preference: <language>" so the preference is kept for next time',
+		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
 		'- get_current_time (current date/time)',
 		// googleSearch line conditional on VOICE_GOOGLE_SEARCH (per-surface config).
 		// When search is off, omit — model would otherwise be told it can use a
