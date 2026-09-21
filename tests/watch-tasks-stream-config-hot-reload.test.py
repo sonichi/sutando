@@ -49,7 +49,12 @@ def start_watcher(ws, instance=None):
 
 
 def write_task(ws, name, body="probe"):
-    (ws / "tasks" / name).write_text(f"id: {name}\naccess_tier: owner\ntask: {body}\n")
+    # Rename into place, as every bridge does: an in-place write raises a
+    # Created and an Updated event, and the watcher would announce both.
+    final = ws / "tasks" / name
+    tmp = final.with_name(f".{name}.tmp")
+    tmp.write_text(f"id: {name}\naccess_tier: owner\ntask: {body}\n")
+    tmp.replace(final)
 
 
 def wait_for(pred, timeout=8):
