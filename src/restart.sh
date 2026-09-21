@@ -82,7 +82,32 @@ pkill -f "remote-gateway-bridge" 2>/dev/null
 # restart, and kept stamping tasks from 39-day-old code. Kill both names.
 pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
-pkill -f "watch-tasks" 2>/dev/null
+# Scoped to THIS core's own watcher only -- a bare `pkill -f "watch-tasks"`
+# matches every pool worker's watcher on the host too (argv substring: a
+# worker's command line is "watch-tasks-stream.sh <delivery-path>"), which
+# caused a real multi-worker outage (2026-09-20, peer-reported: every worker's
+# watcher died and had to re-arm, with a gap for any task that landed in it).
+# Read the core's own sentinel PID; fall back to the no-argument invocation
+# pattern only if the sentinel can't be resolved, so the watcher is never
+# silently left running across a restart.
+_stop_core_watcher() {
+    local sentinel="" pid=""
+    if [ -r "$REPO/src/watcher_sentinel.sh" ] && [ -n "${_WS:-}" ]; then
+        . "$REPO/src/watcher_sentinel.sh"
+        sentinel="$(sentinel_path_for "$_WS/state" 2>/dev/null)" || sentinel=""
+    fi
+    if [ -n "$sentinel" ] && [ -f "$sentinel" ]; then
+        pid="$(cat "$sentinel" 2>/dev/null)"
+        case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null
+        return
+    fi
+    echo "  WARN could not resolve this core's own watcher sentinel -- falling back to the no-argument invocation pattern (a worker's watcher always carries a delivery-path argument, so this still cannot match one)"
+    pkill -f "watch-tasks-stream.sh$" 2>/dev/null
+}
+_stop_core_watcher
 pkill -f "conversation-server" 2>/dev/null
 pkill -f "ngrok" 2>/dev/null
 # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
@@ -121,10 +146,13 @@ fi
 # skipped the relaunch and the user saw "restart did nothing."
 # See feedback_pkill_then_open_race.md and PR #499 for the same class on
 # startup.sh's recompile-replace path.
+# "watch-tasks" deliberately excluded: it would also match a live pool
+# worker's watcher (never touched above), so this drain loop would wait the
+# full 30 iterations on every restart with any worker running.
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
 for _ in $(seq 1 30); do
