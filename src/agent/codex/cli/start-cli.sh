@@ -212,14 +212,19 @@ ensure_task_notifier() {
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
+    "$REPO/src/workspace_dir_resolve.sh"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
   # itself and fswatches it for changes, so the launcher forwards only a genuine
-  # operator pin (if one is already set) and nothing computed.
+  # operator pin (if one is already set) and nothing computed. The effective
+  # workspace override is part of the identity too: an unchanged script tree
+  # with a DIFFERENT SUTANDO_WORKSPACE_DIR/TASKS_DIR/RESULTS_DIR must still
+  # force a restart, or the gate validates one tree while the reused notifier
+  # keeps watching another.
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-e$(printf '%s|%s|%s' "${SUTANDO_WORKSPACE_DIR:-}" "${SUTANDO_TASKS_DIR:-}" "${SUTANDO_RESULTS_DIR:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \

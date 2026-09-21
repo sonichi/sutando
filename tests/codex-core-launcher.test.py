@@ -223,21 +223,25 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler=""):
+    def _notifier_version(self, handler="", workspace_dir="", tasks_dir="", results_dir=""):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
+            str(self.root / "src/workspace_dir_resolve.sh"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
-        # Matches the launcher's own formula, which now folds the resolved
-        # handler (empty here — this fixture publishes none) into the version.
+        # Matches the launcher's own formula: the resolved handler, and the
+        # effective workspace override triple, both fold into the version.
         handler_cksum = subprocess.run(
             ["cksum"], input=handler.encode(), capture_output=True,
             check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}"
+        env_cksum = subprocess.run(
+            ["cksum"], input=f"{workspace_dir}|{tasks_dir}|{results_dir}".encode(),
+            capture_output=True, check=True, text=False).stdout.decode().split()[0]
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-e{env_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -683,6 +687,22 @@ exit 0
         calls = self.log.read_text()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_a_workspace_only_change_still_forces_a_notifier_restart(self):
+        """An active notifier started under one SUTANDO_WORKSPACE_DIR must be
+        replaced when the launcher reruns under a different one, even though
+        every script file is byte-identical -- the version must fold in the
+        effective workspace, not just file content."""
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex",
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(workspace_dir="/tmp/workspace-A"),
+            "SUTANDO_WORKSPACE_DIR": "/tmp/workspace-B",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("kill-session -t =sutando-core-watcher", calls)
+        self.assertIn("new-session -d -s sutando-core-watcher", calls)
 
     def test_nested_tmux_invocation_never_attaches(self):
         result = self.run_launcher_with_tty(env_extra={
