@@ -61,6 +61,24 @@ class ExtraContentTests(unittest.TestCase):
                 room_ops._main(["say", ROOM, "hi", "--extra-content", json.dumps({"space.ag2.k": {"v": 1}})])
         self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
 
+    def test_thread_root_rides_the_payload_and_the_flag_reaches_the_function(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        got = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (got.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "yes", "--thread-root", "$root"])
+        self.assertEqual(got["kw"], {"reply_to": None, "thread_root": "$root"})
+
+    def test_a_malformed_thread_root_is_refused_before_the_network(self):
+        called = []
+        with mock.patch.object(sy, "http_json", side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = sy.say("hi", ROOM, HS, gate=None, thread_root="not-an-id")
+        self.assertFalse(res["ok"]) and self.assertIn("thread_root", res["reason"])
+        self.assertEqual(called, [])
+
     def test_a_flag_that_is_not_an_object_is_refused_before_the_function(self):
         with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
             with self.assertRaises(SystemExit):

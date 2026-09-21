@@ -185,3 +185,17 @@ def relative_position(doc: Doc, text: Text, name: str, index: int) -> dict:
 def encode(doc: Doc, text: Text, name: str, index: int) -> bytes:
     """The same position in Yjs's binary form, what a client decodes."""
     return StickyIndex.from_json(relative_position(doc, text, name, index), sequence=text).encode()
+
+
+def as_awareness_json(position: dict, name: str) -> dict:
+    """The four keys a Yjs RelativePosition serializes to: `type`, `tname`,
+    `item`, `assoc`, nulls included.
+
+    An awareness cursor is read as raw JSON — `createAbsolutePositionFromRelativePosition`
+    takes the object itself, not `createRelativePositionFromJSON` — and its
+    `item !== null` test reads a MISSING key as an id, then dereferences it.
+    So a key left out is not an absent field here; it is a crash, and the
+    caret never draws.
+    """
+    return {"type": None, "tname": name, "item": position.get("item"),
+            "assoc": position.get("assoc", 0)}

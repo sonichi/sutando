@@ -1465,11 +1465,12 @@ class RelationFieldsTests(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to this citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_becomes_its_own_field_and_is_checked_like_a_citation(self):
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(EnvCase):
@@ -1494,12 +1495,17 @@ class SayCitationTests(EnvCase):
         self.assertEqual(cap["payload"]["body"], "hi")
         self.assertEqual(cap["payload"]["op"], "message")
 
-    def test_no_thread_relation_is_ever_sent(self):
-        # Pins the review's requirement: nothing on this path may claim thread
-        # membership the gateway cannot deliver.
+    def test_a_citation_alone_never_claims_a_thread(self):
+        # A reply-to is a citation; only an explicit thread_root asks for the thread.
         _res, cap = self._post(reply_to=EV)
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_thread_root_rides_the_payload_as_the_gateways_own_field(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        self.assertNotIn("m.relates_to", cap["payload"], "the gateway builds the relation, not this side")
 
     def test_extra_content_rides_the_payload_beside_the_body(self):
         anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
