@@ -154,6 +154,7 @@ backend swap, never a re-format.
 | `contract` | opt | `{inputs, outputs, guarantees}` — what downstream depends on across versions |
 | `provenance` | opt | `{source_repo, forked_from, upstream_intent}` — keeps forks trackable |
 | `enabled`, `access_tier`, `tools`, `server`, `startup`, `config` | — | manifest-loaded skills only (see above) |
+| `documented_for_core`, `core_description` | opt | a skill the core runs (no `tools`): `core_description` is read by `loadCoreDocumentedSkills()` (`src/inline-tools.ts`) into the voice prompt, so voice delegates it through `work` instead of saying it cannot |
 
 `permissions` is a **declaration the linter cross-checks**: e.g. `network: false`
 on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that
