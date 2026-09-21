@@ -232,11 +232,14 @@ _VOICE_ROOM_HELD: set = set()
 
 def _voice_result_room(path: Path) -> "str | None":
     """The room a voice result addresses through its own `[channel: !room]`
-    line, or None for the owner-DM shape or an unreadable file."""
+    line, None for the owner-DM shape or a vanished file, "" for one that
+    cannot be decoded (no room verifies as "", so it is held)."""
     try:
         route, room, _ = _proactive_route(path.read_text(encoding="utf-8"))  # noqa: F821
     except OSError:
         return None
+    except ValueError:
+        return ""
     return room if route == "send" else None
 
 

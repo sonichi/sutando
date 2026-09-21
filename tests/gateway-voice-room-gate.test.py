@@ -193,6 +193,12 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         self.assertTrue(self.mod._ag2space_proactive_claim_gate(other),
                         "only the task bridge's proactive-result-* shape is a voice result")
 
+    def test_undecodable_tagged_file_is_held_not_raised(self):
+        bad = self._result("proactive-result-task-11-11.to-ag2space.txt", "x")
+        bad.write_bytes(b"[channel: " + b"\xff\xfe" + b"]\nbody")
+        self.assertFalse(self.mod._ag2space_proactive_claim_gate(bad), "fail closed, never an exception")
+        self.assertIn(bad.name, self.mod._VOICE_ROOM_HELD)
+
     def test_held_file_is_released_once_the_room_verifies(self):
         late = self._result("proactive-result-task-8-8.to-ag2space.txt", "[channel: !late:example.org]\nlate")
         self.assertFalse(self.mod._ag2space_proactive_claim_gate(late))
