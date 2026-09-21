@@ -149,12 +149,8 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	// non-empty, it's the CURRENT session's in-progress turns —
 	// safe to replay without trigger filtering.
 	const recent = ctx.getRecentConversation(8);
-	// Offline-delivery hint: count proactive-result-*.txt files archived
-	// in the last 30 min. These are voice-task results forwarded to the
-	// owner's chat while voice was offline (per task-bridge.ts fallback:
-	// the room the task came from, else the owner's DM on whichever bridge
-	// is active). Surface a one-line ack on reconnect so voice doesn't
-	// have to re-deliver and the user knows where to find the answers.
+	// Offline-delivery hint: proactive-result-*.txt files archived in the last 30 min are voice results
+	// forwarded to the owner's chat while voice was offline; one line on reconnect says where they are.
 	let offlineDeliveryHint = '';
 	try {
 		const archDir = join(WORKSPACE_DIR, 'results', 'archive', new Date().toISOString().slice(0, 7));

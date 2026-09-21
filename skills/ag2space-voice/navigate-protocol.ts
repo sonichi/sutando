@@ -4,10 +4,8 @@
 /** The capability a client announces in `session.context` when it answers `ui.navigate`. */
 export const UI_NAVIGATE_CAPABILITY = 'ui.navigate';
 
-/** Agent → client frame asking the desktop to move: the DM, a room found by
- *  the spoken words in `query`, or home. The client resolves names — it has
- *  the room list and the user's spaces — and answers with `ui.navigated`
- *  carrying the same `request_id`. */
+/** Agent → client: move to the DM, a room found by the spoken words in `query`, or home.
+ *  The client resolves names and answers with `ui.navigated` carrying the same `request_id`. */
 export const UI_NAVIGATE_TYPE = 'ui.navigate';
 export const UI_NAVIGATED_TYPE = 'ui.navigated';
 
@@ -84,9 +82,8 @@ export function buildUiNavigatedFrame(
 	return frame;
 }
 
-/** Pure: a `ui.navigated` v1 frame, or null for anything else (agent side).
- *  An unknown `error` value reads as `unsupported`; a frame that says `ok`
- *  while carrying an error is not ok. */
+/** A `ui.navigated` v1 frame, or null for anything else. An unknown `error` reads as
+ *  `unsupported`; a frame that says `ok` while carrying an error is not ok. */
 export function parseUiNavigatedFrame(msg: unknown): UiNavigatedFrame | null {
 	const m = msg as Record<string, unknown> | null | undefined;
 	if (!m || m.type !== UI_NAVIGATED_TYPE || m.version !== 1) return null;

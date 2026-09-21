@@ -3,12 +3,12 @@
 Adapter-owned, not core policy: `src/remote-gateway-bridge.py` is the only
 importer, and the readers it injects (`members`, `agent_mxid`, `owner_mxid`)
 are that bridge's gateway calls. Nothing here names a gateway or opens a
-connection, and no core module may import it; the task bridge reaches it only
-through the request/verdict files below.
+connection, and no core module may import it; the `skills/ag2space-voice`
+plugin reaches it only through the request/verdict files below.
 
 The voice client only NAMES the room it is docked in; proving that the agent
 and its owner are joined there takes the gateway's credentials, which live in
-the gateway bridge. So the task bridge drops `<key>.request.json` into
+the gateway bridge. So the plugin drops `<key>.request.json` into
 `state/voice-room-checks/`, the verifier thread answers with
 `<key>.verdict.json` (one gateway read per room per TTL), and the proactive
 claim gate re-asks the same verifier before a voice result may post into a

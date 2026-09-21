@@ -252,9 +252,8 @@ export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
 	}
 }
 
-/** Write an origin-bound result for the origin's bridge: `.to-<channel>` in the name,
- *  `[channel: <target>]` on top unless the result opens with its own redirect.
- *  Claimed at once: the name passes `_shouldFallthrough` and would be spoken again. */
+/** Write an origin-bound result: `.to-<channel>` in the name, `[channel: <target>]` on top unless
+ *  it opens with its own redirect. Claimed at once, or the drain would speak it again. */
 export function forwardVoiceResultToOrigin(taskId: string, result: string, origin: VoiceSessionOrigin, nowSec = Math.floor(Date.now() / 1000)): string {
 	const file = `proactive-result-${taskId}-${nowSec}.to-${origin.channel}.txt`;
 	// parse_markers keeps the first redirect, so a result that opens with its own wins by not being preceded.
@@ -384,11 +383,8 @@ export function _isVoiceTask(taskId: string): boolean {
 	return _headerIsVoice(headerLines);
 }
 
-/** The voice verdict over header lines.
- *  `source: voice` is the key. An origin-bound voice task carries its target in
- *  `channel_id`, so that field no longer identifies voice; `media_form:
- *  live_stream` never does (the phone skill stamps it too). The
- *  `channel_id: local-voice` literal stays for files archived before origins. */
+/** Voice verdict over header lines: `source: voice`. `channel_id` may carry an origin's target and
+ *  `media_form` is stamped by phone too; the `local-voice` literal covers older archived files. */
 function _headerIsVoice(headerLines: string[]): boolean {
 	return headerLines.some(l => l.startsWith('source: voice') || l.startsWith('channel_id: local-voice'));
 }
@@ -412,9 +408,8 @@ export async function resolveVoiceResultOrigin(taskId: string): Promise<VoiceSes
 	return null;
 }
 
-/** Voice result with no client attached: to its verified origin — unless it is
- *  `[dm-only]`, then the owner's DM — else the untagged owner-DM shape, left
- *  unclaimed: where no bridge takes it, the drain speaks it on reconnect. */
+/** Voice result with no client attached: its verified origin, or the owner's DM when `[dm-only]`, else
+ *  the untagged owner-DM shape, left unclaimed so the drain speaks it on reconnect if no bridge takes it. */
 export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
 	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
 	if (kept) return kept;
@@ -452,18 +447,16 @@ export function _forwardOfflineThenArchive(
 	});
 }
 
-/** Every header line of a voice task, above `task:`. One writer for the work tool and
- *  the cancel tool. An origin-bound task keeps `source: voice` as its voice identity,
- *  addresses the origin through `channel_id`, and carries the adapter's own keys. */
+/** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
+ *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
 export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
 		`source: voice`,
 		`interaction_type: realtime_audio`,
-		// interaction-model 4D, step 1.5 (scope A): the media-form axis on
-		// live-plane tasks. `live_stream` = the payload originates from a
-		// continuous real-time session (frames stay out-of-band; provenance).
+		// Media-form axis on live-plane tasks: the payload originates from a continuous
+		// real-time session (frames stay out-of-band; this is provenance).
 		'media_form: live_stream',
 		`channel_id: ${origin?.target ?? 'local-voice'}`,
 	];
@@ -1073,9 +1066,8 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 	}, 2000);
 }
 
-/** The drain's listener: the result text, plus an optional delivery note the
- *  adapter injects under it (where the written copy went) when it differs from
- *  what the session was told to expect. */
+/** The drain's listener: the result text, plus an optional delivery note injected under it
+ *  when the written copy went somewhere other than the session was told to expect. */
 export type ResultListener = (result: string, deliveryNote?: string) => void;
 
 export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
