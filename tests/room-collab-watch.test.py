@@ -175,6 +175,31 @@ async def test_the_agents_own_write_is_not_reported():
     await agen.aclose()
 
 
+async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
+    # The editor draws a caret only from awareness `cursor` (a Yjs relative
+    # position); the index is in the store's units, UTF-8 bytes.
+    from pycrdt import StickyIndex
+    doc, room = make()
+    assert "cursor" not in (room._awareness.get_local_state() or {}), "no caret before any write"
+    await room.append("héllo")                       # 6 bytes, 5 chars
+    cur = room._awareness.get_local_state()["cursor"]
+    assert cur["anchor"] == cur["head"], cur
+    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
+    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == len("héllo".encode()), cur
+    await room.insert(0, "¡")                        # 2 bytes at the front
+    cur = room._awareness.get_local_state()["cursor"]
+    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == 2, cur
+    # A remote edit before the caret does not move it off its character.
+    remote_append(doc, "")                           # no-op sync, still fine
+    peer = Doc(); peer.apply_update(doc.get_update())
+    peer.get(DEFAULT_TEXT_NAME, type=Text).insert(0, "ZZZ")
+    doc.apply_update(peer.get_update(doc.get_state()))
+    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == 2 + 3, "a relative position follows the text"
+    await asyncio.sleep(0)                           # the awareness frames are sent quietly, off the write path
+    sent = [m for m in room._ws.sent if m[:1] == b"\x01"]   # awareness frames went out
+    assert len(sent) >= 2, len(sent)
+
+
 async def test_the_session_ending_raises_instead_of_stopping_quietly():
     doc, room = make()
     agen = room.changes()

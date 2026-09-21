@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import websockets
     from pycrdt import (
-        Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
+        Assoc, Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
@@ -319,10 +319,33 @@ class RoomDoc:
     async def append(self, addition: str) -> None:
         text = self._require_text("append text")
         await self._commit(lambda: text.__iadd__(addition))
+        await self._publish_cursor(len(str(text).encode("utf-8")))
 
     async def insert(self, index: int, addition: str) -> None:
         text = self._require_text("insert text")
         await self._commit(lambda: text.insert(index, addition))
+        await self._publish_cursor(index + len(addition.encode("utf-8")))
+
+    async def _publish_cursor(self, index: int) -> None:
+        """Put the agent's caret at `index` (the store's units) for the editors
+        to draw: the same awareness `cursor` a person's editor publishes — a
+        relative position, so it follows the text as others type around it."""
+        if self._text is None:
+            return
+        try:
+            if index >= len(str(self._text).encode("utf-8")):
+                # The end of the text has no item to attach to; Yjs spells it as the
+                # type itself, right-associated. pycrdt panics on it instead.
+                pos = {"tname": self._text_name, "assoc": 0}
+            else:
+                # Right-associated: anchored to the item that starts here. pycrdt
+                # cannot resolve a position at an item's END, so never BEFORE.
+                pos = self._text.sticky_index(index, Assoc.AFTER).to_json()
+        except BaseException:  # noqa: BLE001 - a pyo3 panic, or a cancel mid-send; the write already landed
+            return  # deliberately wider than Exception: a panic is not one
+        self._awareness.set_local_state_field("cursor", {"anchor": pos, "head": pos})
+        await self._send_quietly(create_awareness_message(
+            self._awareness.encode_awareness_update([self._awareness.client_id])))
 
     async def put_elements(self, elements: list[dict]) -> int:
         """Write elements that are newer than what is stored. Returns how many.
@@ -624,6 +647,7 @@ class RoomDoc:
             text.insert(start, new)
 
         await self._commit(mutate)
+        await self._publish_cursor(start + len(new.encode("utf-8")))
 
     async def settle(self, seconds: float = 1.0) -> None:
         """Wait for the server to acknowledge, and fail if it refused instead."""

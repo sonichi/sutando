@@ -232,7 +232,9 @@ Three things that matter more than they look:
 1. **Publish presence.** Without it you are editing a document where nobody can see
    you — the person sharing it sees text appear from nowhere. Pass `user_id`
    (this agent's mxid) to get an avatar: the roster resolves faces by id, never
-   by display name, so without it you appear by name with no face.
+   by display name, so without it you appear by name with no face. Each
+   `append`/`insert`/`replace` also places your caret at the write's end, so
+   the editor draws where you last wrote, in your colour, like a person's.
 2. **One connection per agent per surface.** Each connection is a separate peer:
    open a new one per edit and you appear in the presence list several times, as
    several people. Hold the context manager open instead.
