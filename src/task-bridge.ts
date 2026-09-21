@@ -391,6 +391,26 @@ export function setTaskStatusCallback(fn: (taskId: string, status: string, text:
 // Main agent tool — writes task file directly, no subagent needed
 // ---------------------------------------------------------------------------
 
+// The core's own bookkeeping files are not the owner's queue. Mirrors
+// src/task_queue.py BOOKKEEPING_PREFIXES, the pending list's single owner.
+const QUEUE_BOOKKEEPING_PREFIXES = ['task-cron-', 'task-bench-', 'task-workstream-', 'task-project-grouping-'];
+
+/** How many owner tasks are pending in `dir` besides `excludeId`: the voice
+ *  agent's "N ahead of this one". A directory it cannot read counts as 0 —
+ *  the number is a courtesy line, never a reason to fail the delegation. */
+export function countQueuedAhead(dir: string, excludeId: string): number {
+	let names: string[];
+	try { names = readdirSync(dir); } catch { return 0; }
+	return names.filter(f => f.startsWith('task-') && f.endsWith('.txt') && f !== `${excludeId}.txt`
+		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))).length;
+}
+
+/** The sentence the voice agent says when other tasks are ahead; empty when none are. */
+export function queuedAheadInstruction(queuedAhead: number): string {
+	if (queuedAhead <= 0) return '';
+	return ` ${queuedAhead} task(s) are ahead of this one. Tell the user exactly "Got it, ${queuedAhead} ahead of this one, working in order" and wait; do not narrate the queue again.`;
+}
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
@@ -564,12 +584,17 @@ export const workTool: ToolDefinition = {
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
+		// Counted after the write, so the file just written is excluded by id and
+		// everything older in tasks/ is what stands ahead of it.
+		const queuedAhead = countQueuedAhead(TASK_DIR, taskId);
 		return {
 			status: 'pending',
 			taskId,
-			message: watcherOnline
+			queuedAhead,
+			message: (watcherOnline
 				? 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.'
-				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.',
+				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
+				+ queuedAheadInstruction(queuedAhead),
 		};
 	},
 };
