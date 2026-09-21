@@ -14,13 +14,17 @@ fail=0
 cat > "$T/s1.sh" <<'EOF'
 printf 'leftover\n' > "$PWD/lane-reset-leftover.txt"
 printf '\n# dirtied by a lane suite\n' >> "$PWD/README.md"
+printf '\n# staged by a lane suite\n' >> "$PWD/CONTRIBUTING.md"; git add CONTRIBUTING.md
 [ -e "$PWD/lane-reset-leftover.txt" ] && echo "wrote-untracked"
 git diff --quiet -- README.md || echo "edited-tracked"
+git diff --cached --quiet -- CONTRIBUTING.md || echo "staged-tracked"
 exit 0
 EOF
 cat > "$T/s2.sh" <<'EOF'
 [ -e "$PWD/lane-reset-leftover.txt" ] && echo "untracked-leftover-present"
 git diff --quiet -- README.md || echo "tracked-edit-present"
+git diff --cached --quiet -- CONTRIBUTING.md || echo "staged-edit-present"
+git diff --quiet HEAD -- CONTRIBUTING.md || echo "staged-edit-in-tree"
 [ -L "$PWD/node_modules" ] && echo "node-modules-link-present"
 echo "checked"
 exit 0
@@ -43,6 +47,11 @@ case "$out2" in
     *tracked-edit-present*) echo "  FAIL suite 2 saw suite 1's edit to a tracked file"; fail=1 ;;
     *) echo "  ok   suite 1's edit to a tracked file was reverted before suite 2" ;;
 esac
+# A staged edit lives in the index; a checkout from the index would keep it.
+case "$out2" in
+    *staged-edit-present*|*staged-edit-in-tree*) echo "  FAIL suite 2 saw suite 1's STAGED edit (index not reset)"; fail=1 ;;
+    *) echo "  ok   suite 1's staged edit was dropped from index and tree before suite 2" ;;
+esac
 # The shared node_modules link is a symlink, which .gitignore's `node_modules/`
 # does not cover; the reset must leave it for the next suite.
 if [ -d "$here/node_modules" ]; then
@@ -56,7 +65,7 @@ fi
 # Control: suite 1 really did dirty the tree, or the checks above prove nothing.
 out1="$(cat "$T/rec/1.out" 2>/dev/null)"
 case "$out1" in
-    *wrote-untracked*edited-tracked*) echo "  ok   suite 1 dirtied its tree both ways (control)" ;;
+    *wrote-untracked*edited-tracked*staged-tracked*) echo "  ok   suite 1 dirtied its tree three ways (control)" ;;
     *) echo "  FAIL suite 1 did not dirty its tree: [$out1]"; fail=1 ;;
 esac
 # The caller's own tree is untouched: the reset happens in the lane worktrees only.

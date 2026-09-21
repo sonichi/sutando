@@ -32,7 +32,9 @@ _lane_reset() {
     local top
     top="$(cd "$1" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)" || return 0
     [ "$top" = "$(cd "$1" && pwd -P)" ] || return 0
-    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" checkout -q -- . 2>/dev/null || true
+    # reset --hard, not checkout: a checkout restores from the index, so a suite
+    # that staged an edit would hand it to the next suite intact.
+    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" reset -q --hard HEAD 2>/dev/null || true
     # The node_modules link is a symlink, which `node_modules/` in .gitignore does
     # not cover (that pattern matches directories only), so exclude it by name.
     env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" clean -fdq -e node_modules 2>/dev/null || true
