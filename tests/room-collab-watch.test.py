@@ -175,6 +175,25 @@ async def test_the_agents_own_write_is_not_reported():
     await agen.aclose()
 
 
+async def test_presence_alone_shows_a_caret_at_the_end_of_the_text():
+    # A watcher that only sits in the document must still be drawn somewhere:
+    # a person's editor shows its caret the whole time it is open.
+    doc, room = make()
+    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
+    text += "héllo"
+    await room.set_presence("mars", user_id="@m:x")
+    state = room._awareness.get_local_state()
+    assert state["user"]["name"] == "mars"
+    assert state["cursor"] == {"anchor": {"tname": DEFAULT_TEXT_NAME, "assoc": 0},
+                               "head": {"tname": DEFAULT_TEXT_NAME, "assoc": 0}}, state
+    await asyncio.sleep(0)
+    assert len([m for m in room._ws.sent if m[:1] == b"\x01"]) >= 2, "presence and caret both went out"
+    # A structured surface has no text to sit in: presence only, no caret, no error.
+    _bdoc, board = make_kind(BOARD_KIND)
+    await board.set_presence("mars")
+    assert "cursor" not in board._awareness.get_local_state()
+
+
 async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
     # The editor draws a caret only from awareness `cursor`: a Yjs relative
     # position, i.e. the ID of a unit of text, counted in UTF-16 by Yjs.
