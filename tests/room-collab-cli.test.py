@@ -335,6 +335,122 @@ def test_append_reports_the_growth_it_caused():
     assert payload == {"ok": True, "before": 2, "after": 6}, payload
 
 
+def test_delta_is_the_new_lines_and_a_first_read_is_all_new():
+    assert room_collab.delta_since(None, "a\n\nb\n") == ["a", "b"], "no earlier read: everything"
+    assert room_collab.delta_since("a\nb", "a\nb\nc") == ["c"]
+    assert room_collab.delta_since("a\nb", "a\nb") == []
+    assert room_collab.delta_since("todo: x", "todo: x\ntodo: x") == ["todo: x"], "written again is new again"
+
+
+def test_a_read_is_remembered_per_room_and_surface_and_recalled_with_its_time():
+    import tempfile
+    ws = Path(tempfile.mkdtemp())
+    p = room_collab.snapshot_path(ws, "!r:x", "markdown")
+    assert p.parent == ws / "state" / "room-collab" and "!" not in p.name and ":" not in p.name
+    assert p != room_collab.snapshot_path(ws, "!r:x", "board"), "a surface has its own memory"
+    assert p != room_collab.snapshot_path(ws, "!other:x", "markdown")
+    assert room_collab.recall(p) == (None, None), "nothing yet"
+    room_collab.remember(p, "first\nsecond")
+    text, at = room_collab.recall(p)
+    assert text == "first\nsecond" and isinstance(at, float) and at > 0
+    assert not p.with_suffix(".tmp").exists(), "written atomically, no temp file left"
+
+
+def test_presence_asks_the_service_without_a_socket_and_reads_the_counts():
+    import io
+    seen = {}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(req, timeout=0):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        return _Resp(json.dumps({"room": "!r:x", "surfaces": {
+            "markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
+            "kanban": {"peers": "junk"}, "weird": "not a dict"}}).encode())
+
+    got = room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
+    assert seen["url"] == "https://h/api/v1/room-collab/%21r%3Ax/presence", seen
+    assert seen["auth"] == "Bearer tok"
+    assert got == {"markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
+                   "kanban": {"peers": 0, "agents": 0}}, got
+    # An origin that already names the path is not doubled.
+    room_collab.presence_summary("https://h/api/v1/room-collab", "!r:x", "tok", opener=opener)
+    assert seen["url"].count("/api/v1/room-collab") == 1
+    text = room_collab.render_presence("!r:x", got, as_json=False)
+    assert "markdown     2 present  (1 agent(s), 1 person(s))" in text, text
+    assert json.loads(room_collab.render_presence("!r:x", got, as_json=True))["surfaces"] == got
+    assert "nobody is in any surface" in room_collab.render_presence("!r:x", {"markdown": {"peers": 0, "agents": 0}}, False)
+
+
+def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
+    import io
+    import urllib.error
+
+    def refuse(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, io.BytesIO(b""))
+
+    def garbage(req, timeout=0):
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _R(b'{"room": "!r:x"}')
+
+    for opener, needle in ((refuse, "presence refused (403)"), (garbage, "without surfaces")):
+        try:
+            room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
+        except RoomDocError as e:
+            assert needle in str(e), str(e)
+        else:
+            raise AssertionError(f"{needle}: should have raised")
+
+
+def test_read_delta_prints_only_what_is_new_since_the_last_read():
+    import asyncio
+    import contextlib
+    import io
+    import tempfile
+    import room_collab_client
+    ws = tempfile.mkdtemp()
+
+    class _D:
+        text = "line one\nline two"
+        peers = []
+        authors = {}
+
+    def run(*argv):
+        args = room_collab.build_parser().parse_args(["--workspace", ws, "--url", "https://h", "--token", "t", *argv])
+        real = room_collab_client.open_room_collab
+        room_collab_client.open_room_collab = _opener(_D())
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = asyncio.run(room_collab.run(args))
+        finally:
+            room_collab_client.open_room_collab = real
+        return rc, out.getvalue()
+
+    rc, out = run("read", "--delta", "!r:x")
+    assert rc == 0 and "no earlier read" in out and "line one" in out and "line two" in out, out
+    _D.text = "line one\nline two\nline three"
+    rc, out = run("read", "--delta", "!r:x")
+    assert rc == 0 and "1 new line(s) since your last read at" in out, out
+    assert "line three" in out and "line one" not in out, out
+    rc, out = run("--json", "read", "--delta", "!r:x")
+    body = json.loads(out)
+    assert body["delta"] == [] and body["since"] and body["chars"] == len(_D.text), body
+    rc, out = run("read", "!r:x")
+    assert rc == 0 and out.strip() == _D.text, "a plain read is unchanged, and it remembers too"
+
+
 def test_an_unknown_command_refuses_rather_than_printing_nothing():
     try:
         room_collab.render("nope")

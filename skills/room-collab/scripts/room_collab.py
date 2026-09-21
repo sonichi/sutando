@@ -9,17 +9,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
+from room_collab_watch import new_lines  # noqa: E402
 
 # The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
 COMMENT_KEY = "space.ag2.collab.doc.comment"
@@ -115,6 +121,90 @@ def credential_report(explicit_token: str | None, explicit_url: str | None,
         else:
             rows.append(("url", False, "none found; set one of " + ", ".join(URL_VARS)))
     return rows
+
+
+def delta_since(previous: str | None, current: str) -> list[str]:
+    """The lines that are new since `previous`; everything when there is none.
+
+    A summoned agent that comes back should read what changed before it reads
+    everything again. Same rule as `watch` uses for a remote edit."""
+    if previous is None:
+        return [line for line in current.split("\n") if line.strip()]
+    return new_lines(previous, current)
+
+
+def snapshot_path(workspace: Path, room: str, kind: str) -> Path:
+    """Where this agent keeps what it last read of one surface: per room and kind,
+    hashed so a room id's `!` and `:` never touch the filesystem."""
+    key = hashlib.sha1(f"{room}\n{kind}".encode("utf-8")).hexdigest()[:16]
+    return Path(workspace) / "state" / "room-collab" / f"last-read-{key}.txt"
+
+
+def recall(path: Path) -> tuple[str | None, float | None]:
+    try:
+        return path.read_text(encoding="utf-8"), path.stat().st_mtime
+    except OSError:
+        return None, None
+
+
+def remember(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _workspace(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    sys.path.insert(0, str(HERE.parent.parent.parent / "src"))
+    from workspace_default import resolve_workspace  # noqa: WPS433
+    return Path(resolve_workspace())
+
+
+def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
+    """Who is in each of the room's surfaces, from the service — without opening
+    any of them. The same answer the header's live dot is drawn from."""
+    origin = url.rstrip("/")
+    if "/api/v1/room-collab" not in origin and "/api/v1/room-doc" not in origin:
+        origin = f"{origin}/api/v1/room-collab"
+    endpoint = f"{origin}/{urllib.parse.quote(room, safe='')}/presence"
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RoomDocError(f"presence refused ({exc.code}) at {endpoint}: "
+                           + ("not a member, or the token was rejected" if exc.code == 403
+                              else "the service did not answer it")) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RoomDocError(f"presence unreachable at {endpoint}: {exc}") from exc
+    surfaces = body.get("surfaces") if isinstance(body, dict) else None
+    if not isinstance(surfaces, dict):
+        raise RoomDocError(f"presence answered without surfaces at {endpoint}")
+    def count(v) -> int:
+        return v if isinstance(v, int) and v >= 0 else 0   # junk reads as nobody
+
+    out = {}
+    for kind, counts in surfaces.items():
+        if isinstance(counts, dict):
+            out[str(kind)] = {"peers": count(counts.get("peers")),
+                              "agents": count(counts.get("agents"))}
+    return out
+
+
+def render_presence(room: str, surfaces: dict, as_json: bool) -> str:
+    if as_json:
+        return json.dumps({"room": room, "surfaces": surfaces}, ensure_ascii=False, indent=2)
+    if not any(v["peers"] for v in surfaces.values()):
+        return f"nobody is in any surface of {room}"
+    rows = []
+    for kind, v in sorted(surfaces.items(), key=lambda kv: (-kv[1]["peers"], kv[0])):
+        people = v["peers"] - v["agents"]
+        who = ", ".join(p for p in (f"{v['agents']} agent(s)" if v["agents"] else "",
+                                    f"{people} person(s)" if people else "") if p)
+        rows.append(f"  {kind:<12} {v['peers']} present" + (f"  ({who})" if who else ""))
+    return "\n".join(rows)
 
 
 def parse_elements(raw: str) -> list:
@@ -350,6 +440,10 @@ async def run(args: argparse.Namespace) -> int:
         return await doctor(args)
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "presence":
+        # No socket: opening one would put this agent in the count it asks for.
+        print(render_presence(args.room, presence_summary(url, args.room, token), args.json))
+        return 0
     if args.command == "watch":
         return await watch(args, token, url)
 
@@ -414,6 +508,23 @@ async def run(args: argparse.Namespace) -> int:
         elif args.command == "replace":
             await doc.replace(args.old, args.new)
             await doc.settle(args.settle)
+        if args.command == "read":
+            # Every read remembers what it saw, so the next `--delta` is literal.
+            snap = snapshot_path(_workspace(getattr(args, "workspace", None)), args.room, args.kind)
+            previous, seen_at = recall(snap)
+            remember(snap, doc.text)
+            if getattr(args, "delta", False):
+                lines = delta_since(previous, doc.text)
+                since = (time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(seen_at))
+                         if seen_at else None)
+                if args.json:
+                    print(json.dumps({"chars": len(doc.text), "since": since, "delta": lines,
+                                      "peers": doc.peers}, ensure_ascii=False, indent=2))
+                else:
+                    head = (f"{len(lines)} new line(s) since your last read at {since}" if since
+                            else f"no earlier read of this surface — everything is new ({len(lines)} line(s))")
+                    print(head + ("\n" + "\n".join(lines) if lines else ""))
+                return 0
         print(render(args.command, text=doc.text, peers=doc.peers,
                      as_json=args.json, before=before,
                      authors=doc.authors if args.with_authors else None))
@@ -504,9 +615,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also report who wrote with each Yjs client id")
     sub = p.add_subparsers(dest="command", required=True)
 
+    p.add_argument("--workspace", default=None,
+                   help="workspace root for what you last read (default: the repo's resolver)")
     for name, help_text in (("read", "print the document"), ("peers", "who is present"),
-                            ("doctor", "check deps, credential, URL and connection, step by step")):
+                            ("doctor", "check deps, credential, URL and connection, step by step"),
+                            ("presence", "who is in each of the room's surfaces, without opening any")):
         s = sub.add_parser(name, help=help_text)
+        if name == "read":
+            s.add_argument("--delta", action="store_true",
+                           help="only the lines new since this agent last read the surface")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
     s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")

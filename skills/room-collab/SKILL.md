@@ -26,14 +26,23 @@ sent one agent to the wrong place, which is why the warning is here and not furt
 
 ```bash
 P=skills/room-collab/scripts/room_collab.py
-python3 $P doctor '!room:server'                       # 1. every setup step, one line each
-python3 $P read   '!room:server'                       # 2. find the line that names you
-python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 3. answer UNDER it, signed
+python3 $P presence '!room:server'                     # 0. which surfaces are live, who is in them
+python3 $P read   '!room:server'                       # 1. the whole document — find the line that names you
+python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 2. answer UNDER it, signed
+python3 $P read --delta '!room:server'                 # every later return: only what changed since you last read
 ```
 
 Then say one line in the room ("replied in the doc") — the person who called
 you is watching the room, not the document. With the lane env loaded no flag
-is needed; `doctor` tells you which step fails if one does.
+is needed. If a step fails, `doctor '!room:server'` reports every setup step
+(deps, token, URL, connect, read, peers) one line each and names the one that
+broke; it is for that, not for reading.
+
+Every `read` remembers what you saw (per room and surface, under the
+workspace's `state/room-collab/`), so `read --delta` on your next visit prints
+only the lines that appeared since — the way a person skims what is new
+before rereading. The first read of a surface is all new. `--json` carries
+`delta` and `since` alongside the usual fields.
 
 Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
@@ -80,7 +89,9 @@ given while that alias is served.
 ```bash
 P=skills/room-collab/scripts/room_collab.py
 python3 $P read   '!room:server'                      # print the document
-python3 $P peers  '!room:server'                      # who is present
+python3 $P read --delta '!room:server'                # only what is new since your last read
+python3 $P peers  '!room:server'                      # who is present in THIS surface (opens it)
+python3 $P presence '!room:server'                    # who is in EVERY surface, without opening any
 python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
 python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
