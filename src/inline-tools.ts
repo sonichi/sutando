@@ -1278,10 +1278,11 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 // OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
 // session so the skill registers session handlers without importing core.
-export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
-import type { SkillSetup } from './skill-setup-runner.js';
+export type { SkillSetupCtx, SkillSetup, VoiceSurfaceContribution, VoiceSurfaceHook } from './skill-setup-runner.js';
+import { collectVoiceSurface } from './skill-setup-runner.js';
+import type { SkillSetup, VoiceSurfaceHook } from './skill-setup-runner.js';
 
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[]; voiceSurfaces: VoiceSurfaceHook[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1316,6 +1317,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
 	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
 	const setups = new Map<string, SkillSetup>();
+	const voiceSurfaces = new Map<string, VoiceSurfaceHook>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1357,6 +1359,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
 					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
 				}
+				if (typeof mod.voiceSurface === 'function') voiceSurfaces.set(manifest.name || dirName, mod.voiceSurface as VoiceSurfaceHook);
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1375,7 +1378,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	};
 	// One authoritative line for what actually got registered, after dedupe.
 	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()], voiceSurfaces: [...voiceSurfaces.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1396,6 +1399,8 @@ export const envDependentToolNames: ReadonlySet<string> = new Set([
 // voice-agent invokes each once per session with {session, injectText}.
 // Empty when no skill exports setup().
 export const personalSkillSetups: SkillSetup[] = personalTools.setups;
+// Voice-session-only tools, prompt rules and context lines from skills' voiceSurface().
+export const personalVoiceSurface = collectVoiceSurface(personalTools.voiceSurfaces);
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

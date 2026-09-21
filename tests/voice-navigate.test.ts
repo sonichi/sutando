@@ -348,7 +348,7 @@ describe('navigate_ui wiring (source pins)', () => {
 
 	it('the agent declares navigate_ui only behind navigateUiAvailable(), and tells the prompt the same thing', () => {
 		assert.ok(agent.includes('const VOICE_NAVIGATE_UI = navigateUiAvailable();'));
-		assert.ok(agent.includes('...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : [])];'));
+		assert.ok(agent.includes('...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : []), ...personalVoiceSurface.tools];'));
 		assert.ok(agent.includes('navigateUi: VOICE_NAVIGATE_UI,'));
 		assert.ok(!tools.includes('navigateUiTool'), 'never in the shared tables the phone server pushes');
 	});

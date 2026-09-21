@@ -27,6 +27,7 @@ import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 import type { VoiceSessionRoom } from './task-bridge.js';
+import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
 import { navigateUiTool } from './voice-navigate.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
@@ -48,6 +49,8 @@ export interface VoiceConfigContext {
 	resetNoteViewingDebounce(): void;
 	getRecentConversation(count: number): string;
 	getSecondsSinceLastTurn(): number | null;
+	/** Voice-session-only tools, rules and context lines contributed by optional skills. */
+	voiceSurface?: VoiceSurfaceContribution;
 	/** The room the live session is docked in (task-bridge owns it); null in a DM. */
 	getSessionRoom(): VoiceSessionRoom | null;
 }
@@ -209,7 +212,8 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
 	const host = platform() === 'darwin' ? 'Mac' : platform() === 'win32' ? 'Windows' : platform();
-	const instantTools = ctx.navigateUi ? [...inlineTools, navigateUiTool] : inlineTools;
+	const surface = ctx.voiceSurface ?? {};
+	const instantTools = [...inlineTools, ...(ctx.navigateUi ? [navigateUiTool] : []), ...(surface.tools ?? [])];
 	return [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
@@ -236,7 +240,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
 		'',
-		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ room: ctx.getSessionRoom() }),
+		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ room: ctx.getSessionRoom(), extraLines: surface.contextLines?.() }),
 		'',
 		'DEFAULT BEHAVIOR: Call work for almost everything.',
 		'You are the voice interface. The Claude Code session is the brain.',
@@ -298,6 +302,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
 		// Present only when navigate_ui is declared, so the default prompt is unchanged.
 		...(ctx.navigateUi ? ['- NAVIGATION: "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", "go home" → call navigate_ui (target dm | room | home; query = the room and space words as spoken) — never work, never press_key. On ok, say ONE short line ("Taking you to GTM.") and carry on; the desktop then sends the new room context, and from there your replies and delegated work follow that room. On error "ambiguous", read the candidates and ask which one ("I found two rooms: GTM and GTM planning — which one?"), then call navigate_ui again with the name they pick. On "not_found", say you could not find a room called that. On "unsupported" or "timeout", say navigation works in the desktop app and move on.'] : []),
+		...(surface.promptRules ?? []),
 		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
 		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',

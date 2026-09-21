@@ -33,7 +33,8 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface } from './inline-tools.js';
+import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
@@ -714,7 +715,7 @@ function resolveCurrentMode(): ModeState {
 
 // navigate_ui is declared only where a client can answer it (gateway channel provisioned).
 const VOICE_NAVIGATE_UI = navigateUiAvailable();
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : [])];
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : []), ...personalVoiceSurface.tools];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -724,6 +725,7 @@ const _configCtx: VoiceConfigContext = {
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
 	navigateUi: VOICE_NAVIGATE_UI,
+	voiceSurface: personalVoiceSurface,
 	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
 	getRecentConversation,
@@ -1089,8 +1091,13 @@ async function main() {
 			session.sendJsonToClient({ ...ack });
 		} catch { /* no client attached — the next frame gets its own ack */ }
 		const notice = sessionRoomNotice(change, room);
-		if (!notice) return;
-		const line = framedSystem(notice);
+		if (notice) injectSessionContext(notice);
+	}
+
+	// Context a skill (or the core) wants the model to know: a framed system line sent
+	// as an open turn, retried because a frame can land before the upstream setup completes.
+	function injectSessionContext(text: string): void {
+		const line = framedSystem(text);
 		deliverWithRetry({
 			attempt: () => {
 				try {
@@ -1100,7 +1107,7 @@ async function main() {
 				} catch { /* session still constructing — retry */ }
 				return false;
 			},
-			onExhausted: () => console.log(`${ts()} [SessionRoom] session not active — room notice not injected (task routing still bound)`),
+			onExhausted: () => console.log(`${ts()} [SessionContext] session not active — context line not injected`),
 		});
 	}
 
@@ -1117,6 +1124,8 @@ async function main() {
 		clientCapabilities = next;
 		if (!same) console.log(`${ts()} [SessionRoom] client capabilities: ${caps.length ? caps.join(', ') : 'none'}`);
 	}
+
+	const clientFrames = createClientFrameHub((msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	const healthPersistence = createHealthPersistence();
 	const audioHealth = createAudioHealthLedger({
@@ -1154,6 +1163,8 @@ async function main() {
 			void handleSessionContextFrame(message);
 			resolveUiNavigated(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
+			// Frames the core does not own are offered to optional skills' handlers.
+			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
 		},
 		onClientConnected: () => {
 			if (legacyReconnectInFlight) return; // not a real attach edge
@@ -1166,6 +1177,7 @@ async function main() {
 			setVoiceSessionRoom(null);
 			clientCapabilities = new Set();
 			failPendingNavigations();
+			clientFrames.disconnected();
 			voiceRecoveryCoordinator?.handleClientDisconnected();
 		},
 		// Whenever the coordinator owns the episode (restarting, waiting-retry,
@@ -1633,8 +1645,22 @@ async function main() {
 
 	// Give each skill's setup() the live session so it registers handlers without
 	// importing core. Guarded: a buggy setup must not break session bootstrap.
-	runSkillSetups(personalSkillSetups, { session, injectText },
-		(msg, detail) => console.error(`${ts()} ${msg}`, detail));
+	runSkillSetups(personalSkillSetups, {
+		session,
+		injectText,
+		sendClientFrame: (frame) => {
+			try {
+				if (!session.clientConnected) return false;
+				session.sendJsonToClient(frame);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		onClientFrame: clientFrames.onClientFrame,
+		onClientDisconnected: clientFrames.onClientDisconnected,
+		injectContext: injectSessionContext,
+	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the

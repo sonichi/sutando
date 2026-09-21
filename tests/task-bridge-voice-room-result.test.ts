@@ -383,7 +383,10 @@ describe('room notices ask for an open turn', () => {
 		const src = readFileSync(join(process.cwd(), 'src', 'voice-agent.ts'), 'utf8');
 		const start = src.indexOf('function handleSessionContextFrame');
 		const body = src.slice(start, src.indexOf('\n\t}\n', start));
-		assert.ok(start > 0 && body.includes('injectSilentContext(session, line)'), 'notice goes through injectSilentContext');
+		assert.ok(start > 0 && body.includes('injectSessionContext(notice)'), 'notice goes through the context inject');
+		const injStart = src.indexOf('function injectSessionContext');
+		const inj = src.slice(injStart, src.indexOf('\n\t}\n', injStart));
+		assert.ok(inj.includes('injectSilentContext(session, line)') && !inj.includes('injectText('), 'which is the open-turn path, with no realtime-text fallback');
 		assert.ok(body.includes('await bindSessionContextFrame(message)'), 'the live frame binds only through the verified path');
 		assert.ok(!body.includes('applySessionContextFrame('), 'the unverified apply is never on the live path');
 		assert.ok(body.includes('buildSessionContextAckFrame(refused.id, false, refused.reason)'), 'a refusal is acked to the client');

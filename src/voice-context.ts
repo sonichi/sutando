@@ -65,7 +65,7 @@ export interface VoiceContextRoom { id: string; name?: string }
  * Gives Gemini awareness of the current system state and user context.
  * `room` is the room the live session is docked in (null/absent = DM).
  */
-export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null } = {}): string {
+export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null; extraLines?: string[] } = {}): string {
 	const userProfile = readMemory('user_profile.md');
 	const lines: string[] = [];
 
@@ -77,6 +77,9 @@ export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null } 
 		const label = opts.room.name ? `"${opts.room.name}" (${opts.room.id})` : opts.room.id;
 		lines.push(`ROOM: You are docked in room ${label}. What you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went.`, '');
 	}
+
+	// Lines an optional skill contributes about where the session is.
+	if (opts.extraLines?.length) lines.push(...opts.extraLines, '');
 
 	// Read build log summary
 	const buildLog = join(WORKSPACE_DIR, 'build_log.md');
