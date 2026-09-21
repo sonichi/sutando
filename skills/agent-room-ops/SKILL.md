@@ -64,11 +64,12 @@ python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please rev
 python3 skills/agent-room-ops/room_ops.py members '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$evt' --agent '@a:hs'
 #   --reply-to (on `say` and `mention`) CITES the message being replied to. The post stays
-#   in the MAIN TIMELINE — it is not thread membership. Only a relation with
-#   rel_type m.thread puts an event in a thread, and the gateway has no field for that,
-#   so room-ops deliberately offers no way to ask for one: a call that reported success
-#   while landing outside the requested thread is the failure worth refusing. A malformed
-#   event id is REFUSED before the network rather than posted uncited.
+#   in the MAIN TIMELINE — it is not thread membership. A malformed event id is REFUSED
+#   before the network rather than posted uncited.
+python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'yes, final' --thread-root '$evt' --agent '@a:hs'
+#   --thread-root (on `say`) posts IN that message's thread: the gateway builds the
+#   rel_type m.thread relation from the id, so the post leaves the main timeline and
+#   shows under the root — how a reply under a document comment is made. Same id check.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
