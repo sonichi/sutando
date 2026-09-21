@@ -1,4 +1,10 @@
-"""Trusted-side room-membership verdicts for room-bound voice sessions.
+"""The gateway bridge's room-membership verifier for room-bound voice sessions.
+
+Adapter-owned, not core policy: `src/remote-gateway-bridge.py` is the only
+importer, and the readers it injects (`members`, `agent_mxid`, `owner_mxid`)
+are that bridge's gateway calls. Nothing here names a gateway or opens a
+connection, and no core module may import it; the task bridge reaches it only
+through the request/verdict files below.
 
 The voice client only NAMES the room it is docked in; proving that the agent
 and its owner are joined there takes the gateway's credentials, which live in
