@@ -1501,6 +1501,20 @@ class SayCitationTests(EnvCase):
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
 
+    def test_extra_content_rides_the_payload_beside_the_body(self):
+        anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
+        res, cap = self._post(extra_content=anchor)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.collab.doc.comment"],
+                         anchor["space.ag2.collab.doc.comment"])
+        self.assertEqual(cap["payload"]["body"], "hi")
+
+    def test_extra_content_keeps_the_worker_stamp(self):
+        os.environ["SUTANDO_WORKER_SEAT"] = "7"
+        _res, cap = self._post(extra_content={"space.ag2.x": 1})
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.worker"]["id"], "worker-7")
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.x"], 1)
+
     def test_bad_id_refuses_before_the_network(self):
         os.environ["RELAY_URL"] = "https://r"
         called = []
@@ -1555,6 +1569,19 @@ class CitationCLITests(EnvCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_say_extra_content_flag_is_parsed_and_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '{"space.ag2.k": {"v": 1}}'])
+        self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
+
+    def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with self.assertRaises(SystemExit):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}

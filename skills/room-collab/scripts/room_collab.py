@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI over the room-collab client: read, append, replace, peers.
+"""CLI over the room-collab client: read, append, replace, comment, peers.
 
 Every subcommand opens the document, does one thing and closes. A long-lived
 collaborating agent should import `room_collab_client` instead and hold the
@@ -12,11 +12,19 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
+
+# The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
+COMMENT_KEY = "space.ag2.collab.doc.comment"
+# The client refuses a longer selection rather than truncating the quote it verifies by.
+QUOTE_MAX = 2000
 
 # The collab names lead; the ROOM_DOC_* spellings are read for one release
 # more so an install that set them keeps working through the rename.
@@ -384,6 +392,21 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "comment":
+            at, nth = locate_quote(doc.text, args.quote, args.nth)
+            body, extra = comment_content(doc.anchor(at, at + len(args.quote)), args.quote, nth,
+                                          args.text, args.mention)
+            if args.dry_run:
+                print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
+                                 ensure_ascii=False, indent=2))
+                return 0
+            receipt = post_comment(args.room, body, extra)
+            if args.json:
+                print(json.dumps(receipt, ensure_ascii=False))
+            else:
+                print(f"commented on {args.quote[:60]!r} (occurrence {nth}): "
+                      f"{receipt.get('event_id') or receipt.get('state') or 'posted'}")
+            return 0
         before = len(doc.text)
         if args.command == "append":
             await doc.append(args.text)
@@ -395,6 +418,74 @@ async def run(args: argparse.Namespace) -> int:
                      as_json=args.json, before=before,
                      authors=doc.authors if args.with_authors else None))
     return 0
+
+
+def locate_quote(text: str, quote: str, nth: int | None = None) -> tuple[int, int]:
+    """Where `quote` sits in `text`: (character offset, occurrence index).
+    Refuses an absent quote, and an ambiguous one unless `nth` picks."""
+    if not quote:
+        raise RoomDocError("a comment needs the text it is on: the quote is empty")
+    if len(quote) > QUOTE_MAX:
+        raise RoomDocError(f"the quote is {len(quote)} chars; a comment anchors to at most "
+                           f"{QUOTE_MAX} — quote less of the passage")
+    hits = []
+    i = text.find(quote)
+    while i != -1:
+        hits.append(i)
+        i = text.find(quote, i + 1)
+    if not hits:
+        raise RoomDocError(f"the quoted text is not in the document: {quote[:60]!r}")
+    if nth is None:
+        if len(hits) > 1:
+            raise RoomDocError(f"{quote[:60]!r} occurs {len(hits)} times; pass --nth 0..{len(hits) - 1} "
+                               "(0 is the first) or quote more of the passage")
+        nth = 0
+    if not 0 <= nth < len(hits):
+        raise RoomDocError(f"--nth {nth}, but {quote[:60]!r} occurs {len(hits)} time(s)")
+    return hits[nth], nth
+
+
+def comment_content(anchor: dict, quote: str, nth: int, message: str,
+                    mentions: list[str] | None = None) -> tuple[str, dict]:
+    """The room message a comment is: a body any client can read, and the
+    anchor the collab client hangs it on. The quote leads the body so a plain
+    timeline shows what is being talked about."""
+    text = message.strip()
+    if not text:
+        raise RoomDocError("a comment needs something to say")
+    # A full mxid in the body is what the gateway turns into a real mention.
+    lead = " ".join(m for m in (mentions or []) if m)
+    body = f"> {quote}\n\n{lead + ' ' + text if lead else text}"
+    return body, {COMMENT_KEY: {"anchor": {**anchor, "quote": quote, "nth": nth}, "v": 1}}
+
+
+def room_ops_script() -> Path | None:
+    """The room-ops skill installed beside this one, which is how an agent posts
+    a room message; None when it is not there."""
+    cand = HERE.parent.parent / "agent-room-ops" / "room_ops.py"
+    return cand if cand.is_file() else None
+
+
+def post_comment(room: str, body: str, extra: dict, *, runner=subprocess.run,
+                 script: Path | None = None) -> dict:
+    """Post the comment through room-ops `say`; the reply is its receipt."""
+    script = script or room_ops_script()
+    if script is None:
+        raise RoomDocError("posting needs the agent-room-ops skill installed beside this one. "
+                           "Rerun with --dry-run and post that content with `room_ops.py say "
+                           "--extra-content` yourself.")
+    argv = [sys.executable, str(script), "say", room, body, "--extra-content",
+            json.dumps(extra, ensure_ascii=False)]
+    proc = runner(argv, capture_output=True, text=True)
+    try:
+        receipt = json.loads(proc.stdout or "")
+    except ValueError:
+        receipt = {}
+    if proc.returncode != 0 or not isinstance(receipt, dict) or not receipt.get("ok"):
+        why = (receipt.get("reason") if isinstance(receipt, dict) else None) or \
+            (proc.stderr or proc.stdout or "").strip()[-300:] or f"exit {proc.returncode}"
+        raise RoomDocError(f"the comment was not posted: {why}")
+    return receipt
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -433,6 +524,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("old")
     s.add_argument("new")
+
+    s = sub.add_parser("comment", help="comment on a passage of the document, pinned to those words")
+    s.add_argument("room")
+    s.add_argument("quote", help="the exact text the comment is on, as it appears in the document")
+    s.add_argument("text", help="what to say about it")
+    s.add_argument("--nth", type=int, default=None,
+                   help="which occurrence of the quote, 0-based, when it appears more than once")
+    s.add_argument("--mention", action="append", default=[], metavar="MXID",
+                   help="address someone by mxid (repeatable); an agent among them is called")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print the room message the comment would be and post nothing")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")

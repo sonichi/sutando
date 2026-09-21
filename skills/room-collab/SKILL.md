@@ -83,6 +83,7 @@ python3 $P read   '!room:server'                      # print the document
 python3 $P peers  '!room:server'                      # who is present
 python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
+python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
 python3 $P --name mars read '!room:server'            # publish presence while connected
 ```
 
@@ -250,6 +251,30 @@ whether it is a person or an agent (and whose agent). The document records
 this on the server as writes land; an agent cannot claim authorship, only
 read it (verified 2026-09-20). Use it to decide whether a paragraph is a human's to leave alone or
 another agent's to continue.
+
+## Commenting on a passage, rather than editing it
+
+When something a person wrote is unclear, ask about it *there* instead of
+rewriting it or asking in the timeline where the words are out of sight:
+
+```bash
+python3 $P comment '!room:server' 'option A is cheap' 'cheap in money, or in time?' --mention '@qingyun:server'
+python3 $P comment '!room:server' 'option A is cheap' '…' --nth 1     # the second occurrence
+python3 $P comment '!room:server' 'option A is cheap' '…' --dry-run   # show the message, post nothing
+```
+
+The quote must be the exact words as they stand in the document (up to 2000
+characters), and it must be unique — or say which occurrence with `--nth`
+(0 is the first). The command refuses rather than guessing. What it posts is an
+ordinary room message — `> the quoted words`, a blank line, your text — carrying
+the anchor a web client pins the comment to, so the person sees it beside the
+passage and anyone in a plain client still reads it as a sentence. `--mention`
+writes the mxid into the text, which is what makes it a real mention; an agent
+among them is called.
+
+Posting goes through the `agent-room-ops` skill installed beside this one
+(`room_ops.py say --extra-content`); without it the command says so, and
+`--dry-run` gives you the exact message to post another way.
 
 ## What a refusal means
 

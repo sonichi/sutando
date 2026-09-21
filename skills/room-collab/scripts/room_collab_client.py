@@ -14,6 +14,7 @@ open is not enough — the renewal loop runs for as long as the session does.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import ssl
 import sys
@@ -25,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import websockets
     from pycrdt import (
-        Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
+        Assoc, Awareness, Doc, Map, StickyIndex, Text, YMessageType, YSyncMessageType,
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
@@ -133,6 +134,26 @@ class RoomDoc:
     def files(self) -> list[dict]:
         _, files = self._require_board("read files")
         return [v for k, v in self._items(files) if is_board_file(v, k)]
+
+    def anchor(self, start: int, end: int) -> dict[str, str]:
+        """Two Yjs relative positions, base64, for the character range
+        [start, end) of the text — the form a web client anchors a comment to,
+        which survives edits elsewhere in the document."""
+        current = self.text
+        if not 0 <= start <= end <= len(current):
+            raise RoomDocError(f"anchor range {start}:{end} is outside the text ({len(current)} chars)")
+        return {"start": self._relative_position(current, start),
+                "end": self._relative_position(current, end)}
+
+    def _relative_position(self, current: str, index: int) -> str:
+        text = self._require_text("anchor text")
+        if index == len(current):
+            # The one position no item holds; a sticky index at it panics.
+            sticky = StickyIndex.from_json({"tname": self._text_name, "assoc": 0}, sequence=text)
+        else:
+            # Relative positions count UTF-16 units, unlike insert/delete (bytes).
+            sticky = text.sticky_index(len(current[:index].encode("utf-16-le")) // 2, Assoc.AFTER)
+        return base64.b64encode(sticky.encode()).decode("ascii")
 
     @property
     def peers(self) -> list[dict]:

@@ -51,6 +51,10 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   event id came back. `unconfirmed` is a 200 with no proof: the send probably landed, so do
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
+python3 skills/agent-room-ops/room_ops.py say    '!room:hs' $'> the quoted words\n\nis this final?' --extra-content '{"space.ag2.collab.doc.comment": {"anchor": {...}, "v": 1}}'
+#   --extra-content carries a protocol payload on the event beside the body, for a client
+#   that renders it (here: a document comment pinned to the quoted words — the room-collab
+#   skill's `comment` builds and posts this for you). Only space.ag2.* keys survive the gateway.
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
 #   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
 #   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->

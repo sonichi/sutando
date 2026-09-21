@@ -251,6 +251,10 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--extra-content", dest="extra_content", default=None, metavar="JSON",
+                   help="a JSON object of space.ag2.* keys to carry on the event beside the "
+                        "body (a document comment's anchor, say); other keys are dropped by "
+                        "the gateway")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -315,6 +319,11 @@ def _main(argv):
         _kw = {"reply_to": a.reply_to}
         if a.worker:
             _kw["worker"] = a.worker
+        if a.extra_content:
+            _extra = json.loads(a.extra_content)
+            if not isinstance(_extra, dict):
+                raise SystemExit("room-ops: --extra-content must be a JSON object")
+            _kw["extra_content"] = _extra
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
     elif a.cmd == "grant":

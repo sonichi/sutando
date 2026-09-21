@@ -353,6 +353,42 @@ async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
         raise AssertionError("must raise")
 
 
+async def test_an_anchor_is_a_relative_position_pair_that_counts_utf16_units():
+    import base64
+    from pycrdt import StickyIndex
+    doc, rd = make()
+    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
+    text += "héllo wörld\n日本 line 😀 tail"
+    s = rd.text
+
+    def u16(i):
+        return len(s[:i].encode("utf-16-le")) // 2
+
+    def index_of(b64):
+        return StickyIndex.decode(base64.b64decode(b64), sequence=text).get_index()
+
+    start, end = s.index("日本"), s.index("日本") + 2
+    a = rd.anchor(start, end)
+    # Decoded on the same store, each side lands on the character it was made
+    # for — in UTF-16 units, which is what a Yjs client counts (the emoji is two).
+    assert (index_of(a["start"]), index_of(a["end"])) == (u16(start), u16(end)), a
+    assert u16(len(s)) == len(s) + 1  # the emoji: one char, two units
+
+    # The end of the text is spelled by the type's name (no item holds it);
+    # pycrdt reads that one back in bytes, so only its form is asserted.
+    tail = rd.anchor(s.index("tail"), len(s))
+    end_json = StickyIndex.decode(base64.b64decode(tail["end"]), sequence=text).to_json()
+    assert end_json == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, end_json
+    assert index_of(tail["start"]) == u16(s.index("tail"))
+
+    for bad in ((-1, 2), (3, 2), (0, len(s) + 1)):
+        try:
+            rd.anchor(*bad)
+            raise AssertionError(f"accepted {bad}")
+        except RoomDocError as e:
+            assert "outside the text" in str(e)
+
+
 def test_a_refusal_is_never_a_reconnect():
     from room_collab_protocol import close_code
     for refusal in (4400, 4403, 4404):
