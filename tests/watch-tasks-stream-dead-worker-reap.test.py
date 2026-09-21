@@ -4,6 +4,7 @@ a terminal failure unless an EXACT, non-empty result for that task already exist
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -13,6 +14,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 FAILURE_TEXT = "could not safely process"
+
+# `read_ready_result` stamps ordinary `task-*` results with `[task YYYYMMDD-NNN]`
+# before delivery, so the body on disk is the answer plus that prefix.
+_STAMP = re.compile(r"^\[task \d{8}-\d{3}\]\n\n")
+
+
+def _unstamped(body: str) -> str:
+    return _STAMP.sub("", body or "")
 
 
 class ReadinessTimeout(RuntimeError):
@@ -335,7 +344,8 @@ def scenario_answer_landing_during_the_reap_stays_deliverable() -> None:
         wait_for(lambda: False, timeout=6.0,
                  nudge=lambda n: h.deliver(f"task-nudge-late-{n}.txt"))
         check("an answer that lands during the reap is still at the delivery path",
-              res.read_text() == answer, f"delivery path holds {res.read_text()[:60]!r}")
+              _unstamped(res.read_text()) == answer,
+              f"delivery path holds {res.read_text()[:60]!r}")
         check("and was not relocated to a hidden sibling",
               not list((h.ws / "results").glob(".task-late.txt.superseded.*")))
     finally:
