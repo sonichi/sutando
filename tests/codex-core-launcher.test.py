@@ -652,7 +652,9 @@ exit 23
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(100):
+            # Each notifier lifetime now spawns a role-verdict check, so a
+            # restart is a property to wait for, not a one-second deadline.
+            for _ in range(1000):
                 observed = _read_count(count)
                 if observed >= 2:
                     break
