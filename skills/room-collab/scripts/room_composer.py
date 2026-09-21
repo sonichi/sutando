@@ -225,8 +225,10 @@ def readable(stored: Any) -> dict:
 
 
 def _why_plain(kind: Any, schema: Any) -> str:
+    # What THIS reader could not check, never what a client cannot draw: the
+    # renderers are the client's, and only it knows which ones it has.
     if kind not in TYPES:
-        return f"no renderer for type {kind!r}; showing the fields as text"
+        return f"type {kind!r} is not one this reader knows; showing the fields as text"
     return f"schema {schema!r} is not {SCHEMA}; showing the fields as text"
 
 

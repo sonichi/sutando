@@ -106,7 +106,7 @@ def test_a_feed_tolerates_what_another_writer_may_have_put_there():
     got = feed(junk)
     assert [e["id"] for e in got] == ["1", "2", "3", "4", "5"], got
     assert all(e["created"] is None for e in got), "a bool or a fraction is not a minute"
-    assert got[2]["plain"] and "no renderer" in got[2]["why"]
+    assert got[2]["plain"] and "is not one this reader knows" in got[2]["why"]
 
 
 def test_an_id_this_reader_cannot_check_still_reaches_the_feed():
@@ -124,7 +124,7 @@ def test_an_id_this_reader_cannot_check_still_reaches_the_feed():
     assert by_id["p1"]["plain"] is False and "why" not in by_id["p1"]
     # Two reasons at once read as two reasons, not as one overwriting the other.
     both = feed({"Bad-Id": {"type": "future", "schema": 99}})[0]
-    assert "is not one this reader knows" in both["why"] and "no renderer" in both["why"], both
+    assert both["why"].count("is not one this reader knows") == 2, both
 
 
 def test_a_post_carries_where_it_is_in_its_life_and_an_unknown_one_is_a_draft():
@@ -169,9 +169,11 @@ def test_a_known_draft_reads_as_itself():
 
 
 def test_skew_in_either_direction_degrades_to_plain_and_never_raises():
-    # The writer is newer: a type this reader has no renderer for.
     newer_type = readable({"type": "bluesky_post", "schema": 1, "text": "hi"})
-    assert newer_type["plain"] and "no renderer for type" in newer_type["why"]
+    # The reason names what this reader could not check — never "no renderer",
+    # which is the client's judgement and would mask its own, truer sentence.
+    assert newer_type["plain"] and "type 'bluesky_post' is not one this reader knows" in newer_type["why"]
+    assert "renderer" not in newer_type["why"], "this module has no renderers to speak for"
     assert newer_type["fields"] == {"text": "hi"}, "the fields still come back, to show as text"
     # The writer is newer: a schema this reader does not know.
     newer_schema = readable({"type": X_POST, "schema": 9})
