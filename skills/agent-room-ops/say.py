@@ -49,11 +49,12 @@ def _a2ui_card(raw):
 
 def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         *, reply_to: str | None = None, worker: str | None = None,
-        extra_content: dict | None = None) -> dict:
+        extra_content: dict | None = None, thread_root: str | None = None) -> dict:
     """Post `message` into `room_id` verbatim, mentioning no one.
 
     `reply_to` cites the message being replied to; the post stays in the main
-    timeline. See relations.relation_fields.
+    timeline. `thread_root` puts it in that message's thread instead. See
+    relations.relation_fields.
 
     `extra_content` rides on the event beside the body: a protocol payload a
     client renders (a document comment's anchor, say). The gateway keeps only
@@ -72,7 +73,7 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     # Before the gate and the network: a bad event id is the caller's typo, and
     # posting it unrelated would cite the wrong message silently.
     try:
-        rel = relation_fields(reply_to=reply_to)
+        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
     except RelationError as e:
         return _result(False, room_id=room_id, reason=str(e))
 

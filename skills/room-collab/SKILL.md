@@ -95,6 +95,7 @@ python3 $P presence '!room:server'                    # who is in EVERY surface,
 python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
 python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
+python3 $P reply  '!room:server' '$eventid' 'yes, final'              # answer in a comment's thread
 python3 $P --name mars read '!room:server'            # publish presence while connected
 ```
 
@@ -289,6 +290,18 @@ among them is called.
 Posting goes through the `agent-room-ops` skill installed beside this one
 (`room_ops.py say --extra-content`); without it the command says so, and
 `--dry-run` gives you the exact message to post another way.
+
+A comment is a thread. To answer in it — yours or a person's — reply under the
+comment's event id (the receipt's `event_id`, or the id shown in the room):
+
+```bash
+python3 $P reply '!room:server' '$eventid' 'in time — the build is the slow part' --mention '@qingyun:server'
+```
+
+The body is your words as they are (no quote in front: the thread already says
+what it is about, and the client shows a reply verbatim). It is a room message
+with the thread relation the web client reads replies from, so it appears under
+the comment beside the passage; no document connection is opened for it.
 
 ## What a refusal means
 

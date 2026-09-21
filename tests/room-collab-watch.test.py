@@ -183,9 +183,9 @@ async def test_presence_alone_shows_a_caret_at_the_end_of_the_text():
     text += "héllo"
     await room.set_presence("mars", user_id="@m:x")
     state = room._awareness.get_local_state()
+    end = {"type": None, "tname": DEFAULT_TEXT_NAME, "item": None, "assoc": 0}
     assert state["user"]["name"] == "mars"
-    assert state["cursor"] == {"anchor": {"tname": DEFAULT_TEXT_NAME, "assoc": 0},
-                               "head": {"tname": DEFAULT_TEXT_NAME, "assoc": 0}}, state
+    assert state["cursor"] == {"anchor": end, "head": end}, state
     await asyncio.sleep(0)
     assert len([m for m in room._ws.sent if m[:1] == b"\x01"]) >= 2, "presence and caret both went out"
     # A structured surface has no text to sit in: presence only, no caret, no error.
@@ -203,19 +203,23 @@ async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
     await room.append("héllo")                       # 6 bytes, 5 units: clocks 0-4
     cur = room._awareness.get_local_state()["cursor"]
     assert cur["anchor"] == cur["head"], cur
-    assert cur["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, cur   # the end of the text
+    # The four keys a Yjs RelativePosition serializes to; a peer reads this raw.
+    assert cur["anchor"] == {"type": None, "tname": DEFAULT_TEXT_NAME, "item": None, "assoc": 0}, cur
     await room.insert(0, "¡")                        # 2 bytes, 1 unit: clock 5
     cur = room._awareness.get_local_state()["cursor"]
     # After "¡" the caret sits on "h": clock 0 — the unit, not byte 2 or clock 6.
-    assert cur["anchor"] == {"item": {"client": me, "clock": 0}, "assoc": 0}, cur
+    assert cur["anchor"] == {"type": None, "tname": DEFAULT_TEXT_NAME,
+                             "item": {"client": me, "clock": 0}, "assoc": 0}, cur
     await room.replace("llo", "日本")                 # ends before nothing: the end again
-    assert room._awareness.get_local_state()["cursor"]["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}
+    assert room._awareness.get_local_state()["cursor"]["anchor"] == \
+        {"type": None, "tname": DEFAULT_TEXT_NAME, "item": None, "assoc": 0}
     peer = Doc(); peer.apply_update(doc.get_update())
     peer.get(DEFAULT_TEXT_NAME, type=Text).insert(0, "ZZZ")
     doc.apply_update(peer.get_update(doc.get_state()))
     await room.insert(len("ZZZ¡hé".encode()), "x")   # after é: the caret lands on "日", clock 6
     cur = room._awareness.get_local_state()["cursor"]
-    assert cur["anchor"] == {"item": {"client": me, "clock": 6}, "assoc": 0}, cur
+    assert cur["anchor"] == {"type": None, "tname": DEFAULT_TEXT_NAME,
+                             "item": {"client": me, "clock": 6}, "assoc": 0}, cur
     await asyncio.sleep(0)                           # the awareness frames are sent quietly, off the write path
     sent = [m for m in room._ws.sent if m[:1] == b"\x01"]   # awareness frames went out
     assert len(sent) >= 2, len(sent)

@@ -464,6 +464,17 @@ async def run(args: argparse.Namespace) -> int:
 
     if args.command == "doctor":
         return await doctor(args)
+    if args.command == "reply":
+        # No document at all: a reply is a room message in the comment's thread.
+        body = reply_content(args.text, args.mention)
+        if args.dry_run:
+            print(json.dumps({"room": args.room, "thread_root": args.event, "body": body},
+                             ensure_ascii=False, indent=2))
+            return 0
+        receipt = post_reply(args.room, args.event, body)
+        print(json.dumps(receipt, ensure_ascii=False) if args.json else
+              f"replied under {args.event}: {receipt.get('event_id') or receipt.get('state') or 'posted'}")
+        return 0
 
     token, url = resolve_token(args.token), resolve_url(args.url)
     if args.command == "presence":
@@ -597,6 +608,25 @@ def comment_content(anchor: dict, quote: str, nth: int, message: str,
     return body, {COMMENT_KEY: {"anchor": {**anchor, "quote": quote, "nth": nth}, "v": 1}}
 
 
+def reply_content(message: str, mentions: list[str] | None = None) -> str:
+    """A reply's body: the words as they are, no quote in front — the thread it
+    sits in already says what it is about, and a card shows the body verbatim."""
+    text = message.strip()
+    if not text:
+        raise RoomDocError("a reply needs something to say")
+    lead = " ".join(m for m in (mentions or []) if m)
+    return lead + " " + text if lead else text
+
+
+def post_reply(room: str, root: str, body: str, *, runner=subprocess.run,
+               script: Path | None = None) -> dict:
+    """Post a reply in the comment's thread through room-ops `say --thread-root`."""
+    root = root.strip()
+    if not root.startswith("$") or len(root) < 2:
+        raise RoomDocError(f"a reply goes under a comment's event id, like $abc — got {root!r}")
+    return _post(room, body, ["--thread-root", root], "reply", runner=runner, script=script)
+
+
 def room_ops_script() -> Path | None:
     """The room-ops skill installed beside this one, which is how an agent posts
     a room message; None when it is not there."""
@@ -607,14 +637,18 @@ def room_ops_script() -> Path | None:
 def post_comment(room: str, body: str, extra: dict, *, runner=subprocess.run,
                  script: Path | None = None) -> dict:
     """Post the comment through room-ops `say`; the reply is its receipt."""
+    return _post(room, body, ["--extra-content", json.dumps(extra, ensure_ascii=False)],
+                 "comment", runner=runner, script=script)
+
+
+def _post(room: str, body: str, flags: list[str], what: str, *, runner, script) -> dict:
     script = script or room_ops_script()
     if script is None:
         raise RoomDocError("posting needs the agent-room-ops skill installed beside this one. "
                            "Rerun with --dry-run and post that content with `room_ops.py say "
-                           "--extra-content` yourself.")
-    argv = [sys.executable, str(script), "say", room, body, "--extra-content",
-            json.dumps(extra, ensure_ascii=False)]
-    proc = runner(argv, capture_output=True, text=True)
+                           f"{flags[0]}` yourself.")
+    proc = runner([sys.executable, str(script), "say", room, body, *flags],
+                  capture_output=True, text=True)
     try:
         receipt = json.loads(proc.stdout or "")
     except ValueError:
@@ -622,7 +656,7 @@ def post_comment(room: str, body: str, extra: dict, *, runner=subprocess.run,
     if proc.returncode != 0 or not isinstance(receipt, dict) or not receipt.get("ok"):
         why = (receipt.get("reason") if isinstance(receipt, dict) else None) or \
             (proc.stderr or proc.stdout or "").strip()[-300:] or f"exit {proc.returncode}"
-        raise RoomDocError(f"the comment was not posted: {why}")
+        raise RoomDocError(f"the {what} was not posted: {why}")
     return receipt
 
 
@@ -680,6 +714,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="address someone by mxid (repeatable); an agent among them is called")
     s.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="print the room message the comment would be and post nothing")
+
+    s = sub.add_parser("reply", help="answer in a comment's thread (no document connection needed)")
+    s.add_argument("room")
+    s.add_argument("event", help="the comment's event id ($abc), from its receipt or the room")
+    s.add_argument("text", help="what to say")
+    s.add_argument("--mention", action="append", default=[], metavar="MXID",
+                   help="address someone by mxid (repeatable); an agent among them is called")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print the room message the reply would be and post nothing")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")

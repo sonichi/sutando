@@ -255,6 +255,10 @@ def _main(argv):
                    help="a JSON object of space.ag2.* keys to carry on the event beside the "
                         "body (a document comment's anchor, say); other keys are dropped by "
                         "the gateway")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post IN (rel_type m.thread, built by "
+                        "the gateway): a reply under a document comment, say. Unlike "
+                        "--reply-to, this leaves the main timeline.")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -324,6 +328,8 @@ def _main(argv):
             if not isinstance(_extra, dict):
                 raise SystemExit("room-ops: --extra-content must be a JSON object")
             _kw["extra_content"] = _extra
+        if a.thread_root:
+            _kw["thread_root"] = a.thread_root
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
     elif a.cmd == "grant":

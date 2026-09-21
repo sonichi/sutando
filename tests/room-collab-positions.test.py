@@ -16,7 +16,8 @@ sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 from pycrdt import Array, Doc, Map, StickyIndex, Text  # noqa: E402
 
-from room_collab_positions import blocks, encode, item_map, relative_position, units  # noqa: E402
+from room_collab_positions import (  # noqa: E402
+    as_awareness_json, blocks, encode, item_map, relative_position, units)
 
 FAILS = []
 
@@ -142,6 +143,19 @@ def test_encode_is_the_binary_yjs_form_of_the_same_position():
     assert back == relative_position(doc, text, "markdown", 8), back
     assert base64.b64encode(encode(doc, text, "markdown", 10)).decode() == base64.b64encode(
         StickyIndex.from_json({"tname": "markdown", "assoc": 0}, sequence=text).encode()).decode()
+
+
+def test_an_awareness_cursor_carries_all_four_keys_a_yjs_position_serializes_to():
+    # A peer reads a MISSING `item` as an id (undefined !== null) and
+    # dereferences it, dropping the caret. Measured against the client's yjs.
+    doc, text = small()
+    inside = as_awareness_json(relative_position(doc, text, "markdown", 4), "markdown")
+    end = as_awareness_json(relative_position(doc, text, "markdown", 10), "markdown")
+    for got in (inside, end):
+        assert set(got) == {"type", "tname", "item", "assoc"}, got
+        assert got["type"] is None and got["tname"] == "markdown" and got["assoc"] == 0, got
+    assert inside["item"] == {"client": doc.client_id, "clock": 1}, inside
+    assert end["item"] is None, "the end of the text is the one position with no item"
 
 
 def test_a_peers_items_and_deletions_are_placed_too():
