@@ -125,6 +125,27 @@ def test_an_id_this_reader_cannot_check_still_reaches_the_feed():
     # Two reasons at once read as two reasons, not as one overwriting the other.
     both = feed({"Bad-Id": {"type": "future", "schema": 99}})[0]
     assert both["why"].count("is not one this reader knows") == 2, both
+    assert both["why_about"] == [{"kind": "post-id", "subject": "Bad-Id"},
+                                 {"kind": "type", "subject": "future"}], both
+
+
+def test_the_reasons_come_back_as_data_so_a_client_need_not_parse_the_sentence():
+    # The subject is the join key a renderer compares its own reasons against;
+    # parsing it back out of the prose is what this exists to stop.
+    assert readable({"type": "future", "schema": SCHEMA})["why_about"] == \
+        [{"kind": "type", "subject": "future"}]
+    assert readable({"type": X_POST, "schema": 9})["why_about"] == \
+        [{"kind": "schema", "subject": 9}]
+    assert readable({})["why_about"] == [{"kind": "type", "subject": None}], \
+        "a reason about an absent type still names what it is about"
+    # Present exactly when `why` is, so one absence cannot mean two things.
+    for row in (build(X_POST), build(EMAIL, {"subject": "s", "to": ["a@b.c"]})):
+        got = readable(row)
+        assert "why" not in got and "why_about" not in got, got
+    for entry in feed({"p1": build(X_POST), "p2": {"type": "future", "schema": 1}}):
+        assert ("why" in entry) == ("why_about" in entry), entry
+    # The sentence stays the display form: it is not rebuilt from the data.
+    assert "showing the fields as text" in readable({"type": "future", "schema": 1})["why"]
 
 
 def test_a_post_carries_where_it_is_in_its_life_and_an_unknown_one_is_a_draft():

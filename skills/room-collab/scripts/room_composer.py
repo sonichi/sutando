@@ -171,6 +171,8 @@ def feed(stored: Any) -> list[dict]:
             entry["why"] = "; ".join(filter(None, (
                 f"post id {entry['id']!r} is not one this reader knows how to check",
                 entry.get("why"))))
+            entry["why_about"] = [{"kind": "post-id", "subject": entry["id"]}] + \
+                entry.get("why_about", [])
         created = entry["fields"].pop("created", None)
         ok = isinstance(created, (int, float)) and not isinstance(created, bool)
         entry["created"] = int(created) if ok and created == int(created) else None
@@ -208,6 +210,17 @@ def readable(stored: Any) -> dict:
     normal case, not an error — an agent's skill is pulled per host while a
     client is deployed, so the two ends are never in step. Skew is reported as
     `plain`, which means "show the fields as text", not "fail".
+
+    A skewed row carries two things. `why` is the sentence to show a person.
+    `why_about` is the same reasons as data — `{kind, subject}` per reason — so
+    a client holding its own reasons can tell whether it is about to say the
+    same thing twice by comparing subjects rather than parsing prose.
+
+    A client must keep whatever it did before this field existed: every host
+    that has not pulled this version sends `why` alone, so `why_about` is an
+    upgrade for readers that see it and never a requirement. A mechanism that
+    makes the older one fail is how the duplicate-suppression bug it exists to
+    prevent got there in the first place.
     """
     row = dict(stored) if isinstance(stored, dict) else {}
     kind = row.get("type")
@@ -220,16 +233,20 @@ def readable(stored: Any) -> dict:
         "fields": {k: v for k, v in row.items() if k not in ("type", "schema")},
     }
     if not known:
-        out["why"] = _why_plain(kind, schema)
+        sentence, about = _why_plain(kind, schema)
+        out["why"] = sentence
+        out["why_about"] = [about]
     return out
 
 
-def _why_plain(kind: Any, schema: Any) -> str:
+def _why_plain(kind: Any, schema: Any) -> tuple[str, dict]:
     # What THIS reader could not check, never what a client cannot draw: the
     # renderers are the client's, and only it knows which ones it has.
     if kind not in TYPES:
-        return f"type {kind!r} is not one this reader knows; showing the fields as text"
-    return f"schema {schema!r} is not {SCHEMA}; showing the fields as text"
+        return (f"type {kind!r} is not one this reader knows; showing the fields as text",
+                {"kind": "type", "subject": kind})
+    return (f"schema {schema!r} is not {SCHEMA}; showing the fields as text",
+            {"kind": "schema", "subject": schema})
 
 
 def counted_length(artifact_type: str, prose: str) -> int:
