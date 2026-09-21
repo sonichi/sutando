@@ -126,6 +126,26 @@ run_idle = subprocess.run(["bash", str(rig / "scripts" / "core-status.sh"), "idl
 rec_idle = json.loads((ws4 / "state" / "core-status.json").read_text())
 check(run_idle.returncode == 0 and rec_idle.get("status") == "idle" and "pending" in rec_idle,
       "idle carries pending too")
+
+print("5. an unreadable tasks/ still writes the status, carries no pending, and leaves the snapshot alone")
+if os.name != "posix" or os.geteuid() == 0:
+    print("  skip: chmod cannot make tasks/ unreadable here: not POSIX, or root")
+else:
+    snap_path = ws4 / "state" / "task-queue.json"
+    snap_before = snap_path.read_bytes()
+    (ws4 / "tasks").chmod(0)
+    try:
+        run5 = subprocess.run(["bash", str(rig / "scripts" / "core-status.sh"), "running", "denied"],
+                              capture_output=True, text=True, cwd=str(rig))
+    finally:
+        (ws4 / "tasks").chmod(0o755)
+    rec5 = json.loads((ws4 / "state" / "core-status.json").read_text())
+    check(run5.returncode == 0 and rec5.get("status") == "running" and rec5.get("step") == "denied",
+          f"the liveness write still lands (rc={run5.returncode}, {run5.stderr.strip()[-200:]})")
+    check("pending" not in rec5, f"no pending key: a count it could not take is absent, not [] ({rec5.get('pending')})")
+    check("pending queue not counted" in run5.stderr and "ermission" in run5.stderr,
+          f"the refusal is on stderr ({run5.stderr.strip()[-200:]})")
+    check(snap_path.read_bytes() == snap_before, "state/task-queue.json is byte-for-byte the previous snapshot")
 shutil.rmtree(rig, ignore_errors=True)
 
 if failures:

@@ -148,5 +148,76 @@ class Tolerance(Base):
         self.assertIn("task_queue: disk on fire", err.getvalue())
 
 
+class Unreadable(Base):
+    """Only an absent tasks/ is an empty queue. One that exists but cannot be read raises, and no
+    reader turns that into a zero: the snapshot is refused and the previous one stands."""
+
+    @contextlib.contextmanager
+    def denied(self, mode=0):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
+        d = self.ws / "tasks"
+        d.chmod(mode)
+        try:
+            yield d
+        finally:
+            d.chmod(0o700)
+
+    def test_a_missing_dir_or_a_file_in_its_place_is_empty(self):
+        self.assertEqual(tq.pending(self.ws / "nowhere"), [])
+        flat = Path(self.tmp.name) / "flat"
+        flat.mkdir()
+        (flat / "tasks").write_text("a file where the dir should be\n")
+        self.assertEqual(tq.pending(flat), [])
+        self.assertEqual(tq.position(flat, "task-1"), {"depth": 0, "position": 0})
+        self.assertEqual(tq.waiting(flat, "task-1"), 0)
+
+    def test_an_unreadable_dir_raises_and_never_reads_as_empty(self):
+        self.task("task-1")
+        with self.denied():
+            with self.assertRaises(PermissionError):
+                tq.pending(self.ws)
+            with self.assertRaises(PermissionError):
+                tq.position(self.ws, "task-1")
+            with self.assertRaises(PermissionError):
+                tq.waiting(self.ws, "task-1")
+
+    def test_the_snapshot_is_refused_and_the_previous_one_survives_byte_for_byte(self):
+        self.task("task-1"); self.task("task-2", age=1)
+        snap = tq.write_snapshot(self.ws)
+        before = snap.read_bytes()
+        self.assertEqual(json.loads(before)["depth"], 2)
+        err = io.StringIO()
+        with self.denied(), contextlib.redirect_stderr(err):
+            self.assertIsNone(tq.write_snapshot(self.ws))
+        self.assertEqual(snap.read_bytes(), before, "a count that could not be taken overwrote nothing")
+        self.assertIn("task_queue: snapshot not published, tasks/ could not be read", err.getvalue())
+        self.assertEqual(err.getvalue().count("\n"), 1, "one line")
+        self.assertFalse([f for f in (self.ws / "state").iterdir() if ".tmp" in f.name], "no temp left behind")
+
+    def test_no_snapshot_is_created_when_none_existed(self):
+        with self.denied(), contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(tq.write_snapshot(self.ws))
+        self.assertFalse((self.ws / "state" / "task-queue.json").exists())
+        self.assertFalse((self.ws / "state").exists(), "not even the state dir: nothing was published")
+
+    def test_the_cli_prints_no_count_exits_0_and_says_why(self):
+        # x-only: the task file still opens by path, only the listing is denied — a dispatch
+        # whose QUEUE line must then be absent, not "0", while the dispatch itself goes on.
+        f = self.task("task-1")
+        tq.write_snapshot(self.ws)
+        before = (self.ws / "state" / "task-queue.json").read_bytes()
+        with self.denied(0o100):
+            for argv in (["waiting", "--task-file", str(f)], ["position", "--task-file", str(f)],
+                         ["pending", "--workspace", str(self.ws)], ["snapshot", "--workspace", str(self.ws)]):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = tq.main(argv)
+                self.assertEqual((rc, out.getvalue()), (0, ""), argv)
+                self.assertIn("could not be read" if argv[0] == "snapshot" else "task_queue: ", err.getvalue(), argv)
+                self.assertRegex(err.getvalue(), r"[Pp]ermission", argv)
+        self.assertEqual((self.ws / "state" / "task-queue.json").read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

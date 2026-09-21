@@ -122,7 +122,8 @@ def output_path(requested: str | None, ext: str) -> Path:
 
 
 def read_input_image(path: str) -> tuple[bytes, str] | None:
-    """The image bytes and mime type, downscaled to 4096px when Pillow is around; None if unreadable."""
+    """The image bytes and mime type, downscaled to 4096px when Pillow is around; None when the
+    file is missing, not an image by extension, or one Pillow cannot decode."""
     p = Path(os.path.expanduser(path))
     if not p.is_file():
         return None
@@ -133,6 +134,10 @@ def read_input_image(path: str) -> tuple[bytes, str] | None:
     try:
         from PIL import Image  # noqa: PLC0415
         import io  # noqa: PLC0415
+    except ImportError:
+        return data, mime
+    # Pillow raises OSError (UnidentifiedImageError) for bytes that are not an image: bad input, not a crash.
+    try:
         img = Image.open(io.BytesIO(data))
         if max(img.size) > 4096:
             ratio = 4096 / max(img.size)
@@ -140,8 +145,9 @@ def read_input_image(path: str) -> tuple[bytes, str] | None:
             buf = io.BytesIO(); img.save(buf, format="PNG")
             data, mime = buf.getvalue(), "image/png"
             log(f"Resized {p} to {img.size[0]}x{img.size[1]}")
-    except ImportError:
-        pass
+    except OSError as err:
+        log(f"Not a readable image ({err}): {p}")
+        return None
     return data, mime
 
 
@@ -202,6 +208,9 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
         except ImportError:
             out = out.with_suffix(returned)
             log(f"Pillow not installed: saved the returned {mime} as {out.name}")
+        except OSError as err:
+            out = out.with_suffix(returned)
+            log(f"Pillow could not convert the returned {mime} ({err}): saved it as {out.name}")
     elif wanted not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
         out = out.with_suffix(returned)
     tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")

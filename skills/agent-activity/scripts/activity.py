@@ -47,14 +47,19 @@ def queued(task_file: Path, workspace: Path | None = None) -> int:
 
 def queue(task_file: Path, workspace: Path | None = None) -> int:
     """Where this task stands in the pending list: depth (how many are pending) and its 1-based
-    position, 0 when it is no longer pending. The first line to a task's conversation names it."""
+    position, 0 when it is no longer pending. The first line to a task's conversation names it.
+    When tasks/ cannot be read: nothing on stdout, the reason on stderr, exit 1 — never a zero."""
     ws = workspace or task_file.resolve().parent.parent
     task_id = task_file.stem
     try:
         task_id = task_from_file(task_file)[0]["id"]
     except OSError:
         pass
-    print(json.dumps(queue_position(ws, task_id)))
+    try:
+        print(json.dumps(queue_position(ws, task_id)))
+    except OSError as exc:
+        print(f"activity: queue not counted, tasks/ could not be read: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

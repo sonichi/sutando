@@ -684,6 +684,22 @@ class QueuedWithoutACount(unittest.TestCase):
             self.assertEqual((t.task_id, t.to_phase), ("task-q", "QUEUED"))
             self.assertIsNone(t.queue)
 
+    def test_an_unreadable_tasks_dir_is_a_plain_queued_not_a_zero(self):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "tasks").mkdir()
+            f = ws / "tasks" / "task-q.txt"
+            f.write_text("id: task-q\nsource: ag2space\nsource_message_id: $m\nsource_room_id: !r:s\ntask: hi\n")
+            (ws / "tasks").chmod(0o100)  # the file opens by path; the listing is denied
+            try:
+                t = bus.transition_from_file("QUEUED", f, ws=ws, ts=1)
+            finally:
+                (ws / "tasks").chmod(0o700)
+            self.assertEqual((t.task_id, t.to_phase, t.queue), ("task-q", "QUEUED", None))
+            self.assertEqual(bus.queued_line(t.queue), "queued")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

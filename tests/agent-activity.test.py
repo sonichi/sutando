@@ -175,6 +175,22 @@ class WriterCli(unittest.TestCase):
             card.main(["queue", "--task-file", str(self.ws / "tasks" / "task-gone.txt"), "--workspace", str(self.ws)])
         self.assertEqual(json.loads(out.getvalue()), {"depth": 2, "position": 0})
 
+    def test_queue_on_an_unreadable_tasks_dir_prints_no_count_and_exits_1(self):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
+        (self.ws / "tasks").mkdir()
+        p = self.ws / "tasks" / "task-a.txt"
+        p.write_text("id: task-a\nchannel_id: !r:s\ntask: hi\n")
+        (self.ws / "tasks").chmod(0o100)  # the file opens by path; the listing is denied
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = card.main(["queue", "--task-file", str(p)])
+        finally:
+            (self.ws / "tasks").chmod(0o700)
+        self.assertEqual((rc, out.getvalue()), (1, ""), "no {depth: 0}: the position is unknown")
+        self.assertIn("activity: queue not counted, tasks/ could not be read", err.getvalue())
+
     def test_done_without_a_task_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             card.main(["done", "finished", "--workspace", str(self.ws)])
