@@ -31,9 +31,11 @@ CANONICAL = [
 SKILLS = sorted((REPO / "skills").glob("*/SKILL.md"))
 TARGETS = CANONICAL + SKILLS
 
-# A launch is `bash <anything/>watch-tasks-stream.sh`; a tagged one carries
-# both flags later on the same line, in either spelling.
-LAUNCH = re.compile(r"bash\s+(?:\"?\$?[\w{}./-]*/)?watch-tasks-stream\.sh\"?(?P<rest>[^\n]*)")
+# A launch is `bash` whose command word is the script by name or by the
+# variable a worker is handed; a tagged one carries both flags on the same line.
+LAUNCH = re.compile(
+    r"bash\s+(?:\"?\$?[\w{}./-]*/)?watch-tasks-stream\.sh\"?(?P<rest>[^\n]*)"
+    r"|bash\s+\"?\$\{?SUTANDO_WATCHER_CMD\}?\"?(?P<rest2>[^\n]*)")
 TAG = re.compile(r"--role[= ]session\b.*--inbox[= ]")
 
 failures: list[str] = []
@@ -50,7 +52,7 @@ def bare_launches(text: str) -> list[tuple[int, str]]:
     hits = []
     for n, line in enumerate(text.splitlines(), 1):
         for m in LAUNCH.finditer(line):
-            if not TAG.search(m.group("rest")):
+            if not TAG.search(m.group("rest") or m.group("rest2") or ""):
                 hits.append((n, line.strip()))
                 break
     return hits
@@ -70,6 +72,14 @@ check("detector accepts the = spelling",
       bare_launches("bash src/watch-tasks-stream.sh /w/tasks --role=session --inbox=/w/tasks") == [])
 check("detector ignores a mention that is not a launch",
       bare_launches("the stream watcher (watch-tasks-stream.sh) emits TASK_FILE") == [])
+# The worker's launch names the script through a variable, never literally.
+check("detector flags the bare worker form (the exact shipped line)",
+      bare_launches("2. On `start` only, start the streaming watcher via the `Monitor` tool — "
+                    "`command: 'bash \"$SUTANDO_WATCHER_CMD\" \"$SUTANDO_TASKS_DIR\"'`, `persistent: true`.") != [])
+check("detector flags the braced variable spelling",
+      bare_launches('bash "${SUTANDO_WATCHER_CMD}" "$SUTANDO_TASKS_DIR"') != [])
+check("detector accepts the tagged worker form (positional inbox first)",
+      bare_launches('bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"') == [])
 
 # A missing target or an empty glob would make the sweep vacuously pass.
 for t in CANONICAL:
