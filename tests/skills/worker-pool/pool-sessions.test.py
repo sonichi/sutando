@@ -241,5 +241,75 @@ class ThroughTheActualCLI(unittest.TestCase):
             self.assertIn(row["availability"], ("absent", "unknown"))
 
 
+class TheCLIEntryPoint(unittest.TestCase):
+    """`main()` in-process. The subprocess tests above prove the real end to end;
+    these reach the arg handling and the room filter as executed code."""
+
+    def run_main(self, ws, *args):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pool_sessions.main(["list", "--workspace", str(ws), *args])
+        self.assertEqual(rc, 0)
+        return json.loads(buf.getvalue())
+
+    def test_list_emits_the_workspace_and_every_worker(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}}, {}, {W1: [open_run(W1)]})
+            out = self.run_main(ws)
+            self.assertEqual(out["workspace"], str(ws))
+            self.assertEqual([r["worker_id"] for r in out["sessions"]], [W1])
+
+    def test_the_room_filter_narrows_to_the_bound_worker(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}, W2: {"state": "live"}},
+                                {"!a:ag2.space": W1, "!b:ag2.space": W2},
+                                {W1: [open_run(W1)], W2: [open_run(W2)]})
+            out = self.run_main(ws, "--room", "!b:ag2.space")
+            self.assertEqual([r["worker_id"] for r in out["sessions"]], [W2])
+
+    def test_an_unbound_room_selects_nobody_rather_than_everybody(self):
+        """An empty filter result must not degrade to "show them all" — that is
+        how a viewer ends up offering another agent's worker."""
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}},
+                                {"!a:ag2.space": W1}, {W1: [open_run(W1)]})
+            out = self.run_main(ws, "--room", "!nobody:ag2.space")
+            self.assertEqual(out["sessions"], [])
+
+
+class UnreadableRecordsDegradeToAbsent(unittest.TestCase):
+    def test_a_corrupt_incarnations_file_is_not_live(self):
+        """A record we cannot parse is not evidence of a session. It must read as
+        absent, never raise and never pass for live."""
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}}, {}, {W1: [open_run(W1)]})
+            (ws / "state" / "workers" / W1 / "incarnations.json").write_text("{not json")
+            (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+            self.assertFalse(row["live"])
+            self.assertIsNone(row["attach_argv"])
+
+    def test_live_incarnation_returns_none_rather_than_raising(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = workspace_with(Path(d), {W1: {"state": "live"}}, {}, {W1: [open_run(W1)]})
+            (ws / "state" / "workers" / W1 / "incarnations.json").write_text("{not json")
+            self.assertIsNone(pool_sessions.live_incarnation(ws, W1))
+
+    def test_valid_json_of_the_wrong_shape_is_absent_not_a_crash(self):
+        """The reader swallows unparseable bytes, so THIS is what actually
+        reaches the guard: a well-formed file whose top level is not an object.
+        `incarnations()` raises AttributeError on it, and a lister that dies
+        here takes out every other worker's row too."""
+        for payload in ("[]", '"a string"', "123"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as d:
+                ws = workspace_with(Path(d), {W1: {"state": "live"}}, {}, {W1: [open_run(W1)]})
+                (ws / "state" / "workers" / W1 / "incarnations.json").write_text(payload)
+                self.assertIsNone(pool_sessions.live_incarnation(ws, W1))
+                (row,) = pool_sessions.sessions(ws, probe=EXISTS)
+                self.assertFalse(row["live"])
+                self.assertEqual(row["availability"], "absent")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
