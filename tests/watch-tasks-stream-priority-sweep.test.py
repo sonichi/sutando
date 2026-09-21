@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""The watcher's startup and directory-arm sweeps announce in task_priority
-order (urgent > normal > low, mtime FIFO within a tier), not glob/mtime
-order -- closes #3017 and restores the ordering the single-decider redesign
-moved out of the notifier's now-deleted pick.
+"""The watcher's startup sweep announces in task_priority order (urgent >
+normal > low, mtime FIFO within a tier), not glob/mtime order -- closes
+#3017 and restores the ordering the single-decider redesign moved out of
+the notifier's now-deleted pick.
 
 Drives the real watch-tasks-stream.sh through a stubbed fswatch (same
-pattern as the dedupe regression tests) so both the startup sweep and the
-directory-level fallback arm are exercised without depending on a real
-poll_monitor backend being selected on this platform.
+pattern as the dedupe regression tests). #4560 deleted the directory-level
+fallback arm entirely (a bare-folder event now dispatches nothing, per
+watch-tasks-stream-bare-directory-event.test.py), so there is no second
+sweep site left to exercise here.
 
 Run: python3 tests/watch-tasks-stream-priority-sweep.test.py
 """
@@ -51,7 +52,6 @@ class Harness:
         stub_dir.mkdir()
         (stub_dir / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {self.feed}\n")
         (stub_dir / "fswatch").chmod(0o755)
-        self.tasks_dir_abs = (self.ws / "tasks").resolve()
         self.proc: subprocess.Popen | None = None
         self.lines: list[str] = []
 
@@ -74,10 +74,6 @@ class Harness:
             ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-
-    def deliver_dir_event(self) -> None:
-        with self.feed.open("a") as fh:
-            fh.write(str(self.tasks_dir_abs) + "\n")
 
     def drain_stdout(self) -> None:
         try:
@@ -127,26 +123,6 @@ def test_startup_sweep_announces_urgent_before_older_low():
         h.cleanup()
 
 
-def test_directory_arm_sweep_also_orders_by_priority():
-    """Same invariant through the directory-level fallback arm (poll_monitor's
-    own granularity), not just the startup sweep."""
-    h = Harness()
-    try:
-        h.start()
-        wait_for(lambda: h.proc.poll() is None, timeout=5)
-        h.task("task-low2.txt", "low", age_s=10)
-        h.task("task-urgent2.txt", "urgent")
-        h.deliver_dir_event()
-        ok = wait_for(lambda: len(h.announce_order()) >= 2, timeout=15)
-        order = h.announce_order()
-        check("both tasks announced via the directory arm", ok, f"order so far: {order}")
-        check("task-urgent2.txt announced before task-low2.txt",
-              ok and order.index("task-urgent2.txt") < order.index("task-low2.txt"),
-              f"order: {order}")
-    finally:
-        h.cleanup()
-
-
 def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlog():
     """If the priority-sort helper exits 0 with no output (the exact shape a
     stubbed SUTANDO_PY producing nothing takes), the sweep must still dispatch
@@ -183,7 +159,6 @@ def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlo
 
 def main() -> int:
     test_startup_sweep_announces_urgent_before_older_low()
-    test_directory_arm_sweep_also_orders_by_priority()
     test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlog()
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed: {FAILURES}")
