@@ -205,7 +205,13 @@ jobs:
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
           RECDIR="$(mktemp -d)"
           trap 'rm -rf "$RECDIR"' EXIT
-          find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort > "$RECDIR/all"
+          # A suite that reads the host process table (pgrep/pkill/ps by pattern)
+          # sees sibling lanes' watchers as its own; those run after the lanes,
+          # alone. `|| true`: a list with no such suite is not an error.
+          { xargs grep -lE '\bpgrep\b|\bpkill\b|ps (-ef|ax|-A|-e )' < "$RECDIR/all" || true; } | sort > "$RECDIR/serial"
+          comm -23 "$RECDIR/all" "$RECDIR/serial" > "$RECDIR/files"
+          mkdir -p "$RECDIR/serial-rec"
           # Same scheduler as the Python suite: one SERIAL worker per worktree, so
           # no two suites ever share a cwd, and every suite's output + status land
           # as records replayed in sorted order below — no suite's failure can
@@ -221,12 +227,15 @@ jobs:
           # box, leaving under 2x headroom on a slower, contended CI runner.
           bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
             timeout -k 5 300 bash
-          _idx=0
+          bash scripts/parallel-suite-lane.sh 1 "$RECDIR/serial" "$RECDIR/serial-rec" \
+            timeout -k 5 300 bash
+          _idx=0; _rec="$RECDIR"
           while IFS= read -r f; do
+            if [ "$f" = "--serial--" ]; then _idx=0; _rec="$RECDIR/serial-rec"; continue; fi
             echo "→ $f"
             _idx=$((_idx + 1))
-            rc="$(cat "$RECDIR/$_idx.rc" 2>/dev/null || echo 1)"
-            output="$(cat "$RECDIR/$_idx.out" 2>/dev/null || true)"
+            rc="$(cat "$_rec/$_idx.rc" 2>/dev/null || echo 1)"
+            output="$(cat "$_rec/$_idx.out" 2>/dev/null || true)"
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
                 echo "✖ shell test TIMED OUT (>300s): $f"
@@ -250,7 +259,7 @@ jobs:
                 failed=1
               fi
             fi
-          done < "$RECDIR/files"
+          done < <(cat "$RECDIR/files"; echo "--serial--"; cat "$RECDIR/serial")
           exit "$failed"
 
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
