@@ -75,18 +75,6 @@ done
 set -- "${__args[@]+"${__args[@]}"}"
 [ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
 
-# An in-session (internal) watcher arming means the external standby for THIS
-# inbox is redundant: kill it here, in code, rather than relying on an agent
-# instruction to tear it down (belt-and-suspenders with the supervisor's own
-# poll-and-stop). SUTANDO_TMUX_SESSION is already per-instance (core vs each
-# worker gets a distinct value), so "${SESSION}-watcher" on this process's own
-# socket names only the standby for this same inbox, never another instance's.
-if [ "$WATCHER_ROLE" = "session" ]; then
-  __standby_sock="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
-  __standby_session="${SUTANDO_TMUX_SESSION:-sutando-core}-watcher"
-  tmux -S "$__standby_sock" kill-session -t "=$__standby_session" 2>/dev/null || true
-fi
-
 # Resolve TASKS_DIR via the shared resolver (tasks-dir-resolve.sh): explicit
 # positional arg -> SUTANDO_TASKS_DIR -> canonical M0 loader. Post-v0.8 (#1440
 # + Mini opinion-requested 2026-06-06) the legacy env-var fallback and
@@ -103,6 +91,19 @@ TASKS_DIR="$(resolve_tasks_dir "${1:-}" "$__REPO_ROOT")" || {
   exit 1
 }
 mkdir -p "$TASKS_DIR"
+# An in-session (internal) watcher arming means the external standby for THIS
+# inbox is redundant: kill it here, in code, rather than relying on an agent
+# instruction to tear it down (belt-and-suspenders with the supervisor's own
+# poll-and-stop). SUTANDO_TMUX_SESSION is already per-instance (core vs each
+# worker gets a distinct value), so "${SESSION}-watcher" on this process's own
+# socket names only the standby for this same inbox, never another instance's.
+# Only once this watcher has an inbox it can serve: a kill before the resolve
+# above could exit 1 would leave the inbox with no watcher at all.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  __standby_sock="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+  __standby_session="${SUTANDO_TMUX_SESSION:-sutando-core}-watcher"
+  tmux -S "$__standby_sock" kill-session -t "=$__standby_session" 2>/dev/null || true
+fi
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve
 # symlinks with `pwd -P` to match. Without -P, on macOS the comparison
