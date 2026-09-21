@@ -805,6 +805,8 @@ ensure_task_notifier() {
     "$NOTIFIER_SCRIPT"
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
   # itself and fswatches it for changes, so the launcher forwards only a genuine
@@ -832,6 +834,12 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # Standby/grace-period knobs (#4477): unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.

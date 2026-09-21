@@ -51,30 +51,57 @@ source "$__SCRIPT_DIR/task-emit.sh"
 source "$__SCRIPT_DIR/inbox-resolve.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
 source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
+# shellcheck source=tasks-dir-resolve.sh
+source "$__SCRIPT_DIR/tasks-dir-resolve.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
-# Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
-# Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06) the legacy env-var
-# fallback and hardcoded pre-v0.8 default fallback are gone: the bridges
-# (discord-bridge.py, telegram-bridge.py, dm-result.py — see PRs
-# #708/#720/#722/#723) write to the resolved workspace, and if this watcher
-# diverged from that resolution owner DMs would land silently. Diagnosed
-# 2026-05-15 (~3 dropped DMs over 17 min) and again 2026-05-16 (~45 min
-# silent gap when the Monitor was started without the env var exported
-# into its env). Single resolution path = no divergence.
-if [ -n "${1:-}" ]; then
-  TASKS_DIR="$1"
-elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
-  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
-  # same `/startup` serves it with no argument change.
-  TASKS_DIR="$SUTANDO_TASKS_DIR"
-elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
-  __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
-  TASKS_DIR="$__WS/tasks"
-else
+# --role/--inbox are stripped before the positional TASKS_DIR check below so a
+# tagged invocation (`watch-tasks-stream.sh /path --role session --inbox /path`)
+# still resolves its tasks dir the same as an untagged one. Logged to stderr
+# only, never into the sentinel: three readers int() that file as a bare pid
+# (watcher_sentinel.sh).
+WATCHER_ROLE=""
+WATCHER_INBOX_TAG=""
+__args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role) WATCHER_ROLE="${2:-}"; shift 2 ;;
+    --role=*) WATCHER_ROLE="${1#--role=}"; shift ;;
+    --inbox) WATCHER_INBOX_TAG="${2:-}"; shift 2 ;;
+    --inbox=*) WATCHER_INBOX_TAG="${1#--inbox=}"; shift ;;
+    *) __args+=("$1"); shift ;;
+  esac
+done
+set -- "${__args[@]+"${__args[@]}"}"
+[ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
+
+# An in-session (internal) watcher arming means the external standby for THIS
+# inbox is redundant: kill it here, in code, rather than relying on an agent
+# instruction to tear it down (belt-and-suspenders with the supervisor's own
+# poll-and-stop). SUTANDO_TMUX_SESSION is already per-instance (core vs each
+# worker gets a distinct value), so "${SESSION}-watcher" on this process's own
+# socket names only the standby for this same inbox, never another instance's.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  __standby_sock="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+  __standby_session="${SUTANDO_TMUX_SESSION:-sutando-core}-watcher"
+  tmux -S "$__standby_sock" kill-session -t "=$__standby_session" 2>/dev/null || true
+fi
+
+# Resolve TASKS_DIR via the shared resolver (tasks-dir-resolve.sh): explicit
+# positional arg -> SUTANDO_TASKS_DIR -> canonical M0 loader. Post-v0.8 (#1440
+# + Mini opinion-requested 2026-06-06) the legacy env-var fallback and
+# hardcoded pre-v0.8 default fallback are gone: the bridges (discord-bridge.py,
+# telegram-bridge.py, dm-result.py — see PRs #708/#720/#722/#723) write to the
+# resolved workspace, and if this watcher diverged from that resolution owner
+# DMs would land silently. Diagnosed 2026-05-15 (~3 dropped DMs over 17 min)
+# and again 2026-05-16 (~45 min silent gap when the Monitor was started
+# without the env var exported into its env). Single resolution path = no
+# divergence — and, as of #4477, the same owner task-notifier-supervisor.sh
+# calls to know its own inbox, so the two can never disagree either.
+TASKS_DIR="$(resolve_tasks_dir "${1:-}" "$__REPO_ROOT")" || {
   echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
   exit 1
-fi
+}
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve
@@ -529,6 +556,12 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# cleanup() isn't defined until later; an early exit (mkfifo, python-binary
+# resolution, sourcing) before then bypassed both traps and left this pid
+# stamped as though it were still running (#4522). cleanup()'s own trap
+# registration below replaces this one once it's safe to.
+trap 'sentinel_release_if_owner "$PID_FILE" "$$"' EXIT
+trap 'sentinel_release_if_owner "$PID_FILE" "$$"; exit 0' HUP INT TERM
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
 # handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
 WATCHER_BEAT_PID=""

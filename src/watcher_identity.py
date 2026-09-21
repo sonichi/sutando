@@ -207,11 +207,114 @@ def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable
     return trees
 
 
+def watcher_role(operands: Optional[List[str]]) -> Optional[str]:
+    """The `--role VALUE` (or `--role=VALUE`) operand, or None if absent."""
+    if not operands:
+        return None
+    for i, tok in enumerate(operands):
+        if tok == "--role" and i + 1 < len(operands):
+            return operands[i + 1]
+        if tok.startswith("--role="):
+            return tok.split("=", 1)[1] or None
+    return None
+
+
+def watcher_inbox(operands: Optional[List[str]]) -> Optional[str]:
+    """The `--inbox VALUE` (or `--inbox=VALUE`) operand, or None if absent.
+
+    Distinct from the positional tasks-dir operand: an instance whose inbox
+    comes from $SUTANDO_TASKS_DIR (env, not argv) leaves no positional trace,
+    so only an explicit tag is a reliable cross-process inbox identity.
+    """
+    if not operands:
+        return None
+    for i, tok in enumerate(operands):
+        if tok == "--inbox" and i + 1 < len(operands):
+            return operands[i + 1]
+        if tok.startswith("--inbox="):
+            return tok.split("=", 1)[1] or None
+    return None
+
+
+def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str] = None,
+                 is_watcher: Optional[Callable] = None,
+                 argv_vector: Optional[Callable] = None,
+                 run: Callable = subprocess.run) -> Optional[bool]:
+    """Is a watcher with `--role role` (and, when `inbox` is given, matching
+    `--inbox inbox`) present anywhere on the host?
+
+    Host-wide `ps`, not tmux/session-scoped: two instances (core and a worker,
+    or two workers) can each run a same-`role` watcher for DIFFERENT inboxes at
+    once, so a role match alone cannot tell a caller whether ITS OWN inbox is
+    covered -- that was the gap a plain role-only check left (#4477). Passing
+    `inbox` closes it; omitting it preserves the old host-wide behavior for a
+    caller that genuinely wants "is ANY session-role watcher running".
+
+    True/False/None, same discipline as `is_watcher_argv`: None means the `ps`
+    snapshot itself was unobservable, never "not present".
+    """
+    if ps_output is None:
+        try:
+            result = run(["ps", "-Ao", "pid,ppid,args"],
+                         capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        # A `ps` that RAN and answered non-zero is not an exception -- run()
+        # doesn't raise on that by default -- and its (often empty) stdout
+        # would otherwise read as a clean empty scan, the same "proves
+        # nothing read as absent" gap inspect_pid() guards against below.
+        if getattr(result, "returncode", None) != 0:
+            return None
+        ps_output = result.stdout
+    trees = watcher_trees(ps_output, is_watcher)
+    for members in trees.values():
+        for pid in sorted(members, key=lambda p: int(p) if p.isdigit() else 0):
+            seen = inspect_pid(pid, run=run, argv_vector=argv_vector)
+            if seen.watcher is not True:
+                continue
+            if watcher_role(seen.operands) != role:
+                continue
+            if inbox is not None and watcher_inbox(seen.operands) != inbox:
+                continue
+            return True
+    return False
+
+
 def main(argv=None) -> int:
     """`watcher_identity.py <pid>` -> `watcher`, `not-watcher`, `dead` or
     `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
-    so a shell adapter cannot read an unobservable `ps` as a proven answer."""
+    so a shell adapter cannot read an unobservable `ps` as a proven answer.
+
+    `watcher_identity.py role-present <role> [--inbox VALUE]` -> `yes`, `no`
+    or `unknown` on stdout. Exit 0 for yes/no (both decided), 2 only when the
+    `ps` snapshot itself failed -- `unknown` must never read as `no` to a
+    caller deciding whether to start a duplicate watcher."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "role-present":
+        rest = args[1:]
+        if not rest or rest[0].startswith("-"):
+            print("usage: watcher_identity.py role-present <role> [--inbox VALUE]", file=sys.stderr)
+            return 64
+        role = rest[0]
+        inbox = None
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--inbox" and i + 1 < len(rest):
+                inbox = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--inbox="):
+                inbox = rest[i].split("=", 1)[1] or None
+                i += 1
+            else:
+                print("usage: watcher_identity.py role-present <role> [--inbox VALUE]", file=sys.stderr)
+                return 64
+        verdict = role_present(role, inbox)
+        if verdict is None:
+            print("unknown")
+            print("why=ps snapshot unavailable")
+            return 2
+        print("yes" if verdict else "no")
+        return 0
     if len(args) != 1:
         print("usage: watcher_identity.py <pid>", file=sys.stderr)
         return 64

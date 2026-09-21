@@ -237,6 +237,134 @@ class TestHealthCheckDelegates(unittest.TestCase):
             self.assertIn("watcher_identity.", body, f"{name} does not delegate")
 
 
+WORKER_INBOX = "/ws/deliveries/" + "w" * 32
+CORE_SESSION_ARGS = ["bash", "src/watch-tasks-stream.sh", "--role", "session", "--inbox", INBOX]
+CORE_SESSION_FLAT = "bash src/watch-tasks-stream.sh --role session --inbox " + INBOX
+WORKER_SESSION_ARGS = ["bash", "src/watch-tasks-stream.sh", WORKER_INBOX,
+                       "--role", "session", "--inbox", WORKER_INBOX]
+WORKER_SESSION_FLAT = "bash src/watch-tasks-stream.sh " + WORKER_INBOX + " --role session --inbox " + WORKER_INBOX
+
+
+def vector_for(pid_map):
+    return lambda pid: pid_map.get(str(pid))
+
+
+class TestWatcherRoleAndInboxOperands(unittest.TestCase):
+    def test_role_flag_and_equals_form(self):
+        self.assertEqual(wid.watcher_role(["--role", "session"]), "session")
+        self.assertEqual(wid.watcher_role(["--role=session"]), "session")
+        self.assertIsNone(wid.watcher_role([]))
+        self.assertIsNone(wid.watcher_role(None))
+        self.assertIsNone(wid.watcher_role(["--role"]))  # dangling flag, no value
+
+    def test_inbox_flag_and_equals_form(self):
+        self.assertEqual(wid.watcher_inbox(["--inbox", INBOX]), INBOX)
+        self.assertEqual(wid.watcher_inbox([f"--inbox={INBOX}"]), INBOX)
+        self.assertIsNone(wid.watcher_inbox(["--role", "session"]))
+
+
+class TestRolePresentInboxAware(unittest.TestCase):
+    """role_present() closes #4477's host-wide-not-inbox-scoped gap: a
+    same-role watcher for a DIFFERENT inbox must not satisfy this caller's
+    query, or one instance's crash reads as another instance's coverage."""
+
+    def test_a_session_watcher_for_a_different_inbox_does_not_satisfy_the_query(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=WORKER_INBOX,
+                                       ps_output=ps_output, argv_vector=vec), False)
+
+    def test_a_session_watcher_for_the_same_inbox_satisfies_the_query(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=INBOX,
+                                       ps_output=ps_output, argv_vector=vec), True)
+
+    def test_omitting_inbox_preserves_the_old_host_wide_behavior(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", ps_output=ps_output, argv_vector=vec), True)
+
+    def test_two_instances_each_query_sees_only_its_own_inbox(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n  200 1 {WORKER_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS, "200": WORKER_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=ps_output, argv_vector=vec), True)
+        self.assertIs(wid.role_present("session", inbox=WORKER_INBOX, ps_output=ps_output, argv_vector=vec), True)
+        third_inbox = "/ws/deliveries/" + "z" * 32
+        self.assertIs(wid.role_present("session", inbox=third_inbox, ps_output=ps_output, argv_vector=vec), False)
+
+    def test_a_dead_instances_crash_does_not_read_as_a_live_peers_coverage(self):
+        """The exact #4477 scenario: core's session watcher is down but a
+        worker's is up -- core's own inbox-scoped query must say False, not
+        be satisfied by the worker's unrelated, still-live watcher."""
+        ps_output = f"  200 1 {WORKER_SESSION_FLAT}\n"
+        vec = vector_for({"200": WORKER_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=ps_output, argv_vector=vec), False)
+
+    def test_no_role_present_at_all_is_false_not_none(self):
+        ps_output = f"  100 1 {OBSERVER}\n"
+        got = wid.role_present("session", inbox=INBOX, ps_output=ps_output, argv_vector=unreadable)
+        self.assertIs(got, False)
+
+    def test_unobservable_ps_snapshot_is_none_not_false(self):
+        def raising_run(*_a, **_k):
+            raise FileNotFoundError("ps")
+        self.assertIsNone(wid.role_present("session", inbox=INBOX, run=raising_run))
+
+    def test_a_ps_that_ran_and_answered_non_zero_is_none_not_false(self):
+        """subprocess.run() does not raise on a non-zero exit -- a `ps` that
+        ran and failed must not read as a clean empty scan (real bug: found
+        via a live regression that expected `unknown`, got `no`)."""
+        def failing_run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 1, "", "")
+        self.assertIsNone(wid.role_present("session", inbox=INBOX, run=failing_run))
+
+
+class TestRolePresentCli(unittest.TestCase):
+    def _run(self, argv, **patches):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            with mock.patch.multiple(wid, **patches) if patches else contextlib.nullcontext():
+                rc = wid.main(argv)
+        return rc, buf.getvalue().splitlines(), err.getvalue()
+
+    def test_yes(self):
+        rc, out, _ = self._run(["role-present", "session", "--inbox", INBOX],
+                               role_present=lambda *_a, **_k: True)
+        self.assertEqual((rc, out[0]), (0, "yes"))
+
+    def test_no(self):
+        rc, out, _ = self._run(["role-present", "session", "--inbox", INBOX],
+                               role_present=lambda *_a, **_k: False)
+        self.assertEqual((rc, out[0]), (0, "no"))
+
+    def test_unknown_exits_2_and_never_prints_no(self):
+        rc, out, _ = self._run(["role-present", "session"], role_present=lambda *_a, **_k: None)
+        self.assertEqual((rc, out[0]), (2, "unknown"))
+
+    def test_inbox_is_forwarded_to_role_present(self):
+        seen = {}
+        def fake(role, inbox=None, **_k):
+            seen["role"], seen["inbox"] = role, inbox
+            return True
+        self._run(["role-present", "session", "--inbox", INBOX], role_present=fake)
+        self.assertEqual(seen, {"role": "session", "inbox": INBOX})
+
+    def test_missing_inbox_forwards_none(self):
+        seen = {}
+        def fake(role, inbox=None, **_k):
+            seen["inbox"] = inbox
+            return True
+        self._run(["role-present", "session"], role_present=fake)
+        self.assertIsNone(seen["inbox"])
+
+    def test_usage_error_on_missing_role(self):
+        rc, out, err = self._run(["role-present"])
+        self.assertEqual(rc, 64)
+        self.assertIn("usage", err)
+        self.assertEqual(out, [])
+
+
 class TestCliVerdicts(unittest.TestCase):
     """The shell adapter reads one word: each verdict must be reachable, and an
     unobservable pid must never print the word that licenses cleanup."""

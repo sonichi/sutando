@@ -590,17 +590,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        // A definite match short-circuits alive; an undecidable line must not
-        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
+        let myInbox = workspace + "/tasks"
+        // A definite match short-circuits alive ONLY when it's tagged as THIS
+        // core's own in-session watcher (#4477) -- a watcher-shaped process for
+        // a different inbox (a worker on the same host) is real but doesn't
+        // cover this core. An undecidable line must not be overridden by a
+        // later definite-false one, or an ambiguous argv reads as dead.
         var sawUndecidable = false
+        var sawForeignWatcher = false
         for line in listing.split(separator: "\n") {
             switch watcherLineMatches(line, excluding: selfPID) {
-            case .some(true): return true
+            case .some(true):
+                guard let operands = watcherLineOperands(line),
+                      lineIsSessionRoleWatcherForInbox(operands, inbox: myInbox) else {
+                    sawForeignWatcher = true
+                    continue
+                }
+                return true
             case .none: sawUndecidable = true
             case .some(false): continue
             }
         }
-        return sawUndecidable ? nil : false
+        if sawUndecidable { return nil }
+        if sawForeignWatcher {
+            logToFile("checkWatcher: watcher process(es) seen, none tagged --role session --inbox \(myInbox) -- not this core's")
+        }
+        return false
     }
 
     /// True when `s` contains the watcher script's name at a path/whitespace
@@ -619,6 +634,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
     /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    /// A bare-`true` match only proves SOME watcher is alive on the host, not
+    /// that it's this core's own -- #4477: a worker's watcher for a different
+    /// inbox matches identically here, so `checkWatcher()` also requires the
+    /// stricter `--role session --inbox <this core's tasks dir>` operands
+    /// before treating a match as "my watcher is alive".
     private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
         let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -637,6 +657,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if parts.count == 2 { return false }
         // A spaced script path is indistinguishable from a script plus arguments.
         return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
+    /// Operands (tokens after the script path) of a line already confirmed to
+    /// execute the watcher script, or nil if the boundary can't be located.
+    private func watcherLineOperands(_ line: Substring) -> [Substring]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return nil }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return nil }
+        return Array(parts.dropFirst(2))
+    }
+
+    /// True only when the operands carry `--role session` AND `--inbox
+    /// <inbox>` naming THIS core's own tasks dir -- the same tags step 1.5 /
+    /// the proactive loop's step 9 now stamp on an in-session watcher (#4477).
+    /// A watcher-shaped process missing either tag is real, but not proof
+    /// this core's own watcher is covered.
+    private func lineIsSessionRoleWatcherForInbox(_ operands: [Substring], inbox: String) -> Bool {
+        var role: String?
+        var taggedInbox: String?
+        var i = 0
+        while i < operands.count {
+            let tok = operands[i]
+            if tok == "--role", i + 1 < operands.count { role = String(operands[i + 1]); i += 2; continue }
+            if tok.hasPrefix("--role=") { role = String(tok.dropFirst("--role=".count)); i += 1; continue }
+            if tok == "--inbox", i + 1 < operands.count { taggedInbox = String(operands[i + 1]); i += 2; continue }
+            if tok.hasPrefix("--inbox=") { taggedInbox = String(tok.dropFirst("--inbox=".count)); i += 1; continue }
+            i += 1
+        }
+        return role == "session" && taggedInbox == inbox
     }
 
     /// Both halves are Claude-only. Dispatching against a live non-Claude
