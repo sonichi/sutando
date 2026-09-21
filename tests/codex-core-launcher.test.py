@@ -70,6 +70,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/restart-guard.sh",
             "src/agent/notifier-boot-gate.sh",
             "src/watcher_sentinel.sh",
+            "src/workspace_dir_resolve.sh",
             "src/agent/task-event-handler-lookup.sh",
             "src/skill-manifest-config.sh",
             "src/file_lock.py",

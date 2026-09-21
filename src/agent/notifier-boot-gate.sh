@@ -5,19 +5,16 @@
 # Resolving $SUTANDO_POOL_BOOT_SWEEP is each adapter's own job, at startup --
 # never here, to avoid re-globbing skills/*/manifest.json on every call.
 
-# Mirrors watch-tasks-stream.sh's own WORKSPACE_DIR precedence exactly
-# (SUTANDO_WORKSPACE_DIR, else dirname(SUTANDO_TASKS_DIR), else the default)
-# -- both launchers forward these into NOTIFIER_ENV_ARGS, so the gate must
-# sweep the SAME tree the watcher will actually admit tasks from, or an
-# override workspace's pool never gets its declaration checked at all.
+# Both launchers forward SUTANDO_WORKSPACE_DIR/SUTANDO_TASKS_DIR into
+# NOTIFIER_ENV_ARGS, so the gate must sweep the SAME tree the watcher will
+# actually admit tasks from, or an override workspace's pool never gets its
+# declaration checked. Delegates to workspace_dir_resolve.sh -- the single
+# owner both notifier consumers also call -- rather than re-deriving it here.
 _notifier_boot_gate_workspace() {
-  if [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
-    printf '%s' "$SUTANDO_WORKSPACE_DIR"
-  elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
-    dirname "$SUTANDO_TASKS_DIR"
-  else
-    bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null
-  fi
+  # shellcheck source=../workspace_dir_resolve.sh
+  . "$REPO/src/workspace_dir_resolve.sh" || return 1
+  resolve_workspace_dir_from_tasks_dir "${SUTANDO_TASKS_DIR:-}" \
+    || bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null
 }
 
 # $1: absolute path to a runnable python3 interpreter. Returns 0 to proceed,

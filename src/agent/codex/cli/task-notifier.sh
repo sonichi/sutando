@@ -10,10 +10,11 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-# Same precedence as watch-tasks-stream.sh's own WORKSPACE_DIR and the
-# shared notifier-boot-gate.sh, so this consumer and the gate can never
-# resolve two different workspaces from the same env.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+# Delegates to workspace_dir_resolve.sh -- the single owner the gate also
+# calls -- rather than re-deriving this and risking a silent divergence.
+# shellcheck source=../../../workspace_dir_resolve.sh
+. "$REPO/src/workspace_dir_resolve.sh"
+WORKSPACE_DIR="$(resolve_workspace_dir_from_tasks_dir "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 TASK_HANDLER_CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.

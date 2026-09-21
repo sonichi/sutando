@@ -49,6 +49,8 @@ case "\$1" in
 esac
 EOF
 chmod +x "$FAKE_REPO/scripts/sutando-config.sh"
+mkdir -p "$FAKE_REPO/src"
+cp "$REAL_REPO/src/workspace_dir_resolve.sh" "$FAKE_REPO/src/workspace_dir_resolve.sh"
 
 # --- Case 1: unset -- skip silently, same contract as Step 1.7's own "unset" case ---
 out1="$(
@@ -292,27 +294,51 @@ out9b="$(
 check "SUTANDO_TASKS_DIR-only override -> sweep sees its dirname" \
   "$(cat "$SWEEP.seen-workspace" 2>/dev/null)" "$OVERRIDE_WS"
 
-# --- Case 9c: the gate and the Codex notifier consumer must resolve the SAME
-# workspace even when SUTANDO_WORKSPACE_DIR and SUTANDO_TASKS_DIR disagree.
-# task-notifier.sh's own WORKSPACE_DIR line is replicated here (rather than
-# sourcing the whole script, which has side effects this case must not
-# trigger) to catch the two formulas drifting apart again. ---
+# --- Case 9c: the gate's wrapper must actually delegate to the shared
+# resolver (workspace_dir_resolve.sh) rather than re-deriving the formula --
+# calls the REAL function both ways, never a hand-typed replica of it (a
+# replica is exactly what let the gate and the consumers drift apart before:
+# every prior version of this case matched two copies of a formula, and
+# neither copy could ever catch the other diverging from the real code). ---
 GATE_WS9C="$(
   REPO="$FAKE_REPO"
   . "$GATE_SRC"
   SUTANDO_WORKSPACE_DIR="/tmp/workspace-A" SUTANDO_TASKS_DIR="/tmp/workspace-B/tasks" \
     _notifier_boot_gate_workspace
 )"
-CODEX_CONSUMER_WS9C="$(
-  SUTANDO_WORKSPACE_DIR="/tmp/workspace-A" SUTANDO_TASKS_DIR="/tmp/workspace-B/tasks" \
-    bash -c 'TASKS_DIR="$SUTANDO_TASKS_DIR"; echo "${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"'
+DIRECT_WS9C="$(
+  . "$REAL_REPO/src/workspace_dir_resolve.sh"
+  SUTANDO_WORKSPACE_DIR="/tmp/workspace-A" resolve_workspace_dir_from_tasks_dir "/tmp/workspace-B/tasks"
 )"
-check "gate and Codex notifier consumer agree on the workspace when overrides disagree" \
-  "$GATE_WS9C" "$CODEX_CONSUMER_WS9C"
+check "gate's wrapper delegates to the real shared resolver, not a re-derived formula" \
+  "$GATE_WS9C" "$DIRECT_WS9C"
 
 check "start-cli.sh forwards SUTANDO_WORKSPACE_DIR into the notifier's env" \
   "$(grep -c 'NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=\$SUTANDO_WORKSPACE_DIR")' \
      "$REAL_REPO/src/agent/codex/cli/start-cli.sh")" "1"
+
+# --- Case 9d: keweichen's exact leading-tilde control. A literal ~ in
+# SUTANDO_TASKS_DIR is never shell-expanded inside a variable's value (only
+# an unquoted literal word gets tilde expansion) -- the gate used to return
+# it unexpanded while both consumers expanded it, so all three must agree
+# here specifically. Runs task-notifier.sh's REAL pre-expansion snippet
+# (its own tilde substitution, which happens before it ever calls the
+# shared resolver) rather than skipping straight to the shared function. ---
+GATE_WS9D="$(
+  REPO="$FAKE_REPO"
+  . "$GATE_SRC"
+  HOME=/tmp/h75home SUTANDO_TASKS_DIR='~/split/tasks' _notifier_boot_gate_workspace
+)"
+CODEX_WS9D="$(
+  HOME=/tmp/h75home SUTANDO_TASKS_DIR='~/split/tasks' bash -c '
+    TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
+    . "'"$REAL_REPO"'/src/workspace_dir_resolve.sh"
+    resolve_workspace_dir_from_tasks_dir "$TASKS_DIR"'
+)"
+check "gate resolves a leading-tilde SUTANDO_TASKS_DIR the same as the Codex consumer" \
+  "$GATE_WS9D" "$CODEX_WS9D"
+check "the leading-tilde control actually expanded (not left literal)" \
+  "$GATE_WS9D" "/tmp/h75home/split"
 
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh

@@ -106,6 +106,9 @@ else
   echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
   exit 1
 fi
+# A literal leading ~ in $1/SUTANDO_TASKS_DIR is never shell-expanded (it
+# only expands for an unquoted literal word, not a substituted variable).
+TASKS_DIR="${TASKS_DIR/#\~/$HOME}"
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve
@@ -114,8 +117,12 @@ mkdir -p "$TASKS_DIR"
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
-# inbox; whoever named that inbox names the workspace too.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
+# inbox; whoever named that inbox names the workspace too. Delegates to
+# workspace_dir_resolve.sh -- the single owner the gate and the Codex
+# consumer also call -- rather than re-deriving this independently.
+# shellcheck source=workspace_dir_resolve.sh
+. "$__REPO_ROOT/src/workspace_dir_resolve.sh"
+WORKSPACE_DIR="$(resolve_workspace_dir_from_tasks_dir "$TASKS_DIR_ABS")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
