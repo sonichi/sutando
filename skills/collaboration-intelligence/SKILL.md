@@ -209,6 +209,7 @@ For every encountered room or channel, capture:
 - human-readable name and channel kind
 - members with their provider-native stable `user_id`, classified independently by entity kind (`human`, `agent`, `service`, or `unknown`) and collaboration role (`internal`, `customer`, `external_collaborator`, or `unknown`)
 - purpose and current workstreams
+- any external collaborative document the owner has stated is tied to this room (`linked_docs`) — record only when someone states the link; never guess or enumerate a room's documents
 - latest useful context as a compact rolling summary, not a transcript
 - responsible people/agents, source bridge, visibility, room-size band, attention priority, and last observed time
 

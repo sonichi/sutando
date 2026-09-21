@@ -78,6 +78,12 @@ attention_priority: high | normal | low
 attention_reasons: [string]
 purpose: [evidenced_fact]
 workstreams: [evidenced_fact]
+linked_docs:                        # external collaborative doc tied to this room; record
+                                     # only when someone states it, never guessed
+  - url: string
+    label: string | null
+    stated_by_entity_id: stable-local-id
+    observed_at: timestamp
 membership:
   completeness: full | partial | unknown
   sync_mode: sweep | incremental | task_snapshot | observed_only
