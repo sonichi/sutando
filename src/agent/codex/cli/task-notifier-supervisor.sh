@@ -3,7 +3,7 @@
 # lives -- but ONLY while no in-session (--role session) watcher already
 # covers this inbox. The two hosting modes (a live session's own Monitor
 # watcher, vs this supervisor's external notifier+watcher) are mutually
-# exclusive by code now, not by an agent instruction (#4477): this script
+# exclusive by code now, not by an agent instruction: this script
 # starts in standby, arms after a grace period with no session-role watcher
 # seen for its inbox, and disarms the moment one appears.
 set -u
@@ -16,7 +16,7 @@ source "$REPO/src/tasks-dir-resolve.sh"
 # No positional inbox arg for a supervisor invocation -- SUTANDO_TASKS_DIR (if
 # set) or the canonical loader, same as the watcher it's standing in for would
 # resolve. A resolution failure leaves TASKS_DIR empty: role_present() then
-# runs host-wide (no --inbox), same as before #4477 -- degrade, don't abort.
+# runs host-wide (no --inbox), same as without an inbox tag -- degrade, don't abort.
 TASKS_DIR="$(resolve_tasks_dir "${SUTANDO_TASKS_DIR:-}" "$REPO")" || TASKS_DIR=""
 PY="${SUTANDO_NOTIFIER_PY:-python3}"
 WATCHER_IDENTITY="$REPO/src/watcher_identity.py"
@@ -39,7 +39,7 @@ declared_target() { [ -n "${SUTANDO_TMUX_PANE:-}${SUTANDO_TMUX_WINDOW:-}" ]; }
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
 TARGET_POLL="${SUTANDO_NOTIFIER_TARGET_POLL:-2}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
-# Standby gating (#4477). GRACE_PERIOD: how long "no session-role watcher for
+# Standby gating. GRACE_PERIOD: how long "no session-role watcher for
 # this inbox" must hold, continuously, before arming. ROLE_POLL: how often
 # that's checked, both in standby and while armed, so a session watcher
 # appearing later still disarms this one. Generic knobs, not worker-specific:

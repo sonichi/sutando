@@ -283,10 +283,8 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
                          capture_output=True, text=True, timeout=5)
         except Exception:  # noqa: BLE001
             return None
-        # A `ps` that RAN and answered non-zero is not an exception -- run()
-        # doesn't raise on that by default -- and its (often empty) stdout
-        # would otherwise read as a clean empty scan, the same "proves
-        # nothing read as absent" gap inspect_pid() guards against below.
+        # run() doesn't raise on a non-zero exit -- checked explicitly, or a
+        # failed ps reads as a clean empty scan instead of unknown.
         if getattr(result, "returncode", None) != 0:
             return None
         ps_output = result.stdout

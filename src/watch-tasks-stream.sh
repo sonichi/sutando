@@ -75,17 +75,8 @@ done
 set -- "${__args[@]+"${__args[@]}"}"
 [ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
 
-# Resolve TASKS_DIR via the shared resolver (tasks-dir-resolve.sh): explicit
-# positional arg -> SUTANDO_TASKS_DIR -> canonical M0 loader. Post-v0.8 (#1440
-# + Mini opinion-requested 2026-06-06) the legacy env-var fallback and
-# hardcoded pre-v0.8 default fallback are gone: the bridges (discord-bridge.py,
-# telegram-bridge.py, dm-result.py — see PRs #708/#720/#722/#723) write to the
-# resolved workspace, and if this watcher diverged from that resolution owner
-# DMs would land silently. Diagnosed 2026-05-15 (~3 dropped DMs over 17 min)
-# and again 2026-05-16 (~45 min silent gap when the Monitor was started
-# without the env var exported into its env). Single resolution path = no
-# divergence — and, as of #4477, the same owner task-notifier-supervisor.sh
-# calls to know its own inbox, so the two can never disagree either.
+# One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
+# two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
 TASKS_DIR="$(resolve_tasks_dir "${1:-}" "$__REPO_ROOT")" || {
   echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
   exit 1
@@ -559,7 +550,7 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 echo "$$" > "$PID_FILE"
 # cleanup() isn't defined until later; an early exit (mkfifo, python-binary
 # resolution, sourcing) before then bypassed both traps and left this pid
-# stamped as though it were still running (#4522). cleanup()'s own trap
+# stamped as though it were still running. cleanup()'s own trap
 # registration below replaces this one once it's safe to.
 trap 'sentinel_release_if_owner "$PID_FILE" "$$"' EXIT
 trap 'sentinel_release_if_owner "$PID_FILE" "$$"; exit 0' HUP INT TERM

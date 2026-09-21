@@ -220,7 +220,7 @@ ensure_task_notifier() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-  # Standby/grace-period knobs (#4477): unset here means the supervisor keeps
+  # Standby/grace-period knobs: unset here means the supervisor keeps
   # its own generic defaults. A skill that needs different pacing for an
   # instance it spawns sets these in ITS environment before this launcher
   # runs, same forwarding pattern as every other var above.
