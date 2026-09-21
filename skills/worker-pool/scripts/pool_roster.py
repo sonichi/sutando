@@ -322,20 +322,38 @@ def ensure_task_event_handler(workspace) -> "Path | None":
     (docs/worker-pool-design.md, pool_route_handler.py) -- a recovering or
     abandoned worker's deliveries still route to it, so any worker present in
     the roster needs the handler declared, not only a currently-live one.
-    ABSENT (no roster file) and UNREADABLE (a roster file `load_roster`
-    refuses) are different failures: absent is the ordinary no-pool case,
-    UNREADABLE means an existing pool's ownership can't be established and
-    must fail closed via HandlerPublishError, not collapse to "no pool".
+    ABSENT and UNREADABLE/MALFORMED are different failures: absent is the
+    ordinary no-pool case; unreadable, non-JSON, missing `workers`, or a
+    `workers` value that is not a plain dict of valid rows (null, a list, a
+    string, a row missing `state`) means an existing pool's ownership can't
+    be established and must fail closed via HandlerPublishError, never
+    collapse to "no pool" -- the production strict reader and its own
+    `validate_workers` are reused so this shares one definition of malformed
+    with the writer that would otherwise refuse to produce such a roster.
     """
-    if not roster_path(workspace).exists():
-        return None
-    roster = load_roster(workspace)
-    if roster is None:
+    try:
+        roster = _load_existing_roster_strict(workspace)
+    except RosterError as e:
         raise HandlerPublishError(
-            f"roster at {roster_path(workspace)} exists but is unreadable or "
-            "malformed -- cannot establish whether an existing pool needs the "
+            f"roster at {roster_path(workspace)} is unreadable or malformed "
+            f"-- cannot establish whether an existing pool needs the "
+            f"task-event handler declared: {e}") from e
+    if roster is None:
+        return None
+    workers_raw = roster.get("workers")
+    if workers_raw is None:
+        raise HandlerPublishError(
+            f"roster at {roster_path(workspace)} has a null 'workers' field "
+            "-- cannot establish whether an existing pool needs the "
             "task-event handler declared")
-    workers = roster.get("workers") or {}
+    try:
+        validate_workers(workers_raw)
+    except RosterError as e:
+        raise HandlerPublishError(
+            f"roster at {roster_path(workspace)} has a malformed 'workers' "
+            f"field -- cannot establish whether an existing pool needs the "
+            f"task-event handler declared: {e}") from e
+    workers = workers_raw
     if not workers:
         return None
     handler = Path(__file__).resolve().parent / "pool_route_handler.py"

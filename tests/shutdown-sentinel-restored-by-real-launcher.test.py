@@ -32,6 +32,7 @@ NEEDED = (
     # everything the launcher sources before its bare-exec branch; a missing one
     # kills it at line 23 and the sentinel then "survives" only by never being cleared.
     "src/agent/restart-guard.sh",
+    "src/agent/notifier-boot-gate.sh",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
     "src/shutdown.py",

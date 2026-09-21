@@ -97,6 +97,27 @@ class EnsureTaskEventHandler(Base):
         with self.assertRaises(pr.HandlerPublishError):
             pr.ensure_task_event_handler(self.ws)
 
+    def test_a_falsey_non_dict_workers_value_raises_instead_of_reading_as_no_pool(self):
+        """keweichen's review, round 8: `workers = roster.get("workers") or {}`
+        let a falsey-but-invalid shape (an empty list) collapse into "no pool"
+        without ever reaching validation. Exact repro:
+        roster.json={"workers":[],"bindings":{"room-a":"worker-a"}}."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        for workers_val in ([], None, "bogus", ["w1"], 0, ""):
+            with self.subTest(workers=workers_val):
+                pr.roster_path(self.ws).write_text(json.dumps(
+                    {"workers": workers_val, "bindings": {"room-a": "worker-a"}}))
+                with self.assertRaises(pr.HandlerPublishError):
+                    pr.ensure_task_event_handler(self.ws)
+
+    def test_a_worker_row_missing_state_also_raises(self):
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps(
+            {"workers": {"w1": {"label": "w1"}}, "bindings": {}}))
+
+        with self.assertRaises(pr.HandlerPublishError):
+            pr.ensure_task_event_handler(self.ws)
+
     def test_an_existing_pool_that_predates_the_file_is_backfilled(self):
         """register_worker() already wrote it once (this skill's normal path);
         delete it to simulate a pool registered before publish_task_event_handler

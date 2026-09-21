@@ -414,6 +414,19 @@ exit 0
         self.assertIn("new-session -d -s sutando-core-watcher", calls,
                        "a passing sweep must not block the ordinary notifier start")
 
+    def test_a_failing_kill_session_still_reports_the_watcher_as_alive_and_fatal(self):
+        """A kill-session that runs but does not actually remove the session
+        (the stub's TMUX_WATCHER_EXISTS stays 1 regardless of the kill call)
+        must be caught by a post-kill has-session recheck, not swallowed."""
+        run = self.run_launcher(env_extra={
+            "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": "whatever-matches-or-not",
+            "SUTANDO_POOL_BOOT_SWEEP": self._fake_sweep(1),
+        })
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("STILL RUNNING and STILL UNPROTECTED", run.stderr,
+                       "a kill that did not remove the session produced no loud diagnostic")
+
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """There is no Codex worker mode. Through the dispatcher's --runtime and
         directly, an instance launch is refused, and none of the core's durable

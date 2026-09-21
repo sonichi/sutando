@@ -35,6 +35,8 @@ NEEDED = (
     "src/agent/claude/cli/start-cli.sh",
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
+    "src/agent/notifier-boot-gate.sh",
+    "src/skill-manifest-config.sh",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
     "src/shutdown.py",

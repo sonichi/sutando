@@ -773,16 +773,17 @@ ensure_task_notifier() {
     echo "  ⚠ task notifier not started: no runnable Python interpreter (scripts/python-binary.sh); the health probe will report it missing" >&2
     return 0
   fi
-  # Same synchronous, fail-closed backfill boundary as core's own /startup
-  # Step 1.7: this notifier starts its OWN watcher below, independent of
-  # whether Step 1.7 has run inside the core session yet. "No new session" is
-  # not sufficient on a reuse path -- a watcher already running from before
-  # the sweep started failing must not be left alive to keep admitting work
-  # unprotected (keweichen's review on PR #4503, round 6).
+  # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
+  # running from before the sweep started failing must be killed, not reused.
   if ! notifier_boot_gate "$PY"; then
     if watcher_session_exists; then
       echo "  ⚠ task notifier: killing the existing watcher session -- it cannot be left running unprotected while the boot-time pool sweep is failing" >&2
-      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null
+      # stderr, not exit code -- `return` here would abort the whole launcher
+      # under `set -e` at every call site, some mid-attach.
+      if watcher_session_exists; then
+        echo "  ✗ FATAL task notifier: kill-session did not remove the watcher -- it is STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
+      fi
     fi
     return 0
   fi

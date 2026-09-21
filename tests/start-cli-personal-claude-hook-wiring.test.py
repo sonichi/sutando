@@ -63,6 +63,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             self.root / "src/agent/restart-guard.sh",
         )
         shutil.copy2(
+            REPO / "src/agent/notifier-boot-gate.sh",
+            self.root / "src/agent/notifier-boot-gate.sh",
+        )
+        shutil.copy2(
             REPO / "src/agent/task-event-handler-lookup.sh",
             self.root / "src/agent/task-event-handler-lookup.sh",
         )
