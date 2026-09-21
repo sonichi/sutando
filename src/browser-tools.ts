@@ -39,12 +39,8 @@ export function injectText(session: any, text: string) {
 	}
 }
 
-/** Add context the model should know but not answer: a `clientContent` turn
- *  with `turnComplete: false` sits in the conversation until the user's next
- *  utterance closes it. `injectText` (realtime input) always provokes a spoken
- *  reply, which is how every room switch produced a stray "Working on it."
- *  (owner 2026-09-18). Returns false when the transport cannot do it; the
- *  caller must not fall back to `injectText`, silence beats a phantom line. */
+/** Send context through `transport.sendContent` with `turnComplete: false`. The pinned Gemini
+ *  transport ignores that flag and sends realtime text, so a spoken reply is still possible. */
 export function injectSilentContext(session: any, text: string): boolean {
 	try {
 		const transport = session?.transport;

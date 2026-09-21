@@ -365,19 +365,18 @@ describe('applySessionContextFrame — last frame wins, a DM frame clears, notic
 	});
 });
 
-// The room notice must never be spoken. Realtime text input is answered out
-// loud (every room switch said "Working on it.", owner 2026-09-18); an open
-// clientContent turn is read and left unanswered until the user speaks.
+// The room notice asks for `turnComplete: false`. Whether that is silent is the
+// transport's business: the pinned Gemini transport ignores the flag.
 import { injectSilentContext } from '../src/browser-tools.js';
 
-describe('room notices go in silently', () => {
+describe('room notices ask for an open turn', () => {
 	it('injectSilentContext sends an open turn (turnComplete=false) and reports when it cannot', () => {
 		const sent: Array<{ turns: unknown; turnComplete: unknown }> = [];
 		const session = { transport: { sendContent: (turns: unknown, turnComplete: unknown) => sent.push({ turns, turnComplete }) } };
 		assert.equal(injectSilentContext(session, '[System: hi]'), true);
 		assert.deepEqual(sent, [{ turns: [{ role: 'user', text: '[System: hi]' }], turnComplete: false }]);
 		assert.equal(injectSilentContext({ transport: { session: { sendRealtimeInput: () => {} } } }, 'x'), false,
-			'realtime input is never used for a notice: it would be answered aloud');
+			'without sendContent the notice is dropped, not sent as realtime input');
 	});
 
 	it('the session.context handler uses the silent path and the notice asks for no reply', () => {
