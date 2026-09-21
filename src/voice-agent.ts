@@ -59,7 +59,7 @@ function assertMacOS() {
 }
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, bindSessionContextFrame, sessionRoomNotice } from './task-bridge.js';
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './web-voice-transport.js';
-import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations } from './voice-navigate.js';
+import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, navigateUiAvailable, navigateUiTool } from './voice-navigate.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -712,7 +712,9 @@ function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
 
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+// navigate_ui is declared only where a client can answer it (gateway channel provisioned).
+const VOICE_NAVIGATE_UI = navigateUiAvailable();
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : [])];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -721,6 +723,7 @@ const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
+	navigateUi: VOICE_NAVIGATE_UI,
 	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
 	getRecentConversation,

@@ -10,6 +10,10 @@
  * away. With no seam installed (the phone server, tests) the tool answers
  * `unsupported` at once instead of waiting on a reply that cannot come.
  *
+ * Exposure: the tool is not in the shared inline tables. voice-agent.ts
+ * declares it, and the prompt carries its NAVIGATION rule, only when
+ * `navigateUiAvailable()` says the gateway channel is provisioned.
+ *
  * The frame goes out only to a client that announced the `ui.navigate`
  * capability in its `session.context` frame. Every desktop that merely
  * connects satisfies "attached"; only one that speaks the frame can answer
@@ -19,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
@@ -30,22 +35,37 @@ import {
 	type UiNavigatedFrame,
 	type UiNavigateTarget,
 } from './web-voice-transport.js';
+import { claudeHomePath } from './util_paths.js';
 
 /** How long the tool waits for the client's `ui.navigated` before giving up. */
 export const NAVIGATE_UI_TIMEOUT_MS = 6000;
 
 export const NAVIGATE_UI_UNSUPPORTED_MESSAGE =
-	'No desktop client is connected to this session. Navigation works in the AG2 Space desktop app; tell the user that and move on.';
+	'No desktop client is connected to this session. Navigation works in the desktop app; tell the user that and move on.';
 export const NAVIGATE_UI_TIMEOUT_MESSAGE =
 	'The desktop did not confirm the move in time. Tell the user it did not go through and that they can ask again.';
 /** An attached client that never announced `ui.navigate`: it cannot answer
  *  the frame, so nothing is sent and the owner hears this at once. */
 export const NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE =
-	"This desktop app can't be navigated by voice yet; update it.";
+	"This app can't be navigated by voice yet. If it is the desktop app, tell the user to update it.";
 /** `target:'room'` needs the spoken room words; without them there is nothing
  *  for the desktop to resolve, so no frame goes out. */
 export const NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE =
 	"Say which room, for example 'take me to GTM in Investors'.";
+
+const _GATEWAY_TOKEN_KEYS = ['REMOTE_TASK_TOKEN', 'AG2_REMOTE_TOKEN'];
+
+/** Whether this install has the ag2space gateway channel provisioned: the only
+ *  client that answers `ui.navigate`. Same detection as runtime-health.py. */
+export function navigateUiAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (_GATEWAY_TOKEN_KEYS.some(k => env[k])) return true;
+	try {
+		const lines = readFileSync(claudeHomePath('channels', 'ag2space', '.env'), 'utf-8').split('\n');
+		return lines.some(l => _GATEWAY_TOKEN_KEYS.some(k => l.startsWith(`${k}=`) && l.length > k.length + 1));
+	} catch {
+		return false;
+	}
+}
 
 export interface VoiceNavigateClient {
 	/** True while a real client is attached and can receive frames. */
@@ -173,7 +193,7 @@ export async function navigateUi(args: { target: UiNavigateTarget; query?: strin
 export const navigateUiTool: ToolDefinition = {
 	name: 'navigate_ui',
 	description:
-		'Move the AG2 Space desktop app to the DM, a room, or home. Instant. ' +
+		'Move the desktop app to the DM, a room, or home. Instant. ' +
 		'Call it when the user says "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", or "go home". ' +
 		'Pass target "dm", "room" or "home"; for a room pass `query` = the room and space words exactly as spoken (the desktop resolves the name). ' +
 		'Returns {ok:true, room_name} when the desktop moved — say one short line ("Taking you to GTM.") and continue. ' +

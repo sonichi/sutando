@@ -12,7 +12,9 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -36,6 +38,7 @@ import {
 import {
 	navigateUi,
 	navigateUiTool,
+	navigateUiAvailable,
 	installVoiceNavigateClient,
 	resolveUiNavigated,
 	failPendingNavigations,
@@ -343,11 +346,69 @@ describe('navigate_ui wiring (source pins)', () => {
 		assert.ok(install.includes('send: (frame) => session.sendJsonToClient(frame),'));
 	});
 
-	it('navigate_ui sits in both the inline tool table and the owner-only table', () => {
-		assert.ok(tools.includes("import { navigateUiTool } from './voice-navigate.js';"));
-		const inline = between(tools, 'export const inlineTools = forHostPlatform(assertUniqueToolNames([', ']));');
-		assert.ok(inline.includes('navigateUiTool'), 'in the model\'s table');
-		const ownerOnly = between(tools, 'export const ownerOnlyTools = forHostPlatform([', ']);');
-		assert.ok(ownerOnly.includes('navigateUiTool'), 'owner-only: a guest cannot move the owner\'s desktop');
+	it('the agent declares navigate_ui only behind navigateUiAvailable(), and tells the prompt the same thing', () => {
+		assert.ok(agent.includes('const VOICE_NAVIGATE_UI = navigateUiAvailable();'));
+		assert.ok(agent.includes('...inlineTools, ...(VOICE_NAVIGATE_UI ? [navigateUiTool] : [])];'));
+		assert.ok(agent.includes('navigateUi: VOICE_NAVIGATE_UI,'));
+		assert.ok(!tools.includes('navigateUiTool'), 'never in the shared tables the phone server pushes');
+	});
+});
+
+describe('navigate_ui exposure — declared only where a client can answer it', () => {
+	const ctx = (navigateUi?: boolean) => ({
+		resolveCurrentMode: () => ({ marker: '', isMeeting: false, isPresenter: false }),
+		isMeetingActive: () => false,
+		googleSearch: false,
+		navigateUi,
+		resetSessionGates: () => {},
+		resetNoteViewingDebounce: () => {},
+		getRecentConversation: () => '',
+		getSecondsSinceLastTurn: () => null,
+		getSessionRoom: () => null,
+	});
+	const OVERRIDES = { standIdentityJson: '{}', voiceContext: '', repoUrl: 'https://example.invalid', voiceAgentContext: '' };
+
+	it('the shared tool tables never carry it: phone calls and other installs get no such tool', async () => {
+		const { inlineTools, ownerOnlyTools, anyCallerTools } = await import('../src/inline-tools.js');
+		for (const table of [inlineTools, ownerOnlyTools, anyCallerTools]) {
+			assert.ok(!table.some((t: { name: string }) => t.name === 'navigate_ui'));
+		}
+	});
+
+	it('without the channel the prompt has no NAVIGATION rule and never names the tool; with it, both are there', async () => {
+		const { buildInstructions } = await import('../src/voice-agent-config.js');
+		for (const off of [buildInstructions(ctx(false) as never, OVERRIDES), buildInstructions(ctx() as never, OVERRIDES)]) {
+			assert.ok(!off.includes('NAVIGATION:'));
+			assert.ok(!off.includes('navigate_ui'));
+		}
+		const on = buildInstructions(ctx(true) as never, OVERRIDES);
+		assert.equal(on.split('\n').filter(l => l.startsWith('- NAVIGATION: ')).length, 1);
+		assert.ok(on.split('\n').some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
+		assert.ok(on.split('\n').some(l => l.includes(', navigate_ui — call these directly')), 'and in the joined names line');
+	});
+
+	it('navigateUiAvailable: a gateway token in the env or in channels/ag2space/.env, nothing else', () => {
+		const home = mkdtempSync(join(tmpdir(), 'sutando-navigate-available-'));
+		const saved = process.env.CLAUDE_CONFIG_DIR;
+		process.env.CLAUDE_CONFIG_DIR = home;
+		try {
+			assert.equal(navigateUiAvailable({}), false, 'no channel dir at all');
+			mkdirSync(join(home, 'channels', 'ag2space'), { recursive: true });
+			writeFileSync(join(home, 'channels', 'ag2space', '.env'), 'REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=\n');
+			assert.equal(navigateUiAvailable({}), false, 'a channel file with no token is not a provisioned channel');
+			writeFileSync(join(home, 'channels', 'ag2space', '.env'), 'REMOTE_TASK_URL=https://gw.example\nAG2_REMOTE_TOKEN=tok\n');
+			assert.equal(navigateUiAvailable({}), true);
+			rmSync(join(home, 'channels'), { recursive: true, force: true });
+			assert.equal(navigateUiAvailable({ REMOTE_TASK_TOKEN: 'tok' }), true, 'env wins without a file');
+		} finally {
+			if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved;
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it('what a user can hear names no product', () => {
+		for (const text of [NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, navigateUiTool.description as string]) {
+			assert.doesNotMatch(text, /AG2/i);
+		}
 	});
 });
