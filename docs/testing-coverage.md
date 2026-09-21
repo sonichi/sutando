@@ -43,7 +43,7 @@ failure. The same content lands in the Actions job summary.
 
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
-as three matrix legs that each take a third of the files by discovery order and
+as three matrix legs balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from a job log) and
 upload their combined data as `coverage-data-<shard>`; the `coverage-gate`
 job (`needs:` that job, `pull_request` only — where fork PRs get a read-only
 token) downloads every leg, combines the fragments into one `.coverage` +
