@@ -340,6 +340,28 @@ check "gate resolves a leading-tilde SUTANDO_TASKS_DIR the same as the Codex con
 check "the leading-tilde control actually expanded (not left literal)" \
   "$GATE_WS9D" "/tmp/h75home/split"
 
+# --- Case 9e: keweichen's SECOND control -- a leading-tilde
+# SUTANDO_WORKSPACE_DIR itself (not SUTANDO_TASKS_DIR), checked against the
+# REAL Claude notifier's own pre-expansion snippet
+# (src/agent/claude/cli/task-notifier.sh), which was an omitted fourth
+# policy reader: it never sourced workspace_dir_resolve.sh at all. ---
+GATE_WS9E="$(
+  REPO="$FAKE_REPO"
+  . "$GATE_SRC"
+  HOME=/tmp/h145home SUTANDO_WORKSPACE_DIR='~/split' SUTANDO_TASKS_DIR=/tmp/h145-tasks \
+    _notifier_boot_gate_workspace
+)"
+CLAUDE_WS9E="$(
+  HOME=/tmp/h145home SUTANDO_WORKSPACE_DIR='~/split' SUTANDO_TASKS_DIR=/tmp/h145-tasks bash -c '
+    TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
+    . "'"$REAL_REPO"'/src/workspace_dir_resolve.sh"
+    resolve_workspace_dir_from_tasks_dir "$TASKS_DIR"'
+)"
+check "gate resolves a leading-tilde SUTANDO_WORKSPACE_DIR the same as the Claude notifier" \
+  "$GATE_WS9E" "$CLAUDE_WS9E"
+check "the Claude consumer actually sources the shared resolver, not its own formula" \
+  "$(grep -c 'resolve_workspace_dir_from_tasks_dir' "$REAL_REPO/src/agent/claude/cli/task-notifier.sh")" "1"
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is

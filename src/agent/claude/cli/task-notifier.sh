@@ -16,8 +16,12 @@ else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
 # ONE canonical workspace root for everything workspace-owned (claims, receipts,
-# the handler probe): a separate task inbox must never redefine it.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+# the handler probe): a separate task inbox must never redefine it. Delegates
+# to workspace_dir_resolve.sh -- the single owner the gate and the Codex
+# notifier also call -- rather than re-deriving this independently.
+# shellcheck source=../../../workspace_dir_resolve.sh
+. "$REPO/src/workspace_dir_resolve.sh"
+WORKSPACE_DIR="$(resolve_workspace_dir_from_tasks_dir "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
