@@ -4,6 +4,8 @@ reader never sees a half-written file.
 Run: python3 tests/docket.test.py
 """
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -305,6 +307,105 @@ def test_cli_refuses_then_files_and_lists(tmp):
     assert (tmp / "state" / "docket.json").exists()
 
 
+
+def _run(args, box):
+    """The CLI in this process: coverage cannot see a subprocess, and the real
+    entry point is covered separately by the subprocess case."""
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = todo._cli(["--workspace", str(box)] + args)
+        except SystemExit as exc:  # argparse refuses before we see the args
+            rc = int(exc.code or 0)
+    return rc, out.getvalue(), err.getvalue()
+
+
+FILE_ARGS = [
+    "add", "--room", "!r:x", "--note", "## TODO", "--how-to-open", "read '!r:x'",
+    "--brief", "one line", "--importance", "must", "--urgency", "now", "--size", "S",
+]
+
+
+def test_the_cli_files_moves_and_closes_in_process(tmp):
+    rc, out, _ = _run(FILE_ARGS + ["--when", "idle", "--status", "approved"], tmp)
+    assert rc == 0, out
+    row = json.loads(out)
+
+    rc, out, _ = _run(["list"], tmp)
+    assert rc == 0 and row["id"] in out
+    rc, out, _ = _run(["list", "--status", "approved"], tmp)
+    assert row["id"] in out
+    rc, out, _ = _run(["list", "--status", "blocked"], tmp)
+    assert row["id"] not in out, "the filter must actually filter"
+
+    rc, out, _ = _run(["ready", "--idle"], tmp)
+    assert row["id"] in out, "an approved idle item is ready when idle"
+    rc, out, _ = _run(["ready"], tmp)
+    assert row["id"] not in out, "it waits while not idle"
+    rc, out, _ = _run(["ready", "--idle", "--owner-away", "--tier", "LIGHT", "--for", "c8138e81"], tmp)
+    assert row["id"] in out, "unaddressed items belong to whoever asks"
+
+    rc, _, err = _run(["status", row["id"], "blocked"], tmp)
+    assert rc == 2 and "note" in err, err
+    rc, _, err = _run(["status", row["id"], "blocked", "--note", "waiting on review"], tmp)
+    assert rc == 0 and "moved" in err
+    assert todo.load(tmp)[0]["blocked_note"] == "waiting on review"
+    rc, _, err = _run(["status", "todo-nope", "approved"], tmp)
+    assert rc == 1 and "no such id" in err
+
+    rc, out, _ = _run(["awaiting"], tmp)
+    assert row["id"] not in out, "a blocked item is not waiting on her"
+    _run(["status", row["id"], "completion_declared"], tmp)
+    rc, out, _ = _run(["awaiting"], tmp)
+    assert row["id"] in out, "a declared-complete item needs her confirmation"
+
+    rc, _, err = _run(["done", row["id"]], tmp)
+    assert rc == 0 and "closed" in err
+    rc, _, err = _run(["done", row["id"]], tmp)
+    assert rc == 1, "already closed is not open to close again"
+
+
+def test_the_cli_refuses_a_bad_file_and_cancels(tmp):
+    rc, _, err = _run(["add", "--room", "!r:x", "--brief", "no other fields"], tmp)
+    assert rc != 0, "argparse must refuse a file missing its discipline fields"
+
+    rc, out, _ = _run(FILE_ARGS + ["--context", "see the thread", "--assignee", "c8138e81",
+                                   "--due-at", "1789999999", "--not-before", "1"], tmp)
+    assert rc == 0
+    row = json.loads(out)
+    assert row["assignee"] == "c8138e81" and row["context"] == "see the thread"
+    assert row["due_at"] == 1789999999.0 and row["status"] == "proposed"
+
+    rc, _, err = _run(["cancel", row["id"]], tmp)
+    assert rc == 0 and "closed" in err
+    assert todo.load(tmp, state="cancelled")[0]["id"] == row["id"]
+    rc, _, err = _run(["done", row["id"]], tmp)
+    assert rc == 1, "done must not quietly overwrite a cancellation"
+    assert todo.load(tmp, state="cancelled")[0]["id"] == row["id"]
+
+    rc, out, _ = _run(FILE_ARGS + ["--status", "blocked"], tmp)
+    assert rc == 2, "a blocked file with nothing to wait on is refused"
+
+    # Filing something already blocked is legitimate when the reason is given.
+    rc, out, _ = _run(FILE_ARGS + ["--status", "blocked", "--blocked-note", "needs her API key"], tmp)
+    assert rc == 0, out
+    filed = json.loads(out)
+    assert filed["blocked_note"] == "needs her API key"
+    assert not todo.is_ready(filed, 10**10, {"idle": True}), "blocked is never picked up"
+
+
+def test_the_guards_that_raise_rather_than_report(tmp):
+    assert any("state" in p for p in todo.validate(good(state="halfway")))
+    assert any("blocked_note is free text" in p for p in todo.validate(good(blocked_note=7)))
+    for call, bad in ((todo.close, "state"), (todo.set_status, "status")):
+        try:
+            call("todo-x", "nonsense", workspace=tmp)
+            raise AssertionError(f"{bad} was not checked")
+        except ValueError as exc:
+            assert bad in str(exc), exc
+
+
 def main():
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -330,6 +431,9 @@ def main():
             ("close marks it and says whether it was there", test_close_marks_and_reports),
             ("a concurrent reader never sees a partial file", test_a_reader_never_sees_a_partial_file),
             ("the CLI refuses an incomplete file, then files, lists and closes", test_cli_refuses_then_files_and_lists),
+            ("the CLI files, moves and closes (in process)", test_the_cli_files_moves_and_closes_in_process),
+            ("the CLI refuses a bad file and cancels", test_the_cli_refuses_a_bad_file_and_cancels),
+            ("the guards that raise rather than report", test_the_guards_that_raise_rather_than_report),
         ):
             with tempfile.TemporaryDirectory() as fresh:
                 box = Path(fresh)

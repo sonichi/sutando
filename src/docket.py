@@ -185,7 +185,9 @@ def close(todo_id: str, state: str = "done", workspace: Path | None = None) -> b
     rows = _read(path)
     hit = False
     for row in rows:
-        if row.get("id") == todo_id:
+        # Only an open item closes: otherwise `done` on a cancelled one would
+        # quietly overwrite a deliberate cancellation.
+        if row.get("id") == todo_id and row.get("state", "open") == "open":
             row["state"], row["closed_at"], hit = state, time.time(), True
     if hit:
         _write_atomic(path, rows)
