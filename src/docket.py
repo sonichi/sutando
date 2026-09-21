@@ -1,4 +1,6 @@
-"""Durable TODOs an agent can pick up later, and the conditions that say when.
+"""The docket: matters awaiting action, and the conditions that say when.
+
+A docket entry is one durable TODO an agent can pick up later.
 
 The owner asked for a one-shot reminder that survives a restart. Session crons
 do not: they live in the running session and die with it. The per-host crons
@@ -87,7 +89,7 @@ OPTIONAL_TEXT = ("assignee", "context", "surface")
 
 
 def store_path(workspace: Path | None = None) -> Path:
-    return (workspace or resolve_workspace()) / "state" / "todo-reminders.json"
+    return (workspace or resolve_workspace()) / "state" / "docket.json"
 
 
 def _read(path: Path) -> list[dict]:
@@ -280,7 +282,7 @@ def ready(workspace: Path | None = None, now: float | None = None, signals: dict
 def _cli(argv: list[str]) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(prog="todo_reminders", description=__doc__)
+    parser = argparse.ArgumentParser(prog="docket", description=__doc__)
     # Explicit, because $SUTANDO_WORKSPACE is not honoured any more (#1440): a
     # test that could not name its own workspace wrote into the real one.
     parser.add_argument("--workspace", default=None, help="workspace root; default is the resolved one")

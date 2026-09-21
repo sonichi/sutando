@@ -1,7 +1,7 @@
-"""The durable TODO store: what it refuses, when an item is ready, and that a
+"""The docket: what it refuses, when an item is ready, and that a
 reader never sees a half-written file.
 
-Run: python3 tests/todo-reminders.test.py
+Run: python3 tests/docket.test.py
 """
 
 import json
@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-import todo_reminders as todo  # noqa: E402
+import docket as todo  # noqa: E402
 
 PASS = 0
 FAIL = []
@@ -243,7 +243,7 @@ def test_a_reader_never_sees_a_partial_file(tmp):
 def test_cli_refuses_then_files_and_lists(tmp):
     # --workspace, not an env var: $SUTANDO_WORKSPACE is not honoured any more,
     # and an earlier version of this test wrote its rows into the real workspace.
-    script = str(ROOT / "src" / "todo_reminders.py")
+    script = str(ROOT / "src" / "docket.py")
     base = [sys.executable, script, "--workspace", str(tmp)]
     env = dict(os.environ)
     # Missing the discipline fields: argparse itself refuses, nothing is stored.
@@ -302,7 +302,7 @@ def test_cli_refuses_then_files_and_lists(tmp):
     assert moved.returncode == 2 and "note" in moved.stderr, moved.stderr
 
     # Everything this test wrote went to its own workspace.
-    assert (tmp / "state" / "todo-reminders.json").exists()
+    assert (tmp / "state" / "docket.json").exists()
 
 
 def main():
@@ -335,7 +335,7 @@ def main():
                 box = Path(fresh)
                 (box / "state").mkdir()
                 check(name, lambda fn=fn, box=box: fn(box))
-    print(f"\ntodo reminders: {PASS} passed, {len(FAIL)} failed")
+    print(f"\ndocket: {PASS} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
 
 
