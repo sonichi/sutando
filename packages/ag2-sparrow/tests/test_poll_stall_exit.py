@@ -74,3 +74,15 @@ def test_systemexit_is_not_swallowed_by_the_loops_catch_all():
         except SystemExit:
             raised = True
         assert raised
+
+
+if __name__ == "__main__":
+    test_stalled_only_past_the_limit()
+    print("PASS test_stalled_only_past_the_limit")
+    test_zero_limit_disables_the_exit()
+    print("PASS test_zero_limit_disables_the_exit")
+    test_abort_exits_nonzero_and_records_the_stall()
+    print("PASS test_abort_exits_nonzero_and_records_the_stall")
+    test_systemexit_is_not_swallowed_by_the_loops_catch_all()
+    print("PASS test_systemexit_is_not_swallowed_by_the_loops_catch_all")
+    print("ALL PASS")

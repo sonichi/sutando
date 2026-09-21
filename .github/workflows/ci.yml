@@ -159,6 +159,7 @@ jobs:
         run: |
           timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_poll_stall_exit.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
