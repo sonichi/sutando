@@ -180,6 +180,10 @@ export function _isDeliveredResult(file: string): boolean {
 	return _deliveredResults.has(file);
 }
 
+/** A result whose first non-empty line is a `[channel: <id>]` redirect with an
+ *  id in it (result_markers._REDIRECT_RE). */
+export const LEADING_REDIRECT_RE = /^\s*\[channel:\s*[^\]\s][^\]]*\]/;
+
 /** Post a room-bound voice result into its room: a `proactive-result-*` file
  *  whose first line is the `[channel: <room>]` marker the ag2space gateway's
  *  `_proactive_route` sends to that room. The `.to-ag2space` name tag is the
@@ -190,7 +194,8 @@ export function _isDeliveredResult(file: string): boolean {
  *  the claim the next drain tick would speak the same result a second time. */
 export function forwardVoiceResultToRoom(taskId: string, result: string, room: string, nowSec = Math.floor(Date.now() / 1000)): string {
 	const file = `proactive-result-${taskId}-${nowSec}.to-ag2space.txt`;
-	writeFileSync(join(RESULT_DIR, file), `[channel: ${room}]\n${result}`);
+	// parse_markers keeps the first redirect, so a result that opens with its own wins by not being preceded.
+	writeFileSync(join(RESULT_DIR, file), LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${room}]\n${result}`);
 	_deliveredResults.add(file);
 	return file;
 }

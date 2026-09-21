@@ -21,7 +21,7 @@ const RESULT_DIR = join(TMP, 'results');
 mkdirSync(RESULT_DIR, { recursive: true });
 
 const {
-	forwardVoiceResultToRoom, _isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow,
+	forwardVoiceResultToRoom, LEADING_REDIRECT_RE, _isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow,
 	forwardVoiceResultToOwnerDm, keepVoiceResultToDm, DM_ONLY_RE, DM_ONLY_DELIVERY_NOTE, voiceRoomTaskGuidance, startResultWatcher,
 	parseSessionContextFrame, applySessionContextFrame, sessionRoomNotice,
 	setVoiceSessionRoom, getVoiceSessionRoom, MATRIX_ROOM_ID_RE, ROOM_NAME_MAX_CHARS, workTool,
@@ -71,6 +71,28 @@ describe('forwardVoiceResultToRoom — a room-bound result reaches its room, and
 		assert.equal(py.status, 0, py.stderr);
 		assert.equal(py.stdout.trim(), 'ag2space False True True False');
 		assert.equal(_shouldFallthrough(file), true, 'voice still recognises the tagged name for its own dedupe');
+	});
+
+	it('a result that opens with its own [channel:] redirect keeps it: the docked room is not put in front', () => {
+		const own = '\n[channel: !elsewhere:ag2.space]\nFor the other room.';
+		const file = forwardVoiceResultToRoom('task-1700000000005', own, '!abc123:ag2.space', 1_800_000_005);
+		assert.equal(readFileSync(join(RESULT_DIR, file), 'utf-8'), own, 'byte for byte: the first redirect the gateway reads is the core\'s');
+		assert.match(file, /\.to-ag2space\.txt$/, 'still the gateway\'s file');
+		assert.equal(_isDeliveredResult(file), true);
+		const py = spawnSync('python3', ['-c', [
+			'import sys; sys.path.insert(0, "src")',
+			'from result_markers import parse_markers',
+			`r = parse_markers(${JSON.stringify(own)})`,
+			'print([a.value for a in r.actions if a.kind == "redirect"])',
+		].join('\n')], { cwd: process.cwd(), encoding: 'utf-8' });
+		assert.equal(py.status, 0, py.stderr);
+		assert.equal(py.stdout.trim(), "['!elsewhere:ag2.space']");
+		// A redirect further down, or an empty one, is prose: the docked room leads.
+		for (const [i, body] of ['Intro.\n[channel: !elsewhere:ag2.space]\nbody', '[channel: ]\nbody', '[channel:]\nbody'].entries()) {
+			const f = forwardVoiceResultToRoom(`task-170000000001${i}`, body, '!abc123:ag2.space', 1_800_000_010 + i);
+			assert.equal(readFileSync(join(RESULT_DIR, f), 'utf-8'), `[channel: !abc123:ag2.space]\n${body}`);
+		}
+		assert.match('  [channel: 123]', LEADING_REDIRECT_RE);
 	});
 
 	it('the marker is the shape the gateway accepts (no dm-only, marker alone on its line)', () => {
