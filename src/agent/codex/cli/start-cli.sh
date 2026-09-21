@@ -211,6 +211,16 @@ ensure_task_notifier() {
     echo "  ✗ FATAL task notifier: could not resolve the effective workspace -- refusing to start the watcher (no notifier intake path)" >&2
     return 0
   fi
+  # Defense in depth: the producer already fails closed on an unresolvable
+  # field (workspace_dir_resolve.sh), but a field that is PRESENT and EMPTY
+  # is not caught by the `read -r -d ''` chain above -- three empty-but-
+  # NUL-terminated fields still satisfy all three reads. An empty workspace
+  # is not "no preference", it is silently misread downstream as "sweep the
+  # caller's cwd" (keweichen, #4503 review, P1).
+  if [ -z "$effective_workspace_dir" ] || [ -z "$effective_tasks_dir" ] || [ -z "$effective_results_dir" ]; then
+    echo "  ✗ FATAL task notifier: resolved workspace triple has an EMPTY field -- refusing to start the watcher (no notifier intake path)" >&2
+    return 0
+  fi
   # Same fail-closed boundary as /startup Step 1.7 -- a watcher already
   # running from before the sweep started failing must be killed, not reused.
   if ! notifier_boot_gate "$_HB_PY" "$effective_workspace_dir"; then   # reuses $_HB_PY, resolved once above

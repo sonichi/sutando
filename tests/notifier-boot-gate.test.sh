@@ -405,6 +405,61 @@ resolve_workspace_dir_from_tasks_dir "$SYMLINK_NONEXISTENT/tasks" >/dev/null
 check "resolving a nonexistent path creates nothing (read path, not a write)" \
   "$([ -e "$TD/9g-does-not-exist" ] && echo EXISTS || echo ABSENT)" "ABSENT"
 
+# --- Case 9h: qingyun-wu's #4503 review finding -- under a thin/missing PATH,
+# the external basename/dirname commands used to be unresolvable, and the
+# resulting failure was swallowed: the search loop silently kept the
+# UNRESOLVED logical path, so a symlinked override went right back to being
+# compared against fswatch's physical-path events and never matching. Run
+# with PATH cleared entirely (env -i, no inherited PATH) so this cannot pass
+# by accident on a host where basename/dirname happen to be builtins. ---
+SYMLINK9H_REAL="$TD/9h-real-ws"
+SYMLINK9H_LINK="$TD/9h-link-ws"
+mkdir -p "$SYMLINK9H_REAL/tasks"
+ln -s "$SYMLINK9H_REAL" "$SYMLINK9H_LINK"
+cat > "$TD/9h-runner.sh" << SCRIPT
+. "$REAL_REPO/src/workspace_dir_resolve.sh"
+_canonicalize_or_keep "$SYMLINK9H_LINK/tasks/deeper/still-deeper"
+SCRIPT
+GOT_9H="$(env -i PATH= HOME="$HOME" /bin/bash "$TD/9h-runner.sh" 2>&1)"
+check "under a thin PATH, a symlinked nonexistent leaf still resolves to the physical prefix" \
+  "$GOT_9H" "$(cd "$SYMLINK9H_REAL" && pwd -P)/tasks/deeper/still-deeper"
+
+# --- Case 9i: keweichen's #4503 review finding (P1) -- `cd "$prefix" &&
+# pwd -P` inside a bare command substitution swallows a `cd` failure
+# (e.g. permission denied): printf still runs, the captured output is
+# EMPTY, and the function returns rc 0. Every caller that only checked
+# "did I get 3 NUL-terminated fields" (never "is each field non-empty")
+# then forwarded an empty workspace as if it were resolved -- as far down
+# as notifier_boot_gate.sh sweeping the caller's cwd and reporting success.
+# Chmod 000 makes `[ -d ]` true (the parent can still stat it) while `cd`
+# is refused, which is exactly the gap between those two checks. Both
+# resolve_workspace_dir_from_tasks_dir and resolve_effective_workspace_triple
+# must fail closed (rc != 0, prints nothing), and BOTH launchers' own
+# defense-in-depth empty-field check is exercised in Case 9j/9k below. ---
+DENIED9I="$TD/9i-denied-ws"
+mkdir -p "$DENIED9I/tasks"
+chmod 000 "$DENIED9I"
+GOT9I_OUT="$(resolve_workspace_dir_from_tasks_dir "$DENIED9I/tasks" 2>/dev/null)"
+GOT9I_RC=$?
+check "a permission-denied ancestor makes resolve_workspace_dir_from_tasks_dir fail closed, not silently empty-succeed" \
+  "out=[$GOT9I_OUT] rc=$GOT9I_RC" "out=[] rc=1"
+GOT9I_TRIPLE_OUT="$(SUTANDO_TASKS_DIR="$DENIED9I/tasks" resolve_effective_workspace_triple "$REAL_REPO" 2>/dev/null)"
+GOT9I_TRIPLE_RC=$?
+check "the same failure propagates through resolve_effective_workspace_triple -- no partial/empty triple reaches a caller" \
+  "out=[$GOT9I_TRIPLE_OUT] rc=$GOT9I_TRIPLE_RC" "out=[] rc=1"
+chmod 755 "$DENIED9I"
+
+# --- Case 9j/9k: the launchers' own defense-in-depth guard (added alongside
+# the resolver fix) refuses an EMPTY resolved field even if some future
+# caller of resolve_effective_workspace_triple forgets to check its return
+# code -- the `read -r -d ''` chain alone cannot see this, since a present-
+# but-empty NUL-terminated field satisfies all three reads. ---
+for ADAPTER9J in codex claude; do
+  GUARD_SRC="$REAL_REPO/src/agent/$ADAPTER9J/cli/start-cli.sh"
+  GUARD_COUNT="$(grep -c 'resolved workspace triple has an EMPTY field' "$GUARD_SRC")"
+  check "$ADAPTER9J launcher carries the empty-field defense-in-depth guard" "$GUARD_COUNT" "1"
+done
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is
