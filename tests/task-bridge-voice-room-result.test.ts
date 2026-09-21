@@ -534,7 +534,7 @@ describe('the result leg re-checks the room: a forged source_room_id never becom
 		const dmBody = readFileSync(join(RESULT_DIR, dm), 'utf-8');
 		assert.equal(dmBody, 'the answer', 'no [channel:] marker: the gateway delivers it to the owner DM');
 		assert.ok(!dmBody.includes(FORGED));
-		assert.equal(_isDeliveredResult(dm), true, 'claimed so voice never speaks it as a second narration');
+		assert.equal(_isDeliveredResult(dm), false, 'left unclaimed: with no bridge to take it, the drain speaks it on reconnect');
 		const room = await forwardOfflineVoiceResult(verifiedTask, 'the answer', 1_800_000_101);
 		assert.equal(room, `proactive-result-${verifiedTask}-1800000101.to-ag2space.txt`);
 		assert.equal(readFileSync(join(RESULT_DIR, room), 'utf-8').split('\n')[0], `[channel: ${VERIFIED}]`);

@@ -550,7 +550,8 @@ export async function resolveVoiceResultRoom(taskId: string): Promise<string | n
 
 /** Voice result with no client attached: into its verified room — unless it
  *  is `[dm-only]`, then the owner's DM — else the owner-DM proactive shape
- *  every bridge already delivers. */
+ *  every bridge already delivers. That untagged shape is left unclaimed: on an
+ *  install where no bridge takes it, the drain speaks it on reconnect. */
 export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
 	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
 	if (kept) return kept;
@@ -562,9 +563,30 @@ export async function forwardOfflineVoiceResult(taskId: string, result: string, 
 	}
 	const file = `proactive-result-${taskId}-${nowSec}.txt`;
 	writeFileSync(join(RESULT_DIR, file), result);
-	_deliveredResults.add(file);
 	console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to the owner DM via ${file}`);
 	return file;
+}
+
+/** Offline drain leg: claim, forward, archive only once the forward is on disk.
+ *  A failed forward releases the claim, so the result is spoken on reconnect. */
+export function _forwardOfflineThenArchive(
+	taskId: string, file: string, result: string, dmOnly: boolean,
+	forward: typeof forwardOfflineVoiceResult = forwardOfflineVoiceResult, archiveDelayMs = 10_000,
+): Promise<boolean> {
+	_deliveredResults.add(file);
+	_pendingTasks.delete(taskId);
+	return forward(taskId, result, undefined, dmOnly).then(() => {
+		setTimeout(() => {
+			archiveFile(join(RESULT_DIR, file), 'results', taskId);
+			const taskFile = join(TASK_DIR, `${taskId}.txt`);
+			if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+		}, archiveDelayMs);
+		return true;
+	}, e => {
+		_deliveredResults.delete(file);
+		console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} offline:`, e);
+		return false;
+	});
 }
 
 /** The one system line the model hears when the docked room changes; null
@@ -1430,17 +1452,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						// Claimed now, delivered once the room verdict is in: a task
 						// delegated from a room answers there only while the gateway
 						// bridge still vouches for it, else the owner DM gets it.
-						_deliveredResults.add(file);
-						_pendingTasks.delete(taskId);
-						forwardOfflineVoiceResult(taskId, result, undefined, dmOnly).catch(e => {
-							_deliveredResults.delete(file);
-							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} offline:`, e);
-						});
-						setTimeout(() => {
-							archiveFile(path, 'results', taskId);
-							const taskFile = join(TASK_DIR, `${taskId}.txt`);
-							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-						}, 10_000);
+						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.
