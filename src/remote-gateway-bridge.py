@@ -192,23 +192,35 @@ def _gateway_room_members(room: str):
         _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10))  # noqa: F821
 
 
-_VOICE_OWNER = {"mxid": "", "at": 0.0}
+# An unusable owner reading is remembered this long: the gate runs every
+# outbound scan, and each re-read is a blocking gateway call on that thread.
+VOICE_OWNER_RETRY_S = 5.0
+_VOICE_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
+_voice_owner_clock = time.time
 
 
 def _voice_room_owner() -> str:
     """The owner the gateway registry binds to this agent, cached for one TTL.
     Kept apart from _gateway_owner(): that one also rewrites the DM hint global."""
-    now = time.time()
+    now = _voice_owner_clock()
     if _VOICE_OWNER["mxid"] and now - _VOICE_OWNER["at"] < VERDICT_TTL_S:
         return _VOICE_OWNER["mxid"]
+    bad_at = _VOICE_OWNER["bad_at"]
+    if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
+        return ""
     identity = _reenroll_identity()  # noqa: F821
-    answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+    try:
+        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+    except Exception as e:  # noqa: BLE001 — an unreachable gateway is an unusable reading
+        _log(f"voice-room: owner read failed: {e}")  # noqa: F821
+        answer = None
     agents = answer.get("agents") if isinstance(answer, dict) else None
     row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
     owner = str((row or {}).get("owner") or "")
     if not (owner.startswith("@") and ":" in owner):
+        _VOICE_OWNER.update(mxid="", bad_at=now)
         return ""
-    _VOICE_OWNER.update(mxid=owner, at=now)
+    _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
     return owner
 
 

@@ -97,17 +97,67 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         self.assertIsNone(self.mod._gateway_room_members(FORGED_ROOM))
         self.assertEqual(self.gw.calls[0], ("POST", "/v1/room", {"op": "members", "room_id": OK_ROOM}))
 
+    def _agents_reads(self):
+        return sum(1 for c in self.gw.calls if c[1] == "/v1/agents")
+
+    def _clock(self, start=1000.0):
+        now = [start]
+        self.mod._voice_owner_clock = lambda: now[0]
+        self.mod._VOICE_OWNER.update(mxid="", at=0.0, bad_at=None)
+        return now
+
     def test_owner_is_read_once_per_ttl_and_only_when_well_formed(self):
-        self.mod._VOICE_OWNER.update(mxid="", at=0.0)
+        now = self._clock()
         self.assertEqual(self.mod._voice_room_owner(), OWNER)
         self.assertEqual(self.mod._voice_room_owner(), OWNER)
-        self.assertEqual(sum(1 for c in self.gw.calls if c[1] == "/v1/agents"), 1, "cached")
-        self.mod._VOICE_OWNER.update(mxid="", at=0.0)
+        self.assertEqual(self._agents_reads(), 1, "cached")
+        now[0] += self.mod.VERDICT_TTL_S
+        self.assertEqual(self.mod._voice_room_owner(), OWNER)
+        self.assertEqual(self._agents_reads(), 2, "re-read once the TTL lapses")
+
+    def test_bad_owner_reading_is_held_only_for_the_short_retry_window(self):
+        now = self._clock()
         self.gw.owner = "not-an-mxid"
         self.assertEqual(self.mod._voice_room_owner(), "")
-        self.assertEqual(self.mod._VOICE_OWNER["mxid"], "", "a bad reading is not cached")
+        self.assertEqual(self.mod._VOICE_OWNER["mxid"], "", "a bad reading never becomes the owner")
+        now[0] += self.mod.VOICE_OWNER_RETRY_S - 0.1
+        self.assertEqual(self.mod._voice_room_owner(), "")
+        self.assertEqual(self._agents_reads(), 1, "no second gateway read inside the retry window")
+        self.gw.owner = OWNER
+        now[0] += 0.1
+        self.assertEqual(self.mod._voice_room_owner(), OWNER, "recovery waits one short window, not a TTL")
+        self.assertEqual(self._agents_reads(), 2)
+        self.assertLess(self.mod.VOICE_OWNER_RETRY_S, self.mod.VERDICT_TTL_S)
+
+    def test_unreachable_or_garbled_owner_answer_is_a_bad_reading(self):
+        now = self._clock()
+
+        def hang(*a, **k):
+            self.gw.calls.append(("GET", "/v1/agents", None))
+            raise TimeoutError("timed out")
+        self.mod._req = hang
+        self.assertEqual(self.mod._voice_room_owner(), "")
+        self.assertEqual(self.mod._voice_room_owner(), "")
+        self.assertEqual(self._agents_reads(), 1, "a hanging endpoint is asked once per window")
+        self.assertEqual(len([l for l in self.logs if "owner read failed" in l]), 1, self.logs)
+        now[0] += self.mod.VOICE_OWNER_RETRY_S
         self.mod._req = lambda *a, **k: "garbage"
         self.assertEqual(self.mod._voice_room_owner(), "")
+        now[0] -= 3600
+        self.mod._req = self.gw.req
+        self.assertEqual(self.mod._voice_room_owner(), OWNER, "a clock that stepped back does not extend the window")
+
+    def test_held_file_costs_one_owner_read_per_retry_window(self):
+        now = self._clock()
+        self.gw.owner = ""
+        held = self._result("proactive-result-task-10-10.to-ag2space.txt", f"[channel: {OK_ROOM}]\nbody")
+        for _ in range(30):
+            self.assertFalse(self.mod._ag2space_proactive_claim_gate(held))
+            now[0] += 1.0
+        self.assertEqual(self._agents_reads(), 6, "30 one-second scans span six 5 s windows")
+        self.gw.owner = OWNER
+        now[0] += self.mod.VOICE_OWNER_RETRY_S
+        self.assertTrue(self.mod._ag2space_proactive_claim_gate(held), "released on the first read after recovery")
 
     def test_voice_result_room_reads_the_channel_line(self):
         room_file = self._result("proactive-result-task-1-1.to-ag2space.txt", f"[channel: {OK_ROOM}]\nbody")
