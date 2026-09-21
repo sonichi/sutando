@@ -193,6 +193,44 @@ jobs:
       # existed but were never wired into CI (the discovery glob only covered
       # *.test.py and *.test.ts). Mirrors the Python step above — emit full
       # output on failure so debugging info isn't lost.
+      # TEMPORARY, reverted before merge: the same three actions in the checkout
+      # and in a fresh lane worktree, with the stderr the suites throw away.
+      - name: Lane diagnostics (temporary)
+        run: |
+          set +e
+          for where in checkout lane; do
+            if [ "$where" = lane ]; then
+              git worktree add --detach -q /tmp/lane-dbg HEAD
+              ln -s "$PWD/node_modules" /tmp/lane-dbg/node_modules
+              D=/tmp/lane-dbg
+            else
+              D="$PWD"
+            fi
+            echo "::group::[$where] $D"
+            (
+              cd "$D" || exit 0
+              echo "--- git: toplevel=$(git rev-parse --show-toplevel) branch=[$(git branch --show-current)] gitfile=[$(head -c 120 .git 2>/dev/null)]"
+              echo "--- beat: watcher launched as the suite launches it"
+              ws=$(mktemp -d); mkdir -p "$ws/tasks" "$ws/state"
+              WORKSPACE_DIR="$ws" SUTANDO_WATCHER_BEAT="$D/skills/worker-pool/scripts/pool_beat.py" \
+                python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+                bash src/watch-tasks-stream.sh "$ws/tasks" >"$ws/out" 2>"$ws/err" &
+              wp=$!
+              sleep 8
+              echo "beat dir: $(ls -la "$ws/state/watchers" 2>&1 | tr '\n' ' ')"
+              echo "watcher alive: $(kill -0 "$wp" 2>/dev/null && echo yes || echo no)"
+              echo "children: $(pgrep -P "$wp" 2>/dev/null | tr '\n' ' ')"
+              echo "ERR:"; cat "$ws/err"; echo "OUT:"; cat "$ws/out"
+              kill -TERM -- "-$wp" 2>/dev/null
+              echo "--- sentinel: verdict for pid 99999"
+              python3 -S -I src/watcher_identity.py 99999; echo "rc=$?"
+              echo "--- argparse: setup script first case"
+              bash src/agent/claude/cli/sutando-shell-setup.sh --repair-paths --from=/Users; echo "rc=$?"
+            )
+            echo "::endgroup::"
+          done
+          exit 0
+
       - name: Run shell standalone tests
         run: |
           failed=0
