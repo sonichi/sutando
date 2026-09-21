@@ -86,9 +86,17 @@ fi
 # ci.yml runs the suite under instrumentation exactly once and hands the
 # combined data here, so the gate never runs the suite a second time.
 if [ -n "${COVERAGE_GATE_PRECOMPUTED:-}" ]; then
+# The instrumented run hands over either one merged .coverage (+ its xml) or
+# one fragment per shard, `.coverage.<name>`, which are combined here.
+if [ ! -f .coverage ] && ls .coverage.* >/dev/null 2>&1; then
+    python3 -m coverage combine --quiet
+fi
+if [ -f .coverage ] && [ ! -f coverage.xml ]; then
+    python3 -m coverage xml --quiet
+fi
 if [ ! -f .coverage ] || [ ! -f coverage.xml ]; then
-    echo "coverage-gate: COVERAGE_GATE_PRECOMPUTED is set but .coverage / coverage.xml are not both present." >&2
-    echo "  The instrumented suite run must produce and hand over both files." >&2
+    echo "coverage-gate: COVERAGE_GATE_PRECOMPUTED is set but neither .coverage / coverage.xml nor any .coverage.* fragment is present." >&2
+    echo "  The instrumented suite run must produce and hand over its data." >&2
     exit 2
 fi
 echo "coverage-gate: using precomputed coverage data (.coverage, coverage.xml)."

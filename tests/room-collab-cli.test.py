@@ -335,12 +335,302 @@ def test_append_reports_the_growth_it_caused():
     assert payload == {"ok": True, "before": 2, "after": 6}, payload
 
 
+def test_delta_is_the_new_lines_and_a_first_read_is_all_new():
+    assert room_collab.delta_since(None, "a\n\nb\n") == ["a", "b"], "no earlier read: everything"
+    assert room_collab.delta_since("a\nb", "a\nb\nc") == ["c"]
+    assert room_collab.delta_since("a\nb", "a\nb") == []
+    assert room_collab.delta_since("todo: x", "todo: x\ntodo: x") == ["todo: x"], "written again is new again"
+
+
+def test_a_read_is_remembered_per_room_and_surface_and_recalled_with_its_time():
+    import tempfile
+    ws = Path(tempfile.mkdtemp())
+    p = room_collab.snapshot_path(ws, "!r:x", "markdown")
+    assert p.parent == ws / "state" / "room-collab" and "!" not in p.name and ":" not in p.name
+    assert p != room_collab.snapshot_path(ws, "!r:x", "board"), "a surface has its own memory"
+    assert p != room_collab.snapshot_path(ws, "!other:x", "markdown")
+    # Seats share a workspace: two readers of one surface keep two memories.
+    mine = room_collab.snapshot_path(ws, "!r:x", "markdown", "@mars:x")
+    theirs = room_collab.snapshot_path(ws, "!r:x", "markdown", "@sudoo:x")
+    assert mine != theirs and mine != p
+    import types
+    assert room_collab.reader_identity(types.SimpleNamespace(user_id="@m:x", name="Mars")) == "@m:x"
+    assert room_collab.reader_identity(types.SimpleNamespace(user_id=None, name="Mars")) in ("Mars",) + tuple(
+        os.environ.get(v) for v in room_collab.IDENTITY_VARS if os.environ.get(v))
+    assert room_collab.recall(p) == (None, None), "nothing yet"
+    room_collab.remember(p, "first\nsecond")
+    text, at = room_collab.recall(p)
+    assert text == "first\nsecond" and isinstance(at, float) and at > 0
+    assert not p.with_suffix(".tmp").exists(), "written atomically, no temp file left"
+
+
+def test_presence_asks_the_service_without_a_socket_and_reads_the_counts():
+    import io
+    seen = {}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(req, timeout=0):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        return _Resp(json.dumps({"room": "!r:x", "surfaces": {
+            "markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
+            "kanban": {"peers": "junk"}, "weird": "not a dict"}}).encode())
+
+    got = room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
+    assert seen["url"] == "https://h/api/v1/room-collab/%21r%3Ax/presence", seen
+    assert seen["auth"] == "Bearer tok"
+    assert got == {"markdown": {"peers": 2, "agents": 1}, "board": {"peers": 0, "agents": 0},
+                   "kanban": {"peers": 0, "agents": 0}}, got
+    # An origin that already names the path is not doubled.
+    room_collab.presence_summary("https://h/api/v1/room-collab", "!r:x", "tok", opener=opener)
+    assert seen["url"].count("/api/v1/room-collab") == 1
+    text = room_collab.render_presence("!r:x", got, as_json=False)
+    assert "markdown     2 present  (1 agent(s), 1 person(s))" in text, text
+    assert json.loads(room_collab.render_presence("!r:x", got, as_json=True))["surfaces"] == got
+    assert "nobody is in any surface" in room_collab.render_presence("!r:x", {"markdown": {"peers": 0, "agents": 0}}, False)
+
+
+def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
+    import io
+    import urllib.error
+
+    def refuse(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, io.BytesIO(b""))
+
+    def garbage(req, timeout=0):
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _R(b'{"room": "!r:x"}')
+
+    for opener, needle in ((refuse, "presence refused (403)"), (garbage, "without surfaces")):
+        try:
+            room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
+        except RoomDocError as e:
+            assert needle in str(e), str(e)
+        else:
+            raise AssertionError(f"{needle}: should have raised")
+
+
+def test_read_delta_prints_only_what_is_new_since_the_last_read():
+    import asyncio
+    import contextlib
+    import io
+    import tempfile
+    import room_collab_client
+    ws = tempfile.mkdtemp()
+
+    class _D:
+        text = "line one\nline two"
+        peers = []
+        authors = {}
+
+    def run(*argv):
+        args = room_collab.build_parser().parse_args(["--workspace", ws, "--url", "https://h", "--token", "t", *argv])
+        real = room_collab_client.open_room_collab
+        room_collab_client.open_room_collab = _opener(_D())
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = asyncio.run(room_collab.run(args))
+        finally:
+            room_collab_client.open_room_collab = real
+        return rc, out.getvalue()
+
+    rc, out = run("read", "--delta", "!r:x")
+    assert rc == 0 and "no earlier read" in out and "line one" in out and "line two" in out, out
+    _D.text = "line one\nline two\nline three"
+    rc, out = run("read", "--delta", "!r:x")
+    assert rc == 0 and "1 new line(s) since your last read at" in out, out
+    assert "line three" in out and "line one" not in out, out
+    rc, out = run("--json", "read", "--delta", "!r:x")
+    body = json.loads(out)
+    assert body["delta"] == [] and body["since"] and body["chars"] == len(_D.text), body
+    rc, out = run("read", "!r:x")
+    assert rc == 0 and out.strip() == _D.text, "a plain read is unchanged, and it remembers too"
+
+
 def test_an_unknown_command_refuses_rather_than_printing_nothing():
     try:
         room_collab.render("nope")
         raise AssertionError("expected RoomDocError")
     except RoomDocError:
         pass
+
+
+# --- comment: where the quote is, what the message is, how it is posted ----
+
+DOC = "Plan\n\noption A is cheap\noption B is fast\noption A is cheap too\n"
+
+
+def _refuses(fn, *words):
+    try:
+        fn()
+    except RoomDocError as e:
+        for w in words:
+            assert w in str(e), (w, str(e))
+        return
+    raise AssertionError("expected RoomDocError")
+
+
+def test_a_unique_quote_is_found_and_is_the_first_occurrence():
+    assert room_collab.locate_quote(DOC, "option B is fast") == (DOC.index("option B"), 0)
+
+
+def test_an_ambiguous_quote_refuses_unless_nth_picks():
+    _refuses(lambda: room_collab.locate_quote(DOC, "option A is cheap"), "occurs 2 times", "--nth 0..1")
+    second = DOC.index("option A is cheap too")
+    assert room_collab.locate_quote(DOC, "option A is cheap", 1) == (second, 1)
+    _refuses(lambda: room_collab.locate_quote(DOC, "option A is cheap", 2), "--nth 2", "2 time(s)")
+
+
+def test_an_absent_empty_or_oversized_quote_refuses():
+    _refuses(lambda: room_collab.locate_quote(DOC, "option C"), "not in the document")
+    _refuses(lambda: room_collab.locate_quote(DOC, ""), "empty")
+    _refuses(lambda: room_collab.locate_quote("x" * 3000, "x" * 2001), "at most 2000")
+
+
+def test_the_comment_is_a_message_a_plain_client_reads_and_an_anchor_the_collab_client_pins():
+    anchor = {"start": "AAA=", "end": "BBB="}
+    body, extra = room_collab.comment_content(anchor, "option B is fast", 0, "  is it? ")
+    # The quote leads, then a blank line, then the words: what commentText() strips.
+    assert body == "> option B is fast\n\nis it?", body
+    inner = extra[room_collab.COMMENT_KEY]
+    assert inner == {"anchor": {"start": "AAA=", "end": "BBB=", "quote": "option B is fast", "nth": 0}, "v": 1}
+    assert isinstance(inner["v"], int) and isinstance(inner["anchor"]["nth"], int)
+    _refuses(lambda: room_collab.comment_content(anchor, "q", 0, "   "), "something to say")
+
+
+def test_a_mention_is_the_full_mxid_in_the_body():
+    body, _ = room_collab.comment_content({}, "q", 0, "which one?", ["@qingyun:hs", ""])
+    assert body == "> q\n\n@qingyun:hs which one?", body
+
+
+def test_the_comment_is_posted_through_room_ops_say_with_the_anchor_as_extra_content(tmp_path=None):
+    import tempfile
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"ok": true, "event_id": "$e1", "state": "confirmed"}'
+        stderr = ""
+
+    def runner(argv, **kw):
+        calls.append((argv, kw))
+        return _Proc()
+
+    with tempfile.TemporaryDirectory() as d:
+        script = Path(d) / "room_ops.py"
+        script.write_text("")
+        extra = {room_collab.COMMENT_KEY: {"anchor": {"quote": "日本"}, "v": 1}}
+        receipt = room_collab.post_comment("!r:hs", "> 日本\n\nok", extra, runner=runner, script=script)
+    assert receipt["event_id"] == "$e1"
+    argv, kw = calls[0]
+    assert argv[1:5] == [str(script), "say", "!r:hs", "> 日本\n\nok"], argv
+    assert argv[5] == "--extra-content" and json.loads(argv[6]) == extra
+    assert kw == {"capture_output": True, "text": True}
+
+
+def test_a_post_that_did_not_land_is_a_refusal_with_the_reason():
+    class _Proc:
+        returncode = 0
+        stdout = '{"ok": false, "reason": "client gate denies !r:hs"}'
+        stderr = ""
+    script = Path(__file__)  # any existing file stands in for the script
+    _refuses(lambda: room_collab.post_comment("!r:hs", "b", {}, runner=lambda *a, **k: _Proc(), script=script),
+             "not posted", "client gate denies")
+
+    class _Crash:
+        returncode = 1
+        stdout = ""
+        stderr = "Traceback ...\nKeyError: 'x'"
+    _refuses(lambda: room_collab.post_comment("!r:hs", "b", {}, runner=lambda *a, **k: _Crash(), script=script),
+             "not posted", "KeyError")
+
+
+def test_without_room_ops_installed_the_refusal_names_the_dry_run_route():
+    import unittest.mock as mock
+    with mock.patch.object(room_collab, "room_ops_script", return_value=None):
+        _refuses(lambda: room_collab.post_comment("!r:hs", "b", {}, runner=lambda *a, **k: None),
+                 "agent-room-ops", "--dry-run")
+
+
+def test_room_ops_is_looked_for_beside_this_skill():
+    found = room_collab.room_ops_script()
+    assert found == REPO / "skills" / "agent-room-ops" / "room_ops.py", found
+
+
+def test_comment_runs_end_to_end_through_a_fake_surface():
+    import contextlib
+    import io
+    import unittest.mock as mock
+    try:
+        import room_collab_client
+    except (ImportError, SystemExit):
+        return  # the client's dependencies are not installed here; the pure parts are tested above
+
+    class _Doc:
+        text = DOC
+        peers = []
+
+        def anchor(self, start, end):
+            return {"start": f"s{start}", "end": f"e{end}"}
+
+    @contextlib.asynccontextmanager
+    async def fake_open(*_a, **_k):
+        yield _Doc()
+
+    posted = []
+
+    def fake_post(room, body, extra):
+        posted.append((room, body, extra))
+        return {"ok": True, "event_id": "$e", "state": "confirmed"}
+
+    def run(argv, stream="stdout"):
+        buf = io.StringIO()
+        with (contextlib.redirect_stdout(buf) if stream == "stdout" else contextlib.redirect_stderr(buf)):
+            rc = room_collab.main(argv)
+        return rc, buf.getvalue()
+
+    with mock.patch.object(room_collab_client, "open_room_collab", fake_open), \
+            mock.patch.object(room_collab, "post_comment", fake_post), \
+            mock.patch.dict(os.environ, {"AG2_MATRIX_TOKEN": "t", "AG2_API_ROOT": "https://h"}):
+        rc, out = run(["comment", "!r:hs", "option B is fast", "why?", "--dry-run"])
+        shown = json.loads(out)
+        at = DOC.index("option B is fast")
+        assert rc == 0 and posted == [], (rc, posted)
+        assert shown["body"] == "> option B is fast\n\nwhy?"
+        assert shown["extra_content"][room_collab.COMMENT_KEY]["anchor"] == \
+            {"start": f"s{at}", "end": f"e{at + len('option B is fast')}", "quote": "option B is fast", "nth": 0}
+
+        rc, out = run(["comment", "!r:hs", "option A is cheap", "why?", "--nth", "1"])
+        assert rc == 0 and "occurrence 1" in out and "$e" in out, out
+        assert posted[-1][0] == "!r:hs" and posted[-1][2][room_collab.COMMENT_KEY]["anchor"]["nth"] == 1
+
+        rc, out = run(["--json", "comment", "!r:hs", "option B is fast", "why?"])
+        assert rc == 0 and json.loads(out)["event_id"] == "$e"
+
+        # An ambiguous quote is a refusal on stderr, and nothing is posted for it.
+        rc, err = run(["comment", "!r:hs", "option A is cheap", "why?"], stream="stderr")
+        assert rc == 2 and "occurs 2 times" in err and len(posted) == 2, (rc, err)
+
+
+def test_the_comment_command_parses_its_flags():
+    a = room_collab.build_parser().parse_args(
+        ["comment", "!r:hs", "the words", "why?", "--nth", "1", "--mention", "@a:hs", "--mention", "@b:hs", "--dry-run"])
+    assert (a.command, a.quote, a.text, a.nth, a.mention, a.dry_run) == \
+        ("comment", "the words", "why?", 1, ["@a:hs", "@b:hs"], True)
+    b = room_collab.build_parser().parse_args(["comment", "!r:hs", "q", "t"])
+    assert b.nth is None and b.mention == [] and b.dry_run is False
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

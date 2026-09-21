@@ -42,12 +42,14 @@ the whole-tree percentage, and the per-file uncovered-lines table on
 failure. The same content lands in the Actions job summary.
 
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
-workflow. `python-standalone-tests` runs the suite once under `coverage run`
-and uploads the combined `.coverage` + `coverage.xml` as the `coverage-data`
-artifact; the `coverage-gate` job (`needs:` that job, `pull_request` only —
-where fork PRs get a read-only token) downloads it, runs `diff-cover`
-(`COVERAGE_GATE_PRECOMPUTED=1 scripts/coverage-gate.sh`, which then runs no
-tests itself), and uploads `coverage-summary.md`; `coverage-comment.yml`
+workflow. `python-standalone-tests` runs the suite once under `coverage run`,
+as two matrix legs that each take half the files by discovery order and
+upload their combined data as `coverage-data-<shard>`; the `coverage-gate`
+job (`needs:` that job, `pull_request` only — where fork PRs get a read-only
+token) downloads every leg, combines the fragments into one `.coverage` +
+`coverage.xml`, runs `diff-cover` (`COVERAGE_GATE_PRECOMPUTED=1
+scripts/coverage-gate.sh`, which then runs no tests itself), and uploads
+`coverage-summary.md`; `coverage-comment.yml`
 fires on `workflow_run` of `CI` in the base-repo context with
 `pull-requests: write` and posts it. It never checks out PR code, which is
 what keeps the write token safe. Note `workflow_run` executes the default

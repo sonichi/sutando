@@ -14,6 +14,7 @@ open is not enough — the renewal loop runs for as long as the session does.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import ssl
 import sys
@@ -29,6 +30,7 @@ try:
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
+    from room_collab_positions import encode as encode_position, relative_position, units
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
         f"room-collab client needs its dependencies: {exc}\n"
@@ -133,6 +135,20 @@ class RoomDoc:
     def files(self) -> list[dict]:
         _, files = self._require_board("read files")
         return [v for k, v in self._items(files) if is_board_file(v, k)]
+
+    def anchor(self, start: int, end: int) -> dict[str, str]:
+        """Two Yjs relative positions, base64, for the character range
+        [start, end) of the text — the form a web client anchors a comment to,
+        which survives edits elsewhere in the document."""
+        text = self._require_text("anchor text")
+        current = self.text
+        if not 0 <= start <= end <= len(current):
+            raise RoomDocError(f"anchor range {start}:{end} is outside the text ({len(current)} chars)")
+        # Character offsets here; a Yjs position counts UTF-16 units.
+        return {"start": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:start]))).decode("ascii"),
+                "end": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:end]))).decode("ascii")}
 
     @property
     def peers(self) -> list[dict]:
@@ -303,10 +319,28 @@ class RoomDoc:
     async def append(self, addition: str) -> None:
         text = self._require_text("append text")
         await self._commit(lambda: text.__iadd__(addition))
+        await self._publish_cursor(len(str(text).encode("utf-8")))
 
     async def insert(self, index: int, addition: str) -> None:
         text = self._require_text("insert text")
         await self._commit(lambda: text.insert(index, addition))
+        await self._publish_cursor(index + len(addition.encode("utf-8")))
+
+    async def _publish_cursor(self, index: int) -> None:
+        """Put the agent's caret at `index` (the store's units) for the editors
+        to draw: the same awareness `cursor` a person's editor publishes — a
+        relative position, so it follows the text as others type around it."""
+        if self._text is None:
+            return
+        try:
+            # The writes count UTF-8 bytes; a Yjs position counts UTF-16 units.
+            at = units(str(self._text).encode("utf-8")[:index].decode("utf-8"))
+            pos = relative_position(self._doc, self._text, self._text_name, at)
+        except BaseException:  # noqa: BLE001 - a pyo3 panic, or a cancel mid-send; the write already landed
+            return  # deliberately wider than Exception: a panic is not one
+        self._awareness.set_local_state_field("cursor", {"anchor": pos, "head": pos})
+        await self._send_quietly(create_awareness_message(
+            self._awareness.encode_awareness_update([self._awareness.client_id])))
 
     async def put_elements(self, elements: list[dict]) -> int:
         """Write elements that are newer than what is stored. Returns how many.
@@ -608,6 +642,7 @@ class RoomDoc:
             text.insert(start, new)
 
         await self._commit(mutate)
+        await self._publish_cursor(start + len(new.encode("utf-8")))
 
     async def settle(self, seconds: float = 1.0) -> None:
         """Wait for the server to acknowledge, and fail if it refused instead."""

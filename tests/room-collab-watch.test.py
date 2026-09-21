@@ -175,6 +175,58 @@ async def test_the_agents_own_write_is_not_reported():
     await agen.aclose()
 
 
+async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
+    # The editor draws a caret only from awareness `cursor`: a Yjs relative
+    # position, i.e. the ID of a unit of text, counted in UTF-16 by Yjs.
+    doc, room = make()
+    me = doc.client_id
+    assert "cursor" not in (room._awareness.get_local_state() or {}), "no caret before any write"
+    await room.append("héllo")                       # 6 bytes, 5 units: clocks 0-4
+    cur = room._awareness.get_local_state()["cursor"]
+    assert cur["anchor"] == cur["head"], cur
+    assert cur["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, cur   # the end of the text
+    await room.insert(0, "¡")                        # 2 bytes, 1 unit: clock 5
+    cur = room._awareness.get_local_state()["cursor"]
+    # After "¡" the caret sits on "h": clock 0 — the unit, not byte 2 or clock 6.
+    assert cur["anchor"] == {"item": {"client": me, "clock": 0}, "assoc": 0}, cur
+    await room.replace("llo", "日本")                 # ends before nothing: the end again
+    assert room._awareness.get_local_state()["cursor"]["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}
+    peer = Doc(); peer.apply_update(doc.get_update())
+    peer.get(DEFAULT_TEXT_NAME, type=Text).insert(0, "ZZZ")
+    doc.apply_update(peer.get_update(doc.get_state()))
+    await room.insert(len("ZZZ¡hé".encode()), "x")   # after é: the caret lands on "日", clock 6
+    cur = room._awareness.get_local_state()["cursor"]
+    assert cur["anchor"] == {"item": {"client": me, "clock": 6}, "assoc": 0}, cur
+    await asyncio.sleep(0)                           # the awareness frames are sent quietly, off the write path
+    sent = [m for m in room._ws.sent if m[:1] == b"\x01"]   # awareness frames went out
+    assert len(sent) >= 2, len(sent)
+
+
+async def test_a_caret_that_cannot_be_placed_never_fails_the_write():
+    # pycrdt panics (a BaseException, not an Exception) on some positions; the
+    # write has already landed by then, so the caret is skipped, nothing raised.
+    doc, room = make()
+    await room.append("abc")
+
+    class Panic(BaseException):
+        pass
+
+    real = room._text.sticky_index
+    room._text.sticky_index = lambda *a, **k: (_ for _ in ()).throw(Panic("simulated pyo3 panic"))
+    try:
+        before = dict(room._awareness.get_local_state()["cursor"])
+        await room.insert(1, "X")                     # interior position → sticky_index → panic
+    finally:
+        room._text.sticky_index = real
+    assert str(doc.get(DEFAULT_TEXT_NAME, type=Text)) == "aXbc", "the write landed"
+    assert room._awareness.get_local_state()["cursor"] == before, "the caret was left where it was, not raised on"
+    # A surface with no text (the board) has nowhere to put a caret; the guard returns.
+    bdoc = Doc()
+    board = RoomDoc(FakeWS(), bdoc, Awareness(bdoc), DEFAULT_TEXT_NAME, kind=BOARD_KIND)
+    await board._publish_cursor(0)
+    assert "cursor" not in (board._awareness.get_local_state() or {})
+
+
 async def test_the_session_ending_raises_instead_of_stopping_quietly():
     doc, room = make()
     agen = room.changes()
@@ -351,6 +403,39 @@ async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
         assert e.snapshot == {"peers": [], "text": ""}, "the snapshot travels with the error"
     else:
         raise AssertionError("must raise")
+
+
+async def test_an_anchor_is_a_relative_position_pair_in_yjs_ids():
+    import base64
+    from pycrdt import StickyIndex
+    doc, rd = make()
+    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
+    # Built in four transactions so the items are out of clock order; the
+    # expected IDs are the ones a Y.Doc resolves back to the same indexes.
+    text += "héllo"
+    text.insert(0, "¡")
+    text += "日本"
+    text.insert(3, "😀")
+    s = rd.text
+    assert s == "¡h😀éllo日本", s
+    me = doc.client_id
+
+    def decoded(b64):
+        return StickyIndex.decode(base64.b64decode(b64), sequence=text).to_json()
+
+    a = rd.anchor(s.index("日本"), s.index("日本") + 2)   # chars 7..9 = units 8..10
+    assert decoded(a["start"]) == {"item": {"client": me, "clock": 6}, "assoc": 0}, a
+    assert decoded(a["end"]) == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, a   # the end of the text
+    b = rd.anchor(s.index("éllo"), s.index("éllo") + 4)   # chars 3..7 = units 4..8, after the emoji
+    assert decoded(b["start"]) == {"item": {"client": me, "clock": 1}, "assoc": 0}, b
+    assert decoded(b["end"]) == {"item": {"client": me, "clock": 6}, "assoc": 0}, b
+
+    for bad in ((-1, 2), (3, 2), (0, len(s) + 1)):
+        try:
+            rd.anchor(*bad)
+            raise AssertionError(f"accepted {bad}")
+        except RoomDocError as e:
+            assert "outside the text" in str(e)
 
 
 def test_a_refusal_is_never_a_reconnect():

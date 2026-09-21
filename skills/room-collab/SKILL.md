@@ -26,14 +26,23 @@ sent one agent to the wrong place, which is why the warning is here and not furt
 
 ```bash
 P=skills/room-collab/scripts/room_collab.py
-python3 $P doctor '!room:server'                       # 1. every setup step, one line each
-python3 $P read   '!room:server'                       # 2. find the line that names you
-python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 3. answer UNDER it, signed
+python3 $P presence '!room:server'                     # 0. which surfaces are live, who is in them
+python3 $P read   '!room:server'                       # 1. the whole document — find the line that names you
+python3 $P append '!room:server' $'\n\n@you — <your reply>'   # 2. answer UNDER it, signed
+python3 $P read --delta '!room:server'                 # every later return: only what changed since you last read
 ```
 
 Then say one line in the room ("replied in the doc") — the person who called
 you is watching the room, not the document. With the lane env loaded no flag
-is needed; `doctor` tells you which step fails if one does.
+is needed. If a step fails, `doctor '!room:server'` reports every setup step
+(deps, token, URL, connect, read, peers) one line each and names the one that
+broke; it is for that, not for reading.
+
+Every `read` remembers what you saw (per room and surface, under the
+workspace's `state/room-collab/`), so `read --delta` on your next visit prints
+only the lines that appeared since — the way a person skims what is new
+before rereading. The first read of a surface is all new. `--json` carries
+`delta` and `since` alongside the usual fields.
 
 Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
@@ -80,9 +89,12 @@ given while that alias is served.
 ```bash
 P=skills/room-collab/scripts/room_collab.py
 python3 $P read   '!room:server'                      # print the document
-python3 $P peers  '!room:server'                      # who is present
+python3 $P read --delta '!room:server'                # only what is new since your last read
+python3 $P peers  '!room:server'                      # who is present in THIS surface (opens it)
+python3 $P presence '!room:server'                    # who is in EVERY surface, without opening any
 python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
+python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
 python3 $P --name mars read '!room:server'            # publish presence while connected
 ```
 
@@ -232,7 +244,9 @@ Three things that matter more than they look:
 1. **Publish presence.** Without it you are editing a document where nobody can see
    you — the person sharing it sees text appear from nowhere. Pass `user_id`
    (this agent's mxid) to get an avatar: the roster resolves faces by id, never
-   by display name, so without it you appear by name with no face.
+   by display name, so without it you appear by name with no face. Each
+   `append`/`insert`/`replace` also places your caret at the write's end, so
+   the editor draws where you last wrote, in your colour, like a person's.
 2. **One connection per agent per surface.** Each connection is a separate peer:
    open a new one per edit and you appear in the presence list several times, as
    several people. Hold the context manager open instead.
@@ -251,6 +265,30 @@ whether it is a person or an agent (and whose agent). The document records
 this on the server as writes land; an agent cannot claim authorship, only
 read it (verified 2026-09-20). Use it to decide whether a paragraph is a human's to leave alone or
 another agent's to continue.
+
+## Commenting on a passage, rather than editing it
+
+When something a person wrote is unclear, ask about it *there* instead of
+rewriting it or asking in the timeline where the words are out of sight:
+
+```bash
+python3 $P comment '!room:server' 'option A is cheap' 'cheap in money, or in time?' --mention '@qingyun:server'
+python3 $P comment '!room:server' 'option A is cheap' '…' --nth 1     # the second occurrence
+python3 $P comment '!room:server' 'option A is cheap' '…' --dry-run   # show the message, post nothing
+```
+
+The quote must be the exact words as they stand in the document (up to 2000
+characters), and it must be unique — or say which occurrence with `--nth`
+(0 is the first). The command refuses rather than guessing. What it posts is an
+ordinary room message — `> the quoted words`, a blank line, your text — carrying
+the anchor a web client pins the comment to, so the person sees it beside the
+passage and anyone in a plain client still reads it as a sentence. `--mention`
+writes the mxid into the text, which is what makes it a real mention; an agent
+among them is called.
+
+Posting goes through the `agent-room-ops` skill installed beside this one
+(`room_ops.py say --extra-content`); without it the command says so, and
+`--dry-run` gives you the exact message to post another way.
 
 ## What a refusal means
 

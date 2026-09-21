@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI over the room-collab client: read, append, replace, peers.
+"""CLI over the room-collab client: read, append, replace, comment, peers.
 
 Every subcommand opens the document, does one thing and closes. A long-lived
 collaborating agent should import `room_collab_client` instead and hold the
@@ -9,14 +9,28 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
+from room_collab_watch import new_lines  # noqa: E402
+
+# The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
+COMMENT_KEY = "space.ag2.collab.doc.comment"
+# The client refuses a longer selection rather than truncating the quote it verifies by.
+QUOTE_MAX = 2000
 
 # The collab names lead; the ROOM_DOC_* spellings are read for one release
 # more so an install that set them keeps working through the rename.
@@ -124,6 +138,99 @@ def credential_report(explicit_token: str | None, explicit_url: str | None,
         else:
             rows.append(("url", False, "none found; set one of " + ", ".join(URL_VARS)))
     return rows
+
+
+def delta_since(previous: str | None, current: str) -> list[str]:
+    """The lines that are new since `previous`; everything when there is none.
+
+    A summoned agent that comes back should read what changed before it reads
+    everything again. Same rule as `watch` uses for a remote edit."""
+    if previous is None:
+        return [line for line in current.split("\n") if line.strip()]
+    return new_lines(previous, current)
+
+
+def snapshot_path(workspace: Path, room: str, kind: str, who: str = "") -> Path:
+    """Where ONE reader keeps what it last read of one surface: per room, kind and
+    reader, hashed so a room id's `!` and `:` never touch the filesystem. Several
+    seats share a workspace, so a key without the reader would report "new since
+    someone else read"."""
+    key = hashlib.sha1(f"{room}\n{kind}\n{who}".encode("utf-8")).hexdigest()[:16]
+    return Path(workspace) / "state" / "room-collab" / f"last-read-{key}.txt"
+
+
+def reader_identity(args: argparse.Namespace) -> str:
+    """Who is reading: the mxid when known, else the presence name, else nobody."""
+    who = getattr(args, "user_id", None) or next(
+        (os.environ[v] for v in IDENTITY_VARS if os.environ.get(v)), None)
+    return who or getattr(args, "name", None) or ""
+
+
+def recall(path: Path) -> tuple[str | None, float | None]:
+    try:
+        return path.read_text(encoding="utf-8"), path.stat().st_mtime
+    except OSError:
+        return None, None
+
+
+def remember(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _workspace(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    sys.path.insert(0, str(HERE.parent.parent.parent / "src"))
+    from workspace_default import resolve_workspace  # noqa: WPS433
+    return Path(resolve_workspace())
+
+
+def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
+    """Who is in each of the room's surfaces, from the service — without opening
+    any of them. The same answer the header's live dot is drawn from."""
+    origin = url.rstrip("/")
+    if "/api/v1/room-collab" not in origin and "/api/v1/room-doc" not in origin:
+        origin = f"{origin}/api/v1/room-collab"
+    endpoint = f"{origin}/{urllib.parse.quote(room, safe='')}/presence"
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RoomDocError(f"presence refused ({exc.code}) at {endpoint}: "
+                           + ("not a member, or the token was rejected" if exc.code == 403
+                              else "the service did not answer it")) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RoomDocError(f"presence unreachable at {endpoint}: {exc}") from exc
+    surfaces = body.get("surfaces") if isinstance(body, dict) else None
+    if not isinstance(surfaces, dict):
+        raise RoomDocError(f"presence answered without surfaces at {endpoint}")
+    def count(v) -> int:
+        return v if isinstance(v, int) and v >= 0 else 0   # junk reads as nobody
+
+    out = {}
+    for kind, counts in surfaces.items():
+        if isinstance(counts, dict):
+            out[str(kind)] = {"peers": count(counts.get("peers")),
+                              "agents": count(counts.get("agents"))}
+    return out
+
+
+def render_presence(room: str, surfaces: dict, as_json: bool) -> str:
+    if as_json:
+        return json.dumps({"room": room, "surfaces": surfaces}, ensure_ascii=False, indent=2)
+    if not any(v["peers"] for v in surfaces.values()):
+        return f"nobody is in any surface of {room}"
+    rows = []
+    for kind, v in sorted(surfaces.items(), key=lambda kv: (-kv[1]["peers"], kv[0])):
+        people = v["peers"] - v["agents"]
+        who = ", ".join(p for p in (f"{v['agents']} agent(s)" if v["agents"] else "",
+                                    f"{people} person(s)" if people else "") if p)
+        rows.append(f"  {kind:<12} {v['peers']} present" + (f"  ({who})" if who else ""))
+    return "\n".join(rows)
 
 
 def parse_elements(raw: str) -> list:
@@ -359,6 +466,10 @@ async def run(args: argparse.Namespace) -> int:
         return await doctor(args)
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "presence":
+        # No socket: opening one would put this agent in the count it asks for.
+        print(render_presence(args.room, presence_summary(url, args.room, token), args.json))
+        return 0
     if args.command == "watch":
         return await watch(args, token, url)
 
@@ -401,6 +512,21 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "comment":
+            at, nth = locate_quote(doc.text, args.quote, args.nth)
+            body, extra = comment_content(doc.anchor(at, at + len(args.quote)), args.quote, nth,
+                                          args.text, args.mention)
+            if args.dry_run:
+                print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
+                                 ensure_ascii=False, indent=2))
+                return 0
+            receipt = post_comment(args.room, body, extra)
+            if args.json:
+                print(json.dumps(receipt, ensure_ascii=False))
+            else:
+                print(f"commented on {args.quote[:60]!r} (occurrence {nth}): "
+                      f"{receipt.get('event_id') or receipt.get('state') or 'posted'}")
+            return 0
         before = len(doc.text)
         if args.command == "append":
             await doc.append(args.text)
@@ -408,10 +534,96 @@ async def run(args: argparse.Namespace) -> int:
         elif args.command == "replace":
             await doc.replace(args.old, args.new)
             await doc.settle(args.settle)
+        if args.command == "read":
+            # Every read remembers what it saw, so the next `--delta` is literal.
+            snap = snapshot_path(_workspace(getattr(args, "workspace", None)), args.room, args.kind,
+                                 reader_identity(args))
+            previous, seen_at = recall(snap)
+            remember(snap, doc.text)
+            if getattr(args, "delta", False):
+                lines = delta_since(previous, doc.text)
+                since = (time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(seen_at))
+                         if seen_at else None)
+                if args.json:
+                    print(json.dumps({"chars": len(doc.text), "since": since, "delta": lines,
+                                      "peers": doc.peers}, ensure_ascii=False, indent=2))
+                else:
+                    head = (f"{len(lines)} new line(s) since your last read at {since}" if since
+                            else f"no earlier read of this surface — everything is new ({len(lines)} line(s))")
+                    print(head + ("\n" + "\n".join(lines) if lines else ""))
+                return 0
         print(render(args.command, text=doc.text, peers=doc.peers,
                      as_json=args.json, before=before,
                      authors=doc.authors if args.with_authors else None))
     return 0
+
+
+def locate_quote(text: str, quote: str, nth: int | None = None) -> tuple[int, int]:
+    """Where `quote` sits in `text`: (character offset, occurrence index).
+    Refuses an absent quote, and an ambiguous one unless `nth` picks."""
+    if not quote:
+        raise RoomDocError("a comment needs the text it is on: the quote is empty")
+    if len(quote) > QUOTE_MAX:
+        raise RoomDocError(f"the quote is {len(quote)} chars; a comment anchors to at most "
+                           f"{QUOTE_MAX} — quote less of the passage")
+    hits = []
+    i = text.find(quote)
+    while i != -1:
+        hits.append(i)
+        i = text.find(quote, i + 1)
+    if not hits:
+        raise RoomDocError(f"the quoted text is not in the document: {quote[:60]!r}")
+    if nth is None:
+        if len(hits) > 1:
+            raise RoomDocError(f"{quote[:60]!r} occurs {len(hits)} times; pass --nth 0..{len(hits) - 1} "
+                               "(0 is the first) or quote more of the passage")
+        nth = 0
+    if not 0 <= nth < len(hits):
+        raise RoomDocError(f"--nth {nth}, but {quote[:60]!r} occurs {len(hits)} time(s)")
+    return hits[nth], nth
+
+
+def comment_content(anchor: dict, quote: str, nth: int, message: str,
+                    mentions: list[str] | None = None) -> tuple[str, dict]:
+    """The room message a comment is: a body any client can read, and the
+    anchor the collab client hangs it on. The quote leads the body so a plain
+    timeline shows what is being talked about."""
+    text = message.strip()
+    if not text:
+        raise RoomDocError("a comment needs something to say")
+    # A full mxid in the body is what the gateway turns into a real mention.
+    lead = " ".join(m for m in (mentions or []) if m)
+    body = f"> {quote}\n\n{lead + ' ' + text if lead else text}"
+    return body, {COMMENT_KEY: {"anchor": {**anchor, "quote": quote, "nth": nth}, "v": 1}}
+
+
+def room_ops_script() -> Path | None:
+    """The room-ops skill installed beside this one, which is how an agent posts
+    a room message; None when it is not there."""
+    cand = HERE.parent.parent / "agent-room-ops" / "room_ops.py"
+    return cand if cand.is_file() else None
+
+
+def post_comment(room: str, body: str, extra: dict, *, runner=subprocess.run,
+                 script: Path | None = None) -> dict:
+    """Post the comment through room-ops `say`; the reply is its receipt."""
+    script = script or room_ops_script()
+    if script is None:
+        raise RoomDocError("posting needs the agent-room-ops skill installed beside this one. "
+                           "Rerun with --dry-run and post that content with `room_ops.py say "
+                           "--extra-content` yourself.")
+    argv = [sys.executable, str(script), "say", room, body, "--extra-content",
+            json.dumps(extra, ensure_ascii=False)]
+    proc = runner(argv, capture_output=True, text=True)
+    try:
+        receipt = json.loads(proc.stdout or "")
+    except ValueError:
+        receipt = {}
+    if proc.returncode != 0 or not isinstance(receipt, dict) or not receipt.get("ok"):
+        why = (receipt.get("reason") if isinstance(receipt, dict) else None) or \
+            (proc.stderr or proc.stdout or "").strip()[-300:] or f"exit {proc.returncode}"
+        raise RoomDocError(f"the comment was not posted: {why}")
+    return receipt
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -430,9 +642,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also report who wrote with each Yjs client id")
     sub = p.add_subparsers(dest="command", required=True)
 
+    p.add_argument("--workspace", default=None,
+                   help="workspace root for what you last read (default: the repo's resolver)")
     for name, help_text in (("read", "print the document"), ("peers", "who is present"),
-                            ("doctor", "check deps, credential, URL and connection, step by step")):
+                            ("doctor", "check deps, credential, URL and connection, step by step"),
+                            ("presence", "who is in each of the room's surfaces, without opening any")):
         s = sub.add_parser(name, help=help_text)
+        if name == "read":
+            s.add_argument("--delta", action="store_true",
+                           help="only the lines new since this agent last read the surface")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
     s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")
@@ -451,6 +669,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("old")
     s.add_argument("new")
+
+    s = sub.add_parser("comment", help="comment on a passage of the document, pinned to those words")
+    s.add_argument("room")
+    s.add_argument("quote", help="the exact text the comment is on, as it appears in the document")
+    s.add_argument("text", help="what to say about it")
+    s.add_argument("--nth", type=int, default=None,
+                   help="which occurrence of the quote, 0-based, when it appears more than once")
+    s.add_argument("--mention", action="append", default=[], metavar="MXID",
+                   help="address someone by mxid (repeatable); an agent among them is called")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print the room message the comment would be and post nothing")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")
