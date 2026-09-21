@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_roster  # noqa: E402
+import spawn_worker  # noqa: E402
+
 import worker_identity as wi  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
@@ -40,19 +42,34 @@ def live_incarnation(workspace, worker_id: str) -> "dict | None":
     return open_rows[-1] if open_rows else None
 
 
-def sessions(workspace) -> list:
-    """One row per roster worker, live or not.
+def rooms_bound_to(roster: dict, worker_id: str) -> list:
+    """Rooms whose binding resolves to this worker, via the roster's OWN
+    resolution — a binding may be a bare id or a set, and only it decides."""
+    out = []
+    for room in (roster.get("bindings") or {}):
+        if worker_id in pool_roster.targets_for(roster, room):
+            out.append(room)
+    return sorted(out)
 
-    A worker with no open incarnation is reported with `live: false` and no
-    argv rather than dropped: "this worker exists but has no session right now"
-    and "this worker does not exist" are different answers, and a caller that
-    cannot tell them apart shows an empty tab strip for a pool that is merely
-    between incarnations.
+
+def sessions(workspace, probe=None) -> list:
+    """One row per roster worker, whether or not it has a session right now.
+
+    A worker is never dropped: "exists but has no session" and "no such worker"
+    are different answers, and a caller that cannot tell them apart shows an
+    empty tab strip for a pool that is merely between incarnations.
+
+    Liveness is PROBED, never inferred from the records. A crash leaves an
+    incarnation unclosed by design, so an open row plus a socket string proves
+    only that a run was once started there. `availability` carries the probe's
+    three states and `attach_argv` is emitted for `exists` alone — an argv that
+    cannot attach is worse than none, because the caller acts on it.
     """
     roster = pool_roster.load_roster(workspace)
     if not roster:
         return []
-    bindings = roster.get("bindings") or {}
+    # Resolved per call, so a test's injected prober is the one that runs.
+    probe = probe or spawn_worker.session_probe
     rows = []
     for worker_id, row in sorted((roster.get("workers") or {}).items()):
         row = row or {}
@@ -60,14 +77,20 @@ def sessions(workspace) -> list:
         tmux = (inc or {}).get("tmux") or {}
         socket = tmux.get("socket") or ""
         name = tmux.get("session_name") or wi.tmux_session_name(worker_id)
+        if inc and socket:
+            availability, detail = probe(name, socket=socket)
+        else:
+            availability, detail = "absent", "no open incarnation" if not inc else "no socket recorded"
         entry = {
             "worker_id": worker_id,
             "label": row.get("label") or worker_id,
             "state": row.get("state") or "unknown",
-            "bound_rooms": sorted(r for r, w in bindings.items() if w == worker_id),
+            "bound_rooms": rooms_bound_to(roster, worker_id),
             "session_name": name,
             "tmux_socket": socket,
-            "live": bool(inc) and bool(socket),
+            "availability": availability,
+            "availability_detail": detail,
+            "live": availability == "exists",
         }
         # `=` forces tmux to match the name exactly; without it a short id
         # prefix-matches and attaches to a different worker.
