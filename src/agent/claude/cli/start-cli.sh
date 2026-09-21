@@ -758,16 +758,13 @@ watcher_session_exists() {
 # for once tonight (an unscoped pkill collaterally killed other sessions'
 # production watchers). One instance's liveness must never be answered by
 # another instance's process.
+# The session is healthy while its supervisor runs: in standby it has no
+# notifier or watcher child by design, so a sentinel-pid test would read a
+# correctly idle session as dead and replace it on every rerun.
 watcher_process_alive() {
-  local sentinel pid ws
-  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
-  [ -n "$ws" ] || return 1
-  # shellcheck source=../../../watcher_sentinel.sh
-  . "$REPO/src/watcher_sentinel.sh" || return 1
-  sentinel="$(sentinel_path_for "$ws/state")" || return 1
-  [ -f "$sentinel" ] || return 1
-  pid="$(cat "$sentinel" 2>/dev/null)"
-  [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && kill -0 "$pid" 2>/dev/null
+  local pane_pid
+  pane_pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [ -n "$pane_pid" ] && [ "$pane_pid" -eq "$pane_pid" ] 2>/dev/null && kill -0 "$pane_pid" 2>/dev/null
 }
 
 # The live core's own window and pane, read from the pane that runs it: a heal
