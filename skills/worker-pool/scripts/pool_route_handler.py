@@ -175,6 +175,10 @@ def main(argv=None) -> int:
         return code
     if code == DECLINE:
         return DECLINE
+    if code == MUST_HANDLE:
+        # Terminal: rt.route() reloads the roster itself and can silently
+        # deliver to the core on the same malformed data classify() refused.
+        return MUST_HANDLE
 
     try:
         out = rt.route(ws, task, roster)

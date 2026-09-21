@@ -253,6 +253,21 @@ class TestClassification(Base):
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
                          h.MUST_HANDLE)
 
+    def test_must_handle_is_terminal_at_execution_too_not_just_probe(self):
+        """classify()'s MUST_HANDLE was only honored by the --probe short
+        circuit; non-probe execution fell through to rt.route(), which
+        reloads the SAME malformed roster itself (load_roster() does not
+        validate) and silently delivered to the core with exit 0. Covers the
+        execution path qingyun-wu's review found the null-workers regression
+        missed: no delivery sentinel, non-success exit."""
+        (self.ws / "state" / "roster.json").write_text(
+            json.dumps({"version": 1, "workers": None, "bindings": {}}))
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]),
+                         h.MUST_HANDLE)
+        self.assertFalse((self.ws / "deliveries" / "core" / "task-1.txt").exists())
+        self.assertFalse(list((self.ws / "deliveries").rglob("task-1.txt")))
+
 
 class TestPickerCommandsStayWithTheController(Base):
     def _picker_file(self, wire=True):
