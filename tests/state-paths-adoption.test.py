@@ -145,6 +145,9 @@ ALLOWLIST = {
     # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
     # dir from its caller (marketplace / connect-apps resolve it).
     "src/station_stamp.py",
+    # owner_channel never resolves the workspace — bound_worker(workspace, …) and
+    # its `--workspace` CLI both take the root from the caller (the loop step).
+    "src/owner_channel.py",
     # runtime-api views + registry never resolve the workspace — server.py
     # (the composition root) imports the canonical resolver and injects dirs.
     "src/runtime-api/instance_registry.py",
