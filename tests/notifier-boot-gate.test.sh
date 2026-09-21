@@ -460,6 +460,43 @@ for ADAPTER9J in codex claude; do
   check "$ADAPTER9J launcher carries the empty-field defense-in-depth guard" "$GUARD_COUNT" "1"
 done
 
+# --- Case 9l/9m: qingyun-wu's #4503 review finding, withdrew approval at
+# 363bb0d15 over this -- when SUTANDO_TASKS_DIR is unset,
+# resolve_effective_workspace_triple falls back to
+# "$(sutando-config.sh workspace)/tasks". A failing or silent config
+# command used to be concatenated straight into that string unchecked, so
+# tasks_dir became the literal "/tasks" -- non-empty, and
+# _canonicalize_or_keep resolves it to a non-empty "//tasks" (walking up to
+# "/", the one ancestor that always exists). That passes every empty-field
+# guard this file already covers (9i, 9j/9k), so those alone did not catch
+# it -- a distinct gate on the config command itself is required. ---
+FAKE_REPO9L="$TD/9l-fake-repo"
+mkdir -p "$FAKE_REPO9L/scripts"
+cat > "$FAKE_REPO9L/scripts/sutando-config.sh" << 'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$FAKE_REPO9L/scripts/sutando-config.sh"
+GOT9L_OUT="$(
+  unset SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR
+  resolve_effective_workspace_triple "$FAKE_REPO9L" 2>/dev/null
+)"
+GOT9L_RC=$?
+check "a failing config command makes resolve_effective_workspace_triple fail closed, not silently return //tasks" \
+  "out=[$GOT9L_OUT] rc=$GOT9L_RC" "out=[] rc=1"
+
+cat > "$FAKE_REPO9L/scripts/sutando-config.sh" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+GOT9M_OUT="$(
+  unset SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR
+  resolve_effective_workspace_triple "$FAKE_REPO9L" 2>/dev/null
+)"
+GOT9M_RC=$?
+check "a config command that exits 0 but prints nothing also fails closed" \
+  "out=[$GOT9M_OUT] rc=$GOT9M_RC" "out=[] rc=1"
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is

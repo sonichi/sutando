@@ -97,12 +97,26 @@ resolve_workspace_dir_from_tasks_dir() {
 # partial or empty-fielded triple must never reach a caller as if it were
 # valid, so every field is gated with `|| return 1`, not just the first
 # (keweichen, #4503 review, P1 -- see _canonicalize_or_keep).
+#
+# The config-default fallback (no SUTANDO_TASKS_DIR) is its own gate: a
+# failing or silent `sutando-config.sh workspace` used to be concatenated
+# straight into "$(...)/tasks" unchecked -- a failure or empty stdout left
+# tasks_dir as literally "/tasks", which _canonicalize_or_keep then resolves
+# to a non-empty "//tasks" (walking up to "/", the one ancestor that always
+# exists). That is NON-empty, so it passed every empty-field guard, and a
+# watcher could start rooted at the filesystem root instead of refusing
+# (qingyun-wu, #4503 review, withdrew approval at 363bb0d15 over exactly
+# this). Fixed by capturing the config command's own output and checking
+# both its exit status and that it printed something, before ever building
+# a path from it.
 resolve_effective_workspace_triple() {
-  local repo="$1" tasks_dir workspace_dir results_dir
+  local repo="$1" tasks_dir workspace_dir results_dir config_ws
   if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
     tasks_dir="${SUTANDO_TASKS_DIR/#\~/$HOME}"
   else
-    tasks_dir="$(bash "$repo/scripts/sutando-config.sh" workspace 2>/dev/null)/tasks"
+    config_ws="$(bash "$repo/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
+    [ -n "$config_ws" ] || return 1
+    tasks_dir="$config_ws/tasks"
   fi
   workspace_dir="$(resolve_workspace_dir_from_tasks_dir "$tasks_dir")" || return 1
   tasks_dir="$(_canonicalize_or_keep "$tasks_dir")" || return 1
