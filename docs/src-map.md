@@ -263,6 +263,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`notifier-boot-gate.sh`** — Shared boot-time admission gate for both runtime launchers' task notifiers.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.

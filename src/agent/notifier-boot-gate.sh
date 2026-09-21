@@ -1,11 +1,13 @@
 #!/bin/bash
-# Shared policy for both runtime launchers: a managed task notifier starts its
-# own watcher independent of the core session's own /startup Step 1.7, so it
-# needs the SAME synchronous, fail-closed backfill boundary Step 1.7 enforces
-# -- otherwise a notifier-delivered task can reach the unrestricted core
-# before an existing pool's routing declaration is published (keweichen's
-# review on PR #4503, round 5: an executable harness showed both launchers
-# still `tmux new-session` the notifier even when the sweep path fails).
+# Shared boot-time admission gate for both runtime launchers' task notifiers.
+#
+# A managed task notifier starts its own watcher independent of the core
+# session's own /startup Step 1.7, so it needs the SAME synchronous,
+# fail-closed backfill boundary Step 1.7 enforces -- otherwise a
+# notifier-delivered task can reach the unrestricted core before an existing
+# pool's routing declaration is published (keweichen's review on PR #4503,
+# round 5: an executable harness showed both launchers still `tmux
+# new-session` the notifier even when the sweep path fails).
 #
 # Provider I/O stays at the edge: resolving $SUTANDO_POOL_BOOT_SWEEP (a
 # skill's manifest.json "config" block) is each ADAPTER's job, done ONCE at
