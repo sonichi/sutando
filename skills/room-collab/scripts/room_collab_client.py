@@ -31,29 +31,35 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
-        f"room-doc client needs its dependencies: {exc}\n"
-        "install them with: pip install -r skills/room-doc/requirements.txt"
+        f"room-collab client needs its dependencies: {exc}\n"
+        "install them with: pip install -r skills/room-collab/requirements.txt"
     ) from exc
 
-from room_doc_board import (  # noqa: E402
+from room_collab_board import (complete_element, # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, live_elements,
 )
+from room_kanban import (  # noqa: E402
+    CARDS_KEY, COLUMNS_KEY, KANBAN_KIND, changed as changed_cards, describe_invalid as describe_bad_card,
+    is_card, is_column, normalized,
+)
 
-from room_doc_protocol import (  # noqa: E402
+from room_collab_protocol import (  # noqa: E402
+    close_code,
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
+    http_status,
 )
 
 # The server's attribution map. This client reads it and never writes it.
 AUTHORS_KEY = "authors"
 SYNC_TIMEOUT_S = 20.0
 # Marks a transaction as ours, so the reconcile observer can ignore its own writes.
-LOCAL_ORIGIN = "room-doc-client"
+LOCAL_ORIGIN = "room-collab-client"
 
 
 class RoomDoc:
-    """One open document. Use `open_room_doc()` rather than constructing it."""
+    """One open document. Use `open_room_collab()` rather than constructing it."""
 
     def __init__(self, ws: Any, doc: Doc, awareness: Awareness, text_name: str,
                  kind: str = DEFAULT_KIND):
@@ -62,9 +68,9 @@ class RoomDoc:
         self._awareness = awareness
         self._kind = kind
         self._text_name = text_name
-        # A board is a map of elements, not a text. Resolving the text on one
-        # would materialise an empty key that reads exactly like an empty board.
-        self._text = None if kind == BOARD_KIND else doc.get(text_name, type=Text)
+        # ONLY the markdown document is a text; naming the non-text kinds
+        # instead lets the next one read empty and accept unseen writes.
+        self._text = doc.get(text_name, type=Text) if kind == DEFAULT_KIND else None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
         self._ended: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -81,17 +87,17 @@ class RoomDoc:
         return self._kind
 
     def _require_text(self, what: str) -> Any:
-        """A text operation on a board is refused, never answered with "".
-
-        Returning empty here is the exact failure this client was written to
-        prevent elsewhere: a refusal that reads as an empty document.
-        """
+        """A text operation on a structured document is refused, never answered
+        with "". An empty string reads as an empty document, and a write that
+        lands where nothing reads it is worse than an error."""
         if self._text is None:
+            where = {BOARD_KIND: f"elements under {ELEMENTS_KEY!r}",
+                     KANBAN_KIND: "cards and columns"}.get(
+                         self._kind, "structured data")
             raise RoomDocError(
-                f"cannot {what} on the {self._kind!r} document: it holds a map of "
-                f"elements under {ELEMENTS_KEY!r}, not text. Use the element API "
-                "(elements / put_elements / delete_element), or open the markdown "
-                "document instead.")
+                f"cannot {what} on the {self._kind!r} document: it holds {where}, "
+                f"not text. Only the {DEFAULT_KIND!r} document is a text — open "
+                "that, or use the API for this kind.")
         return self._text
 
     @property
@@ -143,10 +149,9 @@ class RoomDoc:
         Read-only on purpose: this map is the server's, and a client that wrote
         to it would be claiming an identity rather than reporting one.
         """
-        try:
-            authors = self._doc.get(AUTHORS_KEY, type=Map)
-        except Exception:  # noqa: BLE001 - an absent map is simply no attribution
-            return {}
+        # No guard needed: resolving the key as a Map never raises, even when it
+        # holds another type, and a non-dict value is filtered below.
+        authors = self._doc.get(AUTHORS_KEY, type=Map)
         return {str(k): dict(v) for k, v in authors.items() if isinstance(v, dict)}
 
     def wrote(self, client_id: int | str) -> dict | None:
@@ -162,11 +167,21 @@ class RoomDoc:
 
     def _require_live(self) -> None:
         if self._ended.done():
-            raise RoomDocError(f"the document session has ended: {close_reason(self._ended.result())}")
+            raise RoomDocError(f"the surface session has ended: {close_reason(self._ended.result())}")
 
     async def _send(self, payload: bytes) -> None:
         self._require_live()
         await self._ws.send(payload)
+
+    async def _send_quietly(self, payload: bytes) -> None:
+        """Presence renewal after the socket died is not an error worth a
+        traceback per tick; the session's end is reported once, by _ended."""
+        if self._ended.done():
+            return
+        try:
+            await self._ws.send(payload)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _handle(self, data: bytes) -> None:
         if data[0] == YMessageType.SYNC:
@@ -190,13 +205,16 @@ class RoomDoc:
         finally:
             if not self._ended.done():
                 self._ended.set_result(ended)
+            # Nothing renews presence on a dead socket.
+            if self._awareness_task:
+                self._awareness_task.cancel()
 
     async def _start(self) -> None:
         self._reader = asyncio.create_task(self._read_loop())
         try:
             await self._ws.send(create_sync_message(self._doc))
         except Exception as exc:  # noqa: BLE001 - a refusal arrives as a close
-            raise RoomDocError(f"the document did not open: {close_reason(exc)}") from exc
+            raise RoomDocError(f"the surface did not open: {close_reason(exc)}") from exc
         waiter = asyncio.ensure_future(self._synced.wait())
         try:
             await asyncio.wait({waiter, self._ended}, timeout=SYNC_TIMEOUT_S,
@@ -209,8 +227,8 @@ class RoomDoc:
         if self._ended.done():
             # The service accepts and THEN closes for a bad room or kind, so a
             # refusal arrives here rather than at the handshake.
-            raise RoomDocError(f"the document did not open: {close_reason(self._ended.result())}")
-        raise RoomDocError(f"connected but the document never synced within {SYNC_TIMEOUT_S:g}s")
+            raise RoomDocError(f"the surface did not open: {close_reason(self._ended.result())}")
+        raise RoomDocError(f"connected but the surface never synced within {SYNC_TIMEOUT_S:g}s")
 
     def _start_presence_renewal(self) -> None:
         """Forward local awareness changes, and keep the renewal loop running.
@@ -227,7 +245,7 @@ class RoomDoc:
             if mine not in [i for group in changes[0].values() for i in group]:
                 return
             update = self._awareness.encode_awareness_update([mine])
-            asyncio.ensure_future(self._ws.send(create_awareness_message(update)))
+            asyncio.ensure_future(self._send_quietly(create_awareness_message(update)))
 
         self._awareness_sub = self._awareness.observe(on_change)
         self._awareness_task = asyncio.create_task(self._awareness.start())
@@ -303,7 +321,10 @@ class RoomDoc:
                 raise RoomDocError(
                     f"not a board element: {describe_invalid(element)}. "
                     "Nothing was written.")
+        # Filled here, at the one writer: the panel hands the map to the editor
+        # as-is, and a minimal element throws inside its selection handler.
         stored = dict(self._items(ymap))
+        elements = [complete_element(e, base=stored.get(e.get("id"))) for e in elements]
         changed = changed_elements(elements, stored.get)
         # Remembered even when nothing is written: a concurrent merge can still
         # replace a value we already agreed with, and then it needs re-asserting.
@@ -363,6 +384,204 @@ class RoomDoc:
         except RoomDocError:
             pass
 
+    async def changes(self, settle: float = 0.0) -> AsyncIterator[str]:
+        """Every remote edit to the text, yielded as the text after it landed.
+
+        The connection is held for as long as the caller iterates. Local
+        writes are not reported: the caller made them. Ends when the session
+        does, by raising the close reason rather than stopping quietly — a
+        watcher that exits silently looks exactly like one that saw nothing.
+
+        `settle` > 0 coalesces: the server forwards one push per keystroke
+        (measured), so a person typing "@mars please" is a dozen pushes. With
+        settle the text is yielded once, `settle` seconds after the last one.
+        """
+        text = self._require_text("watch text")
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def on_text(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin != LOCAL_ORIGIN:
+                queue.put_nowait(str(text))
+
+        sub = text.observe(on_text)
+        # shield: cancelling this waiter must not cancel the session's own future.
+        ended = asyncio.ensure_future(asyncio.shield(self._ended))
+        pending: str | None = None
+        try:
+            while True:
+                got = asyncio.ensure_future(queue.get())
+                timeout = settle if (settle > 0 and pending is not None) else None
+                done, _ = await asyncio.wait({got, ended}, timeout=timeout,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if ended in done:
+                    got.cancel()
+                    raise RoomDocError(
+                        f"the surface session has ended: {close_reason(ended.result())}")
+                if got in done:
+                    if settle > 0:
+                        pending = got.result()      # keep the newest; wait for quiet
+                        continue
+                    yield got.result()
+                    continue
+                got.cancel()                        # quiet for `settle`: emit once
+                yield pending
+                pending = None
+        finally:
+            text.unobserve(sub)
+            if not ended.done():
+                ended.cancel()
+
+    def snapshot(self) -> dict:
+        """What this document looks like right now, for whichever kind it is,
+        plus who is present — the unit `events()` diffs."""
+        snap: dict = {"peers": list(self.peers)}
+        if self._kind == DEFAULT_KIND:
+            snap["text"] = self.text
+        elif self._kind == BOARD_KIND:
+            snap["elements"] = self.elements
+        elif self._kind == KANBAN_KIND:
+            snap["cards"] = {k: v for k, v in self._items(self._doc.get(CARDS_KEY, type=Map))
+                             if isinstance(v, dict)}
+        return snap
+
+    async def events(self, handles: list[str], settle: float = 1.0,
+                     since: dict | None = None) -> AsyncIterator[dict]:
+        """What happened that concerns `handles`, as it happens: a text or board
+        line that @-mentions one, a kanban card assigned to or moved for one,
+        a peer arriving or leaving. One stream for every kind, so an agent
+        holds one connection and one loop.
+
+        Snapshots are taken after `settle` seconds of quiet (a keystroke is a
+        push), diffed against the last one emitted, and the differences that
+        concern the handles are yielded. Ends by raising the close reason,
+        with `.code` set so a caller can tell a restart from a refusal.
+
+        `since` is a snapshot from an earlier session: on reconnect, what
+        landed while the socket was down is diffed too, not silently skipped.
+        """
+        from room_collab_watch import (addressed_to, board_mentions, kanban_changes,
+                                    new_lines, peer_changes)
+        queue: asyncio.Queue[None] = asyncio.Queue()
+
+        def poke(*_: Any) -> None:
+            queue.put_nowait(None)
+
+        def on_doc(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin != LOCAL_ORIGIN:
+                poke()
+
+        subs = []
+        if self._kind == DEFAULT_KIND:
+            subs.append((self._text, self._text.observe(on_doc)))
+        elif self._kind == BOARD_KIND:
+            m = self._doc.get(ELEMENTS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        elif self._kind == KANBAN_KIND:
+            m = self._doc.get(CARDS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        aw_sub = self._awareness.observe(lambda *_: poke())
+        ended = asyncio.ensure_future(asyncio.shield(self._ended))
+        last = since if since is not None else self.snapshot()
+        # A carried snapshot is compared at once: the gap may hold a mention.
+        dirty = since is not None
+        try:
+            while True:
+                got = asyncio.ensure_future(queue.get())
+                done, _ = await asyncio.wait({got, ended}, timeout=settle if dirty else None,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if ended in done:
+                    got.cancel()
+                    err = RoomDocError(
+                        f"the surface session has ended: {close_reason(ended.result())}")
+                    err.code = close_code(ended.result())
+                    err.snapshot = last
+                    raise err
+                if got in done:
+                    dirty = True
+                    continue
+                got.cancel()
+                dirty = False
+                now = self.snapshot()
+                out: list[dict] = []
+                if "text" in now:
+                    for line in addressed_to(new_lines(last["text"], now["text"]), handles):
+                        out.append({"kind": "mention", "where": "text", "text": line})
+                if "elements" in now:
+                    out += board_mentions(last["elements"], now["elements"], handles)
+                if "cards" in now:
+                    out += kanban_changes(last["cards"], now["cards"], handles)
+                out += peer_changes(last["peers"], now["peers"])
+                last = now
+                for ev in out:
+                    yield ev
+        finally:
+            for obj, sub in subs:
+                obj.unobserve(sub)
+            self._awareness.unobserve(aw_sub)
+            if not ended.done():
+                ended.cancel()
+
+    # --- the kanban: cards and columns, the panel's rules
+
+    def _require_kanban(self, what: str) -> tuple:
+        if self._kind != KANBAN_KIND:
+            raise RoomDocError(
+                f"cannot {what} on the {self._kind!r} document: cards live on the "
+                f"kanban. Open it with kind={KANBAN_KIND!r}.")
+        return (self._doc.get(CARDS_KEY, type=Map), self._doc.get(COLUMNS_KEY, type=Map))
+
+    @property
+    def cards(self) -> list[tuple[str, dict]]:
+        """Every well-formed card, tombstones included, as (id, card)."""
+        cards, _ = self._require_kanban("read cards")
+        return [(k, v) for k, v in self._items(cards) if is_card(v, k)]
+
+    @property
+    def columns(self) -> list[dict]:
+        """The columns in board order."""
+        _, columns = self._require_kanban("read columns")
+        rows = [v for k, v in self._items(columns) if is_column(v, k)]
+        return sorted(rows, key=lambda c: (c["order"], c["id"]))
+
+    async def put_cards(self, cards: list[dict]) -> int:
+        """Write cards that are newer than what is stored. Returns how many.
+        Refuses a card the panel would drop, rather than writing it."""
+        ymap, _ = self._require_kanban("write cards")
+        cards = [normalized(c) if isinstance(c, dict) else c for c in cards]
+        for card in cards:
+            if not is_card(card):
+                raise RoomDocError(f"not a kanban card: {describe_bad_card(card)}. Nothing was written.")
+        stored = dict(self._items(ymap))
+        todo = changed_cards(cards, stored.get)
+        if not todo:
+            return 0
+
+        def mutate() -> None:
+            for card in todo:
+                ymap[card["id"]] = dict(card)
+
+        await self._commit(mutate)
+        return len(todo)
+
+    async def put_columns(self, columns: list[dict]) -> int:
+        _, ymap = self._require_kanban("write columns")
+        for col in columns:
+            if not is_column(col):
+                raise RoomDocError(f"not a kanban column: {col!r}. Nothing was written.")
+        stored = dict(self._items(ymap))
+        todo = changed_cards(columns, stored.get, valid=is_column)
+        if not todo:
+            return 0
+
+        def mutate() -> None:
+            for col in todo:
+                ymap[col["id"]] = dict(col)
+
+        await self._commit(mutate)
+        return len(todo)
+
     async def reconcile(self, elements: list[dict] | None = None) -> int:
         """Re-assert elements now. Rarely needed by hand — `put_elements` arms
         an observer that does this on every remote change."""
@@ -373,15 +592,20 @@ class RoomDoc:
         """Replace the first occurrence. Refuses when absent, so a caller never
         silently writes nothing."""
         self._require_text("replace text")
-        at = self.text.find(old)
+        current = self.text
+        at = current.find(old)
         if at < 0:
             raise RoomDocError(f"text to replace is not in the document: {old[:60]!r}")
 
         text = self._require_text("replace text")
+        # pycrdt indexes Text by UTF-8 BYTES; str.find counts characters. Every
+        # multi-byte character before the match would otherwise shift the write.
+        start = len(current[:at].encode("utf-8"))
+        width = len(old.encode("utf-8"))
 
         def mutate() -> None:
-            del text[at:at + len(old)]
-            text.insert(at, new)
+            del text[start:start + width]
+            text.insert(start, new)
 
         await self._commit(mutate)
 
@@ -392,12 +616,12 @@ class RoomDoc:
 
 
 @asynccontextmanager
-async def open_room_doc(api_root: str, room_id: str, token: str, *,
+async def open_room_collab(api_root: str, room_id: str, token: str, *,
                         kind: str = DEFAULT_KIND,
                         text_name: str = DEFAULT_TEXT_NAME,
                         insecure: bool = False) -> AsyncIterator[RoomDoc]:
-    """Open one of a room's documents. `kind` selects which — the default
-    markdown document, or a separate one such as the board."""
+    """Open one of a room's surfaces. `kind` selects which — the default
+    markdown document, or another surface such as the board or the kanban."""
     url = doc_socket_url(api_root, room_id, kind=kind)
     sslctx = None
     if url.startswith("wss://"):
@@ -416,16 +640,18 @@ async def open_room_doc(api_root: str, room_id: str, token: str, *,
     except RoomDocError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise RoomDocError(explain(exc, url)) from exc
+        err = RoomDocError(explain(exc, url))
+        err.status = http_status(exc)      # a watcher decides from this whether to retry
+        raise err from exc
 
-    room_doc = RoomDoc(ws, doc, awareness, text_name, kind=kind)
+    room_collab = RoomDoc(ws, doc, awareness, text_name, kind=kind)
     try:
-        await room_doc._start()
+        await room_collab._start()
     except BaseException:
         await connection.__aexit__(*sys.exc_info())
         raise
     try:
-        yield room_doc
+        yield room_collab
     finally:
-        await room_doc._stop()
+        await room_collab._stop()
         await connection.__aexit__(None, None, None)

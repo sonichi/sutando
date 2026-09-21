@@ -8,7 +8,7 @@ behaviour, and the owner asked for exactly that distinction.
 
 The map is the SERVER's. This client reads it; writing to it would be claiming
 an identity rather than reporting one, so there is no writer here to test.
-Run: python3 tests/room-doc-authors.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-authors.test.py  (exit 0 pass / 1 fail)
 """
 import asyncio
 import json
@@ -16,18 +16,18 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
-    from pycrdt import Awareness, Doc, Map
+    from pycrdt import Awareness, Doc, Map, Text
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc authors: FAIL — dependencies missing ({exc}).")
+    print(f"room-collab authors: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_doc import render  # noqa: E402
+from room_collab import render  # noqa: E402
 
-from room_doc_client import AUTHORS_KEY, RoomDoc  # noqa: E402
-from room_doc_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME  # noqa: E402
+from room_collab_client import AUTHORS_KEY, RoomDoc  # noqa: E402
+from room_collab_protocol import DEFAULT_KIND, DEFAULT_TEXT_NAME  # noqa: E402
 
 FAILS = []
 
@@ -128,12 +128,23 @@ def test_plain_read_names_the_author_above_the_text():
     assert render("read", text="the body") == "the body"
 
 
+def test_a_wrongly_typed_authors_key_is_no_attribution_not_a_crash():
+    """The key could hold something else — an older document, or a client that
+    wrote there before the server owned it. Reading attribution must not take
+    the caller down; it must say "nothing recorded"."""
+    doc = Doc()
+    doc.get(AUTHORS_KEY, type=Text)      # a Text where a Map belongs
+    rd = RoomDoc(FakeWS(), doc, Awareness(doc), DEFAULT_TEXT_NAME, kind=DEFAULT_KIND)
+    assert rd.authors == {}
+    assert rd.wrote(1) is None
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc authors: FAIL")
+    print("room-collab authors: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc authors: ok")
+print("room-collab authors: ok")

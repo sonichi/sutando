@@ -7,25 +7,25 @@ OLDER version, and the shape silently reverts for everyone. The web client
 answers this by re-applying its scene after every remote change; this client has
 to do the same or an agent's work is quietly undone by whoever it drew beside.
 
-Run: python3 tests/room-doc-board-reconcile.test.py  (exit 0 pass / 1 fail)
+Run: python3 tests/room-collab-board-reconcile.test.py  (exit 0 pass / 1 fail)
 """
 import asyncio
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
     from pycrdt import Awareness, Doc, Map
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc board reconcile: FAIL — dependencies missing ({exc}).")
+    print(f"room-collab board reconcile: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_doc_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
+from room_collab_board import BOARD_KIND, ELEMENTS_KEY  # noqa: E402
 
-from room_doc_client import RoomDoc  # noqa: E402
-from room_doc_protocol import DEFAULT_TEXT_NAME  # noqa: E402
+from room_collab_client import RoomDoc  # noqa: E402
+from room_collab_protocol import DEFAULT_TEXT_NAME  # noqa: E402
 
 FAILS = []
 
@@ -178,8 +178,8 @@ for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startsw
     check(_name, _fn)
 
 if FAILS:
-    print("room-doc board reconcile: FAIL")
+    print("room-collab board reconcile: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc board reconcile: ok")
+print("room-collab board reconcile: ok")

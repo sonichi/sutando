@@ -276,7 +276,7 @@ def _main(argv):
     elif a.cmd in ("context", "doc"):
         import doc as _doc
         if a.cmd == "doc":
-            print("note: `room_ops doc` is now `room_ops context`. This is the room's\n      Context-document FOLDER. The live collaborative document (Doc tab,\n      whiteboard, deck) is a different store — see the room-doc skill.",
+            print("note: `room_ops doc` is now `room_ops context`. This is the room's\n      Context-document FOLDER. The live collaborative document (Doc tab,\n      whiteboard, deck) is a different store — see the room-collab skill.",
                   file=__import__("sys").stderr)
         if a.action == "get":
             res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)

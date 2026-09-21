@@ -1,4 +1,4 @@
-# The room-doc service is pycrdt on the wire; using the same CRDT
+# The room-collab service is pycrdt on the wire; using the same CRDT
 # implementation on both ends keeps the protocol from drifting.
 pycrdt>=0.14,<0.15
 websockets>=13

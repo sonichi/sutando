@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session lifecycle for skills/room-doc, against a real WebSocket server.
+"""Session lifecycle for skills/room-collab, against a real WebSocket server.
 
 These cover what the codec tests cannot: the states where the client can be
 WRONG WITHOUT ERRORING — a refusal read back as an empty document, a session
@@ -14,17 +14,17 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-doc" / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
     import websockets
     from pycrdt import Doc, Text, YMessageType, create_sync_message, handle_sync_message
 except ImportError as exc:  # pragma: no cover
-    print(f"room-doc lifecycle: SKIP (dependencies absent: {exc})")
+    print(f"room-collab lifecycle: SKIP (dependencies absent: {exc})")
     sys.exit(0)
 
-from room_doc_client import RoomDoc, open_room_doc  # noqa: E402
-from room_doc_protocol import RoomDocError, doc_socket_url  # noqa: E402
+from room_collab_client import RoomDoc, open_room_collab  # noqa: E402
+from room_collab_protocol import RoomDocError, doc_socket_url  # noqa: E402
 
 FAILS = []
 
@@ -39,7 +39,7 @@ def check(name, coro_fn):
 
 
 class Server:
-    """A room-doc stand-in: serves one document, or refuses like the real one."""
+    """A room-collab stand-in: serves one document, or refuses like the real one."""
 
     def __init__(self, *, refuse_code=None, refuse_after_sync=False,
                  close_before_step2=False, seed=""):
@@ -95,7 +95,7 @@ async def test_a_refusal_after_accept_is_not_an_empty_document():
     """The bug this pins: 4400 once read back as 'a room with no content'."""
     async with Server(refuse_code=4400) as s:
         try:
-            async with open_room_doc(s.url, "!bad:x", "tok"):
+            async with open_room_collab(s.url, "!bad:x", "tok"):
                 raise AssertionError("opening must fail, not yield an empty document")
         except RoomDocError as e:
             assert "4400" in str(e), f"the reason must name the code, got: {e}"
@@ -107,7 +107,7 @@ async def test_a_close_before_step2_is_not_a_synced_empty_document():
     a dead reader is not treated as a finished sync."""
     async with Server(close_before_step2=True, refuse_code=4403) as s:
         try:
-            async with open_room_doc(s.url, "!r:x", "tok") as doc:
+            async with open_room_collab(s.url, "!r:x", "tok") as doc:
                 raise AssertionError(
                     f"opening must fail; got a document of {len(doc.text)} chars")
         except RoomDocError as e:
@@ -117,7 +117,7 @@ async def test_a_close_before_step2_is_not_a_synced_empty_document():
 async def test_a_bad_kind_refusal_is_also_surfaced():
     async with Server(refuse_code=4404) as s:
         try:
-            async with open_room_doc(s.url, "!r:x", "tok", kind="nope"):
+            async with open_room_collab(s.url, "!r:x", "tok", kind="nope"):
                 raise AssertionError("opening must fail")
         except RoomDocError as e:
             assert "4404" in str(e), e
@@ -126,13 +126,13 @@ async def test_a_bad_kind_refusal_is_also_surfaced():
 async def test_a_real_document_opens_and_reads():
     """Control: the same path succeeds when the server does not refuse."""
     async with Server(seed="hello world") as s:
-        async with open_room_doc(s.url, "!r:x", "tok") as doc:
+        async with open_room_collab(s.url, "!r:x", "tok") as doc:
             assert doc.text == "hello world", repr(doc.text)
 
 
 async def test_a_session_closed_after_sync_refuses_later_writes():
     async with Server(refuse_code=4403, refuse_after_sync=True) as s:
-        async with open_room_doc(s.url, "!r:x", "tok") as doc:
+        async with open_room_collab(s.url, "!r:x", "tok") as doc:
             for _ in range(40):
                 await asyncio.sleep(0.05)
                 if doc._ended.done():
@@ -147,7 +147,7 @@ async def test_a_session_closed_after_sync_refuses_later_writes():
 async def test_presence_keeps_being_renewed_not_sent_once():
     """Holding the socket is not enough: the server expires a silent peer."""
     async with Server() as s:
-        async with open_room_doc(s.url, "!r:x", "tok") as doc:
+        async with open_room_collab(s.url, "!r:x", "tok") as doc:
             await doc.set_presence("mars")
             await asyncio.sleep(0.2)
             first = s.awareness_frames
@@ -163,7 +163,7 @@ async def test_presence_carries_a_user_id_only_when_given_one():
     """The roster resolves an avatar by id, never by display name. Absent id
     means no face, which is better than someone else's."""
     async with Server() as s:
-        async with open_room_doc(s.url, "!r:x", "tok") as doc:
+        async with open_room_collab(s.url, "!r:x", "tok") as doc:
             await doc.set_presence("mars")
             plain = doc._awareness.get_local_state()["user"]
             assert "userId" not in plain, plain
@@ -180,7 +180,7 @@ async def test_the_cli_runs_every_subcommand_against_a_real_socket():
     import io
     import json as _json
 
-    import room_doc as cli
+    import room_collab as cli
 
     async with Server(seed="alpha beta") as s:
         async def run(argv):
@@ -215,7 +215,7 @@ async def test_the_cli_reports_a_refusal_as_a_nonzero_exit():
     import contextlib
     import io
 
-    import room_doc as cli
+    import room_collab as cli
 
     async with Server(refuse_code=4400) as s:
         args = cli.build_parser().parse_args(
@@ -230,11 +230,11 @@ async def test_the_cli_reports_a_refusal_as_a_nonzero_exit():
 
 async def test_the_kind_reaches_the_server_in_the_url():
     async with Server() as s:
-        async with open_room_doc(s.url, "!r:x", "tok", kind="board"):
+        async with open_room_collab(s.url, "!r:x", "tok", kind="board"):
             pass
         assert any("kind=board" in p for p in s.paths), s.paths
     async with Server() as s2:
-        async with open_room_doc(s2.url, "!r:x", "tok"):
+        async with open_room_collab(s2.url, "!r:x", "tok"):
             pass
         assert not any("kind=" in p for p in s2.paths), (
             f"the default must stay bare for compatibility: {s2.paths}")
@@ -246,12 +246,12 @@ def sync_test_main_maps_a_failure_to_a_nonzero_exit():
     import contextlib
     import io
 
-    import room_doc as cli
+    import room_collab as cli
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         rc = cli.main(["--url", "not-a-url", "--token", "t", "read", "!r:x"])
     assert rc != 0, "a failure must not exit 0"
-    assert "room-doc:" in err.getvalue(), err.getvalue()
+    assert "room-collab:" in err.getvalue(), err.getvalue()
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
@@ -263,8 +263,8 @@ except AssertionError as e:
     FAILS.append(f"sync_test_main_maps_a_failure_to_a_nonzero_exit: {e}")
 
 if FAILS:
-    print("room-doc lifecycle: FAIL")
+    print("room-collab lifecycle: FAIL")
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-doc lifecycle: ok")
+print("room-collab lifecycle: ok")
