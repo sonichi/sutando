@@ -71,7 +71,11 @@ def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
 def _launchctl(argv, runner=None):
     # Resolved at call time, so a test that patches `subprocess.run` is honoured;
     # a def-time default would bind the real one and reach the live launchd domain.
-    return (runner or subprocess.run)(["launchctl", *argv], capture_output=True, text=True)
+    # A caller-supplied runner (e.g. spawn_worker._run) already bakes in its own
+    # capture/text behavior -- adding these here duplicated the keywords.
+    if runner is not None:
+        return runner(["launchctl", *argv])
+    return subprocess.run(["launchctl", *argv], capture_output=True, text=True)
 
 
 def is_loaded(runner=None) -> bool:
