@@ -24,6 +24,18 @@ _lane_cleanup() {
 }
 trap _lane_cleanup EXIT
 
+# The next suite starts from a clean tree, whichever suite ran there before.
+# Ignored files stay: the shared node_modules link and coverage fragments.
+# Only ever the lane worktree itself: an exported GIT_DIR/GIT_WORK_TREE would
+# otherwise point `git -C` at the caller's checkout, and a reset there wipes work.
+_lane_reset() {
+    local top
+    top="$(cd "$1" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [ "$top" = "$(cd "$1" && pwd -P)" ] || return 0
+    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" checkout -q -- . 2>/dev/null || true
+    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" clean -fdq 2>/dev/null || true
+}
+
 for _w in $(seq 1 "$WORKERS"); do
     (
         for idx in $(seq 1 "$N"); do
@@ -36,6 +48,7 @@ for _w in $(seq 1 "$WORKERS"); do
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
             printf "%s\n" "$(( SECONDS - _t0 ))" > "$rec.time"
+            _lane_reset "$WTDIR/$_w"
         done
     ) &
 done
