@@ -849,9 +849,9 @@ trap cleanup EXIT
 trap 'cleanup; exit 0' HUP INT TERM
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
-# restart gap, in priority order (closes #3017). Install cleanup first so an
-# immediately exiting fswatch cannot kill a just-started provider before its
-# durable fallback receipt is emitted.
+# restart gap, in priority order. Install cleanup first so an immediately
+# exiting fswatch cannot kill a just-started provider before its durable
+# fallback receipt is emitted.
 while IFS= read -r fn; do
   dispatch_task "$TASKS_DIR/$fn"
 done < <(priority_sorted_tasks)
