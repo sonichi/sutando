@@ -36,14 +36,15 @@ silent=$(grep -cE "printf 'TASK_FILE: %s\\\\n' \"\\\$filename\"( >&9)? \|\| true
     "$WATCHER" "$EMITTERS" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
 check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
-# fallback_outstanding_handlers() (the two shutdown-time emit_task_file call
-# sites) was retired: it existed to recover in-flight background handler
-# runs on shutdown, and there is no more in-flight async work to recover now
-# that run_handler_now() calls the handler synchronously, inline. emit_task_file
-# itself is untouched (task-emit.sh, unmodified) -- just unreferenced by the
-# watcher now. 0 is the correct count going forward, not a regression.
+# fallback_outstanding_handlers()'s DISPATCH_DIR-queue loop (one of its two
+# emit_task_file sites) was retired -- no queue to recover once run_handler_now()
+# is synchronous. Its CLAIMS_DIR loop still applies: a SIGTERM can still
+# interrupt a claim this watcher owns, and settle_own_claims_on_shutdown()
+# (added to fix a real reviewer-found gap -- a dangling unsettled claim) is
+# its synchronous-era successor, with its own single emit_task_file site. 1 is
+# the correct count now, not 0.
 check "no remaining shutdown call site references the retired async recovery path" \
-      "0" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
+      "1" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 check "the handler-fallback site goes through its own emitter" \
       "1" "$(grep -cE '^\s+emit_fallback_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 
