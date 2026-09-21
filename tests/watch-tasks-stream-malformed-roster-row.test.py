@@ -82,7 +82,9 @@ def run(worker_row, bound=True):
         p.wait(timeout=5)
     delivered = sorted(str(q.relative_to(ws)) for q in (ws / "deliveries").rglob("*")
                        if q.is_file())
-    return (any("TASK_FILE" in c for c in out), delivered)
+    results = sorted(str(q.relative_to(ws)) for q in (ws / "results").rglob("*")
+                     if q.is_file())
+    return (any("TASK_FILE" in c for c in out), delivered, results)
 
 
 def check(name, cond, detail=""):
@@ -93,19 +95,23 @@ def check(name, cond, detail=""):
 
 # POSITIVE CONTROL FIRST: an UNBOUND task must reach the core. Without it every
 # "not emitted" below also passes for a watcher that emits nothing at all.
-emitted_unbound, _ = run({"state": "live"}, bound=False)
+emitted_unbound, _, _ = run({"state": "live"}, bound=False)
 check("positive control: an unbound task DOES reach the core", emitted_unbound,
       "the harness never emits, so the not-emitted checks below prove nothing")
 
-emitted, delivered = run("not-a-mapping")
+# A malformed worker row corrupts validate_workers() for the WHOLE roster, so
+# classify()'s MUST_HANDLE is now terminal: nothing may reach deliveries/.
+emitted, delivered, results = run("not-a-mapping")
 check("a malformed worker row does NOT reach the unrestricted core", not emitted,
       "the bound task was emitted; rc 1 read as an optional decline")
-check("and the bound task is still DELIVERED to its worker", delivered != [],
-      "nothing in deliveries/: a failed advertisement publish stopped routing")
+check("and the bound task is NOT delivered to any worker", delivered == [],
+      f"delivered={delivered}: a malformed roster must never be trusted to route")
+check("and the watcher publishes a terminal failure result instead", results != [],
+      "no terminal result: the task was silently dropped, neither routed nor failed")
 
 # A failed advertisement must change nothing observable about routing: same
 # delivery as a clean roster, which is the whole point of catching it.
-emitted_ok, delivered_ok = run({"state": "live"})
+emitted_ok, delivered_ok, _ = run({"state": "live"})
 check("control: a well-formed row delivers the same way", not emitted_ok and delivered_ok != [],
       f"clean roster: emitted={emitted_ok} delivered={delivered_ok}")
 

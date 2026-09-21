@@ -249,6 +249,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
+- **`workspace_dir_resolve.sh`** — Single owner for "given a (possibly tilde-prefixed) tasks dir, which workspace does this mean" -- notifier-boot-gate.sh, task-notifier.sh (Codex) and watch-tasks-stream.sh (Claude) must never re-derive this independently; a hand-copied formula is exactly what let them disagree.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
