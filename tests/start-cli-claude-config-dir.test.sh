@@ -153,6 +153,8 @@ EOF
   cp "$REAL_REPO/src/agent/task-event-handler-lookup.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
+  # ensure_task_notifier sources this for the restart-identity hash.
+  cp "$REAL_REPO/src/workspace_dir_resolve.sh" "$REPO_FAKE/src/"
 
   if [ "$helper_present" = "yes" ]; then
     cp "$REAL_REPO/scripts/sutando-config.sh" "$REPO_FAKE/scripts/"
