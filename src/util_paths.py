@@ -605,12 +605,24 @@ if __name__ == "__main__":
     # of the identity encoding to keep in step with this one.
     if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
         print(watcher_sentinel_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel-default":
+        # The CANONICAL (core) identity's sentinel, explicit -- never the
+        # caller's own ambient SUTANDO_INSTANCE_ID. For a caller naming
+        # another process's path (restart.sh stopping core's watcher, which
+        # must resolve to core even when invoked from a worker's own shell).
+        _default_ident = stated_default_identity(sys.argv[2])
+        if _default_ident is None:
+            print("util_paths: cannot resolve the canonical default identity",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        _inst, _agent = _default_ident
+        print(watcher_sentinel_path(sys.argv[2], instance=_inst, agent=_agent))
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "task-event-handler-config-path":
         print(task_event_handler_config_path(sys.argv[2]))
     else:
-        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir|"
-              "task-event-handler-config-path} <state-dir>",
+        print("usage: util_paths.py {watcher-sentinel|watcher-sentinel-default|"
+              "handler-fallbacks-dir|task-event-handler-config-path} <state-dir>",
               file=sys.stderr)
         raise SystemExit(2)

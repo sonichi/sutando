@@ -47,6 +47,25 @@ sentinel_path_for() {
   printf '%s' "$out"
 }
 
+# The CANONICAL (core) identity's sentinel, explicit -- never the caller's own
+# ambient SUTANDO_INSTANCE_ID. For a caller naming ANOTHER process's path (a
+# host-global operation like restart.sh, which must target core's own watcher
+# even when invoked from a worker's own shell, which carries its own instance
+# id and would otherwise have sentinel_path_for() resolve to itself).
+core_sentinel_path_for() {
+  local state_dir="$1" here out
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local py
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "resolve the core watcher sentinel")" || return 1
+  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel-default "$state_dir")"; then
+    echo "watcher_sentinel: could not resolve the core sentinel path" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
 # Every sentinel present, historic name first, one per line. A caller that asks
 # about one file has asked about one watcher; on a pool host the others are
 # equally real.

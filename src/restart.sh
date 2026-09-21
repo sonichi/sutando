@@ -104,7 +104,12 @@ _stop_core_watcher() {
     if [ -r "$REPO/src/startup-runtime.sh" ] && [ -n "${_WS:-}" ]; then
         # shellcheck source=./startup-runtime.sh
         . "$REPO/src/startup-runtime.sh"
-        sentinel="$(sentinel_path_for "$_WS/state" 2>/dev/null)" || sentinel=""
+        # core_sentinel_path_for(), NOT sentinel_path_for(): this stops CORE's
+        # watcher specifically, and must resolve to core's identity even when
+        # this script runs from a worker's own shell (its own SUTANDO_INSTANCE_ID
+        # would otherwise make sentinel_path_for() resolve to the WORKER's own
+        # sentinel -- the exact collateral-damage class this fix exists for).
+        sentinel="$(core_sentinel_path_for "$_WS/state" 2>/dev/null)" || sentinel=""
     fi
     if [ -n "$sentinel" ] && declare -F reap_stale_task_watcher >/dev/null 2>&1; then
         reap_stale_task_watcher "$sentinel"

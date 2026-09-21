@@ -51,7 +51,7 @@ mkdir -p "$TMP/state" "$TMP/src"
 SENTINEL="$TMP/state/sentinel"
 echo "54321" > "$SENTINEL"
 cat > "$TMP/src/startup-runtime.sh" << EOF
-sentinel_path_for() { printf '%s' "$SENTINEL"; }
+core_sentinel_path_for() { printf '%s' "$SENTINEL"; }
 reap_stale_task_watcher() { printf 'reap_stale_task_watcher %s\n' "\$1" >> "$TMP/reap.log"; }
 EOF
 REAP_LOG="$TMP/reap.log"
@@ -86,7 +86,7 @@ fi
 # every watcher untouched. ---
 : > "$REAP_LOG"; : > "$KILL_LOG"; : > "$PKILL_LOG"
 cat > "$TMP/src/startup-runtime.sh" << EOF
-sentinel_path_for() { return 1; }
+core_sentinel_path_for() { return 1; }
 reap_stale_task_watcher() { printf 'reap_stale_task_watcher %s\n' "\$1" >> "$TMP/reap.log"; }
 EOF
 OUT="$(
@@ -133,6 +133,60 @@ if printf '%s\n' "$patterns_block" | grep -q '"watch-tasks"'; then
     "still present -- would spin the full drain loop whenever a worker is running"
 else
   ok "STOP_PATTERNS no longer waits on the unscoped watch-tasks pattern"
+fi
+
+# --- Case 3 (kewei's #4569 review, real identity resolution -- not a mock):
+# _stop_core_watcher() must target CORE's own sentinel even when this script
+# runs from a WORKER's own shell (its own SUTANDO_INSTANCE_ID). sentinel_path_for()
+# resolves from ambient env -- a worker-scoped caller invoking it would
+# collateral-kill the worker's own watcher instead of core's. The real fix:
+# core_sentinel_path_for() resolves the CANONICAL default identity explicitly
+# (util_paths.py's stated_default_identity()), never the caller's own env. ---
+REAL_WS="$TMP/real-ws"; REAL_STATE="$REAL_WS/state"; mkdir -p "$REAL_STATE"
+PY3="$(command -v python3)"
+CORE_SENTINEL="$(unset SUTANDO_INSTANCE_ID; "$PY3" "$REPO/src/util_paths.py" watcher-sentinel-default "$REAL_STATE" 2>/dev/null)"
+WORKER_SCOPED_SENTINEL="$(SUTANDO_INSTANCE_ID=worker-red "$PY3" "$REPO/src/util_paths.py" watcher-sentinel-default "$REAL_STATE" 2>/dev/null)"
+if [ -n "$CORE_SENTINEL" ] && [ "$CORE_SENTINEL" = "$WORKER_SCOPED_SENTINEL" ]; then
+  ok "core_sentinel_path_for resolves the same canonical path regardless of the caller's own SUTANDO_INSTANCE_ID"
+else
+  bad "core_sentinel_path_for resolves the same canonical path regardless of the caller's own SUTANDO_INSTANCE_ID" \
+    "no-env='$CORE_SENTINEL' worker-scoped='$WORKER_SCOPED_SENTINEL'"
+fi
+# Contrast control: sentinel_path_for() (ambient, unchanged, correct for ITS
+# actual callers) DOES vary with SUTANDO_INSTANCE_ID -- confirms the two
+# functions genuinely differ and this isn't a coincidentally-matching stub.
+AMBIENT_WORKER_SENTINEL="$(SUTANDO_INSTANCE_ID=worker-red "$(command -v python3)" \
+  "$REPO/src/util_paths.py" watcher-sentinel "$REAL_STATE" 2>/dev/null)"
+if [ -n "$AMBIENT_WORKER_SENTINEL" ] && [ "$AMBIENT_WORKER_SENTINEL" != "$CORE_SENTINEL" ]; then
+  ok "control: the ambient sentinel_path_for DOES vary by SUTANDO_INSTANCE_ID (the bug class this avoids)"
+else
+  bad "control: the ambient sentinel_path_for DOES vary by SUTANDO_INSTANCE_ID (the bug class this avoids)" \
+    "ambient-worker='$AMBIENT_WORKER_SENTINEL' core='$CORE_SENTINEL' -- if equal, the control itself is broken"
+fi
+
+# --- Functional: _stop_core_watcher(), run as if from a worker's own shell
+# (SUTANDO_INSTANCE_ID set), must call the reaper with CORE's sentinel path,
+# not the worker's -- kewei's exact live-repro shape, reproduced hermetically.
+# Real identity resolution (sources the real watcher_sentinel.sh so
+# core_sentinel_path_for genuinely resolves core_sentinel_path_for's own
+# real chain), reap itself stubbed (its correctness is a separate suite's job). ---
+cat > "$TMP/src/startup-runtime.sh" << EOF
+. "$REPO/src/watcher_sentinel.sh"
+reap_stale_task_watcher() { printf 'reap_stale_task_watcher %s\n' "\$1" >> "$REAP_LOG"; }
+EOF
+: > "$REAP_LOG"
+(
+  REPO="$TMP"
+  _WS="$REAL_WS"
+  export SUTANDO_INSTANCE_ID="worker-red"
+  eval "$FUNC_SRC"
+  _stop_core_watcher
+)
+if grep -qF "reap_stale_task_watcher $CORE_SENTINEL" "$REAP_LOG"; then
+  ok "invoked from a worker-scoped shell, _stop_core_watcher still targets core's own sentinel"
+else
+  bad "invoked from a worker-scoped shell, _stop_core_watcher still targets core's own sentinel" \
+    "expected core sentinel '$CORE_SENTINEL', reap.log: $(cat "$REAP_LOG")"
 fi
 
 echo "restart.sh watcher-stop scoping:"
