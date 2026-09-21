@@ -47,6 +47,11 @@ from room_kanban import (  # noqa: E402
     is_card, is_column, normalized,
 )
 
+from room_composer import (  # noqa: E402
+    COMPOSER_KIND, POSTS_KEY, ComposerError, build as build_post, feed as post_feed,
+    mark as status_mark, root_for,
+)
+
 from room_collab_protocol import (  # noqa: E402
     close_code,
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
@@ -72,9 +77,10 @@ class RoomDoc:
         self._awareness = awareness
         self._kind = kind
         self._text_name = text_name
-        # ONLY the markdown document is a text; naming the non-text kinds
-        # instead lets the next one read empty and accept unseen writes.
+        # Only markdown has a text by default; a composer holds one per post,
+        # which `open_post` selects. Naming another kind accepts unseen writes.
         self._text = doc.get(text_name, type=Text) if kind == DEFAULT_KIND else None
+        self._post_id: str | None = None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
         self._ended: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -95,6 +101,11 @@ class RoomDoc:
         with "". An empty string reads as an empty document, and a write that
         lands where nothing reads it is worse than an error."""
         if self._text is None:
+            if self._kind == COMPOSER_KIND:
+                raise RoomDocError(
+                    f"cannot {what} on the {COMPOSER_KIND!r} document until a post is open: it "
+                    "holds one text per post, so a write with no post named has no destination. "
+                    "Call open_post(<id>) or add_post(...) first.")
             where = {BOARD_KIND: f"elements under {ELEMENTS_KEY!r}",
                      KANBAN_KIND: "cards and columns"}.get(
                          self._kind, "structured data")
@@ -565,6 +576,82 @@ class RoomDoc:
                 ended.cancel()
 
     # --- the kanban: cards and columns, the panel's rules
+
+    def _require_composer(self, what: str) -> Any:
+        if self._kind != COMPOSER_KIND:
+            raise RoomDocError(
+                f"cannot {what} on the {self._kind!r} document: posts live on the composer. "
+                f"Open it with kind={COMPOSER_KIND!r}.")
+        return self._doc.get(POSTS_KEY, type=Map)
+
+    @staticmethod
+    def _rules(fn: Callable[[], Any]) -> Any:
+        # A rule refusal reaches the caller as the one error this client raises;
+        # `room_composer` imports nothing, so it cannot raise that error itself.
+        try:
+            return fn()
+        except ComposerError as exc:
+            raise RoomDocError(str(exc)) from exc
+
+    @property
+    def post(self) -> str | None:
+        """The post every text operation currently addresses, if one is open."""
+        return self._post_id
+
+    def posts(self) -> list[dict]:
+        """Every post on the surface, oldest first, each with its text root."""
+        return post_feed(self._require_composer("list posts").to_py() or {})
+
+    def open_post(self, post_id: str) -> str:
+        """Point the text operations at one post, and the caret with them.
+
+        The caret carries the root's name, so switching posts is what tells the
+        editors which one this agent is writing in — no extra message.
+        """
+        posts = self._require_composer("open a post")
+        name = self._rules(lambda: root_for(post_id))
+        if str(post_id) not in {str(k) for k, _ in self._items(posts)}:
+            raise RoomDocError(
+                f"no post {post_id!r} on this composer. A text root with no row beside it is "
+                "invisible: the feed is built from the rows. Add it with add_post first.")
+        self._text = self._doc.get(name, type=Text)
+        self._text_name = name
+        self._post_id = str(post_id)
+        return name
+
+    async def add_post(self, post_id: str, artifact_type: str, fields: dict | None = None,
+                       created: int | None = None) -> dict:
+        """File one post and open it. The row is refused here if a renderer
+        could not draw it, rather than stored for the client to discover."""
+        posts = self._require_composer("add a post")
+        name = self._rules(lambda: root_for(post_id))
+        row = self._rules(lambda: build_post(artifact_type, fields, created))
+        if str(post_id) in {str(k) for k, _ in self._items(posts)}:
+            raise RoomDocError(
+                f"post {post_id!r} is already on this composer. Writing it again would replace "
+                "the row someone else may be editing; open it instead.")
+        # One key per post: a write to the whole map would drop a post filed
+        # concurrently, which is the failure this surface exists to prevent.
+        await self._commit(lambda: posts.__setitem__(str(post_id), row))
+        self._text = self._doc.get(name, type=Text)
+        self._text_name = name
+        self._post_id = str(post_id)
+        return row
+
+    async def set_status(self, post_id: str, status: str, at: int | None = None) -> dict:
+        """Move a post along its life: draft, sent, dropped.
+
+        The row is rewritten whole, so two clients changing the SAME post's
+        fields at once keep only one — which is why the prose is not in here.
+        """
+        posts = self._require_composer("set a post's status")
+        current = dict(self._items(posts)).get(str(post_id))
+        if not isinstance(current, dict):
+            raise RoomDocError(
+                f"no post {post_id!r} on this composer to mark {status!r}.")
+        row = {**current, **self._rules(lambda: status_mark(status, at))}
+        await self._commit(lambda: posts.__setitem__(str(post_id), row))
+        return row
 
     def _require_kanban(self, what: str) -> tuple:
         if self._kind != KANBAN_KIND:
