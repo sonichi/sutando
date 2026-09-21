@@ -152,22 +152,35 @@ def feed(stored: Any) -> list[dict]:
     alone would leave their order to each client's map iteration — so two people
     would see the same feed differently, intermittently. A missing or malformed
     `created` counts as 0, which puts it at the top and keeps it there rather
-    than moving between renders. A row that is not a post is skipped rather than
-    raised on: this reads other writers' data.
+    than moving between renders.
+
+    NOTHING here is dropped. A row this reader cannot check — an unknown type,
+    an unknown schema, an id shape it does not recognise — comes back `plain`
+    with a reason, the same as any other skew. Dropping one would lose a post
+    while reporting a healthy shorter feed, which is worse than showing a row
+    that says it could not be read.
     """
     rows = stored.items() if hasattr(stored, "items") else []
     out = []
     for post_id, row in rows:
-        if not POST_ID_RE.fullmatch(str(post_id or "")):
-            continue
         entry = readable(row)
         entry["id"] = str(post_id)
         entry["root"] = f"post:{post_id}"
+        if not POST_ID_RE.fullmatch(entry["id"]):
+            entry["plain"] = True
+            entry["why"] = "; ".join(filter(None, (
+                f"post id {entry['id']!r} is not one this reader knows how to check",
+                entry.get("why"))))
         created = entry["fields"].pop("created", None)
         ok = isinstance(created, (int, float)) and not isinstance(created, bool)
         entry["created"] = int(created) if ok and created == int(created) else None
+        said = row.get("status") if isinstance(row, dict) else None
         entry["status"] = status_of(row if isinstance(row, dict) else {})
         entry["archived"] = entry["status"] in ARCHIVED
+        if said is not None and said != entry["status"]:
+            # Normalising to `draft` must not also erase what it said: a newer
+            # writer's own word is the only clue an operator has.
+            entry["status_said"] = said
         at = entry["fields"].pop("status_at", None)
         at_ok = isinstance(at, (int, float)) and not isinstance(at, bool)
         entry["status_at"] = int(at) if at_ok and at == int(at) else None

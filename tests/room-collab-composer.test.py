@@ -87,7 +87,6 @@ def test_the_feed_is_ordered_by_created_then_id_so_every_client_agrees():
         # or two clients would order these by map iteration and disagree.
         "3": build(EMAIL, {"subject": "s", "to": ["a@b.c"]}, created=1002),
         "9": {"type": X_POST, "schema": SCHEMA},            # no created: sorts to the top, stably
-        "not an id": {"type": X_POST, "schema": SCHEMA},    # not a post: skipped, never raised on
     }
     got = feed(stored)
     assert [e["id"] for e in got] == ["9", "1", "2", "3"], got
@@ -108,6 +107,24 @@ def test_a_feed_tolerates_what_another_writer_may_have_put_there():
     assert [e["id"] for e in got] == ["1", "2", "3", "4", "5"], got
     assert all(e["created"] is None for e in got), "a bool or a fraction is not a minute"
     assert got[2]["plain"] and "no renderer" in got[2]["why"]
+
+
+def test_an_id_this_reader_cannot_check_still_reaches_the_feed():
+    # Dropping a row whose id shape is newer loses a post while reporting a
+    # healthy shorter feed — invisible, and permanent for that reader.
+    stored = {"p1": build(X_POST, created=1), "P3": build(X_POST, created=2),
+              "post_2": build(X_POST, created=3), "x" * 33: build(X_POST, created=4),
+              "p4": {"type": "future", "schema": SCHEMA}}
+    got = feed(stored)
+    assert len(got) == len(stored), f"every stored post reaches the feed: {got}"
+    by_id = {e["id"]: e for e in got}
+    for bad in ("P3", "post_2", "x" * 33):
+        assert by_id[bad]["plain"] and "is not one this reader knows" in by_id[bad]["why"], bad
+        assert by_id[bad]["root"] == f"post:{bad}", "its prose is still addressable"
+    assert by_id["p1"]["plain"] is False and "why" not in by_id["p1"]
+    # Two reasons at once read as two reasons, not as one overwriting the other.
+    both = feed({"Bad-Id": {"type": "future", "schema": 99}})[0]
+    assert "is not one this reader knows" in both["why"] and "no renderer" in both["why"], both
 
 
 def test_a_post_carries_where_it_is_in_its_life_and_an_unknown_one_is_a_draft():
@@ -132,6 +149,10 @@ def test_archived_posts_are_named_as_such_and_never_inferred():
     assert [got[i]["archived"] for i in ("1", "2", "3", "4")] == [False, True, True, False]
     assert got["2"]["status_at"] == 120 and got["1"]["status_at"] is None
     assert got["4"]["status_at"] is None, "a bool is not a minute"
+    assert got["4"]["status_said"] == "weird", \
+        "reading it as a draft must not also erase the word a newer writer used"
+    assert "status_said" not in got["1"] and "status_said" not in got["2"], \
+        "only a status this reader had to reinterpret is worth reporting"
     for entry in got.values():
         assert "status" not in entry["fields"] and "status_at" not in entry["fields"], \
             "the lifecycle is read from its own keys, not left among the renderable fields"
