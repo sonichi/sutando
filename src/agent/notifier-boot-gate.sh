@@ -24,3 +24,31 @@ notifier_boot_gate() {
   fi
   return 0
 }
+
+# Escalation for a caller whose `tmux kill-session` did not actually remove
+# the watcher (nonzero, or 0-but-survives) -- SIGKILLs the watcher's own
+# recorded PID directly, so intake stops even when tmux's teardown does not.
+# Reuses watcher_sentinel.sh's ownership check so a reissued pid is never
+# killed. $1: workspace. Returns 0 only if the PID is now confirmed dead.
+notifier_boot_gate_force_kill_watcher() {
+  local workspace="$1" state_dir sentinel pid
+  [ -n "$workspace" ] || return 1
+  state_dir="$workspace/state"
+  # shellcheck source=watcher_sentinel.sh
+  . "$REPO/src/watcher_sentinel.sh" || return 1
+  sentinel="$(sentinel_path_for "$state_dir")" || return 1
+  [ -f "$sentinel" ] || return 1
+  pid="$(cat "$sentinel" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  sentinel_pid_wrote_file "$pid" "$sentinel" || return 1
+  kill -9 "$pid" 2>/dev/null
+  # SIGKILL delivery is async -- a kill -0 in the same instant can still see
+  # the not-yet-reaped process. Poll briefly rather than fail on that race.
+  local _tries=0
+  while [ "$_tries" -lt 10 ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.05
+    _tries=$((_tries + 1))
+  done
+  return 1
+}

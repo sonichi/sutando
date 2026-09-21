@@ -782,7 +782,11 @@ ensure_task_notifier() {
       # stderr, not exit code -- `return` here would abort the whole launcher
       # under `set -e` at every call site, some mid-attach.
       if watcher_session_exists; then
-        echo "  ✗ FATAL task notifier: kill-session did not remove the watcher -- it is STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
+        if notifier_boot_gate_force_kill_watcher "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"; then
+          echo "  ✗ task notifier: kill-session left the watcher alive; force-killed its sentinel-recorded PID directly" >&2
+        else
+          echo "  ✗ FATAL task notifier: kill-session did not remove the watcher and the force-kill fallback also could not confirm it dead -- it may be STILL RUNNING and STILL UNPROTECTED while the pool sweep fails" >&2
+        fi
       fi
     fi
     return 0

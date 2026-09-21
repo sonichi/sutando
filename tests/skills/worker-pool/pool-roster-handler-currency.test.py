@@ -118,6 +118,42 @@ class EnsureTaskEventHandler(Base):
         with self.assertRaises(pr.HandlerPublishError):
             pr.ensure_task_event_handler(self.ws)
 
+    def test_a_dangling_binding_raises_with_a_valid_live_worker(self):
+        """keweichen's review, round 9, exact repro: a valid live worker-a
+        plus a binding to a nonexistent worker-b. validate_workers alone
+        passes; without validate_bindings this published a handler anyway,
+        and the router's own DECLINE for the dangling binding then fell
+        through to the unrestricted core -- the exact leak this PR closes."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps(
+            {"workers": {"worker-a": {"state": "live"}},
+             "bindings": {"room-a": "worker-b"}}))
+
+        with self.assertRaises(pr.HandlerPublishError):
+            pr.ensure_task_event_handler(self.ws)
+
+    def test_a_dangling_binding_raises_even_with_empty_workers(self):
+        """keweichen's round-9 second half of the same repro: workers={}
+        does NOT make a dangling binding harmless -- it's still a corrupt
+        roster, not the ordinary no-pool case, so it must also raise."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps(
+            {"workers": {}, "bindings": {"room-a": "worker-b"}}))
+
+        with self.assertRaises(pr.HandlerPublishError):
+            pr.ensure_task_event_handler(self.ws)
+
+    def test_a_valid_binding_to_an_existing_worker_still_publishes(self):
+        """Negative control for the two tests above: a binding that DOES
+        resolve to a real worker must not be caught by the new check."""
+        pr.roster_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        pr.roster_path(self.ws).write_text(json.dumps(
+            {"workers": {"worker-a": {"state": "live"}},
+             "bindings": {"room-a": "worker-a"}}))
+
+        self.assertIsNotNone(pr.ensure_task_event_handler(self.ws))
+        self.assertTrue(cfg_path(self.ws).exists())
+
     def test_an_existing_pool_that_predates_the_file_is_backfilled(self):
         """register_worker() already wrote it once (this skill's normal path);
         delete it to simulate a pool registered before publish_task_event_handler

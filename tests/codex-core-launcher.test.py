@@ -69,6 +69,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
             "src/agent/notifier-boot-gate.sh",
+            "src/watcher_sentinel.sh",
             "src/agent/task-event-handler-lookup.sh",
             "src/skill-manifest-config.sh",
             "src/file_lock.py",
@@ -426,6 +427,33 @@ exit 0
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("STILL RUNNING and STILL UNPROTECTED", run.stderr,
                        "a kill that did not remove the session produced no loud diagnostic")
+
+    def test_an_explicit_empty_pool_boot_sweep_survives_the_manifest_in_production(self):
+        """keweichen's review, round 9: pin the env-over-manifest precedence
+        fix in a PRODUCTION-PATH test, not just the synthetic gate unit test.
+        A skill manifest declares SUTANDO_POOL_BOOT_SWEEP; the caller sets it
+        explicitly to EMPTY. The launcher must honor the explicit empty
+        override (skip the sweep silently, same as unset) rather than
+        refilling it from the manifest and running that sweep instead."""
+        manifest_dir = self.root / "skills" / "worker-pool"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        would_run = self.root / "would-run-if-manifest-won.marker"
+        manifest_sweep = self.root / "manifest-sweep.py"
+        manifest_sweep.write_text(
+            f"import pathlib; pathlib.Path({str(would_run)!r}).write_text('ran')\n"
+        )
+        (manifest_dir / "manifest.json").write_text(json.dumps(
+            {"config": {"SUTANDO_POOL_BOOT_SWEEP": str(manifest_sweep)}}))
+
+        run = self.run_launcher(env_extra={"SUTANDO_POOL_BOOT_SWEEP": ""})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = self.log.read_text()
+        self.assertIn("new-session -d -s sutando-core-watcher", calls,
+                       "an explicit empty override must skip the sweep "
+                       "silently, same as unset -- the ordinary path")
+        self.assertFalse(would_run.exists(),
+                         "the manifest-declared sweep ran anyway -- the "
+                         "explicit empty override lost to the manifest")
 
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
         """There is no Codex worker mode. Through the dispatcher's --runtime and

@@ -146,6 +146,57 @@ out6="$(
 check "adapter-level one-time resolution discovers a manifest-declared var" \
   "$out6" "resolved=$SWEEP"
 
+# --- Case 7: notifier_boot_gate_force_kill_watcher actually terminates the
+# real process a launcher's tmux kill-session left alive -- the SAFETY
+# OUTCOME (the watcher can no longer admit a task), not a diagnostic string.
+# Uses REAL_REPO (needs the real util_paths.py/watcher_sentinel.sh). ---
+WS7="$TD/ws7"
+mkdir -p "$WS7/state"
+nohup sleep 25 > /dev/null 2>&1 &
+FAKE_WATCHER_PID=$!
+disown
+SENTINEL7="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS7/state")"
+echo "$FAKE_WATCHER_PID" > "$SENTINEL7"
+out7="$(
+  REPO="$REAL_REPO"
+  . "$GATE_SRC"
+  notifier_boot_gate_force_kill_watcher "$WS7"
+  echo "rc=$?"
+)"
+check "force-kill escalation reports success" "$(grep -o 'rc=[0-9]*' <<<"$out7")" "rc=0"
+if kill -0 "$FAKE_WATCHER_PID" 2>/dev/null; then
+  echo "  FAIL force-kill escalation actually terminates the process (still alive)"
+  FAIL=1
+  kill -9 "$FAKE_WATCHER_PID" 2>/dev/null
+else
+  echo "  ok   force-kill escalation actually terminates the process"
+fi
+
+# --- Case 8: negative control -- a REISSUED pid (the sentinel's mtime
+# predates the live process's own start) must NEVER be killed. ---
+WS8="$TD/ws8"
+mkdir -p "$WS8/state"
+nohup sleep 25 > /dev/null 2>&1 &
+UNRELATED_PID=$!
+disown
+SENTINEL8="$(python3 "$REAL_REPO/src/util_paths.py" watcher-sentinel "$WS8/state")"
+echo "$UNRELATED_PID" > "$SENTINEL8"
+touch -t 202001010000 "$SENTINEL8"
+out8="$(
+  REPO="$REAL_REPO"
+  . "$GATE_SRC"
+  notifier_boot_gate_force_kill_watcher "$WS8"
+  echo "rc=$?"
+)"
+check "force-kill escalation refuses a reissued pid" "$(grep -o 'rc=[0-9]*' <<<"$out8")" "rc=1"
+if kill -0 "$UNRELATED_PID" 2>/dev/null; then
+  echo "  ok   the unrelated live process was correctly left alone"
+else
+  echo "  FAIL the unrelated live process was killed anyway -- ownership check bypassed"
+  FAIL=1
+fi
+kill -9 "$UNRELATED_PID" 2>/dev/null
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "notifier-boot-gate: ALL PASS"

@@ -230,22 +230,15 @@ def validate_workers(workers) -> None:
             raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
 
 
-def validate_current_roster(workspace) -> None:
-    """Refuse a stored roster this process would fail on mid-mutation, so a
-    caller validates BEFORE it writes anything rather than part-way through."""
-    raw = _load_existing_roster_strict(workspace)
-    if raw is not None:
-        validate_workers(raw.get("workers"))
-
-
-def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
-    """Build the roster the router reads. Refuses declarations it cannot honour
-    rather than emitting a roster that routes somewhere unintended."""
-    bindings = dict(bindings if bindings is not None else load_bindings(workspace))
-    validate_workers(workers)
-
+def validate_bindings(workers, bindings) -> None:
+    """A binding's type boundary and target existence, so every caller refuses
+    the same shapes -- the whole-roster half of `validate_workers`. Callers
+    that skip this (an earlier `ensure_task_event_handler` did) can publish a
+    handler for a roster whose binding points at a worker that doesn't
+    exist: the router's own DECLINE for that binding then falls through to
+    the unrestricted core, the exact leak this PR closes for other shapes."""
     known = set(workers or {}) | {CORE}
-    for source, bound in bindings.items():
+    for source, bound in (bindings or {}).items():
         members = list(bound) if isinstance(bound, list) else [bound]
         if not members:
             raise RosterError(f"binding {source!r} names no target")
@@ -259,6 +252,23 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
             raise RosterError(
                 f"binding {source!r} names {missing} which are not workers — "
                 "a binding to a nonexistent target fails every task from that source")
+
+
+def validate_current_roster(workspace) -> None:
+    """Refuse a stored roster this process would fail on mid-mutation, so a
+    caller validates BEFORE it writes anything rather than part-way through."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is not None:
+        validate_workers(raw.get("workers"))
+        validate_bindings(raw.get("workers"), raw.get("bindings"))
+
+
+def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
+    """Build the roster the router reads. Refuses declarations it cannot honour
+    rather than emitting a roster that routes somewhere unintended."""
+    bindings = dict(bindings if bindings is not None else load_bindings(workspace))
+    validate_workers(workers)
+    validate_bindings(workers, bindings)
 
     prev = _load_existing_roster_strict(workspace) or {}
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
@@ -323,13 +333,16 @@ def ensure_task_event_handler(workspace) -> "Path | None":
     abandoned worker's deliveries still route to it, so any worker present in
     the roster needs the handler declared, not only a currently-live one.
     ABSENT and UNREADABLE/MALFORMED are different failures: absent is the
-    ordinary no-pool case; unreadable, non-JSON, missing `workers`, or a
+    ordinary no-pool case; unreadable, non-JSON, missing `workers`, a
     `workers` value that is not a plain dict of valid rows (null, a list, a
-    string, a row missing `state`) means an existing pool's ownership can't
-    be established and must fail closed via HandlerPublishError, never
-    collapse to "no pool" -- the production strict reader and its own
-    `validate_workers` are reused so this shares one definition of malformed
+    string, a row missing `state`), or a binding naming a worker that does
+    not exist means an existing pool's ownership can't be established and
+    must fail closed via HandlerPublishError, never collapse to "no pool" --
+    the production strict reader and its own `validate_workers`/
+    `validate_bindings` are reused so this shares one definition of malformed
     with the writer that would otherwise refuse to produce such a roster.
+    Binding validation runs even when `workers` is empty: a dangling binding
+    is evidence of a corrupt roster either way, not "no pool yet."
     """
     try:
         roster = _load_existing_roster_strict(workspace)
@@ -348,11 +361,12 @@ def ensure_task_event_handler(workspace) -> "Path | None":
             "task-event handler declared")
     try:
         validate_workers(workers_raw)
+        validate_bindings(workers_raw, roster.get("bindings"))
     except RosterError as e:
         raise HandlerPublishError(
             f"roster at {roster_path(workspace)} has a malformed 'workers' "
-            f"field -- cannot establish whether an existing pool needs the "
-            f"task-event handler declared: {e}") from e
+            f"or 'bindings' field -- cannot establish whether an existing "
+            f"pool needs the task-event handler declared: {e}") from e
     workers = workers_raw
     if not workers:
         return None
