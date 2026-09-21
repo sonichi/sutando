@@ -1,16 +1,19 @@
-import { describe, it, after } from 'node:test';
+import { describe, it, after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { injectSilentContext } from '../src/browser-tools.js';
 
-// Room-bound voice (Zerlinda 2026-09-17: "When talk to sutando in microphone,
-// sends back to main conversation, talking but replying to the dm"). The
-// client announces its room with a `session.context` frame (after
-// session.config, then on every room change); the task bridge binds it, stamps
-// every delegated task with it, and posts the result back into that room
-// through the gateway's `[channel: <room>]` proactive marker.
+// The AG2 Space voice plugin against the real task bridge: the client announces its
+// room with a `session.context` frame, the plugin binds it as the session's origin on
+// the gateway bridge's verdict, and the bridge stamps tasks and routes results by it.
+// The plugin is optional: with skills/ag2space-voice/ removed this file skips.
+const PLUGIN_DIR = join(process.cwd(), 'skills', 'ag2space-voice');
+const PRESENT = existsSync(join(PLUGIN_DIR, 'tools.ts'));
+if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 // Fixtures use a tmp workspace, never the live queue: SUTANDO_TEST_MODE=1 must
 // be set before the source-ordered `await import` binds the bridge's paths.
@@ -19,17 +22,49 @@ process.env.SUTANDO_WORKSPACE = TMP;
 process.env.SUTANDO_TEST_MODE = '1';
 const RESULT_DIR = join(TMP, 'results');
 mkdirSync(RESULT_DIR, { recursive: true });
-
-const {
-	forwardVoiceResultToRoom, LEADING_REDIRECT_RE, _isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow,
-	forwardVoiceResultToOwnerDm, keepVoiceResultToDm, DM_ONLY_RE, DM_ONLY_DELIVERY_NOTE, voiceRoomTaskGuidance, startResultWatcher,
-	parseSessionContextFrame, applySessionContextFrame, sessionRoomNotice,
-	setVoiceSessionRoom, getVoiceSessionRoom, MATRIX_ROOM_ID_RE, ROOM_NAME_MAX_CHARS, workTool,
-	bindSessionContextFrame, setVoiceRoomVerifier, resolveVoiceResultRoom, forwardOfflineVoiceResult,
-	requestVoiceRoomVerdict, readVoiceRoomVerdict, voiceRoomCheckKey, VOICE_ROOM_CHECK_DIR, VOICE_ROOM_VERDICT_TTL_S,
-} = await import('../src/task-bridge.js');
 const TASK_DIR = join(TMP, 'tasks');
-const { SESSION_CONTEXT_TYPE, SESSION_CONTEXT_ACK_TYPE, buildSessionContextFrame, buildSessionContextAckFrame } = await import('../src/web-voice-transport.js');
+
+if (PRESENT) {
+const bridge = await import('../src/task-bridge.js');
+const { LEADING_REDIRECT_RE, _isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, keepVoiceResultToDm, DM_ONLY_RE, startResultWatcher, workTool, forwardOfflineVoiceResult } = bridge;
+const plugin = (f: string) => import(pathToFileURL(join(PLUGIN_DIR, f)).href);
+const {
+	SESSION_CONTEXT_TYPE, SESSION_CONTEXT_ACK_TYPE, buildSessionContextAckFrame, parseSessionContextFrame, MATRIX_ROOM_ID_RE, ROOM_NAME_MAX_CHARS,
+} = await plugin('session-context.ts');
+const {
+	createRoomBinding, roomOrigin, roomOriginFromTaskHeader, sessionRoomNotice, roomContextLines, voiceRoomTaskGuidance, DM_ONLY_DELIVERY_NOTE, ORIGIN_CHANNEL,
+	setVoiceRoomVerifier, requestVoiceRoomVerdict, readVoiceRoomVerdict, voiceRoomCheckKey, VOICE_ROOM_CHECK_DIR, VOICE_ROOM_VERDICT_TTL_S,
+} = await plugin('room-binding.ts');
+const { handleSessionContextFrame } = await plugin('tools.ts');
+
+// The plugin wired to the real bridge the way setup(ctx) wires it.
+bridge.setVoiceTaskOriginResolver(roomOriginFromTaskHeader);
+const binding = createRoomBinding({ set: bridge.setVoiceSessionOrigin });
+type Frame = Record<string, unknown> | null | undefined;
+const applySessionContextFrame = (msg: Frame) => binding.apply(msg);
+const bindSessionContextFrame = (msg: Frame) => binding.bind(msg);
+const getVoiceSessionRoom = () => binding.current();
+const setVoiceSessionRoom = (room: { id: string; name?: string } | null) => {
+	if (room) binding.apply({ type: 'session.context', room_id: room.id, room_name: room.name });
+	else binding.release();
+};
+const forwardVoiceResultToRoom = (taskId: string, result: string, room: string, nowSec?: number) =>
+	bridge.forwardVoiceResultToOrigin(taskId, result, roomOrigin({ id: room }), nowSec);
+const forwardVoiceResultToOwnerDm = (taskId: string, result: string, nowSec?: number) =>
+	bridge.forwardVoiceResultToOwnerDm(taskId, result, ORIGIN_CHANNEL, nowSec);
+const resolveVoiceResultRoom = async (taskId: string) => (await bridge.resolveVoiceResultOrigin(taskId))?.target ?? null;
+/** The frame the AG2 Space client sends (webapp voiceRoomBinding.ts): the wire contract, spelled out. */
+const buildSessionContextFrame = (ctx: { roomId: string; roomName?: string } | null) => ctx
+	? { type: 'session.context', version: 1, room_id: ctx.roomId, room_name: ctx.roomName ?? null, surface: 'room', capabilities: ['ui.navigate'] }
+	: { type: 'session.context', version: 1, room_id: null, room_name: null, surface: 'dm', capabilities: ['ui.navigate'] };
+
+const FORGED = '!forged:ag2.space';
+const VERIFIED = '!verified:ag2.space';
+const verdictFor = (room: string, verified: boolean, reason = verified ? 'agent and owner joined' : 'owner not joined') =>
+	({ room_id: room, verified, reason, checked_at: Date.now() / 1000 });
+/** A verifier that vouches for VERIFIED only, and records every question asked. */
+const asked: string[] = [];
+const vouchForVerifiedOnly = async (room: string) => { asked.push(room); return verdictFor(room, room === VERIFIED); };
 
 after(() => {
 	setVoiceSessionRoom(null);
@@ -367,8 +402,6 @@ describe('applySessionContextFrame — last frame wins, a DM frame clears, notic
 
 // The room notice asks for `turnComplete: false`. Whether that is silent is the
 // transport's business: the pinned Gemini transport ignores the flag.
-import { injectSilentContext } from '../src/browser-tools.js';
-
 describe('room notices ask for an open turn', () => {
 	it('injectSilentContext sends an open turn (turnComplete=false) and reports when it cannot', () => {
 		const sent: Array<{ turns: unknown; turnComplete: unknown }> = [];
@@ -379,18 +412,27 @@ describe('room notices ask for an open turn', () => {
 			'without sendContent the notice is dropped, not sent as realtime input');
 	});
 
-	it('the session.context handler uses the silent path and the notice asks for no reply', () => {
-		const src = readFileSync(join(process.cwd(), 'src', 'voice-agent.ts'), 'utf8');
-		const start = src.indexOf('function handleSessionContextFrame');
-		const body = src.slice(start, src.indexOf('\n\t}\n', start));
-		assert.ok(start > 0 && body.includes('injectSessionContext(notice)'), 'notice goes through the context inject');
-		const injStart = src.indexOf('function injectSessionContext');
-		const inj = src.slice(injStart, src.indexOf('\n\t}\n', injStart));
-		assert.ok(inj.includes('injectSilentContext(session, line)') && !inj.includes('injectText('), 'which is the open-turn path, with no realtime-text fallback');
-		assert.ok(body.includes('await bindSessionContextFrame(message)'), 'the live frame binds only through the verified path');
-		assert.ok(!body.includes('applySessionContextFrame('), 'the unverified apply is never on the live path');
-		assert.ok(body.includes('buildSessionContextAckFrame(refused.id, false, refused.reason)'), 'a refusal is acked to the client');
-		assert.ok(!body.includes('injectText('), 'no realtime-text fallback for the notice');
+	it('the frame handler acks the client and injects one context notice per change', async () => {
+		setVoiceRoomVerifier(vouchForVerifiedOnly);
+		const local = createRoomBinding({ set: () => {} });
+		const sent: Record<string, unknown>[] = [];
+		const injected: string[] = [];
+		const ctx = { sendClientFrame: (f: Record<string, unknown>) => { sent.push(f); return true; }, injectContext: (t: string) => { injected.push(t); } };
+		const frame = (room: string | null) => ({ type: 'session.context', version: 1, room_id: room, room_name: room ? 'Ops' : null, surface: room ? 'room' : 'dm' });
+		await handleSessionContextFrame(ctx, local, frame(VERIFIED));
+		await handleSessionContextFrame(ctx, local, frame(VERIFIED));
+		await handleSessionContextFrame(ctx, local, frame(FORGED));
+		await handleSessionContextFrame(ctx, local, frame(null));
+		await handleSessionContextFrame(ctx, local, { type: 'voice.retryUpstream' });
+		assert.deepEqual(sent.map(f => [f.type, f.surface, f.bound]), [
+			['session.context.ack', 'room', true], ['session.context.ack', 'room', true],
+			['session.context.ack', 'refused', false], ['session.context.ack', 'dm', false],
+		]);
+		assert.equal(sent[2].reason, 'owner not joined', 'a refusal is acked to the client with its reason');
+		assert.equal(injected.length, 2, 'entered once, left once; a duplicate and a DM-to-DM frame inject nothing');
+		assert.match(injected[0], /^You are docked in room "Ops";/);
+		assert.match(injected[1], /^You are back in your DM\./);
+		setVoiceRoomVerifier(null);
 		assert.match(sessionRoomNotice('entered', { id: '!r:x', name: 'Ops' })!, /No reply is needed\.$/);
 		assert.match(sessionRoomNotice('left', null)!, /No reply is needed\.$/);
 	});
@@ -402,16 +444,6 @@ describe('room notices ask for an open turn', () => {
 // channel_id/source_room_id stamp or a [channel:] destination only on the
 // gateway bridge's verdict (owner AND agent joined). Everything else is the DM.
 // ---------------------------------------------------------------------------
-
-import { writeFileSync } from 'node:fs';
-
-const FORGED = '!forged:ag2.space';
-const VERIFIED = '!verified:ag2.space';
-const verdictFor = (room: string, verified: boolean, reason = verified ? 'agent and owner joined' : 'owner not joined') =>
-	({ room_id: room, verified, reason, checked_at: Date.now() / 1000 });
-/** A verifier that vouches for VERIFIED only, and records every question asked. */
-const asked: string[] = [];
-const vouchForVerifiedOnly = async (room: string) => { asked.push(room); return verdictFor(room, room === VERIFIED); };
 
 describe('bindSessionContextFrame — a forged but valid room id never becomes a binding', () => {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -625,3 +657,49 @@ describe('session.context.ack — what the client is told', () => {
 			{ type: 'session.context.ack', version: 1, room_id: FORGED, bound: false, surface: 'refused', reason: 'owner not joined' });
 	});
 });
+describe('what the core is handed for a room: the origin, its header keys and the ROOM line', () => {
+	it('roomOrigin: the gateway channel, the room as target, and the keys the core instructions read', () => {
+		const o = roomOrigin({ id: VERIFIED, name: 'Ops' });
+		assert.equal(o.channel, 'ag2space');
+		assert.equal(o.target, VERIFIED);
+		assert.equal(o.label, 'Ops');
+		assert.deepEqual(o.headers, { channel_kind: 'room', source_room_id: VERIFIED });
+		assert.equal(o.contextLine, voiceRoomTaskGuidance(VERIFIED));
+		assert.equal(o.dmOnlyNote, DM_ONLY_DELIVERY_NOTE);
+		assert.equal(bridge.buildVoiceTaskHeader('task-2', '2026-09-18T10:00:00.000Z', 'owner-1', o), [
+			'id: task-2', 'timestamp: 2026-09-18T10:00:00.000Z', 'source: voice', 'interaction_type: realtime_audio', 'media_form: live_stream',
+			`channel_id: ${VERIFIED}`, 'channel_kind: room', `source_room_id: ${VERIFIED}`, 'user_id: owner-1', 'access_tier: owner', 'priority: urgent', '',
+		].join('\n'));
+	});
+
+	it('roomOriginFromTaskHeader: a Matrix room id only; the bridge offers it voice tasks only', () => {
+		assert.equal(roomOriginFromTaskHeader(['source: voice', `source_room_id: ${VERIFIED}`])?.target, VERIFIED);
+		assert.equal(roomOriginFromTaskHeader(['source: voice', 'source_room_id: ../../etc']), null, 'a malformed room id is never a destination');
+		assert.equal(roomOriginFromTaskHeader(['source: voice', 'channel_id: local-voice']), null);
+		mkdirSync(TASK_DIR, { recursive: true });
+		writeFileSync(join(TASK_DIR, 'task-1700000000950.txt'), `id: task-1700000000950\nsource: ag2space\nchannel_id: ${VERIFIED}\nsource_room_id: ${VERIFIED}\ntask: hi\n`);
+		assert.equal(bridge.voiceTaskOrigin('task-1700000000950'), null, 'a gateway room task is not voice');
+		rmSync(join(TASK_DIR, 'task-1700000000950.txt'), { force: true });
+	});
+
+	it('roomContextLines: names the room and its id and says where delegated work answers; nothing in the DM', () => {
+		const [line, ...rest] = roomContextLines({ id: '!abc123:ag2.space', name: 'Commorai' });
+		assert.deepEqual(rest, []);
+		assert.equal(line, 'ROOM: You are docked in room "Commorai" (!abc123:ag2.space). What you delegate is answered there only when it is for the room\'s members, otherwise in the owner\'s DM; say where it went.');
+		assert.match(roomContextLines({ id: '!abc123:ag2.space' })[0], /docked in room !abc123:ag2\.space\./);
+		assert.deepEqual(roomContextLines(null), []);
+	});
+
+	it('the client disconnecting releases the binding and supersedes a pending verdict', async () => {
+		let answer: (v: unknown) => void = () => {};
+		setVoiceRoomVerifier(() => new Promise(r => { answer = r; }));
+		const local = createRoomBinding({ set: bridge.setVoiceSessionOrigin });
+		const pending = local.bind({ type: 'session.context', room_id: VERIFIED });
+		local.release();
+		answer(verdictFor(VERIFIED, true));
+		assert.deepEqual(await pending, { change: 'none', room: null });
+		assert.equal(bridge.getVoiceSessionOrigin(), null);
+		setVoiceRoomVerifier(null);
+	});
+});
+}

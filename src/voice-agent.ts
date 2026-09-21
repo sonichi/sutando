@@ -58,8 +58,8 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionRoom, getVoiceSessionRoom, bindSessionContextFrame, sessionRoomNotice } from './task-bridge.js';
-import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './web-voice-transport.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver } from './task-bridge.js';
+import { parseSessionContextCapabilities } from './web-voice-transport.js';
 import { installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, navigateUiAvailable, navigateUiTool } from './voice-navigate.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -730,7 +730,6 @@ const _configCtx: VoiceConfigContext = {
 	resetNoteViewingDebounce,
 	getRecentConversation,
 	getSecondsSinceLastTurn,
-	getSessionRoom: getVoiceSessionRoom,
 };
 
 const mainAgent: MainAgent = {
@@ -1061,39 +1060,6 @@ async function main() {
 		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
 	})();
 
-	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
-	// session-only) + worker-thread persistence. Created before the session so
-	// the hooks below can reference it; the wraps install after construction.
-	// Room-bound voice: spoken in a room, answered in that room, not the DM.
-	// The client sends a `session.context` frame after session.config and
-	// again on every room change (a DM frame when it leaves rooms); the task
-	// bridge keeps the last one and reports whether the room actually changed,
-	// so the model hears one notice per change and nothing for a duplicate.
-	// The notice rides the task-result injection path (delay-then-check): the
-	// first frame lands ~100ms before Gemini's setup completes, so an immediate
-	// inject would fall through. It goes in as an open (turnComplete=false)
-	// context turn, not realtime input: realtime text is answered out loud, and
-	// the model answered every room switch with "Working on it." until it was
-	// made silent (owner 2026-09-18).
-	// The room in the frame is the client's claim; bindSessionContextFrame
-	// admits it only on the gateway bridge's membership verdict, and the ack
-	// frame tells the client which surface it actually got.
-	async function handleSessionContextFrame(message: Record<string, unknown>): Promise<void> {
-		if (message?.type !== SESSION_CONTEXT_TYPE) return;
-		const applied = await bindSessionContextFrame(message);
-		if (!applied) return;
-		const { change, room, refused } = applied;
-		console.log(`${ts()} [SessionRoom] session.context: ${room ? `${room.id}${room.name ? ` (${room.name})` : ''}` : 'DM'} — ${change}${refused ? ` (refused ${refused.id}: ${refused.reason})` : ''}`);
-		try {
-			const ack = refused
-				? buildSessionContextAckFrame(refused.id, false, refused.reason)
-				: buildSessionContextAckFrame(room?.id ?? null, !!room);
-			session.sendJsonToClient({ ...ack });
-		} catch { /* no client attached — the next frame gets its own ack */ }
-		const notice = sessionRoomNotice(change, room);
-		if (notice) injectSessionContext(notice);
-	}
-
 	// Context a skill (or the core) wants the model to know: a framed system line sent
 	// as an open turn, retried because a frame can land before the upstream setup completes.
 	function injectSessionContext(text: string): void {
@@ -1127,6 +1093,9 @@ async function main() {
 
 	const clientFrames = createClientFrameHub((msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
+	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
+	// session-only) + worker-thread persistence. Created before the session so
+	// the hooks below can reference it; the wraps install after construction.
 	const healthPersistence = createHealthPersistence();
 	const audioHealth = createAudioHealthLedger({
 		sessionId: SESSION_ID,
@@ -1160,7 +1129,6 @@ async function main() {
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
 			recordClientCapabilities(message);
-			void handleSessionContextFrame(message);
 			resolveUiNavigated(message);
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 			// Frames the core does not own are offered to optional skills' handlers.
@@ -1171,10 +1139,9 @@ async function main() {
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
 		onClientDisconnected: () => {
-			// The room binding belongs to the client that announced it; the next
-			// client announces its own (or none, and tasks fall back to the DM).
-			if (getVoiceSessionRoom()) console.log(`${ts()} [SessionRoom] client gone — room released`);
-			setVoiceSessionRoom(null);
+			// An origin belongs to the client that announced it; the next client announces its own.
+			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
+			setVoiceSessionOrigin(null);
 			clientCapabilities = new Set();
 			failPendingNavigations();
 			clientFrames.disconnected();
@@ -1660,6 +1627,9 @@ async function main() {
 		onClientFrame: clientFrames.onClientFrame,
 		onClientDisconnected: clientFrames.onClientDisconnected,
 		injectContext: injectSessionContext,
+		setVoiceSessionOrigin,
+		getVoiceSessionOrigin,
+		setVoiceTaskOriginResolver,
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is

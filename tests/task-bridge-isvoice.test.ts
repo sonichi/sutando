@@ -23,7 +23,7 @@ const TASK_DIR = join(TMP, 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
 mkdirSync(TASK_DIR, { recursive: true });
 
-const { _isVoiceTask, _voiceTaskRoom } = await import('../src/task-bridge.js');
+const { _isVoiceTask, voiceTaskOrigin, setVoiceTaskOriginResolver } = await import('../src/task-bridge.js');
 
 after(() => {
 	try { rmSync(TMP, { recursive: true, force: true }); } catch {}
@@ -155,19 +155,37 @@ describe('_isVoiceTask — archive-path coverage', () => {
 		assert.equal(_isVoiceTask(id), true);
 	});
 
-	it('_voiceTaskRoom: the room of a room-bound voice task; null for DM, non-voice, malformed or missing', () => {
-		writeTask(join(TASK_DIR, 'task-isvoice-test-room-aaa.txt'), VOICE_BODY_ROOM);
-		assert.equal(_voiceTaskRoom('task-isvoice-test-room-aaa'), '!abc123:ag2.space');
-		writeTask(join(TASK_DIR, 'task-isvoice-test-aaa.txt'), VOICE_BODY);
-		assert.equal(_voiceTaskRoom('task-isvoice-test-aaa'), null, 'a DM voice task has no room');
-		writeTask(join(TASK_DIR, 'task-isvoice-test-gw-aaa.txt'), GATEWAY_ROOM_BODY);
-		assert.equal(_voiceTaskRoom('task-isvoice-test-gw-aaa'), null, 'a gateway room task is not voice');
-		writeTask(join(TASK_DIR, 'task-isvoice-test-badroom-aaa.txt'), VOICE_BODY_BAD_ROOM);
-		assert.equal(_voiceTaskRoom('task-isvoice-test-badroom-aaa'), null, 'a malformed room id is never a destination');
-		assert.equal(_voiceTaskRoom('task-isvoice-test-no-such-file'), null);
-		// Archived copies resolve too — the result can land after the task moved.
-		writeTask(join(ARCHIVE_DIR, '2026-09', 'task-isvoice-test-room-arch.txt'), VOICE_BODY_ROOM.replace('room-aaa', 'room-arch'));
-		assert.equal(_voiceTaskRoom('task-isvoice-test-room-arch'), '!abc123:ag2.space');
+	it('voiceTaskOrigin: the adapter\'s resolver rebuilds an origin from a voice task\'s header, and only a voice task\'s', () => {
+		const seen: string[] = [];
+		setVoiceTaskOriginResolver((header) => {
+			const line = header.find(l => l.startsWith('source_room_id:')) ?? '';
+			const target = line.slice('source_room_id:'.length).trim();
+			seen.push(target);
+			return target ? { channel: 'fakechan', target } : null;
+		});
+		try {
+			writeTask(join(TASK_DIR, 'task-isvoice-test-room-aaa.txt'), VOICE_BODY_ROOM);
+			assert.deepEqual(voiceTaskOrigin('task-isvoice-test-room-aaa'), { channel: 'fakechan', target: '!abc123:ag2.space' });
+			writeTask(join(TASK_DIR, 'task-isvoice-test-aaa.txt'), VOICE_BODY);
+			assert.equal(voiceTaskOrigin('task-isvoice-test-aaa'), null, 'a DM voice task has no origin');
+			const before = seen.length;
+			writeTask(join(TASK_DIR, 'task-isvoice-test-gw-aaa.txt'), GATEWAY_ROOM_BODY);
+			assert.equal(voiceTaskOrigin('task-isvoice-test-gw-aaa'), null, 'a non-voice task never reaches the resolver');
+			assert.equal(seen.length, before);
+			writeTask(join(TASK_DIR, 'task-isvoice-test-badroom-aaa.txt'), VOICE_BODY_BAD_ROOM);
+			assert.deepEqual(voiceTaskOrigin('task-isvoice-test-badroom-aaa'), { channel: 'fakechan', target: '../../etc' }, 'target grammar is the adapter\'s to refuse; the core only keeps it one bracket-free token');
+			assert.equal(voiceTaskOrigin('task-isvoice-test-no-such-file'), null);
+			// Archived copies resolve too — the result can land after the task moved.
+			writeTask(join(ARCHIVE_DIR, '2026-09', 'task-isvoice-test-room-arch.txt'), VOICE_BODY_ROOM.replace('room-aaa', 'room-arch'));
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-arch')?.target, '!abc123:ag2.space');
+			setVoiceTaskOriginResolver(() => ({ channel: 'Bad Channel', target: 'x' }));
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'an unusable origin is no origin');
+			setVoiceTaskOriginResolver(() => { throw new Error('boom'); });
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'a throwing resolver is no origin');
+		} finally {
+			setVoiceTaskOriginResolver(null);
+		}
+		assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'with no resolver a header alone binds nothing');
 	});
 
 	it('returns true for a voice task in tasks/processed/', () => {

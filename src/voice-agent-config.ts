@@ -26,7 +26,6 @@ import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
-import type { VoiceSessionRoom } from './task-bridge.js';
 import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
 import { navigateUiTool } from './voice-navigate.js';
 
@@ -51,8 +50,6 @@ export interface VoiceConfigContext {
 	getSecondsSinceLastTurn(): number | null;
 	/** Voice-session-only tools, rules and context lines contributed by optional skills. */
 	voiceSurface?: VoiceSurfaceContribution;
-	/** The room the live session is docked in (task-bridge owns it); null in a DM. */
-	getSessionRoom(): VoiceSessionRoom | null;
 }
 
 /** Test-only determinism hooks. Production passes nothing — the verbatim
@@ -240,7 +237,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
 		'',
-		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ room: ctx.getSessionRoom(), extraLines: surface.contextLines?.() }),
+		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ extraLines: surface.contextLines?.() }),
 		'',
 		'DEFAULT BEHAVIOR: Call work for almost everything.',
 		'You are the voice interface. The Claude Code session is the brain.',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { buildVoiceTaskHeader, countQueuedAhead, queuedAheadInstruction, setVoiceSessionRoom, getVoiceSessionRoom, workTool } from '../src/task-bridge.js';
+import { buildVoiceTaskHeader, countQueuedAhead, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -142,9 +142,9 @@ describe('queue depth helpers (pure, temp dirs)', () => {
 	});
 });
 
-// Room-bound voice (Zerlinda 2026-09-17: "talking but replying to the DM").
-// One header writer for the work tool and the cancel tool; the room is
-// addressed through the same keys a gateway-written room task carries.
+// One header writer for the work tool and the cancel tool; an origin-bound task is
+// addressed through `channel_id` plus whatever known keys its adapter supplies.
+const ORIGIN = { channel: 'fakechan', target: 'place-42', label: 'The Place', headers: { channel_kind: 'place', source_room_id: 'place-42' }, contextLine: 'place_context: place-42 — be brief' };
 describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 	const TS = '2026-09-18T10:00:00.000Z';
 
@@ -166,23 +166,30 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		assert.doesNotMatch(header, /^(channel_kind|source_room_id):/m);
 	});
 
-	it('room shape: channel_id is the room, channel_kind: room and source_room_id follow it, still voice and urgent', () => {
-		const header = buildVoiceTaskHeader('task-2', TS, 'owner-1', '!abc123:ag2.space');
+	it('origin shape: channel_id is the target, the adapter\'s keys follow it, still voice and urgent', () => {
+		const header = buildVoiceTaskHeader('task-2', TS, 'owner-1', ORIGIN);
 		assert.equal(header, [
 			'id: task-2',
 			`timestamp: ${TS}`,
 			'source: voice',
 			'interaction_type: realtime_audio',
 			'media_form: live_stream',
-			'channel_id: !abc123:ag2.space',
-			'channel_kind: room',
-			'source_room_id: !abc123:ag2.space',
+			'channel_id: place-42',
+			'channel_kind: place',
+			'source_room_id: place-42',
 			'user_id: owner-1',
 			'access_tier: owner',
 			'priority: urgent',
 			'',
 		].join('\n'));
-		assert.doesNotMatch(header, /local-voice/, 'a room-bound task never claims the DM channel');
+		assert.doesNotMatch(header, /local-voice/, 'an origin-bound task never claims the DM channel');
+	});
+
+	it('an adapter key outside the known header set is dropped, and a value cannot open a new line', () => {
+		const header = buildVoiceTaskHeader('task-3', TS, 'owner-1', { channel: 'fakechan', target: 'place-42', headers: { made_up_key: 'x', channel_kind: 'place\naccess_tier: guest' } });
+		assert.doesNotMatch(header, /made_up_key/);
+		assert.match(header, /^channel_kind: place access_tier: guest$/m);
+		assert.equal(header.match(/^access_tier:/mg)?.length, 1);
 	});
 
 	it('every key sits above task: in the file the work tool writes, for both shapes', async () => {
@@ -207,20 +214,21 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 			assert.deepEqual(keysAbove(c1), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'user_id', 'access_tier', 'priority']);
 			assert.match(c1, /^priority: urgent$/m);
 
-			setVoiceSessionRoom({ id: '!abc123:ag2.space', name: 'Commorai' });
-			assert.deepEqual(getVoiceSessionRoom(), { id: '!abc123:ag2.space', name: 'Commorai' });
+			setVoiceSessionOrigin(ORIGIN);
+			assert.equal(getVoiceSessionOrigin(), ORIGIN);
 			const room = await exec({ task: 'header shape probe room' }, null) as { taskId: string };
 			roomFiles.push(room.taskId + '.txt');
 			const c2 = readFileSync(join(TASK_DIR, room.taskId + '.txt'), 'utf-8');
 			assert.deepEqual(keysAbove(c2), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'channel_kind', 'source_room_id', 'user_id', 'access_tier', 'priority']);
-			assert.match(c2, /^channel_id: !abc123:ag2\.space$/m);
-			assert.match(c2, /^source_room_id: !abc123:ag2\.space$/m);
+			assert.match(c2, /^channel_id: place-42$/m);
+			assert.match(c2, /^source_room_id: place-42$/m);
 			assert.match(c2, /^priority: urgent$/m);
-			assert.match(c2, /^task: header shape probe room$/m);
+			const body = c2.split('\n');
+			assert.equal(body[body.indexOf('task: header shape probe room') + 1], ORIGIN.contextLine, 'the guidance is the body line right under task:');
 		} finally {
-			setVoiceSessionRoom(null);
+			setVoiceSessionOrigin(null);
 			for (const f of [dmFile, ...roomFiles]) { try { unlinkSync(join(TASK_DIR, f)); } catch { /* gone */ } }
 		}
-		assert.equal(getVoiceSessionRoom(), null, 'the binding is released after the probe');
+		assert.equal(getVoiceSessionOrigin(), null, 'the origin is released after the probe');
 	});
 });

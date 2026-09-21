@@ -84,6 +84,8 @@ exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
 | `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
 | `onClientDisconnected(handler)` | the client left: drop per-client state |
 | `injectContext(text)` | a framed system line the model should know, retried until the session is live |
+| `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
+| `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
 
 A handler that throws or rejects is logged and never reaches another skill's handler.
 

@@ -24,7 +24,7 @@ const header = (id: string) =>
 const until = async (cond: () => boolean, ms: number) => { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await new Promise(r => setTimeout(r, 100)); return cond(); };
 const proactiveFor = (id: string) => readdirSync(RESULT_DIR).filter(f => f.startsWith(`proactive-result-${id}-`));
 
-describe('offline room-less voice result, no bridge: spoken when the client reconnects', () => {
+describe('offline voice result with no origin, no bridge: spoken when the client reconnects', () => {
 	it('the forward is written unclaimed while offline, then the fallthrough speaks it on reconnect', async () => {
 		const task = 'task-1700000001000';
 		let connected = false;
@@ -35,7 +35,7 @@ describe('offline room-less voice result, no bridge: spoken when the client reco
 
 		assert.ok(await until(() => proactiveFor(task).length > 0, 8000), `no offline forward: ${readdirSync(RESULT_DIR).join(', ')}`);
 		const [forward] = proactiveFor(task);
-		assert.equal(forward.endsWith('.to-ag2space.txt'), false, 'room-less: the untagged owner-DM shape');
+		assert.doesNotMatch(forward, /\.to-[a-z0-9_-]+\.txt$/, 'no origin: the untagged owner-DM shape');
 		assert.equal(_isDeliveredResult(forward), false, 'unclaimed, so the drain still owns speaking it');
 		assert.deepEqual(spoken, [], 'nothing is spoken with no client attached');
 

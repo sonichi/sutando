@@ -3,6 +3,7 @@
 
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import type { ClientFrame, ClientFrameHandler, ClientDisconnectedHandler } from './client-frame-hub.js';
+import type { VoiceSessionOrigin, VoiceTaskOriginResolver } from './task-bridge.js';
 
 export type SkillSetupCtx = {
 	session: unknown;
@@ -14,6 +15,11 @@ export type SkillSetupCtx = {
 	onClientDisconnected: (handler: ClientDisconnectedHandler) => void;
 	/** Context the model should know, framed as a system line; retried until the session is live. */
 	injectContext: (text: string) => void;
+	/** Where this session's delegated work came from; null is the default (owner DM). */
+	setVoiceSessionOrigin: (origin: VoiceSessionOrigin | null) => void;
+	getVoiceSessionOrigin: () => VoiceSessionOrigin | null;
+	/** Recover the origin of a task written before a restart from its header lines. */
+	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
 };
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 

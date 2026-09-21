@@ -254,7 +254,8 @@ than store a second copy.
   (host-local), not in the synced workspace.
 - **A room named by the voice client is a claim, not a destination.** The
   desktop's in-room voice session announces its room with a `session.context`
-  frame, but only the gateway can prove membership. The bridge answers
+  frame (handled by the optional `skills/ag2space-voice/` plugin, which writes the
+  request), but only the gateway can prove membership. The bridge answers
   `state/voice-room-checks/<key>.request.json` with `<key>.verdict.json`
   (`src/voice_room_membership.py`): `verified` only when `/v1/room`
   `{"op": "members"}` lists BOTH the agent and the owner from `GET /v1/agents`;

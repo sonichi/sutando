@@ -23,6 +23,9 @@ function fakeCtx(hub = createClientFrameHub(() => {})) {
 		onClientFrame: hub.onClientFrame,
 		onClientDisconnected: hub.onClientDisconnected,
 		injectContext: (t) => { injected.push(t); },
+		setVoiceSessionOrigin: () => {},
+		getVoiceSessionOrigin: () => null,
+		setVoiceTaskOriginResolver: () => {},
 	};
 	return { ctx, hub, sent, injected };
 }
@@ -130,7 +133,7 @@ test('a manifest skill\'s voiceSurface() reaches the voice prompt and stays off 
 		writeFileSync(driver,
 			`const it = await import(process.env.INLINE_TOOLS_URL);\n` +
 			`const cfg = await import(process.env.CONFIG_URL);\n` +
-			`const base = { resolveCurrentMode: () => ({ mode: 'active' }), isMeetingActive: () => false, googleSearch: false, resetSessionGates() {}, resetNoteViewingDebounce() {}, getRecentConversation: () => '', getSecondsSinceLastTurn: () => null, getSessionRoom: () => null };\n` +
+			`const base = { resolveCurrentMode: () => ({ mode: 'active' }), isMeetingActive: () => false, googleSearch: false, resetSessionGates() {}, resetNoteViewingDebounce() {}, getRecentConversation: () => '', getSecondsSinceLastTurn: () => null };\n` +
 			`const plain = cfg.buildInstructions(base);\n` +
 			`const withSurface = cfg.buildInstructions({ ...base, voiceSurface: it.personalVoiceSurface });\n` +
 			`console.log('__OUT__' + JSON.stringify({ shared: it.inlineTools.some(t => t.name === 'fake_move'), surfaceTools: it.personalVoiceSurface.tools.map(t => t.name), plainHas: /FAKE|fake_move/.test(plain), lines: withSurface.split('\\n').filter(l => /FAKE|fake_move/.test(l)) }));\n`);

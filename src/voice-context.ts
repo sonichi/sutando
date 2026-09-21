@@ -56,16 +56,12 @@ export function pickRecentActivity(content: string): string[] {
 	return ['RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), ''];
 }
 
-/** The room a voice session is docked in; structurally the task bridge's
- *  VoiceSessionRoom (not imported: this module stays free of the bridge). */
-export interface VoiceContextRoom { id: string; name?: string }
-
 /**
  * Build a concise context summary for the Gemini voice agent.
  * Gives Gemini awareness of the current system state and user context.
- * `room` is the room the live session is docked in (null/absent = DM).
+ * `extraLines` are lines optional skills contribute about where the session is.
  */
-export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null; extraLines?: string[] } = {}): string {
+export function buildVoiceAgentContext(opts: { extraLines?: string[] } = {}): string {
 	const userProfile = readMemory('user_profile.md');
 	const lines: string[] = [];
 
@@ -73,12 +69,6 @@ export function buildVoiceAgentContext(opts: { room?: VoiceContextRoom | null; e
 		lines.push('USER CONTEXT:', userProfile.slice(0, 500), '');
 	}
 
-	if (opts.room) {
-		const label = opts.room.name ? `"${opts.room.name}" (${opts.room.id})` : opts.room.id;
-		lines.push(`ROOM: You are docked in room ${label}. What you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went.`, '');
-	}
-
-	// Lines an optional skill contributes about where the session is.
 	if (opts.extraLines?.length) lines.push(...opts.extraLines, '');
 
 	// Read build log summary

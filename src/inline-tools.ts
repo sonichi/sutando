@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionRoom } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -734,11 +734,12 @@ export const cancelTaskTool: ToolDefinition = {
 			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
 			// in practice but defence-in-depth). task: field is placed LAST so a
 			// forged line in the body cannot shadow the real source/access_tier above it.
-			// Same header writer as the work tool: a cancel spoken in a docked room
-			// is confirmed in that room, not in the owner's DM.
+			// Same header writer as the work tool, so the confirmation follows the session's origin.
 			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
+			const cancelOrigin = getVoiceSessionOrigin();
+			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
 			const cancelBody =
-				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', getVoiceSessionRoom()?.id ?? null) +
+				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', cancelOrigin) +
 				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 

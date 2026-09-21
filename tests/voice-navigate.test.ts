@@ -332,7 +332,7 @@ describe('navigate_ui wiring (source pins)', () => {
 	});
 
 	it('capabilities come from parseSessionContextCapabilities and are cleared with the pending requests on detach', () => {
-		assert.ok(agent.includes("import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './web-voice-transport.js';"));
+		assert.ok(agent.includes("import { parseSessionContextCapabilities } from './web-voice-transport.js';"));
 		assert.ok(agent.includes('const caps = parseSessionContextCapabilities(message);'));
 		const gone = between(agent, 'onClientDisconnected: () => {', 'suppressClientAutoActions:');
 		assert.ok(gone.includes('clientCapabilities = new Set();'));

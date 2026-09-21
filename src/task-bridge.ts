@@ -11,7 +11,6 @@
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
@@ -184,57 +183,107 @@ export function _isDeliveredResult(file: string): boolean {
  *  id in it (result_markers._REDIRECT_RE). */
 export const LEADING_REDIRECT_RE = /^\s*\[channel:\s*[^\]\s][^\]]*\]/;
 
-/** Post a room-bound voice result into its room: a `proactive-result-*` file
- *  whose first line is the `[channel: <room>]` marker the ag2space gateway's
- *  `_proactive_route` sends to that room. The `.to-ag2space` name tag is the
- *  claim grammar every bridge reads (proactive_routing.proactive_filename):
- *  only that gateway can reach a Matrix room, and an untagged name would go to
- *  whichever bridge the owner last used. The filename is claimed in
- *  `_deliveredResults` at once — it passes `_shouldFallthrough`, and without
- *  the claim the next drain tick would speak the same result a second time. */
-export function forwardVoiceResultToRoom(taskId: string, result: string, room: string, nowSec = Math.floor(Date.now() / 1000)): string {
-	const file = `proactive-result-${taskId}-${nowSec}.to-ag2space.txt`;
+/** `[dm-only]` is detected the way every text bridge detects it
+ *  (result_markers.parse_markers: anywhere in the body, case-insensitive). */
+export const DM_ONLY_RE = /\[dm-only\]/i;
+
+/** Where a voice session's delegated work came from. The core carries it to the
+ *  task header and the result file; the adapter owning `channel` interprets `target`. */
+export interface VoiceSessionOrigin {
+	/** Bridge tag: results are written as `.to-<channel>` (proactive_routing's grammar). */
+	channel: string;
+	/** Opaque destination on that channel; the adapter validates its grammar. */
+	target: string;
+	/** Human name for prompts and logs. */
+	label?: string;
+	/** Extra header lines above `task:`; keys outside the known header set are dropped. */
+	headers?: Record<string, string>;
+	/** Body guidance line under `task:`. */
+	contextLine?: string;
+	/** What voice is told when a result was kept to the owner DM instead of `target`. */
+	dmOnlyNote?: string;
+	/** Re-check at delivery; false or a throw sends the result to the owner DM. */
+	verify?: () => Promise<boolean>;
+}
+
+/** Rebuilds the origin of a task from its header lines (a task written before a restart). */
+export type VoiceTaskOriginResolver = (headerLines: string[]) => VoiceSessionOrigin | null;
+
+const ORIGIN_CHANNEL_RE = /^[a-z0-9_-]+$/;
+// One token with no bracket: the target is written inside a `[channel: …]` marker.
+const ORIGIN_TARGET_RE = /^[^\s\[\]]+$/;
+
+function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSessionOrigin | null {
+	if (!origin || typeof origin.channel !== 'string' || typeof origin.target !== 'string') return null;
+	return ORIGIN_CHANNEL_RE.test(origin.channel) && ORIGIN_TARGET_RE.test(origin.target) ? origin : null;
+}
+
+let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
+let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
+const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+
+/** Bind (or, with null, release) the origin of the live voice session. Tasks written
+ *  afterwards carry the origin current at write time; a malformed origin binds nothing. */
+export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
+	_voiceSessionOrigin = _usableOrigin(origin);
+}
+
+export function getVoiceSessionOrigin(): VoiceSessionOrigin | null {
+	return _voiceSessionOrigin;
+}
+
+export function setVoiceTaskOriginResolver(resolver: VoiceTaskOriginResolver | null): void {
+	_voiceTaskOriginResolver = resolver;
+}
+
+/** The origin a voice task was written with: remembered from the write, else rebuilt
+ *  from its header by the adapter's resolver. Null for a task with no origin. */
+export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
+	const known = _taskOrigins.get(taskId);
+	if (known) return known;
+	if (!_voiceTaskOriginResolver) return null;
+	const headerLines = _readTaskHeader(taskId);
+	if (headerLines === null || !_headerIsVoice(headerLines)) return null;
+	try {
+		return _usableOrigin(_voiceTaskOriginResolver(headerLines));
+	} catch (e) {
+		console.error(`${ts()} [TaskBridge] origin resolver failed for ${taskId}:`, e);
+		return null;
+	}
+}
+
+/** Write an origin-bound result for the origin's bridge: `.to-<channel>` in the name,
+ *  `[channel: <target>]` on top unless the result opens with its own redirect.
+ *  Claimed at once: the name passes `_shouldFallthrough` and would be spoken again. */
+export function forwardVoiceResultToOrigin(taskId: string, result: string, origin: VoiceSessionOrigin, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.to-${origin.channel}.txt`;
 	// parse_markers keeps the first redirect, so a result that opens with its own wins by not being preceded.
-	writeFileSync(join(RESULT_DIR, file), LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${room}]\n${result}`);
+	writeFileSync(join(RESULT_DIR, file), LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${origin.target}]\n${result}`);
 	_deliveredResults.add(file);
 	return file;
 }
 
-/** `[dm-only]` is detected the way every text bridge detects it
- *  (result_markers.parse_markers: anywhere in the body, case-insensitive);
- *  the drain's strip below is narrower on purpose (a standalone line only). */
-export const DM_ONLY_RE = /\[dm-only\]/i;
-
-/** Keep a room-bound voice result to the owner's DM: the same gateway-tagged
- *  proactive shape as the room post, with no `[channel:]` line and the
- *  `[dm-only]` marker restored on top, so `_proactive_route` delivers it to
- *  the owner's own room whatever else the body says. Claimed at once, for the
- *  same reason as the room shape. */
-export function forwardVoiceResultToOwnerDm(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000)): string {
-	const file = `proactive-result-${taskId}-${nowSec}.to-ag2space.txt`;
+/** Keep an origin-bound result to the owner's DM on the same bridge: no `[channel:]`
+ *  line, `[dm-only]` restored on top. Claimed at once, like the origin shape. */
+export function forwardVoiceResultToOwnerDm(taskId: string, result: string, channel: string, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.to-${channel}.txt`;
 	writeFileSync(join(RESULT_DIR, file), `[dm-only]\n${result}`);
 	_deliveredResults.add(file);
 	return file;
 }
 
-/** A room-bound result that declared itself `[dm-only]` goes to the owner's
- *  DM instead of the room (CLAUDE.md "Where replies go": what the owner asked
- *  for themselves goes to the DM even by voice while docked). Owner 2026-09-18,
- *  after a "look into the mute bug" analysis landed in a customer room: "it
- *  should only send messages that are RELEVANT to that room otherwise should go
- *  to the DM". Returns the DM file, or null when the task is not room-bound or
- *  the result is not dm-only — then the caller's room leg decides. */
+/** An origin-bound result that declared itself `[dm-only]` goes to the owner's DM.
+ *  Returns the DM file, or null when the task has no origin or the result is not dm-only. */
 export function keepVoiceResultToDm(taskId: string, result: string, dmOnly: boolean, nowSec = Math.floor(Date.now() / 1000)): string | null {
-	if (!dmOnly || !_voiceTaskRoom(taskId)) return null;
-	const file = forwardVoiceResultToOwnerDm(taskId, result, nowSec);
+	const origin = dmOnly ? voiceTaskOrigin(taskId) : null;
+	if (!origin) return null;
+	const file = forwardVoiceResultToOwnerDm(taskId, result, origin.channel, nowSec);
 	console.log(`${ts()} [TaskBridge] ${taskId} result kept to the DM ([dm-only]) via ${file}`);
 	return file;
 }
 
-/** What voice hears under a result kept to the DM, outside the TASK_RESULT
- *  markers, so the model says "in your DM" rather than the docked room's
- *  "in this room". */
-export const DM_ONLY_DELIVERY_NOTE = 'That result was for the owner alone: its written copy went to their DM, not the room this session is docked in. Tell them it is in their DM ("I sent it to your DM"), never "in this room".';
+/** Delivery note under a result kept to the DM when the origin supplies none. */
+export const DM_ONLY_DELIVERY_NOTE = 'That result was for the owner alone: its written copy went to their DM. Tell them it is in their DM.';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // Per-task pending state: submission epoch, timeout (ms), and whether to
@@ -336,234 +385,43 @@ export function _isVoiceTask(taskId: string): boolean {
 }
 
 /** The voice verdict over header lines.
- *  `source: voice` is the key. A room-bound voice task carries the room id in
+ *  `source: voice` is the key. An origin-bound voice task carries its target in
  *  `channel_id`, so that field no longer identifies voice; `media_form:
  *  live_stream` never does (the phone skill stamps it too). The
- *  `channel_id: local-voice` literal stays for files archived before rooms. */
+ *  `channel_id: local-voice` literal stays for files archived before origins. */
 function _headerIsVoice(headerLines: string[]): boolean {
 	return headerLines.some(l => l.startsWith('source: voice') || l.startsWith('channel_id: local-voice'));
 }
 
-// ---------------------------------------------------------------------------
-// Room-bound voice sessions. The desktop docks a voice session in a room and
-// the client announces it with `session.context` frames (after session.config,
-// then on every room change); while a room is bound, every task the voice
-// agent delegates is addressed to that room and its result is posted there.
-// ---------------------------------------------------------------------------
-
-/** Matrix room id as the gateway's `_proactive_route` accepts it. */
-export const MATRIX_ROOM_ID_RE = /^![^\s:]+:\S+$/;
-/** Display names are prose from the client; capped before they reach a prompt. */
-export const ROOM_NAME_MAX_CHARS = 120;
-
-export interface VoiceSessionRoom { id: string; name?: string }
-
-let _voiceSessionRoom: VoiceSessionRoom | null = null;
-// The room released while another room's verdict is pending; change reporting still counts it as left.
-let _releasedRoom: VoiceSessionRoom | null = null;
-
-/** Bind (or, with null, release) the room the live voice session is docked in. */
-export function setVoiceSessionRoom(room: VoiceSessionRoom | null): void {
-	_voiceSessionRoom = room;
-	_releasedRoom = null;
-}
-
-export function getVoiceSessionRoom(): VoiceSessionRoom | null {
-	return _voiceSessionRoom;
-}
-
-/** The room a `session.context` frame binds, null for a DM/absent room, or
- *  undefined when `msg` is not a session.context frame at all. The type
- *  literal mirrors SESSION_CONTEXT_TYPE in web-voice-transport.ts (the client
- *  file is re-vendored into the desktop, so it cannot be imported here);
- *  tests/task-bridge-voice-room-result.test.ts pins the two together. */
-export function parseSessionContextFrame(msg: Record<string, unknown> | null | undefined): VoiceSessionRoom | null | undefined {
-	if (!msg || msg.type !== 'session.context') return undefined;
-	const id = typeof msg.room_id === 'string' ? msg.room_id.trim() : '';
-	if (!id || !MATRIX_ROOM_ID_RE.test(id)) return null;
-	const rawName = typeof msg.room_name === 'string' ? msg.room_name.replace(/[\r\n]+/g, ' ').trim() : '';
-	const name = rawName.slice(0, ROOM_NAME_MAX_CHARS);
-	return name ? { id, name } : { id };
-}
-
-/** What a frame did to the binding: `entered` a room (from the DM or from
- *  another room), `left` for the DM, or `none` (a duplicate, or DM-to-DM). */
-export type SessionRoomChange = 'none' | 'entered' | 'left';
-
-/** Apply a `session.context` frame for the life of the session: the client
- *  sends one per room change and a DM frame when it leaves rooms, so the last
- *  frame wins and a DM frame releases the room. Tasks written afterwards use
- *  the room current at write time. Returns the change so the caller speaks a
- *  notice once per actual change and never per duplicate frame; undefined
- *  when `msg` is not a session.context frame.
- *  Trust boundary: this applies whatever room the frame names. Live frames go
- *  through bindSessionContextFrame, which admits a room only on the gateway
- *  bridge's membership verdict; call this directly only with a verified room. */
-export function applySessionContextFrame(msg: Record<string, unknown> | null | undefined): { change: SessionRoomChange; room: VoiceSessionRoom | null } | undefined {
-	const room = parseSessionContextFrame(msg);
-	if (room === undefined) return undefined;
-	return _applyVerifiedRoom(room);
-}
-
-function _applyVerifiedRoom(room: VoiceSessionRoom | null): { change: SessionRoomChange; room: VoiceSessionRoom | null } {
-	const prev = _voiceSessionRoom ?? _releasedRoom;
-	_voiceSessionRoom = room;
-	_releasedRoom = null;
-	if (room && room.id !== prev?.id) return { change: 'entered', room };
-	if (!room && prev) return { change: 'left', room: null };
-	return { change: 'none', room };
-}
-
-// ---------------------------------------------------------------------------
-// Membership verdicts. The client's room id is a claim, not a fact: a modified
-// client can name any well-formed room. Only the gateway bridge holds the
-// credentials to prove the agent AND its owner are joined there, so it answers
-// `state/voice-room-checks/<key>.request.json` with `<key>.verdict.json`
-// (src/voice_room_membership.py) and this side binds, stamps and routes on
-// nothing but that verdict. No verdict, a stale one, or a refusal all read as
-// "not a room": the session stays on the DM.
-// ---------------------------------------------------------------------------
-
-export const VOICE_ROOM_CHECK_DIR = join(STATE_DIR, 'voice-room-checks');
-/** Mirrors VERDICT_TTL_S in voice_room_membership.py. */
-export const VOICE_ROOM_VERDICT_TTL_S = 60;
-export const VOICE_ROOM_VERDICT_TIMEOUT_MS = 6000;
-
-export interface VoiceRoomVerdict {
-	room_id: string;
-	verified: boolean;
-	reason: string;
-	checked_at: number;
-	agent_joined?: boolean;
-	owner_joined?: boolean;
-}
-
-export type VoiceRoomVerifier = (room: string) => Promise<VoiceRoomVerdict>;
-
-/** Filesystem-safe key for a room id: readable prefix plus a hash so two ids
- *  that flatten alike never share a verdict file. */
-export function voiceRoomCheckKey(room: string): string {
-	const flat = room.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-	return `${flat}-${createHash('sha256').update(room).digest('hex').slice(0, 16)}`;
-}
-
-/** The verifier's answer for `room` while it is fresh, else null. A verdict
- *  naming another room (a key collision or a tampered file) is null too. */
-export function readVoiceRoomVerdict(room: string, nowSec = Date.now() / 1000): VoiceRoomVerdict | null {
-	try {
-		const raw = JSON.parse(readFileSync(join(VOICE_ROOM_CHECK_DIR, `${voiceRoomCheckKey(room)}.verdict.json`), 'utf-8'));
-		if (!raw || raw.room_id !== room || typeof raw.checked_at !== 'number') return null;
-		if (nowSec - raw.checked_at > VOICE_ROOM_VERDICT_TTL_S || raw.checked_at - nowSec > 5) return null;
-		return {
-			room_id: room, verified: raw.verified === true, reason: typeof raw.reason === 'string' ? raw.reason : '',
-			checked_at: raw.checked_at, agent_joined: raw.agent_joined === true, owner_joined: raw.owner_joined === true,
-		};
-	} catch {
-		return null;
+/** The origin a finished voice task may answer at, re-checked through the origin's
+ *  own `verify` (fail closed). Null sends the result the owner-DM way. */
+export async function resolveVoiceResultOrigin(taskId: string): Promise<VoiceSessionOrigin | null> {
+	const origin = voiceTaskOrigin(taskId);
+	if (!origin) return null;
+	let ok = true;
+	if (origin.verify) {
+		try {
+			ok = (await origin.verify()) === true;
+		} catch (e) {
+			ok = false;
+			console.error(`${ts()} [TaskBridge] origin verify failed for ${taskId}:`, e);
+		}
 	}
-}
-
-const _unverified = (room: string, reason: string): VoiceRoomVerdict =>
-	({ room_id: room, verified: false, reason, checked_at: Date.now() / 1000 });
-
-/** Ask the gateway bridge whether owner and agent are joined in `room`. A
- *  fresh verdict on disk answers at once; otherwise one request is written and
- *  the answer awaited up to `timeoutMs`. Silence (no bridge, no gateway) is a
- *  refusal: a room nobody can vouch for is not bound. */
-export async function requestVoiceRoomVerdict(room: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<VoiceRoomVerdict> {
-	if (!MATRIX_ROOM_ID_RE.test(room)) return _unverified(room, 'not a matrix room id');
-	const cached = readVoiceRoomVerdict(room);
-	if (cached) return cached;
-	const timeoutMs = opts.timeoutMs ?? VOICE_ROOM_VERDICT_TIMEOUT_MS;
-	const pollMs = opts.pollMs ?? 100;
-	try {
-		mkdirSync(VOICE_ROOM_CHECK_DIR, { recursive: true });
-		const key = voiceRoomCheckKey(room);
-		const tmp = join(VOICE_ROOM_CHECK_DIR, `${key}.request.json.tmp`);
-		writeFileSync(tmp, JSON.stringify({ room_id: room, requested_at: Date.now() / 1000 }));
-		renameSync(tmp, join(VOICE_ROOM_CHECK_DIR, `${key}.request.json`));
-	} catch (e) {
-		return _unverified(room, `request not written: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		await new Promise(r => setTimeout(r, pollMs));
-		const verdict = readVoiceRoomVerdict(room);
-		if (verdict) return verdict;
-	}
-	return _unverified(room, 'no verdict from the gateway bridge');
-}
-
-let _voiceRoomVerifier: VoiceRoomVerifier = requestVoiceRoomVerdict;
-
-/** Test seam: replace (or with null restore) the membership verifier. */
-export function setVoiceRoomVerifier(fn: VoiceRoomVerifier | null): void {
-	_voiceRoomVerifier = fn ?? requestVoiceRoomVerdict;
-}
-
-export interface SessionRoomBinding {
-	change: SessionRoomChange;
-	room: VoiceSessionRoom | null;
-	/** Set when the frame named a room the gateway bridge would not vouch for. */
-	refused?: { id: string; reason: string };
-}
-
-let _sessionContextSeq = 0;
-
-/** The live-frame entry point: a DM frame applies at once; a room frame
- *  applies only after the verifier confirms membership, and until then (or on
- *  a refusal) the session is on the DM: a different room bound before the
- *  frame is released before the wait. A newer frame that arrives while a
- *  verdict is pending wins; the older one then returns `change: 'none'`. */
-export async function bindSessionContextFrame(msg: Record<string, unknown> | null | undefined): Promise<SessionRoomBinding | undefined> {
-	const room = parseSessionContextFrame(msg);
-	if (room === undefined) return undefined;
-	const seq = ++_sessionContextSeq;
-	if (!room) return _applyVerifiedRoom(null);
-	if (_voiceSessionRoom && _voiceSessionRoom.id !== room.id) {
-		_releasedRoom = _voiceSessionRoom;
-		_voiceSessionRoom = null;
-	}
-	let verdict: VoiceRoomVerdict;
-	try {
-		verdict = await _voiceRoomVerifier(room.id);
-	} catch (e) {
-		verdict = _unverified(room.id, `verifier failed: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	if (seq !== _sessionContextSeq) return { change: 'none', room: _voiceSessionRoom };
-	if (verdict.verified) return _applyVerifiedRoom(room);
-	console.log(`${ts()} [SessionRoom] refused ${room.id}: ${verdict.reason} — session stays on the DM`);
-	return { ..._applyVerifiedRoom(null), refused: { id: room.id, reason: verdict.reason } };
-}
-
-/** The room a finished voice task may answer in: its header's room, re-checked
- *  against a current verdict (membership can change while the task runs).
- *  Null sends the result the DM way. */
-export async function resolveVoiceResultRoom(taskId: string): Promise<string | null> {
-	const room = _voiceTaskRoom(taskId);
-	if (!room) return null;
-	let verdict: VoiceRoomVerdict;
-	try {
-		verdict = await _voiceRoomVerifier(room);
-	} catch (e) {
-		verdict = _unverified(room, `verifier failed: ${e instanceof Error ? e.message : String(e)}`);
-	}
-	if (verdict.verified) return room;
-	console.log(`${ts()} [TaskBridge] ${taskId} result not posted to ${room}: ${verdict.reason} — delivered the DM way`);
+	if (ok) return origin;
+	console.log(`${ts()} [TaskBridge] ${taskId} result not posted to ${origin.target}: origin not verified — delivered the DM way`);
 	return null;
 }
 
-/** Voice result with no client attached: into its verified room — unless it
- *  is `[dm-only]`, then the owner's DM — else the owner-DM proactive shape
- *  every bridge already delivers. That untagged shape is left unclaimed: on an
- *  install where no bridge takes it, the drain speaks it on reconnect. */
+/** Voice result with no client attached: to its verified origin — unless it is
+ *  `[dm-only]`, then the owner's DM — else the untagged owner-DM shape, left
+ *  unclaimed: where no bridge takes it, the drain speaks it on reconnect. */
 export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
 	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
 	if (kept) return kept;
-	const room = await resolveVoiceResultRoom(taskId);
-	if (room) {
-		const file = forwardVoiceResultToRoom(taskId, result, room, nowSec);
-		console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to room ${room} via ${file}`);
+	const origin = await resolveVoiceResultOrigin(taskId);
+	if (origin) {
+		const file = forwardVoiceResultToOrigin(taskId, result, origin, nowSec);
+		console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to ${origin.target} via ${file}`);
 		return file;
 	}
 	const file = `proactive-result-${taskId}-${nowSec}.txt`;
@@ -594,26 +452,10 @@ export function _forwardOfflineThenArchive(
 	});
 }
 
-/** The one system line the model hears when the docked room changes; null
- *  when nothing changed. Pure: the caller frames and injects it. */
-export function sessionRoomNotice(change: SessionRoomChange, room: VoiceSessionRoom | null): string | null {
-	if (change === 'entered' && room) {
-		const label = room.name ? `"${room.name}"` : room.id;
-		return `You are docked in room ${label}; what you delegate is answered there only when it is for the room's members, otherwise in the owner's DM; say where it went. No reply is needed.`;
-	}
-	if (change === 'left') {
-		return 'You are back in your DM. Work you delegate answers there; say "in your DM" or "here", never "in this room". No reply is needed.';
-	}
-	return null;
-}
-
-/** Every header line of a voice task, above `task:`. One writer for the work
- *  tool and the cancel tool so the two cannot drift. A room-bound task keeps
- *  `source: voice` and `media_form: live_stream` as its voice identity and
- *  addresses the room through `channel_id`, `channel_kind` and
- *  `source_room_id` — the same keys a gateway-written room task carries, so
- *  the core's "reply where you were asked" rule applies unchanged. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, room: string | null): string {
+/** Every header line of a voice task, above `task:`. One writer for the work tool and
+ *  the cancel tool. An origin-bound task keeps `source: voice` as its voice identity,
+ *  addresses the origin through `channel_id`, and carries the adapter's own keys. */
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -623,30 +465,22 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 		// live-plane tasks. `live_stream` = the payload originates from a
 		// continuous real-time session (frames stay out-of-band; provenance).
 		'media_form: live_stream',
-		`channel_id: ${room ?? 'local-voice'}`,
+		`channel_id: ${origin?.target ?? 'local-voice'}`,
 	];
-	if (room) lines.push('channel_kind: room', `source_room_id: ${room}`);
+	for (const [key, value] of Object.entries(origin?.headers ?? {})) {
+		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
+		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
+	}
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
 }
 
-/** The one body line under `task:` that tells the core how to answer a task
- *  delegated while docked in a room. A body line, not a header key: the core
- *  reads it as guidance, no consumer parses it, and it needs no
- *  KNOWN_HEADER_KEYS entry. The drain honours the marker it names. */
-export function voiceRoomTaskGuidance(room: string): string {
-	return `room_context: ${room} — post there only what its members are meant to read; for anything the owner asked for themselves start the result with [dm-only]`;
-}
-
-/** The room a voice task was delegated from, read through the same
- *  delimiter-honoring header reader as `_isVoiceTask`; null for a DM voice
- *  task, a non-voice task, a missing file or a malformed room id. */
-export function _voiceTaskRoom(taskId: string): string | null {
-	const headerLines = _readTaskHeader(taskId);
-	if (headerLines === null || !_headerIsVoice(headerLines)) return null;
-	const line = headerLines.find(l => l.startsWith('source_room_id:'));
-	const room = line ? line.slice('source_room_id:'.length).trim() : '';
-	return MATRIX_ROOM_ID_RE.test(room) ? room : null;
+/** Remember the origin a task was written with, so its result can follow it. */
+export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin | null): void {
+	if (!origin) return;
+	_taskOrigins.set(taskId, origin);
+	// Bounded: only recent tasks can still answer.
+	if (_taskOrigins.size > 200) _taskOrigins.delete(_taskOrigins.keys().next().value as string);
 }
 
 const CLAIM_LEDGERS = 'remote-task-inflight';
@@ -928,14 +762,14 @@ export const workTool: ToolDefinition = {
 					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 			}
 		} catch { /* best effort — never block delegation on context attach */ }
-		// A session docked in a room addresses the task to that room (headers
-		// via buildVoiceTaskHeader) and tells the core, in the body, what that
-		// room may read; a DM session keeps `channel_id: local-voice`.
-		const room = _voiceSessionRoom?.id ?? null;
-		const roomGuidance = room ? `\n${voiceRoomTaskGuidance(room)}` : '';
+		// An origin-bound session addresses the task to its origin and adds the adapter's
+		// guidance line; without one the task keeps `channel_id: local-voice`.
+		const origin = _voiceSessionOrigin;
+		const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
+		_rememberTaskOrigin(taskId, origin);
 		const content =
-			buildVoiceTaskHeader(taskId, timestamp, ownerId, room) +
-			`task: ${confineUserContent(task)}${roomGuidance}${contextBlock}\n`;
+			buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+			`task: ${confineUserContent(task)}${originGuidance}${contextBlock}\n`;
 		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -1364,8 +1198,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// every occurrence and made this consumer disagree with every
 				// text bridge after the Python side was narrowed.
 				const rawResult = readFileSync(path, 'utf-8');
-				// Detected before the strip: a room-bound voice result that carries
-				// the marker is kept to the owner's DM (keepVoiceResultToDm).
+				// Detected before the strip: an origin-bound result that carries the
+				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);
 				const result = rawResult
 					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
@@ -1454,9 +1288,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// handle their own deliveries via pending_replies).
 				if (!clientConnected) {
 					if (file.startsWith('task-') && _isVoiceTask(taskId)) {
-						// Claimed now, delivered once the room verdict is in: a task
-						// delegated from a room answers there only while the gateway
-						// bridge still vouches for it, else the owner DM gets it.
+						// Claimed now, delivered once the origin is re-verified; an
+						// unverified origin falls back to the owner DM.
 						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
@@ -1531,20 +1364,18 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
-					// A voice task delegated from a room is spoken AND written: into
-					// that room when the answer is for its members (the owner asked
-					// there, and the room keeps the record), into the owner's DM when
-					// the core marked it `[dm-only]` — and voice is told which.
-					const roomBound = registersTask && !foreignOrigin && _voiceTaskRoom(taskId) !== null;
-					const keptToDm = roomBound ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
-					if (keptToDm) onResult(result, DM_ONLY_DELIVERY_NOTE);
+					// An origin-bound voice result is spoken AND written: to its origin, or to the
+					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
+					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
+					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
+					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else onResult(result);
-					if (roomBound && !keptToDm) {
-						resolveVoiceResultRoom(taskId).then(room => {
-							if (!room) return;
-							const proactiveFile = forwardVoiceResultToRoom(taskId, result, room);
-							console.log(`${ts()} [TaskBridge] Posted ${taskId} result to room ${room} via ${proactiveFile}`);
-						}).catch(e => console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to its room:`, e));
+					if (taskOrigin && !keptToDm) {
+						resolveVoiceResultOrigin(taskId).then(origin => {
+							if (!origin) return;
+							const proactiveFile = forwardVoiceResultToOrigin(taskId, result, origin);
+							console.log(`${ts()} [TaskBridge] Posted ${taskId} result to ${origin.target} via ${proactiveFile}`);
+						}).catch(e => console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to its origin:`, e));
 					}
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
