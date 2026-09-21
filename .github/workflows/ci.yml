@@ -271,7 +271,10 @@ jobs:
     runs-on: ubuntu-latest
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
-    timeout-minutes: 15
+    # 20, not 15: the suite now runs under coverage instrumentation (the only
+    # run of it per push; the diff-coverage job below consumes its data instead
+    # of running the suite again), and instrumentation costs ~40% wall time.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -290,7 +293,14 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+
+      # watch-tasks-stream-config-hot-reload.test.py exercises the real
+      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # fswatch, so that test silently exercised nothing (its subprocess died
+      # at exec with no writer, indistinguishable from "no event" downstream).
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
@@ -321,12 +331,20 @@ jobs:
             exit 1
           fi
           # Per-file cap: without it one hung suite burns the job budget and
-          # the job is CANCELED mid-suite.
+          # the job is CANCELED mid-suite. 240s, not 120s: instrumentation slows
+          # race/bench-style tests well past their bare runtime (same cap as
+          # scripts/coverage-gate.sh, which ran this suite before).
+          FILE_TIMEOUT=240
+          rm -f .coverage coverage.xml
+          find . -maxdepth 1 -name '.coverage.*' -delete
 
           # Shared scheduler: one SERIAL worker per worktree, so a slot can never
-          # hold two suites — and the regression drives this same script.
+          # hold two suites — and the regression drives this same script. Under
+          # coverage.py, one fragment per file; parallel-suite-lane.sh brings the
+          # worktrees' fragments home for the combine below.
           bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
-            timeout -k 5 120 python3
+            env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 \
+            timeout -k 5 -s ABRT "$FILE_TIMEOUT" python3 -m coverage run --rcfile=.coveragerc
           _idx=0
           while IFS= read -r f; do
             echo "→ $f"
@@ -337,7 +355,7 @@ jobs:
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::TIMED OUT (>120s): $f"
+                echo "::error::TIMED OUT (>${FILE_TIMEOUT}s): $f"
               else
                 echo "::error::FAILED: $f (exit $rc)"
               fi
@@ -357,8 +375,75 @@ jobs:
             # tests actually failed. Review nit, and a correct one.
             echo "::notice::${#failed_files[@]} python test file(s) failed:"
             printf '  %s\n' "${failed_files[@]}"
+            exit "$failed"
           fi
-          exit "$failed"
+          # Green suite: merge the per-file fragments once, here, so the
+          # diff-coverage job measures this run instead of repeating it.
+          python3 -m coverage combine --quiet
+          python3 -m coverage xml --quiet
+
+      # `.coverage` is a dotfile, which upload-artifact v4 skips by default.
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data
+          path: |
+            .coverage
+            coverage.xml
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  coverage-gate:
+    name: diff coverage >= 95% (python)
+    # Enforces >= 95% coverage on the Python lines this PR changes, judged from
+    # the instrumented run above — the suite is never run a second time for
+    # it. pull_request only: the gate is a diff against the PR's base branch.
+    # See docs/testing-coverage.md.
+    needs: python-standalone-tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # diff-cover needs the base branch locally to compute changed lines.
+          fetch-depth: 0
+
+      - name: Install coverage tooling
+        run: python3 -m pip install coverage diff-cover
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-data
+
+      - name: Run coverage gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          COVERAGE_GATE_PRECOMPUTED: "1"
+        run: bash scripts/coverage-gate.sh
+
+      # The companion workflow_run job (.github/workflows/coverage-comment.yml)
+      # posts the summary as a sticky PR comment. Two-stage on purpose: fork PRs
+      # run here with a read-only GITHUB_TOKEN, so the comment must be posted by
+      # a workflow that runs in the base-repo context WITHOUT checking out PR code.
+      - name: Stamp PR number for the comment workflow
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: |
+            coverage-summary.md
+            pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
   required-tests:
     name: tsc + tests (clean install)

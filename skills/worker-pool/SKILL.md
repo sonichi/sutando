@@ -47,6 +47,11 @@ into the core, where the descriptions can be checked against a caller.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags.
 - `pool_ask.py` — ask another instance a question through the front door (below).
+- `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
+
+```bash
+python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--room '!id:ag2.space']
+```
 
 Suites live at `tests/skills/worker-pool/`.
 
