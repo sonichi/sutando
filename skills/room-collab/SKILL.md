@@ -255,6 +255,16 @@ Three things that matter more than they look:
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
 
+**Before you design where something is stored, read
+[`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
+arrangements merge and which silently drop a write — many text roots, one map
+key per row, an order derived from `(created, id)` rather than stored. The
+failure it describes does not look like a failure: a row that was written is
+simply not in the list, with no error and no gap, and nobody notices an absence
+they were never shown. Two of us each lost an evening to a premise we had
+stated as a structural constraint without measuring it; the discriminator was
+ten lines both times.
+
 ## Who wrote what
 
 ```bash
