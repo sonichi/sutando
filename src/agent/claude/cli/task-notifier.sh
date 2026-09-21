@@ -27,6 +27,7 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+. "$REPO/scripts/tmux-pane-lock.bash"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
@@ -41,7 +42,7 @@ POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # Submit verification: re-press C-m while the prompt is still staged in the
-# composer and no result has appeared. See deliver_prompt.
+# composer and no result has appeared. See press_enter_and_confirm.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
 SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 # A queued task with nothing left to re-trigger it (composer busy, staging
@@ -281,7 +282,7 @@ warn_if_capture_truncated() {
 # Type + verify staged, then C-m + verify submitted; both halves retry.
 # A running turn is not a gate: the line queues behind it, as the Monitor
 # tool's own notification does. Only an unhealthy pane or a draft holds.
-deliver_prompt() {
+deliver_prompt_locked() {
   local filename="$1" prompt="$2" type_tries=0 staged=0
   local baseline_esc baseline_raw staged_raw="" incarnation=""
   if ! wait_for_core_healthy; then
@@ -409,8 +410,53 @@ staged_prompt_is_ambiguous() {
   return 1
 }
 
+# Decide fresh-vs-staged-resume and act on it, all under the caller's pane lock.
+# The composer and in-flight marker are read HERE, after the lock is held, never
+# from a pre-lock snapshot -- an independent owner's hold (or a sibling notifier's
+# typed-but-not-yet-entered prompt) must be visible before this commits to a path.
+# 0 = submitted (or already was); the caller should wait for the result. Non-zero
+# = leave it queued, no wait.
+submit_task_locked() {
+  local filename="$1" prompt="$2" raw incarnation live_rc
+  raw="$(capture_raw)" || raw=""
+  incarnation="$(core_incarnation)"
+  # 0 live, 1 not live, anything else undecidable (an unreadable marker): a
+  # marker that cannot be read is not evidence the prompt was never submitted.
+  live_rc=0
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$incarnation" || live_rc=$?
+  if [ "$live_rc" -ne 0 ] && [ "$live_rc" -ne 1 ]; then
+    log_notifier "cannot decide whether $filename is already in flight (marker read failed, rc $live_rc); leaving it queued (failing closed)"
+    return 1
+  fi
+  if prompt_is_staged "$raw" "$prompt"; then
+    # Typed but never confirmed sent (a swallowed Enter, a crash or restart between
+    # the paste and C-m): the composer is exactly ours, so resume at the Enter. This
+    # precedes the marker: a marker beside a staged prompt records an Enter that never landed.
+    if staged_prompt_is_ambiguous "$raw" "$filename"; then
+      log_notifier "composer holds a prompt that reads as $filename's and another pending task's; leaving it queued (failing closed, core may need attention)"
+      return 1
+    fi
+    if [ -z "$incarnation" ]; then
+      log_notifier "core incarnation unreadable while $filename is staged; not pressing Enter (failing closed)"
+      return 1
+    fi
+    log_notifier "prompt for $filename is staged but unsent; resuming its submission"
+    press_enter_and_confirm "$filename" "$prompt" "$incarnation"
+    return $?
+  fi
+  if [ "$live_rc" -eq 0 ]; then
+    log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
+    return 0
+  fi
+  if composer_holds_prompt "$raw" "$prompt"; then
+    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
+    return 1
+  fi
+  deliver_prompt_locked "$filename" "$prompt"
+}
+
 submit_task() {
-  local filename="$1" prompt started raw incarnation live_rc
+  local filename="$1" prompt started rc
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -420,39 +466,19 @@ submit_task() {
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
-  # A capture can fail (the pane is gone); the liveness wait below is what decides that.
-  raw="$(capture_raw)" || raw=""
-  incarnation="$(core_incarnation)"
-  # 0 live, 1 not live, anything else undecidable (an unreadable marker): a
-  # marker that cannot be read is not evidence the prompt was never submitted.
-  live_rc=0
-  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$incarnation" || live_rc=$?
-  if [ "$live_rc" -ne 0 ] && [ "$live_rc" -ne 1 ]; then
-    log_notifier "cannot decide whether $filename is already in flight (marker read failed, rc $live_rc); leaving it queued (failing closed)"
+  # Fresh delivery and staged-resume both decide and act while holding this lock
+  # (submit_task_locked); a decision made before taking it can go stale under it.
+  if ! pane_lock_take "$TMUX_SOCKET" "$SESSION" 8; then
+    log_notifier "could not take the pane lock for $filename; leaving it queued"
     return 0
   fi
-  if prompt_is_staged "$raw" "$prompt"; then
-    # Typed but never confirmed sent (a swallowed Enter, a crash or restart between
-    # the paste and C-m): the composer is exactly ours, so resume at the Enter. This
-    # precedes the marker: a marker beside a staged prompt records an Enter that never landed.
-    if staged_prompt_is_ambiguous "$raw" "$filename"; then
-      log_notifier "composer holds a prompt that reads as $filename's and another pending task's; leaving it queued (failing closed, core may need attention)"
-      return 0
-    fi
-    if [ -z "$incarnation" ]; then
-      log_notifier "core incarnation unreadable while $filename is staged; not pressing Enter (failing closed)"
-      return 0
-    fi
-    log_notifier "prompt for $filename is staged but unsent; resuming its submission"
-    press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
-  elif [ "$live_rc" -eq 0 ]; then
-    log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
-  elif composer_holds_prompt "$raw" "$prompt"; then
-    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
-    return 0
-  else
-    deliver_prompt "$filename" "$prompt" || return 0
-  fi
+  # `|| rc=$?`, not `; rc=$?` -- under set -e a bare non-zero return here would
+  # exit the whole script before the lock is released (unlike the old
+  # deliver_prompt, which only ever ran already-exempted under its own caller's ||).
+  rc=0
+  submit_task_locked "$filename" "$prompt" || rc=$?
+  pane_lock_release 8
+  [ "$rc" -eq 0 ] || return 0
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0

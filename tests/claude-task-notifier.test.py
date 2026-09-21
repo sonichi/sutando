@@ -667,7 +667,7 @@ class EventDispatchTests(FakeTmuxHarness):
 
     def test_unconfirmed_submit_is_re_pressed(self):
         # A swallowed C-m leaves the prompt staged in the composer, so
-        # deliver_prompt must re-press at least once after the confirm timeout.
+        # press_enter_and_confirm must re-press at least once after the confirm timeout.
         self.swallow_enter_flag.write_text("1")
         self.write_task("task-e.txt")
 

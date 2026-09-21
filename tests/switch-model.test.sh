@@ -7,6 +7,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"; T="$(mktemp -d)"; trap 'rm -rf "$T"' E
 mkdir -p "$T/bin" "$T/cfg" "$T/state"
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+[ -n "${TMUX_CODEX:-}" ] && exec bash "$CODEX_SHIM" "$@"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
 # One failed capture, then normal: the first capture-pane call exits 1.
@@ -32,7 +33,7 @@ case " $* " in *" capture-pane "*)
 exit 0
 SH
 chmod +x "$T/bin/tmux"
-export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="/tmp/sutando-tmux.sock"
+export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="/tmp/sutando-tmux.sock" CODEX_SHIM="$HERE/tests/fixtures/codex-pane-shim.sh"
 printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; SETTINGS_BEFORE="$(cat "$T/cfg/settings.json")"
 fails=0; ok(){ echo "  ok   $1"; }; fail(){ echo "  FAIL $1 — $2"; fails=$((fails+1)); }
 run(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"; "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
@@ -51,7 +52,34 @@ touch "$T/statefile"; rc=$("$HERE/scripts/switch-model.sh" sonnet --state-dir "$
 [ "$rc" = 1 ] && grep -q "nothing changed" "$T/err" && settings_untouched && ok "9 unwritable state path: exit 1, 'nothing changed', settings untouched" || fail "9" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='────\n❯ half-typed message\n────\n' run haiku); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "half-typed" "$T/err" && ok "10 pending text in the input box: exit 5, nothing sent, text quoted" || fail "10" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='✽ Thinking… (12s)\n────\n❯\xc2\xa0\n────\n' run haiku); [ "$rc" = 0 ] && grep -q "send-keys -t sutando-core -l /model haiku" "$TMUX_LOG" && ok "11 a clear prompt (nbsp, turn running) still sends — the CLI queues it" || fail "11" "rc=$rc $(cat "$T/err")"
-rc=$(SUTANDO_CORE_RUNTIME=codex run opus); [ "$rc" = 4 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "start-cli.sh --restart" "$T/err" && ok "12 codex runtime: exit 4, restart path named" || fail "12" "rc=$rc"
+# --- codex runtime: the bare /model opens two pickers the observer drives by digit; config.toml is the CLI's to write
+mkdir -p "$T/codexhome"; printf 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n' > "$T/codexhome/config.toml"; TOML_BEFORE="$(cat "$T/codexhome/config.toml")"
+runx(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps" "$T/state/model-switch.json"; SUTANDO_CORE_RUNTIME=codex TMUX_CODEX=1 "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/codexhome" > "$T/out" 2> "$T/err"; echo $?; }
+xkeys(){ grep send-keys "$TMUX_LOG" | sed -E 's/.* -l (.*)$/\1/; s/.* (Enter|Escape)$/\1/' | paste -sd' ' -; }
+rc=$(runx gpt-5.6-luna --effort xhigh); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['model'],d['previous'],d['previous_source'],d['runtime'],d['effort'],d['accepted'],d['settings_read'].endswith('/config.toml'))" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$(xkeys)" = "/model Enter 2 4" ] && grep -q -- "capture-pane -e -p -t sutando-core" "$TMUX_LOG" && [ "$R" = "gpt-5.6-luna gpt-5.5 config.toml codex xhigh True True" ] && grep -q "effort=xhigh" "$T/out" \
+  && ok "12a codex: the BARE /model goes through the sender with --runtime codex (-e capture), row 2 then Extra high (4) are pressed, the record names model/previous(config.toml)/effort/runtime" || fail "12a codex switch" "rc=$rc keys='$(xkeys)' R=$R $(cat "$T/err")"
+[ "$(cat "$T/codexhome/config.toml")" = "$TOML_BEFORE" ] && ok "12b ...and config.toml is byte-identical: the script never writes it" || fail "12b toml written" "$(cat "$T/codexhome/config.toml")"
+rc=$(runx gpt-5.5); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['effort'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$(xkeys)" = "/model Enter 4 Enter" ] && [ "$R" = medium ] && grep -q "effort=medium" "$T/out" && ok "12c codex without --effort: Enter takes the reasoning picker's default; the effort RECORDED is the one the CLI printed (medium), not invented" || fail "12c observed effort" "rc=$rc keys='$(xkeys)' R=$R"
+rc=$(TMUX_ACCEPT_EFFORT_AS=medium runx gpt-5.5 --effort high); [ "$rc" = 10 ] && [ ! -e "$T/state/model-switch.json" ] && [ "$(xkeys)" = "/model Enter 4 3" ] && grep -q "requested effort 'high' but the CLI applied 'medium'" "$T/err" \
+  && ok "12c2 --effort high requested, pane prints 'Model changed to gpt-5.5 medium': exit 10, NO record, requested vs observed named" || fail "12c2 effort mismatch" "rc=$rc keys='$(xkeys)' R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_EFFORT_AS=' ' runx gpt-5.5); [ "$rc" = 11 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "carries no readable effort word" "$T/err" \
+  && ok "12c3 the acknowledgement names the model and NO effort word: exit 11, NO record — an unknown reasoning level is never a success" || fail "12c3 effort absent" "rc=$rc R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
+rc=$(TMUX_ACCEPT_EFFORT_AS='!!' runx gpt-5.5 --effort high); [ "$rc" = 11 ] && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "12c4 ...and an UNPARSABLE effort token fails closed the same way, never as an effort the record could name" || fail "12c4 effort unparsable" "rc=$rc R=$(cat "$T/state/model-switch.json" 2>/dev/null) $(cat "$T/err")"
+rc=$(TMUX_CODEX_CONFIG="$T/codexhome/config.toml" runx gpt-5.6-sol --effort low); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous'])" 2>/dev/null); NOW=$(sed -n 's/^model = "\(.*\)"/\1/p' "$T/codexhome/config.toml")
+[ "$rc" = 0 ] && [ "$R" = gpt-5.5 ] && [ "$NOW" = gpt-5.6-sol ] && ok "12d the CLI rewrote config.toml on acceptance; previous still records the model BEFORE the send" || fail "12d previous read after acceptance" "rc=$rc R=$R now=$NOW"
+printf '%s\n' "$TOML_BEFORE" > "$T/codexhome/config.toml"
+for m in opus claude-opus-5 'gpt-5.5; rm -rf /'; do rc=$(runx "$m"); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && [ ! -e "$T/state/model-switch.json" ] && grep -q "codex, which takes gpt-\* ids" "$T/err" || fail "12e refuse '$m'" "rc=$rc $(cat "$T/err")"; done; ok "12e codex + a claude alias/id or a shell-shaped name: exit 2, nothing sent, no record"
+rc=$(runx gpt-5.5-x); [ "$rc" = 9 ] && [ "$(xkeys)" = "/model Enter Escape" ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "Rows seen: gpt-5.6-sol,gpt-5.6-luna,gpt-5.6-mini,gpt-5.5" "$T/err" && [ "$(cat "$T/codexhome/config.toml")" = "$TOML_BEFORE" ] \
+  && ok "12f requested id not in the picker: Escape, exit 9 naming the rows, no digit, no record, config.toml untouched" || fail "12f not offered" "rc=$rc keys='$(xkeys)' $(cat "$T/err")"
+rc=$(TMUX_NO_ACCEPT=1 runx gpt-5.5 --effort high --accept-timeout 1); [ "$rc" = 8 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "no 'Model changed to gpt-5.5'" "$T/err" && ok "12g pickers driven but no acceptance line: exit 8, NO record" || fail "12g" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_CODEX_PRIOR='• Model changed to gpt-5.5 xhigh\n' TMUX_NO_ACCEPT=1 runx gpt-5.5 --effort xhigh --accept-timeout 1); [ "$rc" = 8 ] && [ ! -e "$T/state/model-switch.json" ] && ok "12h a stale 'Model changed to gpt-5.5' already on screen is baselined, not taken as this switch" || fail "12h baseline" "rc=$rc"
+rc=$(runx gpt-5.5 --effort turbo); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && ok "12i unknown --effort: exit 2 before any pane action" || fail "12i" "rc=$rc"
+rc=$(run opus --effort high); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "claude runtime has none" "$T/err" && ok "12j --effort on the claude runtime: exit 2 (a Codex reasoning level)" || fail "12j" "rc=$rc $(cat "$T/err")"
+rc=$(runx gpt-5.5 --effort medium --dry-run); [ "$rc" = 0 ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "send '/model' to" "$T/out" && grep -q "codexhome/config.toml" "$T/out" && ok "12k codex --dry-run names the bare /model, config.toml and the picks; sends nothing" || fail "12k" "rc=$rc $(cat "$T/out")"
+rm -f "$T/state/model-switch.json"; : > "$TMUX_LOG"
 mkdir -p "$T/Brain With Spaces"; printf '{"model":"claude-opus-5"}\n' > "$T/Brain With Spaces/settings.json"
 printf '{"brain":"%s","socket":"/private/tmp/socket path/s.sock","session":"core name"}\n' "$T/Brain With Spaces" > "$T/desc.json"
 rc=$(env -u SUTANDO_TMUX_SOCKET -u SUTANDO_TMUX_SESSION "$HERE/scripts/switch-model.sh" haiku --dry-run --descriptor-file "$T/desc.json" --state-dir "$T/state" > "$T/out" 2> "$T/err"; echo $?)
@@ -69,6 +97,14 @@ case "$SEQ" in "lit:sonnet enter lit:haiku enter "|"lit:haiku enter lit:sonnet e
 (bash "$HERE/scripts/tmux-send-line.sh" sutando-core watcher --socket "$T/x.sock" --skip-if-queued watcher >/dev/null 2>&1) & wait
 SEQ="$(grep send-keys "$TMUX_LOG" | sed -E 's/.*-l \/model sonnet$/lit:model/; s/.*-l watcher$/lit:watcher/; s/.*Enter$/enter/' | tr '\n' ' ')"
 case "$SEQ" in "lit:model enter lit:watcher enter "|"lit:watcher enter lit:model enter ") ok "18 cross-sender: a switch and an app watcher line serialize through one lock";; *) fail "18" "$SEQ";; esac
+# codex picker transaction: the app's watcher sender (exact shape of main.swift's tmuxSendLine: no --runtime, no --refuse-if-pending)
+# fires the moment /model is typed and must NOT reach the pane until the switch has been accepted.
+: > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps" "$T/state/model-switch.json" "$T/rc"
+(SUTANDO_CORE_RUNTIME=codex TMUX_CODEX=1 TMUX_CAP_DELAY=0.4 "$HERE/scripts/switch-model.sh" gpt-5.5 --effort high --accept-timeout 6 --state-dir "$T/state" --brain "$T/codexhome" > "$T/out" 2> "$T/err"; echo $? > "$T/rc") &
+(i=0; until grep -q -- '-l /model$' "$TMUX_LOG" 2>/dev/null || [ $i -ge 200 ]; do sleep 0.05; i=$((i+1)); done
+ TMUX_CODEX=1 bash "$HERE/scripts/tmux-send-line.sh" sutando-core watcher --socket "$SUTANDO_TMUX_SOCKET" --skip-if-queued watcher > /dev/null 2>&1) & wait
+[ "$(cat "$T/rc")" = 0 ] && [ "$(xkeys)" = "/model Enter 4 3 watcher Enter" ] && [ -e "$T/state/model-switch.json" ] \
+  && ok "18b codex: a watcher line sent mid-picker waits for the whole /model->pickers->acceptance transaction (keys: $(xkeys)); the switch completes" || fail "18b picker collision" "rc=$(cat "$T/rc") keys='$(xkeys)' $(cat "$T/err")"
 settings_untouched && ok "19 after every case above, settings.json is byte-identical to the start" || fail "19 settings" "$(cat "$T/cfg/settings.json")"
 # --- the runtime gate fails closed: bogus / empty resolver output refuses before any record
 rm -f "$T/state/model-switch.json"; : > "$T/tmux.log"
@@ -121,4 +157,23 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 33 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+
+# --- delegation: the pane lock is taken via the shared pane_lock_take (scripts/tmux-pane-lock.bash),
+# never an independent flock. A collision test alone cannot see a second implementation that locks
+# the same file the "right" way; only intercepting the shared function itself proves delegation.
+rm -f "$T/state/model-switch.json"; : > "$TMUX_LOG"
+T2="$T/delegation-repo"; mkdir -p "$T2"
+for entry in "$HERE"/*; do ln -s "$entry" "$T2/$(basename "$entry")"; done
+rm -f "$T2/scripts"; mkdir -p "$T2/scripts"
+for f in "$HERE"/scripts/*; do bn="$(basename "$f")"; [ "$bn" = "tmux-pane-lock.bash" ] && continue; ln -s "$f" "$T2/scripts/$bn"; done
+TAKE_LOG="$T/pane-lock-take.log"; : > "$TAKE_LOG"
+sed '/^pane_lock_take() {/a\
+  printf "TAKE %s %s %s\\n" "$1" "$2" "$3" >> "'"$TAKE_LOG"'"
+' "$HERE/scripts/tmux-pane-lock.bash" > "$T2/scripts/tmux-pane-lock.bash"
+rc=$(bash "$T2/skills/model-switch/scripts/switch-model.sh" opus --accept-timeout 3 --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
+[ "$rc" = 0 ] && grep -Eq "^TAKE .* sutando-core 8$" "$TAKE_LOG" \
+  && ok "34 the pane lock is acquired by calling the shared pane_lock_take (scripts/tmux-pane-lock.bash) on fd 8 — intercepted at the shared function itself, not merely observed as locking behavior a second implementation could also produce" \
+  || fail "34 delegation" "rc=$rc take-log='$(cat "$TAKE_LOG" 2>/dev/null)' $(cat "$T/err")"
+rm -f "$T/state/model-switch.json"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 48 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -18,6 +18,7 @@ DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
 # two cannot disagree about which instance a declined task belongs to.
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+. "$REPO/scripts/tmux-pane-lock.bash"
 NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
 TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
   echo "task-notifier: could not resolve the fallback receipt dir" >&2
@@ -251,6 +252,19 @@ wait_for_composer() {
 # the second half, so a swallowed paste read as instant success and the
 # notifier slept out its completion timeout on a task Codex never received.
 deliver_prompt() {
+  local filename="$1" prompt="$2" rc=0
+  # One writer owns the pane from the paste through the confirmed submit: a key typed
+  # between them lands in this composer, or drives another writer's open picker.
+  if ! pane_lock_take "$TMUX_SOCKET" "$SESSION" 8; then
+    log_notifier "could not take the pane lock for $SESSION; NOT typing $filename"
+    return 1
+  fi
+  deliver_prompt_locked "$filename" "$prompt"; rc=$?
+  pane_lock_release 8
+  return "$rc"
+}
+
+deliver_prompt_locked() {
   local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state
   # Verification is ADVISORY only when the pane hands us NO information at all --
   # a harness or Codex build we cannot read, where wait_for_composer's own poll
