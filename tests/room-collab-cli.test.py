@@ -349,6 +349,14 @@ def test_a_read_is_remembered_per_room_and_surface_and_recalled_with_its_time():
     assert p.parent == ws / "state" / "room-collab" and "!" not in p.name and ":" not in p.name
     assert p != room_collab.snapshot_path(ws, "!r:x", "board"), "a surface has its own memory"
     assert p != room_collab.snapshot_path(ws, "!other:x", "markdown")
+    # Seats share a workspace: two readers of one surface keep two memories.
+    mine = room_collab.snapshot_path(ws, "!r:x", "markdown", "@mars:x")
+    theirs = room_collab.snapshot_path(ws, "!r:x", "markdown", "@sudoo:x")
+    assert mine != theirs and mine != p
+    import types
+    assert room_collab.reader_identity(types.SimpleNamespace(user_id="@m:x", name="Mars")) == "@m:x"
+    assert room_collab.reader_identity(types.SimpleNamespace(user_id=None, name="Mars")) in ("Mars",) + tuple(
+        os.environ.get(v) for v in room_collab.IDENTITY_VARS if os.environ.get(v))
     assert room_collab.recall(p) == (None, None), "nothing yet"
     room_collab.remember(p, "first\nsecond")
     text, at = room_collab.recall(p)

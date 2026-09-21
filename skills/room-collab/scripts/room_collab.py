@@ -133,11 +133,20 @@ def delta_since(previous: str | None, current: str) -> list[str]:
     return new_lines(previous, current)
 
 
-def snapshot_path(workspace: Path, room: str, kind: str) -> Path:
-    """Where this agent keeps what it last read of one surface: per room and kind,
-    hashed so a room id's `!` and `:` never touch the filesystem."""
-    key = hashlib.sha1(f"{room}\n{kind}".encode("utf-8")).hexdigest()[:16]
+def snapshot_path(workspace: Path, room: str, kind: str, who: str = "") -> Path:
+    """Where ONE reader keeps what it last read of one surface: per room, kind and
+    reader, hashed so a room id's `!` and `:` never touch the filesystem. Several
+    seats share a workspace, so a key without the reader would report "new since
+    someone else read"."""
+    key = hashlib.sha1(f"{room}\n{kind}\n{who}".encode("utf-8")).hexdigest()[:16]
     return Path(workspace) / "state" / "room-collab" / f"last-read-{key}.txt"
+
+
+def reader_identity(args: argparse.Namespace) -> str:
+    """Who is reading: the mxid when known, else the presence name, else nobody."""
+    who = getattr(args, "user_id", None) or next(
+        (os.environ[v] for v in IDENTITY_VARS if os.environ.get(v)), None)
+    return who or getattr(args, "name", None) or ""
 
 
 def recall(path: Path) -> tuple[str | None, float | None]:
@@ -510,7 +519,8 @@ async def run(args: argparse.Namespace) -> int:
             await doc.settle(args.settle)
         if args.command == "read":
             # Every read remembers what it saw, so the next `--delta` is literal.
-            snap = snapshot_path(_workspace(getattr(args, "workspace", None)), args.room, args.kind)
+            snap = snapshot_path(_workspace(getattr(args, "workspace", None)), args.room, args.kind,
+                                 reader_identity(args))
             previous, seen_at = recall(snap)
             remember(snap, doc.text)
             if getattr(args, "delta", False):
