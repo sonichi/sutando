@@ -260,9 +260,16 @@ than store a second copy.
   `{"op": "members"}` lists BOTH the agent and the owner from `GET /v1/agents`;
   an unreadable room, a missing identity or no bridge at all is a refusal and
   the session stays on the owner DM. The same verdict gates the claim of a
-  voice result (`results/proactive-result-*.to-ag2space.txt` carrying
-  `[channel: !room]`): an unverified room's file is held on disk and logged
-  once, never posted. Verdicts are cached 60 s per room on both sides.
+  voice result, and only this shape: a file named
+  `results/proactive-result-*.to-ag2space.txt` whose body's `[channel: !room]`
+  redirect names a Matrix room. An unverified room's file is left in place,
+  logged once per hold, and re-checked on every scan; it is released when the
+  room verifies and is never posted or rerouted to the owner DM before that,
+  with no age limit. Nothing else is ever held by this check: an untagged
+  `proactive-result-*.txt` (whatever its body opens with), a tagged file with
+  no room line or a skip marker, and any other `proactive-*.txt` follow the
+  ordinary claim rules. Verdicts are cached 60 s per room on both sides;
+  an unusable owner reading is retried after 5 s, not per scan.
 
 ## Writing your own relay
 
