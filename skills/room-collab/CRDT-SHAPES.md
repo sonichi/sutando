@@ -15,8 +15,14 @@ independently, and concurrent edits to the same root from two peers both land.
 ```
 a["post:1"] += "A wrote "     b["post:1"] += "B wrote "
 b["post:2"] += "only B here"
-after sync -> post:1 == "A wrote B wrote ", post:2 == "only B here"
+after sync -> post:1 contains BOTH "A wrote " and "B wrote "
+               post:2 == "only B here"
 ```
+
+Assert that both edits are present, never the concatenation: which one comes first
+is decided by client id, which is assigned randomly per document, so the exact
+string flips between runs of the same script. Measured over five runs — the lower
+client id leads every time, and which document has it varies.
 
 So "one surface holds one editable thing" is **false**. A surface can hold as many
 independently-collaborative texts as you like. Getting this wrong costs a feature:
@@ -37,9 +43,14 @@ value, and a whole-value write is last-writer-wins whatever the value contains.
 
 ```
 two peers each add a post, neither having seen the other
-  posts as one nested dict -> ['1', '2']      post 3 is gone
-  one key per post         -> ['1', '2', '3']
+  posts as one nested dict -> 2 of the 3 survive; ONE of the concurrent adds is lost
+  one key per post         -> ['1', '2', '3']    all three, every run
 ```
+
+Which of the two concurrent adds is lost depends on arrival order and client id, so
+do not assert on the survivors: over twelve runs of the same script the nested-dict
+case came back `['1','2']` seven times and `['1','3']` five. The invariant is the
+COUNT — a write disappeared — not which one.
 
 Note what the failure looks like from outside: a **shorter list**. No error, no gap,
 nothing in the result admitting a row was dropped — and nobody notices an absence
