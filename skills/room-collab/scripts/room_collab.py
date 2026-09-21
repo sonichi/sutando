@@ -27,6 +27,9 @@ sys.path.insert(0, str(HERE))
 from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
 from room_collab_watch import new_lines  # noqa: E402
 
+# The edge refuses urllib's default agent outright (Cloudflare 1010), so an
+# HTTP read must say who it is. The websocket path sends its own.
+USER_AGENT = "room-collab-skill/1 (+https://ag2.space)"
 # The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
 COMMENT_KEY = "space.ag2.collab.doc.comment"
 # The client refuses a longer selection rather than truncating the quote it verifies by.
@@ -188,6 +191,25 @@ def _workspace(explicit: str | None) -> Path:
     return Path(resolve_workspace())
 
 
+def _refusal(exc) -> str:
+    """Why a presence read was refused, naming the EDGE when the edge did it.
+
+    Cloudflare answers `error code: 1010` to a request whose user agent it does
+    not like, and core-api never sees it — so blaming membership or the token
+    sends the reader to check two things that are both fine.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")[:200]
+    except Exception:  # noqa: BLE001 - an unreadable body must not mask the status
+        body = ""
+    if "1010" in body:
+        return ("refused by the edge in front of the service (Cloudflare 1010), not by the "
+                "service — the request never reached it. Its user agent was rejected.")
+    if exc.code == 403:
+        return "not a member, or the token was rejected"
+    return "the service did not answer it"
+
+
 def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
     """Who is in each of the room's surfaces, from the service — without opening
     any of them. The same answer the header's live dot is drawn from."""
@@ -195,14 +217,14 @@ def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
     if "/api/v1/room-collab" not in origin and "/api/v1/room-doc" not in origin:
         origin = f"{origin}/api/v1/room-collab"
     endpoint = f"{origin}/{urllib.parse.quote(room, safe='')}/presence"
-    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}"})
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}",
+                                                    "User-Agent": USER_AGENT})
     try:
         with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RoomDocError(f"presence refused ({exc.code}) at {endpoint}: "
-                           + ("not a member, or the token was rejected" if exc.code == 403
-                              else "the service did not answer it")) from exc
+                           + _refusal(exc)) from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise RoomDocError(f"presence unreachable at {endpoint}: {exc}") from exc
     surfaces = body.get("surfaces") if isinstance(body, dict) else None
