@@ -227,6 +227,10 @@ jobs:
           # box, leaving under 2x headroom on a slower, contended CI runner.
           bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
             timeout -k 5 300 bash
+          # What the lanes left running decides whether the tail runs alone.
+          echo "::group::processes still alive after the lanes"
+          ps -eo pid,ppid,etime,command | grep -E 'watch-tasks-stream|pool_beat|fswatch|inotifywait|sleep' | grep -v grep || true
+          echo "::endgroup::"
           bash scripts/parallel-suite-lane.sh 1 "$RECDIR/serial" "$RECDIR/serial-rec" \
             timeout -k 5 300 bash
           _idx=0; _rec="$RECDIR"

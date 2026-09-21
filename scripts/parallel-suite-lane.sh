@@ -7,8 +7,8 @@ set -uo pipefail
 WORKERS="$1"; FILES="$2"; RECDIR="$3"; shift 3
 N="$(wc -l < "$FILES" | tr -d ' ')"
 
-# No dot in the lane path: a suite deriving a project slug from its checkout path
-# (`tr '/' '-'`) would otherwise disagree with the slug the product computes.
+# No dot in the lane path: a suite that derives a project slug from its checkout
+# path would otherwise disagree with the slug the product computes.
 WTDIR="$(mktemp -d "${TMPDIR:-/tmp}/lane-XXXXXX")"
 for _w in $(seq 1 "$WORKERS"); do
     git worktree add --detach -q "$WTDIR/$_w" HEAD
