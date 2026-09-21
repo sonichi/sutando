@@ -231,19 +231,20 @@ jobs:
           # order: the environment these suites had before lanes existed.
           _s=0
           while IFS= read -r f; do
-            _s=$((_s + 1))
+            _s=$((_s + 1)); _t0=$SECONDS
             # </dev/null: a suite that reads stdin must not eat the rest of the list.
             if timeout -k 5 300 bash "$f" < /dev/null > "$RECDIR/serial-rec/$_s.out" 2>&1; then
               echo 0 > "$RECDIR/serial-rec/$_s.rc"
             else
               echo $? > "$RECDIR/serial-rec/$_s.rc"
             fi
+            echo $(( SECONDS - _t0 )) > "$RECDIR/serial-rec/$_s.time"
           done < "$RECDIR/serial"
           _idx=0; _rec="$RECDIR"
           while IFS= read -r f; do
             if [ "$f" = "--serial--" ]; then _idx=0; _rec="$RECDIR/serial-rec"; continue; fi
-            echo "→ $f"
             _idx=$((_idx + 1))
+            echo "→ $f ($(cat "$_rec/$_idx.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$_rec/$_idx.rc" 2>/dev/null || echo 1)"
             output="$(cat "$_rec/$_idx.out" 2>/dev/null || true)"
             if [ "$rc" -ne 0 ]; then
@@ -379,9 +380,9 @@ jobs:
             timeout -k 5 -s ABRT "$FILE_TIMEOUT" python3 -m coverage run --rcfile=.coveragerc
           _idx=0
           while IFS= read -r f; do
-            echo "→ $f"
             _idx=$((_idx + 1))
             rec="$RECDIR/$_idx"
+            echo "→ $f ($(cat "$rec.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
             output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
