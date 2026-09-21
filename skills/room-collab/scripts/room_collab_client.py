@@ -26,10 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import websockets
     from pycrdt import (
-        Assoc, Awareness, Doc, Map, StickyIndex, Text, YMessageType, YSyncMessageType,
+        Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
+    from room_collab_positions import encode as encode_position, units
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
         f"room-collab client needs its dependencies: {exc}\n"
@@ -139,21 +140,15 @@ class RoomDoc:
         """Two Yjs relative positions, base64, for the character range
         [start, end) of the text — the form a web client anchors a comment to,
         which survives edits elsewhere in the document."""
+        text = self._require_text("anchor text")
         current = self.text
         if not 0 <= start <= end <= len(current):
             raise RoomDocError(f"anchor range {start}:{end} is outside the text ({len(current)} chars)")
-        return {"start": self._relative_position(current, start),
-                "end": self._relative_position(current, end)}
-
-    def _relative_position(self, current: str, index: int) -> str:
-        text = self._require_text("anchor text")
-        if index == len(current):
-            # The one position no item holds; a sticky index at it panics.
-            sticky = StickyIndex.from_json({"tname": self._text_name, "assoc": 0}, sequence=text)
-        else:
-            # Relative positions count UTF-16 units, unlike insert/delete (bytes).
-            sticky = text.sticky_index(len(current[:index].encode("utf-16-le")) // 2, Assoc.AFTER)
-        return base64.b64encode(sticky.encode()).decode("ascii")
+        # Character offsets here; a Yjs position counts UTF-16 units.
+        return {"start": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:start]))).decode("ascii"),
+                "end": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:end]))).decode("ascii")}
 
     @property
     def peers(self) -> list[dict]:
