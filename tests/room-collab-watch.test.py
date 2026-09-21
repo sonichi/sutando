@@ -200,6 +200,31 @@ async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
     assert len(sent) >= 2, len(sent)
 
 
+async def test_a_caret_that_cannot_be_placed_never_fails_the_write():
+    # pycrdt panics (a BaseException, not an Exception) on some positions; the
+    # write has already landed by then, so the caret is skipped, nothing raised.
+    doc, room = make()
+    await room.append("abc")
+
+    class Panic(BaseException):
+        pass
+
+    real = room._text.sticky_index
+    room._text.sticky_index = lambda *a, **k: (_ for _ in ()).throw(Panic("simulated pyo3 panic"))
+    try:
+        before = dict(room._awareness.get_local_state()["cursor"])
+        await room.insert(1, "X")                     # interior position → sticky_index → panic
+    finally:
+        room._text.sticky_index = real
+    assert str(doc.get(DEFAULT_TEXT_NAME, type=Text)) == "aXbc", "the write landed"
+    assert room._awareness.get_local_state()["cursor"] == before, "the caret was left where it was, not raised on"
+    # A surface with no text (the board) has nowhere to put a caret; the guard returns.
+    bdoc = Doc()
+    board = RoomDoc(FakeWS(), bdoc, Awareness(bdoc), DEFAULT_TEXT_NAME, kind=BOARD_KIND)
+    await board._publish_cursor(0)
+    assert "cursor" not in (board._awareness.get_local_state() or {})
+
+
 async def test_the_session_ending_raises_instead_of_stopping_quietly():
     doc, room = make()
     agen = room.changes()
