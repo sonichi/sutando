@@ -271,6 +271,35 @@ jobs:
           done < <(cat "$RECDIR/files"; echo "--serial--"; cat "$RECDIR/serial")
           exit "$failed"
 
+      # TEMPORARY, reverted before merge: replay the pool suites serially in the
+      # checkout (the pre-lane order), then show what they left behind and
+      # whether the two remaining suites pass in that state.
+      - name: Post-pool checkout state (temporary)
+        if: always()
+        run: |
+          set +e
+          echo "::group::replay pool suites serially in the checkout"
+          find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort \
+            | { xargs grep -LE '\bpgrep\b|\bpkill\b|\bps (-ef|ax|-A|-e |-p )' || true; } | sort > /tmp/pool.list
+          n=0; while IFS= read -r f; do n=$((n+1)); timeout -k 5 300 bash "$f" >/dev/null 2>&1; echo "$? $f"; done < /tmp/pool.list | awk '$1!=0' | head -40
+          echo "::endgroup::"
+          echo "::group::state left in the checkout"
+          git status --short --ignored | grep -vE 'node_modules|^!! \.coverage' | head -40
+          ls -la workspace workspace/state workspace/.claude-sutando 2>&1 | head -30
+          ls -la .. | head; ls -la ../runtime 2>&1 | head -3
+          echo "::endgroup::"
+          echo "::group::processes and interpreter"
+          ps -eo pid,ppid,etime,command | grep -vE 'grep|Runner|provisioner|containerd|dockerd|systemd|sshd|dbus|snapd|udev' | grep -E 'python|watch|sleep|node|bash' | head -20
+          . scripts/python-binary.sh; py="$(require_python "$PWD" probe)"; echo "require_python -> $py"
+          "$py" -S -I src/watcher_identity.py 99999; echo "verdict rc=$?"
+          echo "::endgroup::"
+          echo "::group::the two suites, in this state"
+          for t in watcher-sentinel-ownership watcher-writes-its-beat; do
+            timeout -k 5 300 bash "tests/$t.test.sh" 2>&1 | grep -E 'FAIL|passed|PASS' | head -8; echo "== $t rc=${PIPESTATUS[0]}"
+          done
+          echo "::endgroup::"
+          exit 0
+
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
       # later: these suites existed and CI discovered none of them, so a .mjs
       # suite could fail at HEAD while the run reported green.
