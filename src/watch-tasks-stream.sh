@@ -890,23 +890,8 @@ fswatch \
   --event Updated \
   "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
-# -t bounds the read so a stretch with no fswatch event still gets a periodic,
-# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
-# event shape the platform's fswatch monitor backend turns out to use.
-while true; do
-  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
-  read_rc=$?
-  if [ "$read_rc" -gt 128 ]; then
-    if [ -n "$HANDLER_CONFIG_PATH" ]; then
-      reload_current_handler
-      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
-    fi
-    continue
-  elif [ "$read_rc" -ne 0 ]; then
-    # EOF: fswatch died and closed its end of the pipe. Fall through to the
-    # script's normal exit path rather than spinning on a dead FIFO.
-    break
-  fi
+# EOF (fswatch died and closed its end) ends the loop and takes the normal exit path.
+while IFS= read -r path; do
   case "$path" in
     "HANDLER_DONE: "*)
       completion="${path#HANDLER_DONE: }"
@@ -926,23 +911,6 @@ while true; do
       # DIRECTORY, not the file, on a rename-into-place (measured locally).
       reload_current_handler
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && ensure_dispatch_ready
-      ;;
-    "$TASKS_DIR"|"$TASKS_DIR_ABS")
-      # Same poll_monitor quirk as above, for the tasks dir itself: sweep for
-      # any *.txt this path hasn't dispatched yet (marker avoids re-dispatch
-      # on every later poll of a task still pending/archiving).
-      if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-        continue
-      fi
-      mkdir -p "$WATCH_RUNTIME_DIR/dir-swept"
-      shopt -s nullglob
-      for f in "$TASKS_DIR"/*.txt; do
-        fn="$(basename "$f")"
-        [ -e "$WATCH_RUNTIME_DIR/dir-swept/$fn" ] && continue
-        : > "$WATCH_RUNTIME_DIR/dir-swept/$fn"
-        dispatch_task "$f"
-      done
-      shopt -u nullglob
       ;;
     *.txt)
       parent="$(dirname "$path")"
