@@ -54,6 +54,16 @@ def run_fixture(tmp: Path, suites: dict[str, bool], listed: list[str]) -> subpro
     (tmp / "tests" / "shell-ci-known-failures.txt").write_text(
         "".join(f"tests/{n}\n" for n in listed))
 
+    # The step schedules through the shipped lane script, which runs each suite
+    # in a worktree of HEAD — so the fixture is a committed git repo carrying it.
+    (tmp / "scripts").mkdir(exist_ok=True)
+    lane = REPO / "scripts" / "parallel-suite-lane.sh"
+    (tmp / "scripts" / "parallel-suite-lane.sh").write_bytes(lane.read_bytes())
+    git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
+    subprocess.run(git + ["init", "-q"], cwd=tmp, check=True)
+    subprocess.run(git + ["add", "-A"], cwd=tmp, check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "fixture"], cwd=tmp, check=True)
+
     # GNU `timeout` is absent on macOS; the workflow runs on ubuntu where it exists.
     shim = tmp / "bin"
     shim.mkdir(exist_ok=True)

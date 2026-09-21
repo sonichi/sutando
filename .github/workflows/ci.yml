@@ -202,24 +202,37 @@ jobs:
           # New regressions in the other suites still fail CI immediately.
           # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
           known_failures_file="tests/shell-ci-known-failures.txt"
+          WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          RECDIR="$(mktemp -d)"
+          trap 'rm -rf "$RECDIR"' EXIT
+          find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # Same scheduler as the Python suite: one SERIAL worker per worktree, so
+          # no two suites ever share a cwd, and every suite's output + status land
+          # as records replayed in sorted order below — no suite's failure can
+          # abort the step or mask a later one.
+          #
+          # `timeout -k 5 300` bounds each suite: a hanging suite (e.g. a bounded-
+          # runner test whose --max backstop misfires under CI) would otherwise
+          # burn the whole job's timeout-minutes budget and get the job *canceled*
+          # mid-suite — masking every later suite AND this step's own diagnostics.
+          # On overrun timeout SIGTERMs (then SIGKILLs after 5s) and returns 124,
+          # so the suite fails loudly and in isolation instead of hanging CI.
+          # 300s, not 120s: graceful-restart.test.sh measures 73s on an idle dev
+          # box, leaving under 2x headroom on a slower, contended CI runner.
+          bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
+            timeout -k 5 300 bash
+          _idx=0
           while IFS= read -r f; do
             echo "→ $f"
-            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
-            # default for run: steps) while still capturing output + status. A bare
-            # `output=$(bash "$f")` would abort the whole step on the first failing
-            # suite — losing this step's diagnostics and masking every later suite.
-            #
-            # `timeout -k 5 300` bounds each suite: a hanging suite (e.g. a bounded-
-            # runner test whose --max backstop misfires under CI) would otherwise
-            # burn the whole job's timeout-minutes budget and get the job *canceled*
-            # mid-suite — masking every later suite AND this step's own diagnostics,
-            # the very failure this loop was written to avoid. On overrun timeout
-            # SIGTERMs (then SIGKILLs after 5s) and returns 124, so the suite fails
-            # loudly and in isolation instead of hanging CI.
-            # 300s, not 120s: graceful-restart.test.sh measures 73s on an idle dev
-            # box, leaving under 2x headroom on a slower, contended CI runner.
-            if ! output=$(timeout -k 5 300 bash "$f" 2>&1); then
-              echo "✖ shell test failed: $f"
+            _idx=$((_idx + 1))
+            rc="$(cat "$RECDIR/$_idx.rc" 2>/dev/null || echo 1)"
+            output="$(cat "$RECDIR/$_idx.out" 2>/dev/null || true)"
+            if [ "$rc" -ne 0 ]; then
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "✖ shell test TIMED OUT (>300s): $f"
+              else
+                echo "✖ shell test failed: $f (exit $rc)"
+              fi
               echo "$output"
               # Only gate CI if this suite is not in the known-failures allowlist.
               if ! grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
@@ -237,7 +250,7 @@ jobs:
                 failed=1
               fi
             fi
-          done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
+          done < "$RECDIR/files"
           exit "$failed"
 
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension

@@ -10,6 +10,8 @@ N="$(wc -l < "$FILES" | tr -d ' ')"
 WTDIR="$(mktemp -d)"
 for _w in $(seq 1 "$WORKERS"); do
     git worktree add --detach -q "$WTDIR/$_w" HEAD
+    # Installed deps are untracked, so a fresh worktree has none; share the caller's.
+    [ -d node_modules ] && ln -s "$PWD/node_modules" "$WTDIR/$_w/node_modules"
 done
 _lane_cleanup() {
     for _w in $(seq 1 "$WORKERS"); do
