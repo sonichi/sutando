@@ -411,6 +411,16 @@ def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
         raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {},
                                      io.BytesIO(b"error code: 1010"))
 
+    def unreadable_body(req, timeout=0):
+        class _Unreadable(io.BytesIO):
+            def read(self, *a):
+                raise OSError("connection reset while reading the body")
+        # A body that cannot be read must not mask the status it came with.
+        raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, _Unreadable(b""))
+
+    def server_error(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b"upstream"))
+
     def garbage(req, timeout=0):
         class _R(io.BytesIO):
             def __enter__(self):
@@ -422,6 +432,8 @@ def test_presence_refusals_and_bad_bodies_are_named_not_swallowed():
 
     for opener, needle in ((refuse, "not a member, or the token was rejected"),
                            (edge_refuse, "refused by the edge"),
+                           (unreadable_body, "not a member, or the token was rejected"),
+                           (server_error, "the service did not answer it"),
                            (garbage, "without surfaces")):
         try:
             room_collab.presence_summary("https://h", "!r:x", "tok", opener=opener)
