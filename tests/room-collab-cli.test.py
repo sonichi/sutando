@@ -624,6 +624,61 @@ def test_comment_runs_end_to_end_through_a_fake_surface():
         assert rc == 2 and "occurs 2 times" in err and len(posted) == 2, (rc, err)
 
 
+def test_a_reply_is_the_words_as_they_are_with_any_mention_in_front():
+    assert room_collab.reply_content("  yes, final ") == "yes, final"
+    assert room_collab.reply_content("which?", ["@q:hs", ""]) == "@q:hs which?"
+    _refuses(lambda: room_collab.reply_content("   "), "something to say")
+
+
+def test_a_reply_is_posted_in_the_comments_thread_through_room_ops():
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"ok": true, "event_id": "$r1", "state": "confirmed"}'
+        stderr = ""
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        return _Proc()
+
+    script = Path(__file__)
+    receipt = room_collab.post_reply("!r:hs", " $root ", "yes", runner=runner, script=script)
+    assert receipt["event_id"] == "$r1"
+    assert calls[0][2:] == ["say", "!r:hs", "yes", "--thread-root", "$root"], calls[0]
+    _refuses(lambda: room_collab.post_reply("!r:hs", "root", "yes", runner=runner, script=script),
+             "event id", "$abc")
+    assert len(calls) == 1, "a bad id never reaches room-ops"
+
+
+def test_reply_runs_without_opening_the_document():
+    import contextlib
+    import io
+    import unittest.mock as mock
+    posted = []
+
+    def fake_post(room, root, body):
+        posted.append((room, root, body))
+        return {"ok": True, "event_id": "$r1"}
+
+    def run(argv, stream="stdout"):
+        buf = io.StringIO()
+        with (contextlib.redirect_stdout(buf) if stream == "stdout" else contextlib.redirect_stderr(buf)):
+            rc = room_collab.main(argv)
+        return rc, buf.getvalue()
+
+    with mock.patch.object(room_collab, "post_reply", fake_post), \
+            mock.patch.object(room_collab, "resolve_token", side_effect=AssertionError("no credential needed")):
+        rc, out = run(["reply", "!r:hs", "$root", "yes", "--dry-run"])
+        assert rc == 0 and json.loads(out) == {"room": "!r:hs", "thread_root": "$root", "body": "yes"} and posted == []
+        rc, out = run(["reply", "!r:hs", "$root", "yes", "--mention", "@q:hs"])
+        assert rc == 0 and "$r1" in out and posted == [("!r:hs", "$root", "@q:hs yes")], (out, posted)
+        rc, out = run(["--json", "reply", "!r:hs", "$root", "ok"])
+        assert rc == 0 and json.loads(out)["event_id"] == "$r1"
+        rc, err = run(["reply", "!r:hs", "$root", "   "], stream="stderr")
+        assert rc == 2 and "something to say" in err
+
+
 def test_the_comment_command_parses_its_flags():
     a = room_collab.build_parser().parse_args(
         ["comment", "!r:hs", "the words", "why?", "--nth", "1", "--mention", "@a:hs", "--mention", "@b:hs", "--dry-run"])
