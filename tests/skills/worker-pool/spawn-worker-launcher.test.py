@@ -357,7 +357,11 @@ class TestRuntimeStartFailure(Base):
         t = FakeTmux(runtime="claude")
         got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
         self.assertEqual(got["runtime"], "claude")
-        argv = t.calls[-1]
+        # By shape, not position: a spawn now makes one more call afterward.
+        launcher_calls = [a for a in t.calls
+                          if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+        self.assertEqual(len(launcher_calls), 1)
+        argv = launcher_calls[0]
         self.assertEqual(argv[argv.index("--runtime") + 1], "claude")
 
     def test_a_configured_runtime_without_worker_mode_is_refused(self):
