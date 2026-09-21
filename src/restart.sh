@@ -87,25 +87,30 @@ pkill -f "observability/boot" 2>/dev/null
 # worker's command line is "watch-tasks-stream.sh <delivery-path>"), which
 # caused a real multi-worker outage (2026-09-20, peer-reported: every worker's
 # watcher died and had to re-arm, with a gap for any task that landed in it).
-# Read the core's own sentinel PID; fall back to the no-argument invocation
-# pattern only if the sentinel can't be resolved, so the watcher is never
-# silently left running across a restart.
+#
+# Reuses reap_stale_task_watcher() from startup-runtime.sh (the same function
+# startup.sh calls on its own boot) rather than a second implementation: a
+# bare PID match is a PID-reuse trap (kewei, #4569 review -- an unrelated
+# process wearing a dead watcher's recycled pid would eat the TERM), and a
+# real production launcher ALWAYS invokes watch-tasks-stream.sh with a
+# trailing argument (both task-notifier.sh launchers pass "$TASKS_DIR"), so
+# an anchored no-argument pkill pattern can never match a real core watcher
+# either -- there is no safe argv-shape shortcut here, only the sentinel's
+# proven ownership contract (watcher_identity.py classifies the pid,
+# sentinel_pid_wrote_file() proves this sentinel actually recorded it,
+# re-proven before escalating TERM to KILL).
 _stop_core_watcher() {
-    local sentinel="" pid=""
-    if [ -r "$REPO/src/watcher_sentinel.sh" ] && [ -n "${_WS:-}" ]; then
-        . "$REPO/src/watcher_sentinel.sh"
+    local sentinel=""
+    if [ -r "$REPO/src/startup-runtime.sh" ] && [ -n "${_WS:-}" ]; then
+        # shellcheck source=./startup-runtime.sh
+        . "$REPO/src/startup-runtime.sh"
         sentinel="$(sentinel_path_for "$_WS/state" 2>/dev/null)" || sentinel=""
     fi
-    if [ -n "$sentinel" ] && [ -f "$sentinel" ]; then
-        pid="$(cat "$sentinel" 2>/dev/null)"
-        case "$pid" in ''|*[!0-9]*) pid="" ;; esac
-    fi
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid" 2>/dev/null
+    if [ -n "$sentinel" ] && declare -F reap_stale_task_watcher >/dev/null 2>&1; then
+        reap_stale_task_watcher "$sentinel"
         return
     fi
-    echo "  WARN could not resolve this core's own watcher sentinel -- falling back to the no-argument invocation pattern (a worker's watcher always carries a delivery-path argument, so this still cannot match one)"
-    pkill -f "watch-tasks-stream.sh$" 2>/dev/null
+    echo "  WARN could not resolve this core's own watcher sentinel -- leaving any live watcher untouched (no pattern-match kill is safe here; see this line's own comment)"
 }
 _stop_core_watcher
 pkill -f "conversation-server" 2>/dev/null

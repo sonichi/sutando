@@ -4,9 +4,17 @@
 # line too (it's a substring of "watch-tasks-stream.sh <delivery-path>"),
 # which killed every worker's watcher on a real restart (2026-09-20).
 #
-# Mocks `kill`/`pkill` rather than relying on real signal delivery to a
-# background job (unreliable inside some sandboxes) -- what must be proven is
-# WHICH pid/pattern the function targets, not that SIGTERM itself works.
+# _stop_core_watcher() delegates ownership-proof-then-kill to
+# reap_stale_task_watcher() (src/startup-runtime.sh) -- the exact function
+# startup.sh's own boot reaper uses, already covered end-to-end by
+# tests/startup-watcher-reaper-ownership.test.sh (PID-reuse protection,
+# TERM/KILL escalation, re-proof before escalating). This suite is a WIRING
+# test: does restart.sh call the shared function with the right sentinel and
+# nothing else, not a second copy of the ownership-proof logic itself
+# (kewei's #4569 review: a bare `kill -0` here was a PID-reuse trap, and no
+# argv-pattern fallback is safe -- both production launchers invoke
+# watch-tasks-stream.sh with a trailing TASKS_DIR argument even for core, so
+# there is no shape that distinguishes core's own invocation by pattern).
 #
 # Run: bash tests/restart-watcher-scoped-to-core.test.sh
 # Exit: 0 = all pass, 1 = failure
@@ -29,82 +37,92 @@ if [ -z "$FUNC_SRC" ]; then
 fi
 ok "extracted _stop_core_watcher() from src/restart.sh"
 
-# --- Case 1: sentinel resolves -- must kill exactly that pid, nothing else ---
+# --- wiring: sourced from src/startup-runtime.sh, not a second copy of the
+# sentinel/ownership logic ---
+if grep -qF 'src/startup-runtime.sh' "$REPO/src/restart.sh"; then
+  ok "restart.sh sources startup-runtime.sh (the shared reaper), not a private copy"
+else
+  bad "restart.sh sources startup-runtime.sh (the shared reaper), not a private copy" "no reference found"
+fi
+
+# --- Case 1: sentinel resolves -- reap_stale_task_watcher is called with
+# EXACTLY that sentinel path, and nothing else touches kill/pkill directly. ---
 mkdir -p "$TMP/state" "$TMP/src"
-CORE_PID=54321
-echo "$CORE_PID" > "$TMP/state/sentinel"
-cat > "$TMP/src/watcher_sentinel.sh" << EOF
-sentinel_path_for() { printf '%s' "$TMP/state/sentinel"; }
+SENTINEL="$TMP/state/sentinel"
+echo "54321" > "$SENTINEL"
+cat > "$TMP/src/startup-runtime.sh" << EOF
+sentinel_path_for() { printf '%s' "$SENTINEL"; }
+reap_stale_task_watcher() { printf 'reap_stale_task_watcher %s\n' "\$1" >> "$TMP/reap.log"; }
 EOF
+REAP_LOG="$TMP/reap.log"
 KILL_LOG="$TMP/kill.log"
 PKILL_LOG="$TMP/pkill.log"
-: > "$KILL_LOG"; : > "$PKILL_LOG"
+: > "$REAP_LOG"; : > "$KILL_LOG"; : > "$PKILL_LOG"
 
 (
   REPO="$TMP"
   _WS="$TMP"
-  kill() {
-    printf '%s\n' "$*" >> "$KILL_LOG"
-    [ "${2:-}" = "$CORE_PID" ]  # -0 probe on the fake pid: pretend it's alive
-  }
+  kill() { printf '%s\n' "$*" >> "$KILL_LOG"; }
   pkill() { printf '%s\n' "$*" >> "$PKILL_LOG"; }
   eval "$FUNC_SRC"
   _stop_core_watcher
 )
 
-if grep -qF -- "-TERM $CORE_PID" "$KILL_LOG"; then
-  ok "sentinel-resolved pid gets SIGTERM"
+if grep -qF "reap_stale_task_watcher $SENTINEL" "$REAP_LOG"; then
+  ok "reap_stale_task_watcher called with the resolved sentinel path"
 else
-  bad "sentinel-resolved pid gets SIGTERM" "kill.log: $(cat "$KILL_LOG")"
+  bad "reap_stale_task_watcher called with the resolved sentinel path" "reap.log: $(cat "$REAP_LOG")"
 fi
-if [ -s "$PKILL_LOG" ]; then
-  bad "no fallback pkill fired when the sentinel resolved" "pkill.log: $(cat "$PKILL_LOG")"
+if [ -s "$KILL_LOG" ] || [ -s "$PKILL_LOG" ]; then
+  bad "no direct kill/pkill call -- ownership proof is the reaper's job" \
+    "kill.log: $(cat "$KILL_LOG") / pkill.log: $(cat "$PKILL_LOG")"
 else
-  ok "no fallback pkill fired when the sentinel resolved"
+  ok "no direct kill/pkill call -- ownership proof is the reaper's job"
 fi
 
-# --- Case 2: sentinel absent -- fallback pattern must discriminate core vs
-# worker argv (the actual shapes watch-tasks-stream.sh runs under) ---
-rm -f "$TMP/state/sentinel"
-: > "$KILL_LOG"; : > "$PKILL_LOG"
-(
+# --- Case 2: sentinel absent -- must NOT fall back to any pattern-match
+# kill (there is no safe pattern: core's own real invocation always carries
+# a trailing TASKS_DIR argument, same shape as a worker's). Warn and leave
+# every watcher untouched. ---
+: > "$REAP_LOG"; : > "$KILL_LOG"; : > "$PKILL_LOG"
+cat > "$TMP/src/startup-runtime.sh" << EOF
+sentinel_path_for() { return 1; }
+reap_stale_task_watcher() { printf 'reap_stale_task_watcher %s\n' "\$1" >> "$TMP/reap.log"; }
+EOF
+OUT="$(
   REPO="$TMP"
   _WS="$TMP"
-  kill() { printf '%s\n' "$*" >> "$KILL_LOG"; return 1; }
+  kill() { printf '%s\n' "$*" >> "$KILL_LOG"; }
   pkill() { printf '%s\n' "$*" >> "$PKILL_LOG"; }
   eval "$FUNC_SRC"
   _stop_core_watcher
-)
-FALLBACK_PATTERN="$(grep -oE 'pkill -f "[^"]*watch-tasks-stream[^"]*"' "$REPO/src/restart.sh" | sed -E 's/^pkill -f "//; s/"$//')"
-if [ -z "$FALLBACK_PATTERN" ]; then
-  bad "extracted the fallback pkill pattern from restart.sh" "not found"
+)"
+if [ -s "$REAP_LOG" ] || [ -s "$KILL_LOG" ] || [ -s "$PKILL_LOG" ]; then
+  bad "no kill of any kind when the sentinel can't be resolved" \
+    "reap.log: $(cat "$REAP_LOG") / kill.log: $(cat "$KILL_LOG") / pkill.log: $(cat "$PKILL_LOG")"
 else
-  ok "extracted the fallback pkill pattern: $FALLBACK_PATTERN"
-  CORE_ARGV="/usr/bin/bash /path/to/watch-tasks-stream.sh"
-  WORKER_ARGV="/usr/bin/bash /path/to/watch-tasks-stream.sh /workspace/deliveries/abc123"
-  if [[ "$CORE_ARGV" =~ $FALLBACK_PATTERN ]]; then
-    ok "fallback pattern matches a core-style invocation (no trailing argument)"
-  else
-    bad "fallback pattern matches a core-style invocation (no trailing argument)" "no match against: $CORE_ARGV"
-  fi
-  if [[ "$WORKER_ARGV" =~ $FALLBACK_PATTERN ]]; then
-    bad "fallback pattern does NOT match a worker-style invocation" "matched: $WORKER_ARGV -- this is the exact regression"
-  else
-    ok "fallback pattern does NOT match a worker-style invocation"
-  fi
+  ok "no kill of any kind when the sentinel can't be resolved -- fails closed"
 fi
-if grep -qF -- "watch-tasks-stream.sh\$" "$PKILL_LOG"; then
-  ok "fallback pkill actually fired with the anchored pattern when the sentinel was absent"
-else
-  bad "fallback pkill actually fired with the anchored pattern when the sentinel was absent" "pkill.log: $(cat "$PKILL_LOG")"
-fi
+case "$OUT" in
+  *"could not resolve"*) ok "unresolved sentinel is warned about, not silently ignored" ;;
+  *) bad "unresolved sentinel is warned about, not silently ignored" "output: $OUT" ;;
+esac
 
-# --- Regression check: the OLD unscoped line must be gone, not just
-# shadowed by the new function (a stray leftover would still fire). ---
+# --- Regression check: the OLD unscoped line must be gone. ---
 if grep -q '^pkill -f "watch-tasks" 2>/dev/null$' "$REPO/src/restart.sh"; then
   bad "the old unscoped pkill line is gone" "still present verbatim"
 else
   ok "the old unscoped pkill line is gone"
+fi
+
+# --- Regression check: no anchored pkill fallback either -- proven above to
+# be unable to match a real core invocation (both launchers pass a trailing
+# TASKS_DIR argument), so its mere presence would be a false sense of safety. ---
+if grep -qF 'pkill -f "watch-tasks-stream.sh$"' "$REPO/src/restart.sh"; then
+  bad "no anchored no-argument pkill fallback remains" \
+    "present -- this pattern cannot match a real core watcher (see PR discussion)"
+else
+  ok "no anchored no-argument pkill fallback remains"
 fi
 
 # --- The drain-wait loop's STOP_PATTERNS has the identical unscoped-match
