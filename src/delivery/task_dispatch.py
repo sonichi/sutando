@@ -52,7 +52,7 @@ from delivery.readiness import read_ready_result  # noqa: E402
 
 from local_task_protocol import iter_result_candidates  # noqa: E402
 
-from task_priority import sort_tasks_by_priority  # noqa: E402
+from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
 __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
@@ -288,6 +288,7 @@ _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
@@ -326,6 +327,12 @@ def _main(argv: list[str]) -> int:
         for name in names:
             print(name)
         return 0 if names else 1
+    if argv and argv[0] == "priority-tier":
+        if len(argv) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        print(parse_priority_from_file(Path(argv[1])))
+        return 0
     if len(argv) < 3:
         print(_USAGE, file=sys.stderr)
         return 2

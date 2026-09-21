@@ -345,14 +345,18 @@ filename_is_claimed() {
   [ -e "$CLAIMS_DIR/$1" ]
 }
 
-# The watcher is the sole decider: enqueue exactly the filename it announced,
-# in announce order. No rescan, no priority pick, no handler probe here.
+# The watcher is the sole decider of ROUTING: enqueue exactly the filename
+# it announced. No re-pick, no handler probe here -- the tier read below is
+# not a routing decision (the watcher already decided this task is this
+# instance's); it only orders what the notifier was handed, by the one
+# shared priority policy (task_priority.py), read once and stored on the
+# marker so it is never re-scanned.
 # Checked once, here, not on every retry: a held/claimed filename never
 # occupies the queue at all, so it can never head-of-line-block a later
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local filename="$1"
+  local filename="$1" tier
   case "$filename" in ""|*/*|*..*) return 0 ;; esac
   has_result "$filename" && return 0
   [ -e "$queue_dir/$filename" ] && return 0
@@ -364,13 +368,28 @@ enqueue_announced_task() {
     log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
     return 0
   fi
-  : > "$queue_dir/$filename"
+  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$TASKS_DIR/$filename" 2>/dev/null)"
+  case "$tier" in urgent|normal|low) ;; *) tier=normal ;; esac
+  printf '%s' "$tier" > "$queue_dir/$filename"
 }
 
-# Oldest marker = the head (mtime order == announce order: each marker is
-# created once and never touched again).
+# Highest tier first, oldest marker within a tier (mtime order == announce
+# order: each marker is created once and never touched again). Scans the
+# announce-ordered list once per tier rather than sorting, since every
+# marker's tier is fixed at enqueue and the tier set is exactly three values.
 queue_head() {
-  ls -1tr "$queue_dir" 2>/dev/null | head -1
+  local ordered tier f
+  ordered="$(ls -1tr "$queue_dir" 2>/dev/null)"
+  [ -n "$ordered" ] || return 0
+  for tier in urgent normal low; do
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ "$(cat "$queue_dir/$f" 2>/dev/null)" = "$tier" ]; then
+        printf '%s\n' "$f"
+        return 0
+      fi
+    done <<< "$ordered"
+  done
 }
 
 # Retry the SAME head task on every wake, never re-pick; a busy core keeps
