@@ -176,25 +176,27 @@ async def test_the_agents_own_write_is_not_reported():
 
 
 async def test_a_write_publishes_the_agents_caret_where_the_write_ended():
-    # The editor draws a caret only from awareness `cursor` (a Yjs relative
-    # position); the index is in the store's units, UTF-8 bytes.
-    from pycrdt import StickyIndex
+    # The editor draws a caret only from awareness `cursor`: a Yjs relative
+    # position, i.e. the ID of a unit of text, counted in UTF-16 by Yjs.
     doc, room = make()
+    me = doc.client_id
     assert "cursor" not in (room._awareness.get_local_state() or {}), "no caret before any write"
-    await room.append("héllo")                       # 6 bytes, 5 chars
+    await room.append("héllo")                       # 6 bytes, 5 units: clocks 0-4
     cur = room._awareness.get_local_state()["cursor"]
     assert cur["anchor"] == cur["head"], cur
-    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
-    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == len("héllo".encode()), cur
-    await room.insert(0, "¡")                        # 2 bytes at the front
+    assert cur["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, cur   # the end of the text
+    await room.insert(0, "¡")                        # 2 bytes, 1 unit: clock 5
     cur = room._awareness.get_local_state()["cursor"]
-    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == 2, cur
-    # A remote edit before the caret does not move it off its character.
-    remote_append(doc, "")                           # no-op sync, still fine
+    # After "¡" the caret sits on "h": clock 0 — the unit, not byte 2 or clock 6.
+    assert cur["anchor"] == {"item": {"client": me, "clock": 0}, "assoc": 0}, cur
+    await room.replace("llo", "日本")                 # ends before nothing: the end again
+    assert room._awareness.get_local_state()["cursor"]["anchor"] == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}
     peer = Doc(); peer.apply_update(doc.get_update())
     peer.get(DEFAULT_TEXT_NAME, type=Text).insert(0, "ZZZ")
     doc.apply_update(peer.get_update(doc.get_state()))
-    assert StickyIndex.from_json(cur["anchor"], sequence=text).get_index() == 2 + 3, "a relative position follows the text"
+    await room.insert(len("ZZZ¡hé".encode()), "x")   # after é: the caret lands on "日", clock 6
+    cur = room._awareness.get_local_state()["cursor"]
+    assert cur["anchor"] == {"item": {"client": me, "clock": 6}, "assoc": 0}, cur
     await asyncio.sleep(0)                           # the awareness frames are sent quietly, off the write path
     sent = [m for m in room._ws.sent if m[:1] == b"\x01"]   # awareness frames went out
     assert len(sent) >= 2, len(sent)

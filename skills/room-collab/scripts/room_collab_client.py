@@ -26,11 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import websockets
     from pycrdt import (
-        Assoc, Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
+        Awareness, Doc, Map, Text, YMessageType, YSyncMessageType,
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
-    from room_collab_positions import encode as encode_position, units
+    from room_collab_positions import encode as encode_position, relative_position, units
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
         f"room-collab client needs its dependencies: {exc}\n"
@@ -333,14 +333,9 @@ class RoomDoc:
         if self._text is None:
             return
         try:
-            if index >= len(str(self._text).encode("utf-8")):
-                # The end of the text has no item to attach to; Yjs spells it as the
-                # type itself, right-associated. pycrdt panics on it instead.
-                pos = {"tname": self._text_name, "assoc": 0}
-            else:
-                # Right-associated: anchored to the item that starts here. pycrdt
-                # cannot resolve a position at an item's END, so never BEFORE.
-                pos = self._text.sticky_index(index, Assoc.AFTER).to_json()
+            # The writes count UTF-8 bytes; a Yjs position counts UTF-16 units.
+            at = units(str(self._text).encode("utf-8")[:index].decode("utf-8"))
+            pos = relative_position(self._doc, self._text, self._text_name, at)
         except BaseException:  # noqa: BLE001 - a pyo3 panic, or a cancel mid-send; the write already landed
             return  # deliberately wider than Exception: a panic is not one
         self._awareness.set_local_state_field("cursor", {"anchor": pos, "head": pos})
