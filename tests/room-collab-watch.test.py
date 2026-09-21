@@ -501,6 +501,39 @@ async def test_watch_comes_back_from_a_restart_and_carries_the_snapshot():
     assert second.presence == "mars", "presence is re-published on the new socket"
 
 
+async def test_watch_with_no_for_answers_to_its_own_identity():
+    # A summon @-mentions the agent; a watcher started with no --for used to
+    # hear nobody. Now it hears its mxid, the localpart, and its presence name.
+    import os
+    saved = {v: os.environ.pop(v, None) for v in ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")}
+    os.environ["AG2SPACE_USER_ID"] = "@sutando-qingyun-001:ag2.space"
+    try:
+        assert cli.own_handles(_args(handles=None, name="Mars")) == \
+            ["@sutando-qingyun-001:ag2.space", "sutando-qingyun-001", "Mars"]
+        assert cli.own_handles(_args(handles=None, name=None, user_id="@x:y")) == ["@x:y", "x"]
+        session = _Session([{"kind": "mention", "where": "text",
+                             "text": "@sutando-qingyun-001:ag2.space see line 9"}], None)
+        rc, out, calls = await _run_watch([session], handles=None, name="Mars")
+        assert rc == 0 and "for ['@sutando-qingyun-001:ag2.space', 'sutando-qingyun-001', 'Mars']" in out, out
+        assert "EVENT\tmention\twhere=text\t@sutando-qingyun-001:ag2.space see line 9" in out, out
+        # The explicit list still wins, and the display name a summon writes is a plain handle.
+        assert addressed_to(["@Sutando (qingyun-001) hi"], ["Sutando (qingyun-001)"]) == \
+            ["@Sutando (qingyun-001) hi"]
+    finally:
+        for v, val in saved.items():
+            os.environ.pop(v, None)
+            if val is not None:
+                os.environ[v] = val
+    # No identity anywhere and no --for: still nobody, never a crash.
+    saved = {v: os.environ.pop(v, None) for v in ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")}
+    try:
+        assert cli.own_handles(_args(handles=None, name=None)) == []
+    finally:
+        for v, val in saved.items():
+            if val is not None:
+                os.environ[v] = val
+
+
 async def test_watch_does_not_retry_a_refusal():
     rc, out, calls = await _run_watch([_Session([], 4403)])
     assert isinstance(rc, RoomDocError) and rc.code == 4403 and len(calls) == 1

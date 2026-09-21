@@ -36,6 +36,23 @@ def resolve_identity(explicit: str | None) -> str:
     return who
 
 
+def own_handles(args: argparse.Namespace) -> list[str]:
+    """The names a watcher answers to when none were given: its mxid, the
+    localpart of it, and its presence name. A summon writes the room's display
+    name for the agent, which only the summon message shows — pass that with
+    --for; these defaults cover the forms the agent knows about itself."""
+    who = args.user_id or next((os.environ[v] for v in IDENTITY_VARS if os.environ.get(v)), "")
+    out = []
+    if who:
+        out.append(who)
+        local = who.lstrip("@").split(":", 1)[0]
+        if local and local != who:
+            out.append(local)
+    if getattr(args, "name", None) and args.name not in out:
+        out.append(args.name)
+    return out
+
+
 def split_compound(value: str) -> tuple[str | None, str]:
     """`https://host/relay|secret` -> (origin, secret); a bare token -> (None, token).
 
@@ -299,7 +316,7 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     from room_collab_client import open_room_collab
     from room_collab_protocol import is_transient
 
-    handles = args.handles or []
+    handles = args.handles or own_handles(args)
     since = None
     failures = 0
     print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
@@ -421,7 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")
     s.add_argument("room")
     s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
-                   help="a name or @mxid to watch for (repeatable)")
+                   help="a name or @mxid to watch for (repeatable); default: your mxid, its "
+                        "localpart and --name. Add the display name a summon shows for you.")
     s.add_argument("--max-reconnects", type=int, default=20,
                    help="give up after this many consecutive failed reconnects")
 

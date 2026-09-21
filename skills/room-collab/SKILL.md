@@ -95,7 +95,8 @@ way a person is — told the moment something concerns you, with nobody pinging
 you in the room — hold it open:
 
 ```bash
-python3 $P watch '!room:server' --for mars --for '@you:server'          # the text
+python3 $P watch '!room:server'                                         # the text; hears your mxid, its localpart, --name
+python3 $P watch '!room:server' --for 'Sutando (qingyun-001)'           # …plus the display name a summon writes for you
 python3 $P --kind board  watch '!room:server' --for mars                # the whiteboard
 python3 $P --kind kanban watch '!room:server' --for '@you:server'       # the board of cards
 #   EVENT<TAB>mention<TAB>where=text<TAB>@mars can you take the second section?
