@@ -456,5 +456,74 @@ class TestCliVerdicts(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+class TestRolePresentEdges(unittest.TestCase):
+    """The branches a happy-path snapshot never reaches."""
+
+    def test_watcher_inbox_with_no_operands_is_none(self):
+        self.assertIsNone(wid.watcher_inbox([]))
+        self.assertIsNone(wid.watcher_inbox(None))
+        self.assertIsNone(wid.watcher_inbox(["--inbox="]))
+
+    def test_a_successful_ps_run_is_read_from_its_stdout(self):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 0, f"  100 1 {CORE_SESSION_FLAT}\n", "")
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=INBOX, run=run, argv_vector=vec), True)
+
+    def test_short_lines_and_this_process_are_skipped(self):
+        me = os.getpid()
+        ps_output = f"  {me} 1 {CORE_SESSION_FLAT}\nPID PPID\n\n"
+        vec = vector_for({str(me): CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=ps_output, argv_vector=vec), False)
+
+    def test_a_caller_supplied_is_watcher_veto_skips_the_line(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        got = wid.role_present("session", inbox=INBOX, ps_output=ps_output, argv_vector=vec,
+                               is_watcher=lambda _argv, _pid: False)
+        self.assertIs(got, False)
+
+    def test_a_watcher_with_another_role_does_not_satisfy_the_query(self):
+        ps_output = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.role_present("standby", inbox=INBOX, ps_output=ps_output, argv_vector=vec), False)
+
+
+class TestRolePresentCliForms(unittest.TestCase):
+    def _run(self, args, verdict):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(wid, "role_present", return_value=verdict) as rp, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = wid.main(args)
+        return rc, out.getvalue().strip(), err.getvalue(), rp
+
+    def test_inbox_equals_form_is_parsed(self):
+        rc, out, _, rp = self._run(["role-present", "session", f"--inbox={INBOX}"], True)
+        self.assertEqual((rc, out), (0, "yes"))
+        rp.assert_called_once_with("session", INBOX)
+
+    def test_inbox_flag_form_is_parsed(self):
+        rc, out, _, rp = self._run(["role-present", "session", "--inbox", INBOX], False)
+        self.assertEqual((rc, out), (0, "no"))
+        rp.assert_called_once_with("session", INBOX)
+
+    def test_a_missing_role_is_a_usage_error(self):
+        rc, _, err, rp = self._run(["role-present"], False)
+        self.assertEqual(rc, 64)
+        self.assertIn("usage", err)
+        rp.assert_not_called()
+
+    def test_an_unobservable_snapshot_prints_unknown_and_exits_2(self):
+        rc, out, _, _ = self._run(["role-present", "session"], None)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.splitlines()[0], "unknown")
+
+    def test_an_unknown_option_is_a_usage_error(self):
+        rc, out, err, rp = self._run(["role-present", "session", "--nope"], False)
+        self.assertEqual(rc, 64)
+        self.assertIn("usage", err)
+        rp.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
