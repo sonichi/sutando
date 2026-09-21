@@ -449,7 +449,8 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
                 raise
             failures += 1
             wait = min(2 ** failures, 30)
-            why = f"code={exc.code}" if exc.code else f"status={exc.status}"
+            why = (f"code={exc.code}" if exc.code else
+                   f"status={exc.status}" if exc.status else "no answer")
             print(f"RECONNECTING\t{why} attempt={failures} in {wait}s", flush=True)
             await asyncio.sleep(wait)
 

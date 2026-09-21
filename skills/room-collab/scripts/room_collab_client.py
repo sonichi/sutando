@@ -51,6 +51,7 @@ from room_collab_protocol import (  # noqa: E402
     DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
     explain,
     http_status,
+    unanswered,
 )
 
 # The server's attribution map. This client reads it and never writes it.
@@ -681,6 +682,9 @@ async def open_room_collab(api_root: str, room_id: str, token: str, *,
     except Exception as exc:  # noqa: BLE001
         err = RoomDocError(explain(exc, url))
         err.status = http_status(exc)      # a watcher decides from this whether to retry
+        # A rollout that stops answering is as transient as one answering 503,
+        # and carries neither a status nor a close code to say so.
+        err.transient = unanswered(exc)
         raise err from exc
 
     room_collab = RoomDoc(ws, doc, awareness, text_name, kind=kind)

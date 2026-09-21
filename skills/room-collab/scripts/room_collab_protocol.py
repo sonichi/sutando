@@ -51,11 +51,20 @@ def http_status(exc: BaseException | None) -> int | None:
     return getattr(getattr(exc, "response", None), "status_code", None)
 
 
+def unanswered(exc: BaseException | None) -> bool:
+    """Nothing answered at all — the gap in a rollout between the old process
+    leaving and the new one listening, a handshake that timed out, a name that
+    does not resolve yet. A REFUSAL always answers, with a status or a code."""
+    return isinstance(exc, OSError) and http_status(exc) is None
+
+
 def is_transient(exc: BaseException | None) -> bool:
-    """A failure a watcher rides out: a restart close, or a handshake the edge
-    refused because the service was mid-rollout. A refusal is never transient."""
+    """A failure a watcher rides out: a restart close, a handshake the edge
+    refused because the service was mid-rollout, or no answer at all. A
+    refusal is never transient."""
     return (getattr(exc, "code", None) in RECONNECT_CODES
-            or getattr(exc, "status", None) in RECONNECT_STATUSES)
+            or getattr(exc, "status", None) in RECONNECT_STATUSES
+            or getattr(exc, "transient", False) is True)
 
 
 def write_var_uint(n: int) -> bytes:

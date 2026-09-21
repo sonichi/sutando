@@ -562,6 +562,15 @@ def _refused_open(status):
     return err
 
 
+def _unanswered_open():
+    """What the client builds when nothing answered: no status, no close code."""
+    from room_collab_protocol import unanswered
+    cause = TimeoutError("timed out during opening handshake")
+    err = RoomDocError(f"cannot open wss://h/ws: TimeoutError: {cause}")
+    err.transient = unanswered(cause)
+    return err
+
+
 def _args(**over):
     base = dict(room="!r:x", kind="markdown", handles=["mars"], settle=0.01, name="mars",
                 user_id=None, insecure=False, max_reconnects=3)
@@ -662,6 +671,36 @@ async def test_watch_rides_out_a_rejected_handshake_during_a_rollout():
     assert "RECONNECTING\tstatus=502 attempt=2" in out, out
     assert "RECONNECTING\tstatus=503 attempt=3" in out, out
     assert out.index("@mars before") < out.index("status=502") < out.index("@mars after"), out
+
+
+async def test_watch_rides_out_a_rollout_that_stops_answering():
+    # A real deploy: close 1012, then the reopen times out while the new pod
+    # comes up — no status, no close code, and the watch used to exit there.
+    first = _Session([{"kind": "mention", "where": "text", "text": "@mars before"}], 1012)
+    back = _Session([{"kind": "mention", "where": "text", "text": "@mars after"}], None)
+    rc, out, calls = await _run_watch([first, _unanswered_open(), _unanswered_open(), back])
+    assert rc == 0 and len(calls) == 4, (rc, calls)
+    assert "RECONNECTING\tno answer attempt=2" in out, out
+    assert out.index("@mars before") < out.index("no answer") < out.index("@mars after"), out
+
+
+def test_no_answer_is_transient_and_a_refusal_never_is():
+    from room_collab_protocol import is_transient, unanswered
+    for gone in (TimeoutError("handshake"), ConnectionRefusedError(), ConnectionResetError(),
+                 OSError("host is down"), __import__("socket").gaierror("name or service not known")):
+        assert unanswered(gone), gone
+        assert is_transient(_wrap(gone)), gone
+    refused = RoomDocError("refused"); refused.status = 403
+    assert not is_transient(refused) and not unanswered(ValueError("not a socket problem"))
+    answered = RoomDocError("refused 404"); answered.status = 404
+    assert not is_transient(answered), "a service that answers 404 is not a rollout"
+
+
+def _wrap(cause):
+    from room_collab_protocol import unanswered
+    err = RoomDocError(str(cause))
+    err.transient = unanswered(cause)
+    return err
 
 
 async def test_watch_does_not_retry_a_refused_handshake_that_is_not_a_rollout():
