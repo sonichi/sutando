@@ -370,11 +370,16 @@ class WorkspaceTripleSurvivesAPipeInAPathComponent(unittest.TestCase):
 
     def test_two_triples_colliding_under_the_old_pipe_join_get_different_restart_identities(self):
         """Both triples below `|`.join() to the identical string
-        "/tmp/collide/a|b|/tmp/collide/c|/tmp/collide/d" -- the exact
-        collision this fix must break."""
+        "/tmp/collide/a|/tmp/collide/b|/tmp/collide/c|/tmp/collide/d" -- the
+        exact collision this fix must break. (All six fields absolute --
+        17c6c3222a's #4503 re-audit found _canonicalize_or_keep now refuses
+        a relative field outright, so the collision can no longer be built
+        by shifting the split point into a bare relative fragment the way
+        the original fixture did; reconstructed here by moving the embedded
+        "|" between whole absolute path fragments instead.)"""
         run_a = self.h.launch(extra_env={
-            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
-            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/b|/tmp/collide/c",
             "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
         })
         self.assertEqual(run_a.returncode, 0, run_a.stdout + run_a.stderr)
@@ -384,8 +389,8 @@ class WorkspaceTripleSurvivesAPipeInAPathComponent(unittest.TestCase):
 
         self.h = Harness()
         run_b = self.h.launch(extra_env={
-            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
-            "SUTANDO_TASKS_DIR": "b|/tmp/collide/c",
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|/tmp/collide/b",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
             "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
         })
         self.assertEqual(run_b.returncode, 0, run_b.stdout + run_b.stderr)

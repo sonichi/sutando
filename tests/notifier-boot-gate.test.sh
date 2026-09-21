@@ -497,6 +497,87 @@ GOT9M_RC=$?
 check "a config command that exits 0 but prints nothing also fails closed" \
   "out=[$GOT9M_OUT] rc=$GOT9M_RC" "out=[] rc=1"
 
+# --- Case 9n: 17c6c3222a's independent re-audit of #4503 at b431a7b80,
+# found four more real gaps in the same file. A trailing slash on
+# SUTANDO_TASKS_DIR (ordinary in an operator's env) made the naive
+# ${p%/*} keep the trailing slash's own empty final component, so
+# dirname("$D/ws/tasks/") answered "$D/ws/tasks" instead of "$D/ws" --
+# collapsing the workspace dir onto the tasks dir and nesting results/
+# under tasks/ instead of beside it. ---
+TSLASH9N="$TD/9n-ws/tasks"
+mkdir -p "$TSLASH9N"
+GOT9N_WS="$(
+  unset SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+  if { IFS= read -r -d '' a && IFS= read -r -d '' b && IFS= read -r -d '' c; } \
+      < <(SUTANDO_TASKS_DIR="$TSLASH9N/" resolve_effective_workspace_triple "$REAL_REPO"); then
+    printf '%s' "$a"
+  fi
+)"
+WANT9N_WS="$(cd "$TD/9n-ws" && pwd -P)"
+check "a trailing slash on SUTANDO_TASKS_DIR still derives the PARENT as the workspace dir, not the tasks dir itself" \
+  "$GOT9N_WS" "$WANT9N_WS"
+
+# --- Case 9o: a relative SUTANDO_TASKS_DIR used to pass through
+# _canonicalize_or_keep unchanged (rc 0) -- the exact physical/logical
+# mismatch this file exists to prevent, just relocated: the caller
+# carries the relative string while a consumer resolves the SAME string
+# against ITS OWN cwd. Must refuse. ---
+GOT9O_OUT="$(
+  unset SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+  SUTANDO_TASKS_DIR="rel/tasks" resolve_effective_workspace_triple "$REAL_REPO" 2>/dev/null
+)"
+GOT9O_RC=$?
+check "a relative SUTANDO_TASKS_DIR is refused, not passed through unchanged" \
+  "out=[$GOT9O_OUT] rc=$GOT9O_RC" "out=[] rc=1"
+
+# --- Case 9p: a relative SUTANDO_RESULTS_DIR beside an otherwise-valid
+# absolute workspace must also refuse -- the bug is in
+# _canonicalize_or_keep itself, not specific to the tasks-dir call site. ---
+mkdir -p "$TD/9p-ws/tasks"
+GOT9P_OUT="$(
+  unset SUTANDO_WORKSPACE_DIR
+  SUTANDO_TASKS_DIR="$TD/9p-ws/tasks" SUTANDO_RESULTS_DIR="rel/results" \
+    resolve_effective_workspace_triple "$REAL_REPO" 2>/dev/null
+)"
+GOT9P_RC=$?
+check "a relative SUTANDO_RESULTS_DIR is refused even with a valid absolute workspace" \
+  "out=[$GOT9P_OUT] rc=$GOT9P_RC" "out=[] rc=1"
+
+# --- Case 9q: SUTANDO_WORKSPACE_DIR="~/ws" with HOME unset used to expand
+# to "/ws" (the ~ substitution against an empty HOME), silently rooting
+# the workspace at "/" instead of refusing on the broken environment
+# that produced an unset HOME in the first place. ---
+GOT9Q_OUT="$(
+  unset SUTANDO_TASKS_DIR SUTANDO_RESULTS_DIR HOME
+  SUTANDO_WORKSPACE_DIR="~/ws" resolve_effective_workspace_triple "$REAL_REPO" 2>/dev/null
+)"
+GOT9Q_RC=$?
+check "a tilde-prefixed override with HOME unset is refused, not rooted at /" \
+  "out=[$GOT9Q_OUT] rc=$GOT9Q_RC" "out=[] rc=1"
+
+# --- Case 9r: SUTANDO_TASKS_DIR pointing at a FILE (not a directory) used
+# to resolve successfully -- every caller wants a directory. ---
+GOT9R_OUT="$(
+  unset SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+  SUTANDO_TASKS_DIR="/etc/hosts" resolve_effective_workspace_triple "$REAL_REPO" 2>/dev/null
+)"
+GOT9R_RC=$?
+check "a tasks dir that resolves to an existing FILE is refused" \
+  "out=[$GOT9R_OUT] rc=$GOT9R_RC" "out=[] rc=1"
+
+# --- Case 9s: positive control -- none of 9n-9r broke the ordinary case. ---
+mkdir -p "$TD/9s-ws/tasks"
+GOT9S="$(
+  unset SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+  if { IFS= read -r -d '' a && IFS= read -r -d '' b && IFS= read -r -d '' c; } \
+      < <(SUTANDO_TASKS_DIR="$TD/9s-ws/tasks" resolve_effective_workspace_triple "$REAL_REPO"); then
+    printf '%s|%s|%s' "$a" "$b" "$c"
+  fi
+)"
+WANT9S_WS="$(cd "$TD/9s-ws" && pwd -P)"
+check "the ordinary absolute-path case still resolves the correct triple" \
+  "$GOT9S" "$WANT9S_WS|$WANT9S_WS/tasks|$WANT9S_WS/results"
+
 # --- Case 10: the SUPERVISOR (the watcher session's own pane process) is
 # killed too, not just the inner watcher -- a real task-notifier-supervisor.sh
 # respawns the watcher on any exit, so killing only the sentinel pid is

@@ -793,15 +793,21 @@ exit 0
         """keweichen round 20: the earlier `|`-joined serialization of
         (workspace, tasks, results) is lossy, since `|` is a legal path
         character. Two DIFFERENT triples that produce the IDENTICAL
-        `|`-joined string must now hash to DIFFERENT restart identities."""
+        `|`-joined string must now hash to DIFFERENT restart identities.
+        (All six fields absolute -- 17c6c3222a's #4503 re-audit found
+        _canonicalize_or_keep now refuses a relative field outright, so the
+        collision is reconstructed by moving the embedded "|" between
+        whole absolute path fragments, rather than shifting the split
+        point into a bare relative fragment the way the original fixture
+        did.)"""
         collide_a = {
-            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|b",
-            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/b|/tmp/collide/c",
             "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
         }
         collide_b = {
-            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a",
-            "SUTANDO_TASKS_DIR": "b|/tmp/collide/c",
+            "SUTANDO_WORKSPACE_DIR": "/tmp/collide/a|/tmp/collide/b",
+            "SUTANDO_TASKS_DIR": "/tmp/collide/c",
             "SUTANDO_RESULTS_DIR": "/tmp/collide/d",
         }
         # Both triples join to the identical string under the OLD (buggy)
@@ -826,8 +832,8 @@ exit 0
         result = self.run_launcher(env_extra=collide_a)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text()
-        self.assertIn(f'-e SUTANDO_WORKSPACE_DIR={os.path.realpath("/tmp/collide/a|b")}', calls)
-        self.assertIn(f'-e SUTANDO_TASKS_DIR={os.path.realpath("/tmp/collide/c")}', calls)
+        self.assertIn(f'-e SUTANDO_WORKSPACE_DIR={os.path.realpath("/tmp/collide/a")}', calls)
+        self.assertIn(f'-e SUTANDO_TASKS_DIR={os.path.realpath("/tmp/collide/b|/tmp/collide/c")}', calls)
         self.assertIn(f'-e SUTANDO_RESULTS_DIR={os.path.realpath("/tmp/collide/d")}', calls)
 
     def test_a_newline_in_a_path_component_also_round_trips(self):
