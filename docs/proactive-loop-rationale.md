@@ -681,12 +681,26 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
    | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
    | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set), `persistent: true`. |
+   | not running (no sentinel, no trees) / pid dead with none running | nothing here: the start decision is the per-inbox verdict below, not this probe. |
+
+   **The start decision is per inbox, not per host.** The probe answers "is any watcher running on
+   this host", and on a pool host the answer is always yes: each worker runs its own watcher on its own
+   delivery inbox, so the probe read `ok` for a whole day while the core's inbox had no watcher at all
+   (measured 2026-09-22; the only warn came from the notifier probe, which this step does not read).
+   So the step asks the question the supervisor asks (#4585):
+   `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   — is there a session-role watcher on *this* inbox that has proved ready? `no` → start one with the
+   `Monitor` tool (`bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`,
+   `$SUTANDO_TASKS_DIR` as the inbox when set); an external standby for the inbox stands down by itself
+   once the new watcher stamps. `yes` → nothing. `unknown` → nothing, and say so. The verdict is
+   sentinel-gated and process-checked in one place, so neither a stale sentinel nor a worker's watcher
+   can answer for the core.
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.
 
-   **A missing sentinel is UNKNOWN, not DEAD.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
+   **A missing sentinel is UNKNOWN, not DEAD — for the stop rule; the start decision above never reads
+   the sentinel itself.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
 
    When notifications arrive (`TASK_FILE: <basename>`), Read the named file. Each event represents one new task — process all queued tasks before continuing.
 

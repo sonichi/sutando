@@ -107,12 +107,18 @@ caps this file and refuses date stamps in it).
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
    position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
    Then pivot; never block.
-9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
-   owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` persistent (substitute `$SUTANDO_TASKS_DIR` for the inbox on an
-   instance whose tasks dir isn't `<workspace>/tasks/`). Untagged, this re-arm is invisible to `role_present()`
-   (#4477) — an external supervisor for the same inbox has no way to see it and would arm a second, duplicate
-   watcher after its own grace period. A missing sentinel is UNKNOWN, not dead; never hand-roll a process check.
+9. **Watcher.** Ask the per-inbox question, never the host-wide one: on a pool host a worker's watcher
+   satisfies any "is a watcher running" check while this core's own inbox has none.
+   `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → start it: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"` (same
+   substitution), `description: 'Streaming task watcher'`; an external standby for this inbox stands down on its
+   own once the new watcher proves ready (#4585). `yes` → nothing. `unknown` → change nothing and say so in the
+   pass log; never hand-roll a process check or read the sentinel yourself.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Untagged, a re-arm is invisible to
+   `role_present()` (#4477): an external supervisor for the same inbox would arm a second, duplicate watcher
+   after its own grace period.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
