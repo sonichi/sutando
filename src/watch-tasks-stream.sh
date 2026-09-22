@@ -347,7 +347,7 @@ run_handler_now() {
       --results-dir "$RESULTS_DIR" \
       --repo "$__REPO_ROOT" >/dev/null &
     handler_pid=$!
-    ( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
+    ( trap 'kill "${_s:-}" 2>/dev/null; exit 0' TERM
       sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
       # Reaching here (not cancelled by the handler finishing first) means
       # the timeout genuinely elapsed -- flag it BEFORE killing, so the
