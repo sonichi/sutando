@@ -210,6 +210,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
+- **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
