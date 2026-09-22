@@ -236,40 +236,52 @@ _VOICE_ROOM_HELD: set = set()
 
 def _voice_result_room(path: Path) -> "str | None":
     """The room a voice result addresses through its own `[channel: !room]`
-    line, None for the owner-DM shape or a vanished file, "" for one that
-    cannot be decoded (no room verifies as "", so it is held)."""
+    line, None for the owner-DM shape, "" for a file that cannot be read or
+    decoded (no room verifies as "", so it is held)."""
     try:
         route, room, _ = _proactive_route(path.read_text(encoding="utf-8"))  # noqa: F821
-    except OSError:
-        return None
-    except ValueError:
+    except (OSError, ValueError):
         return ""
     return room if route == "send" else None
 
 
-def _voice_result_room_verified(path: Path) -> bool:
-    """A voice result (`proactive-result-*`, the task bridge's shape) may post
-    into a room only once the gateway confirms owner AND agent are joined."""
-    room = _voice_result_room(path)
-    if room is None:
+def _voice_room_allowed(name: str, room: str) -> bool:
+    """The result named `name` may post into `room` only once the gateway
+    confirms owner AND agent are joined; an unreadable room ("") never may."""
+    if room and VOICE_ROOM_VERIFIER.verified(room):
+        _VOICE_ROOM_HELD.discard(name)
         return True
-    if VOICE_ROOM_VERIFIER.verified(room):
-        _VOICE_ROOM_HELD.discard(path.name)
-        return True
-    if path.name not in _VOICE_ROOM_HELD:
-        _VOICE_ROOM_HELD.add(path.name)
-        _log(f"voice-room: holding {path.name} — {room} is not a verified owner+agent room")  # noqa: F821
+    if name not in _VOICE_ROOM_HELD:
+        _VOICE_ROOM_HELD.add(name)
+        why = f"{room} is not a verified owner+agent room" if room else "its body could not be read"
+        _log(f"voice-room: holding {name} — {why}")  # noqa: F821
     return False
+
+
+def _voice_result_room_verified(path: Path) -> bool:
+    """Pre-claim: the room the file names on disk right now must verify."""
+    room = _voice_result_room(path)
+    return True if room is None else _voice_room_allowed(path.name, room)
+
+
+def _tagged_voice_result(name: str) -> bool:
+    """The task bridge's gateway-tagged room shape. An untagged forward is any
+    bridge's to deliver and is never held here."""
+    return name.startswith("proactive-result-") and proactive_destination(name) == _CHANNEL
+
+
+def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
+    """Post-claim: the room the CLAIMED body names must verify as well — the
+    pre-claim peek can have read a body still being written."""
+    return not _tagged_voice_result(path.name) or _voice_room_allowed(path.name, room)
 
 
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
-    dest = proactive_destination(path.name)
-    # Membership gate: only the task bridge's gateway-tagged room shape. An
-    # untagged forward is any bridge's to deliver and is never held here.
-    if dest == _CHANNEL and path.name.startswith("proactive-result-") and not _voice_result_room_verified(path):
+    if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
         return False
+    dest = proactive_destination(path.name)
     # A filename destination outranks everything below, incl. the grace:
     # a destined file strands visibly rather than leak to the gateway room.
     if dest is not None:
@@ -297,6 +309,7 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

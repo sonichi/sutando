@@ -1349,6 +1349,9 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -3499,6 +3502,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3658,7 +3675,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3681,8 +3700,11 @@ def _post_proactive() -> None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3716,6 +3738,20 @@ def _post_proactive() -> None:
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
