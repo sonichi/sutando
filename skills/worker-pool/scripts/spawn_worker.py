@@ -47,9 +47,8 @@ def default_socket() -> str:
     that sets the env afterwards would silently target the wrong tmux server."""
     return os.environ.get("SUTANDO_TMUX_SOCKET") or DEFAULT_SOCKET
 WATCHER = "src/watch-tasks-stream.sh"
-# The worker's own launcher (this skill's, not core's — core's launcher
-# carries no worker branches). One argv, one set of hooks, for every worker
-# in the pool; WORKER_MODE_RUNTIMES below is the only runtime it ever needs.
+# The worker's own launcher (this skill's, not core's): one argv, one set of
+# hooks, for every worker in the pool.
 LAUNCHER = "skills/worker-pool/scripts/launch-worker-session.sh"
 
 

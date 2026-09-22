@@ -127,7 +127,7 @@ except Exception:
     cfg = {}
 glob = {}
 try:
-    with open(os.path.expanduser("~/.claude.json")) as f:
+    with open(os.path.join(os.path.expanduser("~"), ".claude.json")) as f:
         g = json.load(f)
         if isinstance(g, dict):
             glob = g

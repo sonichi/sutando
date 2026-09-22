@@ -10,9 +10,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
-# apply_claude_tmux_defaults() (the model-clear logic under test in
-# case_tmux_defaults_clear_both_scopes) now lives in the shared session-launch
-# helper, sourced by both start-cli.sh and a pool worker's own launcher.
+# The model-clear logic under test now lives in the shared session-launch helper.
 SESSION_LAUNCH = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
 
 
