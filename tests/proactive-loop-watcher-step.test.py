@@ -40,10 +40,15 @@ check("step 9 scopes the question to this core's inbox",
       '--inbox "$WORKSPACE/tasks"' in step)
 check("step 9 asks the sentinel-gated (ready) form",
       '--ready "$WORKSPACE/state"' in step)
-check("`no` starts the tagged session watcher",
-      re.search(r"`no` → start it: `Monitor` `bash src/watch-tasks-stream\.sh --role session --inbox", step) is not None)
-check("`yes` changes nothing", "`yes` → nothing" in step)
-check("`unknown` changes nothing and is reported", "`unknown` → change nothing and say so" in step)
+check("step 9 also asks standby-present for the same inbox (untagged watchers)",
+      'standby-present --inbox "$WORKSPACE/tasks"' in step)
+check("only both `no` start the tagged session watcher",
+      re.search(r"Both `no` → start it: `Monitor` `bash src/watch-tasks-stream\.sh --role session --inbox", step) is not None)
+check("role-present `yes` changes nothing", "role-present `yes` → nothing" in step)
+check("an untagged watcher on the inbox is reported, never doubled",
+      "role-present `no` with standby-present `yes` → change nothing and say so" in step)
+check("either verdict `unknown` changes nothing and is reported",
+      "Either verdict `unknown` → change nothing and say so" in step)
 check("the start decision no longer hangs on the host-wide task-watcher probe",
       "Act only on the `task-watcher` probe" not in step)
 check("the stop rule still needs the probe's owned/ownerless split",
@@ -65,6 +70,34 @@ with tempfile.TemporaryDirectory() as tmp:
         capture_output=True, text=True, env=env, cwd=str(REPO))
     check("role-present answers `no` for an inbox nobody watches",
           out.stdout.strip() == "no" and out.returncode == 0)
+    out2 = subprocess.run(
+        [sys.executable, str(IDENTITY), "standby-present", "--inbox", str(ws / "tasks")],
+        capture_output=True, text=True, env=env, cwd=str(REPO))
+    check("standby-present answers `no` for an inbox nobody watches",
+          out2.stdout.strip() == "no" and out2.returncode == 0)
+
+    # An untagged watcher on the inbox: role-present says `no` by design, standby-present sees it.
+    # A stub with the watcher's name and the inbox operand is classified from argv like the real one.
+    stub_repo = ws / "repo" / "src"
+    stub_repo.mkdir(parents=True)
+    stub = stub_repo / "watch-tasks-stream.sh"
+    stub.write_text("#!/bin/bash\nsleep 30\n")
+    stub.chmod(0o755)
+    untagged = subprocess.Popen(["bash", str(stub), str(ws / "tasks")],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        import time
+        time.sleep(0.5)
+        rp = subprocess.run([sys.executable, str(IDENTITY), "role-present", "session",
+                             "--inbox", str(ws / "tasks"), "--ready", str(ws / "state")],
+                            capture_output=True, text=True, env=env, cwd=str(REPO)).stdout.strip()
+        sp = subprocess.run([sys.executable, str(IDENTITY), "standby-present", "--inbox", str(ws / "tasks")],
+                            capture_output=True, text=True, env=env, cwd=str(REPO)).stdout.strip()
+        check("an untagged watcher on the inbox reads role-present `no` (the conflation)", rp == "no")
+        check("...and standby-present `yes`, the verdict that must veto the start", sp == "yes")
+    finally:
+        untagged.kill()
+        untagged.wait()
 
 src = IDENTITY.read_text(encoding="utf-8")
 printed = set(re.findall(r'print\("(yes|no|unknown)"\)', src)) | (

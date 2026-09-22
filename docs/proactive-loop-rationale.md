@@ -687,14 +687,17 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    this host", and on a pool host the answer is always yes: each worker runs its own watcher on its own
    delivery inbox, so the probe read `ok` for a whole day while the core's inbox had no watcher at all
    (measured 2026-09-22; the only warn came from the notifier probe, which this step does not read).
-   So the step asks the question the supervisor asks (#4585):
-   `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
-   — is there a session-role watcher on *this* inbox that has proved ready? `no` → start one with the
+   So the step asks two questions about *this* inbox, the ones the supervisor asks (#4585):
+   `role-present session --inbox … --ready …` (a tagged session watcher that has proved ready) and
+   `standby-present --inbox …` (any other watcher on the inbox: the external standby, or an untagged
+   one, which role-present deliberately does not count). Only both `no` → start one with the
    `Monitor` tool (`bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`,
-   `$SUTANDO_TASKS_DIR` as the inbox when set); an external standby for the inbox stands down by itself
-   once the new watcher stamps. `yes` → nothing. `unknown` → nothing, and say so. The verdict is
-   sentinel-gated and process-checked in one place, so neither a stale sentinel nor a worker's watcher
-   can answer for the core.
+   `$SUTANDO_TASKS_DIR` as the inbox when set). role-present `yes` → nothing. role-present `no` with
+   standby-present `yes` → nothing, and say so: a second watcher on a served inbox doubles every task,
+   and the new session watcher would not stop the untagged one (it only waits for a standby to leave,
+   then sweeps anyway). Replacing an untagged watcher is its launcher's job (#4602). Either verdict
+   `unknown` → nothing, and say so. The verdicts are sentinel-gated and process-checked in one
+   place, so neither a stale sentinel nor a worker's watcher can answer for the core.
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.

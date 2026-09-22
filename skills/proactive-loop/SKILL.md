@@ -109,12 +109,18 @@ caps this file and refuses date stamps in it).
    Then pivot; never block.
 9. **Watcher.** Ask the per-inbox question, never the host-wide one: on a pool host a worker's watcher
    satisfies any "is a watcher running" check while this core's own inbox has none.
+   Two verdicts, both for this inbox (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose
+   tasks dir isn't `<workspace>/tasks/`):
    `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
-   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
-   `no` → start it: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"` (same
-   substitution), `description: 'Streaming task watcher'`; an external standby for this inbox stands down on its
-   own once the new watcher proves ready (#4585). `yes` → nothing. `unknown` → change nothing and say so in the
-   pass log; never hand-roll a process check or read the sentinel yourself.
+   (a tagged session watcher that has proved ready) and
+   `python3 src/watcher_identity.py standby-present --inbox "$WORKSPACE/tasks"`
+   (any other watcher on the inbox: the external standby, or an untagged one that role-present cannot see).
+   Both `no` → start it: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. role-present `yes` → nothing.
+   role-present `no` with standby-present `yes` → change nothing and say so: an untagged watcher is serving
+   the inbox and a second one would double every task; it is replaced only through its launcher (#4602),
+   never by starting another. Either verdict `unknown` → change nothing and say so in the pass log; never
+   hand-roll a process check or read the sentinel yourself.
    Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
    labelled groups; one undifferentiated list means change nothing. Untagged, a re-arm is invisible to
    `role_present()` (#4477): an external supervisor for the same inbox would arm a second, duplicate watcher
