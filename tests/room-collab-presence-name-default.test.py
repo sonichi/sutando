@@ -9,16 +9,13 @@ joined to the agent and absent to everyone else — the same silent-no-op shape
 as the `read`-instead-of-`watch` bug. An mxid already carries a usable name.
 """
 import importlib.util
-import os
 import pathlib
 import sys
-import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CLI = REPO / "skills" / "room-collab" / "scripts" / "room_collab.py"
 # The client module exits at import without its deps; load the CLI as a module
 # without executing main, and skip if the deps are genuinely absent.
-os.environ.setdefault("ROOM_DOC_DB", os.path.join(tempfile.mkdtemp(), "t.db"))
 sys.path.insert(0, str(CLI.parent))
 spec = importlib.util.spec_from_file_location("room_collab_cli", CLI)
 mod = importlib.util.module_from_spec(spec)
