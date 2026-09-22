@@ -3569,6 +3569,18 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
     return status, step
 
 
+def _read_core_metadata() -> dict:
+    """Optional launcher-authored metadata; malformed state never blocks polling."""
+    try:
+        data = json.loads((_STATE / "core-runtime.json").read_text())
+        if not isinstance(data, dict):
+            return {}
+        return {"core": _core_str(data.get("runtime")),
+                "model": _core_str(data.get("model"))}
+    except (OSError, ValueError):
+        return {}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -3587,6 +3599,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
     try:
         payload = {
+            **_read_core_metadata(),
             "client": "sutando-gateway-client",
             "protocol_version": 1,
             "provider": PROVIDER,
