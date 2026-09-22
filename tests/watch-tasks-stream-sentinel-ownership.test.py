@@ -197,9 +197,8 @@ def main() -> int:
               "sentinel never appeared")
         pid_a = sentinel.read_text().strip() if sentinel.exists() else ""
 
-        # A second watcher on a watched inbox exits at its own startup; only
-        # --force-restart replaces the holder. The replaced watcher exits through
-        # its EXIT trap, and the sentinel must end up naming the replacement.
+        # A second watcher on a watched inbox exits at startup; only --force-restart
+        # replaces the holder, and the sentinel must end up naming the replacement.
         b = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--force-restart"))
         check("a SECOND watcher with --force-restart takes ownership of the sentinel",
               wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() not in ("", pid_a),
