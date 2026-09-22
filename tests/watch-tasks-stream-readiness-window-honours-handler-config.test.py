@@ -471,6 +471,247 @@ check("the pending task was routed by the replacement: never announced, handled 
       and handled == ["probe-hC", "handle-hC"],
       f"stdout={out!r} handler log={handled!r}")
 
+
+def _watcher_env(tmp, ws, b, extra=None):
+    env = dict(os.environ)
+    env["PATH"] = f"{b}:{env['PATH']}"
+    env["TMPDIR"] = str(tmp)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env["SUTANDO_WORKSPACE_DIR"] = str(ws)
+    env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
+    env.pop("SUTANDO_INSTANCE_ID", None)
+    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+    env.update(extra or {})
+    return env
+
+
+def _handlers(tmp, log, spec):
+    out = {}
+    for name, rc in spec:
+        h = tmp / f"{name}.sh"
+        h.write_text('#!/bin/sh\n'
+                     f'for a in "$@"; do [ "$a" = "--probe" ] && {{ echo probe-{name} >> {log}; exit {rc}; }}; done\n'
+                     f'echo handle-{name} >> {log}\nexit {rc}\n')
+        h.chmod(0o755)
+        out[name] = h
+    return out
+
+
+def _workspace(prefix):
+    tmp = Path(tempfile.mkdtemp(prefix=prefix))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    b = tmp / "bin"
+    b.mkdir()
+    (b / "fswatch").write_text(
+        f"#!/bin/bash\nexec bash {REPO / 'tests' / 'fixtures' / 'fswatch-poll-stub.sh'} \"$@\"\n")
+    (b / "fswatch").chmod(0o755)
+    return tmp, ws, b
+
+
+def _publish(cfg, handler):
+    t = cfg.with_name(".cfg.tmp")
+    t.write_text(json.dumps({"handler": str(handler)}))
+    t.replace(cfg)
+
+
+def _write_task(ws, name):
+    final = ws / "tasks" / f"{name}.txt"
+    t = final.with_name(f".{name}.tmp")
+    t.write_text(f"id: {name}\naccess_tier: team\ntask: restricted\n")
+    t.replace(final)
+
+
+def _start(ws, env, stderr=subprocess.DEVNULL):
+    return subprocess.Popen(
+        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
+         "--role", "session", "--inbox", str(ws / "tasks")],
+        cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=stderr,
+        text=True, start_new_session=True)
+
+
+def _pump(p, out, until, timeout=12, settle=1.5):
+    os.set_blocking(p.stdout.fileno(), False)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(0.3)
+        try:
+            c = p.stdout.read()
+        except (BlockingIOError, TypeError):
+            c = None
+        if c:
+            out.extend(c.splitlines())
+        if until():
+            time.sleep(settle)
+            try:
+                c = p.stdout.read()
+            except (BlockingIOError, TypeError):
+                c = None
+            if c:
+                out.extend(c.splitlines())
+            return True
+    return False
+
+
+def _stop(p):
+    try:
+        os.killpg(p.pid, 15)
+    except (ProcessLookupError, PermissionError):
+        p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+
+
+def _wait_ready(ws, timeout=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout and not list((ws / "state").glob("*.pid")):
+        time.sleep(0.1)
+    time.sleep(1.5)
+
+
+def scenario_resolver_publishes_between_refresh_and_decision():
+    """The inbox resolver, which runs between the start of dispatch_task and the
+    routing decision, atomically publishes must-handle C over fallback B."""
+    tmp, ws, b = _workspace("ready-resolver-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hB", 3), ("hC", 4)))
+    _publish(cfg, h["hB"])
+    cfg_c = tmp / "cfg-c.json"
+    cfg_c.write_text(json.dumps({"handler": str(h["hC"])}))
+    resolver = tmp / "resolver.sh"
+    resolver.write_text('#!/bin/bash\n'
+                        f'cp {cfg_c} {cfg}.tmp && mv {cfg}.tmp {cfg}\n'
+                        'printf \'%s\\n\' "$1"\n')
+    resolver.chmod(0o755)
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_INBOX_RESOLVER": str(resolver)})
+    p = _start(ws, env)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _write_task(ws, "task-team")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out))
+        handled = log.read_text().split() if log.exists() else []
+        return out, handled
+    finally:
+        _stop(p)
+
+
+def scenario_runtime_dir_unwritable():
+    """A must-handle config is published while the watcher's runtime dir cannot
+    take the snapshot copy: the task is held, never announced, and handled once
+    the dir is writable again (the read-timeout tick retries the reload)."""
+    tmp, ws, b = _workspace("ready-broken-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hB", 3), ("hC", 4)))
+    _publish(cfg, h["hB"])
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1"})
+    p = _start(ws, env)
+    out: list[str] = []
+    runtime = None
+    try:
+        _wait_ready(ws)
+        runtime = next(iter(tmp.glob("sutando-task-watch.*")))
+        os.chmod(runtime, 0o500)
+        _publish(cfg, h["hC"])
+        time.sleep(0.5)
+        _write_task(ws, "task-team")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=6, settle=0.5)
+        held_out = list(out)
+        held_log = log.read_text().split() if log.exists() else []
+        os.chmod(runtime, 0o700)
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=12)
+        handled = log.read_text().split() if log.exists() else []
+        return held_out, held_log, out, handled
+    finally:
+        if runtime is not None:
+            os.chmod(runtime, 0o700)
+        _stop(p)
+
+
+def scenario_cksum_fails_at_first():
+    """The checksum tool fails on its first two calls; a config replacement
+    made while it was failing must still route the task."""
+    tmp, ws, b = _workspace("ready-cksum-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hA", 3), ("hC", 4)))
+    _publish(cfg, h["hA"])
+    import shutil
+    real = shutil.which("cksum")
+    counter = tmp / "cksum-calls"
+    (b / "cksum").write_text('#!/bin/bash\n'
+                             f'n=$(cat {counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {counter}\n'
+                             '[ "$n" -le 2 ] && exit 1\n'
+                             f'exec {real} "$@"\n')
+    (b / "cksum").chmod(0o755)
+    env = _watcher_env(tmp, ws, b)
+    p = _start(ws, env)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _publish(cfg, h["hC"])
+        time.sleep(0.5)
+        _write_task(ws, "task-team")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out))
+        handled = log.read_text().split() if log.exists() else []
+        return out, handled, int(counter.read_text() or 0)
+    finally:
+        _stop(p)
+
+
+def scenario_missing_config_stderr():
+    """No config at all: the task reaches the core and the watcher's stderr
+    carries only its own announce line, no error from the stamp's read."""
+    tmp, ws, b = _workspace("ready-nocfg-")
+    env = _watcher_env(tmp, ws, b)
+    errf = tmp / "watcher.err"
+    with open(errf, "w") as fh:
+        p = _start(ws, env, stderr=fh)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _write_task(ws, "task-owner")
+        _pump(p, out, lambda: any("task-owner" in ln for ln in out))
+    finally:
+        _stop(p)
+    err = [ln for ln in errf.read_text().splitlines() if ln.strip()]
+    return out, err
+
+
+print("the inbox resolver publishes must-handle C between the start of dispatch and the decision:")
+out, handled = scenario_resolver_publishes_between_refresh_and_decision()
+check("the task was routed by C, the config on disk at the decision: never announced, handled once",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
+
+print("the runtime dir cannot take the snapshot while a must-handle config is published:")
+held_out, held_log, out, handled = scenario_runtime_dir_unwritable()
+check("while the config could not be read the task was held: no announcement, no handler run",
+      not any("task-team" in ln for ln in held_out) and held_log == [],
+      f"stdout={held_out!r} handler log={held_log!r}")
+check("once the dir was writable again the held task was handled once by C, still never announced",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
+
+print("the checksum tool fails on its first calls:")
+out, handled, calls = scenario_cksum_fails_at_first()
+check("setup: cksum was called more than twice", calls > 2, f"calls={calls}")
+check("a replacement made while the checksum failed still routed the task: never announced, handled once by C",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
+
+print("no config at all:")
+out, err = scenario_missing_config_stderr()
+check("the task reached the core once", sum(ln.startswith("TASK_FILE: task-owner") for ln in out) == 1, f"stdout={out!r}")
+check("stderr holds only the watcher's own announce line",
+      len(err) == 1 and err[0].startswith("watch-tasks-stream: role=session"), f"stderr={err!r}")
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
 sys.exit(1 if FAILURES else 0)
