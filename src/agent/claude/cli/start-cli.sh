@@ -31,6 +31,13 @@ unset _self_dir
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+# Named check before sourcing: an unexplained "No such file or directory" from
+# a bare `.` here reads as a broken launcher, not a fixture/checkout missing
+# this file's own sibling — a real trap for a scratch-repo test fixture.
+if [ ! -r "$REPO/src/agent/claude/cli/session-launch.sh" ]; then
+  echo "start-cli.sh: missing its sibling src/agent/claude/cli/session-launch.sh — refusing to start (a scratch checkout/fixture must copy it alongside this file)" >&2
+  exit 1
+fi
 # shellcheck source=session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
