@@ -32,6 +32,15 @@ from room_collab_watch import new_lines  # noqa: E402
 USER_AGENT = "room-collab-skill/1 (+https://ag2.space)"
 # The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
 COMMENT_KEY = "space.ag2.collab.doc.comment"
+# collabKey('doc', 'summon'): an agent's summon must be the SAME event the
+# client's @-picker writes, or its timeline has no card to render.
+SUMMON_KEY = "space.ag2.collab.doc.summon"
+SUMMON_CONTEXT_MAX = 400
+# An mxid with a server part. The client's own reader refuses anything else, so
+# a summon naming "qingyun" would post a message that renders as plain prose.
+MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
+# The surface as the summon's prose names it; the marker carries `kind` verbatim.
+SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
@@ -506,6 +515,22 @@ async def run(args: argparse.Namespace) -> int:
 
     from room_collab_board import BOARD_KIND, place_clear
     from room_kanban import KANBAN_KIND
+    if args.command == "summon":
+        # No document connection: a summon is a room message, and its context is
+        # what the caller states rather than a passage this command verifies.
+        body, extra = summon_content(args.room, args.invitee, args.kind, args.context)
+        if args.dry_run:
+            print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
+                             ensure_ascii=False, indent=2))
+            return 0
+        receipt = post_summon(args.room, body, extra)
+        if args.json:
+            print(json.dumps(receipt, ensure_ascii=False))
+        else:
+            print(f"summoned {args.invitee} to the {args.kind} surface: "
+                  f"{receipt.get('event_id') or receipt.get('state') or 'posted'}")
+        return 0
+
     if args.command == "reply":
         # No document at all: a reply is a room message in the comment's thread.
         body = reply_content(args.text, args.mention)
@@ -660,6 +685,40 @@ def reply_content(message: str, mentions: list[str] | None = None) -> str:
     return lead + " " + text if lead else text
 
 
+def summon_content(room: str, invitee: str, kind: str,
+                   context: str | None = None) -> tuple[str, dict]:
+    """The room message a summon is: prose any client shows, and the marker the
+    collab client renders as the summon card.
+
+    v3 — `invitee` and `context` in the marker, so a reader draws the card
+    without parsing the prose. v1/v2 carried neither and the client falls back
+    to `m.mentions`; the full mxid in the body is what makes that mention real.
+    """
+    who = invitee.strip()
+    if not MXID_RE.match(who):
+        raise RoomDocError(f"a summon needs the mxid of whoever is called, like "
+                           f"@name:server — got {invitee!r}")
+    where = SUMMON_SURFACE.get(kind)
+    if where is None:
+        raise RoomDocError(f"{kind!r} is not a surface to summon anyone to; "
+                           f"use one of {', '.join(sorted(SUMMON_SURFACE))}")
+    quoted = " ".join((context or "").split())[:SUMMON_CONTEXT_MAX]
+    body = f"{who} — you're needed in this room's {where}."
+    if quoted:
+        body += f"\n\n> {quoted}"
+    marker = {"room_id": room, "kind": kind, "invitee": who, "v": 3}
+    if quoted:
+        marker["context"] = quoted
+    return body, {SUMMON_KEY: marker, "m.mentions": {"user_ids": [who]}}
+
+
+def post_summon(room: str, body: str, extra: dict, *, runner=subprocess.run,
+                script: Path | None = None) -> dict:
+    """Post the summon through room-ops `say`; the reply is its receipt."""
+    return _post(room, body, ["--extra-content", json.dumps(extra, ensure_ascii=False)],
+                 "summon", runner=runner, script=script)
+
+
 def post_reply(room: str, root: str, body: str, *, runner=subprocess.run,
                script: Path | None = None) -> dict:
     """Post a reply in the comment's thread through room-ops `say --thread-root`."""
@@ -765,6 +824,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="address someone by mxid (repeatable); an agent among them is called")
     s.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="print the room message the reply would be and post nothing")
+
+    s = sub.add_parser("summon",
+                       help="call someone into a surface — the card the client renders "
+                            "(no document connection needed)")
+    s.add_argument("room")
+    s.add_argument("invitee", metavar="MXID",
+                   help="who is called, by mxid — a person or another agent")
+    s.add_argument("--context", default=None,
+                   help="the passage they are called about, quoted under the card; "
+                        "stated by you, not checked against the document")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print the room message the summon would be and post nothing")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")
