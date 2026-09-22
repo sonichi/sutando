@@ -252,12 +252,24 @@ export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
 	}
 }
 
+/** Test seam for the result-file publisher: the two calls it makes, replaceable. */
+export const _resultFileOps = { write: writeFileSync, rename: renameSync };
+let _resultStageCounter = 0;
+
+/** Publish a result file whole: staged as a dotfile (no drain glob matches one), then renamed
+ *  into place, so a drain claiming within the second never reads a body still being written. */
+function publishResultFile(file: string, body: string): void {
+	const staged = join(RESULT_DIR, `.${file}.${process.pid}.${++_resultStageCounter}`);
+	_resultFileOps.write(staged, body);
+	_resultFileOps.rename(staged, join(RESULT_DIR, file));
+}
+
 /** Write an origin-bound result: `.to-<channel>` in the name, `[channel: <target>]` on top unless
  *  it opens with its own redirect. Claimed at once, or the drain would speak it again. */
 export function forwardVoiceResultToOrigin(taskId: string, result: string, origin: VoiceSessionOrigin, nowSec = Math.floor(Date.now() / 1000)): string {
 	const file = `proactive-result-${taskId}-${nowSec}.to-${origin.channel}.txt`;
 	// parse_markers keeps the first redirect, so a result that opens with its own wins by not being preceded.
-	writeFileSync(join(RESULT_DIR, file), LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${origin.target}]\n${result}`);
+	publishResultFile(file, LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${origin.target}]\n${result}`);
 	_deliveredResults.add(file);
 	return file;
 }
@@ -266,7 +278,7 @@ export function forwardVoiceResultToOrigin(taskId: string, result: string, origi
  *  line, `[dm-only]` restored on top. Claimed at once, like the origin shape. */
 export function forwardVoiceResultToOwnerDm(taskId: string, result: string, channel: string, nowSec = Math.floor(Date.now() / 1000)): string {
 	const file = `proactive-result-${taskId}-${nowSec}.to-${channel}.txt`;
-	writeFileSync(join(RESULT_DIR, file), `[dm-only]\n${result}`);
+	publishResultFile(file, `[dm-only]\n${result}`);
 	_deliveredResults.add(file);
 	return file;
 }
@@ -409,7 +421,8 @@ export async function resolveVoiceResultOrigin(taskId: string): Promise<VoiceSes
 }
 
 /** Voice result with no client attached: its verified origin, or the owner's DM when `[dm-only]`, else
- *  the untagged owner-DM shape, left unclaimed so the drain speaks it on reconnect if no bridge takes it. */
+ *  the untagged owner-DM shape, left unclaimed so the drain speaks it on reconnect if no bridge takes it.
+ *  The untagged shape keeps a `[dm-only]` the body carried: on every bridge it cancels a redirect. */
 export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
 	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
 	if (kept) return kept;
@@ -420,9 +433,33 @@ export async function forwardOfflineVoiceResult(taskId: string, result: string, 
 		return file;
 	}
 	const file = `proactive-result-${taskId}-${nowSec}.txt`;
-	writeFileSync(join(RESULT_DIR, file), result);
+	publishResultFile(file, dmOnly ? `[dm-only]\n${result}` : result);
 	console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to the owner DM via ${file}`);
 	return file;
+}
+
+/** Connected drain leg for an origin-bound result: written to its origin once that verifies, else kept
+ *  to the owner DM — and spoken only then, so voice hears the DM note with the result when it applies. */
+export async function _deliverOriginBoundResult(
+	taskId: string, result: string, origin: VoiceSessionOrigin, speak: ResultListener,
+): Promise<string | null> {
+	try {
+		const verified = await resolveVoiceResultOrigin(taskId);
+		if (verified) {
+			const file = forwardVoiceResultToOrigin(taskId, result, verified);
+			console.log(`${ts()} [TaskBridge] Posted ${taskId} result to ${verified.target} via ${file}`);
+			speak(result);
+			return file;
+		}
+		const file = forwardVoiceResultToOwnerDm(taskId, result, origin.channel);
+		console.log(`${ts()} [TaskBridge] ${taskId} result kept to the DM (origin refused) via ${file}`);
+		speak(result, origin.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
+		return file;
+	} catch (e) {
+		console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to its origin:`, e);
+		speak(result);
+		return null;
+	}
 }
 
 /** Offline drain leg: claim, forward, archive only once the forward is on disk.
@@ -1361,14 +1398,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
+					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
 					else onResult(result);
-					if (taskOrigin && !keptToDm) {
-						resolveVoiceResultOrigin(taskId).then(origin => {
-							if (!origin) return;
-							const proactiveFile = forwardVoiceResultToOrigin(taskId, result, origin);
-							console.log(`${ts()} [TaskBridge] Posted ${taskId} result to ${origin.target} via ${proactiveFile}`);
-						}).catch(e => console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to its origin:`, e));
-					}
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

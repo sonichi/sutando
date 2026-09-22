@@ -2,9 +2,11 @@
 """Two guards that used to answer a question they never asked.
 
 RUNTIME: the record named one runtime and the launcher chose another, because
-the dispatcher rereads the CORE's configuration. The selector is now in the
-argv, and a runtime whose adapter has no worker mode is refused BEFORE any
-identity state exists — a record for a worker that cannot run is worse than no
+the dispatcher rereads the CORE's configuration. A worker no longer goes
+through that dispatcher at all -- its own launcher only ever runs claude
+(WORKER_MODE_RUNTIMES), so there is no argv selector to drift from the record.
+A runtime whose adapter has no worker mode is still refused BEFORE any
+identity state exists -- a record for a worker that cannot run is worse than no
 worker.
 
 SENTINEL: the guard asked whether `util_paths.py` CONTAINS `def
@@ -42,7 +44,7 @@ class Runner:
     def __call__(self, argv, **kw):
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return subprocess.CompletedProcess(argv, 0, self.runtime + "\n", "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.launches.append(argv)
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -105,18 +107,22 @@ class TestRuntimeSelector(unittest.TestCase):
         self.addCleanup(self._t.cleanup)
         self.ws = Path(self._t.name)
 
-    def test_the_plan_hands_the_launcher_the_runtime_it_recorded(self):
+    def test_the_plan_hands_the_launcher_no_runtime_selector(self):
+        """No --runtime in the argv at all: the worker's own launcher only
+        ever runs claude (WORKER_MODE_RUNTIMES), so there is nothing to
+        select and nothing that could drift from the record."""
         p = sw.plan(self.ws, REPO, runtime="claude")
         argv = p["launcher_argv"]
-        self.assertEqual(argv[argv.index("--runtime") + 1], "claude")
+        self.assertNotIn("--runtime", argv)
+        self.assertTrue(argv[1].endswith("launch-worker-session.sh"), argv)
 
-    def test_the_spawn_launches_with_the_selector_present(self):
+    def test_the_spawn_launches_the_workers_own_script(self):
         r = Runner()
         got = sw.spawn(self.ws, REPO, runner=r, require_sentinel=False)
         self.assertEqual(len(r.launches), 1)
         argv = r.launches[0]
-        self.assertIn("--runtime", argv)
-        self.assertEqual(argv[argv.index("--runtime") + 1], got["runtime"])
+        self.assertNotIn("--runtime", argv)
+        self.assertEqual(got["runtime"], "claude")
 
     def test_a_runtime_without_worker_mode_is_refused(self):
         with self.assertRaises(sw.SpawnRefused) as e:

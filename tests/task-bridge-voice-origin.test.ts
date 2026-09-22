@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +18,7 @@ mkdirSync(RESULT_DIR, { recursive: true });
 const {
 	setVoiceSessionOrigin, getVoiceSessionOrigin, voiceTaskOrigin, resolveVoiceResultOrigin, forwardVoiceResultToOrigin, forwardVoiceResultToOwnerDm,
 	keepVoiceResultToDm, forwardOfflineVoiceResult, startResultWatcher, workTool, DM_ONLY_DELIVERY_NOTE, LEADING_REDIRECT_RE, DM_ONLY_RE,
-	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow,
+	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult,
 } = await import('../src/task-bridge.js');
 
 after(() => {
@@ -143,16 +143,17 @@ describe('the result leg re-checks the origin and fails closed', () => {
 	});
 });
 
+/** One watcher per file (the module keeps one delivered-set): the drain tests below share it. */
+const spoken: Array<{ result: string; note?: string }> = [];
+
 describe('the drain: a plain origin-bound result is written to its origin, a [dm-only] one to the DM and voice is told', () => {
 	it('three results through the drain', async () => {
-		const spoken: Array<{ result: string; note?: string }> = [];
 		setVoiceSessionOrigin(origin('place-1', { verify: async () => true }));
 		const plain = await delegate('drain probe plain');
 		const priv = await delegate('drain probe private');
 		setVoiceSessionOrigin(origin('place-2', { verify: async () => true, dmOnlyNote: 'It went to the DM, not the place.' }));
 		const noted = await delegate('drain probe noted');
 		setVoiceSessionOrigin(null);
-		const { writeFileSync } = await import('node:fs');
 		writeFileSync(join(RESULT_DIR, `${plain.taskId}.txt`), 'Three listings.');
 		writeFileSync(join(RESULT_DIR, `${priv.taskId}.txt`), '[dm-only]\nPrivate one.');
 		writeFileSync(join(RESULT_DIR, `${noted.taskId}.txt`), '[dm-only]\nPrivate two.');
@@ -165,6 +166,112 @@ describe('the drain: a plain origin-bound result is written to its origin, a [dm
 		assert.equal(spoken.find(s => s.result === 'Private one.')?.note, DM_ONLY_DELIVERY_NOTE, 'the default note when the adapter supplies none');
 		assert.equal(spoken.find(s => s.result === 'Private two.')?.note, 'It went to the DM, not the place.');
 		assert.equal(spoken.filter(s => s.result === 'Private one.').length, 1, 'spoken once: the DM file is claimed before the next tick');
+	});
+});
+
+describe('the drain, connected: an origin that refuses at delivery keeps the result to the DM and voice is told', () => {
+	it('refused and throwing verifies: the DM shape is written, no [channel:] file exists, the note accompanies the result', async () => {
+		setVoiceSessionOrigin(origin('place-refused', { verify: async () => false }));
+		const refused = await delegate('drain probe refused at delivery');
+		setVoiceSessionOrigin(origin('place-thrown', { verify: async () => { throw new Error('verifier down'); }, dmOnlyNote: 'Kept to the DM.' }));
+		const thrown = await delegate('drain probe thrown at delivery');
+		setVoiceSessionOrigin(null);
+		writeFileSync(join(RESULT_DIR, `${refused.taskId}.txt`), 'For the place, refused.');
+		writeFileSync(join(RESULT_DIR, `${thrown.taskId}.txt`), 'For the place, thrown.');
+		assert.ok(await until(() => [refused, thrown].every(t => proactiveFor(t.taskId).length > 0), 8000), readdirSync(RESULT_DIR).join(', '));
+		for (const [t, body] of [[refused, 'For the place, refused.'], [thrown, 'For the place, thrown.']] as const) {
+			const files = proactiveFor(t.taskId);
+			assert.equal(files.length, 1, files.join(', '));
+			assert.match(files[0], /\.to-fakechan\.txt$/, 'the owner DM on the same bridge');
+			assert.equal(readFileSync(join(RESULT_DIR, files[0]), 'utf-8'), `[dm-only]\n${body}`, 'no [channel:] line: nothing addresses the refused place');
+			assert.equal(_isDeliveredResult(files[0]), true, 'claimed: voice has spoken it');
+		}
+		assert.equal(spoken.find(s => s.result === 'For the place, refused.')?.note, DM_ONLY_DELIVERY_NOTE, 'voice is told the copy went to the DM');
+		assert.equal(spoken.find(s => s.result === 'For the place, thrown.')?.note, 'Kept to the DM.', 'with the adapter\'s wording when it supplies one');
+		for (const t of [refused, thrown]) rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+	});
+
+	it('_deliverOriginBoundResult: verified → the origin file and no note; a failed write still speaks', async () => {
+		setVoiceSessionOrigin(origin('place-ok', { verify: async () => true }));
+		const ok = await delegate('deliver probe ok');
+		setVoiceSessionOrigin(null);
+		const spoken: Array<{ result: string; note?: string }> = [];
+		const file = await _deliverOriginBoundResult(ok.taskId, 'to the place', voiceTaskOrigin(ok.taskId)!, (result, note) => spoken.push({ result, note }));
+		assert.match(file ?? '', /\.to-fakechan\.txt$/);
+		assert.equal(readFileSync(join(RESULT_DIR, file!), 'utf-8'), '[channel: place-ok]\nto the place');
+		assert.deepEqual(spoken, [{ result: 'to the place', note: undefined }]);
+		const realWrite = _resultFileOps.write;
+		_resultFileOps.write = (() => { throw new Error('disk full'); }) as typeof realWrite;
+		try {
+			assert.equal(await _deliverOriginBoundResult(ok.taskId, 'unwritten', voiceTaskOrigin(ok.taskId)!, (result, note) => spoken.push({ result, note })), null);
+		} finally {
+			_resultFileOps.write = realWrite;
+		}
+		assert.deepEqual(spoken[1], { result: 'unwritten', note: undefined }, 'spoken, with no claim about a written copy');
+		rmSync(join(TASK_DIR, `${ok.taskId}.txt`), { force: true });
+	});
+});
+
+describe('the untagged offline fallback keeps a [dm-only] the body carried', () => {
+	it('no origin, [channel:] + [dm-only]: the marker stays on top, so every bridge still cancels the redirect', async () => {
+		const file = await forwardOfflineVoiceResult('task-1700000000600', '[channel: !room:x]\nsecret for the owner', 1_800_000_600, true);
+		assert.equal(file, 'proactive-result-task-1700000000600-1800000600.txt', 'the untagged owner-DM shape');
+		const body = readFileSync(join(RESULT_DIR, file), 'utf-8');
+		assert.equal(body, '[dm-only]\n[channel: !room:x]\nsecret for the owner');
+		const py = spawnSync('python3', ['-c', [
+			'import sys; sys.path.insert(0, "src")',
+			'from result_markers import parse_markers',
+			`p = parse_markers(open(${JSON.stringify(join(RESULT_DIR, file))}, encoding="utf-8").read())`,
+			'print([a.kind for a in p.actions], repr(p.body))',
+		].join('\n')], { cwd: process.cwd(), encoding: 'utf-8' });
+		assert.equal(py.status, 0, py.stderr);
+		assert.equal(py.stdout.trim(), "['dm-only'] 'secret for the owner'", 'parse_markers sees no redirect: the owner DM, never !room:x');
+		const plain = await forwardOfflineVoiceResult('task-1700000000601', 'not private', 1_800_000_601, false);
+		assert.equal(readFileSync(join(RESULT_DIR, plain), 'utf-8'), 'not private', 'a body without the marker is written as before');
+	});
+});
+
+describe('result files are published whole: staged as a dotfile, renamed into place', () => {
+	const dotfiles = () => readdirSync(RESULT_DIR).filter(f => f.startsWith('.'));
+
+	it('each writer stages under a name no drain matches and the final name appears only through the rename', async () => {
+		setVoiceSessionOrigin(origin('place-atomic', { verify: async () => true }));
+		const ok = await delegate('atomic probe');
+		setVoiceSessionOrigin(null);
+		const realWrite = _resultFileOps.write, realRename = _resultFileOps.rename;
+		const writes: Array<{ path: string; finalExisted: boolean }> = [];
+		const renames: Array<{ from: string; to: string; staged: string }> = [];
+		_resultFileOps.write = ((path: string, body: string) => {
+			const final = path.split('/').pop()!.replace(/^\./, '').replace(/\.\d+\.\d+$/, '');
+			writes.push({ path, finalExisted: existsSync(join(RESULT_DIR, final)) });
+			realWrite(path, body);
+		}) as typeof realWrite;
+		_resultFileOps.rename = ((from: string, to: string) => {
+			renames.push({ from, to, staged: readFileSync(from, 'utf-8') });
+			realRename(from, to);
+		}) as typeof realRename;
+		try {
+			const cases: Array<[string, string]> = [
+				[forwardVoiceResultToOrigin(ok.taskId, 'to the place', voiceTaskOrigin(ok.taskId)!, 1_800_000_700), '[channel: place-atomic]\nto the place'],
+				[forwardVoiceResultToOwnerDm(ok.taskId, 'to the dm', 'fakechan', 1_800_000_701), '[dm-only]\nto the dm'],
+				[await forwardOfflineVoiceResult('task-1700000000702', 'to the owner', 1_800_000_702), 'to the owner'],
+			];
+			assert.equal(writes.length, 3);
+			assert.equal(renames.length, 3);
+			cases.forEach(([file, expected], i) => {
+				const final = join(RESULT_DIR, file);
+				assert.equal(writes[i].path.startsWith(join(RESULT_DIR, `.${file}.`)), true, `staged beside it as a dotfile: ${writes[i].path}`);
+				assert.doesNotMatch(writes[i].path, /\.txt$/, 'no drain glob or suffix filter matches the staged name');
+				assert.equal(writes[i].finalExisted, false, 'the final name did not exist while the body was being written');
+				assert.deepEqual(renames[i], { from: writes[i].path, to: final, staged: expected }, 'the rename publishes the complete body');
+				assert.equal(readFileSync(final, 'utf-8'), expected, 'the published content is unchanged');
+			});
+			assert.deepEqual(dotfiles(), [], 'no staged file is left behind');
+		} finally {
+			_resultFileOps.write = realWrite;
+			_resultFileOps.rename = realRename;
+		}
+		rmSync(join(TASK_DIR, `${ok.taskId}.txt`), { force: true });
 	});
 });
 

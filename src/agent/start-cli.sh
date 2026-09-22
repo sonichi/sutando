@@ -3,7 +3,15 @@
 # src/agent/<runtime>/cli/; every caller uses this dispatcher.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# Pure bash, no external dirname: this dispatcher is the boot chain's own
+# first line (startup.sh execs straight into it), run before anything has
+# confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../.." && pwd)"
+unset _self_dir
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy

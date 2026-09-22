@@ -42,6 +42,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tests" / "_helpers"))
+from os_probes import SWIFTC_SKIP_REASON, swiftc_usable  # noqa: E402
+
 SWIFT_CONFIG = ROOT / "src" / "Sutando" / "SutandoConfig.swift"
 MAIN_SWIFT = ROOT / "src" / "Sutando" / "main.swift"
 
@@ -49,26 +52,6 @@ MAIN_SWIFT = ROOT / "src" / "Sutando" / "main.swift"
 # (REVIEW.md `checks.hardcoded-paths.allow`), so these stand-ins cannot be
 # confused for a real host path.
 FAKE_PY = "/usr/fake/sutando-py"
-
-
-def _swiftc_usable() -> bool:
-    """swiftc is present AND actually runnable.
-
-    `shutil.which("swiftc")` on its own is not enough on macOS: /usr/bin/swiftc
-    is the CLT stub and exists even with no toolchain installed, so a
-    which-only guard would make this very test spawn the dialog it exists to
-    prevent. Ask xcode-select instead — a real binary that does not prompt.
-    """
-    if not shutil.which("swiftc"):
-        return False
-    if sys.platform != "darwin":
-        return True
-    try:
-        return subprocess.run(
-            ["xcode-select", "-p"], capture_output=True, timeout=10
-        ).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
 
 
 PROBE_SOURCE = r"""
@@ -138,7 +121,7 @@ print(result ?? "nil")
 """
 
 
-@unittest.skipUnless(_swiftc_usable(), "swiftc not usable on this host")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class ResolvePython(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

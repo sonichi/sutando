@@ -47,7 +47,7 @@ class FakeTmux:
             # The spawner's per-instance-sentinel safety check stays ON in the code
             # under test, so the fake answers it: one path per instance identity.
             return cp(argv, 0, "sentinel-" + (kw.get("env") or {})["SUTANDO_INSTANCE_ID"], "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             if self.launcher_fails:
                 return cp(argv, 1, "", "claude: not logged in")
             self.live.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
@@ -60,7 +60,7 @@ class FakeTmux:
 
     def launches(self):
         return [(a, e) for a, e in zip(self.calls, self.envs)
-                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+                if a[0] == "bash" and a[1].endswith("launch-worker-session.sh")]
 
     def probes(self):
         return [a for a in self.calls if len(a) > 3 and a[3] == "has-session"]

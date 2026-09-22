@@ -2,7 +2,10 @@
 # src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core
 # tmux session. Single source of truth for the "how to start Claude Code" command,
 # so startup.sh + Sutando.app's Restart Core menu can both invoke it without
-# duplicating the launch arguments.
+# duplicating the launch arguments. Core-only: a pool worker's own launch is a
+# separate script that sources the same session-launch.sh mechanics this file
+# does but owns none of the core-specific ceremony below (restart, notifier,
+# monitor, shutdown sentinel, attach/heal). Neither script names the other.
 #
 # Usage:
 #   bash src/agent/claude/cli/start-cli.sh           # start (or attach if running)
@@ -17,31 +20,28 @@
 set -e
 
 # This script lives at src/agent/claude/cli/ — four levels under the repo root.
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# Pure bash, no external dirname: this is the launcher's own first line, run
+# before anything has confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../../../.." && pwd)"
+unset _self_dir
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
-
-# Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
-# fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
-# Xcode-CLT stub, which returns nothing, so the onboarding seed below (which runs
-# an inline python3 to write hasCompletedClaudeInChromeOnboarding) would silently
-# no-op and the detached core hangs at the Chrome prompt — the exact bug the seed
-# exists to prevent. Prefer SUTANDO_PY (set by launch-sutando.sh), else the
-# bundle-vendored relocatable python (`<engine>/runtime/python`, i.e. REPO/../runtime),
-# else system python3.
-# Single-sourced in scripts/python-binary.sh (see there for why the bare-name
-# fallback this replaced was the CLT-dialog trigger).
-# Source OPTIONALLY. tests/start-cli-claude-config-dir.test.sh pins a contract
-# older than this change: a checkout without the M0 helper must still spawn
-# claude ("helper missing -> silent fallback"). A hard exit here broke that, so
-# the guard lives at each call site instead — which is what CR #2599 actually
-# needs (no `"" -c ...`), without turning a missing helper into a launch failure.
-PY=""
-if [ -r "$REPO/scripts/python-binary.sh" ]; then
-  . "$REPO/scripts/python-binary.sh"
-  PY="$(resolve_python "$REPO")"
+# Named check before sourcing: an unexplained "No such file or directory" from
+# a bare `.` here reads as a broken launcher, not a fixture/checkout missing
+# this file's own sibling — a real trap for a scratch-repo test fixture.
+if [ ! -r "$REPO/src/agent/claude/cli/session-launch.sh" ]; then
+  echo "start-cli.sh: missing its sibling src/agent/claude/cli/session-launch.sh — refusing to start (a scratch checkout/fixture must copy it alongside this file)" >&2
+  exit 1
 fi
+# shellcheck source=session-launch.sh
+. "$REPO/src/agent/claude/cli/session-launch.sh"
+
+resolve_claude_py
 # shellcheck source=skill-manifest-config.sh
 [ -r "$REPO/src/skill-manifest-config.sh" ] && . "$REPO/src/skill-manifest-config.sh"
 
@@ -59,15 +59,10 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
 NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
-# A pool worker runs THIS launcher under its own session/instance env; the
-# owner-facing surfaces (remote control, Chrome) stay with the canonical core.
-WORKER_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
-[ -n "$WORKER_INSTANCE" ] && SURFACE_ARGS=()
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
-[ -n "$WORKER_INSTANCE" ] && BOOT_PROMPT="/startup --worker"
 SESSION_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_RESUME:-}" ]; then
   SESSION_ARGS=(--resume "$SUTANDO_CLAUDE_RESUME")
@@ -86,18 +81,11 @@ fi
 # Snapshot what we INHERITED before the export below overwrites it: the
 # in-session restart guard must not read the marker this script sets itself.
 CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
-# A worker is not the canonical core: the marker is what makes a session claim
-# the core's bootstrap, so exporting it would make every worker a second core.
-if [ -n "$WORKER_INSTANCE" ]; then
-  unset SUTANDO_CORE_SESSION
-else
-  export SUTANDO_CORE_SESSION=1
-fi
+export SUTANDO_CORE_SESSION=1
 
 # Called ONLY from paths that create or heal a core. Attaching to a live one
 # must not clear: that would cancel a `--stop-only` still waiting to be observed.
 clear_shutdown_sentinel() {
-  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   if [ -n "$PY" ]; then
     "$PY" "$REPO/src/shutdown.py" clear >/dev/null \
       || echo "start-cli.sh: shutdown.py clear failed — the intake gate may hold tasks" >&2
@@ -113,7 +101,6 @@ _SENTINEL_STASH=""
 # restore-after-exec below unreachable dead code.
 shopt -s execfail
 stash_shutdown_sentinel() {
-  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   _SENTINEL_STASH=""
   [ -n "$PY" ] || return 0
   _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
@@ -123,7 +110,6 @@ stash_shutdown_sentinel() {
 }
 # Only reachable when exec FAILED: exec never returns on success.
 restore_shutdown_sentinel() {
-  [ -z "$WORKER_INSTANCE" ] || return 0   # the gate belongs to the core alone
   [ -n "$_SENTINEL_STASH" ] && [ -f "$_SENTINEL_STASH" ] || return 0
   _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
   if [ -n "$_sp" ]; then
@@ -135,49 +121,9 @@ restore_shutdown_sentinel() {
   _SENTINEL_STASH=""
 }
 export SUTANDO_CORE_RUNTIME=claude
-CORE_ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude)
-# A server born from a core launch carries the marker in its global env and
-# every new session inherits it; omitting -e is not an override, an empty is.
-if [ -n "$WORKER_INSTANCE" ]; then
-  CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=)
-else
-  CORE_ENV_ARGS+=(-e SUTANDO_CORE_SESSION=1)
-fi
-[ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
-[ -n "${SUTANDO_TMUX_SESSION:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
-[ -n "$WORKER_INSTANCE" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$WORKER_INSTANCE")
-[ -n "${SUTANDO_TASKS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
-# A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
-# workspace from it: unforwarded, its results/ and state/ land under deliveries/.
-[ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
-# The other two halves of the same seam: what the inbox holds, and where answers
-# go. Derived in-session they become deliveries/results, which no bridge drains.
-[ -n "${SUTANDO_INBOX_KIND:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
-[ -n "${SUTANDO_RESULTS_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
-# Third half of that seam: without the resolver a worker reads the sentinel
-# itself, so an unforwarded one is the zero-byte read, not a missing option.
-[ -n "${SUTANDO_INBOX_RESOLVER:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER=$SUTANDO_INBOX_RESOLVER")
-[ -n "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER_TIMEOUT=$SUTANDO_INBOX_RESOLVER_TIMEOUT")
-# The worker gate `/startup --worker` runs, named by the spawner: this launcher
-# is the core's, so it forwards the path and never knows which skill owns it.
-[ -n "${SUTANDO_WORKER_BOOTSTRAP:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKER_BOOTSTRAP=$SUTANDO_WORKER_BOOTSTRAP")
-# The done-flag writer, same seam: tmux hands a new session the SERVER's env, so
-# an unforwarded writer leaves the hook complete but never reached.
-[ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_POOL_DELIVERY_SCRIPT=$SUTANDO_POOL_DELIVERY_SCRIPT")
-# A worker session's cwd is the spawner's --cwd, which need not be the repo, and
-# its PATH python3 may be the CLT stub: name both absolutely from here instead.
-if [ -n "$WORKER_INSTANCE" ]; then
-  CORE_ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
-  # Canonical + executable, or EMPTY: a relative/`..` path resolves against the
-  # worker's cwd, and only an explicit -e overrides a stale server-global value.
-  WORKER_PY=""
-  if [ -n "$PY" ] && [ -x "$PY" ]; then
-    _pyd="${PY%/*}"; [ "$_pyd" = "$PY" ] && _pyd="."
-    _pyd="$(cd "$_pyd" 2>/dev/null && pwd -P)" && WORKER_PY="$_pyd/${PY##*/}"
-    [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
-  fi
-  CORE_ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
-fi
+ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=1)
+[ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
+[ -n "${SUTANDO_TMUX_SESSION:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
 # SAME reason as above (tmux takes the server env, not this shell's). Without
 # this the core's own resolve_workspace() (proactive-loop, task scripts) misses
@@ -185,386 +131,50 @@ fi
 # gateway window (which gets it explicitly) resolves to that path: a split-brain
 # where the two watch different tasks/ dirs. Companion to the resolver change
 # (#2094); conditional so non-bundled/OSS installs are untouched.
-[ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
+[ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 # Product deployments can disable autonomous repo development while keeping
 # owner tasks, health checks, and the task watcher active. Explicitly forward
 # the override because tmux may use an older server environment.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
-  CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+  ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
-# Any installed skill's manifest.json "config" block, forwarded like every var
-# above. Set-ness wins, not non-emptiness: an explicit empty value (a product
-# deployment disabling a feature) must not be re-filled from a manifest.
-# Records are NUL-framed and the key is validated by the emitter; re-checked
-# here so a bad key can never reach `export` under `set -e`.
-if declare -F skill_manifest_config_pending >/dev/null; then
-  _mc_seen=" "
-  while IFS= read -r -d '' _mcrec; do
-    _mck=${_mcrec%%=*}
-    _mcv=${_mcrec#*=}
-    [ -n "$_mck" ] || continue
-    case "$_mck" in
-      [!A-Za-z_]* | *[!A-Za-z0-9_]*) continue ;;
-    esac
-    case "$_mc_seen" in
-      *" $_mck "*)
-        # Every other rejection in this path reports itself; a duplicate must
-        # too, or the losing skill's value vanishes by glob order alone.
-        printf 'skill-manifest-config: %s declared by more than one skill; keeping the first\n' \
-          "$_mck" >&2
-        continue
-        ;;
-    esac
-    _mc_seen="$_mc_seen$_mck "
-    if [ "${!_mck+x}" = x ]; then
-      CORE_ENV_ARGS+=(-e "$_mck=${!_mck}")
-    else
-      export "$_mck=$_mcv"
-      CORE_ENV_ARGS+=(-e "$_mck=$_mcv")
-    fi
-  done < <(skill_manifest_config_pending "$REPO" "$PY")
-  unset _mc_seen _mcrec
-fi
-# Route the core through the credential proxy when one is live (quota
-# telemetry, #2211/#2288). startup.sh exports ANTHROPIC_BASE_URL for cores
-# it launches, but a start-cli-launched core (app restart-intercept,
-# --restart, supervisor) never runs startup.sh — the proxy sits idle,
-# quota-state.json goes stale, and the proactive loop's budget governor
-# runs blind. Guarded twice: honor a caller-set ANTHROPIC_BASE_URL, and
-# only wire up when a LISTENer actually holds the proxy port — never point
-# the core at a dead port (the #1086/#1291 failure class; same
-# LISTEN-not-any-socket rule as src/restart.sh).
-proxy_listener_up() {
-  lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
-}
-if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-  # A loaded launchd job means the proxy is EXPECTED on this host even when its
-  # listener hasn't bound yet (same loaded-job check as startup.sh/restart.sh).
-  PROXY_EXPECTED=""
-  if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
-    PROXY_EXPECTED=1
-  fi
-  if [ -n "$PROXY_EXPECTED" ]; then
-    # Bounded wait (~10s): a supervised proxy can bind seconds after the core on
-    # a cold boot, and a one-shot check would leave the core unrouted for life.
-    for _ in $(seq 1 20); do
-      proxy_listener_up && break
-      sleep 0.5
-    done
-  fi
-  if proxy_listener_up; then
-    export ANTHROPIC_BASE_URL=http://localhost:7846
-  elif [ -n "$PROXY_EXPECTED" ]; then
-    echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — core runs unrouted this session (no proxy protection, no quota telemetry)" >&2
-  fi
-fi
+forward_skill_manifest_config
+ENV_ARGS+=(${SKILL_MANIFEST_ENV_ARGS[@]+"${SKILL_MANIFEST_ENV_ARGS[@]}"})
+resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
-  CORE_ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
+  ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
-# dead port omits, caller preset wins) against the REAL CORE_ENV_ARGS under
+# dead port omits, caller preset wins) against the REAL ENV_ARGS under
 # a stubbed lsof, without touching tmux. No production caller passes this.
 if [ "${1:-}" = "--print-core-env" ]; then
-  printf '%s\n' ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"}
+  printf '%s\n' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   exit 0
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent. Below
-# the probe exit: --print-core-env is a pure read and must not write settings.
-bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
-
-tmux_available() {
-  command -v tmux > /dev/null 2>&1
-}
-
-tmux_session_exists() {
-  tmux_available || return 1
-  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
-}
-
-# A managed core is alive when the tmux session EXISTS and a `claude --name
-# sutando-core` process is running under it. Do NOT gate on the pane's current
-# foreground command: a healthy core that is mid-tool shows the pane cmd as
-# bash/python3/node/etc, so a pane-command match would falsely report it dead
-# and (on --restart) tear down a live core mid-task. Existence + the core claude
-# process is the correct liveness signal.
-tmux_core_session_running() {
-  tmux_session_exists || return 1
-  core_claude_running
-}
-
-core_claude_pids() {
-  # -a: BSD/macOS pgrep excludes the caller's ANCESTORS by default, so when this
-  # script runs from inside the core (startup.sh via the core's own Bash tool)
-  # the live core is invisible → "core Claude is gone" → heal spawns a duplicate
-  # task consumer. `read -r pid _` tolerates procps -a's "pid cmdline" output.
-  pgrep -ax claude 2>/dev/null | while read -r pid _; do
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
-    esac
-  done
-}
-
-core_claude_running() {
-  [ -n "$(core_claude_pids)" ]
-}
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Below the probe
+# exit: --print-core-env is a pure read and must not write settings.
+install_claude_personal_hook
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
 #     script's cwd), exactly as before. Zero behavior change for OSS installs.
 #   - Set (e.g. Sutando.app exports SUTANDO_CLAUDE_WORKING_DIR=$HOME/.sutando/repo):
-#     anchor the core's CWD there instead. Claude Code slugs its project /
-#     auto-memory dir off the cwd, so a stable cwd (not $REPO, which moves across
-#     upgrades / app bundles) keeps that project + memory continuous.
-#     SCOPE: this sets ONLY the cwd. It does NOT relocate CLAUDE_CONFIG_DIR
-#     (sessions / memory / config) — that is resolved independently from
-#     sutando.config's `workspace.path` (read via scripts/sutando-config.sh,
-#     below). If $REPO is a moving bundle path, set `workspace.path` to a stable
-#     location too; this env var alone won't move CLAUDE_CONFIG_DIR off $REPO.
-# Applied uniformly via a tmux `-c` arg array (and a plain `cd` on the no-tmux
-# fallback) so every launch branch agrees. The ${arr[@]+...} expansions below
-# keep the empty (unset) case safe on bash 3.2 under `set -u`, same pattern as
-# SETTINGS_ARGS.
-#
-# CANONICALIZE ONCE, REUSE EVERYWHERE: Claude Code keys the folder-trust dialog
-# (and the project/auto-memory slug) by the process's ABSOLUTE cwd — getcwd(),
-# with symlinks resolved. So resolve the override to its physical absolute path
-# here and re-export it; the SAME value then feeds mkdir, tmux `-c` / the no-tmux
-# `cd`, AND the trust-dialog seed in the onboarding block below. A raw value with
-# a leading ~, a relative segment, or a symlinked parent would otherwise seed
-# projects[<wrong key>] in .claude.json, and the detached no-TTY core would still
-# hang at the trust prompt. Expand a leading ~, create the dir (fail loud with a
-# scoped message if we can't — better than chdir'ing into the wrong place under
-# set -e's raw error), then resolve via `cd … && pwd -P`.
-CWD_ARGS=()
-if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
-  export SUTANDO_CLAUDE_WORKING_DIR
-  CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
-  echo "  ✓ core working dir: $SUTANDO_CLAUDE_WORKING_DIR"
-fi
+#     anchor the core's CWD there instead — see resolve_claude_cwd_args for why.
+resolve_claude_cwd_args
 
-# Resolve workspace-scoped CLAUDE_CONFIG_DIR. The interactive `claude-sutando`
-# shell function does the same per-invocation; this is the machine-spawn
-# equivalent so the tmux-wrapped core process writes sessions / memory / state
-# into the workspace tree rather than the global ~/.claude/.
-#
-# Resolve-or-refuse is shared with src/startup.sh; only the seeding is ours.
-source "$REPO/src/claude_config_dir.sh"
-if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
-    mkdir -p "$_ccd"
-    export CLAUDE_CONFIG_DIR="$_ccd"
-    echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
-    # Onboarding-state seed — fixes "the core re-runs the 'let's get started'
-    # flow on every restart". Claude Code gates the welcome/theme flow on
-    # `hasCompletedOnboarding` in $CLAUDE_CONFIG_DIR/.claude.json. A
-    # workspace-scoped config dir starts without it, and the core runs
-    # detached/non-interactively (-- below) so it never *completes* onboarding
-    # to persist the flag — every launch dead-ends at the welcome flow the
-    # moment the user attaches the Core CLI. Seed only that flag (merge — never
-    # clobber oauthAccount/projects/mcpServers/credentials), carrying `theme`
-    # from the user's global ~/.claude.json when present so the theme picker is
-    # skipped too. Idempotent + atomic. When SUTANDO_CLAUDE_WORKING_DIR is set we
-    # ALSO pre-accept the folder-trust dialog for that ONE directory (trust-seed
-    # in the python below) — otherwise a fresh node's first detached launch
-    # dead-ends at "Do you trust the files in this folder?", which
-    # --dangerously-skip-permissions does NOT bypass, and the core hangs with no
-    # TTY to answer it. Gated on the opt-in env var so we only ever trust the dir
-    # the operator explicitly chose, never arbitrary paths. We still do NOT touch
-    # the dangerous-mode acknowledgement gate on a normal start — that's the
-    # user's to accept. EXCEPTION: when SUTANDO_ACCEPT_BYPASS_PERMISSIONS=1 is set
-    # (a deliberately detached, no-TTY core that explicitly opted in — the bundled
-    # desktop's launch-sutando.sh sets it), we ALSO seed
-    # skipDangerousModePermissionPrompt below, because there is no TTY to answer
-    # that prompt and the core hangs forever otherwise (owner-hit 2026-07-14).
-    # Dedicated opt-in (NOT the broader SUTANDO_CLAUDE_WORKING_DIR trust gate) so
-    # only the truly-headless bundled core auto-accepts — the interactive
-    # terminal-server pane still prompts the user to accept it themselves.
-    # This is the single launch chokepoint (Sutando.app's launchCore, the
-    # terminal-server Core CLI pane, and src/startup.sh all exec this script),
-    # so seeding here covers every path.
-    if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
-import json, os
-ccd = os.environ["_ccd"]
-target = os.path.join(ccd, ".claude.json")
-try:
-    cfg = json.load(open(target)) if os.path.exists(target) else {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-except Exception:
-    cfg = {}
-glob = {}
-try:
-    with open(os.path.expanduser("~/.claude.json")) as f:
-        g = json.load(f)
-        if isinstance(g, dict):
-            glob = g
-except Exception:
-    pass
-changed = False
-chrome_seeded = False
-if cfg.get("hasCompletedOnboarding") is not True:
-    cfg["hasCompletedOnboarding"] = True
-    changed = True
-# Claude-in-Chrome onboarding seed. The core launches with --chrome (see the
-# CORE_CMD below), which on first run in a fresh scoped config shows a "Claude
-# in Chrome" acknowledgement prompt ("Enter to confirm · Esc to cancel").
-# --dangerously-skip-permissions does NOT bypass it, so a detached no-TTY core
-# hangs there — process alive but never reaching /schedule-crons, and the
-# desktop onboarding "Say hello" local probe times out with no reply
-# (owner-hit 2026-07-28, fresh install). Pre-accept it the same way as
-# hasCompletedOnboarding: Claude Code records acceptance as
-# hasCompletedClaudeInChromeOnboarding=true in .claude.json.
-if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
-    cfg["hasCompletedClaudeInChromeOnboarding"] = True
-    changed = True
-    chrome_seeded = True
-if cfg.get("theme") is None and glob.get("theme") is not None:
-    cfg["theme"] = glob["theme"]
-    changed = True
-# Trust-seed for the explicitly-configured working dir. Claude Code keys the
-# folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it for a custom cwd, so the detached core would hang on
-# the prompt. Only pre-trust the one dir the operator chose (env-gated).
-cwd = os.environ.get("_cwd") or ""
-trusted_dir = None
-if cwd:
-    projects = cfg.get("projects")
-    if not isinstance(projects, dict):
-        projects = cfg["projects"] = {}
-    entry = projects.get(cwd)
-    if not isinstance(entry, dict):
-        entry = projects[cwd] = {}
-    if entry.get("hasTrustDialogAccepted") is not True:
-        entry["hasTrustDialogAccepted"] = True
-        changed = True
-        trusted_dir = cwd
-# Dangerous-mode seed (env-gated, detached-core only). The core launches with
-# --dangerously-skip-permissions; on first run in a fresh scoped config Claude
-# Code shows a "Bypass Permissions mode / Yes, I accept" acknowledgement prompt.
-# --dangerously-skip-permissions does NOT bypass THAT prompt, so a detached
-# no-TTY core (the bundled desktop app) hangs on it forever — process alive but
-# never reaching /schedule-crons (owner-hit 2026-07-14 on the mini; distinct from
-# the folder-trust dialog above). Pre-accept it by seeding
-# skipDangerousModePermissionPrompt in <ccd>/settings.json. Gated on the DEDICATED
-# SUTANDO_ACCEPT_BYPASS_PERMISSIONS opt-in (set only by the bundled desktop's
-# launch-sutando.sh) — NOT the broader SUTANDO_CLAUDE_WORKING_DIR trust gate — so
-# only the truly-headless bundled core auto-accepts; the interactive terminal-server
-# pane (also a working-dir launch) still prompts the user. Merge — never clobber
-# existing settings. Idempotent + atomic. Empirically verified on claude v2.1.209
-# (the bundled version): accepting the prompt writes exactly this settings.json key.
-if os.environ.get("_accept_bypass"):
-    settings_path = os.path.join(ccd, "settings.json")
-    try:
-        st = json.load(open(settings_path)) if os.path.exists(settings_path) else {}
-        if not isinstance(st, dict):
-            st = {}
-    except Exception:
-        st = {}
-    if st.get("skipDangerousModePermissionPrompt") is not True:
-        st["skipDangerousModePermissionPrompt"] = True
-        s_tmp = settings_path + ".tmp"
-        with open(s_tmp, "w") as f:
-            json.dump(st, f, indent=2)
-        os.replace(s_tmp, settings_path)
-        print("  ✓ dangerous-mode-seed: skipDangerousModePermissionPrompt set in settings.json")
-if changed:
-    tmp = target + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, target)
-    print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
-    if chrome_seeded:
-        print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
-    if trusted_dir:
-        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
-PY
-    fi
-else
-  _ccd_rc=$?
-  # 2 = caller already scoped the config dir; nothing to seed, and the core
-  # still reaches the intended credential store.
-  [ "$_ccd_rc" = "2" ] || exit 1
-  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
-fi
+# Resolve workspace-scoped CLAUDE_CONFIG_DIR and seed onboarding/trust/bypass
+# state — see session-launch.sh for the full rationale. This is the single
+# launch chokepoint (Sutando.app's launchCore, the terminal-server Core CLI
+# pane, and src/startup.sh all exec this script), so seeding here covers
+# every core path.
+resolve_claude_config_dir_and_seed
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
 # default. An ambient env pin is indistinguishable from a deliberate choice.
-
-# ---- core --settings hooks (AskUserQuestion guard always; obs when enabled) --
-# One `--settings` flag carries every hook the core needs (multiple --settings
-# flags are undocumented / last-wins, so we compose into a single JSON):
-#
-#   * AskUserQuestion guard — ALWAYS registered. The core runs headless (no
-#     interactive user), so an AskUserQuestion tool call would block the session
-#     forever; a PreToolUse `deny` short-circuits it (hooks/skip-ask-user-question.py).
-#   * obs collector hooks — added to the SAME JSON only when an export endpoint
-#     is set, so PreToolUse/PostToolUse only fork obs-hook.sh on the tool-call
-#     hot path when capture is actually on. Endpoint comes from
-#     $SUTANDO_OBS_ENDPOINT (exported so the hook resolves it at hook-time).
-#
-# The JSON is built by node helpers, NOT shell string interpolation: hand-rolled
-# interpolation broke when $REPO held a space (split the command) or a `"` (broke
-# the JSON). The helpers POSIX single-quote the path inside the command and
-# JSON-escape the payload. The ${arr[@]+...} guard keeps the empty array safe on
-# bash 3.2 under `set -u`.
-OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
-export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
-
-SETTINGS_ARGS=()
-if ! command -v node > /dev/null 2>&1; then
-  echo "core hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
-else
-  # Obs hooks are optional; the guard is not. Build the obs blob first (empty
-  # string when capture is off) and let the composer array-concat it with the
-  # always-on guard.
-  OBS_JSON=""
-  if [ -z "$OBS_ENDPOINT" ]; then
-    echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
-  else
-    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
-    if [ -n "$OBS_JSON" ]; then
-      echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
-    else
-      echo "obs hooks: settings build failed — capture disabled this session" >&2
-    fi
-  fi
-  CORE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py")"
-  if [ -n "$CORE_SETTINGS_JSON" ]; then
-    SETTINGS_ARGS=(--settings "$CORE_SETTINGS_JSON")
-    echo "core hooks: AskUserQuestion guard registered (PreToolUse deny — headless core can't answer it)"
-  else
-    echo "core hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
-  fi
-fi
-
-# Optional feature-owned task handler.  The adapter injects the capability at
-# the edge; the generic watcher remains unaware of concrete skills and falls
-# back to its legacy TASK_FILE event whenever this script is absent/unhandled.
-# ---- obs metering (CC native OTel token + cost) -----------------------------
-# Hooks give obs events but carry NO tokens. Claude Code's OTel
-# `claude_code.token.usage` / `cost.usage` metrics are the authoritative usage
-# source, so when an export endpoint is set we also turn on CC telemetry and
-# point its OTLP exporter at the collector (which serves /v1/metrics). Enable
-# ONLY metrics — logs/traces stay off so hooks remain the sole obs source (no
-# duplicate events). JSON OTLP so the collector parses it without protobuf.
-# Metrics may use the default-on local collector without enabling plaintext
-# prompt/tool hooks. An explicit SUTANDO_OBS_ENDPOINT retains the legacy
-# combined behavior. Honor any pre-set OTEL_* so a real backend is not replaced.
-METRICS_ENDPOINT="${SUTANDO_OBS_METRICS_ENDPOINT:-$OBS_ENDPOINT}"
-if [ -n "$METRICS_ENDPOINT" ] && [ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
-  export CLAUDE_CODE_ENABLE_TELEMETRY=1
-  export OTEL_METRICS_EXPORTER=otlp
-  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
-  export OTEL_EXPORTER_OTLP_ENDPOINT="$METRICS_ENDPOINT"
-  export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}" # ms; 10s (CC default 60s)
-  echo "obs metering: → $METRICS_ENDPOINT/v1/metrics (CC OTel token+cost, every ${OTEL_METRIC_EXPORT_INTERVAL}ms)"
-fi
+resolve_claude_settings_args
+apply_claude_obs_metering
 
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
@@ -644,31 +254,31 @@ if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SE
   exit 1
 fi
 if [ -n "$RESTART_REQUESTED" ]; then
-  log_restart_attempt "begin (session=$(tmux_session_exists && echo up || echo none) core=$(core_claude_running && echo up || echo none))"
-  if tmux_session_exists || core_claude_running; then
+  log_restart_attempt "begin (session=$(claude_named_tmux_session_exists && echo up || echo none) core=$(claude_named_process_running && echo up || echo none))"
+  if claude_named_tmux_session_exists || claude_named_process_running; then
     echo "Killing existing $SESSION session..."
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    core_claude_pids | while read -r pid; do
+    claude_named_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
     # The kill is already issued, so this wait can only be bounded, never
     # abandoned: a SessionEnd handoff takes longer than a few seconds.
     GRACE_S="${SUTANDO_RESTART_GRACE_S:-90}"
     _ticks=$(( GRACE_S * 5 ))
-    while [ "$_ticks" -gt 0 ] && { tmux_session_exists || core_claude_running; }; do
+    while [ "$_ticks" -gt 0 ] && { claude_named_tmux_session_exists || claude_named_process_running; }; do
       sleep 0.2; _ticks=$(( _ticks - 1 ))
     done
-    if tmux_session_exists || core_claude_running; then
+    if claude_named_tmux_session_exists || claude_named_process_running; then
       if [ -n "$FORCE_RESTART" ]; then
         # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
         echo "  core still alive ${GRACE_S}s after SIGTERM — force-restart escalating to SIGKILL" >&2
         tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-        core_claude_pids | while read -r pid; do
+        claude_named_pids | while read -r pid; do
           [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
         done
         for _ in $(seq 1 15); do
-          tmux_session_exists || core_claude_running || break
+          claude_named_tmux_session_exists || claude_named_process_running || break
           sleep 0.2
         done
       else
@@ -683,7 +293,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
     fi
     # After force escalation, still alive → hard abort rather than stack a second
     # core on a survivor (double task-consumer) or exit-0 a half-torn-down state.
-    if tmux_session_exists || core_claude_running; then
+    if claude_named_tmux_session_exists || claude_named_process_running; then
       echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
       echo "    Investigate the stuck pid; rerun once it's gone." >&2
       log_restart_attempt "abort: core survived SIGKILL"
@@ -693,39 +303,6 @@ if [ -n "$RESTART_REQUESTED" ]; then
   fi
   log_restart_attempt "kill-complete; creating fresh core"
 fi
-
-# Sutando-friendly tmux defaults (mouse scrollback + alt-screen wheel fix).
-# Defined as a function so it runs on EVERY invocation — including the
-# "already running → attach" path below. 2026-06-11: Chi's scroll broke
-# again because the live server (started 2026-05-30) somehow lacked these
-# options even though #688/#1304 predate it; rather than depend on the
-# session-creation path alone, re-apply on every start/attach/restart so
-# any rerun of this script heals the server. Idempotent: re-applying to an
-# already-configured server is a no-op.
-apply_tmux_defaults() {
-  command -v tmux > /dev/null 2>&1 || return 0
-  tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
-  tmux -S "$TMUX_SOCKET" set-option -g mouse on 2>/dev/null || true
-  # Clear any stale model pin. `setenv -u` with no -t hits tmux's DEFAULT session,
-  # which on a multi-session socket is not necessarily the core's, so target each.
-  tmux -S "$TMUX_SOCKET" setenv -gu SUTANDO_CORE_MODEL 2>/dev/null || true
-  _pin_sessions="$(tmux -S "$TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null || true)"
-  while IFS= read -r _pin_sess; do
-    [ -n "$_pin_sess" ] || continue
-    tmux -S "$TMUX_SOCKET" setenv -t "=$_pin_sess" -u SUTANDO_CORE_MODEL 2>/dev/null || true
-  done <<< "$_pin_sessions"
-  # Wheel-scroll fix (sutando-plus#46, re-broken 2026-06-11): predicate on
-  # mouse_any_flag, NOT alternate_on. Claude Code 2.1.150 stopped using the
-  # alternate screen, so the old alt-screen predicate forwarded wheel events
-  # to an app that never requested mouse input — they were silently dropped
-  # and scrollback became unreachable. mouse_any_flag asks the question we
-  # actually care about: does the pane app WANT mouse events? If yes (vim
-  # with mouse=a, future Claude Code versions), forward them; if no, enter
-  # copy-mode so WheelUp always reaches tmux scrollback regardless of the
-  # app's screen mode. WheelDown passes through so normal scrolling works.
-  tmux -S "$TMUX_SOCKET" bind -n WheelUpPane if-shell -F -t = '#{mouse_any_flag}' 'send-keys -M' 'copy-mode -e; send-keys -M' 2>/dev/null || true
-  tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
-}
 
 # Agent Shepherd M1 monitor (PR #2100). Watch the CANONICAL sutando-core session
 # for blocked-on-input gates the no-TTY core can't answer (/login, a mid-session
@@ -758,16 +335,13 @@ watcher_session_exists() {
 # for once tonight (an unscoped pkill collaterally killed other sessions'
 # production watchers). One instance's liveness must never be answered by
 # another instance's process.
+# The session is healthy while its supervisor runs: in standby it has no
+# notifier or watcher child by design, so a sentinel-pid test would read a
+# correctly idle session as dead and replace it on every rerun.
 watcher_process_alive() {
-  local sentinel pid ws
-  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
-  [ -n "$ws" ] || return 1
-  # shellcheck source=../../../watcher_sentinel.sh
-  . "$REPO/src/watcher_sentinel.sh" || return 1
-  sentinel="$(sentinel_path_for "$ws/state")" || return 1
-  [ -f "$sentinel" ] || return 1
-  pid="$(cat "$sentinel" 2>/dev/null)"
-  [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && kill -0 "$pid" 2>/dev/null
+  local pane_pid
+  pane_pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [ -n "$pane_pid" ] && [ "$pane_pid" -eq "$pane_pid" ] 2>/dev/null && kill -0 "$pane_pid" 2>/dev/null
 }
 
 # The live core's own window and pane, read from the pane that runs it: a heal
@@ -775,7 +349,7 @@ watcher_process_alive() {
 resolve_core_target() {
   local pid row
   CORE_PANE=""
-  for pid in $(core_claude_pids); do
+  for pid in $(claude_named_pids); do
     row="$(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{window_index} #{pane_id} #{pane_pid}' 2>/dev/null \
       | awk -v p="$pid" '$3 == p {print $1, $2; exit}')"
     if [ -n "$row" ]; then
@@ -789,9 +363,9 @@ resolve_core_target() {
 
 # Standby delivery path: pastes a queued task into the core pane only when the
 # pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
+# Core-only: a pool worker never runs a standby/supervisor pairing (#4477/#4585).
 ensure_task_notifier() {
   local expected_version active_version version_files notifier_py
-  [ -z "$WORKER_INSTANCE" ] || return 0   # the notifier serves the core alone
   resolve_core_target
   # The launcher-resolved interpreter or nothing: a bare PATH python3 on a Mac
   # without the developer tools is the CLT stub, and the supervisor would run it every second.
@@ -805,6 +379,8 @@ ensure_task_notifier() {
     "$NOTIFIER_SCRIPT"
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
   # itself and fswatches it for changes, so the launcher forwards only a genuine
@@ -832,6 +408,12 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # Standby/grace-period knobs: unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
@@ -843,9 +425,9 @@ ensure_task_notifier() {
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
 
+# Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
-  [ -z "$WORKER_INSTANCE" ] || return 0   # the supervisor watches the core
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
@@ -879,9 +461,16 @@ ensure_core_monitor() {
     # also makes $! the loop's own pid, so the pidfile can actually stop it.
     # Loop only while the interpreter and script exist, and stop if sleep fails:
     # with them gone (engine dir removed) `while true` would spin at full CPU.
+    # And stop once the core session this loop relays for has been gone for three
+    # checks: a scratch launch (a test, a PR witness) otherwise leaves its loop
+    # running for good, one per launch, since the pidfile is per workspace.
     if [ -n "$PY" ]; then
-      bash -c 'while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
-        relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" \
+      bash -c 'miss=0; while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do
+        if [ -n "$6" ] && command -v tmux > /dev/null 2>&1; then
+          if tmux -S "$6" has-session -t "=$7" 2> /dev/null; then miss=0; else miss=$((miss + 1)); [ "$miss" -lt 3 ] || exit 0; fi
+        fi
+        "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
+        relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" "$TMUX_SOCKET" "$SESSION" \
         >> /tmp/core-supervisor-relay.log 2>&1 < /dev/null &
       echo $! > "$relay_pid_file"
     fi
@@ -890,10 +479,10 @@ ensure_core_monitor() {
 
 # Already running — attach if interactive, else exit cleanly. A managed core is
 # live when the tmux session exists AND a `claude --name sutando-core` process
-# runs under it (tmux_core_session_running). Re-running the script is idempotent:
-# we attach/no-op instead of spawning a second core (→ duplicate task consumers).
-if tmux_core_session_running; then
-  apply_tmux_defaults
+# runs under it. Re-running the script is idempotent: we attach/no-op instead
+# of spawning a second core (→ duplicate task consumers).
+if claude_named_session_running; then
+  apply_claude_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
   ensure_task_notifier
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
@@ -920,13 +509,13 @@ fi
 # claude seen here is either still dying (the SIGKILL escalation above should
 # have reaped it) or one a competing launcher spawned in the race window.
 # Reusing it would defeat the restart and re-introduce the false-success path.
-if [ -z "$RESTART_REQUESTED" ] && core_claude_running; then
+if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
   echo "To recycle it cleanly: bash $0 --restart"
   exit 0
 fi
 
-if tmux_session_exists; then
+if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was
   # kill-session — but the desktop runtime keeps SIBLING windows in this
   # session (gateway, monitor; launch-sutando.sh), so nuking the session tore
@@ -937,15 +526,15 @@ if tmux_session_exists; then
   # free index if 0 is somehow occupied. This also makes sutando-ctl.sh's
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
-  apply_tmux_defaults
+  apply_claude_tmux_defaults
   CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
   # (review-caught: attach/Console then shows the gateway, not the healed core).
-  healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
-    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
+  healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
+    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
     || healed_idx=""
   if [ -z "$healed_idx" ]; then
     # No window at all: a watcher left from the dead core would type into a sibling.
@@ -960,10 +549,10 @@ if tmux_session_exists; then
   # new-window returning an index proves tmux ACCEPTED the command, not that the
   # child lives; poll before opening intake, same bound as the fresh-start path.
   for _ in $(seq 1 25); do
-    tmux_core_session_running && break
+    claude_named_session_running && break
     sleep 0.2
   done
-  if tmux_core_session_running; then
+  if claude_named_session_running; then
     clear_shutdown_sentinel
     CORE_WINDOW="$healed_idx"
     ensure_task_notifier
@@ -994,10 +583,7 @@ fi
 # line per launch; consecutive entries bound each session's lifetime, which
 # is what session-recap tooling needs to pick the right transcript (owner
 # ask 2026-07-13). Best-effort: never block the launch on it.
-# A worker boot is not a core launch; health-check reads the newest row as the
-# current core's, so a worker appended here retires the core's own boundary.
-if [ -z "$WORKER_INSTANCE" ] \
-   && _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
+if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
   mkdir -p "$_ws/state" 2>/dev/null || true
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -1033,13 +619,14 @@ fi
 # same tmux server as the user shell (per #PR_444 watcher-auto-restart).
 #
 # Sutando-friendly tmux defaults — applied to the server before the session
-# attaches (see apply_tmux_defaults above for the full rationale).
+# attaches (see apply_claude_tmux_defaults in session-launch.sh for the full
+# rationale).
 #
 # Tradeoff: `mouse on` intercepts native Cmd+drag text selection in the pane.
 # To copy text the macOS-native way, hold Option while dragging (Terminal.app,
 # iTerm2, Ghostty all honor Option-drag as a tmux-bypass). Documenting here
 # so future readers don't think this is a regression.
-apply_tmux_defaults
+apply_claude_tmux_defaults
 #
 # Branch on whether we have a TTY:
 #   - TTY (user running from terminal): exec attach so the user sees the
@@ -1053,17 +640,7 @@ apply_tmux_defaults
 # (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "$BOOT_PROMPT" || true
-  # Create-then-attach rather than `new-session -A`, so the sentinel clears only
-  # once a session demonstrably exists; the poll below is the single verdict.
-  for _ in $(seq 1 25); do
-    tmux_core_session_running && break
-    sleep 0.2
-  done
-  if ! tmux_core_session_running; then
+  if ! launch_claude_session; then
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
@@ -1073,21 +650,11 @@ if [ -t 1 ]; then
   ensure_task_notifier   # the supervisor needs the core session to exist first
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
-    ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "$BOOT_PROMPT"
   # Verify the core actually came up before reporting success. Without this a
   # failed launch (tmux server refusal, claude crash-on-start, a bad flag) still
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
-  # the same false-success class as the --restart kill race above. Poll ~5s for
-  # the session AND a live `claude --name` under it; exit non-zero otherwise so
-  # the caller surfaces a real failure instead of a silent dead core.
-  for _ in $(seq 1 25); do
-    tmux_core_session_running && break
-    sleep 0.2
-  done
-  if ! tmux_core_session_running; then
+  # the same false-success class as the --restart kill race above.
+  if ! launch_claude_session; then
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1

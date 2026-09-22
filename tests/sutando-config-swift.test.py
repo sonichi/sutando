@@ -15,6 +15,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+import sys
+sys.path.insert(0, str(ROOT / "tests" / "_helpers"))
+from os_probes import SWIFTC_SKIP_REASON, swiftc_usable  # noqa: E402
 SWIFT_CONFIG = ROOT / "src" / "Sutando" / "SutandoConfig.swift"
 
 # Shared with tests/sutando-config-python-resolution.test.py: one warm Clang
@@ -23,7 +26,7 @@ _MODULE_CACHE = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"
 _MODULE_CACHE.mkdir(parents=True, exist_ok=True)
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class TestSutandoConfigSwift(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sutando-swift-config-"))
@@ -101,7 +104,7 @@ class TestSutandoConfigSwift(unittest.TestCase):
         self.assertEqual(proc.stderr, "")
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class TestPersonalAssetPathSwift(unittest.TestCase):
     """Compiles the REAL SutandoConfig.swift and calls the real functions rather than
     re-implementing the resolution order, so a regression in it cannot stay green."""
