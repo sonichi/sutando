@@ -153,7 +153,8 @@ HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTER
 read_handler_config_now() {
   local snap="$WATCH_RUNTIME_DIR/handler-config.snap" state="absent" handler=""
   if [ -n "$HANDLER_CONFIG_PATH" ]; then
-    if [ ! -e "$HANDLER_CONFIG_PATH" ]; then
+    # A dangling or cyclic symlink is a config that exists and cannot be read.
+    if [ ! -e "$HANDLER_CONFIG_PATH" ] && [ ! -L "$HANDLER_CONFIG_PATH" ]; then
       handler="$(task_event_handler "$snap.none")" || handler=""
     elif cat -- "$HANDLER_CONFIG_PATH" > "$snap" 2>/dev/null && handler="$(task_event_handler "$snap")"; then
       state="ready"

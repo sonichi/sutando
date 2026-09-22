@@ -1097,6 +1097,43 @@ check("after the release, the retry event processed the task exactly once",
       handled.count("handle-hC") == 1 and not any(ln.startswith("TASK_FILE: task-team") for ln in out),
       f"stdout={out!r} handler log={handled!r}")
 
+
+def scenario_dangling_symlink_config():
+    """The config path is a dangling symlink: a config that exists and cannot
+    be read, so the task is held, never announced; once the link resolves to
+    a must-handle config, the task is handled once."""
+    tmp, ws, b = _workspace("ready-dangling-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hC", 4),))
+    target = tmp / "real-config.json"
+    os.symlink(target, cfg)  # dangling: the target does not exist yet
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1", "SUTANDO_HELD_RETRY_INTERVAL": "1"})
+    p = _start(ws, env)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _write_task(ws, "task-team")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=4, settle=0.3)
+        held_out = list(out)
+        held_log = log.read_text().split() if log.exists() else []
+        target.write_text(json.dumps({"handler": str(h["hC"])}))
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=10)
+        handled = log.read_text().split() if log.exists() else []
+        return held_out, held_log, out, handled
+    finally:
+        _stop(p)
+
+
+print("the config path is a dangling symlink:")
+held_out, held_log, out, handled = scenario_dangling_symlink_config()
+check("the task was held (a symlink that resolves nowhere is broken, not absent): no announcement, no handler run",
+      not any("task-team" in ln for ln in held_out) and held_log == [],
+      f"stdout={held_out!r} handler log={held_log!r}")
+check("once the link resolved, the held task was handled once by C, never announced",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
 sys.exit(1 if FAILURES else 0)
