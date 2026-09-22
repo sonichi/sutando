@@ -21,3 +21,16 @@ resolve_tasks_dir() {
   fi
   return 1
 }
+
+# The physical inbox path: fswatch emits physical paths, and one directory must
+# have one spelling wherever it is named.
+canonical_tasks_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+# The workspace an inbox belongs to: the one the launcher names, else the
+# physical inbox's parent. The watcher stamps under it; the supervisor reads there.
+workspace_dir_for_inbox() {
+  local abs
+  abs="$(canonical_tasks_dir "$1")" || abs="$1"
+  printf '%s\n' "${SUTANDO_WORKSPACE_DIR:-$(dirname "$abs")}"
+}

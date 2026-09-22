@@ -9,7 +9,9 @@
 #   (e) a session watcher that dies after the handoff is replaced: the
 #       supervisor re-arms the pair within grace + poll (the gap is printed);
 #   (f) a readiness probe that never comes back exits the session watcher,
-#       standby untouched.
+#       standby untouched;
+#   (g) an inbox named through a symlinked path with no workspace override
+#       is still recognised as ready by the supervisor.
 #
 # Run: bash tests/watch-tasks-stream-role-session-kills-standby.test.sh
 set -u
@@ -198,6 +200,54 @@ if [ "$fail" -eq 0 ]; then
     fail=1
   fi
 fi
+
+# --- (g): an inbox named through a symlinked path, no workspace override --------
+# The watcher stamps under the physical inbox's parent; the supervisor must
+# look there too, or a session watcher is never seen as ready.
+WORK2="$(mktemp -d "${TMPDIR:-/tmp}/sut-handoff-link.XXXXXX")"
+SOCK2="$WORK2/tmux.sock"
+mkdir -p "$WORK2/real/tasks" "$WORK2/real/state" "$WORK2/real/results" "$WORK2/alias"
+ln -s "$WORK2/real/tasks" "$WORK2/alias/tasks"
+tmux -S "$SOCK2" new-session -d -s target -c "$REPO" \
+  "printf '\n⏵⏵ bypass permissions on\n'; sleep 100000"
+tmux -S "$SOCK2" new-session -d -s target-watcher -c "$REPO" \
+  "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR SUTANDO_TMUX_SOCKET=$SOCK2 SUTANDO_TMUX_SESSION=target \
+     SUTANDO_TASKS_DIR=$WORK2/alias/tasks \
+     SUTANDO_NOTIFIER_GRACE_PERIOD=$GRACE SUTANDO_NOTIFIER_ROLE_POLL=$POLL SUTANDO_NOTIFIER_TARGET_POLL=$POLL \
+     bash $SUPERVISOR > $WORK2/sup.log 2>&1"
+sup2_pid=""
+sentinel2_pid() { cat "$WORK2"/real/state/*.pid 2>/dev/null | head -1; }
+sb2=""
+for i in $(seq 1 150); do
+  sb2="$(sentinel2_pid)"
+  [ -n "$sb2" ] && alive "$sb2" && break
+  sleep 0.1
+done
+sup2_pid="$(pgrep -f "bash $SUPERVISOR" | while read -r p; do ps -o command= -p "$p" | grep -q . && echo "$p"; done | grep -v "^${sup_pid:-0}$" | head -1)"
+if [ -z "$sb2" ]; then
+  echo "  FAIL (g): setup -- the supervisor on the symlinked inbox never armed a standby (sentinel dir $WORK2/real/state)"
+  fail=1
+else
+  tmux -S "$SOCK2" new-session -d -s ses-link -c "$REPO" \
+    "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR SUTANDO_TMUX_SOCKET=$SOCK2 SUTANDO_TMUX_SESSION=target \
+       bash $WATCHER $WORK2/alias/tasks --role session --inbox $WORK2/alias/tasks > $WORK2/ses.log 2> $WORK2/ses.err"
+  gone=""
+  for i in $(seq 1 100); do
+    alive "$sb2" || { gone=1; break; }
+    sleep 0.1
+  done
+  s2="$(sentinel2_pid)"
+  if [ -n "$gone" ] && [ -n "$s2" ] && [ "$s2" != "$sb2" ] && alive "$s2" && [ "$(ls "$WORK2"/real/state/*.pid | wc -l | tr -d ' ')" = "1" ]; then
+    echo "  PASS (g): symlinked inbox, no workspace override: the standby stood down and one sentinel names the session watcher ($s2)"
+  else
+    echo "  FAIL (g): symlinked inbox: standby-gone=${gone:-0} sentinel=$s2 (standby was $sb2): the supervisor never saw the session watcher as ready"
+    fail=1
+  fi
+fi
+for c in $(pgrep -P "${sup2_pid:-0}" 2>/dev/null); do kill -9 -- "-$c" 2>/dev/null || kill -9 "$c" 2>/dev/null || true; done
+tmux -S "$SOCK2" kill-server >/dev/null 2>&1 || true
+pkill -9 -f "fswatch.*$WORK2" >/dev/null 2>&1 || true
+rm -rf "$WORK2"
 
 if [ "$fail" -eq 0 ]; then
   echo "PASSED: the hosting-mode handoff keeps the supervisor alive and stands the standby down only on readiness"
