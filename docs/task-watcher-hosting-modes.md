@@ -1,9 +1,13 @@
 # Task watcher hosting modes: session watcher, standby, supervisor
 
 One inbox (`<workspace>/tasks/` for the core; `<workspace>/deliveries/<id>/` for a pool worker) is
-watched by **exactly one announcer at any instant**. Two things can host that announcer, and the code
-keeps them mutually exclusive; no agent instruction is relied on for that. This page is the design as
-it stands on `main` after #4477 and #4585; the behaviour is pinned by the tests named at the end.
+meant to have **exactly one announcer** in steady state. Two things can host that announcer, and for
+watchers that carry the tag the code keeps them mutually exclusive without relying on an agent
+instruction. The invariant is intended, not yet unconditional: an untagged watcher and a present but
+not yet ready tagged watcher are both invisible to the verdicts that enforce it, and a handoff can
+produce two notifications for one pending task; each exception is named under "Known issues and
+gaps" with the issue that closes it. This page is the design as it stands on `main` after #4477 and
+#4585; the behaviour is pinned by the tests named at the end.
 
 ## The two hosting modes
 
