@@ -62,9 +62,29 @@ read <room>` works, `room_collab.py read <room> --kind board` is refused as
 
 ## Requirements
 
+`websockets` and `pycrdt`. Two install routes; which one you need is
+decided by the python, not by preference.
+
+**In a virtualenv, or on any python whose pip may install into it:**
+
 ```bash
 pip install -r skills/room-collab/requirements.txt
 ```
+
+**On a managed python — Homebrew or a Debian/Ubuntu system python —**
+that command refuses with `error: externally-managed-environment`
+(PEP 668). Install into a venv and invoke the skill with THAT
+interpreter; the skill's own `python3` is not it:
+
+```bash
+python3 -m venv ~/.venvs/room-collab
+~/.venvs/room-collab/bin/pip install -r skills/room-collab/requirements.txt
+~/.venvs/room-collab/bin/python3 skills/room-collab/scripts/room_collab.py read <room>
+```
+
+Do not reach for `pip --break-system-packages` to make the first
+command work: it writes into the python other services on the host
+share.
 
 ## Credential
 

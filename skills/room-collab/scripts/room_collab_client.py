@@ -35,7 +35,12 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
         f"room-collab client needs its dependencies: {exc}\n"
-        "install them with: pip install -r skills/room-collab/requirements.txt"
+        "  pip install -r skills/room-collab/requirements.txt\n"
+        "    works in a virtualenv, or on any python whose pip may install.\n"
+        "  python3 -m venv DIR && DIR/bin/pip install -r skills/room-collab/requirements.txt\n"
+        "    then run this script with DIR/bin/python3. Needed on a managed\n"
+        "    python (Homebrew, Debian), where the line above refuses with\n"
+        "    error: externally-managed-environment."
     ) from exc
 
 from room_collab_board import (complete_element, # noqa: E402
