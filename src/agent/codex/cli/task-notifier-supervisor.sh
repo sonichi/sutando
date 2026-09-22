@@ -54,7 +54,7 @@ child_pid=""
 # never read as "no": every caller below fails toward keeping whatever
 # coverage already exists rather than risk a second decider.
 session_role_verdict() {
-  local args=(role-present session) out rc
+  local args=(role-present session --ready) out rc
   [ -n "$TASKS_DIR" ] && args+=(--inbox "$TASKS_DIR")
   out="$("$PY" "$WATCHER_IDENTITY" "${args[@]}" 2>/dev/null)"
   rc=$?
