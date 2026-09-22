@@ -47,9 +47,10 @@ def default_socket() -> str:
     that sets the env afterwards would silently target the wrong tmux server."""
     return os.environ.get("SUTANDO_TMUX_SOCKET") or DEFAULT_SOCKET
 WATCHER = "src/watch-tasks-stream.sh"
-# The core's own launcher, run under per-worker env: one argv, one set of
-# hooks, one runtime for every session in the pool.
-LAUNCHER = "src/agent/start-cli.sh"
+# The worker's own launcher (this skill's, not core's — core's launcher
+# carries no worker branches). One argv, one set of hooks, for every worker
+# in the pool; WORKER_MODE_RUNTIMES below is the only runtime it ever needs.
+LAUNCHER = "skills/worker-pool/scripts/launch-worker-session.sh"
 
 
 # Worker mode is a property of an ADAPTER, not of the pool: a runtime is
@@ -177,8 +178,9 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
         "delivery_dir": delivery_dir,
         "tmux": {"socket": socket, "session_name": wi.tmux_session_name(worker_id)},
         # Absolute, from `repo`: relative, `cwd` would pick which code runs.
-        # `--runtime`: unselected, the dispatcher rereads the CORE's config.
-        "launcher_argv": ["bash", str(Path(repo) / LAUNCHER), "--runtime", runtime],
+        # No --runtime: only claude ever had a worker mode (WORKER_MODE_RUNTIMES),
+        # so this script needs no runtime selection at all.
+        "launcher_argv": ["bash", str(Path(repo) / LAUNCHER)],
         "env": {"SUTANDO_TMUX_SOCKET": socket,
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,

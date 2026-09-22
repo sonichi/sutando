@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""The pool's two edits to existing scripts are invisible to the core.
+"""The pool's launcher and `watch-tasks-stream.sh` stay invisible to the core.
 
-`start-cli.sh` gains a worker mode and `watch-tasks-stream.sh` gains a
-delivery-folder override; both are gated on env the core never sets. These
-tests pin the gate from both sides: unset, the core's launch and the core's
-watched folder are what they were; set, the worker's are what the pool needs.
+Launcher-cleanup split worker launch out of start-cli.sh entirely: the core's
+own src/agent/claude/cli/start-cli.sh now carries no worker concept at all,
+and a worker's own skills/worker-pool/scripts/launch-worker-session.sh is a
+separate script (sharing session-launch.sh's mechanics, not start-cli.sh's).
+`watch-tasks-stream.sh` still gains a delivery-folder override, gated on env
+the core never sets. These tests pin the gate from both sides: unset, the
+core's launch (via start-cli.sh) and the core's watched folder are what they
+were; set, the worker's launch (via launch-worker-session.sh) and its watched
+folder are what the pool needs.
 
 Run: python3 tests/worker-mode-is-gated-on-env.test.py
 """
@@ -40,13 +45,18 @@ PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
 
 
-def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
-    """start-cli.sh through its real tmux path on a private socket, from a COPIED
+def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
+                  launcher: str = "src/agent/claude/cli/start-cli.sh") -> list[str]:
+    """The launcher through its real tmux path on a private socket, from a COPIED
     repo whose sutando-config.sh names a scratch workspace: past its liveness
     poll the launcher clears the shutdown sentinel and ensures the supervisor,
     and the real workspace must never be a test's write target. Returns the
     argv of the process it put in the pane. A stub claude that persists is what
     keeps the session alive long enough to read it.
+
+    `launcher` selects the core's own start-cli.sh (default) or the worker's
+    own skills/worker-pool/scripts/launch-worker-session.sh — both source the
+    same copied src/agent/claude/cli/session-launch.sh.
 
     The pgrep stub answers the liveness probe with nothing until the stub claude
     has recorded its pid; every other probe (the monitor guard) still "finds"
@@ -66,6 +76,11 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+        (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
+        shutil.copy2(
+            REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+            root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+        )
         ws = td / "workspace"; (ws / "state").mkdir(parents=True)
         (root / "scripts" / "sutando-config.sh").write_text(
             '#!/bin/bash\ncase "$1" in\n'
@@ -85,7 +100,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
         env = {"PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
                "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1", **extra_env}
         try:
-            run = subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
+            run = subprocess.run(["/bin/bash", str(root / launcher)],
                                  env=env, capture_output=True, text=True, timeout=60)
             assert run.returncode == 0, (
                 f"launcher exited {run.returncode}\nstdout: {run.stdout}\nstderr: {run.stderr}")
@@ -103,7 +118,12 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB) -> list[str]:
 
 
 class TestLauncherGate(unittest.TestCase):
-    def test_unset_the_core_launch_keeps_its_owner_surfaces(self):
+    """Not a gate on shared code anymore — two separate scripts, exercised each
+    through their own entry point (start-cli-worker-bootstrap.test.py pins the
+    same polarity in more depth; this keeps the direct argv-shape assertions
+    close to the pool's own env contract)."""
+
+    def test_the_core_launch_keeps_its_owner_surfaces(self):
         argv, sessions = _launch_argv({})
         self.assertTrue(argv, "claude was never exec'd")
         self.assertIn("sutando-core-watcher", sessions, "the core launch owns a task-notifier watcher")
@@ -115,9 +135,11 @@ class TestLauncherGate(unittest.TestCase):
         self.assertEqual(argv[-1], "/startup")
         self.assertNotIn("--worker", argv)
 
-    def test_set_the_worker_launch_drops_them_and_binds_its_session(self):
-        argv, sessions = _launch_argv({"SUTANDO_INSTANCE_ID": "a" * 32, "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
-                             "SUTANDO_TASKS_DIR": "/tmp/never-read", "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
+    def test_the_worker_launch_drops_them_and_binds_its_session(self):
+        argv, sessions = _launch_argv(
+            {"SUTANDO_INSTANCE_ID": "a" * 32, "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
+             "SUTANDO_TASKS_DIR": "/tmp/never-read", "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+            launcher="skills/worker-pool/scripts/launch-worker-session.sh")
         self.assertTrue(argv, "claude was never exec'd")
         self.assertFalse([s for s in sessions if s.endswith("-watcher")],
                          "a worker must launch no owner-only task notifier: " + str(sessions))
@@ -207,8 +229,11 @@ WORKER_KEYS = ("SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR", "SUTANDO_WORKSPACE_DI
 
 
 def _core_env(extra_env: dict, td: Path) -> list[str]:
-    """What the launcher forwards into the core session (its own --print-core-env
-    probe), from a clean environment: no pool variable, no proxy, no repo .env."""
+    """What the core's own launcher forwards into its session (its own
+    --print-core-env probe), from a clean environment: no pool variable, no
+    proxy, no repo .env. The launcher carries no worker concept at all
+    anymore, so this is core-polarity only — see _worker_env for the pool's
+    own script."""
     root = td / "repo"
     if not root.exists():
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
@@ -225,10 +250,39 @@ def _core_env(extra_env: dict, td: Path) -> list[str]:
     return [tok for tok in out.stdout.split() if "=" in tok]
 
 
+def _worker_env(extra_env: dict, td: Path) -> list[str]:
+    """What skills/worker-pool/scripts/launch-worker-session.sh forwards into a
+    worker's own session (its own --print-env probe, the worker-side twin of
+    _core_env above). Requires SUTANDO_TMUX_SESSION + SUTANDO_INSTANCE_ID —
+    the script refuses to guess a session name without them."""
+    root = td / "repo"
+    if not root.exists():
+        shutil.copytree(REPO / "src", root / "src", symlinks=True)
+        shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+    (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+        root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+    )
+    ws = td / "ws"; ws.mkdir(exist_ok=True)
+    (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
+    stub = td / "bin"; stub.mkdir(exist_ok=True)
+    for name, body in (("lsof", "exit 1\n"), ("launchctl", "exit 0\n"), ("sleep", "exit 0\n")):
+        (stub / name).write_text("#!/bin/sh\n" + body); (stub / name).chmod(0o755)
+    base = {"SUTANDO_TMUX_SESSION": "sutando-worker-" + "z" * 32, "SUTANDO_INSTANCE_ID": "z" * 32}
+    env = {"HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **base, **extra_env}
+    out = subprocess.run(
+        ["bash", str(root / "skills/worker-pool/scripts/launch-worker-session.sh"), "--print-env"],
+        cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return [tok for tok in out.stdout.split() if "=" in tok]
+
+
 class TestCoreEnvInvariance(unittest.TestCase):
-    """No pool variable set = the core session's env is the pre-pool env: the
-    marker is 1 and no worker key is forwarded. Set = the opposite, so the
-    first test cannot pass by the probe printing nothing."""
+    """The core's own launcher forwards the pre-pool env unconditionally — the
+    marker is 1 and it carries no worker key at all, since it has no worker
+    concept anymore. The worker's own script (a separate file) is the other
+    half of each pairing below, run through its own --print-env probe."""
 
     def test_unset_no_worker_key_reaches_the_core_session(self):
         with scratch() as td:
@@ -243,9 +297,8 @@ class TestCoreEnvInvariance(unittest.TestCase):
         resolver the spawner set is absent unless the launcher forwards it —
         and without it the watcher announces the zero-byte sentinel itself."""
         with scratch() as td:
-            env = _core_env({"SUTANDO_INSTANCE_ID": "d" * 32,
-                             "SUTANDO_INBOX_RESOLVER": "/opt/resolve-inbox",
-                             "SUTANDO_INBOX_RESOLVER_TIMEOUT": "7"}, Path(td))
+            env = _worker_env({"SUTANDO_INBOX_RESOLVER": "/opt/resolve-inbox",
+                               "SUTANDO_INBOX_RESOLVER_TIMEOUT": "7"}, Path(td))
         self.assertIn("SUTANDO_INBOX_RESOLVER=/opt/resolve-inbox", env, env)
         self.assertIn("SUTANDO_INBOX_RESOLVER_TIMEOUT=7", env, env)
 
@@ -253,14 +306,14 @@ class TestCoreEnvInvariance(unittest.TestCase):
         """Control: the two keys above are forwarded because they were set, not
         because the launcher names them unconditionally."""
         with scratch() as td:
-            env = _core_env({"SUTANDO_INSTANCE_ID": "e" * 32}, Path(td))
+            env = _worker_env({}, Path(td))
         keys = {tok.split("=", 1)[0] for tok in env}
         self.assertNotIn("SUTANDO_INBOX_RESOLVER", keys, env)
         self.assertNotIn("SUTANDO_INBOX_RESOLVER_TIMEOUT", keys, env)
 
-    def test_set_the_marker_is_blanked_and_the_instance_named(self):
+    def test_the_marker_is_blanked_and_the_instance_named(self):
         with scratch() as td:
-            env = _core_env({"SUTANDO_INSTANCE_ID": "c" * 32}, Path(td))
+            env = _worker_env({"SUTANDO_INSTANCE_ID": "c" * 32}, Path(td))
         self.assertIn("SUTANDO_CORE_SESSION=", env, env)
         self.assertNotIn("SUTANDO_CORE_SESSION=1", env, env)
         self.assertIn("SUTANDO_INSTANCE_ID=" + "c" * 32, env, env)
@@ -293,14 +346,13 @@ class TestWatcherGate(unittest.TestCase):
         it reaches the worker only if the launcher forwards it -- and without it no
         delivery can ever read `finished`."""
         with scratch() as td:
-            env = _core_env({"SUTANDO_INSTANCE_ID": "f" * 32,
-                             "SUTANDO_POOL_DELIVERY_SCRIPT": "/opt/pool_delivery.py"}, Path(td))
+            env = _worker_env({"SUTANDO_POOL_DELIVERY_SCRIPT": "/opt/pool_delivery.py"}, Path(td))
         self.assertIn("SUTANDO_POOL_DELIVERY_SCRIPT=/opt/pool_delivery.py", env, env)
 
     def test_an_unset_pool_writer_is_not_invented(self):
         """Control: a host with no pool never sees the key."""
         with scratch() as td:
-            env = _core_env({"SUTANDO_INSTANCE_ID": "g" * 32}, Path(td))
+            env = _worker_env({}, Path(td))
         keys = {tok.split("=", 1)[0] for tok in env}
         self.assertNotIn("SUTANDO_POOL_DELIVERY_SCRIPT", keys, env)
 

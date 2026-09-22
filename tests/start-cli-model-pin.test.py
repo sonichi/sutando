@@ -10,6 +10,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+# apply_claude_tmux_defaults() (the model-clear logic under test in
+# case_tmux_defaults_clear_both_scopes) now lives in the shared session-launch
+# helper, sourced by both start-cli.sh and a pool worker's own launcher.
+SESSION_LAUNCH = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
 
 
 def _isolated_workspace(td: Path) -> str:
@@ -87,35 +91,46 @@ def case_env_set_is_ignored() -> list[str]:
 
 def case_tmux_defaults_clear_both_scopes() -> list[str]:
     """Both tmux scopes must be cleared; -g is invisible to a per-session query.
-    Static so it still runs where tmux is absent, rather than skipping."""
-    src = SCRIPT.read_text()
+    Static so it still runs where tmux is absent, rather than skipping.
+
+    apply_claude_tmux_defaults() (the model-clear logic) moved into the shared
+    session-launch.sh helper; start-cli.sh's own remaining job is to unset its
+    own env early and call that function, so the two files are checked for
+    their own halves of the invariant."""
+    helper_src = SESSION_LAUNCH.read_text()
     # Comments discuss the removed flag by name, so scan CODE only — otherwise the
     # explanation of the removal trips the guard against the thing it removed.
-    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    helper_code = "\n".join(ln for ln in helper_src.splitlines() if not ln.lstrip().startswith("#"))
     fails = []
-    if "setenv -gu SUTANDO_CORE_MODEL" not in code:
-        fails.append("clear) apply_tmux_defaults must clear the GLOBAL scope (setenv -gu)")
+    if "setenv -gu SUTANDO_CORE_MODEL" not in helper_code:
+        fails.append("clear) apply_claude_tmux_defaults must clear the GLOBAL scope (setenv -gu)")
     # TARGETED per session: an untargeted `setenv -u` clears tmux's default
     # session, which on a multi-session socket is not the core's.
-    if 'setenv -t "=$_pin_sess" -u SUTANDO_CORE_MODEL' not in code:
+    if 'setenv -t "=$_pin_sess" -u SUTANDO_CORE_MODEL' not in helper_code:
         fails.append("clear) the session clear must target each session with -t, not tmux's default")
-    if "list-sessions -F '#{session_name}'" not in code:
+    if "list-sessions -F '#{session_name}'" not in helper_code:
         fails.append("clear) must enumerate sessions to clear each one")
+
+    src = SCRIPT.read_text()
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
     # The pass-through must be gone, not merely bypassed.
     if "MODEL_ARGS" in code:
         fails.append("clear) MODEL_ARGS is back — an empty array is one edit from a pin")
     if "--model" in code:
         fails.append("clear) start-cli.sh reintroduced a --model flag")
     # A server takes its global env from whoever starts it, so the launcher's own
-    # unset must precede any tmux call. Behaviourally covered by fresh-socket.
+    # unset must precede its own call into the tmux-defaults helper (which is
+    # where the actual tmux calls live now). Behaviourally covered by fresh-socket.
     lines = code.splitlines()
     unset_at = next((i for i, l in enumerate(lines) if "unset SUTANDO_CORE_MODEL" in l), None)
-    tmux_at = next((i for i, l in enumerate(lines) if "tmux -S" in l), None)
+    apply_at = next((i for i, l in enumerate(lines) if "apply_claude_tmux_defaults" in l), None)
     if unset_at is None:
         fails.append("clear) the launcher must unset SUTANDO_CORE_MODEL from its own env")
-    elif tmux_at is not None and unset_at > tmux_at:
-        fails.append(f"clear) unset is at code line {unset_at} but a tmux call is at "
-                     f"{tmux_at} — a server started first inherits the pin")
+    if apply_at is None:
+        fails.append("clear) start-cli.sh no longer calls apply_claude_tmux_defaults")
+    elif unset_at is not None and unset_at > apply_at:
+        fails.append(f"clear) unset is at code line {unset_at} but the tmux-defaults call is at "
+                     f"{apply_at} — a server started first inherits the pin")
     return fails
 
 
