@@ -807,5 +807,73 @@ class TestInboxHolders(unittest.TestCase):
         self.assertEqual((seen.observed, seen.holders), (False, []))
 
 
+class TestInboxHoldersEdges(unittest.TestCase):
+    """The paths the presence tests above do not reach: a ps read through run(),
+    a ps that answers non-zero, and a watcher line with no inbox operand at all."""
+
+    def test_a_watcher_with_no_inbox_operand_is_undecided(self):
+        ps = "  100 1 bash src/watch-tasks-stream.sh\n"
+        vec = vector_for({"100": ["bash", "src/watch-tasks-stream.sh"]})
+        got = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec)
+        self.assertEqual((got.holders, got.undecided), ([], 1))
+
+    def test_a_non_zero_ps_is_unobserved(self):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 1, "", "")
+        self.assertEqual(wid.inbox_holders(INBOX, run=run), wid.InboxHolders(False, [], 0))
+
+    def test_a_ps_snapshot_is_read_through_run(self):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 0, f"  100 1 {CORE_SESSION_FLAT}\n", "")
+        got = wid.inbox_holders(INBOX, run=run, argv_vector=vector_for({"100": CORE_SESSION_ARGS}))
+        self.assertEqual(got.holders, [(100, "session")])
+
+
+class TestInboxHoldersCli(unittest.TestCase):
+    """`inbox-holders --inbox X [--exclude PID]`: one `<pid> <role>` line per
+    holder, `none`, or `unobserved` (rc 2); undecided lines go to stderr only."""
+
+    def _run(self, argv, **patches):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with mock.patch.multiple(wid, **patches) if patches else contextlib.nullcontext():
+                rc = wid.main(argv)
+        return rc, out.getvalue().splitlines(), err.getvalue()
+
+    def test_holders_print_one_line_each(self):
+        seen = wid.InboxHolders(True, [(100, "session"), (200, "untagged")], 0)
+        rc, out, err = self._run(["inbox-holders", "--inbox", INBOX],
+                                 inbox_holders=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out, err), (0, ["100 session", "200 untagged"], ""))
+
+    def test_no_holders_prints_none_and_undecided_goes_to_stderr(self):
+        seen = wid.InboxHolders(True, [], 3)
+        rc, out, err = self._run(["inbox-holders", "--inbox=" + INBOX],
+                                 inbox_holders=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out), (0, ["none"]))
+        self.assertIn("undecided=3", err)
+
+    def test_unobserved_is_rc_2_and_says_why(self):
+        seen = wid.InboxHolders(False, [], 0)
+        rc, out, err = self._run(["inbox-holders", "--inbox", INBOX],
+                                 inbox_holders=lambda *_a, **_k: seen)
+        self.assertEqual((rc, out), (2, ["unobserved"]))
+        self.assertIn("why=", err)
+
+    def test_exclude_is_forwarded_as_a_pid(self):
+        calls = []
+
+        def fake(inbox, exclude_pid=None):
+            calls.append((inbox, exclude_pid))
+            return wid.InboxHolders(True, [], 0)
+        rc, _, _ = self._run(["inbox-holders", "--inbox", INBOX, "--exclude", "4242"], inbox_holders=fake)
+        self.assertEqual((rc, calls), (0, [(INBOX, 4242)]))
+
+    def test_a_stray_flag_or_a_missing_inbox_is_a_usage_error(self):
+        self.assertEqual(self._run(["inbox-holders", "--inbox", INBOX, "--bogus"])[0], 64)
+        self.assertEqual(self._run(["inbox-holders"])[0], 64)
+        self.assertEqual(self._run(["inbox-holders", "--inbox="])[0], 64)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
