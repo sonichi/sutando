@@ -9,6 +9,9 @@ handler (a must-handle task is never announced to the live core); task first
 means the task may reach the core, as it would on the live loop, and the
 config applies to the next task.
 
+A third case distinguishes a per-decision refresh from a reload taken once
+before the sweep: the config changes between two swept items.
+
 Run: python3 tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py
 """
 import json
@@ -153,6 +156,98 @@ check("the earlier task reached the core exactly once (no config existed at its 
       f"stdout={out!r}")
 check("the later config applies to the next task: not announced, handled once",
       not any(ln.startswith("TASK_FILE: task-next") for ln in out)
+      and handled.count("probe") == 1 and handled.count("handle") == 1,
+      f"stdout={out!r} handler log={handled!r} results={results!r}")
+
+
+def scenario_config_changes_between_swept_items():
+    """Two tasks pending before the watcher starts. The declared handler, probed
+    for the first task, re-declares a must-handle handler and declines; the
+    second swept task must then be routed by the config as it is on disk at ITS
+    decision, not by a reload taken once before the sweep."""
+    tmp = Path(tempfile.mkdtemp(prefix="ready-sweep-"))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    b = tmp / "bin"
+    b.mkdir()
+    (b / "fswatch").write_text(
+        f"#!/bin/bash\nexec bash {REPO / 'tests' / 'fixtures' / 'fswatch-poll-stub.sh'} \"$@\"\n")
+    (b / "fswatch").chmod(0o755)
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    strict = tmp / "strict.sh"
+    strict.write_text(
+        '#!/bin/sh\n'
+        f'for a in "$@"; do [ "$a" = "--probe" ] && {{ echo probe >> {log}; exit 4; }}; done\n'
+        f'echo handle >> {log}\nexit 4\n')
+    strict.chmod(0o755)
+    first = tmp / "first.sh"
+    first.write_text(
+        '#!/bin/sh\n'
+        f'printf \'{{"handler": "{strict}"}}\' > {cfg}.tmp && mv {cfg}.tmp {cfg}\n'
+        'exit 3\n')
+    first.chmod(0o755)
+    cfg.write_text(json.dumps({"handler": str(first)}))
+    for name in ("task-a", "task-b"):
+        (ws / "tasks" / f"{name}.txt").write_text(f"id: {name}\naccess_tier: team\ntask: restricted\n")
+        time.sleep(0.05)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{b}:{env['PATH']}"
+    env["TMPDIR"] = str(tmp)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env["SUTANDO_WORKSPACE_DIR"] = str(ws)
+    env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
+    env.pop("SUTANDO_INSTANCE_ID", None)
+    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+    p = subprocess.Popen(
+        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
+         "--role", "session", "--inbox", str(ws / "tasks")],
+        cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, start_new_session=True)
+    out: list[str] = []
+    try:
+        os.set_blocking(p.stdout.fileno(), False)
+        t0 = time.time()
+        while time.time() - t0 < 12:
+            time.sleep(0.3)
+            try:
+                c = p.stdout.read()
+            except (BlockingIOError, TypeError):
+                c = None
+            if c:
+                out.extend(c.splitlines())
+            if log.exists() or any("task-b" in ln for ln in out):
+                time.sleep(1.5)
+                try:
+                    c = p.stdout.read()
+                except (BlockingIOError, TypeError):
+                    c = None
+                if c:
+                    out.extend(c.splitlines())
+                break
+        handled = log.read_text().split() if log.exists() else []
+        results = sorted(f.name for f in (ws / "results").glob("task-*.txt"))
+        return out, handled, results
+    finally:
+        try:
+            os.killpg(p.pid, 15)
+        except (ProcessLookupError, PermissionError):
+            p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+print("two swept tasks; the first one's probe re-declares a must-handle handler:")
+out, handled, results = scenario_config_changes_between_swept_items()
+check("the first task, declined by the handler declared at its decision, reached the core once",
+      sum(ln.startswith("TASK_FILE: task-a") for ln in out) == 1, f"stdout={out!r}")
+check("the second task was routed by the config on disk at ITS decision: never announced, handled once",
+      not any(ln.startswith("TASK_FILE: task-b") for ln in out)
       and handled.count("probe") == 1 and handled.count("handle") == 1,
       f"stdout={out!r} handler log={handled!r} results={results!r}")
 
