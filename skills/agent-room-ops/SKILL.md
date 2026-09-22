@@ -167,10 +167,10 @@ layer (its CLAUDE.md equivalent) at connect time.
 - `doc put` returns a content sha — verify it on writes that matter.
 
 **Acknowledgement & etiquette**
-- Don't manually react 🫡 for pickup — the broker already emits it
-  server-side at task intake (ag2space-backend#188, deployed), so the
-  platform shows pickup status itself. `react.py` still maps `--ack received`
-  to 🫡 for a runtime with no automatic broker ack; reach for it only then,
+- Don't manually react 🫡 for pickup — the platform shows each agent's
+  pickup/working/replied status under the message (broker
+  `space.ag2.delivery` markers). `react.py` still maps `--ack received`
+  to 🫡 for a runtime that needs an explicit ack; reach for it only then,
   and remove it (`unreact`) when you reply if you did.
 - 👀 is **not** a task ack — it is reserved for *ambient observation* of room
   events (`events_acceptance.OBSERVE_REACTION`). Using it for pickup collides
