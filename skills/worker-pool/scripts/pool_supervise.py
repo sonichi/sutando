@@ -216,8 +216,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     explain is normal — a faster delivery-time check only shortens it.
     """
     # Backfill BEFORE the routing alarm below reads it -- self-heals on the
-    # sweep's own cadence, no new worker registration needed.
-    pr.ensure_task_event_handler(workspace)
+    # sweep's own cadence. persist=False is diagnostic: report, never publish.
+    if persist:
+        pr.ensure_task_event_handler(workspace)
     state = load_state(workspace)
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
