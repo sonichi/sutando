@@ -49,7 +49,12 @@ def start_watcher(ws, instance=None):
 
 
 def write_task(ws, name, body="probe"):
-    (ws / "tasks" / name).write_text(f"id: {name}\naccess_tier: owner\ntask: {body}\n")
+    # Rename into place, as every bridge does: an in-place write raises a
+    # Created and an Updated event, and the watcher would announce both.
+    final = ws / "tasks" / name
+    tmp = final.with_name(f".{name}.tmp")
+    tmp.write_text(f"id: {name}\naccess_tier: owner\ntask: {body}\n")
+    tmp.replace(final)
 
 
 def wait_for(pred, timeout=8):
@@ -59,6 +64,19 @@ def wait_for(pred, timeout=8):
             return True
         time.sleep(0.2)
     return False
+
+
+def fswatch_live(p):
+    r = subprocess.run(["pgrep", "-P", str(p.pid), "-x", "fswatch"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def wait_for_fswatch(p):
+    # The startup sweep announces before fswatch runs; a write that lands in
+    # that gap raises no event, so nothing is written until fswatch is a child.
+    if not wait_for(lambda: fswatch_live(p), timeout=15):
+        raise SystemExit("watcher never started fswatch")
 
 
 def read_available(p, out):
@@ -101,6 +119,7 @@ cfg = ws / "state" / "task-event-handler.json"
 p = start_watcher(ws)
 out: list[str] = []
 try:
+    wait_for_fswatch(p)
     write_task(ws, "task-one.txt")
     ok = wait_for(lambda: (read_available(p, out), any("TASK_FILE" in s for s in out))[1])
     check("(1) no config file: the task is emitted straight to the live core",
@@ -129,6 +148,7 @@ log_before = log.read_text() if log.exists() else ""
 p2 = start_watcher(ws, instance="worker-1")
 out3: list[str] = []
 try:
+    wait_for_fswatch(p2)
     write_task(ws, "task-three.txt")
     ok3 = wait_for(lambda: (read_available(p2, out3), any("TASK_FILE" in s for s in out3))[1])
     log_after = log.read_text() if log.exists() else ""

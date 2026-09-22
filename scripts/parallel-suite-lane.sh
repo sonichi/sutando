@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# One SERIAL worker per git worktree: worker w takes lines w, w+W, w+2W... so a
-# worktree never holds two suites at once — exclusivity is structural, not a lock.
+# One SERIAL worker per git worktree, all workers pulling from one queue: a
+# worktree never holds two suites at once, and no worker idles while another
+# still has a pile — a fixed stride left the heaviest suites stacked on one worker.
 # usage: parallel-suite-lane.sh <workers> <files-list> <recdir> <cmd-prefix...>
 # Records land as <recdir>/<line-index>.{out,rc,time}; aggregation stays the caller's.
 set -uo pipefail
@@ -19,14 +20,31 @@ _lane_cleanup() {
     for _w in $(seq 1 "$WORKERS"); do
         git worktree remove --force "$WTDIR/$_w" 2>/dev/null || true
     done
-    rm -rf "$WTDIR"
+    rm -rf "$WTDIR" "$RECDIR"/.claim-*
 }
 trap _lane_cleanup EXIT
 
+# The next suite starts from a clean tree, whichever suite ran there before.
+# Ignored files stay: the shared node_modules link and coverage fragments.
+# Only ever the lane worktree itself: an exported GIT_DIR/GIT_WORK_TREE would
+# otherwise point `git -C` at the caller's checkout, and a reset there wipes work.
+_lane_reset() {
+    local top
+    top="$(cd "$1" 2>/dev/null && env -u GIT_DIR -u GIT_WORK_TREE git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [ "$top" = "$(cd "$1" && pwd -P)" ] || return 0
+    # reset --hard, not checkout: a checkout restores from the index, so a suite
+    # that staged an edit would hand it to the next suite intact.
+    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" reset -q --hard HEAD 2>/dev/null || true
+    # The node_modules link is a symlink, which `node_modules/` in .gitignore does
+    # not cover (that pattern matches directories only), so exclude it by name.
+    env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" clean -fdq -e node_modules 2>/dev/null || true
+}
+
 for _w in $(seq 1 "$WORKERS"); do
     (
-        idx="$_w"
-        while [ "$idx" -le "$N" ]; do
+        for idx in $(seq 1 "$N"); do
+            # mkdir is the atomic claim: exactly one worker creates it, the rest skip.
+            mkdir "$RECDIR/.claim-$idx" 2>/dev/null || continue
             f="$(sed -n "${idx}p" "$FILES")"
             rec="$RECDIR/$idx"
             _t0=$SECONDS
@@ -34,7 +52,7 @@ for _w in $(seq 1 "$WORKERS"); do
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
             printf "%s\n" "$(( SECONDS - _t0 ))" > "$rec.time"
-            idx=$((idx + WORKERS))
+            _lane_reset "$WTDIR/$_w"
         done
     ) &
 done

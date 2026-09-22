@@ -16,6 +16,7 @@ cp "$SCRIPT" "$REPO/skills/refresh-skill.sh"
 echo "# demo" > "$SRC/SKILL.md"; ln -s "$SRC" "$DST/demo"
 helper_ok()   { printf '#!/usr/bin/env bash\n[ "${1:-}" = "claude-home-path" ] && { echo "%s"; exit 0; }\nexit 1\n' "$DST" > "$REPO/scripts/sutando-config.sh"; }
 helper_fail() { printf '#!/usr/bin/env bash\necho "config: no workspace resolves from here" >&2\nexit 1\n' > "$REPO/scripts/sutando-config.sh"; }
+helper_empty() { printf '#!/usr/bin/env bash\nexit 0\n' > "$REPO/scripts/sutando-config.sh"; }
 # env -u: a caller's SUTANDO_REPO_DIR must not leak into the cases that test its absence.
 run() { (cd "$TMP" && env -u SUTANDO_REPO_DIR REFRESH_SKILL_SETTLE_S=0 HOME="$TMP/home" "$@" bash "$REPO/skills/refresh-skill.sh" demo 2>&1); }
 mkdir -p "$TMP/home/.claude/skills"
@@ -27,6 +28,17 @@ set +e; out="$(run env)"; rc=$?; set -e
 case "$out" in *"$REPO/scripts/sutando-config.sh"*"failed"*) ok "the failure names the helper" ;; *) fail "the failure does not name the helper. Got: $out" ;; esac
 case "$out" in *"no workspace resolves from here"*) ok "the helper's own stderr is shown" ;; *) fail "the helper's stderr was swallowed. Got: $out" ;; esac
 case "$out" in *"NOT INSTALLED"*) fail "still reported NOT INSTALLED — it guessed a directory. Got: $out" ;; *) ok "no NOT INSTALLED from a guessed directory" ;; esac
+
+# --- the other half of the same guard: helper succeeds, says nothing ----------
+# `|| [ -z "$SKILLS_DST" ]` is what covers this, and nothing above exercises it:
+# with only the exit-1 case, removing that clause leaves the suite fully green
+# while the empty value falls through to $HOME/.claude/skills and reports the
+# skill NOT INSTALLED -- the exact defect this file exists to prevent.
+helper_empty
+set +e; out="$(run env)"; rc=$?; set -e
+[ "$rc" -eq 3 ] && ok "a helper that exits 0 with no output exits 3" || fail "an empty-output helper exited $rc, expected 3. Got: $out"
+case "$out" in *"$REPO/scripts/sutando-config.sh"*"failed"*) ok "the empty-output failure names the helper" ;; *) fail "the failure does not name the helper. Got: $out" ;; esac
+case "$out" in *"NOT INSTALLED"*) fail "still reported NOT INSTALLED — it guessed a directory. Got: $out" ;; *) ok "no NOT INSTALLED from an empty resolution" ;; esac
 
 # --- SUTANDO_REPO_DIR pointing at a checkout with no helper --------------------
 helper_ok
