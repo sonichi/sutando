@@ -10286,6 +10286,14 @@ def check_sandbox_delegation(window_sec: int = 86400) -> dict:
     # results/ is drained fast, so the evidence is usually already in the
     # month-partitioned archive; scan both or a same-day outage reads as clean.
     roots = [results_dir]
+    # archive-stale-results.py sweeps into results/archive-<date>/, a SIBLING of
+    # archive/, on a retention tunable below this probe's fixed 24h window.
+    try:
+        roots += [results_dir / e.name for e in os.scandir(results_dir)
+                  if e.is_dir() and e.name.startswith("archive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
     archive = results_dir / "archive"
     if archive.is_dir():
         # archive/ ITSELF holds results too, not only its month subdirectories;

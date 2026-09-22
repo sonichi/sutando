@@ -138,6 +138,25 @@ def case_d2_flat_archive_sentinel_warns() -> list[str]:
     return fails
 
 
+def case_d3_sibling_dated_archive_sentinel_warns() -> list[str]:
+    """A sentinel in results/archive-YYYY-MM-DD/ — the SIBLING archive that
+    src/archive-stale-results.py writes at every startup, not a child of
+    archive/. Its RETENTION_HOURS is config-tunable below this probe's fixed
+    24h window, so a file can be swept there while still in scope."""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        arch = _results(tmp) / "archive-2026-09-13"
+        arch.mkdir(parents=True)
+        (arch / "task-guest-4.txt").write_text(SENTINEL, encoding="utf-8")
+        r = _run(tmp)
+        if r["status"] != "warn":
+            fails.append(
+                f"(d3) sibling dated archive: expected warn, got {r['status']} — {r['detail']}"
+            )
+    return fails
+
+
 def case_e_unscannable_archive_warns() -> list[str]:
     """An unreadable directory must not read as an absence of failures.
 
@@ -232,6 +251,7 @@ def main() -> int:
     for fn in (case_a_recent_sentinel_warns, case_b_no_sentinel_is_ok,
                case_c_old_sentinel_is_ok, case_d_archived_sentinel_warns,
                case_d2_flat_archive_sentinel_warns,
+case_d3_sibling_dated_archive_sentinel_warns,
                case_e_unscannable_archive_warns, case_e2_unreadable_file_is_isolated,
                case_f_non_task_file_ignored):
         fails += fn()
@@ -240,7 +260,7 @@ def main() -> int:
         for f in fails:
             print("  " + f)
         return 1
-    print("PASS sandbox-delegation: warns on a recent sentinel (results/, archive/ flat and archive/<month>/), "
+    print("PASS sandbox-delegation: warns on a recent sentinel (results/, archive/ flat, archive/<month>/ and the sibling archive-<date>/), "
           "ok without one, ok outside the window, warn on an unscannable dir, "
           "unreadable files counted not fatal, task-* only")
     return 0
