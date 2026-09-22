@@ -654,9 +654,20 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
-while IFS= read -r fn; do
-  dispatch_task "$TASKS_DIR/$fn"
-done < <(priority_sorted_tasks)
+SWEPT_NAMES=""
+startup_sweep() {
+  local fn
+  while IFS= read -r fn; do
+    dispatch_task "$TASKS_DIR/$fn"
+    SWEPT_NAMES="$SWEPT_NAMES$fn
+"
+  done < <(priority_sorted_tasks)
+}
+# A session watcher sweeps only once the standby has stopped (below); any other
+# role has no peer on its inbox and sweeps before it subscribes, as always.
+if [ "$WATCHER_ROLE" != "session" ]; then
+  startup_sweep
+fi
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -705,58 +716,17 @@ for _ in 1 2 3 4 5; do
   kill -0 "$FSWATCH_PID" 2>/dev/null || { fswatch_alive=0; break; }
   sleep 0.1
 done
-# Exit before the sentinel stamp and the standby kill: a watcher that cannot
-# serve the inbox leaves whatever is serving it untouched.
+# Exit before the sentinel stamp: a watcher that cannot serve the inbox leaves
+# whatever is serving it untouched.
 if [ "$fswatch_alive" -eq 0 ]; then
   echo "watch-tasks-stream: fswatch failed to start; no sentinel written and no standby touched" >&2
   exit 1
 fi
-# In place, never write-elsewhere-then-mv: mv preserves mtime, and
-# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
-# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
-# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
-# INJECTED, never located: a core helper may run a path it is handed but must not
-# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
-if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
-  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
-      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
-  WATCHER_BEAT_PID=$!
-fi
-# An in-session (internal) watcher arming means the external standby for THIS
-# inbox is redundant: kill it here, in code, rather than relying on an agent
-# instruction to tear it down (belt-and-suspenders with the supervisor's own
-# poll-and-stop). SUTANDO_TMUX_SESSION is already per-instance (core vs each
-# worker gets a distinct value), so "${SESSION}-watcher" on this process's own
-# socket names only the standby for this same inbox, never another instance's.
-# Only now, with fswatch confirmed up and the sentinel stamped: a kill on any
-# earlier failure path left the inbox with no watcher at all.
-if [ "$WATCHER_ROLE" = "session" ]; then
-  __standby_sock="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
-  __standby_session="${SUTANDO_TMUX_SESSION:-sutando-core}-watcher"
-  tmux -S "$__standby_sock" kill-session -t "=$__standby_session" 2>/dev/null || true
-fi
-# -t bounds the read so a stretch with no fswatch event still gets a periodic,
-# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
-# event shape the platform's fswatch monitor backend turns out to use.
-while true; do
-  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path
-  read_rc=$?
-  if [ "$read_rc" -ne 0 ]; then
-    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
-    # exit code alone can't distinguish them -- ask whether fswatch is still
-    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
-    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      if [ -n "$HANDLER_CONFIG_PATH" ]; then
-        reload_current_handler
-        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
-      fi
-      continue
-    fi
-    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
-    # to the script's normal exit path rather than spinning on a dead FIFO.
-    break
-  fi
+
+# One fswatch line. Shared by the readiness replay and the main loop so a line
+# read early is handled exactly as a line read late.
+handle_event() {
+  local path="$1" parent name
   case "$path" in
     "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR")
       # Matches the file OR its bare dir -- poll_monitor reports the watched
@@ -776,10 +746,96 @@ while true; do
         # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
         # emitting one mid-shutdown would orphan it.
         if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-          continue
+          return 0
+        fi
+        # The sweep already announced this name; its own event would announce it twice.
+        name="$(basename "$path")"
+        if [ -n "$SWEPT_NAMES" ] && printf '%s' "$SWEPT_NAMES" | grep -qxF -- "$name"; then
+          SWEPT_NAMES="$(printf '%s' "$SWEPT_NAMES" | grep -vxF -- "$name")
+"
+          return 0
         fi
         dispatch_task "$path"
       fi
       ;;
   esac
-done < "$WATCH_RUNTIME_DIR/events"
+}
+
+# Readiness is a real round-trip: a probe this watcher writes into its own inbox
+# must come back through fswatch. Its name matches no admission pattern.
+PRE_READY_EVENTS=""
+if [ "$WATCHER_ROLE" = "session" ]; then
+  READY_PROBE="$TASKS_DIR/.ready-$$"
+  READY_DEADLINE=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
+  : > "$READY_PROBE"
+  ready=0
+  while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
+    if ! IFS= read -r -t 1 path <&3; then
+      kill -0 "$FSWATCH_PID" 2>/dev/null && continue
+      break
+    fi
+    case "$path" in
+      */.ready-$$|.ready-$$) ready=1; break ;;
+      *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
+" ;;
+    esac
+  done
+  rm -f "$READY_PROBE"
+  if [ "$ready" -ne 1 ]; then
+    echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; no sentinel written and no standby touched" >&2
+    exit 1
+  fi
+fi
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
+echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
+# The standby is the supervisor's to stop (its session also hosts the supervisor,
+# the only re-arm); sweep once it is gone, but never wait on it forever.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  STANDBY_DEADLINE=$(( $(date +%s) + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} ))
+  standby="unknown"
+  while [ "$(date +%s)" -lt "$STANDBY_DEADLINE" ]; do
+    standby="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" standby-present --inbox "$TASKS_DIR_ABS" 2>/dev/null)" || standby="unknown"
+    [ "$standby" = "no" ] && break
+    sleep 0.5
+  done
+  if [ "$standby" != "no" ]; then
+    echo "watch-tasks-stream: standby watcher still present after ${SUTANDO_STANDBY_STOP_TIMEOUT:-15}s; sweeping anyway" >&2
+  fi
+  startup_sweep
+  while IFS= read -r path; do
+    [ -n "$path" ] && handle_event "$path"
+  done <<< "$PRE_READY_EVENTS"
+fi
+# -t bounds the read so a stretch with no fswatch event still gets a periodic,
+# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
+# event shape the platform's fswatch monitor backend turns out to use.
+while true; do
+  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path <&3
+  read_rc=$?
+  if [ "$read_rc" -ne 0 ]; then
+    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
+    # exit code alone can't distinguish them -- ask whether fswatch is still
+    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
+    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
+      if [ -n "$HANDLER_CONFIG_PATH" ]; then
+        reload_current_handler
+        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
+      fi
+      continue
+    fi
+    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
+    # to the script's normal exit path rather than spinning on a dead FIFO.
+    break
+  fi
+  handle_event "$path"
+done
