@@ -10288,6 +10288,9 @@ def check_sandbox_delegation(window_sec: int = 86400) -> dict:
     roots = [results_dir]
     archive = results_dir / "archive"
     if archive.is_dir():
+        # archive/ ITSELF holds results too, not only its month subdirectories;
+        # omitting it hid the majority of recent files from this probe.
+        roots.append(archive)
         try:
             roots += [archive / e.name for e in os.scandir(archive) if e.is_dir()]
         except OSError as exc:
