@@ -236,6 +236,20 @@ def main() -> int:
     check("a body [channel:] Discord target is claimed even when routing alone says no",
           bool(sent4), "routing-false + body marker still did not deliver")
 
+    # --- the peek itself can fail: routing False + an unreadable file ------
+    # Same branch, the OTHER outcome: read_text() raises, must not crash or claim.
+    box5 = Path(tempfile.mkdtemp(prefix="proactive-unreadable-"))
+    unreadable = box5 / "proactive-unreadable.txt"
+    unreadable.write_text("[channel: 1530802402603700415]\nbriefing text")
+    os.chmod(unreadable, 0)
+    sent5: list = []
+    try:
+        _run_one_pass(box5, lambda *a, **_k: sent5.append(a), claims_by_routing=False)
+        check("an unreadable file with routing=False is left unclaimed, no crash",
+              not sent5 and unreadable.exists(), f"sent={sent5!r}")
+    finally:
+        os.chmod(unreadable, 0o644)
+
     # --- hermeticity, asserted rather than assumed -------------------------
     live_after = sorted(p.name for p in _LIVE_RESULTS.iterdir()) if _LIVE_RESULTS.exists() else None
     check("HERMETIC: operator's real results/ untouched", live_after == _live_before,
