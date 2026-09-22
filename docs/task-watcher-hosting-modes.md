@@ -10,7 +10,7 @@ it stands on `main` after #4477 and #4585; the behaviour is pinned by the tests 
 | mode | who runs the watcher | how tasks reach the agent | when it is used |
 |---|---|---|---|
 | **session watcher** | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | the normal state of a live core |
-| **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types `Sutando task ready: <id>` into the core's tmux pane | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
+| **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types one instruction line into the core's tmux pane: `Sutando task ready: <file>. Read <tasks>/<file>, follow CLAUDE.md, and write the result to <results>/<file>.` | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
 
 The watcher script decides everything about a task (routing through the task-event handler, priority,
 dedupe, holds); the notifier only executes what the watcher announces (#4561). So the two modes differ
@@ -49,9 +49,12 @@ Events that arrive during the probe window are buffered and replayed **before** 
 
 ## The supervisor's contract (`task-notifier-supervisor.sh`)
 
-Started by the launcher (`start-cli.sh`) for the core's inbox, in tmux session `<core>-watcher`; the
-supervisor, the notifier and the standby watcher all live in that session, so nothing that runs inside
-the core session may kill it (#4585 removed the one kill that did).
+The script is `src/agent/codex/cli/task-notifier-supervisor.sh`; despite the directory it is
+runtime-agnostic (parameterised by `SUTANDO_NOTIFIER_SCRIPT`), and the Claude launcher pairs it
+with the Claude notifier. Started by the launcher (`start-cli.sh`) for the core's inbox, in tmux
+session `<core>-watcher`; the supervisor, the notifier and the standby watcher all live in that
+session, so nothing that runs inside the core session may kill it (#4585 removed the one kill that
+did).
 
 1. **Standby.** Poll `role-present session --inbox <inbox> --ready <state>` every `ROLE_POLL` (5 s).
 2. **Arm.** After `GRACE_PERIOD` (45 s) of continuous `no`, start the notifier, which starts the
@@ -91,9 +94,12 @@ the same supervisor pid; the second handoff took 12 s.
   itself (exit when any watcher already covers the inbox; replace only with `--force-restart`): #4602.
 - **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
   outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
-- **`Monitor` expiry.** The tool this build ships has no `persistent` argument and ends the process at
-  its 30-minute cap, so a session watcher dies every half hour unless the session re-arms it; the
-  supervisor's standby covers the gap after 45 s: #4524.
+- **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
+  exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
+  30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
+  standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
+  2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
+  affected: #4524.
 - **Untagged is what pool workers run today** (`SUTANDO_WATCHER_CMD <inbox>`), which is why #4600 and
   #4602 are the next two watcher changes. The rule going forward (owner, 2026-09-22): every start
   carries an explicit `--role` (`session` or `standby`) and `--inbox`; the watcher refuses an untagged
