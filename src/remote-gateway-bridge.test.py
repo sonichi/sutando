@@ -608,6 +608,15 @@ def main() -> int:
     hb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
     check(hb.get("status") == "running" and hb.get("step") == "opening PR #20",
           "heartbeat carries core-status status+step when core-status.json present")
+    metadata_path = rtc.WS / "state" / "core-runtime.json"
+    metadata_path.write_text(json.dumps({"runtime": "codex", "model": "test-model"}))
+    rtc._post_heartbeat(set(), force=True)
+    check(STATE["heartbeats"][-1].get("core") == "codex"
+          and STATE["heartbeats"][-1].get("model") == "test-model",
+          "heartbeat forwards launcher core and model metadata")
+    metadata_path.write_text('[]')
+    check(rtc._read_core_metadata() == {}, "malformed core metadata is ignored")
+    metadata_path.unlink()
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
         json.dumps({"status": "idle", "ts": 2}))

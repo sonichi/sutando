@@ -585,6 +585,7 @@ fi
 # ask 2026-07-13). Best-effort: never block the launch on it.
 if _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_ws" ]; then
   mkdir -p "$_ws/state" 2>/dev/null || true
+  python3 "$REPO/src/core_metadata.py" "$_ws" claude "$SESSION" 2>/dev/null || true
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$_ws/state/session-starts.log" 2>/dev/null || true
