@@ -5,7 +5,8 @@
 #   (c) a session watcher over an untagged (standby-shaped) holder proceeds: the handoff;
 #   (d) a standby over a live session watcher exits 0;
 #   (e) an untagged start on a free inbox warns and runs;
-#   (f) a watcher on ANOTHER inbox is never a holder for this one.
+#   (f) a watcher on ANOTHER inbox is never a holder for this one;
+#   (h) --force-restart aborts, signaling nothing, when a live holder can no longer be re-proven.
 # Run: bash tests/watch-tasks-stream-self-check.test.sh
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -90,6 +91,33 @@ C1=$(PATH="$WORK/nops:$PATH" run_watcher "$WORK/c" "$WORK/c1.err" "$WORK/c/tasks
 sleep 3
 alive "$C1"; check "(g) an unreadable process table still starts the watcher" $? "$(tail -1 "$WORK/c1.err")"
 grep -q "could not read the process table" "$WORK/c1.err"; check "(g) ...and says the check was skipped" $?
+
+# (h) THE REVIEW REGRESSION: the first scan finds a holder, then process
+# inspection goes unobservable. --force-restart must abort (rc 3), leave the
+# holder and its children alone, and start nothing; "unobserved" is not "gone".
+mkdir -p "$WORK/d/tasks" "$WORK/d/state" "$WORK/blind"
+cat > "$WORK/blind/ps" <<EOS
+#!/bin/sh
+case " \$* " in *" -Ao "*)
+  n=\$(cat "$WORK/blind/n" 2>/dev/null || echo 0); n=\$((n+1)); echo "\$n" > "$WORK/blind/n"
+  if [ "\$n" -le 1 ]; then for p in /bin/ps /usr/bin/ps; do [ -x "\$p" ] && exec "\$p" "\$@"; done; fi ;;
+esac
+exit 1
+EOS
+chmod +x "$WORK/blind/ps"
+D1=$(run_watcher "$WORK/d" "$WORK/d1.err" "$WORK/d/tasks" --role session --inbox "$WORK/d/tasks"); PIDS+=("$D1")
+sleep 2
+alive "$D1"; check "(h) the holder is up" $?
+D1KIDS="$(pgrep -P "$D1" -f stubbin/fswatch | tr '\n' ' ')"
+# Time-bound: the defect this pins starts a replacement that never exits.
+( PATH="$WORK/blind:$PATH" run_watcher_fg "$WORK/d" "$WORK/d2.err" "$WORK/d/tasks" --role session --inbox "$WORK/d/tasks" --force-restart; echo $? > "$WORK/d2.rc" ) &
+for _ in $(seq 1 100); do [ -f "$WORK/d2.rc" ] && break; sleep 0.1; done
+rc="$(cat "$WORK/d2.rc" 2>/dev/null || echo "still running")"
+[ -f "$WORK/d2.rc" ] || pkill -TERM -f "force-restart" 2>/dev/null
+check "(h) --force-restart with a blind revalidation exits 3" $([ "$rc" = 3 ] && echo 0 || echo 1) "rc=$rc — $(tail -1 "$WORK/d2.err")"
+alive "$D1"; check "(h) ...the holder is untouched" $?
+kids_ok=0; for k in $D1KIDS; do alive "$k" || kids_ok=1; done; check "(h) ...and so are its children" $kids_ok "kids=$D1KIDS"
+grep -q "cannot be re-proven" "$WORK/d2.err"; check "(h) ...and it says why" $?
 
 if [ "$fail" = 0 ]; then echo "  ok  one announcer per inbox, enforced by the watcher"; else echo "  FAILED"; fi
 exit "$fail"
