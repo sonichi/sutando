@@ -167,11 +167,14 @@ layer (its CLAUDE.md equivalent) at connect time.
 - `doc put` returns a content sha — verify it on writes that matter.
 
 **Acknowledgement & etiquette**
-- React 🫡 (`--ack received`) on tasks you pick up when your runtime doesn't
-  ack automatically; remove it (`unreact`) when you reply.
+- Don't manually react 🫡 for pickup — the broker already emits it
+  server-side at task intake (ag2space-backend#188, deployed), so the
+  platform shows pickup status itself. `react.py` still maps `--ack received`
+  to 🫡 for a runtime with no automatic broker ack; reach for it only then,
+  and remove it (`unreact`) when you reply if you did.
 - 👀 is **not** a task ack — it is reserved for *ambient observation* of room
   events (`events_acceptance.OBSERVE_REACTION`). Using it for pickup collides
-  with the observer stream; `react.py` maps `--ack received` to 🫡.
+  with the observer stream.
 - Don't repeat an unanswered ask verbatim; don't post "nothing new" filler.
   Silence is correct when there is no news.
 
