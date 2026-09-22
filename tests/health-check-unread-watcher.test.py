@@ -17,7 +17,9 @@ Run: python3 tests/health-check-unread-watcher.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -144,6 +146,63 @@ class Probe(unittest.TestCase):
         """No lsof is not evidence of a stray."""
         r = probe_with_sink(wid.OutputSink(False, "unknown", "", None))
         self.assertEqual(r["status"], "ok")
+
+
+class OutputSinkEdges(unittest.TestCase):
+    """lsof output shapes the happy paths above never produce."""
+
+    def test_blank_lines_and_a_typeless_record_before_the_typed_one_are_skipped(self):
+        # `p` opens the block; each `f` starts a record; a blank line is skipped;
+        # a record with no `t` field says nothing and the next one is read.
+        fd1 = "p7100\nf1\nn/dev/null\n\nf1\ntREG\nn/ws/logs/watcher.log\n"
+        s = wid.output_sink(WATCHER_PID, run=fake_lsof(fd1, SELF_ONLY + READER))
+        self.assertEqual((s.kind, s.target, s.read), ("file", "/ws/logs/watcher.log", True))
+
+    def test_an_unconsultable_reader_lookup_is_unobserved_but_keeps_the_target(self):
+        def run(cmd, **kw):
+            if "--" in cmd:
+                return mock.Mock(returncode=2, stdout="")
+            return mock.Mock(returncode=0, stdout=FD1_FILE)
+        s = wid.output_sink(WATCHER_PID, run=run)
+        self.assertEqual((s.observed, s.kind, s.target, s.read), (False, "file", "/ws/logs/watcher.log", None))
+
+    def test_an_unfamiliar_kind_is_reported_as_itself_and_left_undecided(self):
+        s = wid.output_sink(WATCHER_PID, run=fake_lsof("p7100\nf1\ntDIR\nn/ws\n"))
+        self.assertEqual((s.observed, s.kind, s.read), (True, "DIR", None))
+
+
+class OutputSinkCli(unittest.TestCase):
+    """`output-sink <pid>`: `<kind> <target>` then `read=yes|no|unknown`; rc 2 when
+    lsof could not be consulted, rc 64 on a bad pid."""
+
+    def _run(self, argv, sink=None):
+        out, err = io.StringIO(), io.StringIO()
+        ctx = mock.patch.object(wid, "output_sink", lambda p: sink) if sink else contextlib.nullcontext()
+        with ctx, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = wid.main(argv)
+        return rc, out.getvalue().splitlines(), err.getvalue()
+
+    def test_an_unread_file_prints_its_target_and_read_no(self):
+        rc, out, _ = self._run(["output-sink", WATCHER_PID],
+                               wid.OutputSink(True, "file", "/ws/logs/watcher.log", False))
+        self.assertEqual((rc, out), (0, ["file /ws/logs/watcher.log", "read=no"]))
+
+    def test_a_read_tty_prints_read_yes(self):
+        rc, out, _ = self._run(["output-sink", WATCHER_PID], wid.OutputSink(True, "tty", "/dev/ttys004", True))
+        self.assertEqual((rc, out), (0, ["tty /dev/ttys004", "read=yes"]))
+
+    def test_an_undecided_stream_prints_read_unknown(self):
+        rc, out, _ = self._run(["output-sink", WATCHER_PID], wid.OutputSink(True, "stream", "", None))
+        self.assertEqual((rc, out), (0, ["stream", "read=unknown"]))
+
+    def test_unobserved_is_rc_2_and_says_why(self):
+        rc, out, err = self._run(["output-sink", WATCHER_PID], wid.OutputSink(False, "unknown", "", None))
+        self.assertEqual((rc, out), (2, ["unknown", "read=unknown"]))
+        self.assertIn("why=", err)
+
+    def test_a_missing_or_non_numeric_pid_is_a_usage_error(self):
+        self.assertEqual(self._run(["output-sink"])[0], 64)
+        self.assertEqual(self._run(["output-sink", "abc"])[0], 64)
 
 
 if __name__ == "__main__":
