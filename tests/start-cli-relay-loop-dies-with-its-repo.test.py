@@ -181,14 +181,8 @@ else:
                 p.kill()
                 _, err = p.communicate()
                 rc = None
-            # Assert on the recorded probe outcomes, not a relay-call-count delta:
-            # a probe already in flight when kill-server runs can still observe
-            # the session alive and its (unrelated) relay call can land after
-            # n_before was read, which used to inflate n_after - n_before past
-            # any fixed bound with no defect involved (Qingyun's review of
-            # #4605). The loop's real invariant is "exit immediately after the
-            # third CONSECUTIVE absent probe" -- read that off probes.log
-            # directly, independent of wall-clock snapshot timing.
+            # Probe outcomes, not a relay-call delta: an in-flight probe at
+            # kill-server can land an unrelated relay call after n_before.
             probe_hist = probes.read_text().splitlines() if probes.exists() else []
             check("d) the loop exits 0 once its session is gone", rc == 0,
                   f"rc={rc}; probes={probe_hist}; stderr: {err[-200:]}")
