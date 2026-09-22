@@ -814,6 +814,62 @@ else:
           handled == ["probe-hO", "handle-hO"] and not any(ln.startswith("TASK_FILE: task-held") for ln in out),
           f"stdout={out!r} handler log={handled!r}")
 
+
+def scenario_held_task_under_a_busy_stream():
+    """A held task must be retried on an elapsed deadline even when unrelated
+    events arrive continuously (each one restarts the read timeout)."""
+    tmp, ws, b = _workspace("ready-busy-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hC", 4),))
+    _publish(cfg, h["hC"])
+    os.chmod(cfg, 0)
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "30", "SUTANDO_HELD_RETRY_INTERVAL": "2"})
+    p = _start(ws, env)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _write_task(ws, "task-team")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=3, settle=0.3)
+        held_log = log.read_text().split() if log.exists() else []
+        t0 = time.time()
+        dispatched_at = None
+        n = 0
+        while time.time() - t0 < 8:
+            (ws / "state" / f"noise-{n}").write_text("x")  # an ignored event every 150 ms
+            n += 1
+            if time.time() - t0 >= 1.0 and (cfg.stat().st_mode & 0o777) == 0:
+                os.chmod(cfg, 0o644)
+            if dispatched_at is None and log.exists():
+                dispatched_at = time.time() - t0
+                break
+            time.sleep(0.15)
+        time.sleep(1.0)
+        try:
+            os.set_blocking(p.stdout.fileno(), False)
+            c = p.stdout.read()
+            if c:
+                out.extend(c.splitlines())
+        except (BlockingIOError, TypeError):
+            pass
+        handled = log.read_text().split() if log.exists() else []
+        return held_log, out, handled, dispatched_at
+    finally:
+        try:
+            os.chmod(cfg, 0o644)
+        except OSError:
+            pass
+        _stop(p)
+
+
+print("a held task under a stream of ignored events every 150 ms; the config becomes readable at 1 s:")
+held_log, out, handled, at = scenario_held_task_under_a_busy_stream()
+check("setup: the task was held first", held_log == [], f"handler log={held_log!r}")
+check("the held task was dispatched within the retry deadline (2 s) despite the busy stream, once, never announced",
+      at is not None and at <= 4.5 and handled == ["probe-hC", "handle-hC"]
+      and not any(ln.startswith("TASK_FILE: task-team") for ln in out),
+      f"dispatched_at={at} stdout={out!r} handler log={handled!r}")
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
 sys.exit(1 if FAILURES else 0)

@@ -87,10 +87,10 @@ mkdir -p "$TASKS_DIR"
 # symlinks with `pwd -P` to match. Without -P, on macOS the comparison
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
-TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
+TASKS_DIR_ABS="$(canonical_tasks_dir "$TASKS_DIR")"
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
-# inbox; whoever named that inbox names the workspace too.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
+# inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
+WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # shellcheck source=../scripts/python-binary.sh
@@ -130,6 +130,8 @@ fi
 # config exists but could not be copied or parsed; nothing routes on it.
 HANDLER_STATE="absent"
 HELD_NAMES=""
+HELD_RETRY_AT=0
+HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
 # One read per routing decision: the bytes are copied once into a private
 # snapshot and parsed from there; no cache, no compare, nothing to go stale.
 read_handler_config_now() {
@@ -157,9 +159,17 @@ redispatch_held_tasks() {
   local held="$HELD_NAMES" fn
   [ -n "$held" ] || return 0
   HELD_NAMES=""
+  HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
   while IFS= read -r fn; do
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
   done <<< "$held"
+}
+# An elapsed deadline, checked after every event: a busy stream never resets it
+# the way it resets the read timeout.
+retry_held_tasks_if_due() {
+  [ -n "$HELD_NAMES" ] || return 0
+  [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
+  redispatch_held_tasks
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
@@ -525,6 +535,7 @@ dispatch_task() {
 "
   read_handler_config_now
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
+    [ -n "$HELD_NAMES" ] || HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
     HELD_NAMES="$HELD_NAMES$filename
 "
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
@@ -899,4 +910,5 @@ while true; do
     break
   fi
   handle_event "$path"
+  retry_held_tasks_if_due
 done
