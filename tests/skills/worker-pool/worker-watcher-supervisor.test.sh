@@ -35,7 +35,8 @@ chmod +x "$WORK/bin/tmux"
 export PATH="$WORK/bin:$PATH"
 export SUTANDO_INSTANCE_ID="w-abc123" SUTANDO_TASKS_DIR="$WORK/ws/deliveries/w-abc123" \
        SUTANDO_TMUX_SESSION="sutando-worker-w-abc123" SUTANDO_TMUX_SOCKET="$WORK/sock" \
-       SUTANDO_WORKSPACE_DIR="$WORK/ws" SUTANDO_INBOX_KIND="deliveries" SUTANDO_PY="/usr/bin/python3"
+       SUTANDO_WORKSPACE_DIR="$WORK/ws" SUTANDO_INBOX_KIND="deliveries" SUTANDO_PY="/usr/bin/python3" \
+       SUTANDO_INBOX_RESOLVER="$REPO/skills/worker-pool/scripts/resolve-inbox-entry" SUTANDO_INBOX_RESOLVER_TIMEOUT="5"
 
 echo "worker-watcher-supervisor:"
 # (a) the command names every piece and runs nothing.
@@ -46,6 +47,7 @@ for want in "new-session" "-s" "sutando-worker-w-abc123-watcher" \
             "SUTANDO_TASKS_DIR=$WORK/ws/deliveries/w-abc123" "SUTANDO_TMUX_SESSION=sutando-worker-w-abc123" \
             "SUTANDO_INSTANCE_ID=w-abc123" "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py" \
             "SUTANDO_INBOX_KIND=deliveries" "SUTANDO_NOTIFIER_PY=/usr/bin/python3" \
+            "SUTANDO_INBOX_RESOLVER=$REPO/skills/worker-pool/scripts/resolve-inbox-entry" "SUTANDO_INBOX_RESOLVER_TIMEOUT=5" \
             "$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"; do
   printf '%s\n' "$cmd" | grep -qxF -- "$want"; check "(a) command carries $want" $?
 done

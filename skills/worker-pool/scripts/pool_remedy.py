@@ -116,7 +116,10 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
            "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
            "SUTANDO_INBOX_KIND": "deliveries",
            "SUTANDO_WORKSPACE_DIR": str(workspace),
-           "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace))}
+           "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+           # The timer's env carries none of the spawner's; the standby watcher needs
+           # the resolver or it announces nothing for a delivery inbox.
+           "SUTANDO_INBOX_RESOLVER": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry")}
     if socket:
         env["SUTANDO_TMUX_SOCKET"] = socket
     try:

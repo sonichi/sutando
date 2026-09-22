@@ -72,6 +72,7 @@ class EnsureSupervisor(unittest.TestCase):
         self.assertEqual(env["SUTANDO_TMUX_SESSION"], rem.wi.tmux_session_name(WID))
         self.assertEqual(env["SUTANDO_INBOX_KIND"], "deliveries")
         self.assertEqual(env["SUTANDO_WORKSPACE_DIR"], str(self.ws))
+        self.assertEqual(env["SUTANDO_INBOX_RESOLVER"], str(REPO / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"))
 
     def test_the_last_runs_socket_is_forwarded_when_recorded(self):
         run = Runner(rc=0)

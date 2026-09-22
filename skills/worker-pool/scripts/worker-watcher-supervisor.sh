@@ -10,7 +10,8 @@
 #   SUTANDO_TASKS_DIR     the worker's delivery inbox (required)
 #   SUTANDO_TMUX_SESSION  the worker's tmux session (required)
 #   SUTANDO_TMUX_SOCKET, SUTANDO_WORKSPACE_DIR, SUTANDO_RESULTS_DIR,
-#   SUTANDO_INBOX_KIND, SUTANDO_TASK_EVENT_HANDLER, SUTANDO_PY   forwarded when set
+#   SUTANDO_INBOX_KIND, SUTANDO_INBOX_RESOLVER(_TIMEOUT), SUTANDO_POOL_DELIVERY_SCRIPT,
+#   SUTANDO_TASK_EVENT_HANDLER, SUTANDO_PY   forwarded when set
 #
 # Usage: worker-watcher-supervisor.sh            ensure the supervisor is running
 #        worker-watcher-supervisor.sh --print-command   print the tmux argv, run nothing
@@ -42,7 +43,10 @@ ENV_ARGS=(
   -e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID"
   -e "SUTANDO_WATCHER_BEAT=$BEAT"
 )
+# The resolver is what turns a delivery sentinel into its task body: without it the
+# standby watcher announces nothing for a worker inbox.
 for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
+         SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT \
          SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL; do
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
