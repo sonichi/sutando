@@ -141,7 +141,7 @@ case "$__holders" in
         # stdout, in the TASK_FILE shape: a Monitor-hosted caller sees stdout as
         # its event stream and would never read the stderr line.
         __hread="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" output-sink "$__hpid" 2>/dev/null | sed -n 's/^read=//p')"
-        __hsince="$(ps -o lstart= -p "$__hpid" 2>/dev/null | sed 's/^ *//')"
+        __hsince="$(ps -o lstart= -p "$__hpid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
         echo "WATCHER_HELD: inbox=$TASKS_DIR_ABS pid=$__hpid role=$__hrole since=\"${__hsince:-unknown}\" read=${__hread:-unknown} replace=\"watch-tasks-stream.sh --force-restart --role ${WATCHER_ROLE} --inbox $TASKS_DIR_ABS\""
         echo "watch-tasks-stream: $TASKS_DIR_ABS is already watched by pid $__hpid ($__hrole); exiting 0. Use --force-restart to replace it." >&2
         exit 0
@@ -152,7 +152,7 @@ case "$__holders" in
       # Each child is captured with its start time: a recycled pid has another.
       __hkids=""
       for __k in $(pgrep -P "$__hpid" 2>/dev/null || true); do
-        __hkids="$__hkids$__k|$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//')
+        __hkids="$__hkids$__k|$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//; s/ *$//')
 "
       done
       # Live means "not proven gone": kill -0 also answers for a zombie, so ps stat
@@ -206,7 +206,7 @@ case "$__holders" in
       if [ "$__signaled" = 1 ]; then
         while IFS='|' read -r __k __kstart; do
           [ -n "$__k" ] || continue
-          [ "$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//')" = "$__kstart" ] || continue
+          [ "$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//; s/ *$//')" = "$__kstart" ] || continue
           kill -TERM "$__k" 2>/dev/null || true
         done <<< "$__hkids"
       fi
