@@ -1341,6 +1341,9 @@ POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
 # Backoff alone caps at 60s and never gives up, so a relay that stays down
 # leaves a live process polling into the void. 0 disables the exit.
 POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
+# Exiting only helps where something restarts us. startup-runtime.sh launches the
+# primary and every named lane as a bare `&`, so the owner must be declared here.
+POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -4744,21 +4747,41 @@ def _poll_stalled(last_ok: float, now: float,
     return limit > 0 and (now - last_ok) > limit
 
 
-def _abort_if_poll_stalled(last_ok: float) -> None:
-    """Exit non-zero so the supervisor can restart a bridge backoff cannot revive.
+_STALL_REPORTED_FOR: float | None = None
 
-    Every poll failure loops instead of exiting, so a wedged-but-alive bridge
-    is invisible to a wrapper that restarts only on exit.
+
+def _abort_if_poll_stalled(last_ok: float) -> None:
+    """Record a wedged-but-alive bridge, and exit only if something restarts us.
+
+    Every poll failure loops instead of exiting, so the stall is invisible to a
+    wrapper that restarts only on exit. Exiting an UNSUPERVISED lane is worse
+    than the loop it replaces -- it ends the lane until someone reruns startup --
+    so the exit is armed only when a restart owner is declared, while the status
+    sidecar records the stall either way.
     """
+    global _STALL_REPORTED_FOR
     now = time.time()
     # Pass the limit explicitly: the parameter default binds at def time,
     # so a reconfigured module global would otherwise never be read.
     if not _poll_stalled(last_ok, now, POLL_STALL_EXIT_S):
         return
     stalled_s = int(now - last_ok)
+    if not POLL_STALL_RESTART_OWNER:
+        # Once per stall episode, not once per poll: the loop calls this on every
+        # iteration and the sidecar is a file write.
+        if _STALL_REPORTED_FOR != last_ok:
+            _STALL_REPORTED_FOR = last_ok
+            _emit_gateway_status(False, error=(
+                f"stalled: no successful poll in {stalled_s}s (limit "
+                f"{POLL_STALL_EXIT_S:g}s); retrying -- no restart owner declared, "
+                "so exiting would end this lane"))
+            _log(f"WARN: no successful poll in {stalled_s}s and no restart owner "
+                 "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
+        return
     _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
     sys.exit(f"FATAL: no successful poll in {stalled_s}s "
-             f"(limit {POLL_STALL_EXIT_S:g}s) — exiting so the supervisor restarts the bridge.")
+             f"(limit {POLL_STALL_EXIT_S:g}s) -- exiting so {POLL_STALL_RESTART_OWNER} "
+             "restarts the bridge.")
 
 
 def main() -> None:

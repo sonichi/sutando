@@ -6,6 +6,7 @@ only on process exit never sees it. These pin the exit that gives it one.
 """
 import os
 import tempfile
+import time
 import importlib
 import sys
 import pathlib
@@ -36,9 +37,10 @@ def test_zero_limit_disables_the_exit():
 
 def test_abort_exits_nonzero_and_records_the_stall():
     import json
-    import time
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
+        # The exit is armed only where something restarts us.
+        os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
         m = _load(tmp)
         m.POLL_STALL_EXIT_S = 10
         # within the limit: returns, does not exit
@@ -63,6 +65,7 @@ def test_systemexit_is_not_swallowed_by_the_loops_catch_all():
     whole fix is inert if a future handler widens to BaseException.
     """
     with tempfile.TemporaryDirectory() as d:
+        os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
         m = _load(pathlib.Path(d))
         m.POLL_STALL_EXIT_S = 1
         raised = False
@@ -76,6 +79,65 @@ def test_systemexit_is_not_swallowed_by_the_loops_catch_all():
         assert raised
 
 
+def test_unsupervised_lane_does_NOT_exit_and_keeps_retrying():
+    """The reviewer's case: startup-runtime.sh launches the primary and every
+    named lane as a bare `&`, so exiting there ends the lane until someone
+    reruns startup. With no declared owner the stall is recorded, not fatal."""
+    import json
+    import time
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
+        m = _load(tmp)
+        m.POLL_STALL_EXIT_S = 10
+        assert m.POLL_STALL_RESTART_OWNER == "", "no owner should be declared here"
+        # Well past the limit: must return rather than raise.
+        m._abort_if_poll_stalled(time.time() - 60)
+        rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+        assert rec["connected"] is False
+        assert "stalled" in rec["error"]
+        assert "retrying" in rec["error"], rec["error"]
+        assert "no restart owner" in rec["error"], rec["error"]
+
+
+def test_declared_owner_arms_the_exit_and_names_it():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
+        try:
+            m = _load(tmp)
+            m.POLL_STALL_EXIT_S = 10
+            assert m.POLL_STALL_RESTART_OWNER == "launchd"
+            try:
+                m._abort_if_poll_stalled(time.time() - 60)
+            except SystemExit as e:
+                assert e.code != 0
+                assert "launchd" in str(e.code), e.code
+            else:
+                raise AssertionError("a declared owner must arm the exit")
+        finally:
+            os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
+
+
+def test_the_unsupervised_stall_is_recorded_once_per_episode():
+    """The poll loop calls this every iteration; the sidecar is a file write."""
+    import time
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
+        m = _load(tmp)
+        m.POLL_STALL_EXIT_S = 10
+        last_ok = time.time() - 60
+        m._abort_if_poll_stalled(last_ok)
+        first = m.GATEWAY_STATUS_FILE.stat().st_mtime_ns
+        m.GATEWAY_STATUS_FILE.write_text("{}")          # would be overwritten on a re-emit
+        m._abort_if_poll_stalled(last_ok)               # same episode
+        assert m.GATEWAY_STATUS_FILE.read_text() == "{}", "re-emitted within one episode"
+        m._abort_if_poll_stalled(time.time() - 120)     # a NEW episode does report
+        assert m.GATEWAY_STATUS_FILE.read_text() != "{}"
+        assert first > 0
+
+
 if __name__ == "__main__":
     test_stalled_only_past_the_limit()
     print("PASS test_stalled_only_past_the_limit")
@@ -84,5 +146,11 @@ if __name__ == "__main__":
     test_abort_exits_nonzero_and_records_the_stall()
     print("PASS test_abort_exits_nonzero_and_records_the_stall")
     test_systemexit_is_not_swallowed_by_the_loops_catch_all()
+    print("PASS test_systemexit_is_not_swallowed_by_the_loops_catch_all")
+    test_unsupervised_lane_does_NOT_exit_and_keeps_retrying()
+    print("PASS test_unsupervised_lane_does_NOT_exit_and_keeps_retrying")
+    test_declared_owner_arms_the_exit_and_names_it()
+    print("PASS test_declared_owner_arms_the_exit_and_names_it")
+    test_the_unsupervised_stall_is_recorded_once_per_episode()
     print("PASS test_systemexit_is_not_swallowed_by_the_loops_catch_all")
     print("ALL PASS")

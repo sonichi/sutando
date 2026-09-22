@@ -81,6 +81,11 @@
         <string>__REPO__</string>
         <key>CLAUDE_CONFIG_DIR</key>
         <string>__CLAUDE_CONFIG_DIR__</string>
+        <!-- Arms the poll-stall exit. KeepAlive above is the restart owner; the
+             bridge refuses to exit on a stall unless one is declared, because
+             startup-runtime.sh launches bare `&` lanes that nothing restarts. -->
+        <key>SUTANDO_BRIDGE_RESTART_OWNER</key>
+        <string>launchd</string>
     </dict>
 
     <key>StandardOutPath</key>
