@@ -126,62 +126,36 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
 fi
 
-# The config's identity is its content: a checksum changes on every replacement,
-# where mtime (one-second) plus size misses two same-second, same-size rewrites.
-handler_config_stamp() {  # handler_config_stamp <file>
-  [ -f "$1" ] && cksum < "$1" 2>/dev/null || echo absent
-}
 # absent: no config on disk (the core takes every task). ready: parsed. broken: a
-# config exists but could not be copied, stamped or parsed; nothing routes on it.
+# config exists but could not be copied or parsed; nothing routes on it.
 HANDLER_STATE="absent"
 HELD_NAMES=""
-# One read of the config feeds both the parse and the stamp, so the cached handler
-# and its stamp describe the same bytes; a live file that moved meanwhile is re-read.
-reload_current_handler() {
-  local snap="$WATCH_RUNTIME_DIR/handler-config.snap" tries=0 live
-  while :; do
+# One read per routing decision: the bytes are copied once into a private
+# snapshot and parsed from there; no cache, no compare, nothing to go stale.
+read_handler_config_now() {
+  local snap="$WATCH_RUNTIME_DIR/handler-config.snap" state="absent" handler=""
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
     if [ ! -e "$HANDLER_CONFIG_PATH" ]; then
-      HANDLER_CONFIG_STAMP="absent"
-      HANDLER_STATE="absent"
-      CURRENT_HANDLER="$(task_event_handler "$snap.none")" || CURRENT_HANDLER=""
-      rm -f "$snap"
-      return 0
-    fi
-    if cat -- "$HANDLER_CONFIG_PATH" > "$snap" 2>/dev/null \
-        && HANDLER_CONFIG_STAMP="$(handler_config_stamp "$snap")" && [ "$HANDLER_CONFIG_STAMP" != "absent" ] \
-        && CURRENT_HANDLER="$(task_event_handler "$snap")"; then
-      live="$(handler_config_stamp "$HANDLER_CONFIG_PATH")"
-      rm -f "$snap"
-      if [ "$live" = "$HANDLER_CONFIG_STAMP" ]; then
-        HANDLER_STATE="ready"
-        return 0
-      fi
+      handler="$(task_event_handler "$snap.none")" || handler=""
+    elif cat -- "$HANDLER_CONFIG_PATH" > "$snap" 2>/dev/null && handler="$(task_event_handler "$snap")"; then
+      state="ready"
     else
-      rm -f "$snap"
+      state="broken"
+      handler=""
     fi
-    tries=$((tries + 1))
-    if [ "$tries" -ge 5 ]; then
-      [ "$HANDLER_STATE" = "broken" ] || \
-        echo "watch-tasks-stream: task-event-handler config exists but cannot be read; holding every task until it can" >&2
-      HANDLER_STATE="broken"
-      HANDLER_CONFIG_STAMP=""
-      CURRENT_HANDLER=""
-      return 0
-    fi
-  done
+    rm -f "$snap"
+  fi
+  if [ "$state" = "broken" ] && [ "$HANDLER_STATE" != "broken" ]; then
+    echo "watch-tasks-stream: task-event-handler config exists but cannot be read; holding every task until it can" >&2
+  fi
+  HANDLER_STATE="$state"
+  CURRENT_HANDLER="$handler"
 }
-HANDLER_CONFIG_STAMP=""
-# Before every routing decision, so no decision runs on a handler older than the
-# file on disk; the JSON is re-read only when the content moved.
-refresh_current_handler() {
-  [ -n "$HANDLER_CONFIG_PATH" ] || return 0
-  [ "$(handler_config_stamp "$HANDLER_CONFIG_PATH")" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
-}
-# Tasks decided while the config was broken, re-dispatched once it reads.
+reload_current_handler() { read_handler_config_now; }
+# Tasks decided while the config was broken; replayed at most once per event.
 redispatch_held_tasks() {
   local held="$HELD_NAMES" fn
   [ -n "$held" ] || return 0
-  [ "$HANDLER_STATE" != "broken" ] || return 0
   HELD_NAMES=""
   while IFS= read -r fn; do
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
@@ -546,10 +520,12 @@ dispatch_task() {
   # decision (#4502). CURRENT_HANDLER is never populated for a worker (see the
   # SUTANDO_INSTANCE_ID gate at its assignment above), so this is enforced
   # structurally too, not just by this early return.
-  # Read the config here, with nothing between this read and its use.
-  refresh_current_handler
+  # This decision is its own read: a fresh snapshot, parsed here, used here.
+  [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
+"
+  read_handler_config_now
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
-    printf '%s' "$HELD_NAMES" | grep -qxF -- "$filename" || HELD_NAMES="$HELD_NAMES$filename
+    HELD_NAMES="$HELD_NAMES$filename
 "
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
@@ -558,6 +534,7 @@ dispatch_task() {
     emit_dispatch_task_file "$announce"
     return
   fi
+  prepare_handler_state
   "$CURRENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
@@ -892,7 +869,6 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   fi
   # Buffered events first, in fswatch's order, so a task sees the handler config
   # delivered before it; the sweep then covers only what no event announced.
-  refresh_current_handler
   REPLAYING=1
   while IFS= read -r path; do
     [ -n "$path" ] && handle_event "$path"
