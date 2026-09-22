@@ -128,6 +128,18 @@ fi
 
 reload_current_handler() {
   CURRENT_HANDLER="$(task_event_handler "$HANDLER_CONFIG_PATH")" || CURRENT_HANDLER=""
+  HANDLER_CONFIG_STAMP="$(stat -f '%m %z' "$HANDLER_CONFIG_PATH" 2>/dev/null \
+    || stat -c '%Y %s' "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent)"
+}
+HANDLER_CONFIG_STAMP=""
+# Before every routing decision: re-read the config only when its mtime or size
+# moved, so a decision never runs on a handler older than the file on disk.
+refresh_current_handler() {
+  [ -n "$HANDLER_CONFIG_PATH" ] || return 0
+  local stamp
+  stamp="$(stat -f '%m %z' "$HANDLER_CONFIG_PATH" 2>/dev/null \
+    || stat -c '%Y %s' "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent)"
+  [ "$stamp" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
@@ -455,6 +467,7 @@ priority_sorted_tasks() {
 
 dispatch_task() {
   local task_path="$1" rc filename announce resolved attempt
+  refresh_current_handler
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   #
@@ -654,10 +667,16 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
+# Names dispatched from buffered events are not swept; names the sweep
+# dispatched are not dispatched again by the one event they raised.
+REPLAYED_NAMES=""
 SWEPT_NAMES=""
 startup_sweep() {
   local fn
   while IFS= read -r fn; do
+    if [ -n "$REPLAYED_NAMES" ] && printf '%s' "$REPLAYED_NAMES" | grep -qxF -- "$fn"; then
+      continue
+    fi
     dispatch_task "$TASKS_DIR/$fn"
     SWEPT_NAMES="$SWEPT_NAMES$fn
 "
@@ -725,6 +744,7 @@ fi
 
 # One fswatch line. Shared by the readiness replay and the main loop so a line
 # read early is handled exactly as a line read late.
+REPLAYING=""
 handle_event() {
   local path="$1" parent name
   case "$path" in
@@ -748,14 +768,15 @@ handle_event() {
         if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
           return 0
         fi
-        # The sweep already announced this name; its own event would announce it twice.
         name="$(basename "$path")"
-        if [ -n "$SWEPT_NAMES" ] && printf '%s' "$SWEPT_NAMES" | grep -qxF -- "$name"; then
+        if [ -z "$REPLAYING" ] && [ -n "$SWEPT_NAMES" ] && printf '%s' "$SWEPT_NAMES" | grep -qxF -- "$name"; then
           SWEPT_NAMES="$(printf '%s' "$SWEPT_NAMES" | grep -vxF -- "$name")
 "
           return 0
         fi
         dispatch_task "$path"
+        [ -n "$REPLAYING" ] && REPLAYED_NAMES="$REPLAYED_NAMES$name
+"
       fi
       ;;
   esac
@@ -765,22 +786,25 @@ handle_event() {
 # must come back through fswatch. Its name matches no admission pattern.
 PRE_READY_EVENTS=""
 if [ "$WATCHER_ROLE" = "session" ]; then
-  READY_PROBE="$TASKS_DIR/.ready-$$"
   READY_DEADLINE=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
-  : > "$READY_PROBE"
+  probe_n=0
+  : > "$TASKS_DIR/.ready-$$-$probe_n"
   ready=0
   while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
     if ! IFS= read -r -t 1 path <&3; then
-      kill -0 "$FSWATCH_PID" 2>/dev/null && continue
-      break
+      kill -0 "$FSWATCH_PID" 2>/dev/null || break
+      # A probe written before fswatch subscribed raises nothing: write a fresh one.
+      probe_n=$((probe_n + 1))
+      : > "$TASKS_DIR/.ready-$$-$probe_n"
+      continue
     fi
     case "$path" in
-      */.ready-$$|.ready-$$) ready=1; break ;;
+      */.ready-$$-*|.ready-$$-*) ready=1; break ;;
       *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
 " ;;
     esac
   done
-  rm -f "$READY_PROBE"
+  rm -f "$TASKS_DIR"/.ready-$$-*
   if [ "$ready" -ne 1 ]; then
     echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; no sentinel written and no standby touched" >&2
     exit 1
@@ -811,10 +835,15 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   if [ "$standby" != "no" ]; then
     echo "watch-tasks-stream: standby watcher still present after ${SUTANDO_STANDBY_STOP_TIMEOUT:-15}s; sweeping anyway" >&2
   fi
-  startup_sweep
+  # Buffered events first, in fswatch's order, so a task sees the handler config
+  # delivered before it; the sweep then covers only what no event announced.
+  refresh_current_handler
+  REPLAYING=1
   while IFS= read -r path; do
     [ -n "$path" ] && handle_event "$path"
   done <<< "$PRE_READY_EVENTS"
+  REPLAYING=""
+  startup_sweep
 fi
 # -t bounds the read so a stretch with no fswatch event still gets a periodic,
 # core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
