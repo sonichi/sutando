@@ -132,6 +132,14 @@ HANDLER_STATE="absent"
 HELD_NAMES=""
 HELD_RETRY_AT=0
 DISPATCHED_IDS=""
+DECISION_IDENTITY=""
+# Called only where a task is actually admitted: announced to the core, or
+# handed to the handler with the claim held. A decision that admits nothing
+# records nothing.
+record_admission() {
+  [ -z "$DECISION_IDENTITY" ] || DISPATCHED_IDS="$DISPATCHED_IDS$DECISION_IDENTITY
+"
+}
 # `ls -di` is one line on every POSIX ls; GNU `stat -f` prints a filesystem dump.
 task_file_identity() {
   local inode sum
@@ -374,6 +382,7 @@ run_handler_now() {
   if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
     return 0
   fi
+  record_admission
   activity_transition RUNNING "$task_path"
   timed_out=0
   # `pending` before the run so a result the live core sees always has
@@ -566,10 +575,9 @@ dispatch_task() {
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
   fi
-  [ -z "$identity" ] || DISPATCHED_IDS="$DISPATCHED_IDS$identity
-"
+  DECISION_IDENTITY="$identity"
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
-    emit_dispatch_task_file "$announce"
+    emit_dispatch_task_file "$announce" && record_admission
     return
   fi
   prepare_handler_state
@@ -583,7 +591,7 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      emit_dispatch_task_file "$announce"
+      emit_dispatch_task_file "$announce" && record_admission
       return
     fi
     run_handler_now "$task_path" "fallback"
@@ -593,10 +601,10 @@ dispatch_task() {
     rm -f "$FALLBACKS_DIR/$filename"
     run_handler_now "$task_path" "must-handle"
   elif [ "$rc" -eq 3 ]; then
-    emit_dispatch_task_file "$announce"
+    emit_dispatch_task_file "$announce" && record_admission
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    emit_dispatch_task_file "$announce"
+    emit_dispatch_task_file "$announce" && record_admission
   fi
 }
 

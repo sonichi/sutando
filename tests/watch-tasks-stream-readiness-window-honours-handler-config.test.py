@@ -871,6 +871,34 @@ check("the held task was dispatched within the retry deadline (2 s) despite the 
       f"dispatched_at={at} stdout={out!r} handler log={handled!r}")
 
 
+def _feed_start(tmp, ws, b, env):
+    """A feed-driven fswatch stand-in: the test emits event lines itself.
+    Returns (process, emit, real_tasks_dir); readiness is already proven."""
+    feed = tmp / "feed"
+    feed.write_text("")
+    (b / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {feed}\n")
+    (b / "fswatch").chmod(0o755)
+    p = _start(ws, env)
+    real_tasks = Path(os.path.realpath(ws / "tasks"))
+
+    def emit(path):
+        with open(feed, "a") as fh:
+            fh.write(f"{path}\n")
+
+    t0 = time.time()
+    probe = None
+    while time.time() - t0 < 10:
+        probes = list((ws / "tasks").glob(".ready-*"))
+        if probes:
+            probe = probes[0]
+            break
+        time.sleep(0.05)
+    assert probe is not None, "no readiness probe appeared"
+    emit(real_tasks / probe.name)
+    _wait_ready(ws)
+    return p, emit, real_tasks
+
+
 def scenario_held_task_events_after_recovery_feed():
     """Linux semantics, driven deterministically: after a held task is
     re-dispatched on recovery, its own Created and Updated events arrive; it
@@ -976,6 +1004,98 @@ check("two distinct tasks were both admitted, once each",
       f"stdout={out!r}")
 check("no task was dispatched without an identity (the identity was one usable line)",
       "no usable file identity" not in err, f"stderr={err!r}")
+
+
+def scenario_held_task_during_shutdown(trigger):
+    """A task held on a broken config, then the shutdown sentinel is written and
+    the config recovers: the held task must not be replayed by the config event
+    ("event") nor by the poll tick ("tick"); it stays in the inbox."""
+    tmp, ws, b = _workspace(f"ready-shutdown-{trigger}-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hC", 4),))
+    _publish(cfg, h["hC"])
+    os.chmod(cfg, 0)
+    poll = "1" if trigger == "tick" else "60"
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": poll, "SUTANDO_HELD_RETRY_INTERVAL": "60"})
+    p, emit, real_tasks = _feed_start(tmp, ws, b, env)
+    out: list[str] = []
+    try:
+        _write_task(ws, "task-team")
+        emit(real_tasks / "task-team.txt")
+        _pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=3, settle=0.3)
+        held_log = log.read_text().split() if log.exists() else []
+        (ws / "state" / "shutdown.sentinel").write_text("")
+        os.chmod(cfg, 0o644)
+        if trigger == "event":
+            emit(cfg)  # the config's own event runs the reload and the held replay
+        time.sleep(4.0)
+        try:
+            os.set_blocking(p.stdout.fileno(), False)
+            c = p.stdout.read()
+            if c:
+                out.extend(c.splitlines())
+        except (BlockingIOError, TypeError):
+            pass
+        handled = log.read_text().split() if log.exists() else []
+        still_there = (ws / "tasks" / "task-team.txt").exists()
+        return held_log, out, handled, still_there
+    finally:
+        try:
+            os.chmod(cfg, 0o644)
+        except OSError:
+            pass
+        _stop(p)
+
+
+for trigger in ("event", "tick"):
+    print(f"a held task, then the shutdown sentinel, then the config recovers via the {trigger} path:")
+    held_log, out, handled, still_there = scenario_held_task_during_shutdown(trigger)
+    check(f"[{trigger}] setup: the task was held first", held_log == [], f"handler log={held_log!r}")
+    check(f"[{trigger}] the held task was NOT replayed mid-shutdown and remains in the inbox",
+          handled == [] and not any("task-team" in ln for ln in out) and still_there,
+          f"stdout={out!r} handler log={handled!r} still_there={still_there}")
+
+
+def scenario_foreign_claim_then_retry():
+    """A live foreign claim holds the task at its first decision, so nothing
+    runs; once the claim is released, a retry event for the same unchanged file
+    must process the task exactly once."""
+    tmp, ws, b = _workspace("ready-claim-")
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hC", 4),))
+    _publish(cfg, h["hC"])
+    claims = ws / "state" / "task-event-handler-claims"
+    claims.mkdir()
+    _write_task(ws, "task-team")
+    task_path = os.path.realpath(ws / "tasks" / "task-team.txt")
+    # run_handler_now's claim record: owner pid, watcher id, payload, disposition
+    (claims / "task-team.txt").write_text(f"{os.getpid()}\nforeign-1\n{task_path}\nmust-handle\n")
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    p, emit, real_tasks = _feed_start(tmp, ws, b, env)
+    out: list[str] = []
+    try:
+        emit(real_tasks / "task-team.txt")
+        time.sleep(3.0)
+        first = log.read_text().split() if log.exists() else []
+        (claims / "task-team.txt").unlink()
+        emit(real_tasks / "task-team.txt")  # the retry event for the same unchanged file
+        _pump(p, out, lambda: log.exists(), timeout=8, settle=2.0)
+        handled = log.read_text().split() if log.exists() else []
+        return first, out, handled
+    finally:
+        _stop(p)
+
+
+print("a live foreign claim holds the task, then the claim is released and a retry event arrives:")
+first, out, handled = scenario_foreign_claim_then_retry()
+check("setup: with the foreign claim live the handler ran nothing beyond the probe and nothing was announced",
+      "handle-hC" not in first and not any("task-team" in ln for ln in out[:0] + [ln for ln in out if ln.startswith("TASK_FILE")]),
+      f"handler log={first!r} stdout={out!r}")
+check("after the release, the retry event processed the task exactly once",
+      handled.count("handle-hC") == 1 and not any(ln.startswith("TASK_FILE: task-team") for ln in out),
+      f"stdout={out!r} handler log={handled!r}")
 
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
