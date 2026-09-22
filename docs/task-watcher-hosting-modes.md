@@ -10,7 +10,7 @@ it stands on `main` after #4477 and #4585; the behaviour is pinned by the tests 
 | mode | who runs the watcher | how tasks reach the agent | when it is used |
 |---|---|---|---|
 | **session watcher** | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | the normal state of a live core |
-| **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types one instruction line into the core's tmux pane: `Sutando task ready: <file>. Read <tasks>/<file>, follow CLAUDE.md, and write the result to <results>/<file>.` | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
+| **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types one instruction line into the core's tmux pane: `Sutando task ready: <file>. Read <tasks>/<file>, follow CLAUDE.md, complete the task, and write the result to <results>/<file>.` | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
 
 The watcher script decides everything about a task (routing through the task-event handler, priority,
 dedupe, holds); the notifier only executes what the watcher announces (#4561). So the two modes differ
