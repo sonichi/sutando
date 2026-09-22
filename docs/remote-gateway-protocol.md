@@ -284,3 +284,31 @@ A minimal relay needs only: an authenticated queue behind `GET /v1/tasks`
 (long-poll or return-immediately), an `ack` sink, a `results` sink, and a
 heartbeat sink. The four endpoints above are the entire contract — anything that
 implements them can drive Sutando.
+
+
+### Independent health-check reporting
+
+Each completed `health-check.py` run atomically publishes a compact
+`state/agent-health.json` record (`version`, `checked_at`, `total`, `failures`).
+It uses the same failure predicate as the local check's exit code. Warnings
+remain warnings; check names, diagnostic output, task text, and paths are not
+included in the record.
+
+The gateway overlays a recent failing report onto its next heartbeat as
+`status: error` with a failure count. This works even without a core status
+file, allowing the independent health checker to report a failed core.
+A later passing check removes the override and resumes the core's status.
+Repair attempts do not imply recovery: another completed check must verify it.
+
+Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
+as the five-minute fallback. Expired, malformed, or empty reports emit
+`status: unknown`, preventing cached health from being refreshed indefinitely.
+An absent report preserves legacy core-status reporting for installations
+without the health checker. A passing report alone does not invent a core
+status. If the gateway or host is down, no heartbeat can be sent; the broker's
+existing contact timeout still yields disconnected/unknown.
+
+The AG2 Space dashboard already classifies `error` as unhealthy, so this
+requires updating Sutando's health checker and restarting its gateway bridge;
+no dashboard schema change is needed. Reporting starts after the first health
+check completes and follows the installed check cadence.

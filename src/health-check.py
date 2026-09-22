@@ -14690,6 +14690,31 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
+
+
+def publish_health_report(checks, state_dir=None):
+    """Publish only aggregate health; diagnostics and user data stay local."""
+    state_dir = Path(state_dir) if state_dir is not None else WORKSPACE_DIR / "state"
+    tmp = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report = {"version": 1, "checked_at": time.time(), "total": len(checks),
+                  "failures": sum(is_issue(c) for c in checks)}
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir,
+                                         prefix=".agent-health-", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump(report, out)
+        os.replace(tmp, state_dir / "agent-health.json")
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -14701,6 +14726,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    publish_health_report(checks)
     track_health_fix(checks)
     if do_fix:
         track_health_fix(checks, start=True)
@@ -14988,6 +15014,7 @@ def main():
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
         residual_checks = run_all_checks()
+        publish_health_report(residual_checks)
         emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)
