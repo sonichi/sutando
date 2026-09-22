@@ -12,6 +12,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
@@ -93,6 +94,22 @@ class LocalCron(_Base):
         self._result()
         self._sweep()
         self.assertEqual(len(self.posted), 1)
+
+    def test_unreadable_task_defers_without_consuming_result(self):
+        task = gw.TASKS_DIR / f"{TID}.txt"
+        task.write_text(f"id: {TID}\nsource: cron\ntask: check\n")
+        result = self._result()
+        read_text = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if path == task:
+                raise PermissionError("task temporarily unreadable")
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read):
+            self._sweep()
+        self.assertEqual(self.posted, [])
+        self.assertTrue(result.exists())
 
 
 class DoubleWrite(_Base):
