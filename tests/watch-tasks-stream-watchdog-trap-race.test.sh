@@ -54,6 +54,9 @@ for i in $(seq 1 "$N"); do
       SUTANDO_HANDLER_RUN_TIMEOUT=1
       ( exit 0 ) &
       handler_pid=$!
+      # timeout_flag is set one real line before this extracted range
+      # starts; the harness sets it here the same way, out of range.
+      timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/wdrace-timeout.XXXXXX")"
       '"$SNIPPET"'
       wait "$handler_pid" 2>/dev/null
       kill -TERM "$watchdog_pid" 2>/dev/null
