@@ -75,11 +75,23 @@ def resolve_cloud_origin(
     env = os.environ if environ is None else environ
     override = env.get(CLOUD_ENV_NAME)
     if override:
-        return override
+        return _normalize_origin(override)
     declared = _manifest_default(CLOUD_ENV_NAME, manifest_path)
     if declared:
-        return declared
+        return _normalize_origin(declared)
     return CLOUD_FALLBACK
+
+
+def _normalize_origin(origin: str) -> str:
+    """A retired production origin reads as the current one (cloud_auth owns the list)."""
+    src = Path(os.path.realpath(__file__)).parents[3] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        from cloud_auth import normalize_base  # type: ignore
+    except Exception:
+        return origin
+    return normalize_base(origin)
 
 
 CLOUD = resolve_cloud_origin()

@@ -102,6 +102,20 @@ class CloudOriginPrecedence(unittest.TestCase):
         )
         self.assertTrue(str(m["config"]["AG2_CLOUD_ORIGIN"]).startswith("http"))
 
+    def test_retired_origin_reads_as_current_from_env_and_manifest(self):
+        """The shared list in src/cloud_auth.py decides what is retired; a
+        retired origin from the env or the manifest is sent nowhere."""
+        sys.path.insert(0, str(SKILL.parents[1] / "src"))
+        import cloud_auth  # noqa: E402
+
+        retired = cloud_auth.RETIRED_CLOUD_ORIGINS[0]
+        with tempfile.TemporaryDirectory() as td:
+            mp = _write_manifest(td, {"AG2_CLOUD_ORIGIN": retired})
+            from_manifest = report_usage.resolve_cloud_origin({}, mp)
+            from_env = report_usage.resolve_cloud_origin({"AG2_CLOUD_ORIGIN": retired}, mp)
+        self.assertEqual(from_manifest, cloud_auth.DEFAULT_CLOUD_ORIGIN)
+        self.assertEqual(from_env, cloud_auth.DEFAULT_CLOUD_ORIGIN)
+
     def test_script_has_no_ad_hoc_environ_read(self):
         """The specific shape that was flagged: a bare
         `os.environ.get("AG2_CLOUD_ORIGIN", ...)` at import time. Resolution
