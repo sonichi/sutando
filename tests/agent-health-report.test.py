@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Independent diagnostics must reach the heartbeat, including recovery and expiry."""
+from contextlib import ExitStack
 import importlib.util
 import json
 import os
@@ -121,6 +122,37 @@ class HealthReportTests(unittest.TestCase):
             self.publish('ok')
         self.assertEqual(self.heartbeat()['status'], 'error')
         self.assertEqual(list(self.state.glob('.agent-health-*')), [])
+
+    def test_cleanup_error_never_breaks_health_check(self):
+        with patch.object(hc.os, 'replace', side_effect=OSError('disk full')), \
+                patch.object(Path, 'unlink', side_effect=OSError('read only')):
+            self.publish('down')
+
+    def test_unwritable_state_directory_is_best_effort(self):
+        with patch.object(Path, 'mkdir', side_effect=OSError('read only')):
+            self.publish('down')
+        self.assertFalse((self.state / 'agent-health.json').exists())
+
+    def test_residual_recheck_publishes_verified_recovery(self):
+        failing = [{'name': 'fixture-check', 'status': 'down', 'detail': ''}]
+        passing = [{'name': 'fixture-check', 'status': 'ok', 'detail': ''}]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sys, 'argv', ['health-check.py', '--quiet', '--fix', '--emit-task']))
+            stack.enter_context(patch.object(hc, 'run_all_checks', side_effect=[failing, passing]))
+            for name in ('track_health_fix', 'apply_skill_symlink_fixes',
+                         'apply_task_watcher_sentinel_fix', 'apply_claude_hooks_fix',
+                         'emit_task_for_failures'):
+                stack.enter_context(patch.object(hc, name))
+            stack.enter_context(patch.object(hc, 'fix_down_bridges', return_value=[]))
+            stack.enter_context(patch.object(hc, '_any_core_alive', return_value=False))
+            stack.enter_context(patch.object(hc.time, 'sleep'))
+            stack.enter_context(patch('builtins.print'))
+            publish = stack.enter_context(patch.object(hc, 'publish_health_report',
+                                                       wraps=lambda c: hc_publish(c, self.state)))
+            with self.assertRaises(SystemExit):
+                hc.main()
+            self.assertEqual([call.args[0] for call in publish.call_args_list], [failing, passing])
+            self.assertEqual(self.heartbeat()['status'], 'running')
 
     def test_main_publishes_before_json_and_quiet_exit(self):
         checks = [{'name': 'core', 'status': 'down', 'detail': ''}]
