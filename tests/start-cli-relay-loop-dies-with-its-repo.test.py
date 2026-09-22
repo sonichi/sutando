@@ -65,14 +65,20 @@ def _exe(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _dual_python3_stub(calls: Path, srcdir: Path) -> str:
-    """A fake python3 that still counts relay calls, but really runs
-    tmux-probe-cli.py (real tmux_probe.py copied beside it) when the loop
-    calls it for classification -- the loop's own delegation, exercised."""
+def _dual_python3_stub(calls: Path, srcdir: Path, probes: Path) -> str:
+    """A fake python3 that counts relay calls AND records each classification
+    probe's exit code (0 PRESENT / 1 ABSENT / 2 UNKNOWN) to `probes`, real
+    tmux-probe-cli.py (real tmux_probe.py copied beside it) doing the actual
+    classification -- the loop's own delegation, exercised. Recording the
+    exit code (not just a relay-call count) is what lets the caller assert on
+    the loop's actual miss-streak invariant instead of a wall-clock-sensitive
+    call-count delta -- the two can diverge whenever a probe that was already
+    in flight (started before the session died, observed while it was still
+    alive) lands after the caller's own "before" snapshot."""
     (srcdir / "tmux_probe.py").write_text((REPO / "src" / "tmux_probe.py").read_text())
     (srcdir / "tmux-probe-cli.py").write_text((REPO / "src" / "tmux-probe-cli.py").read_text())
     return (f'#!/bin/sh\ncase "$1" in\n'
-            f'  */tmux-probe-cli.py) exec {sys.executable} "$@" ;;\n'
+            f'  */tmux-probe-cli.py) {sys.executable} "$@"; rc=$?; echo "$rc" >> "{probes}"; exit $rc ;;\n'
             f'  *) echo run >> "{calls}" ;;\nesac\n')
 
 
@@ -145,9 +151,10 @@ else:
         binp.mkdir()
         (repo / "src").mkdir(parents=True)
         calls = Path(td) / "calls.log"
+        probes = Path(td) / "probes.log"
         script = repo / "src" / "core-supervisor-relay.py"
         script.write_text("# stand-in for the relay\n")
-        _exe(binp / "python3", _dual_python3_stub(calls, repo / "src"))
+        _exe(binp / "python3", _dual_python3_stub(calls, repo / "src", probes))
         _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
         os.symlink(tmux, binp / "tmux")
         sock = Path(td) / "tmux.sock"
@@ -174,11 +181,25 @@ else:
                 p.kill()
                 _, err = p.communicate()
                 rc = None
-            n_after = len(calls.read_text().splitlines()) if calls.exists() else 0
+            # Assert on the recorded probe outcomes, not a relay-call-count delta:
+            # a probe already in flight when kill-server runs can still observe
+            # the session alive and its (unrelated) relay call can land after
+            # n_before was read, which used to inflate n_after - n_before past
+            # any fixed bound with no defect involved (Qingyun's review of
+            # #4605). The loop's real invariant is "exit immediately after the
+            # third CONSECUTIVE absent probe" -- read that off probes.log
+            # directly, independent of wall-clock snapshot timing.
+            probe_hist = probes.read_text().splitlines() if probes.exists() else []
             check("d) the loop exits 0 once its session is gone", rc == 0,
-                  f"rc={rc}; relay ran {n_after}x; stderr: {err[-200:]}")
-            check("d) at most three checks pass between the session's death and the exit",
-                  n_after - n_before <= 3, f"relay ran {n_after - n_before}x after kill-server")
+                  f"rc={rc}; probes={probe_hist}; stderr: {err[-200:]}")
+            tail_absent = 0
+            for outcome in reversed(probe_hist):
+                if outcome == "1":
+                    tail_absent += 1
+                else:
+                    break
+            check("d) exactly three consecutive ABSENT probes precede the exit",
+                  tail_absent == 3, f"probe history: {probe_hist}")
         finally:
             subprocess.run([tmux, "-S", str(sock), "kill-server"], check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
