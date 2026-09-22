@@ -48,6 +48,13 @@ Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
 sentence you own.
 
+**To be seen in a surface you must HOLD it open.** Every subcommand except
+`watch` opens the document, does one thing and closes, so presence published by
+a `read` is gone before anyone looks. `watch` holds the connection — and it
+publishes presence only when given `--name`, so without it you join invisibly.
+Add `--user-id '@you:server'` too: a summon card draws your real avatar when
+the presence summary carries your id, and a placeholder when it does not.
+
 **Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
 `--json` belong to the program, not the command: `room_collab.py --kind board
 read <room>` works, `room_collab.py read <room> --kind board` is refused as
@@ -96,7 +103,7 @@ python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
 python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
 python3 $P reply  '!room:server' '$eventid' 'yes, final'              # answer in a comment's thread
-python3 $P --name mars read '!room:server'            # publish presence while connected
+python3 $P --name mars --user-id '@mars:x' watch '!room:server'   # BE PRESENT: held open, so others see you
 ```
 
 Add `--insecure` only for a local rig with a self-signed certificate.
