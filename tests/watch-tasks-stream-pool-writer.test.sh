@@ -35,22 +35,29 @@ check "the hook runs the writer through SUTANDO_PY_BIN, not the shebang" \
       "1" "$(printf '%s\n' "$hook" | grep -c '"\$SUTANDO_PY_BIN" "\$SUTANDO_POOL_DELIVERY_SCRIPT"')"
 check "the hook refuses to run without a resolved interpreter" \
       "1" "$(printf '%s\n' "$hook" | grep -c 'SUTANDO_PY_BIN:-}" \] || return 1')"
-check "the runner is handed the resolved interpreter" \
-      "1" "$(grep -c 'SUTANDO_PY_BIN="\$SUTANDO_PY_BIN" /bin/bash "\$0" --handler-runner' "$WATCHER")"
+# "the runner is handed the resolved interpreter" (a re-exec'd `bash "$0"
+# --handler-runner` subprocess) is retired: run_handler_now() calls the
+# handler inline, in this same process, so $SUTANDO_PY_BIN is already in
+# scope for record_worker_done -- there is no separate runner to hand it to.
+# The hook's own two checks above already cover the real property (resolved
+# interpreter, not the shebang).
 settle="$(awk '/^settle_worker_record\(\) \{/,/^\}/' "$WATCHER")"
 check "settling a record means promoting it to the published stage" \
       "1" "$(printf '%s\n' "$settle" | grep -c 'record_worker_done "\$1" done "\$WORKSPACE_DIR"')"
 ptf="$(awk '/^publish_terminal_failure\(\) \{/,/^\}/' "$WATCHER")"
 check "both terminal paths (failure published, answer already there) settle the record" \
       "2" "$(printf '%s\n' "$ptf" | grep -c 'settle_worker_record "\$filename"')"
+# 3 -> 2: drain_dispatch_queue's own site collapsed into run_handler_now's
+# single failure switch, and fallback_outstanding_handlers' DISPATCH_DIR-queue
+# loop has no equivalent now that there is no queue -- only its CLAIMS_DIR
+# loop (settle_own_claims_on_shutdown's one site) still applies.
 check "every fallback-to-live-core site withdraws the pending hold first" \
-      "3" "$(grep -c 'record_worker_done "\$filename" abandon "\$WORKSPACE_DIR"' "$WATCHER")"
+      "2" "$(grep -c 'record_worker_done "\$filename" abandon "\$WORKSPACE_DIR"' "$WATCHER")"
 
 # ── functional: the real runner, the real writer ──
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 ws="$tmp/ws"; mkdir -p "$ws/tasks" "$ws/results" "$ws/state"
 printf 'id: task-x\ntask: hi\n' > "$ws/tasks/task-x.txt"
-events="$tmp/events"; : > "$events"
 
 # A handler that publishes a result and succeeds; a second that fails.
 ok_handler="$tmp/handler-ok.sh"; printf '#!/bin/bash\nprintf "done\\n" > "%s/results/task-x.txt"\nexit 0\n' "$ws" > "$ok_handler"; chmod +x "$ok_handler"
@@ -60,9 +67,19 @@ bad_handler="$tmp/handler-bad.sh"; printf '#!/bin/bash\nexit 7\n' > "$bad_handle
 # writer would fail and the record would be missing.
 poison="$tmp/poison"; mkdir -p "$poison"; printf '#!/bin/sh\necho POISONED-PYTHON-RAN >&2\nexit 97\n' > "$poison/python3"; chmod +x "$poison/python3"
 
+# --handler-runner (a re-exec'd subprocess mode) is retired along with the
+# rest of the async runner -- record_worker_done() itself is unchanged, so
+# extract and eval just that one function and reproduce the exact pending/
+# run/done call sequence run_handler_now() makes, in-process, no re-exec.
+eval "$(awk '/^record_worker_done\(\) \{/,/^\}/' "$WATCHER")"
 run_runner() {  # run_runner <handler> ; env comes from the caller
-    /bin/bash "$WATCHER" --handler-runner "$1" "" "$ws" "$ws/tasks/task-x.txt" "$ws/results" "$REPO" "$events" task-x.txt 2>"$tmp/stderr"
-    cat "$events"; : > "$events"
+    local filename=task-x.txt rc
+    record_worker_done "$filename" pending "$ws" || { printf 'HANDLER_DONE: 1 %s\n' "$filename"; return; }
+    "$1" --runtime "" --workspace "$ws" --task-file "$ws/tasks/task-x.txt" \
+      --results-dir "$ws/results" --repo "$REPO" >/dev/null 2>"$tmp/stderr"
+    rc=$?
+    [ "$rc" -eq 0 ] && record_worker_done "$filename" done "$ws"
+    printf 'HANDLER_DONE: %s %s\n' "$rc" "$filename"
 }
 flags() { ls "$ws/state/workers/worker-3/done" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
 

@@ -95,7 +95,7 @@ const _HEADER_KEYS = [
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
-	'thread_root', 'source_room_id',
+	'thread_root', 'source_room_id', 'channel_kind',
 	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
@@ -174,6 +174,116 @@ export function writeChatTask(taskDescription: string): string {
 let _sendTaskStatus: ((taskId: string, status: string, text: string, result?: string) => void) | null = null;
 const _deliveredResults = new Set<string>();
 
+/** Test seam: whether the drain already delivered (or pre-claimed) `file`. */
+export function _isDeliveredResult(file: string): boolean {
+	return _deliveredResults.has(file);
+}
+
+/** A result whose first non-empty line is a `[channel: <id>]` redirect with an
+ *  id in it (result_markers._REDIRECT_RE). */
+export const LEADING_REDIRECT_RE = /^\s*\[channel:\s*[^\]\s][^\]]*\]/;
+
+/** `[dm-only]` is detected the way every text bridge detects it
+ *  (result_markers.parse_markers: anywhere in the body, case-insensitive). */
+export const DM_ONLY_RE = /\[dm-only\]/i;
+
+/** Where a voice session's delegated work came from. The core carries it to the
+ *  task header and the result file; the adapter owning `channel` interprets `target`. */
+export interface VoiceSessionOrigin {
+	/** Bridge tag: results are written as `.to-<channel>` (proactive_routing's grammar). */
+	channel: string;
+	/** Opaque destination on that channel; the adapter validates its grammar. */
+	target: string;
+	/** Human name for prompts and logs. */
+	label?: string;
+	/** Extra header lines above `task:`; keys outside the known header set are dropped. */
+	headers?: Record<string, string>;
+	/** Body guidance line under `task:`. */
+	contextLine?: string;
+	/** What voice is told when a result was kept to the owner DM instead of `target`. */
+	dmOnlyNote?: string;
+	/** Re-check at delivery; false or a throw sends the result to the owner DM. */
+	verify?: () => Promise<boolean>;
+}
+
+/** Rebuilds the origin of a task from its header lines (a task written before a restart). */
+export type VoiceTaskOriginResolver = (headerLines: string[]) => VoiceSessionOrigin | null;
+
+const ORIGIN_CHANNEL_RE = /^[a-z0-9_-]+$/;
+// One token with no bracket: the target is written inside a `[channel: …]` marker.
+const ORIGIN_TARGET_RE = /^[^\s\[\]]+$/;
+
+function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSessionOrigin | null {
+	if (!origin || typeof origin.channel !== 'string' || typeof origin.target !== 'string') return null;
+	return ORIGIN_CHANNEL_RE.test(origin.channel) && ORIGIN_TARGET_RE.test(origin.target) ? origin : null;
+}
+
+let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
+let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
+const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+
+/** Bind (or, with null, release) the origin of the live voice session. Tasks written
+ *  afterwards carry the origin current at write time; a malformed origin binds nothing. */
+export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
+	_voiceSessionOrigin = _usableOrigin(origin);
+}
+
+export function getVoiceSessionOrigin(): VoiceSessionOrigin | null {
+	return _voiceSessionOrigin;
+}
+
+export function setVoiceTaskOriginResolver(resolver: VoiceTaskOriginResolver | null): void {
+	_voiceTaskOriginResolver = resolver;
+}
+
+/** The origin a voice task was written with: remembered from the write, else rebuilt
+ *  from its header by the adapter's resolver. Null for a task with no origin. */
+export function voiceTaskOrigin(taskId: string): VoiceSessionOrigin | null {
+	const known = _taskOrigins.get(taskId);
+	if (known) return known;
+	if (!_voiceTaskOriginResolver) return null;
+	const headerLines = _readTaskHeader(taskId);
+	if (headerLines === null || !_headerIsVoice(headerLines)) return null;
+	try {
+		return _usableOrigin(_voiceTaskOriginResolver(headerLines));
+	} catch (e) {
+		console.error(`${ts()} [TaskBridge] origin resolver failed for ${taskId}:`, e);
+		return null;
+	}
+}
+
+/** Write an origin-bound result: `.to-<channel>` in the name, `[channel: <target>]` on top unless
+ *  it opens with its own redirect. Claimed at once, or the drain would speak it again. */
+export function forwardVoiceResultToOrigin(taskId: string, result: string, origin: VoiceSessionOrigin, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.to-${origin.channel}.txt`;
+	// parse_markers keeps the first redirect, so a result that opens with its own wins by not being preceded.
+	writeFileSync(join(RESULT_DIR, file), LEADING_REDIRECT_RE.test(result) ? result : `[channel: ${origin.target}]\n${result}`);
+	_deliveredResults.add(file);
+	return file;
+}
+
+/** Keep an origin-bound result to the owner's DM on the same bridge: no `[channel:]`
+ *  line, `[dm-only]` restored on top. Claimed at once, like the origin shape. */
+export function forwardVoiceResultToOwnerDm(taskId: string, result: string, channel: string, nowSec = Math.floor(Date.now() / 1000)): string {
+	const file = `proactive-result-${taskId}-${nowSec}.to-${channel}.txt`;
+	writeFileSync(join(RESULT_DIR, file), `[dm-only]\n${result}`);
+	_deliveredResults.add(file);
+	return file;
+}
+
+/** An origin-bound result that declared itself `[dm-only]` goes to the owner's DM.
+ *  Returns the DM file, or null when the task has no origin or the result is not dm-only. */
+export function keepVoiceResultToDm(taskId: string, result: string, dmOnly: boolean, nowSec = Math.floor(Date.now() / 1000)): string | null {
+	const origin = dmOnly ? voiceTaskOrigin(taskId) : null;
+	if (!origin) return null;
+	const file = forwardVoiceResultToOwnerDm(taskId, result, origin.channel, nowSec);
+	console.log(`${ts()} [TaskBridge] ${taskId} result kept to the DM ([dm-only]) via ${file}`);
+	return file;
+}
+
+/** Delivery note under a result kept to the DM when the origin supplies none. */
+export const DM_ONLY_DELIVERY_NOTE = 'That result was for the owner alone: its written copy went to their DM. Tell them it is in their DM.';
+
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes default
 // Per-task pending state: submission epoch, timeout (ms), and whether to
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
@@ -188,7 +298,7 @@ const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim()
 
 /** True if the task file (in tasks/, tasks/processed/, or tasks/archive/
  * — including month-partitioned subdirs `tasks/archive/YYYY-MM/`) is
- * voice-originated (channel_id: local-voice). Used by the result watcher
+ * voice-originated (`source: voice`, see _headerIsVoice). Used by the result watcher
  * to decide whether to forward an unsent result to Discord DM when voice is
  * offline. Returns false on missing file or parse error — bias toward not
  * forwarding to keep Susan-rejected always-DM behavior off by default for
@@ -270,7 +380,100 @@ export function _readTaskHeader(taskId: string): string[] | null {
 export function _isVoiceTask(taskId: string): boolean {
 	const headerLines = _readTaskHeader(taskId);
 	if (headerLines === null) return false;
-	return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+	return _headerIsVoice(headerLines);
+}
+
+/** Voice verdict over header lines: the voice `source` value. `channel_id` may carry an origin's target and
+ *  `media_form` is stamped by phone too; the `local-voice` literal covers older archived files. */
+function _headerIsVoice(headerLines: string[]): boolean {
+	return headerLines.some(l => l.startsWith('source: voice') || l.startsWith('channel_id: local-voice'));
+}
+
+/** The origin a finished voice task may answer at, re-checked through the origin's
+ *  own `verify` (fail closed). Null sends the result the owner-DM way. */
+export async function resolveVoiceResultOrigin(taskId: string): Promise<VoiceSessionOrigin | null> {
+	const origin = voiceTaskOrigin(taskId);
+	if (!origin) return null;
+	let ok = true;
+	if (origin.verify) {
+		try {
+			ok = (await origin.verify()) === true;
+		} catch (e) {
+			ok = false;
+			console.error(`${ts()} [TaskBridge] origin verify failed for ${taskId}:`, e);
+		}
+	}
+	if (ok) return origin;
+	console.log(`${ts()} [TaskBridge] ${taskId} result not posted to ${origin.target}: origin not verified — delivered the DM way`);
+	return null;
+}
+
+/** Voice result with no client attached: its verified origin, or the owner's DM when `[dm-only]`, else
+ *  the untagged owner-DM shape, left unclaimed so the drain speaks it on reconnect if no bridge takes it. */
+export async function forwardOfflineVoiceResult(taskId: string, result: string, nowSec = Math.floor(Date.now() / 1000), dmOnly = false): Promise<string> {
+	const kept = keepVoiceResultToDm(taskId, result, dmOnly, nowSec);
+	if (kept) return kept;
+	const origin = await resolveVoiceResultOrigin(taskId);
+	if (origin) {
+		const file = forwardVoiceResultToOrigin(taskId, result, origin, nowSec);
+		console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to ${origin.target} via ${file}`);
+		return file;
+	}
+	const file = `proactive-result-${taskId}-${nowSec}.txt`;
+	writeFileSync(join(RESULT_DIR, file), result);
+	console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to the owner DM via ${file}`);
+	return file;
+}
+
+/** Offline drain leg: claim, forward, archive only once the forward is on disk.
+ *  A failed forward releases the claim, so the result is spoken on reconnect. */
+export function _forwardOfflineThenArchive(
+	taskId: string, file: string, result: string, dmOnly: boolean,
+	forward: typeof forwardOfflineVoiceResult = forwardOfflineVoiceResult, archiveDelayMs = 10_000,
+): Promise<boolean> {
+	_deliveredResults.add(file);
+	_pendingTasks.delete(taskId);
+	return forward(taskId, result, undefined, dmOnly).then(() => {
+		setTimeout(() => {
+			archiveFile(join(RESULT_DIR, file), 'results', taskId);
+			const taskFile = join(TASK_DIR, `${taskId}.txt`);
+			if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+		}, archiveDelayMs);
+		return true;
+	}, e => {
+		_deliveredResults.delete(file);
+		console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} offline:`, e);
+		return false;
+	});
+}
+
+/** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
+ *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
+	const lines = [
+		`id: ${taskId}`,
+		`timestamp: ${timestamp}`,
+		`source: voice`,
+		`interaction_type: realtime_audio`,
+		// Media-form axis on live-plane tasks: the payload originates from a continuous
+		// real-time session (frames stay out-of-band; this is provenance).
+		'media_form: live_stream',
+		`channel_id: ${origin?.target ?? 'local-voice'}`,
+	];
+	for (const [key, value] of Object.entries(origin?.headers ?? {})) {
+		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
+		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
+	}
+	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
+	return lines.join('\n') + '\n';
+}
+
+/** Remember the origin a task was written with, so its result can follow it. */
+export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin | null): void {
+	if (!origin) return;
+	_taskOrigins.set(taskId, origin);
+	// Bounded: only recent tasks can still answer.
+	if (_taskOrigins.size > 200) _taskOrigins.delete(_taskOrigins.keys().next().value as string);
 }
 
 const CLAIM_LEDGERS = 'remote-task-inflight';
@@ -408,7 +611,10 @@ export function countQueuedAhead(dir: string, excludeId: string): number {
 /** The sentence the voice agent says when other tasks are ahead; empty when none are. */
 export function queuedAheadInstruction(queuedAhead: number): string {
 	if (queuedAhead <= 0) return '';
-	return ` ${queuedAhead} task(s) are ahead of this one. Tell the user exactly "Got it, ${queuedAhead} ahead of this one, working in order" and wait; do not narrate the queue again.`;
+	const line = queuedAhead === 1
+		? 'Got it, right after the one I\'m on.'
+		: `Got it, ${queuedAhead} in line before this one.`;
+	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
 }
 
 export const workTool: ToolDefinition = {
@@ -549,23 +755,14 @@ export const workTool: ToolDefinition = {
 					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 			}
 		} catch { /* best effort — never block delegation on context attach */ }
+		// An origin-bound session addresses the task to its origin and adds the adapter's
+		// guidance line; without one the task keeps `channel_id: local-voice`.
+		const origin = _voiceSessionOrigin;
+		const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
+		_rememberTaskOrigin(taskId, origin);
 		const content =
-			`id: ${taskId}\n` +
-			`timestamp: ${timestamp}\n` +
-			`source: voice\n` +
-			`interaction_type: realtime_audio\n` +
-			// interaction-model 4D, step 1.5 (scope A): stamp the media-form axis
-			// on live-plane tasks. Additive/observability — routing still keys on
-			// _isVoiceTask (source/channel_id); scope B makes this the canonical
-			// plane-routing signal. `live_stream` = the payload originates from a
-			// continuous real-time session (media frames stay out-of-band per the
-			// three-channel rule; this is provenance, not stream bytes).
-			`media_form: live_stream\n` +
-			`channel_id: local-voice\n` +
-			`user_id: ${ownerId}\n` +
-			`access_tier: owner\n` +
-			`priority: urgent\n` +
-			`task: ${confineUserContent(task)}${contextBlock}\n`;
+			buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+			`task: ${confineUserContent(task)}${originGuidance}${contextBlock}\n`;
 		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -822,7 +1019,7 @@ export function resetNoteViewingDebounce(): void {
  * submitted. Results it doesn't own are left untouched for their real
  * consumers on the core host. Skip markers get the same silent-archive
  * treatment as the local path. */
-function startRelayResultWatcher(onResult: (result: string) => void): void {
+function startRelayResultWatcher(onResult: ResultListener): void {
 	console.log(`${ts()} [TaskBridge] Relay result watcher polling core agent-api`);
 	let inFlight = false;
 	setInterval(async () => {
@@ -869,7 +1066,11 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 	}, 2000);
 }
 
-export function startResultWatcher(onResult: (result: string) => void, isClientConnected: () => boolean): void {
+/** The drain's listener: the result text, plus an optional delivery note injected under it
+ *  when the written copy went somewhere other than the session was told to expect. */
+export type ResultListener = (result: string, deliveryNote?: string) => void;
+
+export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
 	if (_delegation.mode === 'relay') {
 		// Split-host mode: the local watcher below reads core-host state
 		// (task files for timeout snippets, voice-/question-/proactive- flows,
@@ -988,7 +1189,11 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// The old expression here was /\[dm-only\]\s*/gi, which stripped
 				// every occurrence and made this consumer disagree with every
 				// text bridge after the Python side was narrowed.
-				const result = readFileSync(path, 'utf-8')
+				const rawResult = readFileSync(path, 'utf-8');
+				// Detected before the strip: an origin-bound result that carries the
+				// marker is kept to the owner's DM (keepVoiceResultToDm).
+				const dmOnly = DM_ONLY_RE.test(rawResult);
+				const result = rawResult
 					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
 					.trim();
 				if (!result) continue;
@@ -1075,21 +1280,9 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 				// handle their own deliveries via pending_replies).
 				if (!clientConnected) {
 					if (file.startsWith('task-') && _isVoiceTask(taskId)) {
-						try {
-							const proactiveTs = Math.floor(Date.now() / 1000);
-							const proactivePath = join(RESULT_DIR, `proactive-result-${taskId}-${proactiveTs}.txt`);
-							writeFileSync(proactivePath, result);
-							console.log(`${ts()} [TaskBridge] Voice offline; forwarded ${taskId} result to Discord DM via ${proactivePath}`);
-							_deliveredResults.add(file);
-							_pendingTasks.delete(taskId);
-							setTimeout(() => {
-								archiveFile(path, 'results', taskId);
-								const taskFile = join(TASK_DIR, `${taskId}.txt`);
-								if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-							}, 10_000);
-						} catch (e) {
-							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
-						}
+						// Claimed now, delivered once the origin is re-verified; an
+						// unverified origin falls back to the owner DM.
+						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.
@@ -1163,7 +1356,19 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
 					logConversation('core-agent', `[task:${taskId}] ${result.slice(0, LOG_LINE_MAX_CHARS)}`);
-					onResult(result);
+					// An origin-bound voice result is spoken AND written: to its origin, or to the
+					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
+					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
+					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
+					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
+					else onResult(result);
+					if (taskOrigin && !keptToDm) {
+						resolveVoiceResultOrigin(taskId).then(origin => {
+							if (!origin) return;
+							const proactiveFile = forwardVoiceResultToOrigin(taskId, result, origin);
+							console.log(`${ts()} [TaskBridge] Posted ${taskId} result to ${origin.target} via ${proactiveFile}`);
+						}).catch(e => console.error(`${ts()} [TaskBridge] Failed to post ${taskId} result to its origin:`, e));
+					}
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

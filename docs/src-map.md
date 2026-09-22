@@ -45,6 +45,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
+- **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
@@ -203,6 +204,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
+- **`tasks-dir-resolve.sh`** — Shared TASKS_DIR resolution — sourceable so watch-tasks-stream.sh and task-notifier-supervisor.sh can never resolve a different inbox for the same instance.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
 - **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
@@ -243,6 +245,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-silence-recovery-coordinator.ts`** — ACTIVE-silence recovery coordinator (Phase 1 armed mode) — the impure driver around the pure reducer in voice-active-silence-watchdog.ts: executes effects against the bodhi session surface (recoverUpstream, client JSON), owns retry timers, the terminal voice-stalled push/resend, the retry-ack wire, and the reducer↔transport attempt-epoch correlation.
 - **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
 - **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
+- **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
@@ -273,6 +276,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
@@ -280,7 +284,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
-- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
+- **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives -- but ONLY while no in-session (--role session) watcher already covers this inbox.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
 ## `src/channels/`

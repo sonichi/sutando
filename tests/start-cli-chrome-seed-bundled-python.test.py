@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Regression test for the Chrome-onboarding seed interpreter resolution in
-start-cli.sh (sonichi#2433 review, marklysze blocker).
+"""Regression test for the Chrome-onboarding seed interpreter resolution,
+originally in start-cli.sh, now in the shared session-launch.sh helper both
+the core and a pool worker's own launcher use (sonichi#2433 review, marklysze
+blocker).
 
 The seed that writes `hasCompletedClaudeInChromeOnboarding` runs an inline
 python. On a FRESH Mac there is no real system `python3` — bare `python3`
@@ -14,7 +16,7 @@ The fix resolves the interpreter into `$PY` (SUTANDO_PY → bundled
 `<engine>/runtime/python` → system python3) and uses `"$PY"` for the seed, with
 a `"$PY" -c 'import sys'` guard (proves it RUNS, not just that a name exists).
 
-This test is SOURCE-TIED, not a full launch of start-cli.sh: it extracts the
+This test is SOURCE-TIED, not a full launch of session-launch.sh: it extracts the
 seed's PY heredoc verbatim from the script and reproduces the script's own
 resolver + guard in a small shell harness, then runs the extracted seed under a
 simulated clean-Mac env — a working interpreter in SUTANDO_PY, and a `python3`
@@ -22,7 +24,7 @@ stub on PATH that mimics the CLT shim (emits the notice, returns nothing, exit
 1). It asserts the seed writes `hasCompletedClaudeInChromeOnboarding: true`.
 
 Drift is caught by `_resolver_and_guard_snippet()` and the verbatim heredoc
-extraction — if start-cli.sh's resolver, guard, or seed block changes shape,
+extraction — if session-launch.sh's resolver, guard, or seed block changes shape,
 those assertions fail. If the guard regresses to bare `python3`, the stub wins on
 PATH under the reproduced harness and the flag is never written — the test fails.
 (A full end-to-end launch is avoided so the run stays hermetic and fast — it
@@ -42,7 +44,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
 
 # The CLT-shim stub: what bare `python3` does on a genuinely fresh Mac.
 CLT_STUB = (
@@ -78,7 +80,7 @@ def _resolver_and_guard_snippet() -> str:
     assert 'runtime/python/bin/python3' in resolver.read_text(), \
         "the resolver lost the bundled-python tier"
 
-    # This one stays source-tied on purpose: it is about start-cli.sh's OWN
+    # This one stays source-tied on purpose: it is about session-launch.sh's OWN
     # invocation, not the cascade.
     assert '"$PY" - <<' in txt or "\"$PY\" -" in txt, \
         "the Chrome seed no longer invokes the resolved \"$PY\""
@@ -87,7 +89,7 @@ def _resolver_and_guard_snippet() -> str:
     code_lines = [ln for ln in txt.splitlines() if not ln.lstrip().startswith("#")]
     bad = [ln for ln in code_lines if re.search(r'(?<![\"\w.])python3\s', ln)
            and "bash/python3/node" not in ln]
-    assert not bad, f"bare `python3` still invoked in start-cli.sh: {bad}"
+    assert not bad, f"bare `python3` still invoked in session-launch.sh: {bad}"
     return txt
 
 
@@ -104,7 +106,7 @@ def _seed_program() -> str:
 
 def _resolve_and_run_seed(prog: str, ccd: Path, sutando_py: str, path_with_stub: str,
                           home: Path) -> dict | None:
-    """Reproduce start-cli.sh's resolver + guard in a tiny shell harness, then run
+    """Reproduce session-launch.sh's resolver + guard in a tiny shell harness, then run
     the ACTUAL extracted seed program with the resolved interpreter — under a PATH
     whose `python3` is the CLT stub. Returns the seeded .claude.json or None."""
     prog_file = ccd / "_seed.py"

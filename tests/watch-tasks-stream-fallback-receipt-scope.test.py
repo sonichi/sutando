@@ -70,6 +70,9 @@ def run(watcher_instance, receipt_owner, want_state=False):
             # Sample WHILE the watcher lives: its cleanup trap unlinks the
             # sentinel on exit, so a post-hoc listing is always empty.
             seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            # The sweep announces before the sentinel is stamped (the stamp
+            # waits for fswatch to be confirmed up), so keep sampling for it.
+            if want_state and not seen_state: continue
             if log.exists() and "handle" in log.read_text(): break
             if any("TASK_FILE" in c for c in out): break
     finally:
@@ -85,7 +88,9 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-HANDLED = ["probe", "probe", "handle"]  # enqueue-time probe, then drain's own re-probe
+# Single probe now: no queue between probe and run to guard against a stale
+# enqueue-time handler reference (see PR body for the old async shape).
+HANDLED = ["probe", "handle"]
 BYPASSED = ["probe"]
 NO_HANDLER_CALL = []  # a worker never probes: not even a bare "probe" entry
 
