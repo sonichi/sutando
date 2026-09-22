@@ -9422,6 +9422,20 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # A watcher holds its inbox whether or not anything consumes what it
+    # announces; the reader is the only difference visible from outside.
+    unread = []
+    for _p in sorted(live):
+        _sink = watcher_identity.output_sink(_p)
+        if _sink.observed and _sink.read is False:
+            unread.append(f"{_p} -> {_sink.kind} {_sink.target}".rstrip())
+    if unread:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(unread)} announce(s) where nothing is reading: "
+                          f"{'; '.join(unread)}. That inbox is held but not served — "
+                          "a session start will exit naming the holder, so clearing it "
+                          "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
         return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
     return {"name": name, "status": "ok",
