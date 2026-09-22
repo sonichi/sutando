@@ -33,8 +33,10 @@ from pathlib import Path
 REAL_REPO = Path(__file__).resolve().parent.parent
 NEEDED = (
     "src/agent/claude/cli/start-cli.sh",
+    "src/agent/claude/cli/session-launch.sh",
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
+    "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
     "src/shutdown.py",
     "src/workspace_default.py",

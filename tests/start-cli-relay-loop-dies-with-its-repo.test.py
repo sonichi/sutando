@@ -115,8 +115,74 @@ with tempfile.TemporaryDirectory() as td:
           f"rc={rc}; relay invoked {n} times")
     check("c) the relay ran once before the loop gave up", n == 1, f"relay invoked {n} times")
 
+# d) tied to its core session: runs while the session exists, exits 0 once it has been
+#    gone for three checks, so a scratch launch never leaves a loop behind.
+import shutil
+tmux = shutil.which("tmux")
+if tmux is None:
+    print("  skip d) tmux not installed — session-lifetime case not run")
+else:
+    with tempfile.TemporaryDirectory() as td:
+        binp, repo = Path(td) / "bin", Path(td) / "repo"
+        binp.mkdir()
+        (repo / "src").mkdir(parents=True)
+        calls = Path(td) / "calls.log"
+        script = repo / "src" / "core-supervisor-relay.py"
+        script.write_text("# stand-in for the relay\n")
+        _exe(binp / "python3", f'#!/bin/sh\necho run >> "{calls}"\n')
+        _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
+        os.symlink(tmux, binp / "tmux")
+        sock = Path(td) / "tmux.sock"
+        subprocess.run([tmux, "-S", str(sock), "new-session", "-d", "-s", "scratch-core", "sleep 300"], check=True)
+        try:
+            p = subprocess.Popen(["/bin/bash", "-c", body, "relay-loop", str(binp / "python3"), str(script),
+                                  "SIG", "STATE", "ACTIVE", str(sock), "scratch-core"],
+                                 env={"PATH": str(binp)}, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                p.wait(timeout=1.5)
+                alive_while_session = False
+            except subprocess.TimeoutExpired:
+                alive_while_session = True
+            n_before = len(calls.read_text().splitlines()) if calls.exists() else 0
+            check("d) the loop keeps running while its session exists", alive_while_session,
+                  f"exited rc={p.returncode} with the session present; relay ran {n_before}x")
+            check("d) the relay is invoked while the session exists", n_before >= 1, f"relay ran {n_before}x")
+            subprocess.run([tmux, "-S", str(sock), "kill-server"], check=False)
+            try:
+                _, err = p.communicate(timeout=5)
+                rc = p.returncode
+            except subprocess.TimeoutExpired:
+                p.kill()
+                _, err = p.communicate()
+                rc = None
+            n_after = len(calls.read_text().splitlines()) if calls.exists() else 0
+            check("d) the loop exits 0 once its session is gone", rc == 0,
+                  f"rc={rc}; relay ran {n_after}x; stderr: {err[-200:]}")
+            check("d) at most three checks pass between the session's death and the exit",
+                  n_after - n_before <= 3, f"relay ran {n_after - n_before}x after kill-server")
+        finally:
+            subprocess.run([tmux, "-S", str(sock), "kill-server"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# e) a launch that gives no socket keeps the old contract: only the inputs govern the loop.
+with tempfile.TemporaryDirectory() as td:
+    binp, repo = Path(td) / "bin", Path(td) / "repo"
+    binp.mkdir()
+    (repo / "src").mkdir(parents=True)
+    calls = Path(td) / "calls.log"
+    script = repo / "src" / "core-supervisor-relay.py"
+    script.write_text("# stand-in for the relay\n")
+    # PATH holds only the stubs, so the counter must name its tools absolutely.
+    _exe(binp / "python3", f'#!/bin/sh\necho run >> "{calls}"\n[ "$(/usr/bin/wc -l < "{calls}")" -lt 3 ] || /bin/rm -f "$1"\n')
+    _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
+    rc, err = _run(body, [str(binp / "python3"), str(script), "SIG", "STATE", "ACTIVE"], path=str(binp))
+    n = len(calls.read_text().splitlines()) if calls.exists() else 0
+    check("e) without a socket the loop runs until its script is gone", rc is not None and n == 3,
+          f"rc={rc}; relay ran {n}x")
+
 if failures:
     print("\n".join(f"  FAIL {f}" for f in failures))
 else:
-    print("  ok  the relay loop stops when its interpreter, script or sleep are gone")
+    print("  ok  the relay loop stops when its interpreter, script, sleep or core session are gone")
 sys.exit(1 if failures else 0)

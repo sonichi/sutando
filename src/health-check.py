@@ -9244,7 +9244,9 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+                          "restart via Monitor: bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set)"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
@@ -9613,6 +9615,61 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
                           "each with a live counter (measured zero)"}
     return {"name": name, "status": "ok",
             "detail": "no migrated outbox roots — dual-read window not active"}
+
+
+
+def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
+    """A PARKED outbound item is a reply the owner never received, and nothing
+    retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
+    that nothing in production could lift. Until now it was visible only to
+    someone who ran the CLI by hand."""
+    name = "outbox-parked"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
+    if not roots:
+        return {"name": name, "status": "ok",
+                "detail": "no outbox root — nothing to park (this 0 is untestable)"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
+    parked: list[str] = []
+    unreadable: list[str] = []
+    for root in roots:
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
+        items_dir = outbox._items_dir(Path(root))
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
+        for d in outbox.list_items(root, status="PARKED"):
+            parked.append(str(d.get("item_id") or "?"))
+    if unreadable:
+        return {"name": name, "status": "warn",
+                "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
+                          + "; ".join(unreadable)}
+    if parked:
+        shown = ", ".join(sorted(parked)[:4])
+        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+        return {"name": name, "status": "warn",
+                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
+                          f"nothing retries them: {shown}{more}. Recover with "
+                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+    return {"name": name, "status": "ok",
+            "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -13145,12 +13202,10 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
-            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
                            "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is recovered by nothing "
-                                     "while the CLI is busy"})
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -13186,6 +13241,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
+    checks.append(check_outbox_parked())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
@@ -14354,9 +14410,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -14440,9 +14495,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:

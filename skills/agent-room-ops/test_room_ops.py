@@ -1465,11 +1465,12 @@ class RelationFieldsTests(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to this citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_becomes_its_own_field_and_is_checked_like_a_citation(self):
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(EnvCase):
@@ -1494,12 +1495,31 @@ class SayCitationTests(EnvCase):
         self.assertEqual(cap["payload"]["body"], "hi")
         self.assertEqual(cap["payload"]["op"], "message")
 
-    def test_no_thread_relation_is_ever_sent(self):
-        # Pins the review's requirement: nothing on this path may claim thread
-        # membership the gateway cannot deliver.
+    def test_a_citation_alone_never_claims_a_thread(self):
+        # A reply-to is a citation; only an explicit thread_root asks for the thread.
         _res, cap = self._post(reply_to=EV)
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_thread_root_rides_the_payload_as_the_gateways_own_field(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        self.assertNotIn("m.relates_to", cap["payload"], "the gateway builds the relation, not this side")
+
+    def test_extra_content_rides_the_payload_beside_the_body(self):
+        anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
+        res, cap = self._post(extra_content=anchor)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.collab.doc.comment"],
+                         anchor["space.ag2.collab.doc.comment"])
+        self.assertEqual(cap["payload"]["body"], "hi")
+
+    def test_extra_content_keeps_the_worker_stamp(self):
+        os.environ["SUTANDO_WORKER_SEAT"] = "7"
+        _res, cap = self._post(extra_content={"space.ag2.x": 1})
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.worker"]["id"], "worker-7")
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.x"], 1)
 
     def test_bad_id_refuses_before_the_network(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -1555,6 +1575,19 @@ class CitationCLITests(EnvCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_say_extra_content_flag_is_parsed_and_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '{"space.ag2.k": {"v": 1}}'])
+        self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
+
+    def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with self.assertRaises(SystemExit):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}
@@ -1702,6 +1735,7 @@ class DegradeReasonFromTests(unittest.TestCase):
 
     def test_no_body_falls_back_to_the_status_text(self):
         self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
+
 
 
 if __name__ == "__main__":

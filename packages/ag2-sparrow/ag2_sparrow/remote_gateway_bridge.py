@@ -310,6 +310,7 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
+from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -1348,6 +1349,9 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -3498,6 +3502,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3657,7 +3675,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3680,8 +3700,11 @@ def _post_proactive() -> None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3715,6 +3738,20 @@ def _post_proactive() -> None:
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -4092,27 +4129,50 @@ def _result_worker(task_id: str) -> str:
 
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
-    done-flag. `task_id` is the result stem, which already carries the
-    `task-` prefix.
+    completion record. `task_id` is the result stem, prefix included.
 
     SUPERSEDED as the primary signal by _assigned_worker(): this infers the
     author from completion residue after the fact, which is exactly the
     fragility assignment-time provenance removes. Kept as the transition
     fallback in _result_worker() for tasks routed before that record existed.
 
-    Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
-    by the pool's own done_flag()/mark_done() writer, in an optional local
-    skill this standalone PyPI package cannot import or name (see
-    docs/architecture-boundaries.md, "Optional adapter capabilities"). Keep
-    the two in step by hand; tests/gateway-result-worker-attribution.test.py
-    builds its fixtures through that writer's own path function so a future
-    drift between the two fails a test instead of silently returning "".
+    The recipient grammar, the record layout, the stage order and the "is this
+    a record?" predicate all come from pool_record, which the pool's own
+    writer binds too — an optional local skill this standalone package can
+    neither import nor name (docs/architecture-boundaries.md, "Optional
+    adapter capabilities"). No second predicate lives here, so the reader
+    cannot accept state the writer would refuse.
+
+    FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
+    with another worker's identity — so anything unreadable, or any record the
+    writer's own predicate would reject, yields "". Entries PROVEN not to be
+    recipients are skipped instead: a stray file beside the recipient folders
+    is not an unreadable claimant, and must not suppress valid attribution.
+    `Path.glob` is deliberately not used: it reports an unreadable subtree as
+    absent, which would let one unreadable claimant hand the answer to another.
     """
+    root = pool_record.workers_root(_STATE)
     try:
-        hits = sorted((_STATE / "workers").glob(f"*/done/{task_id}.flag"))
-    except OSError:
+        recipients = pool_record.iter_recipients(root)
+    except FileNotFoundError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    except OSError:
+        return ""  # unreadable root: no reading, not "nobody claimed it"
+    claimants = set()
+    for name in recipients:
+        for stage in pool_record.STAGES:
+            try:
+                state = pool_record.read_record_state(
+                    pool_record.record_path(root, name, task_id, stage))
+            except OSError:
+                return ""  # unreadable claim tree: abstain, never fall through
+            if state is pool_record.RecordState.ABSENT:
+                continue
+            if state is not pool_record.RecordState.PRESENT:
+                return ""  # malformed record the writer would itself refuse
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -4142,6 +4202,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if worker:
         doc["metadata"] = {"worker_id": worker}
+        _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)

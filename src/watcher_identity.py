@@ -207,11 +207,261 @@ def watcher_trees(ps_output: Optional[str] = None, is_watcher: Optional[Callable
     return trees
 
 
+def watcher_role(operands: Optional[List[str]]) -> Optional[str]:
+    """The `--role VALUE` (or `--role=VALUE`) operand, or None if absent."""
+    if not operands:
+        return None
+    for i, tok in enumerate(operands):
+        if tok == "--role" and i + 1 < len(operands):
+            return operands[i + 1]
+        if tok.startswith("--role="):
+            return tok.split("=", 1)[1] or None
+    return None
+
+
+def watcher_inbox(operands: Optional[List[str]]) -> Optional[str]:
+    """The `--inbox VALUE` (or `--inbox=VALUE`) operand, or None if absent.
+
+    Distinct from the positional tasks-dir operand: an instance whose inbox
+    comes from $SUTANDO_TASKS_DIR (env, not argv) leaves no positional trace,
+    so only an explicit tag is a reliable cross-process inbox identity.
+    """
+    if not operands:
+        return None
+    for i, tok in enumerate(operands):
+        if tok == "--inbox" and i + 1 < len(operands):
+            return operands[i + 1]
+        if tok.startswith("--inbox="):
+            return tok.split("=", 1)[1] or None
+    return None
+
+
+INBOX_TAG_FLAT = re.compile(r"--inbox(?:=|\s+)(.+?)(?=\s+--[a-z]|\s*$)")
+
+
+def positional_inbox(operands: Optional[List[str]]) -> Optional[str]:
+    """The first bare operand: an untagged watcher names its inbox only there."""
+    if not operands:
+        return None
+    skip = False
+    for tok in operands:
+        if skip:
+            skip = False
+            continue
+        if tok in ("--role", "--inbox"):
+            skip = True
+            continue
+        if tok.startswith("-"):
+            continue
+        return tok
+    return None
+
+
+def sentinel_names_pid(pid: Optional[int], state_dir: Optional[str]) -> bool:
+    """True only when a readable watcher sentinel under `state_dir` holds `pid`.
+    Anything unreadable is not a stamp, so it never counts as ready."""
+    if pid is None or not state_dir:
+        return False
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from util_paths import watcher_sentinel_paths
+        for sentinel in watcher_sentinel_paths(state_dir):
+            try:
+                if int(sentinel.read_text().strip().split()[0]) == pid:
+                    return True
+            except (OSError, ValueError, IndexError):
+                continue
+    except Exception:  # noqa: BLE001 -- the helper itself is unavailable: not a stamp
+        return False
+    return False
+
+
+def canonical_inbox(path: Optional[str]) -> Optional[str]:
+    """One spelling per inbox, so a trailing slash, a doubled slash or a
+    /private symlink prefix cannot make one directory look like two."""
+    if not path:
+        return None
+    return os.path.realpath(os.path.expanduser(path.strip()))
+
+
+def flat_inbox(argv: str) -> Optional[str]:
+    """The `--inbox` value of a FLATTENED argv: runs to the next `--flag` or the
+    end, so a value containing a space (the default desktop root has one) is kept whole."""
+    m = INBOX_TAG_FLAT.search(argv)
+    return m.group(1).strip() if m else None
+
+
+def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str] = None,
+                 is_watcher: Optional[Callable] = None,
+                 argv_vector: Optional[Callable] = None,
+                 run: Callable = subprocess.run,
+                 ready: bool = False, state_dir: Optional[str] = None) -> Optional[bool]:
+    """Is a watcher with `--role role` (and, when `inbox` is given, an `--inbox`
+    naming the same directory) present anywhere on the host?
+
+    Host-wide `ps`, not tmux/session-scoped: two instances (core and a worker,
+    or two workers) can each run a same-`role` watcher for DIFFERENT inboxes at
+    once, so a role match alone cannot tell a caller whether ITS OWN inbox is
+    covered. Passing `inbox` closes that; omitting it keeps the host-wide answer
+    for a caller that genuinely wants "is ANY session-role watcher running".
+
+    Every process is classified from the ONE snapshot (plus the authoritative
+    argv vector where one exists); no second per-pid `ps`, which would disagree
+    with the snapshot about anything that exited in between, and which a host
+    with no such pid answers with a failure indistinguishable from "unknown".
+
+    True/False/None: None means the snapshot itself was unobservable, or a
+    watcher-shaped line could not be decided AND could be for this inbox. A
+    line whose tag names a different inbox is decidably not ours, so it never
+    turns a clean answer into "unknown".
+
+    `ready`: a matching watcher counts only once a sentinel under `state_dir`
+    names its pid, which the watcher stamps after a real event round-trip; a
+    process that exists but has not stamped is decidably "no", never "unknown".
+    The caller names `state_dir`: this module resolves no workspace.
+    """
+    if ps_output is None:
+        try:
+            result = run(["ps", "-Ao", "pid,ppid,args"],
+                         capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        # run() doesn't raise on a non-zero exit -- checked explicitly, or a
+        # failed ps reads as a clean empty scan instead of unknown.
+        if getattr(result, "returncode", None) != 0:
+            return None
+        ps_output = result.stdout
+    want = canonical_inbox(inbox)
+    me = str(os.getpid())
+    saw_undecidable = False
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me:
+            continue
+        pid, argv = parts[0], parts[2]
+        if is_watcher is not None and is_watcher(argv, as_pid(pid)) is False:
+            continue
+        verdict = classify_argv(argv, as_pid(pid), argv_vector)
+        if verdict.watcher is False:
+            continue
+        if verdict.watcher is None:
+            tagged = canonical_inbox(flat_inbox(argv))
+            if want is not None and tagged is not None and tagged != want:
+                continue
+            saw_undecidable = True
+            continue
+        if watcher_role(verdict.operands) != role:
+            continue
+        if want is not None and canonical_inbox(watcher_inbox(verdict.operands)) != want:
+            continue
+        if ready and not sentinel_names_pid(as_pid(pid), state_dir):
+            continue
+        return True
+    return None if saw_undecidable else False
+
+
+def standby_present(inbox: str, ps_output: Optional[str] = None,
+                    argv_vector: Optional[Callable] = None,
+                    run: Callable = subprocess.run) -> Optional[bool]:
+    """Is a watcher that is NOT session-role serving `inbox` (tagged or by its
+    positional operand)? The external standby is untagged, so the tag alone
+    cannot find it. None when the snapshot is unobservable or undecidable."""
+    if ps_output is None:
+        try:
+            result = run(["ps", "-Ao", "pid,ppid,args"],
+                         capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if getattr(result, "returncode", None) != 0:
+            return None
+        ps_output = result.stdout
+    want = canonical_inbox(inbox)
+    me = str(os.getpid())
+    saw_undecidable = False
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me:
+            continue
+        pid, argv = parts[0], parts[2]
+        verdict = classify_argv(argv, as_pid(pid), argv_vector)
+        if verdict.watcher is False:
+            continue
+        if verdict.watcher is None:
+            tagged = canonical_inbox(flat_inbox(argv))
+            if tagged is not None and tagged != want:
+                continue
+            saw_undecidable = True
+            continue
+        if watcher_role(verdict.operands) == "session":
+            continue
+        served = watcher_inbox(verdict.operands) or positional_inbox(verdict.operands)
+        if canonical_inbox(served) != want:
+            continue
+        return True
+    return None if saw_undecidable else False
+
+
 def main(argv=None) -> int:
     """`watcher_identity.py <pid>` -> `watcher`, `not-watcher`, `dead` or
     `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
-    so a shell adapter cannot read an unobservable `ps` as a proven answer."""
+    so a shell adapter cannot read an unobservable `ps` as a proven answer.
+
+    `watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]`
+    -> `yes`, `no` or `unknown` on stdout; `--ready` counts a session watcher
+    only once a sentinel under STATE_DIR names it. `standby-present --inbox VALUE` asks the same of a
+    watcher that is NOT session-role for that inbox. Exit 0 for yes/no (both decided), 2 only when the
+    `ps` snapshot itself failed -- `unknown` must never read as `no` to a
+    caller deciding whether to start a duplicate watcher."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "standby-present":
+        rest = args[1:]
+        inbox = None
+        if len(rest) == 2 and rest[0] == "--inbox":
+            inbox = rest[1]
+        elif len(rest) == 1 and rest[0].startswith("--inbox="):
+            inbox = rest[0].split("=", 1)[1] or None
+        if not inbox:
+            print("usage: watcher_identity.py standby-present --inbox VALUE", file=sys.stderr)
+            return 64
+        verdict = standby_present(inbox)
+        if verdict is None:
+            print("unknown")
+            print("why=ps snapshot unavailable or undecidable")
+            return 2
+        print("yes" if verdict else "no")
+        return 0
+    if args and args[0] == "role-present":
+        rest = args[1:]
+        if not rest or rest[0].startswith("-"):
+            print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]", file=sys.stderr)
+            return 64
+        role = rest[0]
+        inbox = None
+        state_dir = None
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--inbox" and i + 1 < len(rest):
+                inbox = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--inbox="):
+                inbox = rest[i].split("=", 1)[1] or None
+                i += 1
+            elif rest[i] == "--ready" and i + 1 < len(rest):
+                state_dir = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--ready="):
+                state_dir = rest[i].split("=", 1)[1] or None
+                i += 1
+            else:
+                print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]", file=sys.stderr)
+                return 64
+        verdict = role_present(role, inbox, ready=state_dir is not None, state_dir=state_dir)
+        if verdict is None:
+            print("unknown")
+            print("why=ps snapshot unavailable")
+            return 2
+        print("yes" if verdict else "no")
+        return 0
     if len(args) != 1:
         print("usage: watcher_identity.py <pid>", file=sys.stderr)
         return 64

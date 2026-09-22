@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Ties start-cli's tmux env allowlist to its caller: every variable the spawner
-# sets AND the watcher reads must reach the worker's session, or its results/
-# land under deliveries/ where no drain looks. Derived from both files, so the
-# next such variable is covered too.
+# Ties the worker launcher's tmux env allowlist to its caller: every variable
+# the spawner sets AND the watcher reads must reach the worker's session, or
+# its results/ land under deliveries/ where no drain looks. Derived from both
+# files, so the next such variable is covered too. Was start-cli.sh's job
+# (tested as start-cli-worker-env-forwarded.test.sh); a worker's own launch
+# now lives in skills/worker-pool/scripts/launch-worker-session.sh.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+WORKERCLI="$REPO/skills/worker-pool/scripts/launch-worker-session.sh"
 STARTCLI="$REPO/src/agent/claude/cli/start-cli.sh"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 # No proxy, no launchd job: the probe must not poll or wire a base URL here.
@@ -24,8 +27,6 @@ mkdir -p "$INBOX"
 # The plan the spawner would hand the launcher, as KEY=VALUE lines.
 python3 - "$REPO" "$WS" "$WID" > "$TMP/plan-env" <<'PY'
 import sys
-# The spawner lives in the optional worker-pool skill; this core-launcher test
-# names it, because it is the caller whose env contract is under test.
 sys.path.insert(0, sys.argv[1] + "/skills/worker-pool/scripts")
 import spawn_worker
 p = spawn_worker.plan(sys.argv[2], sys.argv[1], runtime="claude",
@@ -36,13 +37,17 @@ PY
 [ -s "$TMP/plan-env" ]
 check $? "spawn_worker.plan() produced a session env ($(wc -l < "$TMP/plan-env" | tr -d ' ') vars)"
 
-# What the launcher forwards into tmux, under exactly that env.
+# What the worker launcher forwards into tmux, under exactly that env.
 # shellcheck disable=SC2046
 env -i HOME="$HOME" PATH="$STUB_PATH" $(cat "$TMP/plan-env") \
-    bash "$STARTCLI" --print-core-env > "$TMP/fwd" 2>/dev/null
-# Not the core marker: a worker launch deliberately carries none.
+    bash "$WORKERCLI" --print-env > "$TMP/fwd" 2>/dev/null
 grep -q "SUTANDO_CORE_RUNTIME=claude" "$TMP/fwd"
-check $? "the --print-core-env probe returned the assembled allowlist"
+check $? "the --print-env probe returned the assembled allowlist"
+# Not the core marker: a worker launch carries the marker explicit-EMPTY, not
+# omitted (omitting -e leaves a stale server-global value in place) and never
+# the canonical core's "=1".
+grep -qx -- "SUTANDO_CORE_SESSION=" "$TMP/fwd"
+check $? "a worker session carries the core-session marker explicit-empty"
 ! grep -q "SUTANDO_CORE_SESSION=1" "$TMP/fwd"
 check $? "a worker session is not handed the canonical core's marker"
 
@@ -71,6 +76,9 @@ check $? "the worker gate the spawner names reaches the session"
 # reaches the spawner by path because it is the caller under test.
 grep -q "skills/worker-pool" "${BASH_SOURCE[0]}"
 check $? "control: the pool-path scan finds a real occurrence"
+# The placement rule cuts the other way now: the WORKER launcher lives inside
+# the skill and is expected to reference its own siblings freely; it's
+# core/src/'s launcher that must never name a pool path (it arrives in env).
 ! grep -q "skills/worker-pool" "$STARTCLI"
 check $? "the core's launcher names no pool path (it arrives in env)"
 
@@ -89,10 +97,12 @@ check $? "the worker resolves RESULTS_DIR to the shared workspace (got $resolved
 case "$resolved" in */deliveries/*) false ;; *) true ;; esac
 check $? "the worker's results/ is not under deliveries/"
 
-# Backward compatibility: with no worker env the forwarded set is unchanged.
-env -i HOME="$HOME" PATH="$STUB_PATH" bash "$STARTCLI" --print-core-env > "$TMP/fwd-bare" 2>/dev/null
-! grep -q "SUTANDO_WORKSPACE_DIR\|SUTANDO_WORKER_BOOTSTRAP" "$TMP/fwd-bare"
-check $? "an install that sets no workspace env forwards none (old behaviour intact)"
+# The worker launcher REFUSES outright with no SUTANDO_TMUX_SESSION/INSTANCE_ID
+# (spawn_worker.py always sets both) rather than silently launching a
+# core-shaped session under a guessed name.
+env -i HOME="$HOME" PATH="$STUB_PATH" bash "$WORKERCLI" --print-env > "$TMP/fwd-bare" 2>"$TMP/fwd-bare.err"
+[ $? -ne 0 ]
+check $? "an install with no worker env refuses rather than guessing a session name"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

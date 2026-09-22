@@ -43,9 +43,9 @@ ck("it still names the hotkey consequence", "hotkeys" in detail)
 ck("it names checkWatcher by name", "checkWatcher" in detail)
 ck("it says the watcher goes unrecovered",
    re.search(r"recovered by nothing", detail, re.I) is not None)
-# The claim must carry the CLI-idle condition: checkWatcher defers to the loop
-# whenever cliIsWorking(), so "the app recovers it" overstates the guarantee.
-ck("and scopes it to when the CLI is busy", "while the CLI is busy" in detail)
+# Recovery no longer gates on CLI-busy (it calls the launcher dispatcher, which
+# never touches the pane), so the claim scopes to the app itself being absent.
+ck("and scopes it to the app being absent, not a busy CLI", "until the app restarts" in detail)
 
 # The GREEN branch had the same hotkey-only identity, which is why one-line
 # fixes to the warn leave the probe still describing a keyboard convenience.
@@ -84,12 +84,12 @@ for _callee in re.findall(r"\b(\w+)\(\)", body):
 ck("and it really probes for the watcher via /bin/ps",
    '"/bin/ps"' in _probe_scope and '"pid,command"' in _probe_scope)
 ck("the loose, unanchored pgrep probe is gone", '"-f", "watch-tasks"' not in _probe_scope)
-ck("cliIsWorking() gates the poke INSIDE checkWatcher, not merely somewhere in the file",
-   "if cliIsWorking()" in body)
-# `[^}]*` cannot cross a nested block: add any inner brace before the return and
-# this goes RED on correct code. Widen the pattern then — do not delete the check.
-ck("and that guard actually returns early",
-   re.search(r"if cliIsWorking\(\)\s*\{[^}]*\breturn\b", body, re.S) is not None)
+# Recovery calls the launcher dispatcher, which never writes into the pane —
+# there is nothing left to race, so checkWatcher must NOT gate on CLI-busy.
+ck("cliIsWorking() is NOT called anywhere in checkWatcher's body",
+   "cliIsWorking()" not in body)
+ck("recovery goes through the launcher dispatcher, not a pane keystroke",
+   "start-cli.sh" in body and 'line: "watcher"' not in body)
 
 
 # Drive the branch for real: everything above reads source, so the message could
@@ -131,7 +131,7 @@ try:
     d = stopped[0]["detail"] if stopped else ""
     ck("the emitted row is a warn", bool(stopped) and stopped[0]["status"] == "warn")
     ck("the EMITTED detail names checkWatcher", "checkWatcher" in d)
-    ck("the EMITTED detail scopes it to a busy CLI", "while the CLI is busy" in d)
+    ck("the EMITTED detail scopes it to the app being absent", "until the app restarts" in d)
 except Exception as e:  # a drive that cannot run must fail, never skip
     ck(f"the ok-stopped branch is drivable ({type(e).__name__}: {e})", False)
 
