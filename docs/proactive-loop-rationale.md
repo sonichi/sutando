@@ -681,7 +681,20 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
    | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
    | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set), `persistent: true`. |
+   | not running (no sentinel, no trees) / pid dead with none running | nothing here: the start decision is the per-inbox verdict below, not this probe. |
+
+   **The start decision is per inbox, and the watcher itself refuses to double one.** The probe
+   answers "is any watcher running on this host", which on a pool host is always yes (each worker
+   runs its own), so it read `ok` for a whole day while the core's inbox had no watcher (measured
+   2026-09-22). The step asks `watcher_identity.py role-present session --inbox … --ready …` for the
+   core's inbox and, on `no`, runs the launcher. The launcher is safe by construction: at startup
+   `watch-tasks-stream.sh` asks `watcher_identity.py inbox-holders` for every watcher-shaped process
+   naming its inbox, tagged or not, ready or not; a second watcher of the same kind exits 0 naming
+   the holder, a session watcher over a standby proceeds (the supervisor stands the standby down once
+   it proves ready), a standby over a session watcher exits, and an unobservable `ps` refuses to
+   start. Only `--force-restart` replaces a holder, and only on the owner's word. So a start is never
+   a duplicate, and the untagged and present-but-unready cases that a verdict alone cannot see are
+   closed where the process is born, not in this instruction.
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.
