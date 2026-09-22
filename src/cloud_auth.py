@@ -72,8 +72,8 @@ def origin_vault_key(origin: str) -> str:
 
 
 def resolve_cloud_origin() -> str:
-    env = os.environ.get("AG2_CLOUD_ORIGIN", "").strip().rstrip("/")
-    return env or DEFAULT_CLOUD_ORIGIN
+    """The env override, with a retired production origin read as the current one."""
+    return normalize_base(os.environ.get("AG2_CLOUD_ORIGIN", ""))
 
 
 def keychain_get(key: str) -> str | None:

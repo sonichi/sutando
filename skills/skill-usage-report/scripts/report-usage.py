@@ -36,7 +36,7 @@ MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
 # truth for this default (skills/MANIFEST.md); this constant exists so an
 # unreadable/corrupt manifest degrades to the historical value instead of
 # crashing a cron-invoked reporter. If the two ever disagree, the manifest wins.
-CLOUD_FALLBACK = "https://sutando.ag2.ai"
+CLOUD_FALLBACK = "https://sutando.ag2.space"
 MAX_EVENTS = 100  # server cap per report
 
 
