@@ -6,7 +6,8 @@
 # while it persists, must ignore a session-role watcher for a DIFFERENT
 # inbox, and must treat an unobservable `ps` snapshot as "unknown", not "no
 # watcher": no arming inside the grace period, arming after it rather than
-# leaving the inbox unwatched forever.
+# leaving the inbox unwatched forever. A session watcher counts only once its
+# sentinel names it, which it stamps after a real event round-trip.
 #
 # Uses a stub notifier (SUTANDO_NOTIFIER_SCRIPT override) so this test does
 # not depend on the real task-notifier.sh/pane machinery, which is out of
@@ -37,13 +38,18 @@ while true; do sleep 1; done
 EOS
 chmod +x "$STUB"
 
-# The watchers' event source is not under test here, only whether they are
-# seen; a stub fswatch that idles keeps them alive on a host that ships none.
+# A session watcher counts only once its readiness probe came back through
+# fswatch, so the stand-in must deliver events: a polling stub does, on any host.
 STUBBIN="$WORK/stubbin"
 mkdir -p "$STUBBIN"
-printf '#!/bin/bash\nexec sleep 100000\n' > "$STUBBIN/fswatch"
+cp "$REPO/tests/fixtures/fswatch-poll-stub.sh" "$STUBBIN/fswatch"
 chmod +x "$STUBBIN/fswatch"
 export PATH="$STUBBIN:$PATH"
+# An fswatch that runs but never emits: the watcher exists, its sentinel never lands.
+IDLEBIN="$WORK/idlebin"
+mkdir -p "$IDLEBIN"
+printf '#!/bin/bash\nexec sleep 100000\n' > "$IDLEBIN/fswatch"
+chmod +x "$IDLEBIN/fswatch"
 
 cleanup_all() {
   tmux -S "$SOCK" kill-server >/dev/null 2>&1 || true
@@ -65,10 +71,11 @@ start_supervisor() {
        bash $SUPERVISOR > $WORK/sup.log 2>&1"
 }
 
-start_internal_watcher() {
-  local tasks_dir="$1" name="$2"
+start_internal_watcher() {  # start_internal_watcher <tasks_dir> <name> [<PATH prefix>]
+  local tasks_dir="$1" name="$2" extra_path="${3:-}"
   tmux -S "$SOCK" new-session -d -s "$name" -c "$REPO" \
-    "env -u SUTANDO_INSTANCE_ID SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target \
+    "env -u SUTANDO_INSTANCE_ID PATH=${extra_path:+$extra_path:}\$PATH \
+       SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target SUTANDO_WATCHER_READY_TIMEOUT=60 \
        bash $WATCHER $tasks_dir --role session --inbox $tasks_dir > $WORK/$name.log 2>&1"
 }
 
@@ -170,6 +177,28 @@ else
   fail=1
 fi
 tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+sleep 0.3
+
+# --- scenario 6: a session-role watcher that exists but has not proven
+# --- readiness (its sentinel never lands) does not disarm: the standby keeps
+# --- the inbox until the session watcher has read a real event.
+MARK4="$WORK/notifier4.marker"
+start_supervisor "$WORK/core/tasks" "$MARK4" 2 1
+if ! wait_for "$MARK4" 100; then
+  echo "  FAIL: scenario 6 setup -- notifier never armed"
+  fail=1
+else
+  start_internal_watcher "$WORK/core/tasks" internal-unready "$IDLEBIN"
+  sleep 4
+  if [ -s "$MARK4" ] && tmux -S "$SOCK" has-session -t internal-unready 2>/dev/null; then
+    echo "  PASS: scenario 6 -- a session watcher with no sentinel yet leaves the notifier armed"
+  else
+    echo "  FAIL: scenario 6 -- notifier disarmed on a session watcher that never proved readiness"
+    fail=1
+  fi
+fi
+tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+tmux -S "$SOCK" kill-session -t internal-unready >/dev/null 2>&1 || true
 
 if [ "$fail" -eq 0 ]; then
   echo "PASSED: task-notifier-supervisor standby gate"

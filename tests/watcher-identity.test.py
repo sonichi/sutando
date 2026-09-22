@@ -20,6 +20,7 @@ import importlib.util
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -500,12 +501,12 @@ class TestRolePresentCliForms(unittest.TestCase):
     def test_inbox_equals_form_is_parsed(self):
         rc, out, _, rp = self._run(["role-present", "session", f"--inbox={INBOX}"], True)
         self.assertEqual((rc, out), (0, "yes"))
-        rp.assert_called_once_with("session", INBOX)
+        rp.assert_called_once_with("session", INBOX, ready=False)
 
     def test_inbox_flag_form_is_parsed(self):
         rc, out, _, rp = self._run(["role-present", "session", "--inbox", INBOX], False)
         self.assertEqual((rc, out), (0, "no"))
-        rp.assert_called_once_with("session", INBOX)
+        rp.assert_called_once_with("session", INBOX, ready=False)
 
     def test_a_missing_role_is_a_usage_error(self):
         rc, _, err, rp = self._run(["role-present"], False)
@@ -523,6 +524,110 @@ class TestRolePresentCliForms(unittest.TestCase):
         self.assertEqual(rc, 64)
         self.assertIn("usage", err)
         rp.assert_not_called()
+
+
+
+
+class TestReadyGate(unittest.TestCase):
+    """A session watcher counts under `ready` only once the inbox's sentinel names it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.state)
+        self.ps = f"  100 1 {CORE_SESSION_FLAT}\n"
+        self.vec = vector_for({"100": CORE_SESSION_ARGS})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_without_ready_the_process_alone_counts(self):
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, state_dir=self.state), True)
+
+    def test_ready_with_no_sentinel_is_a_decided_no(self):
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, ready=True, state_dir=self.state), False)
+
+    def test_ready_once_the_sentinel_names_the_pid(self):
+        with open(os.path.join(self.state, "watch-tasks-stream.pid"), "w") as fh:
+            fh.write("100\n")
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, ready=True, state_dir=self.state), True)
+
+    def test_a_sentinel_naming_another_pid_is_not_ready(self):
+        with open(os.path.join(self.state, "watch-tasks-stream.pid"), "w") as fh:
+            fh.write("200\n")
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, ready=True, state_dir=self.state), False)
+
+    def test_an_unreadable_sentinel_is_not_ready(self):
+        with open(os.path.join(self.state, "watch-tasks-stream.pid"), "w") as fh:
+            fh.write("not-a-pid\n")
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, ready=True, state_dir=self.state), False)
+
+    def test_the_state_dir_follows_the_workspace_env_then_the_inbox(self):
+        with mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE_DIR": "/w"}):
+            self.assertEqual(wid.state_dir_for_inbox("/x/tasks"), "/w/state")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(wid.state_dir_for_inbox("/x/tasks"), "/x/state")
+            self.assertIsNone(wid.state_dir_for_inbox(None))
+
+    def test_cli_ready_flag_reaches_role_present(self):
+        out = io.StringIO()
+        with mock.patch.object(wid, "role_present", return_value=True) as rp, \
+                contextlib.redirect_stdout(out):
+            rc = wid.main(["role-present", "session", "--inbox", INBOX, "--ready"])
+        rp.assert_called_once_with("session", INBOX, ready=True)
+        self.assertEqual((rc, out.getvalue().strip()), (0, "yes"))
+
+
+class TestStandbyPresent(unittest.TestCase):
+    """The external standby is an UNTAGGED watcher; only its positional operand names its inbox."""
+
+    def test_positional_inbox_skips_flags_and_their_values(self):
+        self.assertEqual(wid.positional_inbox([INBOX, "--role", "session", "--inbox", INBOX]), INBOX)
+        self.assertEqual(wid.positional_inbox(["--role", "session", INBOX]), INBOX)
+        self.assertIsNone(wid.positional_inbox(["--role", "session", "--inbox", INBOX]))
+        self.assertIsNone(wid.positional_inbox([]))
+        self.assertIsNone(wid.positional_inbox(None))
+
+    def test_an_untagged_watcher_on_the_inbox_is_a_standby(self):
+        ps = f"  100 1 {GENUINE}\n"
+        vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", INBOX]})
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vec), True)
+
+    def test_a_session_watcher_is_not_a_standby(self):
+        ps = f"  100 1 {CORE_SESSION_FLAT}\n"
+        vec = vector_for({"100": CORE_SESSION_ARGS})
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vec), False)
+
+    def test_another_inbox_is_not_this_standby(self):
+        other = "/ws/deliveries/" + "e" * 32
+        ps = f"  100 1 bash src/watch-tasks-stream.sh {other}\n"
+        vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", other]})
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vec), False)
+
+    def test_an_undecidable_line_is_unknown(self):
+        ps = "  100 1 bash /some path/watch-tasks-stream.sh extra\n"
+        self.assertIsNone(wid.standby_present(INBOX, ps_output=ps, argv_vector=vector_for({})))
+
+    def test_an_unobservable_snapshot_is_unknown(self):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 1, "", "")
+        self.assertIsNone(wid.standby_present(INBOX, run=run))
+
+    def test_cli_standby_present(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(wid, "standby_present", return_value=False) as sp, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = wid.main(["standby-present", "--inbox", INBOX])
+            rc_usage = wid.main(["standby-present"])
+        sp.assert_called_once_with(INBOX)
+        self.assertEqual((rc, out.getvalue().strip()), (0, "no"))
+        self.assertEqual(rc_usage, 64)
+        self.assertIn("usage", err.getvalue())
 
 
 if __name__ == "__main__":
