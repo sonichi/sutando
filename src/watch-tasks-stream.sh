@@ -116,10 +116,12 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 
-# One announcer per inbox, enforced here rather than by every launcher: a second
-# watcher of the SAME kind exits 0, and only --force-restart replaces the holder.
-# A session watcher over a standby proceeds (the supervisor stands the standby
-# down once this one proves ready); a standby over a session watcher exits.
+# One announcer per inbox, enforced here rather than by every launcher: a start
+# over a holder exits 0 as covered and says so on stdout, and only
+# --force-restart replaces the holder, whatever its kind. The one exception is a
+# session watcher over a supervisor's standby, which proceeds: the supervisor
+# stands its standby down once this one proves ready. An untagged holder is
+# nobody's standby, so it counts as covered.
 # A holder must be PROVEN: an unreadable process table, or a line that cannot be
 # decided, starts the watcher anyway. Refusing would leave the inbox with no
 # announcer at all, which is worse than the duplicate this check prevents.
@@ -132,18 +134,27 @@ case "$__holders" in
   *)
     while IFS=' ' read -r __hpid __hrole; do
       [ -n "$__hpid" ] || continue
-      __hkind="$__hrole"; [ "$__hkind" = "session" ] || __hkind="standby"
-      if [ "$__my_kind" = "session" ] && [ "$__hkind" = "standby" ]; then
-        continue   # the designed handoff: the standby leaves once this watcher is ready
-      fi
       if [ -z "$FORCE_RESTART" ]; then
+        if [ "$__my_kind" = "session" ] && [ "$__hrole" = "standby" ]; then
+          continue   # the designed handoff: the standby leaves once this watcher is ready
+        fi
+        # stdout, in the TASK_FILE shape: a Monitor-hosted caller sees stdout as
+        # its event stream and would never read the stderr line.
+        __hread="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" output-sink "$__hpid" 2>/dev/null | sed -n 's/^read=//p')"
+        __hsince="$(ps -o lstart= -p "$__hpid" 2>/dev/null | sed 's/^ *//')"
+        echo "WATCHER_HELD: inbox=$TASKS_DIR_ABS pid=$__hpid role=$__hrole since=\"${__hsince:-unknown}\" read=${__hread:-unknown} replace=\"watch-tasks-stream.sh --force-restart --role ${WATCHER_ROLE} --inbox $TASKS_DIR_ABS\""
         echo "watch-tasks-stream: $TASKS_DIR_ABS is already watched by pid $__hpid ($__hrole); exiting 0. Use --force-restart to replace it." >&2
         exit 0
       fi
       echo "watch-tasks-stream: --force-restart: stopping watcher pid $__hpid ($__hrole) on $TASKS_DIR_ABS" >&2
       # A parent that has not reaped the holder leaves a zombie that kill -0
       # still sees; its fswatch child is collected first so it cannot linger.
-      __hkids="$(pgrep -P "$__hpid" 2>/dev/null || true)"
+      # Each child is captured with its start time: a recycled pid has another.
+      __hkids=""
+      for __k in $(pgrep -P "$__hpid" 2>/dev/null || true); do
+        __hkids="$__hkids$__k|$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//')
+"
+      done
       # Live means "not proven gone": kill -0 also answers for a zombie, so ps stat
       # settles that, and a ps that cannot answer leaves the pid live.
       __holder_live() {
@@ -190,14 +201,19 @@ case "$__holders" in
         esac
       fi
       # The children were captured from the holder; only a holder this watcher
-      # signaled can have left them behind.
+      # signaled can have left them behind, and only a pid whose start time still
+      # matches its capture is that child rather than a process reusing its pid.
       if [ "$__signaled" = 1 ]; then
-        for __k in $__hkids; do kill -TERM "$__k" 2>/dev/null || true; done
+        while IFS='|' read -r __k __kstart; do
+          [ -n "$__k" ] || continue
+          [ "$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//')" = "$__kstart" ] || continue
+          kill -TERM "$__k" 2>/dev/null || true
+        done <<< "$__hkids"
       fi
     done <<< "$__holders"
     ;;
 esac
-unset __my_kind __holders __hpid __hrole __hkind __hkids __k __sh __signaled
+unset __my_kind __holders __hpid __hrole __hkids __k __kstart __hread __hsince __sh __signaled
 unset -f __holder_live __still_holder __abort_blind 2>/dev/null || true
 # Optional task handlers run synchronously, inline -- see run_handler_now().
 HANDLER_STATE_READY=""

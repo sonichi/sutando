@@ -114,7 +114,9 @@ caps this file and refuses date stamps in it).
    (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
    if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
    duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
-   change nothing and say so. `--force-restart` replaces a holder; use it only on the owner's word.
+   change nothing and say so. A re-arm that prints `WATCHER_HELD:` on stdout did not start: it names
+   the holder (pid, role, whether its output is read) and the `--force-restart` command; report that
+   line and do not re-arm again. `--force-restart` replaces a holder; use it only on the owner's word.
    Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
    labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
    untagged watcher is invisible to the verdict above and to the supervisor.

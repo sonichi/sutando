@@ -92,9 +92,12 @@ the same supervisor pid; the second handoff took 12 s.
   the owner; the announce-once marker keyed to the core session (PR-B) is deferred.
 - **The watcher's own startup check (#4602).** Before it touches anything, `watch-tasks-stream.sh`
   asks `watcher_identity.py inbox-holders --inbox <inbox>` for every watcher-shaped process naming its
-  inbox, tagged or not, ready or not. A second watcher of the same kind exits 0 naming the holder; a
-  session watcher over a standby proceeds (the supervisor stands the standby down once it proves
-  ready); a standby over a session watcher exits 0; an unobservable `ps` refuses to start. Only
+  inbox, tagged or not, ready or not. A start over a holder exits 0 as covered: one `WATCHER_HELD:`
+  line on stdout (inbox, holder pid, role, start time, whether anything reads its output, and the
+  `--force-restart` command that replaces it) so a Monitor-hosted caller sees it as an event, plus the
+  stderr line. The one exception is a session watcher over a supervisor's standby, which proceeds
+  (the supervisor stands the standby down once it proves ready); an untagged holder is nobody's
+  standby and counts as covered. An unobservable `ps` refuses to start. Only
   `--force-restart` replaces the holder (TERM, then KILL, then its fswatch child), and only on the
   owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
   touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a

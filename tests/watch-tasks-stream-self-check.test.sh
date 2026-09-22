@@ -6,7 +6,10 @@
 #   (d) a standby over a live session watcher exits 0;
 #   (e) an untagged start is refused (rc 64): a watcher is started by its monitor and says so;
 #   (f) a watcher on ANOTHER inbox is never a holder for this one;
-#   (h) --force-restart aborts, signaling nothing, when a live holder can no longer be re-proven.
+#   (h) --force-restart aborts, signaling nothing, when a live holder can no longer be re-proven;
+#   (i) a covered exit prints one WATCHER_HELD line on stdout naming the holder and the replace command;
+#   (j) an untagged holder is nobody's standby: a session start over it exits 0 as covered;
+#   (k) --force-restart replaces a standby holder too, not only a session one.
 # Run: bash tests/watch-tasks-stream-self-check.test.sh
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +47,13 @@ run_watcher_fg() {  # same, in the foreground: returns the watcher's exit code
       SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" \
       python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       bash "$WATCHER" "$@" > /dev/null 2> "$err"
+}
+run_watcher_fg_out() {  # same as run_watcher_fg, stdout kept: run_watcher_fg_out <ws> <errfile> <outfile> <args...>
+  local ws="$1" err="$2" out="$3"; shift 3
+  env -u SUTANDO_INSTANCE_ID -u AGENT_ID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE \
+      SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" \
+      python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      bash "$WATCHER" "$@" > "$out" 2> "$err"
 }
 alive() { kill -0 "$1" 2>/dev/null; }
 
@@ -128,6 +138,35 @@ check "(h) --force-restart with a blind revalidation exits 3" $([ "$rc" = 3 ] &&
 alive "$D1"; check "(h) ...the holder is untouched" $?
 kids_ok=0; for k in $D1KIDS; do alive "$k" || kids_ok=1; done; check "(h) ...and so are its children" $kids_ok "kids=$D1KIDS"
 grep -q "cannot be re-proven" "$WORK/d2.err"; check "(h) ...and it says why" $?
+
+# (i) the covered exit tells the caller on stdout, in the TASK_FILE shape.
+run_watcher_fg_out "$WORK/a" "$WORK/i.err" "$WORK/i.out" "$WORK/a/tasks" --role session --inbox "$WORK/a/tasks"; rc=$?
+check "(i) a second session start still exits 0" "$rc"
+grep -q "^WATCHER_HELD: inbox=$(cd "$WORK/a/tasks" && pwd -P) pid=$A3 role=session since=\"" "$WORK/i.out" && r=0 || r=1; check "(i) ...and prints WATCHER_HELD with the holder's pid and role" "$r" "$(cat "$WORK/i.out")"
+grep -q ' read=\(yes\|no\|unknown\) replace="watch-tasks-stream.sh --force-restart --role session --inbox ' "$WORK/i.out" && r=0 || r=1; check "(i) ...with the read verdict and the replace command" "$r"
+
+# (j) an untagged holder counts as covered: a session start over it exits 0.
+# Untagged starts are refused since the tag became mandatory, so the holder is a
+# real process shaped like one: a script named watch-tasks-stream.sh, inbox as
+# its only operand, classified by the real identity code.
+mkdir -p "$WORK/e/tasks" "$WORK/e/state" "$WORK/fake"; printf '#!/bin/bash\nsleep 60\n' > "$WORK/fake/watch-tasks-stream.sh"; chmod +x "$WORK/fake/watch-tasks-stream.sh"
+bash "$WORK/fake/watch-tasks-stream.sh" "$WORK/e/tasks" & U1=$!; PIDS+=("$U1")
+sleep 1
+run_watcher_fg_out "$WORK/e" "$WORK/j.err" "$WORK/j.out" "$WORK/e/tasks" --role session --inbox "$WORK/e/tasks"; rc=$?
+check "(j) a session start over an untagged holder exits 0" "$rc" "$(tail -1 "$WORK/j.err")"
+grep -q "^WATCHER_HELD: .* pid=$U1 role=untagged " "$WORK/j.out" && r=0 || r=1; check "(j) ...naming the untagged holder" "$r" "$(cat "$WORK/j.out")"
+alive "$U1"; check "(j) ...and leaves it running" $?
+
+# (k) --force-restart replaces a standby holder, not only a session one.
+mkdir -p "$WORK/f/tasks" "$WORK/f/state"
+F1=$(run_watcher "$WORK/f" "$WORK/f1.err" "$WORK/f/tasks" --role standby --inbox "$WORK/f/tasks"); PIDS+=("$F1")
+sleep 2
+alive "$F1"; check "(k) the standby holder is up" $?
+F2=$(run_watcher "$WORK/f" "$WORK/f2.err" "$WORK/f/tasks" --role session --inbox "$WORK/f/tasks" --force-restart); PIDS+=("$F2")
+sleep 3
+alive "$F1"; check "(k) --force-restart stopped the standby holder $F1" $([ $? = 0 ] && echo 1 || echo 0)
+alive "$F2"; check "(k) ...and the replacement runs" $?
+grep -q "stopping watcher pid $F1 (standby)" "$WORK/f2.err" && r=0 || r=1; check "(k) ...saying which pid it replaced" "$r"
 
 if [ "$fail" = 0 ]; then echo "  ok  one announcer per inbox, enforced by the watcher"; else echo "  FAILED"; fi
 exit "$fail"
