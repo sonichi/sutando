@@ -66,8 +66,12 @@ def _decision(hook_src: str) -> dict:
         stub.write_text(
             hook_src.replace(REPO_LINE, f'REPO_DIR="{REPO}"').replace(RESOLVE, f'WORKSPACE="{ws}"')
         )
-        out = subprocess.run(["/bin/bash", str(stub)], capture_output=True, text=True,
-                             stdin=subprocess.DEVNULL)
+        out = subprocess.run(
+            ["/bin/bash", str(stub)],
+            capture_output=True,
+            text=True,
+            input='{"hook_event_name":"Stop"}',
+        )
         assert out.returncode == 0, f"hook exited {out.returncode}: {out.stderr}"
         return json.loads(out.stdout or "{}")
 
