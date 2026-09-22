@@ -101,7 +101,7 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
 
 
 SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
-SUPERVISED, NOT_RUNNING, SUPERVISOR_FAILED = "supervised", "not-running", "supervisor-failed"
+SUPERVISED, NOT_RUNNING, HELD, SUPERVISOR_FAILED = "supervised", "not-running", "held", "supervisor-failed"
 
 
 def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
@@ -128,6 +128,8 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
         return {"worker_id": worker_id, "outcome": SUPERVISED}
     if r.returncode == 3:
         return {"worker_id": worker_id, "outcome": NOT_RUNNING}
+    if r.returncode == 4:
+        return {"worker_id": worker_id, "outcome": HELD}
     return {"worker_id": worker_id, "outcome": SUPERVISOR_FAILED,
             "why": (r.stderr or r.stdout or "").strip()[-300:]}
 

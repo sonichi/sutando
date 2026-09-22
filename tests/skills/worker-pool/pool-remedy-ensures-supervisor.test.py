@@ -81,6 +81,8 @@ class EnsureSupervisor(unittest.TestCase):
     def test_exit_3_reads_as_not_running_and_other_failures_carry_why(self):
         self.assertEqual(rem.ensure_supervisor(self.ws, REPO, WID, runner=Runner(rc=3))["outcome"],
                          rem.NOT_RUNNING)
+        self.assertEqual(rem.ensure_supervisor(self.ws, REPO, WID, runner=Runner(rc=4))["outcome"],
+                         rem.HELD)
         out = rem.ensure_supervisor(self.ws, REPO, WID, runner=Runner(rc=1, stderr="tmux could not start"))
         self.assertEqual(out["outcome"], rem.SUPERVISOR_FAILED)
         self.assertIn("tmux could not start", out["why"])

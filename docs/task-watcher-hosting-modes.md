@@ -105,9 +105,9 @@ the same supervisor pid; the second handoff took 12 s.
 - **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
   starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
   session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and
-  `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. A supervisor
-  whose standby would only yield to a standby-kind watcher someone else already runs on that inbox
-  stays in standby instead of restarting its notifier every second.
+  `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. An inbox
+  already held by a standby-kind watcher no supervisor started (a legacy untagged one) gets no
+  supervisor until that watcher is replaced: its standby would only yield to the holder, on a loop.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
   exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
   30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's

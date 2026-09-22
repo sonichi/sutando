@@ -7,7 +7,9 @@
 #   (c) worker session up, supervisor absent -> exactly one new-session, named
 #       <worker session>-watcher, with the env from (a);
 #   (d) supervisor already up -> nothing started (idempotent);
-#   (e) a missing required variable refuses before touching tmux.
+#   (e) a missing required variable refuses before touching tmux;
+#   (f) an inbox already held by a standby-kind watcher no supervisor started -> exit 4, nothing
+#       started, and the same ensure starts one once that watcher is gone.
 # tmux is a recording stub: has-session answers from a list of "live" names,
 # new-session appends its argv to a log.
 set -u
@@ -78,6 +80,22 @@ env -u SUTANDO_TASKS_DIR bash "$ENSURE" >/dev/null 2>"$WORK/e.err"; rc=$?
 check "(e) no SUTANDO_TASKS_DIR -> refused" "$([ "$rc" != 0 ] && echo 0 || echo 1)" "rc=$rc"
 grep -q "SUTANDO_TASKS_DIR is required" "$WORK/e.err" && r=0 || r=1; check "(e) ...naming the variable" "$r"
 [ ! -e "$WORK/new-session.log" ] && r=0 || r=1; check "(e) ...and started nothing" "$r"
+
+# (f) a standby-kind holder nobody supervises (a legacy untagged watcher has this
+# shape): a real process named watch-tasks-stream.sh with the inbox as its tag,
+# classified by the real watcher_identity.py against the real process table.
+mkdir -p "$WORK/fake"; printf '#!/bin/bash\nsleep 60\n' > "$WORK/fake/watch-tasks-stream.sh"; chmod +x "$WORK/fake/watch-tasks-stream.sh"
+echo "sutando-worker-w-abc123" > "$WORK/live"; rm -f "$WORK/new-session.log"
+bash "$WORK/fake/watch-tasks-stream.sh" --role standby --inbox "$SUTANDO_TASKS_DIR" & HOLDER=$!
+sleep 1
+bash "$ENSURE" >"$WORK/f.out" 2>"$WORK/f.err"; rc=$?
+check "(f) a standby-kind holder on the inbox -> exit 4" "$([ "$rc" = 4 ] && echo 0 || echo 1)" "rc=$rc — $(tail -1 "$WORK/f.err")"
+grep -q "already served by a standby-kind watcher" "$WORK/f.err" && r=0 || r=1; check "(f) ...saying so, and how to replace it" "$r"
+[ ! -e "$WORK/new-session.log" ] && r=0 || r=1; check "(f) ...and started nothing" "$r"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; sleep 0.5
+bash "$ENSURE" >"$WORK/f2.out" 2>"$WORK/f2.err"; rc=$?
+check "(f) ...and once the holder is gone the same ensure starts one" "$rc" "$(cat "$WORK/f2.err")"
+[ "$(grep -c '^new-session$' "$WORK/new-session.log" 2>/dev/null)" = 1 ] && r=0 || r=1; check "(f) ...exactly one new-session" "$r"
 
 if [ "$fail" = 0 ]; then echo "  ok  one supervisor per worker inbox, idempotent"; else echo "  FAILED"; fi
 exit "$fail"

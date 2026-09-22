@@ -15,6 +15,8 @@
 # Usage: worker-watcher-supervisor.sh            ensure the supervisor is running
 #        worker-watcher-supervisor.sh --print-command   print the tmux argv, run nothing
 # Exit 0: running (already, or started now). 3: no worker session to supervise.
+# 4: a standby-kind watcher someone else runs already holds the inbox (a legacy
+#    untagged one, typically); a supervisor's standby would only yield to it.
 set -u
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 : "${SUTANDO_INSTANCE_ID:?worker-watcher-supervisor: SUTANDO_INSTANCE_ID is required}"
@@ -57,6 +59,12 @@ fi
 if ! tmux -S "$SOCK" has-session -t "=$WORKER_SESSION" 2>/dev/null; then
   echo "worker-watcher-supervisor: worker session $WORKER_SESSION is not running; nothing to supervise" >&2
   exit 3
+fi
+# The supervisor's own standby would yield at once to a standby-kind holder it
+# does not own, on a restart loop; leave such an inbox alone until it is replaced.
+if [ "$("$PY" "$REPO/src/watcher_identity.py" standby-present --inbox "$SUTANDO_TASKS_DIR" 2>/dev/null)" = "yes" ]; then
+  echo "worker-watcher-supervisor: $SUTANDO_TASKS_DIR is already served by a standby-kind watcher not started by a supervisor; not starting one until it is replaced (watch-tasks-stream.sh --force-restart on the owner's word)" >&2
+  exit 4
 fi
 "${CMD[@]}" || { echo "worker-watcher-supervisor: tmux could not start $SUP_SESSION" >&2; exit 1; }
 echo "worker-watcher-supervisor: started $SUP_SESSION for $SUTANDO_TASKS_DIR"
