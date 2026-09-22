@@ -18,6 +18,23 @@ REAL_REPO = Path(os.environ.get(
 )).resolve()
 
 
+# A restart is a property to wait for, not a deadline: a notifier lifetime
+# spawns a role-verdict check, and a loaded runner is far slower than a fast one.
+RESTART_WAIT_S = float(os.environ.get("SUTANDO_TEST_RESTART_WAIT_S", "10"))
+
+
+def _wait_for_restarts(path, minimum=2, timeout=None):
+    """The count once the notifier has run `minimum` times, or the last value
+    seen at the deadline. Returns what satisfied the wait, never a fresh read:
+    re-reading re-enters _read_count's truncate window."""
+    limit = time.monotonic() + (RESTART_WAIT_S if timeout is None else timeout)
+    observed = _read_count(path)
+    while observed < minimum and time.monotonic() < limit:
+        time.sleep(0.01)
+        observed = _read_count(path)
+    return observed
+
+
 def _read_count(path):
     """Read the supervisor's counter file, tolerating a mid-write empty read.
 
@@ -652,13 +669,7 @@ exit 23
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            # Each notifier lifetime now spawns a role-verdict check, so a
-            # restart is a property to wait for, not a one-second deadline.
-            for _ in range(1000):
-                observed = _read_count(count)
-                if observed >= 2:
-                    break
-                time.sleep(0.01)
+            observed = _wait_for_restarts(count)
             self.assertTrue(count.exists(), "supervisor never started notifier")
             # Assert the value that satisfied the loop, not a fresh read: a second
             # read re-enters the same truncate window and can see 0 after the
@@ -704,12 +715,7 @@ sleep 60
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            observed = 0
-            for _ in range(200):
-                observed = _read_count(count)
-                if observed >= 2:
-                    break
-                time.sleep(0.01)
+            observed = _wait_for_restarts(count)
             self.assertTrue(count.exists(), "supervisor never started notifier")
             # Assert the value that satisfied the loop, not a fresh read: a second
             # read re-enters the same truncate window and can see 0 after the
