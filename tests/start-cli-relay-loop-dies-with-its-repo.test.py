@@ -15,6 +15,11 @@ This test extracts the loop body from start-cli.sh and drives it directly:
   b) the relay is invoked with the launcher's argv and the loop ends once the
      script disappears
   c) a failing `sleep` ends the loop instead of degrading into a busy loop
+  d) tied to a real tmux session: keeps running while it exists, exits 0 once
+     it has been gone for three checks
+  e) no socket given: the old inputs-only contract still governs the loop
+  f) an ambiguous tmux failure (refused, unrecognised, empty stderr) is
+     UNKNOWN, never a confirmed absence, so it cannot end the loop on its own
 
 Run: python3 tests/start-cli-relay-loop-dies-with-its-repo.test.py  (exit 0/1)
 """
@@ -180,6 +185,27 @@ with tempfile.TemporaryDirectory() as td:
     n = len(calls.read_text().splitlines()) if calls.exists() else 0
     check("e) without a socket the loop runs until its script is gone", rc is not None and n == 3,
           f"rc={rc}; relay ran {n}x")
+
+# f) an ambiguous tmux failure (refused, unrecognised, empty stderr) is UNKNOWN,
+#    never a confirmed absence, and must not advance the miss count.
+with tempfile.TemporaryDirectory() as td:
+    binp, repo = Path(td) / "bin", Path(td) / "repo"
+    binp.mkdir()
+    (repo / "src").mkdir(parents=True)
+    calls = Path(td) / "calls.log"
+    script = repo / "src" / "core-supervisor-relay.py"
+    script.write_text("# stand-in for the relay\n")
+    # Cap at 6 (a buggy 3-strike loop would stop at 3) and end via script removal.
+    _exe(binp / "python3", f'#!/bin/sh\necho run >> "{calls}"\n'
+         f'[ "$(/usr/bin/wc -l < "{calls}")" -lt 6 ] || /bin/rm -f "$1"\n')
+    _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
+    # Always fails with a message that matches none of the absence signatures.
+    _exe(binp / "tmux", '#!/bin/sh\necho "unrecognised: permission or version refusal" >&2\nexit 1\n')
+    rc, err = _run(body, [str(binp / "python3"), str(script), "SIG", "STATE", "ACTIVE",
+                          "/tmp/does-not-matter.sock", "some-session"], path=str(binp))
+    n = len(calls.read_text().splitlines()) if calls.exists() else 0
+    check("f) an unrecognised tmux failure never ends the loop on its own",
+          rc is not None and n == 6, f"rc={rc}; relay ran {n}x (an old 3-strike bug would stop at 3)")
 
 if failures:
     print("\n".join(f"  FAIL {f}" for f in failures))
