@@ -132,8 +132,12 @@ HANDLER_STATE="absent"
 HELD_NAMES=""
 HELD_RETRY_AT=0
 DISPATCHED_IDS=""
+# `ls -di` is one line on every POSIX ls; GNU `stat -f` prints a filesystem dump.
 task_file_identity() {
-  printf '%s %s' "$(stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1" 2>/dev/null)" "$(cksum < "$1" 2>/dev/null)"
+  local inode sum
+  inode="$(ls -di -- "$1" 2>/dev/null | awk 'NR==1 {print $1}')"
+  sum="$(cksum < "$1" 2>/dev/null | awk 'NR==1 {print $1 "-" $2}')"
+  printf '%s' "${inode}:${sum}"
 }
 HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
 # One read per routing decision: the bytes are copied once into a private
@@ -537,7 +541,13 @@ dispatch_task() {
   # One admission per file identity per watcher lifetime: a later event for the
   # same bytes in the same inode is not a new task; a replaced file is.
   identity="$filename|$(task_file_identity "$task_path")"
-  if [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
+  # A malformed identity never dedupes: a duplicate is recoverable, a silently
+  # dropped task is not.
+  case "$identity" in
+    *"|"[0-9]*:[0-9]*-[0-9]*) ;;
+    *) echo "watch-tasks-stream: no usable file identity for $filename; dispatching without dedupe" >&2; identity="" ;;
+  esac
+  if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
     return 0
   fi
   # This decision is its own read: a fresh snapshot, parsed here, used here.
@@ -551,7 +561,7 @@ dispatch_task() {
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
   fi
-  DISPATCHED_IDS="$DISPATCHED_IDS$identity
+  [ -z "$identity" ] || DISPATCHED_IDS="$DISPATCHED_IDS$identity
 "
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
     emit_dispatch_task_file "$announce"

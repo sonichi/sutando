@@ -936,6 +936,47 @@ check("its later Created and Updated events did not admit it again",
       handled == ["probe-hO", "handle-hO"] and not any(ln.startswith("TASK_FILE: task-held") for ln in out),
       f"stdout={out!r} handler log={handled!r}")
 
+
+def scenario_gnu_stat_shim_two_tasks():
+    """A `stat` that behaves like GNU coreutils (`-f` prints a multi-line
+    filesystem dump and exits 1; `-c '%i'` works): two distinct tasks must both
+    be admitted, and the recorded identity must be one line."""
+    tmp, ws, b = _workspace("ready-gnustat-")
+    (b / "stat").write_text(
+        '#!/bin/bash\n'
+        'case "$1" in\n'
+        '  -f) printf "  File: \\"%s\\"\\n    ID: 1 Namelen: 255 Type: apfs\\nBlock size: 4096  Fundamental block size: 4096\\n'
+        'Blocks: Total: 1 Free: 1 Available: 1\\nInodes: Total: 1 Free: 1\\n" "$2"; exit 1 ;;\n'
+        '  -c) printf "%s\\n" "$(ls -di -- "$3" | awk \'{print $1}\')" ;;\n'
+        '  *) exit 1 ;;\n'
+        'esac\n')
+    (b / "stat").chmod(0o755)
+    env = _watcher_env(tmp, ws, b)
+    errf = tmp / "watcher.err"
+    with open(errf, "w") as fh:
+        p = _start(ws, env, stderr=fh)
+    out: list[str] = []
+    try:
+        _wait_ready(ws)
+        _write_task(ws, "task-one")
+        _pump(p, out, lambda: any("task-one" in ln for ln in out), timeout=6, settle=0.3)
+        _write_task(ws, "task-two")
+        _pump(p, out, lambda: any("task-two" in ln for ln in out), timeout=6, settle=0.5)
+    finally:
+        _stop(p)
+    err = errf.read_text()
+    return out, err
+
+
+print("a GNU-like stat on PATH (`-f` dumps the filesystem and exits 1):")
+out, err = scenario_gnu_stat_shim_two_tasks()
+check("two distinct tasks were both admitted, once each",
+      sum(ln.startswith("TASK_FILE: task-one") for ln in out) == 1
+      and sum(ln.startswith("TASK_FILE: task-two") for ln in out) == 1,
+      f"stdout={out!r}")
+check("no task was dispatched without an identity (the identity was one usable line)",
+      "no usable file identity" not in err, f"stderr={err!r}")
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
 sys.exit(1 if FAILURES else 0)
