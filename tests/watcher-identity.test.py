@@ -739,49 +739,72 @@ class TestStandbyPresentEdges(unittest.TestCase):
 
 class TestInboxHolders(unittest.TestCase):
     """inbox_holders() is presence, tagged or not, ready or not: what the watcher's own
-    startup asks before it doubles an inbox. Readiness stays the supervisor's question."""
+    startup asks before it doubles an inbox. Readiness stays the supervisor's question,
+    and an undecidable line is counted, never reported as a holder."""
 
-    def test_no_watcher_is_an_empty_list_not_none(self):
+    def test_no_watcher_is_an_empty_list_of_holders(self):
         ps = "  100 1 python3 something-else\n"
-        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({})), [])
+        seen = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({}))
+        self.assertEqual((seen.observed, seen.holders, seen.undecided), (True, [], 0))
 
     def test_a_tagged_session_watcher_is_a_session_holder(self):
         ps = f"  100 1 {CORE_SESSION_FLAT}\n"
         vec = vector_for({"100": CORE_SESSION_ARGS})
-        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec), [(100, "session")])
+        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec).holders,
+                         [(100, "session")])
 
     def test_an_untagged_watcher_is_an_untagged_holder(self):
         ps = f"  100 1 {GENUINE}\n"
         vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", INBOX]})
-        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec), [(100, "untagged")])
+        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec).holders,
+                         [(100, "untagged")])
 
     def test_a_standby_tag_is_a_standby_holder(self):
         args = ["bash", "src/watch-tasks-stream.sh", INBOX, "--role", "standby", "--inbox", INBOX]
         ps = f"  100 1 {' '.join(args)}\n"
-        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({"100": args})),
+        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps,
+                                           argv_vector=vector_for({"100": args})).holders,
                          [(100, "standby")])
 
     def test_another_inbox_is_never_a_holder(self):
         other = "/ws/deliveries/" + "e" * 32
         ps = f"  100 1 bash src/watch-tasks-stream.sh {other}\n"
         vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", other]})
-        self.assertEqual(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec), [])
+        seen = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vec)
+        self.assertEqual((seen.holders, seen.undecided), ([], 0))
 
     def test_the_caller_and_its_forked_children_are_excluded(self):
         # A command substitution inside the watcher forks a child carrying the
         # watcher's own argv; neither may read as a second holder.
         ps = f"  100 1 {CORE_SESSION_FLAT}\n  101 100 {CORE_SESSION_FLAT}\n"
         vec = vector_for({"100": CORE_SESSION_ARGS, "101": CORE_SESSION_ARGS})
-        self.assertEqual(wid.inbox_holders(INBOX, exclude_pid=100, ps_output=ps, argv_vector=vec), [])
+        self.assertEqual(wid.inbox_holders(INBOX, exclude_pid=100, ps_output=ps,
+                                           argv_vector=vec).holders, [])
 
-    def test_an_undecidable_line_for_this_inbox_is_unknown(self):
+    def test_an_undecidable_line_is_counted_and_is_not_a_holder(self):
+        # A process that exits between the ps snapshot and the argv read is
+        # undecidable; reading that as a holder leaves the inbox with no watcher.
         ps = f"  100 1 bash src/watch-tasks-stream.sh {INBOX} --role session\n"
-        self.assertIsNone(wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({})))
+        seen = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({}))
+        self.assertEqual((seen.observed, seen.holders, seen.undecided), (True, [], 1))
 
-    def test_an_unobservable_ps_is_unknown(self):
+    def test_an_undecidable_line_for_another_inbox_is_not_even_counted(self):
+        other = "/ws/deliveries/" + "e" * 32
+        ps = f"  100 1 bash src/watch-tasks-stream.sh x --inbox {other} --role session\n"
+        seen = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({}))
+        self.assertEqual(seen.undecided, 0)
+
+    def test_a_decided_holder_still_reports_beside_an_undecidable_line(self):
+        ps = (f"  100 1 {CORE_SESSION_FLAT}\n"
+              f"  200 1 bash src/watch-tasks-stream.sh {INBOX} --role session\n")
+        seen = wid.inbox_holders(INBOX, ps_output=ps, argv_vector=vector_for({"100": CORE_SESSION_ARGS}))
+        self.assertEqual((seen.holders, seen.undecided), ([(100, "session")], 1))
+
+    def test_an_unobservable_ps_is_not_observed(self):
         def run(*a, **k):
             raise OSError("no ps")
-        self.assertIsNone(wid.inbox_holders(INBOX, run=run))
+        seen = wid.inbox_holders(INBOX, run=run)
+        self.assertEqual((seen.observed, seen.holders), (False, []))
 
 
 if __name__ == "__main__":

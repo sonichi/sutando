@@ -81,5 +81,15 @@ grep -q -E "already watched by pid ($B1 \(untagged\)|$B2 \(session\))" "$WORK/b3
 # (f) inbox a's watcher is not a holder for inbox b and vice versa.
 alive "$A3" && alive "$B2"; check "(f) both inboxes keep their own watcher" $?
 
+# (g) THE CI REGRESSION: an unreadable process table must not stop a start.
+# Refusing there leaves the inbox with no announcer at all, which is the failure
+# this whole mechanism exists to prevent.
+mkdir -p "$WORK/c/tasks" "$WORK/c/state" "$WORK/nops"
+printf '#!/bin/sh\nexit 1\n' > "$WORK/nops/ps"; chmod +x "$WORK/nops/ps"
+C1=$(PATH="$WORK/nops:$PATH" run_watcher "$WORK/c" "$WORK/c1.err" "$WORK/c/tasks" --role session --inbox "$WORK/c/tasks"); PIDS+=("$C1")
+sleep 3
+alive "$C1"; check "(g) an unreadable process table still starts the watcher" $? "$(tail -1 "$WORK/c1.err")"
+grep -q "could not read the process table" "$WORK/c1.err"; check "(g) ...and says the check was skipped" $?
+
 if [ "$fail" = 0 ]; then echo "  ok  one announcer per inbox, enforced by the watcher"; else echo "  FAILED"; fi
 exit "$fail"

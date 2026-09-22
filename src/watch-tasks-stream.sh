@@ -103,14 +103,16 @@ SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 # watcher of the SAME kind exits 0, and only --force-restart replaces the holder.
 # A session watcher over a standby proceeds (the supervisor stands the standby
 # down once this one proves ready); a standby over a session watcher exits.
+# A holder must be PROVEN: an unreadable process table, or a line that cannot be
+# decided, starts the watcher anyway. Refusing would leave the inbox with no
+# announcer at all, which is worse than the duplicate this check prevents.
 [ -n "$WATCHER_ROLE" ] || echo "watch-tasks-stream: untagged start (no --role); treated as standby for the inbox check. Pass --role session|standby --inbox <dir>." >&2
 __my_kind="$WATCHER_ROLE"; [ "$__my_kind" = "session" ] || __my_kind="standby"
-__holders="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders --inbox "$TASKS_DIR_ABS" --exclude "$$" 2>/dev/null)" || __holders="unknown"
+__holders="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders --inbox "$TASKS_DIR_ABS" --exclude "$$" 2>/dev/null)" || __holders="unobserved"
 case "$__holders" in
   none) ;;
-  unknown)
-    echo "watch-tasks-stream: cannot decide whether $TASKS_DIR_ABS is already watched (ps unobservable); not starting" >&2
-    exit 3 ;;
+  unobserved|"")
+    echo "watch-tasks-stream: could not read the process table; starting without the duplicate check on $TASKS_DIR_ABS" >&2 ;;
   *)
     while IFS=' ' read -r __hpid __hrole; do
       [ -n "$__hpid" ] || continue
@@ -127,19 +129,28 @@ case "$__holders" in
       # still sees; its fswatch child is collected first so it cannot linger.
       __hkids="$(pgrep -P "$__hpid" 2>/dev/null || true)"
       __holder_live() { local s; s="$(ps -o stat= -p "$1" 2>/dev/null)"; [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }
-      kill -TERM "$__hpid" 2>/dev/null || true
+      # Re-prove the pid is STILL this inbox's watcher immediately before each
+      # signal: a dead holder's pid can be recycled onto an unrelated process.
+      __still_holder() {
+        "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders \
+          --inbox "$TASKS_DIR_ABS" --exclude "$$" 2>/dev/null | grep -q "^$1 "
+      }
+      if __still_holder "$__hpid"; then kill -TERM "$__hpid" 2>/dev/null || true; fi
       for _ in $(seq 1 100); do __holder_live "$__hpid" || break; sleep 0.1; done
-      if __holder_live "$__hpid"; then
+      if __holder_live "$__hpid" && __still_holder "$__hpid"; then
         kill -KILL "$__hpid" 2>/dev/null || true
         for _ in $(seq 1 30); do __holder_live "$__hpid" || break; sleep 0.1; done
       fi
-      __holder_live "$__hpid" && { echo "watch-tasks-stream: pid $__hpid did not exit; not starting" >&2; exit 3; }
+      if __holder_live "$__hpid" && __still_holder "$__hpid"; then
+        echo "watch-tasks-stream: pid $__hpid did not exit; not starting" >&2
+        exit 3
+      fi
       for __k in $__hkids; do kill -TERM "$__k" 2>/dev/null || true; done
     done <<< "$__holders"
     ;;
 esac
 unset __my_kind __holders __hpid __hrole __hkind __hkids __k
-unset -f __holder_live 2>/dev/null || true
+unset -f __holder_live __still_holder 2>/dev/null || true
 # Optional task handlers run synchronously, inline -- see run_handler_now().
 HANDLER_STATE_READY=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
