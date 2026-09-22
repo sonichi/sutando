@@ -226,8 +226,8 @@ def main() -> int:
         check("  ...body intact even on the last-resort path",
               survivors[0].read_text() == "must not vanish", "content lost")
 
-    # --- an explicit body [channel:] target outranks routing alone ---------
-    # CI found this branch uncovered: routing False + a body redirect present.
+    # An explicit body [channel:] target outranks routing alone -- the
+    # defect-detecting coverage for this fix (see #4593's review history).
     box4 = Path(tempfile.mkdtemp(prefix="proactive-bodymarker-"))
     (box4 / "proactive-bodymarker.txt").write_text(
         "[channel: 1530802402603700415]\nbriefing text")
