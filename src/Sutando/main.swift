@@ -580,6 +580,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ps.standardOutput = psPipe
         ps.standardError = FileHandle.nullDevice
         do { try ps.run() } catch { return nil }
+        // Drain BEFORE waiting: this listing exceeds the 64 KiB pipe buffer, so
+        // waiting first deadlocks ps on write against a main thread that never reads.
+        let out = psPipe.fileHandleForReading.readDataToEndOfFile()
         ps.waitUntilExit()
         // A failed ps must read as unknown -- an empty listing from a
         // non-zero exit is not a clean "no match" (the sysmond-unreachable
@@ -588,7 +591,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
             return nil
         }
-        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let listing = String(data: out, encoding: .utf8) ?? ""
         let selfPID = ProcessInfo.processInfo.processIdentifier
         let myInbox = canonicalInbox(ProcessInfo.processInfo.environment["SUTANDO_TASKS_DIR"] ?? workspace + "/tasks")
         // A tagged line answers by its inbox: this core's own is alive, another
