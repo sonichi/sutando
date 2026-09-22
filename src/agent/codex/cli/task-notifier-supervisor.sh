@@ -99,7 +99,9 @@ trap 'stop_child; exit 0' HUP INT TERM
 # armed-loop and the outer standby loop both end), 2 when a session-role
 # watcher appeared and this notifier was stopped to yield to it (caller
 # returns to standby).
+quick_exits=0
 run_notifier_once() {
+  local started_at; started_at="$(date +%s)"
   # watch-tasks-stream.sh deliberately uses `kill 0` when its fswatch pipeline
   # ends so no orphan child survives. Run the notifier in a separate process
   # group; otherwise that cleanup signal also kills this supervisor and tmux
@@ -127,9 +129,13 @@ run_notifier_once() {
   child_pid=""
   target_alive || return 1
   [ "$(session_role_verdict)" = "yes" ] && return 2
-  # Our own standby is gone with the child; a standby still present is someone
-  # else's, and the inbox is covered: back to standby rather than a restart loop.
-  [ "$(standby_present_verdict)" = "yes" ] && return 2
+  # A notifier that keeps exiting at once is yielding to a standby-kind watcher
+  # someone else runs on this inbox; our own is gone with the child. Covered.
+  if [ $(( $(date +%s) - started_at )) -lt 2 ]; then quick_exits=$((quick_exits + 1)); else quick_exits=0; fi
+  if [ "$quick_exits" -ge 3 ] && [ "$(standby_present_verdict)" = "yes" ]; then
+    quick_exits=0
+    return 2
+  fi
   echo "task-notifier-supervisor: notifier exited with status $status; restarting" >&2
   sleep "$RESTART_DELAY"
   return 0
@@ -142,7 +148,7 @@ run_notifier_once() {
 unknown_since=""
 while target_alive; do
   verdict="$(session_role_verdict)"
-  if [ "$verdict" = "yes" ] || { [ "$verdict" = "no" ] && [ "$(standby_present_verdict)" = "yes" ]; }; then
+  if [ "$verdict" = "yes" ]; then
     unknown_since=""
     sleep "$ROLE_POLL"
     continue
@@ -163,7 +169,7 @@ while target_alive; do
       sleep "$ROLE_POLL"
       waited=$((waited + ROLE_POLL))
       v="$(session_role_verdict)"
-      if [ "$v" = "yes" ] || { [ "$v" = "no" ] && [ "$(standby_present_verdict)" = "yes" ]; }; then
+      if [ "$v" = "yes" ]; then
         clear_to_arm=0
         break
       fi
@@ -171,6 +177,12 @@ while target_alive; do
       # early -- a transient ps failure costs time, never coverage either way.
     done
     [ "$clear_to_arm" -eq 1 ] || continue
+  fi
+  # Once per arm attempt, not per poll: a standby-kind watcher someone else runs
+  # on this inbox already covers it, and ours would only yield to it.
+  if [ "$(standby_present_verdict)" = "yes" ]; then
+    sleep "$ROLE_POLL"
+    continue
   fi
   unknown_since=""
   while target_alive; do
