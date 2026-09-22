@@ -43,6 +43,12 @@ the compatibility window.
 
 ## Transport
 
+The orphan-result sweep leaves local tasks with a pre-body `source: cron`
+header untouched, including archived tasks and old completion files. A local
+scheduled task has no gateway lease to close. Its completion does not become a
+remote reply; owner notifications use the separate proactive delivery path.
+Gateway task results retain the existing recovery, suppression, and retry behavior.
+
 - All requests carry `Authorization: Bearer <REMOTE_TASK_TOKEN>`.
 - Request/response bodies are JSON.
 - The protocol is versioned under the `/v1` path prefix.

@@ -4520,6 +4520,17 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
             continue
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is not None:
+            try:
+                headers = local_task_protocol.parse_task_headers(
+                    task.read_text(encoding="utf-8", errors="replace")).headers
+            except OSError:
+                continue
+            # Cron completions belong to the local scheduler, not a gateway lease.
+            # Leave their delivery and retirement to the local consumers.
+            if headers.get("source") == "cron":
+                continue
         try:
             age = now - rfile.stat().st_mtime
         except OSError:
@@ -4545,7 +4556,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
-        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
             if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue

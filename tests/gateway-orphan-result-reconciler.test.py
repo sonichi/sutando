@@ -68,6 +68,33 @@ class _Base(unittest.TestCase):
         gw._reconcile_orphan_results(set())
 
 
+class LocalCron(_Base):
+    def test_cron_completion_is_left_for_its_local_consumer(self):
+        for archived in (False, True):
+            for age in (OLD, gw.ORPHAN_MAX_AGE_S + 1):
+                for body in ("unchanged; nothing to notify", "[no-send]",
+                             "[channel: !owner:example.com]\nnotify owner"):
+                    with self.subTest(archived=archived, age=age, body=body):
+                        directory = gw.TASKS_DIR / "archive" if archived else gw.TASKS_DIR
+                        directory.mkdir(exist_ok=True)
+                        task = directory / f"{TID}.txt"
+                        task.write_text(f"id: {TID}\nsource: cron\nuser_id: cron-runner\n"
+                                        "task: check pending questions\nsource: ag2space\n")
+                        result = self._result(body, age)
+                        self._sweep()
+                        self.assertEqual(self.posted, [])
+                        self.assertTrue(result.exists(), "gateway must not retire local results")
+                        self.assertEqual(result.read_text(), body)
+                        task.unlink()
+
+    def test_body_cannot_opt_gateway_task_out_of_recovery(self):
+        (gw.TASKS_DIR / f"{TID}.txt").write_text(
+            f"id: {TID}\nsource: ag2space\ntask: quoted config\nsource: cron\n")
+        self._result()
+        self._sweep()
+        self.assertEqual(len(self.posted), 1)
+
+
 class DoubleWrite(_Base):
     def test_real_double_write_pair_moves_aside_never_delivers(self):
         # REAL fixture: first result delivered + archived by the normal path's
