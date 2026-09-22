@@ -53,9 +53,11 @@ child_pid=""
 # yes / no / unknown -- unknown (ps snapshot unavailable) is deliberately
 # never read as "no": every caller below fails toward keeping whatever
 # coverage already exists rather than risk a second decider.
+# The sentinel dir is the workspace the launcher names, else the inbox's parent:
+# the watcher's own fallback, so both read the same file. No inbox, no gate.
 session_role_verdict() {
-  local args=(role-present session --ready) out rc
-  [ -n "$TASKS_DIR" ] && args+=(--inbox "$TASKS_DIR")
+  local args=(role-present session) out rc
+  [ -n "$TASKS_DIR" ] && args+=(--inbox "$TASKS_DIR" --ready "${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}/state")
   out="$("$PY" "$WATCHER_IDENTITY" "${args[@]}" 2>/dev/null)"
   rc=$?
   if [ "$rc" -eq 0 ] && [ -n "$out" ]; then

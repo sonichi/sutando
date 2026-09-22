@@ -257,16 +257,6 @@ def positional_inbox(operands: Optional[List[str]]) -> Optional[str]:
     return None
 
 
-def state_dir_for_inbox(inbox: Optional[str]) -> Optional[str]:
-    """The state dir whose sentinels cover `inbox`: the workspace the launcher
-    names, else the inbox's parent, the same fallback the watcher itself uses."""
-    ws = os.environ.get("SUTANDO_WORKSPACE_DIR")
-    if ws:
-        return os.path.join(ws, "state")
-    want = canonical_inbox(inbox)
-    return None if want is None else os.path.join(os.path.dirname(want), "state")
-
-
 def sentinel_names_pid(pid: Optional[int], state_dir: Optional[str]) -> bool:
     """True only when a readable watcher sentinel under `state_dir` holds `pid`.
     Anything unreadable is not a stamp, so it never counts as ready."""
@@ -325,9 +315,10 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
     line whose tag names a different inbox is decidably not ours, so it never
     turns a clean answer into "unknown".
 
-    `ready`: a matching watcher counts only once the inbox's sentinel names its
-    pid, which the watcher stamps after a real event round-trip; a process that
-    exists but has not stamped is decidably "no", never "unknown".
+    `ready`: a matching watcher counts only once a sentinel under `state_dir`
+    names its pid, which the watcher stamps after a real event round-trip; a
+    process that exists but has not stamped is decidably "no", never "unknown".
+    The caller names `state_dir`: this module resolves no workspace.
     """
     if ps_output is None:
         try:
@@ -363,7 +354,7 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
             continue
         if want is not None and canonical_inbox(watcher_inbox(verdict.operands)) != want:
             continue
-        if ready and not sentinel_names_pid(as_pid(pid), state_dir or state_dir_for_inbox(inbox)):
+        if ready and not sentinel_names_pid(as_pid(pid), state_dir):
             continue
         return True
     return None if saw_undecidable else False
@@ -415,9 +406,9 @@ def main(argv=None) -> int:
     `unknown` on stdout, with `why=` beneath. Exit 0 when decided, 2 when not,
     so a shell adapter cannot read an unobservable `ps` as a proven answer.
 
-    `watcher_identity.py role-present <role> [--inbox VALUE] [--ready]` -> `yes`,
-    `no` or `unknown` on stdout; `--ready` counts a session watcher only once
-    its sentinel names it. `standby-present --inbox VALUE` asks the same of a
+    `watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]`
+    -> `yes`, `no` or `unknown` on stdout; `--ready` counts a session watcher
+    only once a sentinel under STATE_DIR names it. `standby-present --inbox VALUE` asks the same of a
     watcher that is NOT session-role for that inbox. Exit 0 for yes/no (both decided), 2 only when the
     `ps` snapshot itself failed -- `unknown` must never read as `no` to a
     caller deciding whether to start a duplicate watcher."""
@@ -442,11 +433,11 @@ def main(argv=None) -> int:
     if args and args[0] == "role-present":
         rest = args[1:]
         if not rest or rest[0].startswith("-"):
-            print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready]", file=sys.stderr)
+            print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]", file=sys.stderr)
             return 64
         role = rest[0]
         inbox = None
-        ready = False
+        state_dir = None
         i = 1
         while i < len(rest):
             if rest[i] == "--inbox" and i + 1 < len(rest):
@@ -455,13 +446,16 @@ def main(argv=None) -> int:
             elif rest[i].startswith("--inbox="):
                 inbox = rest[i].split("=", 1)[1] or None
                 i += 1
-            elif rest[i] == "--ready":
-                ready = True
+            elif rest[i] == "--ready" and i + 1 < len(rest):
+                state_dir = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--ready="):
+                state_dir = rest[i].split("=", 1)[1] or None
                 i += 1
             else:
-                print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready]", file=sys.stderr)
+                print("usage: watcher_identity.py role-present <role> [--inbox VALUE] [--ready STATE_DIR]", file=sys.stderr)
                 return 64
-        verdict = role_present(role, inbox, ready=ready)
+        verdict = role_present(role, inbox, ready=state_dir is not None, state_dir=state_dir)
         if verdict is None:
             print("unknown")
             print("why=ps snapshot unavailable")

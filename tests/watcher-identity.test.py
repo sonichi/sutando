@@ -501,12 +501,12 @@ class TestRolePresentCliForms(unittest.TestCase):
     def test_inbox_equals_form_is_parsed(self):
         rc, out, _, rp = self._run(["role-present", "session", f"--inbox={INBOX}"], True)
         self.assertEqual((rc, out), (0, "yes"))
-        rp.assert_called_once_with("session", INBOX, ready=False)
+        rp.assert_called_once_with("session", INBOX, ready=False, state_dir=None)
 
     def test_inbox_flag_form_is_parsed(self):
         rc, out, _, rp = self._run(["role-present", "session", "--inbox", INBOX], False)
         self.assertEqual((rc, out), (0, "no"))
-        rp.assert_called_once_with("session", INBOX, ready=False)
+        rp.assert_called_once_with("session", INBOX, ready=False, state_dir=None)
 
     def test_a_missing_role_is_a_usage_error(self):
         rc, _, err, rp = self._run(["role-present"], False)
@@ -567,20 +567,20 @@ class TestReadyGate(unittest.TestCase):
         self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
                                        argv_vector=self.vec, ready=True, state_dir=self.state), False)
 
-    def test_the_state_dir_follows_the_workspace_env_then_the_inbox(self):
-        with mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE_DIR": "/w"}):
-            self.assertEqual(wid.state_dir_for_inbox("/x/tasks"), "/w/state")
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(wid.state_dir_for_inbox("/x/tasks"), "/x/state")
-            self.assertIsNone(wid.state_dir_for_inbox(None))
+    def test_ready_with_no_state_dir_named_is_a_decided_no(self):
+        self.assertIs(wid.role_present("session", inbox=INBOX, ps_output=self.ps,
+                                       argv_vector=self.vec, ready=True), False)
 
-    def test_cli_ready_flag_reaches_role_present(self):
-        out = io.StringIO()
+    def test_cli_ready_takes_the_state_dir_from_the_caller(self):
+        out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(wid, "role_present", return_value=True) as rp, \
-                contextlib.redirect_stdout(out):
-            rc = wid.main(["role-present", "session", "--inbox", INBOX, "--ready"])
-        rp.assert_called_once_with("session", INBOX, ready=True)
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = wid.main(["role-present", "session", "--inbox", INBOX, "--ready", self.state])
+            rc_bare = wid.main(["role-present", "session", "--ready"])
+        rp.assert_called_once_with("session", INBOX, ready=True, state_dir=self.state)
         self.assertEqual((rc, out.getvalue().strip()), (0, "yes"))
+        self.assertEqual(rc_bare, 64)
+        self.assertIn("usage", err.getvalue())
 
 
 class TestStandbyPresent(unittest.TestCase):
