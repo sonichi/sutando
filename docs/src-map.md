@@ -276,6 +276,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
