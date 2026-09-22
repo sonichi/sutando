@@ -166,6 +166,8 @@ reload_current_handler() { read_handler_config_now; }
 redispatch_held_tasks() {
   local held="$HELD_NAMES" fn
   [ -n "$held" ] || return 0
+  # Mid-shutdown a held task stays held: the next lifetime's sweep takes it.
+  [ -f "$STATE_DIR/shutdown.sentinel" ] && return 0
   HELD_NAMES=""
   HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
   while IFS= read -r fn; do
@@ -505,6 +507,9 @@ priority_sorted_tasks() {
 
 dispatch_task() {
   local task_path="$1" rc filename announce resolved attempt identity
+  # Graceful-shutdown gate: every path in (sweep, replay, event, held retry)
+  # holds new tasks while the sentinel is present; emitting one would orphan it.
+  [ -f "$STATE_DIR/shutdown.sentinel" ] && return 0
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   #
@@ -817,11 +822,6 @@ handle_event() {
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
-        # emitting one mid-shutdown would orphan it.
-        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-          return 0
-        fi
         dispatch_task "$path"
         redispatch_held_tasks
       fi
