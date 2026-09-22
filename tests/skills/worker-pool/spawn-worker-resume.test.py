@@ -49,7 +49,7 @@ class FakeTmux:
         self.envs.append(dict(kw.get("env") or {}))
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return cp(argv, 0, self.runtime + "\n", "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return cp(argv, 0, "Started detached.", "")
         sub = argv[3] if len(argv) > 3 else ""
@@ -61,7 +61,7 @@ class FakeTmux:
 
     def launches(self):
         return [e for a, e in zip(self.calls, self.envs)
-                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+                if a[0] == "bash" and a[1].endswith("launch-worker-session.sh")]
 
 
 def _spawned(ws, repo, runner, label="alpha"):
@@ -186,7 +186,7 @@ class FailingLauncher(FakeTmux):
         self.fail_from, self.launched = fail_from, 0
 
     def __call__(self, argv, **kw):
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.launched += 1
             if self.launched >= self.fail_from:
                 self.calls.append(argv)

@@ -323,6 +323,44 @@ class TestSweep(Base):
         self.assertTrue(accepted.exists())
 
 
+class TestAliasRefused(Base):
+    """The writer refuses to publish through a recipient-named symlink: a record
+    would otherwise land in the TARGET's folder under this recipient's name."""
+
+    A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def _root(self):
+        return pd.done_flag(self.ws.root, self.B, "task-0aliased000000000").parent.parent.parent
+
+    def _alias(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).symlink_to(root / self.B)
+        return root
+
+    def test_mark_done_through_an_aliased_recipient_dir_writes_nothing(self):
+        root = self._alias()
+        for published in (False, True):
+            with self.assertRaises(pd.RecipientAliasError):
+                pd.mark_done(self.ws.root, self.A, "task-0aliased000000001", published=published)
+        self.assertEqual(sorted(p.name for p in (root / self.B / "done").iterdir()), [],
+                         "a record was published into B's folder under A's name")
+
+    def test_an_aliased_done_dir_is_refused_too(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).mkdir()
+        (root / self.A / "done").symlink_to(root / self.B / "done")
+        with self.assertRaises(OSError):
+            pd.mark_done(self.ws.root, self.A, "task-0aliased000000002", published=True)
+        self.assertEqual(list((root / self.B / "done").iterdir()), [])
+
+    def test_control_a_real_recipient_dir_still_publishes(self):
+        pd.mark_done(self.ws.root, self.B, "task-0aliased000000003", published=True)
+        self.assertTrue(pd.done_flag(self.ws.root, self.B, "task-0aliased000000003").exists())
+
+
 class TestPayload(Base):
     def test_reads_the_bridges_task_file_as_text(self):
         self.ws.payload("task-1", "write the docs")

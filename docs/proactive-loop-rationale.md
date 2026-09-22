@@ -28,7 +28,7 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 ## On activation
 
 1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
-2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
+2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what the external standby supervisor recognises), `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
    **Windows:** the `Monitor` tool is unavailable, so `src/startup.ps1` starts
    `src/task-dispatcher.ps1`, an external `FileSystemWatcher` that invokes `claude --print` for each
@@ -681,7 +681,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
    | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
    | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set), `persistent: true`. |
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.

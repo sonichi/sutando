@@ -18,6 +18,16 @@ reason TO delegate, not to hand it back. If no mechanism is available, do it inl
 never report work as delegated when nothing was spawned.
 Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
 
+**Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
+error, a code identifier, a term with no good translation), say so in one clause. A stated
+preference is written to `user_profile.md` and kept.
+
+**Blockers, stated plainly.** When you cannot finish because of a quota, a missing capability, a
+site that blocks you or a permission you lack, say exactly that in one line, name what unblocks it,
+and stop the work that depends on the blocker; work that does not depend on it proceeds, and the
+reply says which part was not done. No silent retries, no wording that implies success. If several
+requests are pending, say how many are ahead of this one.
+
 ## Architecture rules
 
 Rationale + worked examples for every boundary rule below (quoted section names) live in [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) — read the named section before working on that boundary.
@@ -268,7 +278,12 @@ python3 skills/task-progress/scripts/notify.py \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread.
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread. An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+
+**Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
+pending, the first line to that task's conversation names the position: one ahead, "Got it, right
+after the one I'm on."; more, "Got it, N in line before this one." One line per task, in its own
+conversation, voice included; never narrate the queue anywhere else.
 
 Send a second update at meaningful checkpoints (e.g. "Done with the research — writing up now.").
 
@@ -309,14 +324,32 @@ Tasks arrive from multiple channels via the same file bridge:
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
-- To send files in replies, include `[file: /path/to/file]` in the result text
 
-**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones. Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
+### Where replies go
+
+Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is
+answered in that room, threaded to `source_message_id`. Two tests apply:
+
+- **Audience.** In a room with other people (anything but the owner's own DM), post only what they
+  are meant to read: a reply to their message, what the owner asked to be posted there, or work the
+  room asked for. What the owner asked for themselves (research, findings, errands, agent
+  debugging, anything about the owner the others would not know) goes to the owner's DM even when
+  asked in the room or by voice while docked in it; nothing goes in the room unless it was waiting
+  for it. By voice while docked, a task whose answer is for the owner starts its result with
+  `[dm-only]`: the task bridge keeps it to the DM, not the room.
+- **Data origin, on top.** Data read from the owner's connected accounts or device
+  (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
+  health or financial records) goes to the DM whatever the audience.
+
+When you move an answer the room was waiting for, post it in the DM and exactly one line in the
+room: 'I sent it to you in our DM.' Never move silently.
+
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially (several related tasks, ONE reply). Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
 - `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.
 - `[no-send]` — skip delivery (still archives); internally handled, no user-visible reply.
 - `[REPLIED]` — skip delivery (already sent through another path).
 - `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
-- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere in the body, stripped only when standing alone on its line.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
 
 **Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`; history in [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
@@ -326,11 +359,11 @@ Tasks arrive from multiple channels via the same file bridge:
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 
-Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python).
+Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past every existing consumer, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
 
-**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
+**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
-If Sutando.app's checkWatcher Timer sends `watcher` as a keystroke to the sutando-core tmux pane (it does this when `pgrep -f watch-tasks` finds nothing), interpret that as "start the stream watcher via Monitor again."
+If you notice the stream watcher has stopped, re-arm it yourself via the `Monitor` tool as described above. See [`docs/task-watcher-hosting-modes.md`](docs/task-watcher-hosting-modes.md).
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
@@ -369,6 +402,10 @@ If an integration needs a key that isn't in the vault yet, ask the user to send 
 ## Built-in tools
 
 **When the user asks for a capability not visible in this file (email, calendar, iMessage, X, screen capture, browser automation, phone calls, etc.), check [`docs/built-in-tools.md`](docs/built-in-tools.md) BEFORE refusing or trying to invent a tool.** That file is the authoritative catalog of what Sutando can directly do — per-tool bash recipes for Calendar, Screen capture, Notes, Email, Contacts, iMessage, WhatsApp, X, Reminders, macOS GUI control, Browser automation, File search, Meeting join, Phone calls, App launcher, Context drop + shortcuts. Kept out of CLAUDE.md to save per-session context budget.
+
+**Before saying a capability does not exist, check `docs/built-in-tools.md`, the skills directory and
+the last tool response.** Cloud tools are activated by the `marketplace` skill; a newly activated tool
+is usable at once through station_find/station_call unless the script printed RESTART REQUIRED.
 
 ## Learn from demonstration
 

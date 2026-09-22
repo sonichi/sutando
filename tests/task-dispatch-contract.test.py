@@ -628,6 +628,46 @@ class MainDispatchTest(unittest.TestCase):
         (self.results_dir / "task-b.txt").write_text("   \n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
 
+    def test_sort_by_priority_orders_by_tier_then_mtime(self):
+        low = self.tasks_dir / "task-low.txt"
+        normal = self.tasks_dir / "task-normal.txt"
+        urgent = self.tasks_dir / "task-urgent.txt"
+        low.write_text("priority: low\ntask: x\n")
+        normal.write_text("priority: normal\ntask: x\n")
+        urgent.write_text("priority: urgent\ntask: x\n")
+        now = 1_000_000.0
+        os.utime(low, (now, now))
+        os.utime(normal, (now + 1, now + 1))
+        os.utime(urgent, (now + 2, now + 2))
+        rc, out, err = self._run("sort-by-priority", str(self.tasks_dir))
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out.splitlines(), ["task-urgent.txt", "task-normal.txt", "task-low.txt"])
+
+    def test_sort_by_priority_empty_dir_is_rc_1_no_output(self):
+        rc, out, err = self._run("sort-by-priority", str(self.tasks_dir))
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_sort_by_priority_wrong_arity_is_usage_error(self):
+        rc, _, err = self._run("sort-by-priority", str(self.tasks_dir), "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_priority_tier_prints_the_parsed_tier(self):
+        f = self.tasks_dir / "task-a.txt"
+        f.write_text("priority: urgent\ntask: x\n")
+        rc, out, err = self._run("priority-tier", str(f))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "urgent\n")
+        self.assertEqual(err, "")
+
+    def test_priority_tier_wrong_arity_is_usage_error(self):
+        rc, _, err = self._run("priority-tier", str(self.tasks_dir / "task-a.txt"), "extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
     def test_find_ready_both_outcomes(self):
         rc, out, _ = self._run("find-ready", str(self.results_dir), "task-a.txt")
         self.assertEqual(rc, 1)

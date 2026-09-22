@@ -31,4 +31,13 @@ for skill_dir in "$SKILLS_DIR"/*/; do
 done
 
 echo ""
+# One release of alias: `room-doc` was renamed `room-collab`. A seat that still
+# says /room-doc gets the new skill; a broken old link is replaced, a real dir is left alone.
+if [ -e "$TARGET/room-collab" ]; then
+  if [ -L "$TARGET/room-doc" ] || [ ! -e "$TARGET/room-doc" ]; then
+    ln -sfn "$TARGET/room-collab" "$TARGET/room-doc"
+    echo "  ↪ room-doc → room-collab (alias)"
+  fi
+fi
+
 echo "Installed. Skills available in any Claude Code session."

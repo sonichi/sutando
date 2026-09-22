@@ -158,6 +158,28 @@ class TestPickerReplayAcrossRestart(Base):
         self.assertEqual(self.bindings().get(self.ROOM), W)
 
 
+class TheReceipt(Base):
+    """Every consult leaves a receipt: the one proof outside the watcher's process
+    that this host routes at all (the supervisor's unrouted-host alarm reads it)."""
+
+    def test_a_probe_leaves_a_receipt_even_when_it_declines(self):
+        self.roster(bindings={})
+        t = self.task_file("task-1", channel_id="!other:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
+        r = h.prr.read(self.ws)
+        self.assertEqual((r["mode"], r["task_id"]), ("probe", "task-1"))
+
+    def test_a_receipt_that_cannot_be_written_changes_no_decision(self):
+        self.roster(bindings={})
+        t = self.task_file("task-1", channel_id="!other:x")
+        (self.ws / "state" / "pool-routing-receipt.json").mkdir()   # a directory: unwritable
+        with patch("sys.stderr"):
+            rc = h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"])
+        self.assertEqual(rc, h.DECLINE)
+        self.assertIsNone(h.prr.read(self.ws))
+
+
 class TestClassification(Base):
     def test_unbound_declines_so_the_core_takes_it(self):
         self.roster(bindings={})

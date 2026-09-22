@@ -1,8 +1,8 @@
 /**
  * Credential resolver — capability, not key (G8, desktop-parity plan).
  *
- * Consumers ask for a CAPABILITY ('gemini-voice', 'gemini-text') and the
- * resolver decides which credential satisfies it, walking tiers in order:
+ * Consumers ask for a CAPABILITY ('gemini-voice', 'gemini-text', 'gemini-image')
+ * and the resolver decides which credential satisfies it, walking tiers in order:
  *
  *   1. managed — desktop/AU-provisioned `<workspace>/state/auth/managed-credentials.json`
  *                (per-host durable install state, same contract as cloud-auth.json:
@@ -36,6 +36,14 @@
  * honors the quarantine marker — quarantine is about revoking managed
  * credentials after logout, not about source choice.
  *
+ * 'gemini-image' (the image-generation skill) walks the slots text THEN voice
+ * in each tier: any Gemini key generates images, and a managed-key install
+ * holds only the voice entry. It is not a voice surface, so a 'managed'
+ * preference never blocks its env fallback; a 'byok' preference skips only the
+ * managed VOICE slot (the owner chose their own key for voice, so that managed
+ * entry is not theirs to spend), and quarantine hides every managed entry as
+ * always. Twin: src/credential_resolver.py.
+ *
  * With no managed file present (every pre-managed install), resolution is
  * byte-for-byte identical to the legacy env chain — this module changes where
  * the decision lives, not what it decides.
@@ -61,7 +69,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
-export type Capability = 'gemini-voice' | 'gemini-text';
+export type Capability = 'gemini-voice' | 'gemini-text' | 'gemini-image';
 
 export type CredentialSource = 'managed' | 'env' | 'none';
 
@@ -85,6 +93,7 @@ export interface ResolvedCredential {
 const CAPABILITY_FALLBACKS: Record<Capability, string[]> = {
 	'gemini-voice': ['gemini-voice', 'gemini-text'],
 	'gemini-text': ['gemini-text'],
+	'gemini-image': ['gemini-text', 'gemini-voice'],
 };
 
 /** Env-var names per capability slot, in existing-chain order. */
@@ -138,6 +147,8 @@ export function resolveCredential(
 	const preference = capability === 'gemini-voice' ? managed.voicePreference : undefined;
 	if (preference !== 'byok' && !managed.quarantined) {
 		for (const slot of slots) {
+			// The managed voice entry is not the image capability's to spend under a byok voice preference.
+			if (capability === 'gemini-image' && slot === 'gemini-voice' && managed.voicePreference === 'byok') continue;
 			const entry = managed.caps[slot];
 			const key = entry?.key;
 			if (typeof key === 'string' && key) {

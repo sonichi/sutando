@@ -136,7 +136,7 @@ class TestHandle(Base):
         self.task()
         self.warm("linear")
         line = hook.handle(self.payload(), now=NOW + 1, table=TABLE)
-        self.assertTrue(line.startswith("connect-apps precheck: needs_connect=googlecalendar (Google Calendar); connected=linear; room_kind=dm; run: "), line)
+        self.assertTrue(line.startswith("connect-apps precheck: needs_connect=googlecalendar (Google Calendar); connected=linear; room_kind=dm; reply_to=dm; run: "), line)
         self.assertIn(f"card googlecalendar --room '{ROOM}' --reply-to '$evt1' --task task-1 --owner-from-task --request-file -", line)
         self.assertNotIn("--private", line)
         self.assertIn(str(hook.SCRIPT), line)
@@ -152,6 +152,23 @@ class TestHandle(Base):
                 line = hook.handle(self.payload(sid=f"s-{want_kind}-{kw}"), now=NOW, table=TABLE)
                 self.assertIn(f"room_kind={want_kind}", line)
                 self.assertIn(want_flag, line)
+
+    def test_reply_to_is_the_room_unless_the_room_is_the_owners_dm(self):
+        # The answer goes where it was asked: only a confirmed DM makes it a DM answer; an unknown
+        # room kind is a room, so a personal-sounding request from a shared room stays in that room.
+        self.assertEqual(hook.reply_to({"channel_kind": "dm"}), "dm")
+        self.assertEqual(hook.reply_to({"channel_kind": "room"}), "room")
+        self.assertEqual(hook.reply_to({"room_member_count": "2"}), "dm")
+        self.assertEqual(hook.reply_to({"room_member_count": "7"}), "room")
+        self.assertEqual(hook.reply_to({}), "room")
+        for kw, want in ((dict(channel_kind="room"), "room_kind=room; reply_to=room"),
+                         (dict(channel_kind=None, member_count=2), "room_kind=dm; reply_to=dm"),
+                         (dict(channel_kind=None), "room_kind=unknown; reply_to=room")):
+            with self.subTest(kw):
+                self.task(**kw)
+                self.warm()
+                line = hook.handle(self.payload(sid=f"s-reply-{kw}"), now=NOW, table=TABLE)
+                self.assertIn(want, line)
 
     def test_cold_stale_or_skewed_cache_claims_nothing_about_connectedness(self):
         self.task()
@@ -170,7 +187,7 @@ class TestHandle(Base):
         self.task()
         self.warm("googlecalendar", "gmail")
         line = hook.handle(self.payload(), now=NOW, table=TABLE)
-        self.assertIn("needs_connect=none; connected=gmail,googlecalendar; room_kind=dm", line)
+        self.assertIn("needs_connect=none; connected=gmail,googlecalendar; room_kind=dm; reply_to=dm", line)
         self.assertNotIn("run:", line)
 
     def test_non_owner_and_non_ag2space_tasks_get_no_card_hint(self):

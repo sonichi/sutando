@@ -20,9 +20,18 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
 | `task.event` | event id of the user message (`source_message_id`); the client mounts the per-message card under it |
 | `task.into` | on a consolidated `done`: event id of the message whose reply answered this one too |
+| `queue` | on the `queued` row only: `{depth, position}` — how many tasks are pending and this one's 1-based place in the order the core takes them (`src/task_queue.py`) |
 
 A `notice` row reading `queued` is written by the task watcher when the file lands, before any turn
-has it (`activity.py queued --task-file …`; only for files that name a room and a message).
+has it (the activity bus's QUEUED transition; `activity.py queued --task-file …` is the same row by
+hand, only for files that name a room and a message). With at least one task ahead the line reads
+`queued · N ahead` and carries `queue`.
+
+`python3 $S/activity.py queue --task-file <workspace>/tasks/task-….txt` prints that task's
+`{"depth": N, "position": K}` now. When more than one task is pending, the first line to the task's
+own conversation names the position ("Got it, right after the one I'm on." for one ahead, "Got it,
+N in line before this one." for more); nothing else narrates the queue. When `tasks/` cannot be read
+it prints nothing, says why on stderr and exits 1: the position is unknown then, not zero.
 
 A task's rows are **live** until its `done` row; a task-less row is live 15 minutes. The drawer
 shows only live rows and hides itself when none is live. Rows are flat: the client marks the first

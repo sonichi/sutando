@@ -1172,5 +1172,102 @@ class LiveParkedBanner(unittest.TestCase):
                 self.assertEqual([], w.live_banner_lines(line), line)
 
 
+class NeedsLoginRecognisesTheDialogTitleNotOnlyProseAboutLoggingIn(unittest.TestCase):
+    """The family matched Claude's own "run /login" phrasing but not the login
+    DIALOG'S title text -- a real blind spot, not the Fable-limit collision this
+    looks like at a glance (that one is already caught, by the whole-line
+    quota-limit grammar's optional session/usage/... group, and is fenced off by
+    pane_gate's existing named-gate-first precedence, not by cli_wedge)."""
+
+    TITLES = ("Select login method", "Paste code here", "Browser didn't open")
+    PROSE = "I logged in yesterday and it worked fine."
+
+    def test_each_dialog_title_is_needs_login(self):
+        for title in self.TITLES:
+            with self.subTest(title=title):
+                v = w.frame_abnormal(title)
+                self.assertEqual((v.kind, v.names), ("abnormal", ("needs-login",)))
+
+    def test_prose_about_logging_in_stays_clean(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_fable_limit_was_already_caught_by_the_looser_whole_line_grammar(self):
+        # Control: proves this PR did not newly create the Fable/quota-limit
+        # overlap -- it already existed via live_banner_lines before this change.
+        v = w.frame_abnormal("reached your Fable limit")
+        self.assertEqual((v.kind, v.names), ("provider-limit", ("quota-limit",)))
+
+
+class TheWorkingMarkerIsMotionSoItLivesWithTheMotionAxis(unittest.TestCase):
+    """`esc to interrupt` says a turn is in flight, which is this module's axis.
+    classify() answers motion only from frame-to-frame novelty, so it needs two
+    samples and cannot speak for a single capture; frame_working can."""
+
+    RUNNING = "\u273b Thinking\u2026 (12s \u00b7 esc to interrupt)"
+
+    def test_the_affordance_is_a_running_turn(self):
+        self.assertTrue(w.frame_working(self.RUNNING))
+
+    def test_an_idle_footer_is_not(self):
+        self.assertFalse(w.frame_working("\u23f5\u23f5 bypass permissions on"))
+
+    def test_it_is_orthogonal_to_the_abnormal_verdict(self):
+        # A retrying pane is BOTH working-looking and abnormal; each answers its own
+        # question, and the gate's ordering between them is the gate's to make.
+        both = self.RUNNING + "\n  \u23bf  Connection error. Retrying in 2 seconds\u2026"
+        self.assertTrue(w.frame_working(both))
+        self.assertEqual(w.frame_abnormal(both).kind, "retry-loop")
+
+
+class FrameAbnormalRanksOneCaptureAsTheWindowRanksASample(unittest.TestCase):
+    """A single capture cannot show recurrence, so its abnormal verdict is the
+    window classifier's ranking of a current sample and nothing more: provider-limit
+    over retry over the rest. A gate that consumed the detectors and ranked them
+    itself once put the interrupt affordance above a retry; the ranking is here."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    API = "API Error: 529 Overloaded"
+    QUOTA = "You've hit your usage limit · resets 3pm"
+    PROSE = "⏺ I once saw a Connection error. Retrying was the fix.\n❯ \n"
+    ABNORMAL_KINDS = {"provider-limit", "retry-loop", "abnormal"}
+
+    def test_prose_is_no_verdict(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_a_retry_alone_is_a_retry_loop_and_says_so(self):
+        v = w.frame_abnormal(self.RETRY)
+        self.assertEqual((v.kind, v.retrying, v.names), ("retry-loop", True, ("retry:retrying",)))
+
+    def test_a_retry_beside_a_parked_line_is_abnormal_keeping_both_names(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.API}")
+        self.assertEqual((v.kind, v.retrying), ("abnormal", True))
+        self.assertEqual(set(v.names), {"retry:retrying", "api-error"})
+
+    def test_a_family_only_the_anchored_patterns_see_still_reaches_the_verdict(self):
+        # ABNORMAL_PATTERNS is line-anchored and looser than the whole-line banner
+        # grammar, so a long parked line reaches the verdict through it alone.
+        long_line = ("Compacting context and this line runs on well past forty characters "
+                     "so the banner grammar will not take it")
+        self.assertEqual(w.live_banner_lines(long_line), [])          # control
+        self.assertEqual(w.matched_abnormal([long_line]), ["compacting"])
+        v = w.frame_abnormal(long_line)
+        self.assertEqual((v.kind, v.names, v.retrying), ("abnormal", ("compacting",), False))
+
+    def test_a_provider_limit_outranks_a_retry(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.QUOTA}")
+        self.assertEqual((v.kind, v.retrying), ("provider-limit", True))
+
+    def test_the_kind_is_what_the_window_classifier_says_of_a_run_of_that_capture(self):
+        # Banners only: the window's retry telemetry is searched text and may fire on
+        # still prose, which the whole-line grammar here is narrower than by design.
+        th = w.PROVISIONAL_THRESHOLDS
+        for text in (self.RETRY, self.API, self.QUOTA, f"{self.RETRY}\n{self.API}",
+                     f"{self.RETRY}\n{self.QUOTA}"):
+            with self.subTest(text=text):
+                frames = [text] * max(3, th["min_samples"])
+                window = w.classify(frames, work_outstanding=False, duration_s=th["min_duration_s"] + 1)
+                self.assertEqual(w.frame_abnormal(text).kind, window["kind"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

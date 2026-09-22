@@ -8,11 +8,20 @@ answers in its own transcript, the terminal shows the reply, and only the queue
 disagrees. Measured five times in one session, caught every time by re-listing
 by hand and never by recall.
 
-Exit 1 when a task older than --min-age-sec has no result, 0 otherwise.
+Exit 1 when a task older than --min-age-sec has no result AND no worker holds
+it, 0 otherwise, 2 when the answer cannot be decided. A task the router
+delegated is that worker's to answer, so counting it here reports the core as
+owing work it must not do.
+
+The third code exists because 1 and "cannot decide" must not share one: an
+unreadable deliveries/ says nothing about who holds a task, and reporting that
+as 1 is indistinguishable from "the core owes a reply" to the caller that
+chains `unanswered-tasks.py && core-status.sh idle`.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,6 +62,22 @@ def _unanswered_reason(results: Path, task_id: str, tasks: Path | None = None) -
     return dedup_soundness.dedup_problem(results, task_id, tasks, src_dir=_SRC)
 
 
+_POOL_SCRIPTS = _SRC.parent / "skills" / "worker-pool" / "scripts"
+
+
+def _holder(workspace: Path, task_id: str) -> str | None:
+    """Delegated to the worker-pool skill's worker_delivery.py. The skill is
+    optional: without it there is no router, so nobody can hold a task."""
+    try:
+        os.stat(_POOL_SCRIPTS / "worker_delivery.py")
+    except FileNotFoundError:
+        return None
+    # Any other stat failure propagates: an unreadable skill is not an absent one.
+    sys.path.insert(0, str(_POOL_SCRIPTS))
+    from worker_delivery import holder_of  # noqa: E402
+    return holder_of(workspace, task_id)
+
+
 def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) -> list[tuple[str, float, str]]:
     _markers()  # resolve up front: an empty queue must not silently skip the guard
     now = time.time() if now is None else now
@@ -64,6 +89,13 @@ def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) ->
         age = now - f.stat().st_mtime
         if age < min_age_sec:
             continue  # still plausibly in flight
+        holder = _holder(workspace, f.stem)
+        if holder is not None:
+            # Not the core's to report: the router made it that worker's. Said
+            # on stderr so a genuinely stuck holder stays visible to a human.
+            print(f"unanswered-tasks: {f.stem} held by {holder} ({age/60:.0f}m) — not the core's to answer",
+                  file=sys.stderr)
+            continue
         reason = _unanswered_reason(results, f.stem, tasks)
         if reason is not None:
             out.append((f.stem, age, reason))
@@ -76,7 +108,14 @@ def main() -> int:
     ap.add_argument("--min-age-sec", type=float, default=120.0,
                     help="ignore tasks younger than this (default 120)")
     a = ap.parse_args()
-    rows = unanswered(Path(a.workspace), a.min_age_sec)
+    try:
+        rows = unanswered(Path(a.workspace), a.min_age_sec)
+    except OSError as exc:
+        # holder_of propagates rather than reading an unreadable deliveries/ as
+        # "nobody holds it"; the CLI turns that into its own cannot-answer code.
+        print(f"unanswered-tasks: cannot read deliveries/ ({exc}) — "
+              "cannot decide who holds these tasks", file=sys.stderr)
+        return 2
     if not rows:
         print("unanswered-tasks: none")
         return 0

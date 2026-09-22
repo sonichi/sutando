@@ -160,6 +160,9 @@ KNOWN_HEADER_KEYS = (
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
+    # dm|room verdict a trusted writer stamps (room-bound voice tasks put it
+    # above task:); header status defangs a forged body copy that would claim DM.
+    "channel_kind",
     # Which instance took delivery. Same namespace as the addressee in the body, so a
     # non-addressed core can tell; header status defangs a forged body copy.
     "receiving_instance",

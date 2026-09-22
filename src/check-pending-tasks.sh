@@ -163,7 +163,9 @@ STOP_RC=$?
 # Fail OPEN on anything but an explicit refusal (rc 1 AND a reason): a gate that
 # cannot run must never wedge the agent into a turn it has no way to end.
 if [ "$STOP_RC" -eq 1 ] && [ -n "$STOP_REASON" ]; then
-  SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Turn is ending without a message or an explicit no-send","additionalContext":os.environ.get("SUTANDO_HOOK_REASON","")}, separators=(",",":"), ensure_ascii=False))'
+  # `reason` is what a blocking Stop delivers to the model; the guidance used to
+  # ride a top-level additionalContext, which this event does not read.
+  SUTANDO_HOOK_REASON="$STOP_REASON" "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ.get("SUTANDO_HOOK_REASON") or "Turn is ending without a message or an explicit no-send"}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'
 fi

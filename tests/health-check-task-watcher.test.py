@@ -539,7 +539,7 @@ def case_c_dead_pid_warns() -> list[str]:
 
 def case_d_pid_reuse_warns() -> list[str]:
     # kill -0 alone would call this alive — the argv check is what catches it.
-    r = run_check(core_alive=True, pid_text="4242", argv="/usr/sbin/cupsd -l")
+    r = run_check(core_alive=True, pid_text="4194305", argv="/usr/sbin/cupsd -l")
     if r["status"] != "warn":
         return [f"d) PID reuse should warn, got {r['status']}"]
     if "reuse" not in r["detail"]:
@@ -548,7 +548,7 @@ def case_d_pid_reuse_warns() -> list[str]:
 
 
 def case_e_live_watcher_is_ok() -> list[str]:
-    r = run_check(core_alive=True, pid_text="4242", argv="bash src/watch-tasks-stream.sh")
+    r = run_check(core_alive=True, pid_text="4194305", argv="bash src/watch-tasks-stream.sh")
     if r["status"] != "ok":
         return [f"e) live watcher should be ok, got {r['status']} ({r['detail']})"]
     return []
@@ -622,9 +622,9 @@ def case_j_extra_tree_warns() -> list[str]:
     """A live sentinel does not mean a healthy watcher layer: an orphan from an
     earlier start keeps draining tasks/ too, so every task is processed twice.
     Observed 2026-07-21 — two monitors reported the same TASK_FILE."""
-    r = run_check(core_alive=True, pid_text="4242",
+    r = run_check(core_alive=True, pid_text="4194305",
                   argv="bash src/watch-tasks-stream.sh",
-                  trees={"4200": {"4200", "4242"}, "9000": {"9000", "9001"}})
+                  trees={"4200": {"4200", "4194305"}, "9000": {"9000", "9001"}})
     fails = []
     if r["status"] != "warn":
         fails.append(f"j) an untracked extra tree should warn, got {r['status']}")
@@ -639,9 +639,9 @@ def case_k_sentinels_own_tree_is_not_an_extra() -> list[str]:
     """The sentinel records the SCRIPT's pid, not its shell wrapper's, so the
     tree containing it must be recognised as the tracked one — otherwise the
     check tells the operator to kill the watcher it just told them to keep."""
-    r = run_check(core_alive=True, pid_text="4242",
+    r = run_check(core_alive=True, pid_text="4194305",
                   argv="bash src/watch-tasks-stream.sh",
-                  trees={"4200": {"4200", "4242", "4243"}})
+                  trees={"4200": {"4200", "4194305", "4194306"}})
     if r["status"] != "ok":
         return [f"k) sole tree owning the sentinel should be ok, got {r['status']} ({r['detail']})"]
     return []

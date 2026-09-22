@@ -6,11 +6,11 @@
 no gateway, no env.
 
 `reply_to` -> m.relates_to.m.in_reply_to. This is a CITATION and the event stays
-in the MAIN TIMELINE — it is not thread membership. Only a relation with
-`rel_type: m.thread` puts an event in a thread, and the gateway has no field for
-that today, so this module deliberately offers no way to ask for one: a call that
-reported success while landing outside the requested thread would be the
-silent-wrong-place failure the id check below exists to prevent.
+in the MAIN TIMELINE — it is not thread membership. `thread_root` -> the
+gateway's own field for a `rel_type: m.thread` relation, built server-side from
+the id, which puts the event IN that thread; it subsumes `reply_to`, which then
+becomes the relation's fallback target. Either id is checked here first: posting
+unrelated because an id was unusable would be the silent-wrong-place failure.
 """
 from __future__ import annotations
 
@@ -27,8 +27,12 @@ def _event_id(value, field: str) -> str:
     return text
 
 
-def relation_fields(reply_to=None) -> dict:
-    """op:message fields citing the message this post replies to, or {}."""
+def relation_fields(reply_to=None, thread_root=None) -> dict:
+    """op:message fields citing the message this post replies to and/or the
+    thread it belongs in, or {}."""
+    out = {}
     if reply_to:
-        return {"reply_to": _event_id(reply_to, "reply_to")}
-    return {}
+        out["reply_to"] = _event_id(reply_to, "reply_to")
+    if thread_root:
+        out["thread_root"] = _event_id(thread_root, "thread_root")
+    return out

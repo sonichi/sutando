@@ -17,6 +17,9 @@ reflected in BOTH suites with identical inputs/outputs.
   5. S3/R15 read side: opaque generations REPORTED (managed `generation` field /
      SUTANDO_VOICE_CREDENTIAL_GENERATION), never minted; top-level
      preferenceRevision/sessionRevision tolerated and ignored.
+  6. 'gemini-image': slots text THEN voice per tier; a byok voice preference
+     skips only the managed voice slot; a managed preference never blocks its
+     env fallback; quarantine hides every managed entry.
 """
 
 import json
@@ -188,6 +191,44 @@ check("manual/legacy env key stays generationless (Y4/Z4)", resolve_credential("
 # 23. gemini-text env key never picks up the VOICE generation env var
 _reset_env(); os.environ["GEMINI_API_KEY"] = "mk"; os.environ["SUTANDO_VOICE_CREDENTIAL_GENERATION"] = "cg1-injected"
 check("text env key never carries the voice generation", resolve_credential("gemini-text", _missing()), {"key": "mk", "source": "env"})
+
+# --- gemini-image: any Gemini key, text slot first, voice slot second -------
+
+# 25. legacy: no managed file, TEXT key wins over VOICE for image; voice alone still serves
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"; os.environ["GEMINI_API_KEY"] = "mk"
+check("image: no managed, TEXT key wins", resolve_credential("gemini-image", _missing()), {"key": "mk", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"
+check("image: no managed, VOICE key serves", resolve_credential("gemini-image", _missing()), {"key": "vk", "source": "env"})
+_reset_env()
+check("image: nothing set -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
+
+# 26. managed: text slot first, voice slot second, both beat env
+_reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
+check("image: managed TEXT beats managed VOICE and env", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS)), {"key": "managed-t", "source": "managed"})
+check("image: a managed-key install (voice entry only) serves images", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}})), {"key": "managed-v", "source": "managed"})
+
+# 27. byok voice preference: only the managed VOICE slot is skipped
+_reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
+check("image: byok pref keeps the managed TEXT slot", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS, {"voicePreference": "byok"})), {"key": "managed-t", "source": "managed"})
+check("image: byok pref skips the managed VOICE slot -> env", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}}, {"voicePreference": "byok"})), {"key": "mk", "source": "env"})
+_reset_env()
+check("image: byok pref, managed VOICE only, no env -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}}, {"voicePreference": "byok"})), {"key": "", "source": "none"})
+
+# 28. managed voice preference never blocks the image env fallback (not a voice surface)
+_reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
+check("image: managed pref + managed missing -> env, not none", resolve_credential("gemini-image", _write_managed({}, {"voicePreference": "managed"})), {"key": "mk", "source": "env"})
+
+# 29. quarantine hides every managed entry for image too
+_reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
+check("image: quarantined -> env fallback", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS, {"quarantined": True})), {"key": "mk", "source": "env"})
+_reset_env()
+check("image: quarantined + no env -> none", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS, {"quarantined": True})), {"key": "", "source": "none"})
+
+# 30. generation: managed entry reported verbatim; env never carries the VOICE generation
+_reset_env()
+check("image: managed generation reported verbatim", resolve_credential("gemini-image", _write_managed({"gemini-text": {"key": "managed-t", "generation": "cg1-img"}})), {"key": "managed-t", "source": "managed", "credential_generation": "cg1-img"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"; os.environ["SUTANDO_VOICE_CREDENTIAL_GENERATION"] = "cg1-injected"
+check("image: env key never carries the voice generation", resolve_credential("gemini-image", _missing()), {"key": "vk", "source": "env"})
 
 # 24. credential_source_label: the design's user-facing vocabulary
 _reset_env()

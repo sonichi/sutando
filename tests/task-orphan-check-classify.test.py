@@ -678,5 +678,84 @@ class TestCli(unittest.TestCase):
             self.assertIsNone(mod.resolve_workspace())
 
 
+class TestWorkerHeld(ClassifyBase):
+    """A task the router delegated is a worker's, not a core orphan (2026-09-18 boot: four
+    ag2.space owner DMs held by two worker seats were archived and reported as orphans)."""
+
+    HELD = "task-4cdcec263eb7dab5eb"
+
+    def held_task(self, queued: float = NOW - 1533) -> None:
+        self.ws.task(f"{self.HELD}.txt", chat_task_text(self.HELD, queued, source="ag2space"))
+
+    def sentinel(self, recipient: str, suffix: str) -> Path:
+        d = self.ws.root / "deliveries" / recipient
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{self.HELD}{suffix}"
+        p.touch()
+        return p
+
+    def test_control_without_a_sentinel_is_an_orphan(self):
+        self.held_task()
+        (self.ws.root / "deliveries" / "39041ce6").mkdir(parents=True)
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_every_router_suffix_makes_the_task_worker_held(self):
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                ws = Workspace()
+                self.addCleanup(ws.cleanup)
+                self.ws = ws
+                self.held_task()
+                self.sentinel("39041ce6", suffix)
+                row = self.one()
+                self.assertEqual(row["verdict"], "worker-held", row)
+                self.assertEqual(row["holder"], "39041ce6")
+                self.assertIn("never archived", row["reason"])
+
+    def test_held_task_stays_held_whatever_its_age(self):
+        self.held_task(queued=NOW - 3 * 86400)
+        self.sentinel("c8138e81", ".accepted")
+        self.assertEqual(self.one()["verdict"], "worker-held")
+
+    def test_held_task_younger_than_the_age_line_is_still_held_not_fresh(self):
+        self.held_task(queued=NOW - 60)
+        self.sentinel("39041ce6", ".txt")
+        self.assertEqual(self.one()["verdict"], "worker-held")
+
+    def test_result_file_beats_the_sentinel(self):
+        self.held_task()
+        self.sentinel("39041ce6", ".txt")
+        (self.ws.root / "results" / f"{self.HELD}.txt").write_text("answered\n")
+        self.assertEqual(self.one()["verdict"], "done")
+
+    def test_sentinel_check_runs_before_the_import_branch(self):
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 7200))
+        d = self.ws.root / "deliveries" / "39041ce6"
+        d.mkdir(parents=True)
+        (d / f"{IMPORT_ID}.txt").touch()
+        row = self.one()
+        self.assertEqual(row["verdict"], "worker-held")
+        self.assertFalse(row["import"])
+
+    def test_unreadable_deliveries_is_unknown_never_orphan(self):
+        self.held_task()
+        with unittest.mock.patch.object(self.mod, "_holder_of",
+                                        side_effect=PermissionError(1, "Operation not permitted")):
+            row = self.one()
+        self.assertEqual(row["verdict"], "unknown", row)
+        self.assertIn("never archived", row["reason"])
+
+    def test_absent_worker_pool_skill_keeps_the_old_rules(self):
+        self.held_task()
+        self.sentinel("39041ce6", ".txt")
+        with unittest.mock.patch.object(self.mod, "_POOL_SCRIPTS", self.ws.root / "no-such-skill"):
+            self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_missing_deliveries_dir_keeps_the_old_rules(self):
+        self.held_task()
+        self.assertFalse((self.ws.root / "deliveries").exists())
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

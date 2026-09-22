@@ -575,6 +575,14 @@ def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     return base / key if key else base
 
 
+def task_event_handler_config_path(state_dir) -> Path:
+    """Where a skill declares core's task-event handler, e.g. via worker-pool's
+    register_worker(). Core-only: workers never read this (their own inbox is
+    already the routing decision), so it is not instance-scoped.
+    """
+    return Path(state_dir) / "task-event-handler.json"
+
+
 def watcher_sentinel_paths(state_dir) -> "list[Path]":
     """Every sentinel present, historic name first.
 
@@ -599,7 +607,10 @@ if __name__ == "__main__":
         print(watcher_sentinel_path(sys.argv[2]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "task-event-handler-config-path":
+        print(task_event_handler_config_path(sys.argv[2]))
     else:
-        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir|"
+              "task-event-handler-config-path} <state-dir>",
               file=sys.stderr)
         raise SystemExit(2)

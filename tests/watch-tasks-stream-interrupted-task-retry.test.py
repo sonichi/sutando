@@ -13,9 +13,17 @@ tasks/ forever"), and an archived task is out of the sweep's reach.
 
 These scenarios pin both halves as they behave TODAY, so that a change to the
 shutdown path shows up here as a deliberate behaviour flip rather than as a
-silent one. They assert the mechanism, not the wording: `REFUSAL_MARK` is the
-shared prefix of every terminal-failure body, and `INTERRUPTED` is the reason
-word this path passes.
+silent one. They assert the mechanism, not just the wording: `REFUSAL_MARK` is
+the shared prefix of every terminal-failure body, `INTERRUPTED` its reason word.
+
+The async dispatch pipeline (`--handler-runner`/the old `fallback_outstanding_
+handlers`) that used to publish this on shutdown was retired -- run_handler_now()
+runs the handler synchronously, and a SIGTERM landing mid-call interrupts bash's
+`wait` on it directly rather than deferring, so run_handler_now() itself never
+resumes to settle the claim. `settle_own_claims_on_shutdown()` (called from
+cleanup()) restores the equivalent: disposition-aware settlement of any claim
+this watcher still owns, operating on CLAIMS_DIR directly rather than depending
+on where execution was interrupted -- same shape, same wording, as before.
 """
 from __future__ import annotations
 
@@ -50,8 +58,10 @@ def claims_dir(h) -> Path:
 
 
 def worker_running(h) -> bool:
-    d = h.dispatch()
-    return bool(d and (d / "workers").is_dir() and any((d / "workers").iterdir()))
+    # DISPATCH_DIR/workers/ is retired (see module docstring); a claim is the
+    # compatible replacement signal -- run_handler_now() takes it synchronously.
+    d = claims_dir(h)
+    return d.is_dir() and any(d.glob("task-*.txt"))
 
 
 def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
@@ -67,7 +77,7 @@ def scenario_interrupted_task_is_refused_but_left_in_tasks() -> None:
         check("a handler worker is running before the shutdown",
               wait_for(lambda: worker_running(h), 30.0))
 
-        h.stop(graceful=True)  # SIGTERM -> the trap runs fallback_outstanding_handlers()
+        h.stop(graceful=True)  # SIGTERM -> settle_own_claims_on_shutdown()
 
         result = h.ws / "results" / "task-interrupted.txt"
         check("the shutdown publishes a terminal refusal", wait_for(result.is_file, 20.0))

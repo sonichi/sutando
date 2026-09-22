@@ -26,6 +26,7 @@ import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
+import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -44,6 +45,8 @@ export interface VoiceConfigContext {
 	resetNoteViewingDebounce(): void;
 	getRecentConversation(count: number): string;
 	getSecondsSinceLastTurn(): number | null;
+	/** Voice-session-only tools, rules and context lines contributed by optional skills. */
+	voiceSurface?: VoiceSurfaceContribution;
 }
 
 /** Test-only determinism hooks. Production passes nothing — the verbatim
@@ -146,11 +149,8 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	// non-empty, it's the CURRENT session's in-progress turns —
 	// safe to replay without trigger filtering.
 	const recent = ctx.getRecentConversation(8);
-	// Offline-delivery hint: count proactive-result-*.txt files archived
-	// in the last 30 min. These are voice-task results forwarded to the
-	// owner's Discord DM while voice was offline (per task-bridge.ts
-	// fallback). Surface a one-line ack on reconnect so voice doesn't
-	// have to re-deliver and the user knows where to find the answers.
+	// Offline-delivery hint: proactive-result-*.txt files archived in the last 30 min are voice results
+	// forwarded to the owner's chat while voice was offline; one line on reconnect says where they are.
 	let offlineDeliveryHint = '';
 	try {
 		const archDir = join(WORKSPACE_DIR, 'results', 'archive', new Date().toISOString().slice(0, 7));
@@ -161,7 +161,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 				statSync(join(archDir, f)).mtimeMs >= cutoff
 			);
 			if (recent_proactive.length > 0) {
-				offlineDeliveryHint = `\n\n[While the user was offline, ${recent_proactive.length} task result(s) were delivered to their Discord DM. If they ask about a task, refer them to Discord.]`;
+				offlineDeliveryHint = `\n\n[While the user was offline, ${recent_proactive.length} task result(s) were delivered to their chat — the room they asked in, or their DM. If they ask about a task, refer them to that chat.]`;
 			}
 		}
 	} catch {}
@@ -202,6 +202,8 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
 	const host = platform() === 'darwin' ? 'Mac' : platform() === 'win32' ? 'Windows' : platform();
+	const surface = ctx.voiceSurface ?? {};
+	const instantTools = [...inlineTools, ...(surface.tools ?? [])];
 	return [
 		// Per-session-evaluated factory (vs static array): lets the prompt
 		// re-check time-sensitive state on every session.start() / reconnect.
@@ -228,7 +230,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'shape everything you do without them having to repeat themselves.',
 		'All of your code was written by your own autonomous build loop.',
 		'',
-		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext(),
+		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ extraLines: surface.contextLines?.() }),
 		'',
 		'DEFAULT BEHAVIOR: Call work for almost everything.',
 		'You are the voice interface. The Claude Code session is the brain.',
@@ -248,7 +250,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		// native grounding over the `work` tool for current-info queries
 		// (news/scores/weather/stocks) — wins ~5-10s vs the delegation round-trip.
 		(() => ctx.googleSearch ? '- Google Search for current-info queries (news, scores, weather, stocks, recent events) — use it directly, it returns faster than delegating to work' : '')(),
-		`- ${inlineTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
+		`- ${instantTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
 		'',
 		'For EVERYTHING else, call work. This includes:',
 		'- Tutorial ("tutorial", "walk me through", "show me what you can do") — delegate to work, which reads the full tutorial and walks through it step by step',
@@ -268,7 +270,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- switch_mode: Switch between "active" (normal) and "meeting" (silent note-taker). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode". Call switch_mode("active") to resume.',
 		'- save_meeting_note: Save meeting observations to notes/meeting-{date}.md. Call every 5-10 min in meeting mode. Use type "summary" when exiting meeting mode.',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
-		...inlineTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
+		...instantTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		...(coreDocumentedSkills.length > 0 ? [
 			'',
 			'DELEGATABLE SKILLS (call via work — core runs these, not voice-inline):',
@@ -288,6 +290,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- NEVER pretend you called a tool. NEVER say "done" without actually calling work.',
 		'- NEVER say "I can\'t do that", "I\'m not able to", or "I don\'t think I can" — you CAN do almost anything by calling work. If you\'re unsure, call work and let the core agent handle it. The core agent has full system access. Your job is to relay requests, not gatekeep them.',
 		'- For SIMPLE actions (press enter, clear input, select all), use press_key or type_text — do NOT use work for keystrokes.',
+		...(surface.promptRules ?? []),
 		'- For IN-PLACE EDITS on text already visible on screen (a draft, an email body, a code block, a focused textarea) — call read_selection FIRST to fetch the current text, compute the edited version, then call type_text to write the edited version into the field. Do NOT delegate to work for in-place edits; the user is on screen watching for the change to appear in the field. work is correct for edits that require server-side logic (commit a change, send the email, mutate files outside the focused field) — not for editing the text the user is looking at.',
 		'- For COMPLEX operations (git commands, code changes, file operations, installing packages), ALWAYS delegate to work — do NOT try to type commands into a terminal. The core agent executes these directly and reliably.',
 		'- If you KNOW the answer from your instructions or context, answer directly. Only delegate to work for questions you genuinely cannot answer.',

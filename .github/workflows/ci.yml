@@ -115,7 +115,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -145,6 +145,8 @@ jobs:
         run: |
           timeout -k 5 120 python3 scripts/lint-skill.test.py
           timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
+          # The rename keeps a few old spellings alive on purpose; this refuses NEW ones.
+          timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
@@ -193,51 +195,7 @@ jobs:
       # output on failure so debugging info isn't lost.
       - name: Run shell standalone tests
         run: |
-          failed=0
-          # Load the known-failures allowlist (suites that fail on ubuntu-latest
-          # due to macOS-specific tooling or timing). Allowlisted suites still run
-          # and their output is printed, but a failure does NOT set failed=1.
-          # New regressions in the other suites still fail CI immediately.
-          # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
-          known_failures_file="tests/shell-ci-known-failures.txt"
-          while IFS= read -r f; do
-            echo "→ $f"
-            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
-            # default for run: steps) while still capturing output + status. A bare
-            # `output=$(bash "$f")` would abort the whole step on the first failing
-            # suite — losing this step's diagnostics and masking every later suite.
-            #
-            # `timeout -k 5 300` bounds each suite: a hanging suite (e.g. a bounded-
-            # runner test whose --max backstop misfires under CI) would otherwise
-            # burn the whole job's timeout-minutes budget and get the job *canceled*
-            # mid-suite — masking every later suite AND this step's own diagnostics,
-            # the very failure this loop was written to avoid. On overrun timeout
-            # SIGTERMs (then SIGKILLs after 5s) and returns 124, so the suite fails
-            # loudly and in isolation instead of hanging CI.
-            # 300s, not 120s: graceful-restart.test.sh measures 73s on an idle dev
-            # box, leaving under 2x headroom on a slower, contended CI runner.
-            if ! output=$(timeout -k 5 300 bash "$f" 2>&1); then
-              echo "✖ shell test failed: $f"
-              echo "$output"
-              # Only gate CI if this suite is not in the known-failures allowlist.
-              if ! grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
-                failed=1
-              else
-                echo "  (known failure — not gating CI; see $known_failures_file)"
-              fi
-            else
-              echo "$output" | grep -E 'FAIL|^Summary' || true
-              # A listed suite that PASSES is a stale entry, and a stale entry
-              # un-gates a suite nobody thinks is un-gated. Fail so the list
-              # cannot silently outlive the failures it excuses.
-              if grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
-                echo "✖ stale allowlist entry: $f passed — delete its line from $known_failures_file"
-                failed=1
-              fi
-            fi
-          done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
-          exit "$failed"
-
+          bash scripts/run-shell-suites.sh lanes
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
       # later: these suites existed and CI discovered none of them, so a .mjs
       # suite could fail at HEAD while the run reported green.
@@ -264,12 +222,35 @@ jobs:
           done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
 
-  python-standalone-tests:
-    name: python standalone tests
+  shell-tail-tests:
+    name: shell tests (serial tail)
     runs-on: ubuntu-latest
+    # The process-table suites run one at a time in the checkout; on their own
+    # runner they no longer sit behind the typecheck job's lanes.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+      - name: Run shell standalone tests (serial tail)
+        run: bash scripts/run-shell-suites.sh tail
+
+  python-standalone-tests:
+    name: python standalone tests (${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    # Three runners, each a third of the files by discovery order; the
+    # coverage-gate job combines every leg's data.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
-    timeout-minutes: 15
+    # 20, not 15: the suite now runs under coverage instrumentation (the only
+    # run of it per push; the diff-coverage job below consumes its data instead
+    # of running the suite again), and instrumentation costs ~40% wall time.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -288,7 +269,14 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+
+      # watch-tasks-stream-config-hot-reload.test.py exercises the real
+      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # fswatch, so that test silently exercised nothing (its subprocess died
+      # at exec with no writer, indistinguishable from "no event" downstream).
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
@@ -297,6 +285,8 @@ jobs:
       # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           # Records are collected per file and replayed SERIALLY in sorted
           # order below, so `failed_files` keeps its order.
@@ -308,7 +298,10 @@ jobs:
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
-          bash scripts/discover-python-tests.sh > "$RECDIR/files"
+          bash scripts/discover-python-tests.sh > "$RECDIR/all"
+          # Measured cost, heaviest first onto the lightest leg: every file lands in
+          # exactly one leg, and the legs finish together instead of by line parity.
+          bash scripts/shard-by-cost.sh 3 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/all" > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
@@ -319,23 +312,31 @@ jobs:
             exit 1
           fi
           # Per-file cap: without it one hung suite burns the job budget and
-          # the job is CANCELED mid-suite.
+          # the job is CANCELED mid-suite. 240s, not 120s: instrumentation slows
+          # race/bench-style tests well past their bare runtime (same cap as
+          # scripts/coverage-gate.sh, which ran this suite before).
+          FILE_TIMEOUT=240
+          rm -f .coverage coverage.xml
+          find . -maxdepth 1 -name '.coverage.*' -delete
 
           # Shared scheduler: one SERIAL worker per worktree, so a slot can never
-          # hold two suites — and the regression drives this same script.
+          # hold two suites — and the regression drives this same script. Under
+          # coverage.py, one fragment per file; parallel-suite-lane.sh brings the
+          # worktrees' fragments home for the combine below.
           bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
-            timeout -k 5 120 python3
+            env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 \
+            timeout -k 5 -s ABRT "$FILE_TIMEOUT" python3 -m coverage run --rcfile=.coveragerc
           _idx=0
           while IFS= read -r f; do
-            echo "→ $f"
             _idx=$((_idx + 1))
             rec="$RECDIR/$_idx"
+            echo "→ $f ($(cat "$rec.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
             output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::TIMED OUT (>120s): $f"
+                echo "::error::TIMED OUT (>${FILE_TIMEOUT}s): $f"
               else
                 echo "::error::FAILED: $f (exit $rc)"
               fi
@@ -355,15 +356,81 @@ jobs:
             # tests actually failed. Review nit, and a correct one.
             echo "::notice::${#failed_files[@]} python test file(s) failed:"
             printf '  %s\n' "${failed_files[@]}"
+            exit "$failed"
           fi
-          exit "$failed"
+          # Green leg: merge the per-file fragments once, here; the
+          # diff-coverage job combines the legs and measures this run.
+          python3 -m coverage combine --quiet
+          mv .coverage ".coverage.shard${SHARD:-1}"
+
+      # `.coverage` is a dotfile, which upload-artifact v4 skips by default.
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-${{ matrix.shard }}
+          path: .coverage.shard${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  coverage-gate:
+    name: diff coverage >= 95% (python)
+    # Enforces >= 95% coverage on the Python lines this PR changes, judged from
+    # the instrumented run above — the suite is never run a second time for
+    # it. pull_request only: the gate is a diff against the PR's base branch.
+    # See docs/testing-coverage.md.
+    needs: python-standalone-tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # diff-cover needs the base branch locally to compute changed lines.
+          fetch-depth: 0
+
+      - name: Install coverage tooling
+        run: python3 -m pip install coverage diff-cover
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      - name: Run coverage gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          COVERAGE_GATE_PRECOMPUTED: "1"
+        run: bash scripts/coverage-gate.sh
+
+      # The companion workflow_run job (.github/workflows/coverage-comment.yml)
+      # posts the summary as a sticky PR comment. Two-stage on purpose: fork PRs
+      # run here with a read-only GITHUB_TOKEN, so the comment must be posted by
+      # a workflow that runs in the base-repo context WITHOUT checking out PR code.
+      - name: Stamp PR number for the comment workflow
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: |
+            coverage-summary.md
+            pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
   required-tests:
     name: tsc + tests (clean install)
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [typecheck-and-test, python-standalone-tests]
+    needs: [typecheck-and-test, shell-tail-tests, python-standalone-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -389,5 +456,6 @@ jobs:
             esac
           }
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
+          check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
           exit "$rc"

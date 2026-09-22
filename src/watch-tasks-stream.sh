@@ -42,37 +42,6 @@ record_worker_done() {
     mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
 }
 
-if [ "${1:-}" = "--handler-runner" ]; then
-  handler="$2"
-  runtime="$3"
-  workspace="$4"
-  task_path="$5"
-  results="$6"
-  repo="$7"
-  events_fifo="$8"
-  filename="$9"
-  # `pending` before the result so a result the drain can see always has
-  # attribution beside it; an injected-but-broken writer fails the task instead.
-  if ! record_worker_done "$filename" pending "$workspace"; then
-    echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
-    handler_rc=1
-  elif "$handler" \
-      --runtime "$runtime" \
-      --workspace "$workspace" \
-      --task-file "$task_path" \
-      --results-dir "$results" \
-      --repo "$repo" >/dev/null; then
-    handler_rc=0
-    # Promote only after the result is visible: `.flag` is the sole stage the
-    # sweep retires on, so it must never precede the thing it attributes.
-    record_worker_done "$filename" done "$workspace" || handler_rc=1
-  else
-    handler_rc=$?
-  fi
-  printf 'HANDLER_DONE: %s %s\n' "$handler_rc" "$filename" > "$events_fifo"
-  exit 0
-fi
-
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=watcher_sentinel.sh
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
@@ -80,56 +49,59 @@ source "$__SCRIPT_DIR/watcher_sentinel.sh"
 source "$__SCRIPT_DIR/task-emit.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
+# shellcheck source=agent/task-event-handler-lookup.sh
+source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
+# shellcheck source=tasks-dir-resolve.sh
+source "$__SCRIPT_DIR/tasks-dir-resolve.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
-# Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
-# Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06) the legacy env-var
-# fallback and hardcoded pre-v0.8 default fallback are gone: the bridges
-# (discord-bridge.py, telegram-bridge.py, dm-result.py — see PRs
-# #708/#720/#722/#723) write to the resolved workspace, and if this watcher
-# diverged from that resolution owner DMs would land silently. Diagnosed
-# 2026-05-15 (~3 dropped DMs over 17 min) and again 2026-05-16 (~45 min
-# silent gap when the Monitor was started without the env var exported
-# into its env). Single resolution path = no divergence.
-if [ -n "${1:-}" ]; then
-  TASKS_DIR="$1"
-elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
-  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
-  # same `/startup` serves it with no argument change.
-  TASKS_DIR="$SUTANDO_TASKS_DIR"
-elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
-  __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
-  TASKS_DIR="$__WS/tasks"
-else
+# --role/--inbox are stripped before the positional TASKS_DIR check below so a
+# tagged invocation (`watch-tasks-stream.sh /path --role session --inbox /path`)
+# still resolves its tasks dir the same as an untagged one. Logged to stderr
+# only, never into the sentinel: three readers int() that file as a bare pid
+# (watcher_sentinel.sh).
+WATCHER_ROLE=""
+WATCHER_INBOX_TAG=""
+__args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role) WATCHER_ROLE="${2:-}"; shift 2 ;;
+    --role=*) WATCHER_ROLE="${1#--role=}"; shift ;;
+    --inbox) WATCHER_INBOX_TAG="${2:-}"; shift 2 ;;
+    --inbox=*) WATCHER_INBOX_TAG="${1#--inbox=}"; shift ;;
+    *) __args+=("$1"); shift ;;
+  esac
+done
+set -- "${__args[@]+"${__args[@]}"}"
+[ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
+
+# One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
+# two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
+TASKS_DIR="$(resolve_tasks_dir "${1:-}" "$__REPO_ROOT")" || {
   echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
   exit 1
-fi
+}
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve
 # symlinks with `pwd -P` to match. Without -P, on macOS the comparison
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
-TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
+TASKS_DIR_ABS="$(canonical_tasks_dir "$TASKS_DIR")"
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
-# inbox; whoever named that inbox names the workspace too.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
+# inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
+WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
-# Optional task handlers are injected by runtime adapters. Two provider workers
-# may run at once; further eligible tasks stay as tiny on-disk receipts instead
-# of spawning an unbounded process fanout. Unhandled work still emits its
-# TASK_FILE event immediately, even while the provider queue is full.
-TASK_HANDLER_WORKERS=2
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
-DISPATCH_DIR=""
+# Optional task handlers run synchronously, inline -- see run_handler_now().
+HANDLER_STATE_READY=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
 FSWATCH_PID=""
 CLEANING_UP=0
-GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # Per instance: this receipt says "MY optional handler declined this task", and
 # a shared one makes another instance bypass its own handler. Owner: util_paths.
@@ -138,6 +110,87 @@ FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fall
   exit 1
 }
 WATCHER_ID="$$-${RANDOM:-0}"
+
+# Core only: a worker's own inbox is already the routing decision (#4502), so
+# it never reads or watches this file. A skill declares the handler by writing
+# it (e.g. worker-pool's register_worker()); this process fswatches it below
+# and reloads CURRENT_HANDLER the moment it changes -- no restart needed.
+HANDLER_CONFIG_PATH=""
+HANDLER_CONFIG_DIR=""
+CURRENT_HANDLER=""
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  HANDLER_CONFIG_PATH="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" task-event-handler-config-path "$WORKSPACE_DIR/state")" || {
+    echo "watch-tasks-stream: could not resolve the task-event-handler config path" >&2
+    exit 1
+  }
+  HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+fi
+
+# absent: no config on disk (the core takes every task). ready: parsed. broken: a
+# config exists but could not be copied or parsed; nothing routes on it.
+HANDLER_STATE="absent"
+HELD_NAMES=""
+HELD_RETRY_AT=0
+DISPATCHED_IDS=""
+DECISION_IDENTITY=""
+# Called only where a task is actually admitted: announced to the core, or
+# handed to the handler with the claim held. A decision that admits nothing
+# records nothing.
+record_admission() {
+  [ -z "$DECISION_IDENTITY" ] || DISPATCHED_IDS="$DISPATCHED_IDS$DECISION_IDENTITY
+"
+}
+# `ls -di` is one line on every POSIX ls; GNU `stat -f` prints a filesystem dump.
+task_file_identity() {
+  local inode sum
+  inode="$(ls -di -- "$1" 2>/dev/null | awk 'NR==1 {print $1}')"
+  sum="$(cksum < "$1" 2>/dev/null | awk 'NR==1 {print $1 "-" $2}')"
+  printf '%s' "${inode}:${sum}"
+}
+HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+# One read per routing decision: the bytes are copied once into a private
+# snapshot and parsed from there; no cache, no compare, nothing to go stale.
+read_handler_config_now() {
+  local snap="$WATCH_RUNTIME_DIR/handler-config.snap" state="absent" handler=""
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
+    # A dangling or cyclic symlink is a config that exists and cannot be read.
+    if [ ! -e "$HANDLER_CONFIG_PATH" ] && [ ! -L "$HANDLER_CONFIG_PATH" ]; then
+      handler="$(task_event_handler "$snap.none")" || handler=""
+    elif cat -- "$HANDLER_CONFIG_PATH" > "$snap" 2>/dev/null && handler="$(task_event_handler "$snap")"; then
+      state="ready"
+    else
+      state="broken"
+      handler=""
+    fi
+    rm -f "$snap"
+  fi
+  if [ "$state" = "broken" ] && [ "$HANDLER_STATE" != "broken" ]; then
+    echo "watch-tasks-stream: task-event-handler config exists but cannot be read; holding every task until it can" >&2
+  fi
+  HANDLER_STATE="$state"
+  CURRENT_HANDLER="$handler"
+}
+reload_current_handler() { read_handler_config_now; }
+# Tasks decided while the config was broken; replayed at most once per event.
+redispatch_held_tasks() {
+  local held="$HELD_NAMES" fn
+  [ -n "$held" ] || return 0
+  # Mid-shutdown a held task stays held: the next lifetime's sweep takes it.
+  [ -f "$STATE_DIR/shutdown.sentinel" ] && return 0
+  HELD_NAMES=""
+  HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
+  while IFS= read -r fn; do
+    [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
+  done <<< "$held"
+}
+# An elapsed deadline, checked after every event: a busy stream never resets it
+# the way it resets the read timeout.
+retry_held_tasks_if_due() {
+  [ -n "$HELD_NAMES" ] || return 0
+  [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
+  redispatch_held_tasks
+}
+[ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
 claim_is_live() {
   local claim="$1" owner_pid
@@ -193,7 +246,9 @@ release_task_claim() {
   claim="$CLAIMS_DIR/$filename"
   owner_id="$(sed -n '2p' "$claim" 2>/dev/null)"
   [ "$owner_id" = "$WATCHER_ID" ] || return 1
-  retired="$DISPATCH_DIR/settled/claim-$filename"
+  # Same atomic move-away-then-delete shape as retire_stale_claim: no separate
+  # scratch dir needed now that there's no async queue to house one in.
+  retired="$CLAIMS_DIR/.settled-$WATCHER_ID-$filename"
   if mv "$claim" "$retired" 2>/dev/null; then
     remove_claim "$retired"
     return 0
@@ -260,10 +315,15 @@ publish_terminal_failure() {
   return "$rc"
 }
 
-if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER" ]; then
-  DISPATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-dispatch.XXXXXX")"
-  mkdir "$DISPATCH_DIR/pending" "$DISPATCH_DIR/running" "$DISPATCH_DIR/settled" \
-    "$DISPATCH_DIR/workers"
+# Only core makes a routing decision (should this task go to a bound worker);
+# a worker's own inbox already IS that decision, made by whoever delivered the
+# sentinel there (#4502). So a worker never probes a handler, regardless of
+# CURRENT_HANDLER, and only core's branch ever calls this.
+#
+# Idempotent, so a handler declared later still works with no restart; only
+# the claim bookkeeping remains -- handler runs are synchronous, no queue.
+prepare_handler_state() {
+  [ -z "$HANDLER_STATE_READY" ] || return 0
   mkdir -p "$CLAIMS_DIR" "$FALLBACKS_DIR"
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
@@ -272,67 +332,12 @@ if [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && [ -x "$SUTANDO_TASK_EVENT_HANDLER
     claim_is_live "$claim" || retire_stale_claim "$claim" || true
   done
   shopt -u nullglob
+  HANDLER_STATE_READY=1
+}
+
+if [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ]; then
+  prepare_handler_state
 fi
-
-acquire_dispatch_lock() {
-  [ -n "$DISPATCH_DIR" ] || return 1
-  while ! mkdir "$DISPATCH_DIR/lock" 2>/dev/null; do
-    [ -d "$DISPATCH_DIR" ] || return 1
-    sleep 0.01
-  done
-}
-
-release_dispatch_lock() {
-  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || true
-}
-
-finish_handler_task() {
-  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled announce verdict
-  filename="$(basename "$task_path")"
-  announce="$(task_announce "$task_path")"
-  worker_receipt="$DISPATCH_DIR/workers/$filename"
-  settled="$DISPATCH_DIR/settled/$filename.worker"
-  # Cleanup and the completion path race by atomically moving the same receipt.
-  # On failure, keep the durable at-least-once order: fallback receipt, event,
-  # then claim release. A signal between event and release may duplicate the
-  # event during cleanup, but it cannot strand the task without either path.
-  if mv "$marker" "$settled" 2>/dev/null; then
-    if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
-      claim_settled=1
-      # THIS run's own terminal code outranks a disposition fixed back at probe
-      # time: 4 is the handler saying the live core must not inherit the task.
-      if [ "$rc" -eq 4 ]; then
-        verdict=0
-      else
-        claim_disposition "$filename"
-        verdict=$?
-      fi
-      case $verdict in
-        0)
-          echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
-          # An unsettled publish leaves the claim held rather than clobbering a
-          # destination this watcher does not own; cross-restart retry is separate.
-          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
-          ;;
-        1)
-          printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-          echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
-          emit_fallback_task_file "$announce"
-          ;;
-        *)
-          echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
-          ;;
-      esac
-      [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
-    elif [ "$rc" -eq 0 ]; then
-      release_task_claim "$filename" || true
-    fi
-    rm -f "$settled"
-  fi
-  rm -f "$worker_receipt"
-  drain_dispatch_queue
-}
 
 # Our own terminal-refusal wording, shared by the writer and the reader below so
 # a reworded refusal cannot silently stop counting as one.
@@ -362,89 +367,110 @@ handler_result_exists() {
   "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$filename" 2>/dev/null
 }
 
-drain_dispatch_queue() {
-  local marker candidate task_path running_marker worker_receipt running_count=0
-  local filename worker_pid
-  # finish_handler_task ends by calling this function, and the dispatch lock is
-  # a mkdir spinlock with no timeout — a nested call would deadlock on it.
-  [ -n "${DRAIN_ACTIVE:-}" ] && return
-  [ -n "$DISPATCH_DIR" ] && [ ! -e "$DISPATCH_DIR/shutting-down" ] || return
-  acquire_dispatch_lock || return
-  if [ -e "$DISPATCH_DIR/shutting-down" ]; then
-    release_dispatch_lock
-    return
-  fi
-  DRAIN_ACTIVE=1
-  shopt -s nullglob
-  # Count LIVE workers, not marker files: a worker that died before emitting
-  # HANDLER_DONE leaves its marker and would retire the slot permanently.
-  for marker in "$DISPATCH_DIR/running/"*; do
-    filename="$(basename "$marker")"
-    worker_pid="$(cat "$DISPATCH_DIR/workers/$filename" 2>/dev/null)"
-    if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null; then
-      running_count=$((running_count + 1))
-      continue
-    fi
-    # rc decides whether the sender gets a terminal-failure reply — only when
-    # the worker died before producing a deliverable result.
-    if handler_result_exists "$filename"; then
-      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 0
-    else
-      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1
-    fi
-  done
-  while [ "$running_count" -lt "$TASK_HANDLER_WORKERS" ]; do
-    marker=""
-    for candidate in "$DISPATCH_DIR/pending/"*; do
-      marker="$candidate"
-      break
-    done
-    [ -n "$marker" ] || break
-    running_marker="$DISPATCH_DIR/running/$(basename "$marker")"
-    # Cleanup may concurrently settle a pending receipt. Moving it is the
-    # ownership boundary: never read or spawn unless this dispatcher won.
-    if ! mv "$marker" "$running_marker" 2>/dev/null; then
-      continue
-    fi
-    task_path="$(cat "$running_marker")"
-    worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
-    : > "$worker_receipt"
-    SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
-      "$SUTANDO_TASK_EVENT_HANDLER" \
-      "${SUTANDO_CORE_RUNTIME:-}" \
-      "$WORKSPACE_DIR" \
-      "$task_path" \
-      "$RESULTS_DIR" \
-      "$__REPO_ROOT" \
-      "$WATCH_RUNTIME_DIR/events" \
-      "$(basename "$marker")" &
-    printf '%s\n' "$!" > "$worker_receipt"
-    activity_transition RUNNING "$task_path"  # keys on the real payload, resolved or not
-    running_count=$((running_count + 1))
-  done
-  shopt -u nullglob
-  release_dispatch_lock
-  DRAIN_ACTIVE=""
-}
+# Runs the real (non-probe) handler synchronously, inline: the rc is known
+# the instant this returns, so no reap-loop can misjudge crashed-vs-finished.
+#
+# MUST_HANDLE's failure never falls back to the live core (rc 4 always
+# outranks the stored disposition); ACCEPT's failure safely may.
+SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
-queue_handler_task() {
-  local task_path="$1" disposition="${2:-fallback}" filename marker
+run_handler_now() {
+  local task_path="$1" disposition="${2:-fallback}" filename announce handler_rc verdict claim_settled
+  local handler_pid watchdog_pid timeout_flag timed_out
   filename="$(basename "$task_path")"
-  acquire_dispatch_lock || return 1
-  if [ -e "$DISPATCH_DIR/shutting-down" ]; then
-    release_dispatch_lock
-    return 1
+  announce="$(task_announce "$task_path")"
+  prepare_handler_state
+  if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
+    return 0
   fi
-  marker="$DISPATCH_DIR/pending/$filename"
-  if [ ! -e "$marker" ] && [ ! -e "$DISPATCH_DIR/running/$filename" ]; then
-    if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
-      release_dispatch_lock
-      return 0
+  record_admission
+  activity_transition RUNNING "$task_path"
+  timed_out=0
+  # `pending` before the run so a result the live core sees always has
+  # attribution beside it; an injected-but-broken writer fails the task
+  # instead of racing the handler.
+  if ! record_worker_done "$filename" pending "$WORKSPACE_DIR"; then
+    echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
+    handler_rc=1
+  else
+    # Bounded the same way resolve_inbox_entry already bounds a resolver in
+    # this same single-threaded dispatch loop: never plain `timeout`, which
+    # isn't reliably present (this host has neither `timeout` nor
+    # `gtimeout`), and a bare `timeout` with no kill-after leaves a
+    # TERM-resistant handler unbounded anyway. A genuinely hung handler was
+    # never observed, but is no longer isolated in its own process either
+    # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
+    # ~250x the measured normal ~35-40ms cost) bounds it regardless.
+    timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/sutando-handler-timeout.XXXXXX")"
+    "$CURRENT_HANDLER" \
+      --runtime "${SUTANDO_CORE_RUNTIME:-}" \
+      --workspace "$WORKSPACE_DIR" \
+      --task-file "$task_path" \
+      --results-dir "$RESULTS_DIR" \
+      --repo "$__REPO_ROOT" >/dev/null &
+    handler_pid=$!
+    ( trap 'kill "${_s:-}" 2>/dev/null; exit 0' TERM
+      sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
+      # Reaching here (not cancelled by the handler finishing first) means
+      # the timeout genuinely elapsed -- flag it BEFORE killing, so the
+      # caller can tell "we gave up waiting" apart from a real exit/signal.
+      : > "$timeout_flag"
+      kill -TERM "$handler_pid" 2>/dev/null; sleep 1
+      kill -KILL "$handler_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+    wait "$handler_pid" 2>/dev/null
+    handler_rc=$?
+    kill -TERM "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    if [ -f "$timeout_flag" ]; then
+      timed_out=1
+      rm -f "$timeout_flag"
     fi
-    printf '%s\n' "$task_path" > "$marker"
+    if [ "$handler_rc" -eq 0 ]; then
+      record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
+    fi
   fi
-  release_dispatch_lock
-  drain_dispatch_queue
+
+  if [ "$handler_rc" -ne 0 ] && claim_is_ours "$filename"; then
+    claim_settled=1
+    # A watchdog timeout means WE gave up waiting -- the handler may still
+    # be doing legitimate work (e.g. blocked on a real delivery lock), not
+    # declining. Never safe to read that as "optional decline, hand to
+    # core" regardless of the stored disposition: treat it the same
+    # fail-closed way MUST_HANDLE's own rc 4 verdict is treated. Distinct
+    # from the handler's own exit code, which this does not override.
+    if [ "$timed_out" -eq 1 ] || [ "$handler_rc" -eq 4 ]; then
+      verdict=0
+    else
+      claim_disposition "$filename"
+      verdict=$?
+    fi
+    case $verdict in
+      0)
+        if [ "$timed_out" -eq 1 ]; then
+          echo "watch-tasks-stream: handler timed out for $filename after ${SUTANDO_HANDLER_RUN_TIMEOUT}s (still running, not a decline); publishing safe terminal failure rather than assuming core may inherit it" >&2
+          publish_terminal_failure "$filename" "timed out" "$task_path" || claim_settled=0
+        else
+          echo "watch-tasks-stream: required Team handler failed for $filename (exit $handler_rc); publishing safe terminal failure" >&2
+          # An unsettled publish leaves the claim held rather than clobbering a
+          # destination this watcher does not own; cross-restart retry is separate.
+          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
+        fi
+        ;;
+      1)
+        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
+        echo "watch-tasks-stream: optional task handler failed for $filename (exit $handler_rc); falling back to live core (possible at-least-once retry)" >&2
+        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
+        emit_fallback_task_file "$announce"
+        ;;
+      *)
+        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
+        ;;
+    esac
+    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+  elif [ "$handler_rc" -eq 0 ]; then
+    release_task_claim "$filename" || true
+  fi
 }
 
 # A name is read relative to the reader's own inbox: a body that resolution
@@ -462,11 +488,55 @@ task_announce() {
   fi
 }
 
+# Order only (urgent > normal > low, mtime FIFO within a tier) -- every
+# *.txt; dispatch_task's own checks still decide eligibility, unchanged.
+# Empty output with files present is ambiguous (a real empty dir, or the
+# helper failing silently) -- fall back to mtime-glob order rather than ever
+# silently dropping the backlog; ordering degrades, dispatch never does.
+priority_sorted_tasks() {
+  local out rc=0 had_files=0 f
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" 2>/dev/null)" || rc=$?
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    had_files=1
+    break
+  done
+  shopt -u nullglob
+  [ "$had_files" -eq 1 ] || return 1
+  echo "watch-tasks-stream: priority sort broken (rc=$rc); dispatching in mtime order" >&2
+  shopt -s nullglob
+  for f in "$TASKS_DIR"/*.txt; do
+    basename "$f"
+  done
+  shopt -u nullglob
+}
+
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved
+  local task_path="$1" rc filename announce resolved attempt identity
+  # Graceful-shutdown gate: every path in (sweep, replay, event, held retry)
+  # holds new tasks while the sentinel is present; emitting one would orphan it.
+  [ -f "$STATE_DIR/shutdown.sentinel" ] && return 0
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
-  resolved="$(resolve_inbox_entry "$task_path")" || return 0
+  #
+  # A sentinel can be visible to fswatch before its payload's own write is —
+  # two separate files, no ordering guarantee between them — so one failed
+  # resolve is retried briefly rather than treated as permanent. Same bounded
+  # shape as acquire_task_claim's lock race, applied to filesystem visibility
+  # instead of lock contention.
+  attempt=0
+  until resolved="$(resolve_inbox_entry "$task_path")"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 3 ]; then
+      echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
+      return 0
+    fi
+    sleep 0.2
+  done
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
@@ -479,11 +549,40 @@ dispatch_task() {
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
-  if [ -z "$DISPATCH_DIR" ]; then
-    emit_dispatch_task_file "$announce"
+  # Only core makes a routing decision; a worker's own inbox already IS that
+  # decision (#4502). CURRENT_HANDLER is never populated for a worker (see the
+  # SUTANDO_INSTANCE_ID gate at its assignment above), so this is enforced
+  # structurally too, not just by this early return.
+  # One admission per file identity per watcher lifetime: a later event for the
+  # same bytes in the same inode is not a new task; a replaced file is.
+  identity="$filename|$(task_file_identity "$task_path")"
+  # A malformed identity never dedupes: a duplicate is recoverable, a silently
+  # dropped task is not.
+  case "$identity" in
+    *"|"[0-9]*:[0-9]*-[0-9]*) ;;
+    *) echo "watch-tasks-stream: no usable file identity for $filename; dispatching without dedupe" >&2; identity="" ;;
+  esac
+  if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
+    return 0
+  fi
+  # This decision is its own read: a fresh snapshot, parsed here, used here.
+  [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
+"
+  read_handler_config_now
+  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
+    [ -n "$HELD_NAMES" ] || HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
+    HELD_NAMES="$HELD_NAMES$filename
+"
+    echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
+    return 0
+  fi
+  DECISION_IDENTITY="$identity"
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+    emit_dispatch_task_file "$announce" && record_admission
     return
   fi
-  "$SUTANDO_TASK_EVENT_HANDLER" \
+  prepare_handler_state
+  "$CURRENT_HANDLER" \
     --runtime "${SUTANDO_CORE_RUNTIME:-}" \
     --workspace "$WORKSPACE_DIR" \
     --task-file "$task_path" \
@@ -493,22 +592,20 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      emit_dispatch_task_file "$announce"
+      emit_dispatch_task_file "$announce" && record_admission
       return
     fi
-    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$announce"
+    run_handler_now "$task_path" "fallback"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
     rm -f "$FALLBACKS_DIR/$filename"
-    if ! queue_handler_task "$task_path" "must-handle"; then
-      publish_terminal_failure "$filename" "could not be queued" "$task_path" || true
-    fi
+    run_handler_now "$task_path" "must-handle"
   elif [ "$rc" -eq 3 ]; then
-    emit_dispatch_task_file "$announce"
+    emit_dispatch_task_file "$announce" && record_admission
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    emit_dispatch_task_file "$announce"
+    emit_dispatch_task_file "$announce" && record_admission
   fi
 }
 
@@ -525,28 +622,9 @@ mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
 PID_FILE="$(sentinel_path_for "$STATE_DIR")"
-# In place, never write-elsewhere-then-mv: mv preserves mtime, and
-# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
-# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
-# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+# Stamped only once fswatch is confirmed up (below the launch): until then the
+# file may still name a live standby that this watcher must not displace.
 WATCHER_BEAT_PID=""
-# INJECTED, never located: a core helper may run a path it is handed but must not
-# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
-if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
-  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
-      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
-  WATCHER_BEAT_PID=$!
-fi
-# PID-file cleanup is folded into the unified `cleanup` function below so a
-# single trap covers both responsibilities (rm + kill children). An earlier
-# version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
-# later — the second trap shadowed the first, so the PID file was never
-# removed on clean exit. Stale PID files don't break the `kill -0` gate (it
-# correctly identifies dead PIDs), but they accumulated forever, and the
-# Stop-hook path that relies on this file being current got confused by
-# leftover entries from prior sessions. Dirty exits (SIGKILL, panic) still
-# skip the trap — the Stop hook + startup reaper cover those.
 
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
@@ -591,71 +669,25 @@ _tmux_wake() {
 #   plain signal (only `kill -9` stops it). Ignoring the signals we're about
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
-fallback_outstanding_handlers() {
-  local marker task_path filename announce settled made_progress found claim owner_id cleanup_ready claim_settled
-  local worker_receipt worker_pid job_pid
-  [ -n "$DISPATCH_DIR" ] && [ -d "$DISPATCH_DIR" ] || return
-  : > "$DISPATCH_DIR/shutting-down"
+#
+# SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
+# to settle its own claim -- this settles directly from CLAIMS_DIR instead.
+settle_own_claims_on_shutdown() {
+  local claim filename task_path announce claim_settled verdict
+  [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
   shopt -s nullglob
-  while true; do
-    # A drain that acquired its lock just before shutdown may move a pending
-    # receipt after this glob. Rescan until both namespaces are empty so that
-    # ownership transfer cannot make cleanup miss the running receipt.
-    found=0
-    made_progress=0
-    for marker in "$DISPATCH_DIR/pending/"* "$DISPATCH_DIR/running/"*; do
-      found=1
-      settled="$DISPATCH_DIR/settled/$(basename "$marker").cleanup"
-      mv "$marker" "$settled" 2>/dev/null || continue
-      task_path="$(cat "$settled")"
-      filename="$(basename "$task_path")"
-      announce="$(task_announce "$task_path")"
-      if claim_is_ours "$filename"; then
-        claim_settled=1
-        claim_disposition "$filename"
-        case $? in
-          0)
-            echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-            # As above: hold the claim rather than publish over a destination this
-            # watcher does not own.
-            publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
-            ;;
-          1)
-            printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-            echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
-            emit_task_file "$announce"
-            ;;
-          *)
-            echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
-            ;;
-        esac
-        [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
-      fi
-      rm -f "$settled"
-      made_progress=1
-    done
-    [ "$found" -eq 1 ] || break
-    [ "$made_progress" -eq 1 ] || sleep 0.01
-  done
-  # A signal can land after atomic claim publication but before the pending
-  # receipt write, or after a worker moved its receipt but before completion
-  # was consumed. Persist and emit before releasing: duplicate delivery is
-  # acceptable here, while release-before-emit could permanently strand work.
   for claim in "$CLAIMS_DIR"/task-*.txt; do
-    owner_id="$(sed -n '2p' "$claim" 2>/dev/null)"
-    [ "$owner_id" = "$WATCHER_ID" ] || continue
+    filename="$(basename "$claim")"
+    [ "$(sed -n '2p' "$claim" 2>/dev/null)" = "$WATCHER_ID" ] || continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     [ -n "$task_path" ] || continue
-    filename="$(basename "$task_path")"
     announce="$(task_announce "$task_path")"
     claim_settled=1
     claim_disposition "$filename"
-    case $? in
+    verdict=$?
+    case $verdict in
       0)
         echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-        # Hold the claim rather than release: a task that is neither delivered nor
-        # failed must keep its last record. Cross-restart retry is separate work.
         publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
         ;;
       1)
@@ -670,62 +702,12 @@ fallback_outstanding_handlers() {
     esac
     [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
   done
-
-  # Claims and fallback events are durable now. TERM the whole process group,
-  # then explicitly KILL and reap direct jobs/worker runners: an asynchronous
-  # bash can otherwise survive long enough to retain stdout/stderr pipe FDs.
-  kill -TERM 0 2>/dev/null || true
-  GROUP_TERM_SENT=1
-  for worker_receipt in "$DISPATCH_DIR/workers/"*; do
-    worker_pid="$(cat "$worker_receipt" 2>/dev/null)"
-    case "$worker_pid" in
-      ""|*[!0-9]*) ;;
-      *)
-        kill -KILL "$worker_pid" 2>/dev/null || true
-        wait "$worker_pid" 2>/dev/null || true
-        ;;
-    esac
-    rm -f "$worker_receipt"
-  done
-  while IFS= read -r job_pid; do
-    case "$job_pid" in
-      ""|*[!0-9]*) continue ;;
-    esac
-    kill -KILL "$job_pid" 2>/dev/null || true
-    wait "$job_pid" 2>/dev/null || true
-  done < <(jobs -pr 2>/dev/null)
-
-  # A killed completion path can leave its atomically-owned settled receipt or
-  # mkdir lock behind. Claims were reconciled above, and shutting-down still
-  # prevents new dispatch, so these local artifacts are now safe to sweep.
-  for settled in "$DISPATCH_DIR/settled/"*.worker \
-      "$DISPATCH_DIR/settled/"*.cleanup \
-      "$DISPATCH_DIR/settled/claim-"*; do
-    rm -f "$settled"
-  done
-  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || true
   shopt -u nullglob
-  cleanup_ready=1
-  rmdir "$DISPATCH_DIR/lock" 2>/dev/null || [ ! -d "$DISPATCH_DIR/lock" ] || cleanup_ready=0
-  rmdir "$DISPATCH_DIR/pending" 2>/dev/null || cleanup_ready=0
-  rmdir "$DISPATCH_DIR/running" 2>/dev/null || cleanup_ready=0
-  rmdir "$DISPATCH_DIR/settled" 2>/dev/null || cleanup_ready=0
-  rmdir "$DISPATCH_DIR/workers" 2>/dev/null || cleanup_ready=0
-  if [ "$cleanup_ready" -eq 1 ]; then
-    rm -f "$DISPATCH_DIR/shutting-down"
-    rmdir "$DISPATCH_DIR" 2>/dev/null || true
-  fi
-  [ -d "$DISPATCH_DIR" ] || DISPATCH_DIR=""
 }
 
 cleanup() {
   [ "${CLEANING_UP:-0}" -eq 0 ] || return
   CLEANING_UP=1
-  # FIRST, before any release/kill/sweep work: the drain and queue guards read
-  # this file, so anything they do before it exists can still promote a worker.
-  if [ -n "${DISPATCH_DIR:-}" ] && [ -d "$DISPATCH_DIR" ]; then
-    : > "$DISPATCH_DIR/shutting-down"
-  fi
   # EXIT and signal traps share this function. Disarm EXIT before spawning
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
@@ -740,16 +722,12 @@ cleanup() {
   if [ -n "${WATCHER_BEAT_PID:-}" ]; then
     kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
-  if declare -F fallback_outstanding_handlers >/dev/null; then
-    fallback_outstanding_handlers
-  fi
+  settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
     rm -f "$WATCH_RUNTIME_DIR/events"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
   fi
-  if [ "${GROUP_TERM_SENT:-0}" -eq 0 ]; then
-    kill -TERM 0 2>/dev/null || true
-  fi
+  kill -TERM 0 2>/dev/null || true
 }
 trap cleanup EXIT
 # HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
@@ -763,13 +741,20 @@ trap cleanup EXIT
 trap 'cleanup; exit 0' HUP INT TERM
 
 # Initial sweep — surface any pre-existing tasks that arrived during a
-# restart gap. Install cleanup first so an immediately exiting fswatch cannot
-# kill a just-started provider before its durable fallback receipt is emitted.
-shopt -s nullglob
-for f in "$TASKS_DIR"/*.txt; do
-  dispatch_task "$f"
-done
-shopt -u nullglob
+# restart gap, in priority order. Install cleanup first so an immediately
+# exiting fswatch cannot kill a just-started provider before its durable
+# fallback receipt is emitted.
+startup_sweep() {
+  local fn
+  while IFS= read -r fn; do
+    dispatch_task "$TASKS_DIR/$fn"
+  done < <(priority_sorted_tasks)
+}
+# A session watcher sweeps only once the standby has stopped (below); any other
+# role has no peer on its inbox and sweeps before it subscribes, as always.
+if [ "$WATCHER_ROLE" != "session" ]; then
+  startup_sweep
+fi
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -795,37 +780,146 @@ shopt -u nullglob
 # Mode A fix (#1088): `|| exit 0` on printf — if the consumer pipe is
 # dead, the first failed write exits immediately instead of silently
 # buffering ~100 events into the kernel pipe buffer.
+#
+# HANDLER_CONFIG_DIR (core only) rides the SAME fswatch process as a second
+# path -- not the file itself, which inotify/poll_monitor can't watch reliably before it exists.
+fswatch_paths=("$TASKS_DIR")
+if [ -n "$HANDLER_CONFIG_DIR" ]; then
+  mkdir -p "$HANDLER_CONFIG_DIR"
+  fswatch_paths+=("$HANDLER_CONFIG_DIR")
+fi
 fswatch \
   -l 0.5 \
   --event Created \
   --event Renamed \
-  "$TASKS_DIR" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  --event Updated \
+  "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
-while IFS= read -r path; do
+# The writer end opens only once a reader exists, so fswatch execs here, not at
+# the launch above; fd 3 stays open so the loop's own open can never be the last reader.
+exec 3< "$WATCH_RUNTIME_DIR/events"
+fswatch_alive=1
+for _ in 1 2 3 4 5; do
+  kill -0 "$FSWATCH_PID" 2>/dev/null || { fswatch_alive=0; break; }
+  sleep 0.1
+done
+# Exit before the sentinel stamp: a watcher that cannot serve the inbox leaves
+# whatever is serving it untouched.
+if [ "$fswatch_alive" -eq 0 ]; then
+  echo "watch-tasks-stream: fswatch failed to start; no sentinel written and no standby touched" >&2
+  exit 1
+fi
+
+# One fswatch line. Shared by the readiness replay and the main loop so a line
+# read early is handled exactly as a line read late.
+handle_event() {
+  local path="$1" parent
   case "$path" in
-    "HANDLER_DONE: "*)
-      completion="${path#HANDLER_DONE: }"
-      handler_rc="${completion%% *}"
-      filename="${completion#* }"
-      case "$handler_rc" in
-        ""|*[!0-9]*) handler_rc=1 ;;
-      esac
-      running_marker="$DISPATCH_DIR/running/$filename"
-      if [ -f "$running_marker" ]; then
-        task_path="$(cat "$running_marker")"
-        finish_handler_task "$running_marker" "$task_path" "$handler_rc"
-      fi
+    "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR")
+      # Matches the file OR its bare dir -- poll_monitor reports the watched
+      # DIRECTORY, not the file, on a rename-into-place (measured locally).
+      # Reload only: the next task (already fswatched separately, on tasks/)
+      # sees the new CURRENT_HANDLER in dispatch_task() and run_handler_now()
+      # calls the real handler right there -- nothing queued, nothing to
+      # drain on a bare config change. No more HANDLER_DONE case here either:
+      # that signaled a background --handler-runner subprocess's completion,
+      # which no longer exists now that the handler runs synchronously.
+      reload_current_handler
+      [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
+      redispatch_held_tasks
       ;;
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
-        # emitting one mid-shutdown would orphan it.
-        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
-          continue
-        fi
         dispatch_task "$path"
+        redispatch_held_tasks
       fi
       ;;
   esac
-done < "$WATCH_RUNTIME_DIR/events"
+}
+
+# Readiness is a real round-trip: a probe this watcher writes into its own inbox
+# must come back through fswatch. Its name matches no admission pattern.
+PRE_READY_EVENTS=""
+if [ "$WATCHER_ROLE" = "session" ]; then
+  READY_DEADLINE=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
+  probe_n=0
+  : > "$TASKS_DIR/.ready-$$-$probe_n"
+  ready=0
+  while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
+    if ! IFS= read -r -t 1 path <&3; then
+      kill -0 "$FSWATCH_PID" 2>/dev/null || break
+      # A probe written before fswatch subscribed raises nothing: write a fresh one.
+      probe_n=$((probe_n + 1))
+      : > "$TASKS_DIR/.ready-$$-$probe_n"
+      continue
+    fi
+    case "$path" in
+      */.ready-$$-*|.ready-$$-*) ready=1; break ;;
+      *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
+" ;;
+    esac
+  done
+  rm -f "$TASKS_DIR"/.ready-$$-*
+  if [ "$ready" -ne 1 ]; then
+    echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; no sentinel written and no standby touched" >&2
+    exit 1
+  fi
+fi
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
+echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
+# The standby is the supervisor's to stop (its session also hosts the supervisor,
+# the only re-arm); sweep once it is gone, but never wait on it forever.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  STANDBY_DEADLINE=$(( $(date +%s) + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} ))
+  standby="unknown"
+  while [ "$(date +%s)" -lt "$STANDBY_DEADLINE" ]; do
+    standby="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" standby-present --inbox "$TASKS_DIR_ABS" 2>/dev/null)" || standby="unknown"
+    [ "$standby" = "no" ] && break
+    sleep 0.5
+  done
+  if [ "$standby" != "no" ]; then
+    echo "watch-tasks-stream: standby watcher still present after ${SUTANDO_STANDBY_STOP_TIMEOUT:-15}s; sweeping anyway" >&2
+  fi
+  # Buffered events first, in fswatch's order, so a task sees the handler config
+  # delivered before it; the sweep then covers only what no event announced.
+  while IFS= read -r path; do
+    [ -n "$path" ] && handle_event "$path"
+  done <<< "$PRE_READY_EVENTS"
+  startup_sweep
+fi
+# -t bounds the read so a stretch with no fswatch event still gets a periodic,
+# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
+# event shape the platform's fswatch monitor backend turns out to use.
+while true; do
+  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path <&3
+  read_rc=$?
+  if [ "$read_rc" -ne 0 ]; then
+    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
+    # exit code alone can't distinguish them -- ask whether fswatch is still
+    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
+    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
+      if [ -n "$HANDLER_CONFIG_PATH" ]; then
+        reload_current_handler
+        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
+        redispatch_held_tasks
+      fi
+      continue
+    fi
+    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
+    # to the script's normal exit path rather than spinning on a dead FIFO.
+    break
+  fi
+  handle_event "$path"
+  retry_held_tasks_if_due
+done

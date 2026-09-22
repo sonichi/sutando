@@ -1,8 +1,74 @@
 // Shared runner for optional skills' setup() hooks. The isolation guarantee is
 // the contract: one bad skill must not crash or stall the host's bootstrap.
 
-export type SkillSetupCtx = { session: unknown; injectText: (session: unknown, text: string) => void };
+import type { ToolDefinition } from 'bodhi-realtime-agent';
+import type { ClientFrame, ClientFrameHandler, ClientDisconnectedHandler } from './client-frame-hub.js';
+import type { VoiceSessionOrigin, VoiceTaskOriginResolver } from './task-bridge.js';
+
+export type SkillSetupCtx = {
+	session: unknown;
+	injectText: (session: unknown, text: string) => void;
+	/** True while a client is attached and can receive frames. */
+	clientAttached: () => boolean;
+	/** Send one JSON frame to the attached client; false when none took it. */
+	sendClientFrame: (frame: ClientFrame) => boolean;
+	/** Offered every client JSON frame; return true to claim it. */
+	onClientFrame: (handler: ClientFrameHandler) => void;
+	onClientDisconnected: (handler: ClientDisconnectedHandler) => void;
+	/** Context the model should know, framed as a system line; retried until the session is live. */
+	injectContext: (text: string) => void;
+	/** Where this session's delegated work came from; null is the default (owner DM). */
+	setVoiceSessionOrigin: (origin: VoiceSessionOrigin | null) => void;
+	getVoiceSessionOrigin: () => VoiceSessionOrigin | null;
+	/** Recover the origin of a task written before a restart from its header lines. */
+	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
+};
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
+
+/** What a skill's optional `voiceSurface()` export adds to the web voice session only. */
+export interface VoiceSurfaceContribution {
+	/** Declared on the voice session, never on the phone tool table. */
+	tools?: ToolDefinition[];
+	/** Rule lines for the voice prompt's RULES block. */
+	promptRules?: string[];
+	/** Context lines, re-evaluated at every prompt build. */
+	contextLines?: () => string[];
+}
+export type VoiceSurfaceHook = () => VoiceSurfaceContribution;
+
+/** Evaluate each hook under isolation and merge; a throwing or malformed hook contributes nothing. */
+export function collectVoiceSurface(
+	hooks: readonly VoiceSurfaceHook[],
+	log: (msg: string, detail?: unknown) => void = (m, d) => console.error(m, d),
+): Required<VoiceSurfaceContribution> {
+	const tools: ToolDefinition[] = [];
+	const promptRules: string[] = [];
+	const contextFns: Array<() => string[]> = [];
+	for (const hook of hooks) {
+		try {
+			const c = hook();
+			if (!c || typeof c !== 'object') continue;
+			if (Array.isArray(c.tools)) tools.push(...c.tools);
+			if (Array.isArray(c.promptRules)) promptRules.push(...c.promptRules.filter(l => typeof l === 'string' && l));
+			if (typeof c.contextLines === 'function') contextFns.push(c.contextLines);
+		} catch (err) {
+			log('[voice-surface] hook threw:', err instanceof Error ? err.message : err);
+		}
+	}
+	const contextLines = (): string[] => {
+		const out: string[] = [];
+		for (const fn of contextFns) {
+			try {
+				const lines = fn();
+				if (Array.isArray(lines)) out.push(...lines.filter(l => typeof l === 'string' && l));
+			} catch (err) {
+				log('[voice-surface] contextLines threw:', err instanceof Error ? err.message : err);
+			}
+		}
+		return out;
+	};
+	return { tools, promptRules, contextLines };
+}
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {
 	return !!v && (typeof v === 'object' || typeof v === 'function')
