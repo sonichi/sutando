@@ -5,13 +5,20 @@ The stderr strings below are verbatim from tmux 3.6a (server, homebrew) and a
 socket. Absence is matched positively: the genuine misses are False; the
 version-skew failure, a signalled client and an unrecognised message are None.
 """
+import importlib.util
 import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import tmux_probe  # noqa: E402
+
+_CLI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "tmux-probe-cli.py")
+_cli_spec = importlib.util.spec_from_file_location("tmux_probe_cli", _CLI_PATH)
+tmux_probe_cli = importlib.util.module_from_spec(_cli_spec)
+_cli_spec.loader.exec_module(tmux_probe_cli)
 
 
 class _R:
@@ -111,6 +118,34 @@ class TestHasSession(unittest.TestCase):
 
     def test_real_binary_missing_is_unknown(self):
         self.assertIsNone(tmux_probe.has_session("s.sock", "core", tmux="/nonexistent-tmux-xyz"))
+
+
+class TestTmuxProbeCliMain(unittest.TestCase):
+    """Direct calls to main() -- in-process, so coverage sees them (the
+    subprocess-based TestTmuxProbeCli below proves the real end-to-end path,
+    which coverage cannot instrument across a process boundary)."""
+
+    def test_present_maps_to_0(self):
+        with mock.patch.object(tmux_probe_cli, "has_session", return_value=True):
+            self.assertEqual(tmux_probe_cli.main(["tmux-probe-cli.py", "s.sock", "=x"]), 0)
+
+    def test_absent_maps_to_1(self):
+        with mock.patch.object(tmux_probe_cli, "has_session", return_value=False):
+            self.assertEqual(tmux_probe_cli.main(["tmux-probe-cli.py", "s.sock", "=x"]), 1)
+
+    def test_unknown_maps_to_2(self):
+        with mock.patch.object(tmux_probe_cli, "has_session", return_value=None):
+            self.assertEqual(tmux_probe_cli.main(["tmux-probe-cli.py", "s.sock", "=x"]), 2)
+
+    def test_bad_argv_maps_to_2_without_calling_has_session(self):
+        with mock.patch.object(tmux_probe_cli, "has_session") as m:
+            self.assertEqual(tmux_probe_cli.main(["tmux-probe-cli.py", "only-one"]), 2)
+            m.assert_not_called()
+
+    def test_args_reach_has_session_unchanged(self):
+        with mock.patch.object(tmux_probe_cli, "has_session", return_value=True) as m:
+            tmux_probe_cli.main(["tmux-probe-cli.py", "the.sock", "=the-session"])
+            m.assert_called_once_with("the.sock", "=the-session")
 
 
 class TestTmuxProbeCli(unittest.TestCase):
