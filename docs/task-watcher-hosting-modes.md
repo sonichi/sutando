@@ -1,13 +1,12 @@
 # Task watcher hosting modes: session watcher, standby, supervisor
 
 One inbox (`<workspace>/tasks/` for the core; `<workspace>/deliveries/<id>/` for a pool worker) is
-meant to have **exactly one announcer** in steady state. Two things can host that announcer, and for
-watchers that carry the tag the code keeps them mutually exclusive without relying on an agent
-instruction. The invariant is intended, not yet unconditional: an untagged watcher and a present but
-not yet ready tagged watcher are both invisible to the verdicts that enforce it, and a handoff can
-produce two notifications for one pending task; each exception is named under "Known issues and
-gaps" with the issue that closes it. This page is the design as it stands on `main` after #4477 and
-#4585; the behaviour is pinned by the tests named at the end.
+meant to have **exactly one announcer** in steady state. Two things can host that announcer, and the
+watcher itself refuses to double an inbox at its own startup (`inbox-holders`, below), so no
+launcher or instruction has to get the check right. The remaining exception is that a handoff can
+produce two notifications for one pending task; it is named under "Known issues and gaps" with the
+issue that closes it. This page is the design as it stands on `main` after #4477, #4585 and #4602;
+the behaviour is pinned by the tests named at the end.
 
 ## The two hosting modes
 
@@ -91,11 +90,15 @@ the same supervisor pid; the second handoff took 12 s.
 - **Two notifications per handoff, at most.** A core-bound task pending during a handoff can be
   announced by the standby's notifier and by the session watcher's sweep. Accepted as a known issue by
   the owner; the announce-once marker keyed to the core session (PR-B) is deferred.
-- **Untagged watchers.** A watcher started without `--role session` on an inbox reads `no` from
-  `role-present`, so the supervisor would arm a standby next to it, and a re-arm rule that reads only
-  `role-present` would start a second session watcher next to it. Likewise a tagged watcher that is
-  present but not yet ready reads `no` from both verdicts. The fix is a self-check in the watcher
-  itself (exit when any watcher already covers the inbox; replace only with `--force-restart`): #4602.
+- **The watcher's own startup check (#4602).** Before it touches anything, `watch-tasks-stream.sh`
+  asks `watcher_identity.py inbox-holders --inbox <inbox>` for every watcher-shaped process naming its
+  inbox, tagged or not, ready or not. A second watcher of the same kind exits 0 naming the holder; a
+  session watcher over a standby proceeds (the supervisor stands the standby down once it proves
+  ready); a standby over a session watcher exits 0; an unobservable `ps` refuses to start. Only
+  `--force-restart` replaces the holder (TERM, then KILL, then its fswatch child), and only on the
+  owner's word. An untagged start is warned about and treated as standby-kind for the check;
+  refusing it outright waits for the remaining positional launches to be tagged. The supervisor's
+  standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
 - **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
   outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
@@ -104,10 +107,10 @@ the same supervisor pid; the second handoff took 12 s.
   standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
   2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
   affected: #4524.
-- **Untagged is what pool workers run today** (`SUTANDO_WATCHER_CMD <inbox>`), which is why #4600 and
-  #4602 are the next two watcher changes. The rule going forward (owner, 2026-09-22): every start
-  carries an explicit `--role` (`session` or `standby`) and `--inbox`; the watcher refuses an untagged
-  start.
+- **Untagged is what pool workers run today** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose worker
+  boot skill predates the tagged form), which is what #4600 closes. The rule going forward (owner,
+  2026-09-22): every start carries an explicit `--role` (`session` or `standby`) and `--inbox`; the
+  watcher warns on an untagged start today and will refuse it once every launch is tagged.
 
 ## Tests that pin this
 

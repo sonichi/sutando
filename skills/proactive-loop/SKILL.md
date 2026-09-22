@@ -107,12 +107,17 @@ caps this file and refuses date stamps in it).
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
    position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
    Then pivot; never block.
-9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
-   owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` persistent (substitute `$SUTANDO_TASKS_DIR` for the inbox on an
-   instance whose tasks dir isn't `<workspace>/tasks/`). Untagged, this re-arm is invisible to `role_present()`
-   (#4477) — an external supervisor for the same inbox has no way to see it and would arm a second, duplicate
-   watcher after its own grace period. A missing sentinel is UNKNOWN, not dead; never hand-roll a process check.
+9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
+   "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
+   if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
+   duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
+   change nothing and say so. `--force-restart` replaces a holder; use it only on the owner's word.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
+   untagged watcher is invisible to the verdict above and to the supervisor.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.

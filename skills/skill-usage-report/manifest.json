@@ -6,7 +6,7 @@
   "stability": "experimental",
   "description": "Drain the local skill-usage log and report it to AG2 Cloud. Manifest present to DECLARE config per the config-only convention in skills/MANIFEST.md — this skill contributes no inline tools.",
   "config": {
-    "AG2_CLOUD_ORIGIN": "https://sutando.ag2.ai"
+    "AG2_CLOUD_ORIGIN": "https://sutando.ag2.space"
   },
   "permissions": {
     "network": true,

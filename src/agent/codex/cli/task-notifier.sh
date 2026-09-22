@@ -327,8 +327,8 @@ mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"
 mkdir -p "$queue_dir"
 "$NOTIFIER_PY" -c \
-  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
 # A narrower net than the watcher's own routing, for a worker claim that
