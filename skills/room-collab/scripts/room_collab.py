@@ -438,6 +438,21 @@ async def kanban(doc, args: argparse.Namespace) -> int:
 
 
 
+def presence_name(name: "str | None", user_id: "str | None") -> "str | None":
+    """The name to publish presence under: the given one, else the mxid's localpart.
+
+    A peer with no name is not rendered — the web client skips it and the
+    service's summary counts it without naming it — so publishing nameless is
+    indistinguishable from not joining. An mxid already carries a usable name.
+    """
+    if name and name.strip():
+        return name.strip()
+    if isinstance(user_id, str) and user_id.startswith("@") and ":" in user_id:
+        local = user_id[1:].split(":", 1)[0].strip()
+        return local or None
+    return None
+
+
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
@@ -455,8 +470,9 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
         try:
             async with open_room_collab(url, args.room, token, kind=args.kind,
                                      insecure=args.insecure) as doc:
-                if args.name:
-                    await doc.set_presence(args.name, user_id=args.user_id)
+                announce = presence_name(args.name, args.user_id)
+                if announce:
+                    await doc.set_presence(announce, user_id=args.user_id)
                 if since is not None:
                     print("RECONNECTED\tcatching up on what landed meanwhile", flush=True)
                 async for ev in doc.events(handles, settle=args.settle, since=since):
