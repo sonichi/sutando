@@ -116,7 +116,10 @@ the same supervisor pid; the second handoff took 12 s.
 
 - `tests/watch-tasks-stream-role-session-kills-standby.test.sh`: the handoff contract with the real
   supervisor and notifier (arm after grace, stand down on readiness, re-arm after a kill).
-- `tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py`: the readiness window,
-  buffered replay before the sweep, holds and admissions.
+- `tests/watch-tasks-stream-readiness-window-decision-instant.test.py`,
+  `tests/watch-tasks-stream-readiness-window-unreadable-config.test.py`,
+  `tests/watch-tasks-stream-readiness-window-held-task-recovery.test.py` (split from one combined
+  file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
+  CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.
