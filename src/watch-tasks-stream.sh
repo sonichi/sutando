@@ -131,6 +131,10 @@ fi
 HANDLER_STATE="absent"
 HELD_NAMES=""
 HELD_RETRY_AT=0
+DISPATCHED_IDS=""
+task_file_identity() {
+  printf '%s %s' "$(stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1" 2>/dev/null)" "$(cksum < "$1" 2>/dev/null)"
+}
 HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
 # One read per routing decision: the bytes are copied once into a private
 # snapshot and parsed from there; no cache, no compare, nothing to go stale.
@@ -496,7 +500,7 @@ priority_sorted_tasks() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved attempt
+  local task_path="$1" rc filename announce resolved attempt identity
   # Resolve before anything observes it: claim, handler and emit must all name
   # the body, never the sentinel that merely pointed at it.
   #
@@ -530,6 +534,12 @@ dispatch_task() {
   # decision (#4502). CURRENT_HANDLER is never populated for a worker (see the
   # SUTANDO_INSTANCE_ID gate at its assignment above), so this is enforced
   # structurally too, not just by this early return.
+  # One admission per file identity per watcher lifetime: a later event for the
+  # same bytes in the same inode is not a new task; a replaced file is.
+  identity="$filename|$(task_file_identity "$task_path")"
+  if [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
+    return 0
+  fi
   # This decision is its own read: a fresh snapshot, parsed here, used here.
   [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
 "
@@ -541,6 +551,8 @@ dispatch_task() {
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
   fi
+  DISPATCHED_IDS="$DISPATCHED_IDS$identity
+"
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
     emit_dispatch_task_file "$announce"
     return
@@ -708,19 +720,10 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
-# Names dispatched from buffered events are not swept; names the sweep
-# dispatched are not dispatched again by the one event they raised.
-REPLAYED_NAMES=""
-SWEPT_NAMES=""
 startup_sweep() {
   local fn
   while IFS= read -r fn; do
-    if [ -n "$REPLAYED_NAMES" ] && printf '%s' "$REPLAYED_NAMES" | grep -qxF -- "$fn"; then
-      continue
-    fi
     dispatch_task "$TASKS_DIR/$fn"
-    SWEPT_NAMES="$SWEPT_NAMES$fn
-"
   done < <(priority_sorted_tasks)
 }
 # A session watcher sweeps only once the standby has stopped (below); any other
@@ -785,9 +788,8 @@ fi
 
 # One fswatch line. Shared by the readiness replay and the main loop so a line
 # read early is handled exactly as a line read late.
-REPLAYING=""
 handle_event() {
-  local path="$1" parent name
+  local path="$1" parent
   case "$path" in
     "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR")
       # Matches the file OR its bare dir -- poll_monitor reports the watched
@@ -810,15 +812,7 @@ handle_event() {
         if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
           return 0
         fi
-        name="$(basename "$path")"
-        if [ -z "$REPLAYING" ] && [ -n "$SWEPT_NAMES" ] && printf '%s' "$SWEPT_NAMES" | grep -qxF -- "$name"; then
-          SWEPT_NAMES="$(printf '%s' "$SWEPT_NAMES" | grep -vxF -- "$name")
-"
-          return 0
-        fi
         dispatch_task "$path"
-        [ -n "$REPLAYING" ] && REPLAYED_NAMES="$REPLAYED_NAMES$name
-"
         redispatch_held_tasks
       fi
       ;;
@@ -880,11 +874,9 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   fi
   # Buffered events first, in fswatch's order, so a task sees the handler config
   # delivered before it; the sweep then covers only what no event announced.
-  REPLAYING=1
   while IFS= read -r path; do
     [ -n "$path" ] && handle_event "$path"
   done <<< "$PRE_READY_EVENTS"
-  REPLAYING=""
   startup_sweep
 fi
 # -t bounds the read so a stretch with no fswatch event still gets a periodic,

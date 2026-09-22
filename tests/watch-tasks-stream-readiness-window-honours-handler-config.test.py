@@ -870,6 +870,72 @@ check("the held task was dispatched within the retry deadline (2 s) despite the 
       and not any(ln.startswith("TASK_FILE: task-team") for ln in out),
       f"dispatched_at={at} stdout={out!r} handler log={handled!r}")
 
+
+def scenario_held_task_events_after_recovery_feed():
+    """Linux semantics, driven deterministically: after a held task is
+    re-dispatched on recovery, its own Created and Updated events arrive; it
+    must not be admitted again. The test feeds fswatch's output itself."""
+    tmp, ws, b = _workspace("ready-feed-")
+    feed = tmp / "feed"
+    feed.write_text("")
+    (b / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {feed}\n")
+    (b / "fswatch").chmod(0o755)
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    h = _handlers(tmp, log, (("hO", 0),))
+    _publish(cfg, h["hO"])
+    os.chmod(cfg, 0)
+    env = _watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60", "SUTANDO_HELD_RETRY_INTERVAL": "1"})
+    p = _start(ws, env)
+    out: list[str] = []
+    real_tasks = Path(os.path.realpath(ws / "tasks"))
+
+    def emit(path):
+        with open(feed, "a") as fh:
+            fh.write(f"{path}\n")
+
+    try:
+        # readiness: echo the probe the watcher writes into its own inbox
+        t0 = time.time()
+        probe = None
+        while time.time() - t0 < 10:
+            probes = list((ws / "tasks").glob(".ready-*"))
+            if probes:
+                probe = probes[0]
+                break
+            time.sleep(0.05)
+        assert probe is not None, "no readiness probe appeared"
+        emit(real_tasks / probe.name)
+        _wait_ready(ws)
+        _write_task(ws, "task-held")
+        emit(real_tasks / "task-held.txt")
+        _pump(p, out, lambda: log.exists() or any("task-held" in ln for ln in out), timeout=4, settle=0.3)
+        held_log = log.read_text().split() if log.exists() else []
+        os.chmod(cfg, 0o644)
+        emit(ws / "state" / "noise-1")  # any event: the retry deadline is checked after it
+        _pump(p, out, lambda: log.exists(), timeout=8, settle=1.0)
+        first = log.read_text().split() if log.exists() else []
+        emit(real_tasks / "task-held.txt")  # Created
+        emit(real_tasks / "task-held.txt")  # Updated
+        time.sleep(3.0)
+        handled = log.read_text().split() if log.exists() else []
+        return held_log, first, out, handled
+    finally:
+        try:
+            os.chmod(cfg, 0o644)
+        except OSError:
+            pass
+        _stop(p)
+
+
+print("a held task is re-dispatched on recovery, then its own Created and Updated events arrive (feed-driven):")
+held_log, first, out, handled = scenario_held_task_events_after_recovery_feed()
+check("setup: the task was held first", held_log == [], f"handler log={held_log!r}")
+check("recovery dispatched it once", first == ["probe-hO", "handle-hO"], f"handler log={first!r}")
+check("its later Created and Updated events did not admit it again",
+      handled == ["probe-hO", "handle-hO"] and not any(ln.startswith("TASK_FILE: task-held") for ln in out),
+      f"stdout={out!r} handler log={handled!r}")
+
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
 sys.exit(1 if FAILURES else 0)
