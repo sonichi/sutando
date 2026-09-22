@@ -2,9 +2,9 @@
 # The watcher enforces one announcer per inbox at its own startup:
 #   (a) a second session watcher on a watched inbox exits 0 and leaves the first alone;
 #   (b) --force-restart replaces exactly the holder: the first dies, the second runs;
-#   (c) a session watcher over an untagged (standby-shaped) holder proceeds: the handoff;
+#   (c) a session watcher over a standby holder proceeds: the handoff;
 #   (d) a standby over a live session watcher exits 0;
-#   (e) an untagged start on a free inbox warns and runs;
+#   (e) an untagged start is refused (rc 64): a watcher is started by its monitor and says so;
 #   (f) a watcher on ANOTHER inbox is never a holder for this one;
 #   (h) --force-restart aborts, signaling nothing, when a live holder can no longer be re-proven.
 # Run: bash tests/watch-tasks-stream-self-check.test.sh
@@ -64,20 +64,30 @@ alive "$A1"; check "(b) --force-restart stopped the holder $A1" $([ $? = 0 ] && 
 alive "$A3"; check "(b) ...and the replacement runs" $?
 grep -q "stopping watcher pid $A1 (session)" "$WORK/a3.err"; check "(b) ...saying which pid it replaced" $?
 
-# (c) a session watcher over an untagged holder proceeds (the supervisor stands it down).
-B1=$(run_watcher "$WORK/b" "$WORK/b1.err" "$WORK/b/tasks"); PIDS+=("$B1")
+# (e) an untagged start is refused before anything is touched: no role, no
+# inbox tag, a tag that names another directory. Nothing runs, no sentinel.
+run_watcher_fg "$WORK/b" "$WORK/e1.err" "$WORK/b/tasks"; rc=$?
+check "(e) a start with no --role is refused with rc 64" $([ "$rc" = 64 ] && echo 0 || echo 1) "rc=$rc — $(tail -1 "$WORK/e1.err")"
+run_watcher_fg "$WORK/b" "$WORK/e2.err" "$WORK/b/tasks" --role standby; rc=$?
+check "(e) a start with no --inbox is refused with rc 64" $([ "$rc" = 64 ] && echo 0 || echo 1) "rc=$rc"
+run_watcher_fg "$WORK/b" "$WORK/e3.err" "$WORK/b/tasks" --role standby --inbox "$WORK/a/tasks"; rc=$?
+check "(e) a tag naming another directory is refused with rc 64" $([ "$rc" = 64 ] && echo 0 || echo 1) "rc=$rc"
+grep -q "refusing to start" "$WORK/e1.err"; check "(e) ...and each says it is refusing" $?
+[ ! -e "$WORK/b/state/watch-tasks-stream.pid" ]; check "(e) ...and no sentinel was written" $?
+
+# (c) a session watcher over a standby holder proceeds (the supervisor stands it down).
+B1=$(run_watcher "$WORK/b" "$WORK/b1.err" "$WORK/b/tasks" --role standby --inbox "$WORK/b/tasks"); PIDS+=("$B1")
 sleep 2
-alive "$B1"; check "(e) an untagged start on a free inbox runs" $?
-grep -q "untagged start" "$WORK/b1.err"; check "(e) ...with the tag warning" $?
+alive "$B1"; check "(c) the standby holder is up" $?
 B2=$(run_watcher "$WORK/b" "$WORK/b2.err" "$WORK/b/tasks" --role session --inbox "$WORK/b/tasks"); PIDS+=("$B2")
 sleep 3
-alive "$B2"; check "(c) a session watcher over an untagged holder proceeds" $?
+alive "$B2"; check "(c) a session watcher over a standby holder proceeds" $?
 alive "$B1"; check "(c) ...and does not kill it (the supervisor's job)" $?
 
 # (d) a standby over a live session watcher exits 0.
 run_watcher_fg "$WORK/b" "$WORK/b3.err" "$WORK/b/tasks" --role standby --inbox "$WORK/b/tasks"; rc=$?
 check "(d) a standby over a session watcher exits 0" $([ "$rc" = 0 ] && echo 0 || echo 1) "rc=$rc"
-grep -q -E "already watched by pid ($B1 \(untagged\)|$B2 \(session\))" "$WORK/b3.err"; check "(d) ...naming a holder of the inbox" $? "$(tail -1 "$WORK/b3.err")"
+grep -q -E "already watched by pid ($B1 \(standby\)|$B2 \(session\))" "$WORK/b3.err"; check "(d) ...naming a holder of the inbox" $? "$(tail -1 "$WORK/b3.err")"
 
 # (f) inbox a's watcher is not a holder for inbox b and vice versa.
 alive "$A3" && alive "$B2"; check "(f) both inboxes keep their own watcher" $?

@@ -116,7 +116,7 @@ class Harness:
         # The watched dir is $1, NOT an env var — passing it as one would fall
         # through to the resolver and watch the REAL workspace.
         self.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
 

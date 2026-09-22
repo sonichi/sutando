@@ -86,7 +86,7 @@ set -m
 # startup and overwrites the caller's, so only SUTANDO_PY overrides it.
 SUTANDO_INBOX_RESOLVER="$resolver" SUTANDO_WORKSPACE_DIR="$ws" \
   SUTANDO_RESULTS_DIR="$ws/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp2/py" \
-  bash "$SRC/watch-tasks-stream.sh" "$inbox" > "$outfile" 2>"$tmp2/sweep.err" &
+  bash "$SRC/watch-tasks-stream.sh" "$inbox" --role standby --inbox "$inbox" > "$outfile" 2>"$tmp2/sweep.err" &
 sweep_pid=$!
 set +m
 for _ in $(seq 1 40); do grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && break; sleep 0.25; done
@@ -129,7 +129,7 @@ printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$payload3" > "$resolver3"; chmod +x 
 set -m
 SUTANDO_INBOX_RESOLVER="$resolver3" SUTANDO_TASK_EVENT_HANDLER="$tmp3/handler.sh" SUTANDO_WORKSPACE_DIR="$ws3" \
   SUTANDO_RESULTS_DIR="$ws3/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp3/py" \
-  bash "$SRC/watch-tasks-stream.sh" "$inbox3" > "$tmp3/sweep.out" 2>"$tmp3/sweep.err" &
+  bash "$SRC/watch-tasks-stream.sh" "$inbox3" --role standby --inbox "$inbox3" > "$tmp3/sweep.out" 2>"$tmp3/sweep.err" &
 sweep3=$!
 set +m
 for _ in $(seq 1 60); do grep -q 'transition FAILED' "$log3" 2>/dev/null && break; sleep 0.25; done

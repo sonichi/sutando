@@ -43,7 +43,7 @@ def start_watcher(ws, instance=None):
         env.pop("SUTANDO_INSTANCE_ID", None)
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)  # no operator pin -- config file only
     return subprocess.Popen(
-        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
+        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
         env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, start_new_session=True)
 

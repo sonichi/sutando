@@ -96,9 +96,9 @@ the same supervisor pid; the second handoff took 12 s.
   session watcher over a standby proceeds (the supervisor stands the standby down once it proves
   ready); a standby over a session watcher exits 0; an unobservable `ps` refuses to start. Only
   `--force-restart` replaces the holder (TERM, then KILL, then its fswatch child), and only on the
-  owner's word. An untagged start is warned about and treated as standby-kind for the check;
-  refusing it outright waits for the remaining positional launches to be tagged. The supervisor's
-  standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
+  owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
+  touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
+  different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
 - **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
   outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
@@ -107,10 +107,10 @@ the same supervisor pid; the second handoff took 12 s.
   standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
   2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
   affected: #4524.
-- **Untagged is what pool workers run today** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose worker
-  boot skill predates the tagged form), which is what #4600 closes. The rule going forward (owner,
-  2026-09-22): every start carries an explicit `--role` (`session` or `standby`) and `--inbox`; the
-  watcher warns on an untagged start today and will refuse it once every launch is tagged.
+- **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
+  worker boot skill predated the tagged form) keep running and read as `untagged` holders until
+  their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
+  carries an explicit `--role` (`session` or `standby`) and `--inbox`, and the watcher enforces it.
 
 ## Tests that pin this
 

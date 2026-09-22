@@ -75,7 +75,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 set -- "${__args[@]+"${__args[@]}"}"
-[ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
+# A watcher is started by its monitor and says so: the session Monitor command
+# or a notifier's standby. No tag, no start, and no sentinel is touched.
+case "$WATCHER_ROLE" in
+  session|standby) ;;
+  "") echo "watch-tasks-stream: refusing to start: no --role. A watcher is started by its monitor; pass --role session|standby --inbox <dir>." >&2; exit 64 ;;
+  *) echo "watch-tasks-stream: refusing to start: --role must be session or standby, got '$WATCHER_ROLE'." >&2; exit 64 ;;
+esac
+if [ -z "$WATCHER_INBOX_TAG" ]; then
+  echo "watch-tasks-stream: refusing to start: no --inbox. Pass --role $WATCHER_ROLE --inbox <dir>; the tag is what the supervisor and the self-check read." >&2
+  exit 64
+fi
+# The tag names the inbox when no positional does, so the two can never differ.
+[ $# -gt 0 ] || set -- "$WATCHER_INBOX_TAG"
+echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=$WATCHER_INBOX_TAG pid=$$" >&2
 
 # One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
 # two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
@@ -90,6 +103,10 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(canonical_tasks_dir "$TASKS_DIR")"
+if [ "$(canonical_tasks_dir "$WATCHER_INBOX_TAG")" != "$TASKS_DIR_ABS" ]; then
+  echo "watch-tasks-stream: refusing to start: --inbox $WATCHER_INBOX_TAG names a different directory than the inbox operand $TASKS_DIR_ABS." >&2
+  exit 64
+fi
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
 # inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
@@ -106,8 +123,7 @@ SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 # A holder must be PROVEN: an unreadable process table, or a line that cannot be
 # decided, starts the watcher anyway. Refusing would leave the inbox with no
 # announcer at all, which is worse than the duplicate this check prevents.
-[ -n "$WATCHER_ROLE" ] || echo "watch-tasks-stream: untagged start (no --role); treated as standby for the inbox check. Pass --role session|standby --inbox <dir>." >&2
-__my_kind="$WATCHER_ROLE"; [ "$__my_kind" = "session" ] || __my_kind="standby"
+__my_kind="$WATCHER_ROLE"
 __holders="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders --inbox "$TASKS_DIR_ABS" --exclude "$$" 2>/dev/null)" || __holders="unobserved"
 case "$__holders" in
   none) ;;

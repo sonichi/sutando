@@ -55,7 +55,7 @@ def run(watcher_instance, receipt_owner, want_state=False):
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     if watcher_instance: env["SUTANDO_INSTANCE_ID"] = watcher_instance
     else: env.pop("SUTANDO_INSTANCE_ID", None)
-    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
+    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, start_new_session=True)
     out, t0, seen_state = [], time.time(), set()

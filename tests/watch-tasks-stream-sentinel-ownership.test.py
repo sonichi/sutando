@@ -177,7 +177,7 @@ def main() -> int:
     try:
         # The production shape: every launcher names the inbox as an operand, and
         # the startup self-check can only see an inbox that argv names.
-        a = Watcher(ws, bin_dir, args=(str(ws / "tasks"),))
+        a = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")))
         # A watcher that exits on startup makes every assertion below either
         # fail for the wrong reason or pass vacuously, so establish liveness
         # FIRST and bail with a diagnosis rather than a cascade.
@@ -199,7 +199,7 @@ def main() -> int:
 
         # A second watcher on a watched inbox exits at startup; only --force-restart
         # replaces the holder, and the sentinel must end up naming the replacement.
-        b = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--force-restart"))
+        b = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks"), "--force-restart"))
         check("a SECOND watcher with --force-restart takes ownership of the sentinel",
               wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() not in ("", pid_a),
                        timeout=15),
