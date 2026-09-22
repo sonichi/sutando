@@ -630,5 +630,112 @@ class TestStandbyPresent(unittest.TestCase):
         self.assertIn("usage", err.getvalue())
 
 
+
+
+class TestReadyGateErrorPaths(unittest.TestCase):
+    """Every fallback in the sentinel read and the CLI equals forms, with real inputs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.state)
+        self.ps = f"  100 1 {CORE_SESSION_FLAT}\n"
+        self.vec = vector_for({"100": CORE_SESSION_ARGS})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _sentinel(self, body):
+        with open(os.path.join(self.state, "watch-tasks-stream.pid"), "w") as fh:
+            fh.write(body)
+
+    def test_an_empty_sentinel_is_not_a_stamp(self):
+        self._sentinel("")
+        self.assertFalse(wid.sentinel_names_pid(100, self.state))
+
+    def test_a_sentinel_that_cannot_be_read_is_not_a_stamp(self):
+        self._sentinel("100\n")
+        os.chmod(os.path.join(self.state, "watch-tasks-stream.pid"), 0)
+        try:
+            self.assertFalse(wid.sentinel_names_pid(100, self.state))
+        finally:
+            os.chmod(os.path.join(self.state, "watch-tasks-stream.pid"), 0o644)
+
+    def test_a_missing_state_dir_is_not_a_stamp(self):
+        self.assertFalse(wid.sentinel_names_pid(100, os.path.join(self.tmp, "absent")))
+
+    def test_no_pid_or_no_dir_is_not_a_stamp(self):
+        self.assertFalse(wid.sentinel_names_pid(None, self.state))
+        self.assertFalse(wid.sentinel_names_pid(100, None))
+
+    def test_a_broken_sentinel_helper_is_not_a_stamp(self):
+        self._sentinel("100\n")
+        import util_paths
+        with mock.patch.object(util_paths, "watcher_sentinel_paths", side_effect=RuntimeError("no")):
+            self.assertFalse(wid.sentinel_names_pid(100, self.state))
+
+    def test_cli_ready_equals_form(self):
+        self._sentinel("100\n")
+        out = io.StringIO()
+        with mock.patch.object(wid, "role_present", return_value=True) as rp, \
+                contextlib.redirect_stdout(out):
+            rc = wid.main(["role-present", "session", f"--inbox={INBOX}", f"--ready={self.state}"])
+        rp.assert_called_once_with("session", INBOX, ready=True, state_dir=self.state)
+        self.assertEqual((rc, out.getvalue().strip()), (0, "yes"))
+
+    def test_cli_ready_equals_with_no_value_is_not_ready(self):
+        with mock.patch.object(wid, "role_present", return_value=False) as rp, \
+                contextlib.redirect_stdout(io.StringIO()):
+            wid.main(["role-present", "session", "--ready="])
+        rp.assert_called_once_with("session", None, ready=False, state_dir=None)
+
+
+class TestStandbyPresentEdges(unittest.TestCase):
+    def test_positional_inbox_skips_a_lone_flag_and_a_flag_value(self):
+        self.assertEqual(wid.positional_inbox(["--verbose", INBOX]), INBOX)
+        self.assertEqual(wid.positional_inbox(["--role", "session", "--inbox", INBOX, "/other"]), "/other")
+
+    def test_a_ps_that_raises_is_unknown(self):
+        def run(*_a, **_k):
+            raise OSError("no ps")
+        self.assertIsNone(wid.standby_present(INBOX, run=run))
+
+    def test_a_successful_ps_is_read_from_its_stdout(self):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess(["ps"], 0, f"  100 1 {GENUINE}\n", "")
+        vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", INBOX]})
+        self.assertIs(wid.standby_present(INBOX, run=run, argv_vector=vec), True)
+
+    def test_short_lines_this_process_and_non_watchers_are_skipped(self):
+        ps = f"  1 0\n  {os.getpid()} 1 {GENUINE}\n  200 1 python3 something.py\n"
+        vec = vector_for({"200": ["python3", "something.py"]})
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vec), False)
+
+    def test_an_undecidable_line_for_another_inbox_is_skipped(self):
+        other = "/ws/deliveries/" + "e" * 32
+        ps = f"  100 1 bash /some path/watch-tasks-stream.sh --inbox {other}\n"
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vector_for({})), False)
+
+    def test_an_untagged_watcher_on_another_inbox_is_skipped(self):
+        other = "/ws/deliveries/" + "e" * 32
+        ps = f"  100 1 bash src/watch-tasks-stream.sh {other}\n  101 1 {GENUINE}\n"
+        vec = vector_for({"100": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", other],
+                          "101": ["/bin/bash", "/repo/src/watch-tasks-stream.sh", INBOX]})
+        self.assertIs(wid.standby_present(INBOX, ps_output=ps, argv_vector=vec), True)
+
+    def test_cli_standby_present_equals_form_and_unknown(self):
+        out = io.StringIO()
+        with mock.patch.object(wid, "standby_present", return_value=None) as sp, \
+                contextlib.redirect_stdout(out):
+            rc = wid.main(["standby-present", f"--inbox={INBOX}"])
+        sp.assert_called_once_with(INBOX)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.getvalue().splitlines()[0], "unknown")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(wid.main(["standby-present", "--inbox="]), 64)
+        self.assertIn("usage", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
