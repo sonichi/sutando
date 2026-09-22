@@ -126,20 +126,21 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
 fi
 
+# The config's identity is its content: a checksum changes on every replacement,
+# where mtime (one-second) plus size misses two same-second, same-size rewrites.
+handler_config_stamp() {
+  cksum < "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent
+}
 reload_current_handler() {
   CURRENT_HANDLER="$(task_event_handler "$HANDLER_CONFIG_PATH")" || CURRENT_HANDLER=""
-  HANDLER_CONFIG_STAMP="$(stat -f '%m %z' "$HANDLER_CONFIG_PATH" 2>/dev/null \
-    || stat -c '%Y %s' "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent)"
+  HANDLER_CONFIG_STAMP="$(handler_config_stamp)"
 }
 HANDLER_CONFIG_STAMP=""
-# Before every routing decision: re-read the config only when its mtime or size
-# moved, so a decision never runs on a handler older than the file on disk.
+# Before every routing decision, so no decision runs on a handler older than the
+# file on disk; the JSON is re-read only when the content moved.
 refresh_current_handler() {
   [ -n "$HANDLER_CONFIG_PATH" ] || return 0
-  local stamp
-  stamp="$(stat -f '%m %z' "$HANDLER_CONFIG_PATH" 2>/dev/null \
-    || stat -c '%Y %s' "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent)"
-  [ "$stamp" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
+  [ "$(handler_config_stamp)" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 

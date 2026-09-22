@@ -10,7 +10,9 @@ means the task may reach the core, as it would on the live loop, and the
 config applies to the next task.
 
 A third case distinguishes a per-decision refresh from a reload taken once
-before the sweep: the config changes between two swept items.
+before the sweep: the config changes between two swept items. A fourth makes
+two same-second, equal-size atomic replacements and requires the second one
+to route.
 
 Run: python3 tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py
 """
@@ -250,6 +252,123 @@ check("the second task was routed by the config on disk at ITS decision: never a
       not any(ln.startswith("TASK_FILE: task-b") for ln in out)
       and handled.count("probe") == 1 and handled.count("handle") == 1,
       f"stdout={out!r} handler log={handled!r} results={results!r}")
+
+
+def scenario_same_second_equal_size_replacements():
+    """The config is replaced twice, atomically, with equal-size contents and
+    identical mtimes, while fswatch's delivery is held; a task written in the same
+    instant is then delivered before the config's event. Its routing decision
+    must read the second replacement, not a stamp-equal stale handler."""
+    tmp = Path(tempfile.mkdtemp(prefix="ready-stamp-"))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    b = tmp / "bin"
+    b.mkdir()
+    (b / "fswatch").write_text(
+        f"#!/bin/bash\nexec bash {REPO / 'tests' / 'fixtures' / 'fswatch-poll-stub.sh'} \"$@\"\n")
+    (b / "fswatch").chmod(0o755)
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    handlers = {}
+    for name, rc in (("hA", 3), ("hB", 3), ("hC", 4)):
+        h = tmp / f"{name}.sh"
+        h.write_text('#!/bin/sh\n'
+                     f'for a in "$@"; do [ "$a" = "--probe" ] && {{ echo probe-{name} >> {log}; exit {rc}; }}; done\n'
+                     f'echo handle-{name} >> {log}\nexit {rc}\n')
+        h.chmod(0o755)
+        handlers[name] = h
+    fixed = 1_700_000_000  # one mtime for every replacement
+
+    def publish(name):
+        t = cfg.with_name(f".cfg-{name}.tmp")
+        t.write_text(json.dumps({"handler": str(handlers[name])}))
+        os.utime(t, (fixed, fixed))
+        t.replace(cfg)
+
+    publish("hA")
+    sizes = {cfg.stat().st_size}
+    env = dict(os.environ)
+    env["PATH"] = f"{b}:{env['PATH']}"
+    env["TMPDIR"] = str(tmp)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env["SUTANDO_WORKSPACE_DIR"] = str(ws)
+    env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
+    env.pop("SUTANDO_INSTANCE_ID", None)
+    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+    p = subprocess.Popen(
+        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
+         "--role", "session", "--inbox", str(ws / "tasks")],
+        cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, start_new_session=True)
+    out: list[str] = []
+    stub = None
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 15 and not list((ws / "state").glob("*.pid")):
+            time.sleep(0.1)
+        time.sleep(1.5)  # past the standby wait and the sweep
+        # Hold delivery: the stub is the watcher's fswatch child.
+        kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True).stdout.split()
+        stub = [k for k in kids if "fswatch" in subprocess.run(["ps", "-o", "command=", "-p", k],
+                                                                capture_output=True, text=True).stdout]
+        for k in stub:
+            os.kill(int(k), 19)  # SIGSTOP
+        publish("hB")
+        sizes.add(cfg.stat().st_size)
+        publish("hC")
+        sizes.add(cfg.stat().st_size)
+        final = ws / "tasks" / "task-team.txt"
+        tt = final.with_name(".task-team.tmp")
+        tt.write_text("id: task-team\naccess_tier: team\ntask: restricted\n")
+        tt.replace(final)
+        mtime = int(cfg.stat().st_mtime)
+        for k in stub:
+            os.kill(int(k), 18)  # SIGCONT
+        stub = None
+        os.set_blocking(p.stdout.fileno(), False)
+        t0 = time.time()
+        while time.time() - t0 < 12:
+            time.sleep(0.3)
+            try:
+                c = p.stdout.read()
+            except (BlockingIOError, TypeError):
+                c = None
+            if c:
+                out.extend(c.splitlines())
+            if log.exists() or any("task-team" in ln for ln in out):
+                time.sleep(1.5)
+                try:
+                    c = p.stdout.read()
+                except (BlockingIOError, TypeError):
+                    c = None
+                if c:
+                    out.extend(c.splitlines())
+                break
+        handled = log.read_text().split() if log.exists() else []
+        return out, handled, sizes, mtime
+    finally:
+        for k in stub or []:
+            os.kill(int(k), 18)
+        try:
+            os.killpg(p.pid, 15)
+        except (ProcessLookupError, PermissionError):
+            p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+print("two same-second, equal-size atomic config replacements before the task's decision:")
+out, handled, sizes, mtime = scenario_same_second_equal_size_replacements()
+check("setup: every replacement had the same size and the same mtime",
+      len(sizes) == 1 and mtime == 1_700_000_000, f"sizes={sizes!r} mtime={mtime}")
+check("the task was routed by the SECOND replacement: never announced, handled once by hC",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out)
+      and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
 
 print(("FAILED — " + ", ".join(FAILURES)) if FAILURES else
       "PASS — a task admitted after readiness sees the handler config fswatch delivered before it")
