@@ -461,23 +461,21 @@ ensure_core_monitor() {
     # also makes $! the loop's own pid, so the pidfile can actually stop it.
     # Loop only while the interpreter and script exist, and stop if sleep fails:
     # with them gone (engine dir removed) `while true` would spin at full CPU.
-    # And stop once the core session this loop relays for has been gone for three
-    # checks: a scratch launch (a test, a PR witness) otherwise leaves its loop
-    # running for good, one per launch, since the pidfile is per workspace.
-    # A miss counts only a confirmed absence (mirrors tmux_probe.classify()'s
-    # ABSENT_SIGNATURES by hand -- the body below must stay single-quote free).
+    # And stop once the core session this loop relays for has been gone for
+    # three CONSECUTIVE confirmed-absent checks: a scratch launch (a test, a
+    # PR witness) otherwise leaves its loop running for good. Classification
+    # delegates to tmux_probe.has_session() via tmux-probe-cli.py -- its own
+    # bounded subprocess timeout covers a wedged tmux client, and this stays
+    # the ONE place ABSENT_SIGNATURES is defined.
     if [ -n "$PY" ]; then
-      bash -c 'miss=0; while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do
-        if [ -n "$6" ] && command -v tmux > /dev/null 2>&1; then
-          out="$(tmux -S "$6" has-session -t "=$7" 2>&1 > /dev/null)"; rc=$?
-          if [ "$rc" -eq 0 ]; then
-            miss=0
-          else
-            case "$out" in
-              *"find session"*|*"no server running"*|*"(No such file or directory)"*)
-                miss=$((miss + 1)); [ "$miss" -lt 3 ] || exit 0 ;;
-            esac
-          fi
+      bash -c 'miss=0; srcdir="${2%/*}"; while command -v "$1" > /dev/null 2>&1 && [ -f "$2" ]; do
+        if [ -n "$6" ]; then
+          "$1" "$srcdir/tmux-probe-cli.py" "$6" "=$7"
+          case $? in
+            0) miss=0 ;;
+            1) miss=$((miss + 1)); [ "$miss" -lt 3 ] || exit 0 ;;
+            *) miss=0 ;;
+          esac
         fi
         "$1" "$2" --signal "$3" --state-file "$4" --active-from "$5"; sleep 30 || exit 1; done' \
         relay-loop "$PY" "$REPO/src/core-supervisor-relay.py" "$mon_out" "$relay_state" "$ws/state/last-owner-activity.json" "$TMUX_SOCKET" "$SESSION" \

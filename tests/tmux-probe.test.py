@@ -113,5 +113,52 @@ class TestHasSession(unittest.TestCase):
         self.assertIsNone(tmux_probe.has_session("s.sock", "core", tmux="/nonexistent-tmux-xyz"))
 
 
+class TestTmuxProbeCli(unittest.TestCase):
+    """The CLI start-cli.sh's relay loop calls, exit code only: 0 PRESENT,
+    1 confirmed ABSENT, 2 UNKNOWN. Proves the delegation, not a re-test of
+    classify() -- that stays TestClassify's job."""
+
+    CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "tmux-probe-cli.py")
+
+    def _run(self, argv, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([sys.executable, self.CLI, *argv], env=env,
+                              capture_output=True, timeout=15).returncode
+
+    def test_absent_when_socket_does_not_exist(self):
+        self.assertEqual(self._run(["/tmp/sutando-test-no-such-sock", "=x"]), 1)
+
+    def test_unknown_on_bad_argv(self):
+        self.assertEqual(self._run(["only-one-arg"]), 2)
+
+    def test_unknown_on_unrecognised_tmux_failure(self):
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake = os.path.join(td, "tmux")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\necho 'refused: unrecognised' >&2\nexit 1\n")
+            os.chmod(fake, 0o755)
+            self.assertEqual(self._run(["s.sock", "=x"], path=td), 2)
+
+    def test_present_and_absent_against_a_real_scratch_session(self):
+        import shutil
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "sock")
+            subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", "clitest", "sleep 60"],
+                           check=True)
+            try:
+                self.assertEqual(self._run([sock, "=clitest"]), 0)
+                self.assertEqual(self._run([sock, "=nope"]), 1)
+            finally:
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+
+
 if __name__ == "__main__":
     unittest.main()

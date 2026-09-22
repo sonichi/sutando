@@ -20,6 +20,8 @@ This test extracts the loop body from start-cli.sh and drives it directly:
   e) no socket given: the old inputs-only contract still governs the loop
   f) an ambiguous tmux failure (refused, unrecognised, empty stderr) is
      UNKNOWN, never a confirmed absence, so it cannot end the loop on its own
+  g) structural: the loop delegates to tmux-probe-cli.py, no private copy of
+     tmux's absence-message strings
 
 Run: python3 tests/start-cli-relay-loop-dies-with-its-repo.test.py  (exit 0/1)
 """
@@ -61,6 +63,17 @@ def _run(body: str, argv: list[str], path: str, timeout: float = 5.0):
 def _exe(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(0o755)
+
+
+def _dual_python3_stub(calls: Path, srcdir: Path) -> str:
+    """A fake python3 that still counts relay calls, but really runs
+    tmux-probe-cli.py (real tmux_probe.py copied beside it) when the loop
+    calls it for classification -- the loop's own delegation, exercised."""
+    (srcdir / "tmux_probe.py").write_text((REPO / "src" / "tmux_probe.py").read_text())
+    (srcdir / "tmux-probe-cli.py").write_text((REPO / "src" / "tmux-probe-cli.py").read_text())
+    return (f'#!/bin/sh\ncase "$1" in\n'
+            f'  */tmux-probe-cli.py) exec {sys.executable} "$@" ;;\n'
+            f'  *) echo run >> "{calls}" ;;\nesac\n')
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -134,7 +147,7 @@ else:
         calls = Path(td) / "calls.log"
         script = repo / "src" / "core-supervisor-relay.py"
         script.write_text("# stand-in for the relay\n")
-        _exe(binp / "python3", f'#!/bin/sh\necho run >> "{calls}"\n')
+        _exe(binp / "python3", _dual_python3_stub(calls, repo / "src"))
         _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
         os.symlink(tmux, binp / "tmux")
         sock = Path(td) / "tmux.sock"
@@ -195,17 +208,31 @@ with tempfile.TemporaryDirectory() as td:
     calls = Path(td) / "calls.log"
     script = repo / "src" / "core-supervisor-relay.py"
     script.write_text("# stand-in for the relay\n")
-    # Cap at 6 (a buggy 3-strike loop would stop at 3) and end via script removal.
-    _exe(binp / "python3", f'#!/bin/sh\necho run >> "{calls}"\n'
-         f'[ "$(/usr/bin/wc -l < "{calls}")" -lt 6 ] || /bin/rm -f "$1"\n')
+    # Real classification delegation, plus a relay-call cap (6 -- a buggy
+    # 3-strike loop would stop at 3) that removes the script to end the run.
+    _exe(binp / "python3", f'#!/bin/sh\ncase "$1" in\n'
+         f'  */tmux-probe-cli.py) exec {sys.executable} "$@" ;;\n'
+         f'  *) echo run >> "{calls}"\n'
+         f'     [ "$(/usr/bin/wc -l < "{calls}")" -lt 6 ] || /bin/rm -f "$1" ;;\n'
+         f'esac\n')
+    (repo / "src" / "tmux_probe.py").write_text((REPO / "src" / "tmux_probe.py").read_text())
+    (repo / "src" / "tmux-probe-cli.py").write_text((REPO / "src" / "tmux-probe-cli.py").read_text())
     _exe(binp / "sleep", "#!/bin/sh\nexit 0\n")
     # Always fails with a message that matches none of the absence signatures.
     _exe(binp / "tmux", '#!/bin/sh\necho "unrecognised: permission or version refusal" >&2\nexit 1\n')
     rc, err = _run(body, [str(binp / "python3"), str(script), "SIG", "STATE", "ACTIVE",
-                          "/tmp/does-not-matter.sock", "some-session"], path=str(binp))
+                          "/tmp/does-not-matter.sock", "some-session"], path=str(binp), timeout=10.0)
     n = len(calls.read_text().splitlines()) if calls.exists() else 0
     check("f) an unrecognised tmux failure never ends the loop on its own",
           rc is not None and n == 6, f"rc={rc}; relay ran {n}x (an old 3-strike bug would stop at 3)")
+
+# g) structural: the loop delegates to tmux-probe-cli.py and carries no
+#    private copy of tmux's absence-message strings.
+check("g) the loop body references the shared classification CLI",
+      "tmux-probe-cli.py" in body, "no reference to tmux-probe-cli.py in the loop body")
+check("g) the loop body carries none of tmux's absence-message text",
+      not any(s in body for s in ("find session", "no server running", "No such file")),
+      "the loop body still duplicates a tmux error string instead of delegating")
 
 if failures:
     print("\n".join(f"  FAIL {f}" for f in failures))
