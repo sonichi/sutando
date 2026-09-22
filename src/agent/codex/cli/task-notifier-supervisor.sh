@@ -67,6 +67,21 @@ session_role_verdict() {
   fi
 }
 
+# yes / no / unknown: does a standby-kind watcher (ours or not) already serve
+# this inbox? In standby none is ours, so "yes" means someone else covers it;
+# arming would only start a standby that yields at once, over and over.
+standby_present_verdict() {
+  [ -n "$TASKS_DIR" ] || { echo "unknown"; return; }
+  local out rc
+  out="$("$PY" "$WATCHER_IDENTITY" standby-present --inbox "$TASKS_DIR" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    echo "unknown"
+  fi
+}
+
 stop_child() {
   [ -n "$child_pid" ] || return 0
   # The Python child calls setsid(), so its PID is also the notifier process
@@ -112,6 +127,9 @@ run_notifier_once() {
   child_pid=""
   target_alive || return 1
   [ "$(session_role_verdict)" = "yes" ] && return 2
+  # Our own standby is gone with the child; a standby still present is someone
+  # else's, and the inbox is covered: back to standby rather than a restart loop.
+  [ "$(standby_present_verdict)" = "yes" ] && return 2
   echo "task-notifier-supervisor: notifier exited with status $status; restarting" >&2
   sleep "$RESTART_DELAY"
   return 0
@@ -124,7 +142,7 @@ run_notifier_once() {
 unknown_since=""
 while target_alive; do
   verdict="$(session_role_verdict)"
-  if [ "$verdict" = "yes" ]; then
+  if [ "$verdict" = "yes" ] || { [ "$verdict" = "no" ] && [ "$(standby_present_verdict)" = "yes" ]; }; then
     unknown_since=""
     sleep "$ROLE_POLL"
     continue
@@ -145,7 +163,7 @@ while target_alive; do
       sleep "$ROLE_POLL"
       waited=$((waited + ROLE_POLL))
       v="$(session_role_verdict)"
-      if [ "$v" = "yes" ]; then
+      if [ "$v" = "yes" ] || { [ "$v" = "no" ] && [ "$(standby_present_verdict)" = "yes" ]; }; then
         clear_to_arm=0
         break
       fi

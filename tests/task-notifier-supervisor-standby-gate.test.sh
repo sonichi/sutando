@@ -200,6 +200,31 @@ fi
 tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
 tmux -S "$SOCK" kill-session -t internal-unready >/dev/null 2>&1 || true
 
+# --- scenario 6: a foreign standby-kind watcher on the SAME inbox -> stays in
+# --- standby: arming would start a standby that yields to it at once, on a
+# --- one-second restart loop. A legacy untagged worker watcher has this shape.
+mkdir -p "$WORK/held/tasks"
+MARK6="$WORK/notifier6.marker"
+tmux -S "$SOCK" new-session -d -s foreign-standby -c "$REPO" \
+  "env -u SUTANDO_INSTANCE_ID SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target \
+     bash $WATCHER $WORK/held/tasks --role standby --inbox $WORK/held/tasks > $WORK/foreign-standby.log 2>&1"
+sleep 2
+start_supervisor "$WORK/held/tasks" "$MARK6" 3 1
+if wait_for "$MARK6" 80; then
+  echo "  FAIL: scenario 6 -- armed over a standby-kind watcher that already serves the inbox"
+  fail=1
+else
+  echo "  PASS: scenario 6 -- stayed in standby while a foreign standby-kind watcher held the inbox"
+fi
+tmux -S "$SOCK" kill-session -t foreign-standby >/dev/null 2>&1 || true
+if wait_for "$MARK6" 100; then
+  echo "  PASS: scenario 6 -- armed once the foreign standby was gone"
+else
+  echo "  FAIL: scenario 6 -- never armed after the foreign standby left"
+  fail=1
+fi
+tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+
 if [ "$fail" -eq 0 ]; then
   echo "PASSED: task-notifier-supervisor standby gate"
 else

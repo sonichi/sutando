@@ -102,8 +102,12 @@ the same supervisor pid; the second handoff took 12 s.
   owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
   touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
   different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
-- **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
-  outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
+- **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
+  starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
+  session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and
+  `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. A supervisor
+  whose standby would only yield to a standby-kind watcher someone else already runs on that inbox
+  stays in standby instead of restarting its notifier every second.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
   exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
   30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
