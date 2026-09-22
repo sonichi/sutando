@@ -361,6 +361,55 @@ def role_present(role: str, inbox: Optional[str] = None, ps_output: Optional[str
     return None if saw_undecidable else False
 
 
+def inbox_holders(inbox: str, exclude_pid=None, ps_output: Optional[str] = None,
+                  argv_vector: Optional[Callable] = None,
+                  run: Callable = subprocess.run) -> Optional[List[tuple]]:
+    """Every watcher-shaped process serving `inbox`, tagged or not, ready or not:
+    `[(pid, role), ...]` with role `session`, `standby` or `untagged`. None when the
+    snapshot is unobservable or a watcher-shaped line could be for this inbox but
+    cannot be decided. Presence only: readiness is the supervisor's question."""
+    if ps_output is None:
+        try:
+            result = run(["ps", "-Ao", "pid,ppid,args"],
+                         capture_output=True, text=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            return None
+        if getattr(result, "returncode", None) != 0:
+            return None
+        ps_output = result.stdout
+    want = canonical_inbox(inbox)
+    skip = {str(os.getpid()), str(exclude_pid) if exclude_pid else ""}
+    holders: List[tuple] = []
+    saw_undecidable = False
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        # A forked child of the excluded caller (its own command substitution)
+        # carries the caller's argv and would read as a second watcher.
+        if len(parts) < 3 or parts[0] in skip or parts[1] in skip:
+            continue
+        pid, argv = parts[0], parts[2]
+        verdict = classify_argv(argv, as_pid(pid), argv_vector)
+        if verdict.watcher is False:
+            continue
+        if verdict.watcher is None:
+            flat = flat_inbox(argv)
+            if flat is None or canonical_inbox(flat) == want:
+                saw_undecidable = True
+            continue
+        tagged = watcher_inbox(verdict.operands)
+        theirs = canonical_inbox(tagged if tagged else positional_inbox(verdict.operands))
+        if theirs is None:
+            saw_undecidable = True
+            continue
+        if theirs != want:
+            continue
+        role = watcher_role(verdict.operands)
+        holders.append((int(pid), role if role in ("session", "standby") else "untagged"))
+    if saw_undecidable:
+        return None
+    return holders
+
+
 def standby_present(inbox: str, ps_output: Optional[str] = None,
                     argv_vector: Optional[Callable] = None,
                     run: Callable = subprocess.run) -> Optional[bool]:
@@ -506,6 +555,38 @@ def main(argv=None) -> int:
         if not sink.observed:
             print("why=lsof could not be consulted", file=sys.stderr)
             return 2
+        return 0
+    if args and args[0] == "inbox-holders":
+        rest = args[1:]
+        inbox = None
+        exclude = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--inbox" and i + 1 < len(rest):
+                inbox = rest[i + 1]
+                i += 2
+            elif rest[i].startswith("--inbox="):
+                inbox = rest[i].split("=", 1)[1] or None
+                i += 1
+            elif rest[i] == "--exclude" and i + 1 < len(rest):
+                exclude = as_pid(rest[i + 1])
+                i += 2
+            else:
+                print("usage: watcher_identity.py inbox-holders --inbox VALUE [--exclude PID]", file=sys.stderr)
+                return 64
+        if not inbox:
+            print("usage: watcher_identity.py inbox-holders --inbox VALUE [--exclude PID]", file=sys.stderr)
+            return 64
+        holders = inbox_holders(inbox, exclude_pid=exclude)
+        if holders is None:
+            print("unknown")
+            print("why=ps snapshot unavailable or undecidable")
+            return 2
+        if not holders:
+            print("none")
+            return 0
+        for pid, role in holders:
+            print(f"{pid} {role}")
         return 0
     if args and args[0] == "standby-present":
         rest = args[1:]
