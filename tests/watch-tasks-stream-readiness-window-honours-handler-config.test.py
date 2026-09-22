@@ -12,7 +12,7 @@ config applies to the next task.
 A third case distinguishes a per-decision refresh from a reload taken once
 before the sweep: the config changes between two swept items. A fourth makes
 two same-second, equal-size atomic replacements and requires the second one
-to route.
+to route. A fifth replaces the config between its parse and its stamp.
 
 Run: python3 tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py
 """
@@ -366,6 +366,107 @@ out, handled, sizes, mtime = scenario_same_second_equal_size_replacements()
 check("setup: every replacement had the same size and the same mtime",
       len(sizes) == 1 and mtime == 1_700_000_000, f"sizes={sizes!r} mtime={mtime}")
 check("the task was routed by the SECOND replacement: never announced, handled once by hC",
+      not any(ln.startswith("TASK_FILE: task-team") for ln in out)
+      and handled == ["probe-hC", "handle-hC"],
+      f"stdout={out!r} handler log={handled!r}")
+
+
+def scenario_replacement_between_parse_and_stamp():
+    """The parser is interposed: after it has parsed config A, and before any
+    freshness stamp can be taken, the config is replaced atomically by C
+    (must-handle), with no fswatch event for it. A task pending before start is
+    then decided: it must be routed by C, never announced to the core."""
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="ready-parse-"))
+    ws = tmp / "ws"
+    (ws / "tasks").mkdir(parents=True)
+    (ws / "results" / "archive").mkdir(parents=True)
+    (ws / "state").mkdir()
+    b = tmp / "bin"
+    b.mkdir()
+    (b / "fswatch").write_text(
+        f"#!/bin/bash\nexec bash {REPO / 'tests' / 'fixtures' / 'fswatch-poll-stub.sh'} \"$@\"\n")
+    (b / "fswatch").chmod(0o755)
+    cfg = ws / "state" / "task-event-handler.json"
+    log = tmp / "handler.log"
+    handlers = {}
+    for name, rc in (("hA", 3), ("hC", 4)):
+        h = tmp / f"{name}.sh"
+        h.write_text('#!/bin/sh\n'
+                     f'for a in "$@"; do [ "$a" = "--probe" ] && {{ echo probe-{name} >> {log}; exit {rc}; }}; done\n'
+                     f'echo handle-{name} >> {log}\nexit {rc}\n')
+        h.chmod(0o755)
+        handlers[name] = h
+    cfg.write_text(json.dumps({"handler": str(handlers["hA"])}))
+    (ws / "tasks" / "task-team.txt").write_text("id: task-team\naccess_tier: team\ntask: restricted\n")
+    real_py = shutil.which("python3")
+    swapped = tmp / "swapped"
+    cfg_c = tmp / "cfg-c.json"
+    cfg_c.write_text(json.dumps({"handler": str(handlers["hC"])}))
+    # The interpreter the watcher is told to use: the real python, except that the
+    # first config parse is followed by the atomic replacement A -> C.
+    shim = tmp / "py-shim.sh"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'out="$(' + real_py + ' "$@")"; rc=$?\n'
+        'case "$*" in *json*handler*)\n'
+        f'  if [ ! -e {swapped} ]; then touch {swapped}; cp {cfg_c} {cfg}.tmp && mv {cfg}.tmp {cfg}; fi ;;\n'
+        'esac\n'
+        'printf \'%s\\n\' "$out"; exit $rc\n')
+    shim.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{b}:{env['PATH']}"
+    env["TMPDIR"] = str(tmp)
+    env["SUTANDO_PY"] = str(shim)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env["SUTANDO_WORKSPACE_DIR"] = str(ws)
+    env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
+    env.pop("SUTANDO_INSTANCE_ID", None)
+    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+    p = subprocess.Popen(
+        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
+         "--role", "session", "--inbox", str(ws / "tasks")],
+        cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, start_new_session=True)
+    out: list[str] = []
+    try:
+        os.set_blocking(p.stdout.fileno(), False)
+        t0 = time.time()
+        while time.time() - t0 < 15:
+            time.sleep(0.3)
+            try:
+                c = p.stdout.read()
+            except (BlockingIOError, TypeError):
+                c = None
+            if c:
+                out.extend(c.splitlines())
+            if log.exists() or any("task-team" in ln for ln in out):
+                time.sleep(1.5)
+                try:
+                    c = p.stdout.read()
+                except (BlockingIOError, TypeError):
+                    c = None
+                if c:
+                    out.extend(c.splitlines())
+                break
+        handled = log.read_text().split() if log.exists() else []
+        return out, handled, swapped.exists()
+    finally:
+        try:
+            os.killpg(p.pid, 15)
+        except (ProcessLookupError, PermissionError):
+            p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+print("config replaced atomically after it was parsed and before its stamp was taken:")
+out, handled, swapped = scenario_replacement_between_parse_and_stamp()
+check("setup: the parser hook replaced the config once", swapped)
+check("the pending task was routed by the replacement: never announced, handled once by hC",
       not any(ln.startswith("TASK_FILE: task-team") for ln in out)
       and handled == ["probe-hC", "handle-hC"],
       f"stdout={out!r} handler log={handled!r}")

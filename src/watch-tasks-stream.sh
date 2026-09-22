@@ -128,19 +128,28 @@ fi
 
 # The config's identity is its content: a checksum changes on every replacement,
 # where mtime (one-second) plus size misses two same-second, same-size rewrites.
-handler_config_stamp() {
-  cksum < "$HANDLER_CONFIG_PATH" 2>/dev/null || echo absent
+handler_config_stamp() {  # handler_config_stamp <file>
+  [ -f "$1" ] && cksum < "$1" 2>/dev/null || echo absent
 }
+# One read of the config feeds both the parse and the stamp, so the cached
+# handler and its stamp always describe the same bytes.
 reload_current_handler() {
-  CURRENT_HANDLER="$(task_event_handler "$HANDLER_CONFIG_PATH")" || CURRENT_HANDLER=""
-  HANDLER_CONFIG_STAMP="$(handler_config_stamp)"
+  local snap="$WATCH_RUNTIME_DIR/handler-config.snap"
+  if [ -f "$HANDLER_CONFIG_PATH" ] && cat -- "$HANDLER_CONFIG_PATH" > "$snap" 2>/dev/null; then
+    HANDLER_CONFIG_STAMP="$(handler_config_stamp "$snap")"
+    CURRENT_HANDLER="$(task_event_handler "$snap")" || CURRENT_HANDLER=""
+  else
+    HANDLER_CONFIG_STAMP="absent"
+    CURRENT_HANDLER="$(task_event_handler "$snap.none")" || CURRENT_HANDLER=""
+  fi
+  rm -f "$snap"
 }
 HANDLER_CONFIG_STAMP=""
 # Before every routing decision, so no decision runs on a handler older than the
 # file on disk; the JSON is re-read only when the content moved.
 refresh_current_handler() {
   [ -n "$HANDLER_CONFIG_PATH" ] || return 0
-  [ "$(handler_config_stamp)" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
+  [ "$(handler_config_stamp "$HANDLER_CONFIG_PATH")" = "$HANDLER_CONFIG_STAMP" ] || reload_current_handler
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
