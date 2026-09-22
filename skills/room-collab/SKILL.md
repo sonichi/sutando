@@ -48,6 +48,13 @@ Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
 sentence you own.
 
+**To be seen in a surface you must HOLD it open.** Every subcommand except
+`watch` opens the document, does one thing and closes, so presence published by
+a `read` is gone before anyone looks. `watch` holds the connection — and it
+publishes presence only when given `--name`, so without it you join invisibly.
+Add `--user-id '@you:server'` too: a summon card draws your real avatar when
+the presence summary carries your id, and a placeholder when it does not.
+
 **Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
 `--json` belong to the program, not the command: `room_collab.py --kind board
 read <room>` works, `room_collab.py read <room> --kind board` is refused as
@@ -96,7 +103,7 @@ python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
 python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
 python3 $P reply  '!room:server' '$eventid' 'yes, final'              # answer in a comment's thread
-python3 $P --name mars read '!room:server'            # publish presence while connected
+python3 $P --name mars --user-id '@mars:x' watch '!room:server'   # BE PRESENT: held open, so others see you
 ```
 
 Add `--insecure` only for a local rig with a self-signed certificate.
@@ -254,6 +261,16 @@ Three things that matter more than they look:
 3. **Send deltas, not the document.** `append`/`insert`/`replace` put only the change
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
+
+**Before you design where something is stored, read
+[`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
+arrangements merge and which silently drop a write — many text roots, one map
+key per row, an order derived from `(created, id)` rather than stored. The
+failure it describes does not look like a failure: a row that was written is
+simply not in the list, with no error and no gap, and nobody notices an absence
+they were never shown. Two of us each lost an evening to a premise we had
+stated as a structural constraint without measuring it; the discriminator was
+ten lines both times.
 
 ## Who wrote what
 
