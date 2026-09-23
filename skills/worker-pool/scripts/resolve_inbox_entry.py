@@ -7,7 +7,10 @@ this as an opaque executable (`SUTANDO_INBOX_RESOLVER`) and verifies the answer.
 
 Contract, because the caller enforces it and a violation fails closed there:
 stdout is the payload's ABSOLUTE path and nothing else; any other outcome is a
-non-zero exit with the reason on stderr and an empty stdout.
+non-zero exit with the reason on stderr and an empty stdout. Exit 3 is typed:
+the sentinel names no payload, a verdict about the entry rather than about this
+run of the resolver; every other failure (a timeout, a crash, a bad workspace)
+says nothing about the entry and is worth retrying.
 """
 from __future__ import annotations
 
@@ -17,6 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pool_delivery as pd  # noqa: E402
+
+
+NO_PAYLOAD_RC = 3
+
+
+class NoPayload(ValueError):
+    """The sentinel names no payload: final for the entry, not a resolver fault."""
 
 
 def resolve(entry: str, workspace=None) -> Path:
@@ -31,7 +41,7 @@ def resolve(entry: str, workspace=None) -> Path:
     # name, and the caller adopts the returned basename as the task's identity.
     path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
     if not pd.is_regular_file(path):
-        raise ValueError(f"sentinel {task_id} names no payload at {path}")
+        raise NoPayload(f"sentinel {task_id} names no payload at {path}")
     return path
 
 
@@ -54,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         print(resolve(args[0], workspace))
+    except NoPayload as e:
+        print(f"resolve_inbox_entry: {e}", file=sys.stderr)
+        return NO_PAYLOAD_RC
     except (ValueError, pd.NotDelivered) as e:
         print(f"resolve_inbox_entry: {e}", file=sys.stderr)
         return 1

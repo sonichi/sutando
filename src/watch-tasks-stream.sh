@@ -666,21 +666,23 @@ dispatch_task() {
   # resolve is retried briefly rather than treated as permanent. Same bounded
   # shape as acquire_task_claim's lock race, applied to filesystem visibility
   # instead of lock contention.
-  # Only a fresh sentinel can be racing its payload; an old one that fails to
-  # resolve is final at once, so a sweep over stale sentinels costs one call each.
-  local max_attempts=3 mtime now
+  # Only a fresh sentinel can be racing its payload, and only the resolver's
+  # typed "no payload" verdict (rc 4) is about the entry rather than the run.
+  local max_attempts=3 mtime now age=0
   # GNU first: on GNU, `stat -f` answers a different question and succeeds, so
   # the result is validated as numeric rather than trusted by exit status.
   mtime="$(stat -c %Y -- "$task_path" 2>/dev/null || true)"
   case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m -- "$task_path" 2>/dev/null || true)" ;; esac
   now="$(date +%s)"
-  case "$mtime" in
-    ''|*[!0-9]*) ;;
-    *) [ $((now - mtime)) -gt "$RESOLVE_RACE_WINDOW_S" ] && max_attempts=1 ;;
-  esac
+  case "$mtime" in ''|*[!0-9]*) ;; *) age=$((now - mtime)) ;; esac
   attempt=0
   until resolved="$(resolve_inbox_entry "$task_path")"; do
+    rc=$?
     attempt=$((attempt + 1))
+    if [ "$rc" -eq 4 ] && [ "$age" -gt "$RESOLVE_RACE_WINDOW_S" ]; then
+      echo "watch-tasks-stream: $task_path names no payload and is ${age}s old, past the ${RESOLVE_RACE_WINDOW_S}s race window; not dispatching (1 attempt)" >&2
+      return 0
+    fi
     if [ "$attempt" -ge "$max_attempts" ]; then
       echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
       return 0
