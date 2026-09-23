@@ -242,7 +242,16 @@ def compose_message(signal: dict) -> str:
         where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
                  f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
                  if be else f"where the core is running on {host}")
-        msg += f" — answer it {where}. A chat reply can't answer it."
+        if kind in ("selection", "permission"):
+            # A numbered picker (a model prompt, a login-method menu) or a permission
+            # dialog is also projected to the owner's DM as a HITL card whose buttons
+            # type the answer (src/hitl/tui_gate.py); the card is the owner's first
+            # option, the terminal the second. user feedback 2026-09-17: the core sat on a
+            # model-selection prompt for hours with a notice that only named tmux.
+            msg += (f" — tap an option on the choice card in our DM (it answers for you), or answer it"
+                    f" {where}. A typed chat reply can't answer it.")
+        else:
+            msg += f" — answer it {where}. A chat reply can't answer it."
     return msg
 
 

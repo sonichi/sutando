@@ -283,6 +283,22 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("refuses every turn", m)
         self.assertIn("where the core is running", m)
 
+    def test_a_selection_or_permission_gate_names_the_choice_card_first(self):
+        """A numbered picker or a permission dialog is projected to the owner's DM as a
+        HITL card whose buttons type the answer; the notice must say so before the
+        terminal (user feedback 2026-09-17: a model prompt sat for hours behind a notice
+        that only named tmux). A typed reply still cannot answer it."""
+        for kind, detail in (("selection", "awaiting user: selection"), ("permission", "awaiting user: permission")):
+            sig = {"state": "blocked-human", "detail": detail, "prompt": "pick one", "kind": kind}
+            with _no_backend():
+                m = compose_message(sig)
+            self.assertIn("choice card in our DM", m, kind)
+            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
+            self.assertIn("A typed chat reply can't answer it", m)
+        sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
+        with _no_backend():
+            self.assertNotIn("choice card", compose_message(sig))
+
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
         nor the app can answer it, so the remedy must name the terminal."""
