@@ -343,14 +343,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # `pip install --user` are refused by PEP 668, so the previous
                 # bare `python3 -m pip install detect-secrets` could not succeed
                 # on the most common Sutando host. Verified 2026-07-20.
+                from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
-                    f"can't validate an unquoted value. AGENT: run "
-                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
-                    f"with 'externally-managed-environment' (PEP 668), retry the same "
-                    f"command with --break-system-packages. Then tell the owner to "
-                    f"re-send this vault set (or quote the value next time). Never echo "
-                    f"or ask for the value.]"
+                    f"can't validate an unquoted value. AGENT: {install_hint(sys.executable)}. "
+                    f"Then tell the owner to re-send this vault set (or quote the value next "
+                    f"time). Never echo or ask for the value.]"
                 )
             if not scan_secrets(value):
                 if _LOOKS_LIKE_PLAIN_LOWERCASE_WORD.fullmatch(key):

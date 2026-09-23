@@ -30,6 +30,33 @@ for skill_dir in "$SKILLS_DIR"/*/; do
   fi
 done
 
+# The owner's own skills live in <workspace>/skills/ — the folder that survives an
+# engine update (the engine tree is replaced on update; 2026-09-17 an owner's skill
+# written under engine/sutando/skills/ was erased). A repo skill wins a name collision.
+WS="${SUTANDO_WORKSPACE_DIR:-$(bash "$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh" workspace 2>/dev/null || true)}"
+if [ -n "$WS" ] && [ -d "$WS/skills" ]; then
+  for skill_dir in "$WS"/skills/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_name=$(basename "$skill_dir")
+    [ ! -f "$skill_dir/SKILL.md" ] && continue
+    if [ -d "$SKILLS_DIR/$skill_name" ] && [ -f "$SKILLS_DIR/$skill_name/SKILL.md" ]; then
+      echo "  ⚠ $skill_name (workspace copy shadowed by the shipped skill of the same name — rename yours)"
+      continue
+    fi
+    if [ -L "$TARGET/$skill_name" ] && [ "$(readlink "$TARGET/$skill_name")" = "${skill_dir%/}" ]; then
+      echo "  ↻ $skill_name (workspace skill, symlink exists)"
+    elif [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
+      rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
+      echo "  ✓ $skill_name (workspace skill, relinked — old symlink was broken)"
+    elif [ -e "$TARGET/$skill_name" ]; then
+      echo "  ⚠ $skill_name (workspace skill; target exists, skipping)"
+    else
+      ln -s "${skill_dir%/}" "$TARGET/$skill_name"
+      echo "  ✓ $skill_name (workspace skill)"
+    fi
+  done
+fi
+
 echo ""
 # One release of alias: `room-doc` was renamed `room-collab`. A seat that still
 # says /room-doc gets the new skill; a broken old link is replaced, a real dir is left alone.

@@ -211,3 +211,30 @@ def scan_and_redact(text: str) -> tuple[list[SecretHit], str]:
     """Convenience wrapper for the common scan-then-redact path."""
     hits = scan_secrets(text)
     return hits, redact_secrets(text, hits)
+
+
+# The desktop's bundled interpreter lives inside the engine tree the app
+# replaces on every update (rsync --delete): a pip install there is erased by
+# the next update. Seen twice on one host, 2026-09-16/17 (owner report).
+BUNDLED_PY_MARKER = "/engine/runtime/python/"
+
+
+def is_bundled_interpreter(interpreter: str) -> bool:
+    return BUNDLED_PY_MARKER in str(interpreter)
+
+
+def install_hint(interpreter: str) -> str:
+    """What fixes a missing detect-secrets for THIS interpreter. The desktop's bundled
+    python gets it from the app build (engine/fetch-scanner-deps.sh), never from pip;
+    a host python gets the pip line, with the PEP 668 fallback named up front. Twin of
+    the bash `case` in src/startup.sh's _vault_scanner_check."""
+    if is_bundled_interpreter(interpreter):
+        return (
+            "update the app — this Sutando build did not vendor detect-secrets into its bundled "
+            "Python (engine/fetch-scanner-deps.sh); a pip install into the bundle is erased by "
+            "the next engine update. Until then, quote the value to store it now."
+        )
+    return (
+        f"{interpreter} -m pip install detect-secrets "
+        "(add --break-system-packages if PEP 668 blocks it)"
+    )

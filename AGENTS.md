@@ -302,10 +302,10 @@ with `python3 skills/agent-activity/scripts/activity.py append "<line>" --kind t
 
 ## Workspace layout
 
-- Vision + docs: `README.md` (this directory)
+- Vision + docs: `README.md`
 - Voice agent: `src/voice-agent.ts`
 - Task bridge: `src/task-bridge.ts`
-- Skills: `skills/`
+- Skills: `skills/`; yours: `<workspace>/skills/`
 
 **Looking for where an existing module lives?** [`docs/src-map.md`](docs/src-map.md)
 indexes every agent-facing source module under `src/` with a one-line purpose
