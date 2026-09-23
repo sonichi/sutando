@@ -320,8 +320,7 @@ redispatch_held_tasks() {
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
   done <<< "$held"
 }
-# An elapsed deadline, checked after every event: a busy stream never resets it
-# the way it resets the read timeout.
+# An elapsed deadline, checked after every event; a busy stream never resets it.
 retry_held_tasks_if_due() {
   [ -n "$HELD_NAMES" ] || return 0
   [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
