@@ -50,7 +50,8 @@ async def run(client, pycrdt):
     surface._awareness = aw
 
     hits = []
-    stop = client.RoomDoc._observe_changes(surface, lambda: hits.append(1))
+    # Through the public entry the daemon actually calls.
+    stop = client.RoomDoc.on_activity(surface, lambda: hits.append(1))
     task = asyncio.create_task(aw.start())
     try:
         await asyncio.sleep(2.5)
@@ -84,6 +85,39 @@ async def run(client, pycrdt):
     check("our own edit is not activity", local_edit_hits == 0, f"{local_edit_hits} hits")
 
 
+async def every_kind(client, pycrdt):
+    """The filter must hold for every surface kind, not only markdown."""
+    from room_collab_board import BOARD_KIND, ELEMENTS_KEY
+    from room_kanban import CARDS_KEY, KANBAN_KIND
+
+    for kind, key in ((BOARD_KIND, ELEMENTS_KEY), (KANBAN_KIND, CARDS_KEY)):
+        doc = pycrdt.Doc()
+        doc[key] = pycrdt.Map()
+        aw = pycrdt.Awareness(doc, outdated_timeout=1000)
+        surface = object.__new__(client.RoomDoc)
+        surface._kind, surface._doc, surface._text, surface._awareness = kind, doc, None, aw
+        hits = []
+        stop = client.RoomDoc.on_activity(surface, lambda: hits.append(1))
+        task = asyncio.create_task(aw.start())
+        try:
+            await asyncio.sleep(1.2)
+            renewal = len(hits)
+            with doc.transaction(origin="someone-else"):
+                doc[key]["a"] = {"id": "a"}
+            await asyncio.sleep(0.05)
+            remote_edit = len(hits) - renewal
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await aw.stop()
+            stop()
+        check(f"{kind}: renewal is not activity", renewal == 0, f"{renewal} hits")
+        check(f"{kind}: a remote edit IS activity", remote_edit >= 1, f"{remote_edit} hits")
+
+
 def main():
     try:
         import pycrdt
@@ -92,6 +126,7 @@ def main():
         return 0
     client = load("room_collab_client")
     asyncio.run(run(client, pycrdt))
+    asyncio.run(every_kind(client, pycrdt))
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all activity-filter checks ok'}")
     return 1 if FAILS else 0
 

@@ -450,8 +450,17 @@ def main() -> int:
     check("a second copy is refused", dm.acquire_singleton(lock_ws) is None)
     if first is not None:
         first.close()
-    check("...and the lock is free once it exits",
-          dm.acquire_singleton(lock_ws) is not None)
+    # Keep the handle: the lock lives on the open file description, so dropping
+    # the reference lets GC close it and release the lock under the next caller.
+    again = dm.acquire_singleton(lock_ws)
+    check("...and the lock is free once it exits", again is not None)
+    # main() must refuse BEFORE opening a socket, so credentials it never uses
+    # are supplied; if the refusal moved after the connect this call would hang.
+    rc = dm.main(["--workspace", str(lock_ws), "--url", "wss://example.invalid",
+                  "--token", "unused"])
+    check("a second copy exits non-zero from main() rather than connecting", rc == 3, f"rc={rc}")
+    if again is not None:
+        again.close()
     shutil.rmtree(lock_ws, ignore_errors=True)
 
     shutil.rmtree(TMP, ignore_errors=True)

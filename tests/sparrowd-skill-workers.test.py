@@ -108,6 +108,16 @@ def main() -> int:
         specs, skipped = mod._skill_worker_specs()
         check("a worker name that is a path is refused",
               not any(s.name.startswith("..") for s in specs), str(skipped))
+        declare(worker={"script": None})
+        specs, skipped = mod._skill_worker_specs()
+        check("a declaration with no script is refused",
+              find(specs, "synthetic-worker") is None
+              and any("script is missing" in s for s in skipped), str(skipped))
+        declare(worker={"interpreter": "not-an-object"})
+        specs, skipped = mod._skill_worker_specs()
+        check("a declaration with no interpreter.config is refused",
+              find(specs, "synthetic-worker") is None
+              and any("interpreter.config is missing" in s for s in skipped), str(skipped))
         manifest.write_text("{ not json", encoding="utf-8")
         specs, skipped = mod._skill_worker_specs()
         check("an unreadable manifest is skipped, not raised",
