@@ -57,22 +57,16 @@ stop_watcher() {
   watcher_pid=""
 }
 
-cleanup_notifier() {
-  stop_watcher
-  if [ -n "$event_dir" ]; then
-    rm -f "$event_dir/events"
-    rm -rf "$event_dir/queue" 2>/dev/null || true
-    rmdir "$event_dir" 2>/dev/null || true
-  fi
-}
-trap cleanup_notifier EXIT
 # The supervisor stops this notifier with TERM once a session watcher is ready;
 # say which ending this is, so the log answers "how often was the standby needed".
 # The standby watcher yields to a session watcher it sees before that watcher
 # has stamped, so "ready" is re-polled briefly before an ending is called a loss.
+# $2 = how many times to ask. On a SIGNAL the answer is asked once: the
+# supervisor sends TERM precisely because role-present already said yes, and a
+# handler that polls for seconds delays cleanup_notifier past its killer's patience.
 standby_end_log() {
-  local i v=""
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  local i v="" tries="${2:-10}"
+  for i in $(seq 1 "$tries"); do
     # rc 2 is "the process table could not be read", and under `set -e` a bare
     # assignment from it would end the notifier instead of logging its ending.
     v="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || v="unknown"
@@ -85,8 +79,20 @@ standby_end_log() {
     log_notifier "standby ended for $TASKS_DIR ($1) with no session-role watcher ready"
   fi
 }
-trap 'standby_end_log "stopped by signal"; exit 0' HUP INT TERM
+trap 'exit 0' HUP INT TERM
 
+cleanup_notifier() {
+  # The watcher goes FIRST: the ending is logged from here, and a probe that ran
+  # before the watcher was stopped would delay its kill past a caller's patience.
+  stop_watcher
+  [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1; standby_end_log "${STANDBY_END_WHY:-notifier exiting}" 1; }
+  if [ -n "$event_dir" ]; then
+    rm -f "$event_dir/events"
+    rm -rf "$event_dir/queue" 2>/dev/null || true
+    rmdir "$event_dir" 2>/dev/null || true
+  fi
+}
+trap cleanup_notifier EXIT
 log_notifier() {
   local msg="task-notifier: $*" dir
   dir="$WORKSPACE_DIR/logs"
@@ -595,6 +601,6 @@ while :; do
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
-  standby_end_log "standby watcher exited"
+  STANDBY_END_WHY="standby watcher exited"
   break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"

@@ -290,6 +290,47 @@ class MainLoopWiringTest(FakeTmuxHarness):
             time.sleep(0.1)
         return False
 
+    def tearDown(self):
+        """Every test in this class starts the real main loop, whose standby
+        watcher calls setsid() and so survives a killpg of the notifier."""
+        left = self._kill_strays()
+        super().tearDown()
+        self.assertEqual(left, [], "a fixture watcher or fswatch outlived the test")
+
+    def _strays(self):
+        """Pids still naming this fixture. `pgrep -f` matches the full argv;
+        macOS `ps -o command=` truncates it to the terminal width and would
+        silently report none."""
+        out = subprocess.run(["pgrep", "-f", Path(self.root).name],
+                             capture_output=True, text=True).stdout
+        me = os.getpid()
+        return [int(x) for x in out.split() if x.isdigit() and int(x) != me]
+
+    def _kill_strays(self, grace=5.0):
+        """Reap anything still naming this fixture, by process group."""
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            pids = self._strays()
+            if not pids:
+                return []
+            for pid in pids:
+                for killer in (os.killpg, os.kill):
+                    try:
+                        killer(pid, signal.SIGTERM)
+                        break
+                    except (ProcessLookupError, PermissionError):
+                        continue
+            time.sleep(0.3)
+        for pid in self._strays():
+            for killer in (os.killpg, os.kill):
+                try:
+                    killer(pid, signal.SIGKILL)
+                    break
+                except (ProcessLookupError, PermissionError):
+                    continue
+        time.sleep(0.3)
+        return self._strays()
+
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")

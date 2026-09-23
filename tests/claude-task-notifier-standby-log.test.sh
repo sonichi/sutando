@@ -68,7 +68,7 @@ if grep -q "standby stood down for $WORK/ws/tasks (standby watcher exited)" "$LO
   echo "  PASS (b) the standby watcher yielded on its own and the log says it stood down"
 else
   kill -TERM -- "-$n" 2>/dev/null || kill -TERM "$n" 2>/dev/null   # what the supervisor does on 'yes'
-  wait_log "standby stood down for $WORK/ws/tasks (stopped by signal): a session-role watcher is ready"; check "(b) when stopped while a session watcher is ready, the log says the standby stood down" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|') | n.err: $(tail -2 "$WORK/n.err" | tr '\n' '|')"
+  wait_log "standby stood down for $WORK/ws/tasks (notifier exiting): a session-role watcher is ready"; check "(b) when stopped while a session watcher is ready, the log says the standby stood down" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|') | n.err: $(tail -2 "$WORK/n.err" | tr '\n' '|')"
 fi
 ! grep -q "with no session-role watcher ready" "$LOG"; check "(b) ...and the hand-off was never logged as a loss" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|')"
 for i in $(seq 1 50); do alive "$n" || break; sleep 0.1; done
