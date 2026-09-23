@@ -81,19 +81,26 @@ class AnnouncedEntry(_Workspace):
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
             self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
+    def _cli(self, *argv: str) -> tuple[int, str]:
+        # In-process, so the entry point's own branch is what runs (and is measured).
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = td._main(["announced-entry", str(self.inbox), *argv])
+        return rc, out.getvalue()
+
     def test_the_cli_prints_key_tab_payload_and_refuses_with_1(self):
+        self.assertEqual(self._cli(str(self.payload), "--resolved", str(self.ws / "tasks")),
+                         (0, f"task-abc.txt\t{self.payload}\n"))
+        self.assertEqual(self._cli(str(self.payload), "--resolved"), (2, ""))
+        self.assertEqual(self._cli(str(self.payload)), (1, ""))
+        self.assertEqual(self._cli(str(self.payload), "--bogus"), (2, ""))
+        self.assertEqual(self._cli("task-abc.txt"), (0, f"task-abc.txt\t{self.inbox / 'task-abc.txt'}\n"))
+        # The shipped notifiers reach the same entry point through an interpreter path.
         r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
                             str(self.payload), "--resolved", str(self.ws / "tasks")], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (0, f"task-abc.txt\t{self.payload}\n"))
-        r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
-                            str(self.payload), "--resolved"], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 2)
-        r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
-                            str(self.payload)], capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout), (1, ""))
-        r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
-                            str(self.payload), "--bogus"], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 2)
 
 
 class ShippedEnqueue(_Workspace):
