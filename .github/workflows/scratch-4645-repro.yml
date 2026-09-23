@@ -1,0 +1,37 @@
+name: scratch-4645-repro
+
+# Throwaway workflow for issue #4645 (Linux-only flake reproduction). Only
+# triggers on this one scratch branch; deleted with it.
+on:
+  push:
+    branches: [scratch/4645-loop-repro]
+
+jobs:
+  loop:
+    name: loop the two flaky tests 20x
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+
+      - name: Loop watch-tasks-stream-fallback-receipt-scope + handler-terminal-rc
+        run: |
+          set +e
+          FAIL=0
+          for i in $(seq 1 20); do
+            echo "=== iteration $i: fallback-receipt-scope ==="
+            python3 tests/watch-tasks-stream-fallback-receipt-scope.test.py
+            rc1=$?
+            echo "=== iteration $i: handler-terminal-rc ==="
+            python3 tests/watch-tasks-stream-handler-terminal-rc.test.py
+            rc2=$?
+            if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
+              echo "### FAIL at iteration $i (fallback-receipt-scope rc=$rc1, handler-terminal-rc rc=$rc2)"
+              FAIL=1
+            fi
+          done
+          exit $FAIL
