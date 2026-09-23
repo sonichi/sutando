@@ -46,8 +46,11 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
 # Consecutive composer-not-empty refusals before the owner is told; only they can clear it.
 COMPOSER_BLOCK_ESCALATE_AFTER="${SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER:-4}"
-# Per instance: pool workers share this workspace but each types into its own pane.
-COMPOSER_BLOCK_FILE="$WORKSPACE_DIR/state/task-notifier-composer-block${SUTANDO_INSTANCE_ID:+-$SUTANDO_INSTANCE_ID}"
+# Per instance: pool workers share this workspace but each types into its own pane. Owner: util_paths.
+# Empty when unresolvable; note_composer_block then alerts from memory instead of counting.
+COMPOSER_BLOCK_FILE="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" composer-block-path "$WORKSPACE_DIR/state" 2>/dev/null)" || COMPOSER_BLOCK_FILE=""
+# "incarnation filename" already alerted by this process when the record cannot be written.
+COMPOSER_BLOCK_ALERTED=""
 watcher_pid=""
 event_dir=""
 # FIFO of announced-but-unresolved filenames, as marker files (oldest mtime =
@@ -79,29 +82,70 @@ log_notifier() {
   printf '%s\n' "$msg" >&2
 }
 
-# A file keyed to (core incarnation, task), so the count spans --event runs and retries.
-# No lock: each supervisor runs one notifier child at a time, so there is one writer.
+write_composer_block() {
+  local tmp
+  [ -n "$COMPOSER_BLOCK_FILE" ] || return 1
+  # mv onto a directory moves INTO it and reports success.
+  [ ! -d "$COMPOSER_BLOCK_FILE" ] || return 1
+  mkdir -p "$(dirname "$COMPOSER_BLOCK_FILE")" 2>/dev/null || true
+  tmp="$(mktemp "$COMPOSER_BLOCK_FILE.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s\n' "$1" >"$tmp" 2>/dev/null && mv -f "$tmp" "$COMPOSER_BLOCK_FILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+clear_composer_block() {
+  [ -n "$COMPOSER_BLOCK_FILE" ] || return 0
+  rm -f "$COMPOSER_BLOCK_FILE" 2>/dev/null \
+    || log_notifier "could not clear composer-block record $COMPOSER_BLOCK_FILE; continuing"
+}
+
+alert_composer_block() {
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  command -v osascript >/dev/null 2>&1 || return 0
+  # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
+  (
+    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" &
+    op=$!
+    (
+      trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
+      sleep 2 & s=$!
+      wait "$s" || true
+      kill -TERM "$op" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$op" 2>/dev/null || true
+    ) &
+    wd=$!
+    wait "$op" 2>/dev/null || true
+    kill -TERM "$wd" 2>/dev/null || true
+    wait "$wd" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+}
+
+# Record "n incarnation filename [alerted]", keyed so the count spans --event runs and retries.
+# Persist before alerting; at-least-once: a lost "alerted" write may repeat the alert.
 note_composer_block() {
-  local filename="$1" incarnation="$2" n=0 rec_n rec_inc rec_file tmp op
-  if read -r rec_n rec_inc rec_file 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
+  local filename="$1" incarnation="$2" n=0 alerted="" rec_n rec_inc rec_file rec_alerted
+  if [ -n "$COMPOSER_BLOCK_FILE" ] \
+     && read -r rec_n rec_inc rec_file rec_alerted 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
      && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
     case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
+    [ "$rec_alerted" = alerted ] && alerted=alerted
   fi
   n=$((n + 1))
-  mkdir -p "$(dirname "$COMPOSER_BLOCK_FILE")" 2>/dev/null || true
-  tmp="$(mktemp "$COMPOSER_BLOCK_FILE.XXXXXX" 2>/dev/null)" || tmp=""
-  if [ -n "$tmp" ] && printf '%s %s %s\n' "$n" "$incarnation" "$filename" >"$tmp" 2>/dev/null; then
-    mv -f "$tmp" "$COMPOSER_BLOCK_FILE" 2>/dev/null || rm -f "$tmp"
-  else
-    [ -n "$tmp" ] && rm -f "$tmp"
+  if write_composer_block "$n $incarnation $filename${alerted:+ $alerted}"; then
+    [ -z "$alerted" ] && [ "$n" -ge "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
+    alert_composer_block "$filename" "$n"
+    write_composer_block "$n $incarnation $filename alerted" \
+      || log_notifier "could not record the composer-block alert for $filename; it may repeat"
+    return 0
   fi
-  [ "$n" -eq "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $filename for $n consecutive attempts; clear the composer or press Enter to resume"
-  command -v osascript >/dev/null 2>&1 || return 0
-  # Advisory only: a hung osascript must never stall delivery, so it is backgrounded and bounded.
-  osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" >/dev/null 2>&1 &
-  op=$!
-  ( sleep 2; kill "$op" 2>/dev/null ) >/dev/null 2>&1 &
+  log_notifier "could not persist composer-block count for $filename (${COMPOSER_BLOCK_FILE:-path unresolved}); alerting now"
+  [ "$COMPOSER_BLOCK_ALERTED" = "$incarnation $filename" ] && return 0
+  COMPOSER_BLOCK_ALERTED="$incarnation $filename"
+  alert_composer_block "$filename" "$n"
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -300,7 +344,7 @@ deliver_prompt() {
       note_composer_block "$filename" "$incarnation"
       return 1
     fi
-    rm -f "$COMPOSER_BLOCK_FILE"
+    clear_composer_block
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
@@ -465,7 +509,7 @@ if [ "${1:-}" = "--event" ]; then
 fi
 
 # A new notifier starts a new episode; a record left by the previous one is not its history.
-rm -f "$COMPOSER_BLOCK_FILE"
+clear_composer_block
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-claude-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"

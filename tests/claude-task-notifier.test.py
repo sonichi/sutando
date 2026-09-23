@@ -599,7 +599,7 @@ class EventDispatchTests(FakeTmuxHarness):
                              f"attempt {attempt}: escalate at the 3rd refusal, never again")
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertEqual(log.count("delivery blocked:"), 1)
-        counter = self.root / "workspace" / "state" / "task-notifier-composer-block"
+        counter = self._block_path()
         self.assertEqual(counter.read_text().split()[0], "5")
         # An empty composer ends the episode, so the next block escalates afresh.
         self.pane_file.write_text(IDLE_FOOTER + "\n")
@@ -607,17 +607,79 @@ class EventDispatchTests(FakeTmuxHarness):
                        env_extra={**env, "SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertFalse(counter.exists(), "an empty composer must reset the block count")
 
+    def _block_path(self, env_extra=None):
+        out = subprocess.run(
+            ["python3", str(REPO / "src/util_paths.py"), "composer-block-path",
+             str(self.root / "workspace" / "state")],
+            env=self._env(env_extra), capture_output=True, text=True, check=True)
+        return Path(out.stdout.strip())
+
     def test_block_counts_are_per_instance(self):
         # Pool workers share the core's workspace; one pane's draft must not
         # count toward, or reset, another pane's episode.
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
         self.write_task("task-i.txt")
+        envs = [{"SUTANDO_INSTANCE_ID": "w1", "SUTANDO_AGENT_ID": "@a:x"},
+                {"SUTANDO_INSTANCE_ID": "w2", "SUTANDO_AGENT_ID": "@a:x"},
+                {"SUTANDO_INSTANCE_ID": "w1", "SUTANDO_AGENT_ID": "@b:x"},
+                {"SUTANDO_INSTANCE_ID": "w/1", "SUTANDO_AGENT_ID": "@a:x"}]
+        paths = [self._block_path(e) for e in envs]
+        self.assertEqual(len(set(paths)), len(envs), "each (actor, instance) needs its own record")
         state = self.root / "workspace" / "state"
-        self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w1"}, timeout=8)
-        self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w2"}, timeout=8)
-        self.assertEqual((state / "task-notifier-composer-block-w1").read_text().split()[0], "1")
-        self.assertEqual((state / "task-notifier-composer-block-w2").read_text().split()[0], "1")
+        for env, path in zip(envs, paths):
+            self.assertEqual(path.parent, state, "an instance id must not escape state/")
+            self.run_event("task-i.txt", env_extra=env, timeout=8)
+            self.assertEqual(path.read_text().split()[0], "1", env)
         self.assertFalse((state / "task-notifier-composer-block").exists())
+
+    def test_an_unwritable_record_still_alerts_and_logs(self):
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-u.txt")
+        self._block_path().mkdir(parents=True)
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "4"}
+        res = self.run_event("task-u.txt", env_extra=env, timeout=8)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self._notifications(calls, 1), 1,
+                         "a count that cannot be kept must not silence the owner alert")
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("could not persist composer-block count", log)
+
+    def _incarnation(self, filename, env):
+        self.run_event(filename, env_extra=env, timeout=8)
+        return self._block_path().read_text().split()[1]
+
+    def test_a_record_at_threshold_alerts_unless_already_alerted(self):
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-t.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        inc = self._incarnation("task-t.txt", env)
+        record = self._block_path()
+        # A crash between persisting the count and alerting leaves n >= threshold unmarked.
+        record.write_text(f"5 {inc} task-t.txt\n")
+        self.run_event("task-t.txt", env_extra=env, timeout=8)
+        self.assertEqual(self._notifications(calls, 1), 1)
+        self.assertEqual(record.read_text().split(), ["6", inc, "task-t.txt", "alerted"])
+        self.run_event("task-t.txt", env_extra=env, timeout=8)
+        time.sleep(0.5)
+        self.assertEqual(self._notifications(calls, 1), 1, "an alerted episode must not re-alert")
+
+    def test_startup_survives_an_unremovable_block_record(self):
+        # The startup reset is best-effort: under set -e a failed rm must not kill the notifier.
+        self._block_path().mkdir(parents=True)
+        proc = subprocess.Popen(["/bin/bash", str(NOTIFIER)], env=self._env(), cwd=str(self.root),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            time.sleep(3)
+            self.assertIsNone(proc.poll(), proc.stderr.read() if proc.poll() is not None else "")
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
 
     def _notifications(self, calls, expect):
         # The notification is backgrounded, so its stub may land just after the event returns.
@@ -667,6 +729,30 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("delivery blocked:", (self.logs_dir / "claude-task-notifier.log").read_text())
         # The backgrounded stub writes into the temp dir; wait for it so cleanup cannot race it.
         self.assertEqual(self._notifications(calls, 1), 1)
+
+    def test_a_notification_ignoring_term_is_killed(self):
+        pidfile = self.root / "osascript.pid"
+        calls = self._osascript_stub(f'trap "" TERM\necho $$ > "{pidfile}"\nexec sleep 30')
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-k2.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "1"}
+        self.run_event("task-k2.txt", env_extra=env, timeout=8)
+        self.assertEqual(self._notifications(calls, 1), 1)
+        for _ in range(40):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            self.fail("an osascript that ignores TERM must still be killed")
 
     def test_ghost_text_suggestion_is_not_a_draft(self):
         # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
