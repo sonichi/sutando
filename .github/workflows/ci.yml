@@ -56,8 +56,11 @@ jobs:
                   docs/*|*.md) ;;
                   *) code=true; break ;;
                 esac
-                # A doc a suite pins is code for CI's purposes.
-                if grep -rlF -- "$(basename "$f")" tests scripts skills/*/tests 2>/dev/null | grep -q .; then
+                # A doc a suite pins is code for CI's purposes. grep rc 1 is the only
+                # "not pinned"; a hit (0) or an error (2) both run the suites.
+                rc=0
+                grep -rlqF -- "$(basename "$f")" tests scripts 2>/dev/null || rc=$?
+                if [ "$rc" -ne 1 ]; then
                   code=true; break
                 fi
               done <<< "$files"
