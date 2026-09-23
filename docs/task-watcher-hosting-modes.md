@@ -102,8 +102,18 @@ the same supervisor pid; the second handoff took 12 s.
   owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
   touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
   different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
-- **Workers' watchers are unsupervised.** A pool worker's watcher is started by its session and nothing
-  outside re-arms it; the pool supervisor is to give each worker inbox the same contract: #4600.
+- **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
+  starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
+  session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and
+  `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. An inbox
+  already held by a standby-kind watcher no supervisor started (a legacy untagged one) gets no
+  supervisor until that watcher is replaced: its standby would only yield to the holder, on a loop.
+  The stand-down is readiness-gated here as for the core: a worker's session watcher counts as the
+  holder from the moment it execs, but the standby stays armed until that watcher has proved it can
+  deliver, so the startup-scan window (#4588: a scan that grows with the inbox's backlog) is covered
+  by the standby rather than deaf. What the standby announces reaches the worker's pane only once the
+  notifier accepts a resolver-backed (absolute-path) announcement for a delivery inbox (#4635); until
+  then a supervised worker inbox is heard only by its own session watcher.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
   exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
   30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
@@ -119,7 +129,10 @@ the same supervisor pid; the second handoff took 12 s.
 
 - `tests/watch-tasks-stream-role-session-kills-standby.test.sh`: the handoff contract with the real
   supervisor and notifier (arm after grace, stand down on readiness, re-arm after a kill).
-- `tests/watch-tasks-stream-readiness-window-honours-handler-config.test.py`: the readiness window,
-  buffered replay before the sweep, holds and admissions.
+- `tests/watch-tasks-stream-readiness-window-decision-instant.test.py`,
+  `tests/watch-tasks-stream-readiness-window-unreadable-config.test.py`,
+  `tests/watch-tasks-stream-readiness-window-held-task-recovery.test.py` (split from one combined
+  file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
+  CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.

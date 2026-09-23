@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,6 +34,7 @@ def _sibling(name):
 sys.path.insert(0, str(_HERE))
 sup = _sibling("pool_supervise")
 sw = _sibling("spawn_worker")
+pd = _sibling("pool_delivery")
 ps, wi = sup.ps, sup.wi
 
 RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
@@ -97,6 +100,50 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
             "session_id": out.get("runtime_session_id")}
 
 
+SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
+SUPERVISED, NOT_RUNNING, HELD, SUPERVISOR_FAILED = "supervised", "not-running", "held", "supervisor-failed"
+
+
+def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
+    """Make sure this worker's inbox has its watcher supervisor. Idempotent by the
+    script's own has-session check; a worker whose session is gone gets none."""
+    run = runner or subprocess.run
+    last = _last_run(workspace, worker_id)
+    socket = (last.get("tmux") or {}).get("socket") or ""
+    env = {**os.environ,
+           "SUTANDO_INSTANCE_ID": worker_id,
+           "SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
+           "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
+           "SUTANDO_INBOX_KIND": "deliveries",
+           "SUTANDO_WORKSPACE_DIR": str(workspace),
+           "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+           # The timer's env carries none of the spawner's; the standby watcher needs
+           # the resolver or it announces nothing for a delivery inbox.
+           "SUTANDO_INBOX_RESOLVER": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry")}
+    if socket:
+        env["SUTANDO_TMUX_SOCKET"] = socket
+    try:
+        r = run(["bash", str(Path(repo) / SUPERVISOR_SCRIPT)], env=env,
+                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"worker_id": worker_id, "outcome": SUPERVISOR_FAILED, "why": str(e)}
+    if r.returncode == 0:
+        return {"worker_id": worker_id, "outcome": SUPERVISED}
+    if r.returncode == 3:
+        return {"worker_id": worker_id, "outcome": NOT_RUNNING}
+    if r.returncode == 4:
+        return {"worker_id": worker_id, "outcome": HELD}
+    return {"worker_id": worker_id, "outcome": SUPERVISOR_FAILED,
+            "why": (r.stderr or r.stdout or "").strip()[-300:]}
+
+
+def ensure_supervisors(workspace, repo, observations: dict, *, runner=None) -> dict:
+    """One ensure per worker whose session answered alive this tick: a session
+    that is gone is the recover rung's business, not a supervisor's."""
+    return {w: ensure_supervisor(workspace, repo, w, runner=runner)
+            for w, o in observations.items() if o.get("session_alive") is True}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. Only `recover` acts; `escalate` is returned
     untouched, because asking the owner is the core's, not a timer's."""
@@ -129,6 +176,8 @@ def main(argv=None) -> int:
         return 2
     acted = ({"recoveries": {}, "escalations": [], "dry_run": True} if a.dry_run
              else apply(a.workspace, a.repo, tick["decisions"]))
+    if not a.dry_run:
+        acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
     print(json.dumps({"decisions": tick["decisions"], **acted}, indent=2, sort_keys=True))
     failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
     return 1 if failed else 0

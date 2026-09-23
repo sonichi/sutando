@@ -93,6 +93,9 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # the spawner's --cwd, which need not be the repo, so a relative path would
 # resolve against the wrong directory.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+# The worker's own watcher beats state/watchers/<id>.alive, so the pool can
+# observe it as a file rather than a process scan.
+ENV_ARGS+=(-e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py")
 # Canonical + executable, or EMPTY: a relative/`..` interpreter path resolves
 # against the worker's cwd, and only an explicit -e overrides a stale
 # server-global value.
@@ -140,3 +143,7 @@ if ! launch_claude_session; then
   exit 1
 fi
 echo "Started worker session $SESSION detached."
+# The worker's inbox gets the same hosting-mode supervisor the core has; the
+# remedy timer re-ensures it, so a supervisor that dies is not gone for good.
+SUTANDO_PY="$WORKER_PY" bash "$REPO/skills/worker-pool/scripts/worker-watcher-supervisor.sh" \
+  || echo "  ⚠ the worker's watcher supervisor did not start; the remedy timer retries within 5 min" >&2
