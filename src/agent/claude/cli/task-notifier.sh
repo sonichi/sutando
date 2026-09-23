@@ -85,9 +85,8 @@ cleanup_notifier() {
   # The watcher goes FIRST: the ending is logged from here, and a probe that ran
   # before the watcher was stopped would delay its kill past a caller's patience.
   stop_watcher
-  # Only the hand-off waits: the standby watcher yields the moment it SEES a
-  # session watcher, which may not have stamped yet. Every other ending asks
-  # once, so nothing delays this notifier's own exit.
+  # Only the hand-off waits (the standby yields before the session watcher has
+  # stamped); asking once elsewhere keeps this notifier's own exit prompt.
   [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1
     standby_end_log "${STANDBY_END_WHY:-notifier exiting}" "${STANDBY_END_TRIES:-1}"; }
   if [ -n "$event_dir" ]; then
