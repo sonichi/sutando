@@ -17,6 +17,10 @@ cleanup() {
 }
 trap cleanup EXIT
 check() { if [ "$1" = 0 ]; then echo "  PASS $2"; else echo "  FAIL $2${3:+ — $3}"; fail=1; fi; }
+# The suite OWNS the heartbeat period: on the script's 20 s default the SIGKILL
+# case would wait 4 s, see an untouched cursor because no tick was due, and pass
+# whatever the heartbeat does. Short here, and every wait is derived from it.
+export SUTANDO_TAIL_HEARTBEAT_SEC=1
 WS="$WORK/ws"; mkdir -p "$WS/tasks" "$WS/state" "$WS/logs"
 LOG="$(python3 "$REPO/src/util_paths.py" watcher-log "$WS" "$WS/tasks")"
 CUR="$(python3 "$REPO/src/util_paths.py" watcher-log-cursor "$WS" "$WS/tasks")"
@@ -69,10 +73,12 @@ check $? "(c) a reader that stopped touching it reads as stale, which is what th
 P="$(run "$WORK/k.out")"; PIDS+=("$P")
 settle 1; check $? "(c2) a reader is up on the log" "cursor=$(cur_n)"
 kill -KILL "$P" 2>/dev/null; wait "$P" 2>/dev/null
+# Long enough for SEVERAL ticks: one tick's worth would pass even if the
+# heartbeat never checked the reader, which is the mutant this must catch.
 M0="$(stat -c %Y "$CUR" 2>/dev/null || stat -f %m "$CUR")"
-sleep "$(( ${SUTANDO_TAIL_HEARTBEAT_SEC:-2} + 2 ))"
+sleep "$(( SUTANDO_TAIL_HEARTBEAT_SEC * 4 + 1 ))"
 M1="$(stat -c %Y "$CUR" 2>/dev/null || stat -f %m "$CUR")"
-[ "$M0" = "$M1" ]; check $? "(c2) the cursor stops being touched once the reader is SIGKILLed" "mtime $M0 -> $M1"
+[ "$M0" = "$M1" ]; check $? "(c2) the cursor stops being touched once the reader is SIGKILLed (waited $(( SUTANDO_TAIL_HEARTBEAT_SEC * 4 + 1 ))s = 4 ticks)" "mtime $M0 -> $M1"
 [ -z "$(pgrep -f "tail -n \+.*$(basename "$LOG")" 2>/dev/null)" ]
 check $? "(c2) ...and the orphaned tail is taken with it" "left: $(pgrep -f "tail -n \+.*$(basename "$LOG")" | tr '\n' ' ')"
 
