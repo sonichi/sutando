@@ -20,6 +20,14 @@ cleanup() {
 trap cleanup EXIT
 check() { if [ "$2" = 0 ]; then echo "  PASS $1"; else echo "  FAIL $1${3:+ — $3}"; fail=1; fi; }
 alive() { kill -0 "$1" 2>/dev/null; }
+start_inst() {  # start_inst <ws> <inbox> <instance> <name>; prints the pid
+  local ws="$1" inbox="$2" inst="$3" name="$4"
+  env -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
+      SUTANDO_INSTANCE_ID="$inst" SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" \
+      python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      bash "$WATCHER" "$inbox" --role session --inbox "$inbox" > "$WORK/$name.out" 2> "$WORK/$name.err" &
+  echo $!
+}
 start() {  # start <ws-env> <inbox> <name> [args]; prints the pid
   local ws="$1" inbox="$2" name="$3"; shift 3
   env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
@@ -60,30 +68,31 @@ for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 grep -q "(it named '999999' before)" "$WORK/third.err"; check "(b) ...naming what it found" $?
 
 # (c) a ready holder is left alone: no re-stamp line, sentinel unchanged
-before="$(stat -f %m "$SENT" 2>/dev/null || stat -c %Y "$SENT")"
-sleep 1.1
+# Content, not mtime: a 1 s granularity clock makes an mtime comparison a race,
+# and what must not change is WHOSE pid the sentinel names.
+before="$(cat "$SENT")"
 n="$(start "$WS" "$WS/tasks" fourth)"; PIDS+=("$n")
 for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
-after="$(stat -f %m "$SENT" 2>/dev/null || stat -c %Y "$SENT")"
-[ "$before" = "$after" ] && ! grep -q 're-stamped' "$WORK/fourth.err"; check "(c) a ready holder's sentinel is not rewritten by a covered start" $?
+[ "$(cat "$SENT")" = "$before" ] && [ "$before" = "$h" ] && ! grep -q 're-stamped' "$WORK/fourth.err"; check "(c) a ready holder's sentinel is not rewritten by a covered start" $? "before=$before now=$(cat "$SENT") | $(tail -2 "$WORK/fourth.err" | tr '\n' '|')"
 
-# (d) the workspace guard: an inbox outside the named workspace is refused
-OTHER="$WORK/other"; mkdir -p "$OTHER/tasks" "$OTHER/state"
-# Foreground: the refusal is immediate, and only a direct child yields its rc.
-env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
-    SUTANDO_WORKSPACE_DIR="$WS" PATH="$WORK/stubbin:$PATH" \
-    bash "$WATCHER" "$OTHER/tasks" --role session --inbox "$OTHER/tasks" > "$WORK/guard.out" 2> "$WORK/guard.err"; rc=$?
-[ "$rc" = 64 ]; check "(d) an inbox not under SUTANDO_WORKSPACE_DIR is refused (rc $rc)" $? "$(tail -2 "$WORK/guard.err" | tr '\n' '|')"
-grep -q "is not under SUTANDO_WORKSPACE_DIR=" "$WORK/guard.err"; check "(d) ...naming the mismatch" $?
-[ "$(cat "$SENT" 2>/dev/null)" = "$h" ] && [ -z "$(ls "$OTHER"/state/*.pid 2>/dev/null)" ]; check "(d) ...and no sentinel was touched in either tree" $?
-# ...while the two production shapes still start: a worker inbox under the workspace, and no env at all
-mkdir -p "$WS/deliveries/w1"
-w="$(start "$WS" "$WS/deliveries/w1" worker)"; PIDS+=("$w")
-for i in $(seq 1 150); do [ "$(cat "$WS"/state/*.pid 2>/dev/null | grep -c "^$w\$")" = 1 ] && break; sleep 0.1; done
-alive "$w"; check "(d) a worker inbox under the workspace starts" $? "$(tail -2 "$WORK/worker.err" | tr '\n' '|')"
-NOENV="$WORK/noenv"; mkdir -p "$NOENV/tasks" "$NOENV/state"
-e="$(start "" "$NOENV/tasks" noenv)"; PIDS+=("$e")
-ready "$NOENV" "$e"; check "(d) with no SUTANDO_WORKSPACE_DIR the inbox's parent is the workspace, as before" $? "$(tail -2 "$WORK/noenv.err" | tr '\n' '|')"
+# (d) Only this seat's own sentinel is written: a start whose identity is not the
+#     inbox's owner leaves the holder unready rather than mislabelling a sentinel.
+WS2="$WORK/ws2"; mkdir -p "$WS2/deliveries/w1" "$WS2/state"
+hw="$(start_inst "$WS2" "$WS2/deliveries/w1" w1 holderw)"; PIDS+=("$hw")
+for i in $(seq 1 150); do [ -n "$(ls "$WS2"/state/*+w1.pid 2>/dev/null)" ] && break; sleep 0.1; done
+SENT2="$(ls "$WS2"/state/*+w1.pid 2>/dev/null | head -1)"
+[ -n "$SENT2" ] && [ "$(cat "$SENT2")" = "$hw" ]; check "(d) a worker holder is ready on its own inbox" $? "state=$(ls "$WS2/state" | tr '\n' ' ')"
+rm -f "$SENT2"
+n="$(start_inst "$WS2" "$WS2/deliveries/w1" w2 stranger)"; PIDS+=("$n")
+for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
+! alive "$n"; check "(d) a start from another identity still yields to the holder" $?
+[ -z "$(ls "$WS2"/state/*+w2.pid 2>/dev/null)" ] && [ -z "$(ls "$WS2"/state/*+w1.pid 2>/dev/null)" ]; check "(d) ...and wrote no sentinel of its own for the holder's pid" $? "state=$(for f in "$WS2/state"/*.pid; do printf '%s=%s ' "$(basename "$f")" "$(cat "$f" 2>/dev/null)"; done)"
+! grep -q 're-stamped' "$WORK/stranger.err"; check "(d) ...and said nothing about re-stamping" $? "$(tail -2 "$WORK/stranger.err" | tr '\n' '|')"
+# ...while the inbox's own identity does re-stamp it.
+n="$(start_inst "$WS2" "$WS2/deliveries/w1" w1 owner2)"; PIDS+=("$n")
+for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
+[ "$(cat "$WS2"/state/*+w1.pid 2>/dev/null)" = "$hw" ]; check "(d) the inbox's own identity re-stamps the holder's pid" $? "$(tail -2 "$WORK/owner2.err" | tr '\n' '|')"
+
 
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASS"; else echo "TESTS FAILED"; exit 1; fi

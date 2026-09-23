@@ -110,16 +110,6 @@ fi
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
 # inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
-# A named workspace must contain the inbox: a fixture inbox under a LIVE
-# SUTANDO_WORKSPACE_DIR (a test run from a worker's shell) would stamp the live
-# state dir and take the live watcher's readiness sentinel with it on exit.
-if [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
-  __ws_abs="$(cd "$SUTANDO_WORKSPACE_DIR" 2>/dev/null && pwd -P || printf '%s' "$SUTANDO_WORKSPACE_DIR")"
-  case "$TASKS_DIR_ABS/" in
-    "$__ws_abs"/*) ;;
-    *) echo "watch-tasks-stream: refusing to start: inbox $TASKS_DIR_ABS is not under SUTANDO_WORKSPACE_DIR=$__ws_abs; a test must point SUTANDO_WORKSPACE_DIR at its own fixture." >&2; exit 64 ;;
-  esac
-fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # shellcheck source=../scripts/python-binary.sh
@@ -217,12 +207,20 @@ case "$__holders" in
         # A live session holder whose sentinel is gone or names another pid reads
         # as unready to every probe (the Stop hook's included) and nothing else
         # will stamp it: put the holder's own pid back before yielding to it.
-        if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
+        # A live session holder whose sentinel is gone or names another pid reads
+        # as unready to every probe (the Stop hook's included) and nothing else
+        # will stamp it. Only THIS SEAT's own sentinel may be written, so the
+        # re-stamp runs only when the inbox is this identity's own (a worker's
+        # deliveries/<id>, or the core's tasks/ with no instance id) and no
+        # sentinel anywhere already names the holder.
+        if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
+           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
+                \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$(basename "$TASKS_DIR_ABS")" = "tasks" \) ] \
+           && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
+           && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"
-          if [ "$__hprev" != "$__hpid" ]; then
-            mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
-            echo "$__hpid" > "$__hsent" && echo "watch-tasks-stream: re-stamped $__hsent for live holder pid $__hpid (it named '${__hprev:-<nothing>}' before)" >&2
-          fi
+          mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
+          echo "$__hpid" > "$__hsent" && echo "watch-tasks-stream: re-stamped $__hsent for live holder pid $__hpid (it named '${__hprev:-<nothing>}' before)" >&2
         fi
         # stdout, in the TASK_FILE shape: a Monitor-hosted caller sees stdout as
         # its event stream and would never read the stderr line.
