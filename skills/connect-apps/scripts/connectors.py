@@ -1010,7 +1010,10 @@ def cmd_status(
     rows = cloud.connection_rows(cached=True)
     connections = [
         {"id": r.get("id"), "toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status"),
-         "accountLabel": r.get("accountLabel")}
+         "accountLabel": r.get("accountLabel"),
+         # The account the agent uses for the app unless a call names another
+         # (agent-universe #279). None: the cloud predates the flag.
+         "isDefault": r.get("isDefault")}
         for r in rows
         if isinstance(r, dict)
     ]

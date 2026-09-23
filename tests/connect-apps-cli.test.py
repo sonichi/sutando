@@ -1165,8 +1165,10 @@ class TestSwitch(Base):
         code, out = run(self.ws, ["status", "linear"], cloud)
         self.assertEqual(code, connectors.EXIT_OK)
         self.assertEqual(out["connections"], [
-            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com"},
-            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None}])
+            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com",
+             "isDefault": None},
+            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None,
+             "isDefault": None}])
         self.assertEqual(cloud.paths, ["/api/connectors"])
 
     def test_active_connections_keeps_ids_of_active_rows(self):

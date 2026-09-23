@@ -278,10 +278,28 @@ The resume task of a switch wait says "signed in with the new account" and is ha
 now signed in with the new account."). The label is personal: in a shared room it goes on the private
 card with `note`, never in the room.
 
+## Two accounts of one app
+
+The owner may keep two accounts of one app connected (a personal and a work Gmail). `composio_find`
+lists them under the app's `accounts` (`id`, `label`, `is_default`) only when there are two or more;
+`python3 "$C" status` shows `isDefault` on each connection.
+
+- **The ask names one** ("check my work Gmail", "put it on my personal calendar", "from
+  me@work.com"): pass `account` to `composio_exec` with the label or a unique part of it
+  (`"account": "work"`). Never pick by guessing which one they meant.
+- **The ask names none:** pass no `account`; the call uses their default account.
+- **`account_ambiguous` / `account_not_found`:** the error's `accounts` lists the candidates. Ask in
+  the owner's DM which one, naming the labels ("Your work Gmail (me@work.com) or the personal one
+  (me@gmail.com)?"). Labels are personal: never in a room with other people.
+- **"Use my work account by default" / "add my other Gmail":** no card. Say "You can add an account
+  and pick the default in Settings → Integrations (Add account / Use by default)." You never change
+  the default yourself.
+
 ## Which apps am I connected to? Disconnect <app>
 
 - **"Which apps am I connected to?"** Run `python3 "$C" status`. List the apps whose `connections`
-  status is `active`, each with its `accountLabel` when there is one, and end with "Manage them in
+  status is `active`, each with its `accountLabel` when there is one (an app with two accounts: both,
+  the `isDefault` one marked "default"), and end with "Manage them in
   Settings → Integrations." Account labels are personal: answer only where private content may go
   (the owner's confirmed DM, see "Where the answer may go"); from a shared room, send it to the DM and
   say only "I sent it to you in our DM."
@@ -390,7 +408,8 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
-- Never disconnect an app, and never switch one without the owner's card tap.
+- Never disconnect an app, and never switch one without the owner's card tap. Never change which of
+  two accounts is the default: that is Settings → Integrations.
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
