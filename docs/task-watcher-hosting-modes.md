@@ -108,6 +108,12 @@ the same supervisor pid; the second handoff took 12 s.
   `pool_remedy.py` re-ensures it each tick for every worker whose session answers alive. An inbox
   already held by a standby-kind watcher no supervisor started (a legacy untagged one) gets no
   supervisor until that watcher is replaced: its standby would only yield to the holder, on a loop.
+  The stand-down is readiness-gated here as for the core: a worker's session watcher counts as the
+  holder from the moment it execs, but the standby stays armed until that watcher has proved it can
+  deliver, so the startup-scan window (#4588: a scan that grows with the inbox's backlog) is covered
+  by the standby rather than deaf. What the standby announces reaches the worker's pane only once the
+  notifier accepts a resolver-backed (absolute-path) announcement for a delivery inbox (#4635); until
+  then a supervised worker inbox is heard only by its own session watcher.
 - **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
   exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
   30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
