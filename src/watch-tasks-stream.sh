@@ -204,15 +204,8 @@ case "$__holders" in
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "standby" ]; then
           continue   # the designed handoff: the standby leaves once this watcher is ready
         fi
-        # A live session holder whose sentinel is gone or names another pid reads
-        # as unready to every probe (the Stop hook's included) and nothing else
-        # will stamp it: put the holder's own pid back before yielding to it.
-        # A live session holder whose sentinel is gone or names another pid reads
-        # as unready to every probe (the Stop hook's included) and nothing else
-        # will stamp it. Only THIS SEAT's own sentinel may be written, so the
-        # re-stamp runs only when the inbox is this identity's own (a worker's
-        # deliveries/<id>, or the core's tasks/ with no instance id) and no
-        # sentinel anywhere already names the holder.
+        # An unready live holder is stamped by nobody else; only THIS SEAT's own
+        # sentinel may be written, so the inbox must be this identity's own.
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
            && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
                 \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$(basename "$TASKS_DIR_ABS")" = "tasks" \) ] \
