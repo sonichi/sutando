@@ -144,11 +144,24 @@ def main() -> int:
     print("── the lock: concurrent agents must not lose a registration ──")
     race = TMP / "race.json"
     N = 16
+    # Bounded: a worker exception that cannot be pickled back leaves the parent
+    # waiting forever, and the suite then blames a timeout instead of the cause.
+    timed_out = False
     with mp.Pool(8) as pool:
-        pool.map(_register, [(str(race), n) for n in range(N)])
-    rooms = sorted(e["room"] for e in store.read_entries(race))
-    check(f"all {N} concurrent registrations survive",
-          rooms == sorted((f"!r{n}" for n in range(N))), f"got {len(rooms)} of {N}")
+        try:
+            pool.map_async(_register, [(str(race), n) for n in range(N)]).get(timeout=120)
+        except mp.TimeoutError:
+            timed_out = True
+            pool.terminate()
+        except Exception as exc:  # noqa: BLE001 - the cause belongs in the report
+            check(f"all {N} concurrent registrations survive", False, f"worker raised: {exc!r}")
+            timed_out = True
+    if not timed_out:
+        rooms = sorted(e["room"] for e in store.read_entries(race))
+        check(f"all {N} concurrent registrations survive",
+              rooms == sorted((f"!r{n}" for n in range(N))), f"got {len(rooms)} of {N}")
+    elif timed_out:
+        check(f"all {N} concurrent registrations survive within 120s", False, "timed out")
 
     print("── upsert / without ──")
     es = [{"room": "!a", "kind": "markdown", "summoned_at": 1}]
