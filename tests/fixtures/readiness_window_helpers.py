@@ -16,9 +16,8 @@ from clean_watcher_env import clean_env  # noqa: E402
 
 
 def watcher_env(tmp, ws, b, extra=None):
-    # clean_env(), not dict(os.environ): a live pool worker's real SUTANDO_*
-    # state (SUTANDO_INBOX_RESOLVER, ...) otherwise leaks into the watcher
-    # subprocess under test. See #4649.
+    # clean_env(), not dict(os.environ): a live worker's real SUTANDO_* env
+    # otherwise leaks into the watcher subprocess under test.
     env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
