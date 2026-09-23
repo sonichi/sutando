@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -109,6 +110,73 @@ class Counts(unittest.TestCase):
         r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", task_file, "--inbox", str(self.inbox)],
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "1"))
+
+
+class ResolvedOncePerCall(unittest.TestCase):
+    """Ready results are resolved in one pass per call, in every layout the per-id
+    helper knows, and the number of directory listings does not grow with the inbox."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name).resolve()
+        for d in ("tasks", "results", "results/archive", "results/archive/2026-08", "results/archive-2026-09-01", "state"):
+            (self.ws / d).mkdir(parents=True)
+        self.inbox = self.ws / "deliveries" / "w1"
+        self.inbox.mkdir(parents=True)
+        spec = importlib.util.spec_from_file_location("task_dispatch", REPO / "src" / "delivery" / "task_dispatch.py")
+        self.td = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(self.td)
+
+    def _sentinel(self, tid: str) -> None:
+        _task(self.ws / "tasks" / f"{tid}.txt", tid)
+        (self.inbox / f"{tid}.txt").write_text("")
+
+    def test_every_result_layout_agrees_with_the_per_id_helper(self):
+        r = self.ws / "results"
+        layouts = {
+            "task-live": r / "task-live.txt",
+            "task-flat": r / "archive" / "task-flat.txt",
+            "task-flat-epoch": r / "archive" / "task-flat-epoch-1790000000.txt",
+            "task-month": r / "archive" / "2026-08" / "task-month.txt",
+            "task-month-epoch": r / "archive" / "2026-08" / "task-month-epoch-1790000001.txt",
+            "task-day": r / "archive-2026-09-01" / "task-day.txt",
+            "task-day-epoch": r / "archive-2026-09-01" / "task-day-epoch-1790000002.txt",
+        }
+        for tid, path in layouts.items():
+            self._sentinel(tid)
+            path.write_text("done\n")
+        self._sentinel("task-placeholder")                      # live empty, archived ready
+        (r / "task-placeholder.txt").write_text("  \n")
+        (r / "archive" / "task-placeholder.txt").write_text("done\n")
+        self._sentinel("task-open")                             # no result anywhere
+        self._sentinel("task-blank")                            # only a whitespace placeholder
+        (r / "task-blank.txt").write_text("\n")
+        names = sorted(p.name for p in self.inbox.iterdir())
+        batch = self.td.ready_result_filenames(r, names)
+        per_id = {n for n in names if self.td.has_ready_result(r, n)}
+        self.assertEqual(batch, per_id)
+        self.assertEqual(sorted(batch), sorted(f"{t}.txt" for t in list(layouts) + ["task-placeholder"]))
+        self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, self.inbox)), ["task-blank", "task-open"])
+
+    def test_directory_listings_do_not_grow_with_the_inbox(self):
+        r = self.ws / "results"
+        for i in range(400):                                    # a flat archive far larger than the inbox
+            (r / "archive" / f"task-spent-{i}-1790000000.txt").write_text("done\n")
+        for i in range(60):
+            self._sentinel(f"task-spent-{i}")
+        self._sentinel("task-open")
+        calls = []
+        real_scandir = os.scandir
+
+        def counting_scandir(path=".", *a, **k):
+            calls.append(str(path))
+            return real_scandir(path, *a, **k)
+        with unittest.mock.patch("os.scandir", counting_scandir):
+            self.assertEqual([t["id"] for t in tq.pending(self.ws, self.inbox)], ["task-open"])
+        # live results, archive/, its month dirs (1), the base for retention dirs (1), and the inbox itself.
+        self.assertLessEqual(len(calls), 8, calls)
 
 
 class EmitPassesTheInbox(unittest.TestCase):

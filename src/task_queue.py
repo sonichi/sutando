@@ -85,11 +85,12 @@ def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> l
     except (FileNotFoundError, NotADirectoryError):
         return []
     if inbox:
-        # A delivery sentinel is never retired on a live host, so its presence proves
-        # nothing; an entry is pending only while its task has no ready result.
-        from delivery.task_dispatch import has_ready_result
-        results_dir = ws / "results"
-        paths = [p for p in paths if p.name.endswith(".txt") and not has_ready_result(results_dir, p.name)]
+        # A sentinel is never retired on a live host: an entry is pending only while its task
+        # has no ready result, resolved for the whole inbox at once (listed, not globbed per entry).
+        from delivery.task_dispatch import ready_result_filenames
+        paths = [p for p in paths if p.name.endswith(".txt")]
+        ready = ready_result_filenames(ws / "results", [p.name for p in paths])
+        paths = [p for p in paths if p.name not in ready]
     out = []
     for p in sort_tasks_by_priority(paths):
         try:
