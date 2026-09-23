@@ -69,11 +69,17 @@ class Counts(unittest.TestCase):
                             "--inbox", str(self.inbox)], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "1"))
         self.assertFalse((self.ws / "state" / "task-queue.json").exists())
-        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt")],
-                           capture_output=True, text=True)
+        # The shipped core passes its own inbox, which is tasks/: same count, snapshot written.
+        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt"),
+                            "--inbox", str(self.ws / "tasks")], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "3"))
         snap = json.loads((self.ws / "state" / "task-queue.json").read_text())
         self.assertEqual(snap["depth"], 4)
+        (self.ws / "state" / "task-queue.json").unlink()
+        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt")],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "3"))
+        self.assertTrue((self.ws / "state" / "task-queue.json").exists())
 
 
 class EmitPassesTheInbox(unittest.TestCase):
@@ -102,9 +108,13 @@ class EmitPassesTheInbox(unittest.TestCase):
             (inbox / "task-mine-2.txt").write_text("")
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(r.stdout, "QUEUE: 1 pending after this\nEND\n", r.stderr)
-            env.pop("TASKS_DIR_ABS")                            # the core: no inbox, tasks/ as before
+            # The core: its watcher names its inbox too, and that inbox is tasks/. The count is
+            # the core's queue as before, and the snapshot is refreshed on the announcement.
+            env["TASKS_DIR_ABS"] = str(ws / "tasks")
+            self.assertFalse((ws / "state" / "task-queue.json").exists())
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(r.stdout, "QUEUE: 2 pending after this\nEND\n", r.stderr)
+            self.assertEqual(json.loads((ws / "state" / "task-queue.json").read_text())["depth"], 3)
 
 
 if __name__ == "__main__":

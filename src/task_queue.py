@@ -145,7 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         a = ap.parse_args(argv)
         ws = _workspace_of(a.task_file, a.workspace)
         tid = a.task_id or (_task_id(Path(a.task_file)) if a.task_file else None)
+        # The core's watcher names its inbox too, and its inbox IS tasks/: that is the
+        # no-inbox case, snapshot and all, not a worker's.
         inbox = a.inbox or None
+        if inbox and ws is not None and Path(inbox).resolve() == (ws / "tasks").resolve():
+            inbox = None
         if a.cmd == "pending":
             print(json.dumps(pending(ws, inbox)))
         elif a.cmd == "snapshot":
