@@ -66,7 +66,16 @@ cleanup_notifier() {
   fi
 }
 trap cleanup_notifier EXIT
-trap 'exit 0' HUP INT TERM
+# The supervisor stops this notifier with TERM once a session watcher is ready;
+# say which ending this is, so the log answers "how often was the standby needed".
+standby_end_log() {
+  if [ "$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "yes" ]; then
+    log_notifier "standby stood down for $TASKS_DIR ($1): a session-role watcher is ready"
+  else
+    log_notifier "standby ended for $TASKS_DIR ($1) with no session-role watcher ready"
+  fi
+}
+trap 'standby_end_log "stopped by signal"; exit 0' HUP INT TERM
 
 log_notifier() {
   local msg="task-notifier: $*" dir
@@ -356,9 +365,12 @@ task_payload() {
   printf '%s' "${p:-$TASKS_DIR/$1}"
 }
 
+# The notifier only ever delivers as the STANDBY (a session watcher stands it
+# down), so the prompt says so and names the re-arm: the session reading it is
+# looking at exactly the problem the Stop hook would otherwise block on later.
 task_prompt() {
-  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s.' \
-    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1"
+  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash %s/src/watch-tasks-stream.sh "%s" --role session --inbox "%s"' \
+    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
 # Whitespace is not identity in a wrapped composer: when another pending task's
@@ -379,6 +391,7 @@ submit_task() {
   esac
   has_result "$filename" && return 0
   prompt="$(task_prompt "$filename")"
+  log_notifier "delivering $filename as the standby: no session-role watcher holds $TASKS_DIR"
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     log_notifier "no session $SESSION — dropping $filename"
     return 0
@@ -442,6 +455,7 @@ mkdir -p "$queue_dir" "$PAYLOAD_DIR"
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
+log_notifier "standby armed for $TASKS_DIR (standby watcher pid $watcher_pid)"
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
@@ -571,5 +585,6 @@ while :; do
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
+  standby_end_log "standby watcher exited"
   break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"

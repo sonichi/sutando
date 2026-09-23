@@ -868,6 +868,22 @@ class EventDispatchTests(FakeTmuxHarness):
                       "a missing status file must not hold a task on an idle pane")
 
 
+class StandbyReminderTests(FakeTmuxHarness):
+    """Every notifier delivery is a standby delivery, so the pane text says so,
+    names the re-arm command, and the log records the delivery as the standby's."""
+
+    def test_the_prompt_names_the_standby_and_the_rearm_command(self):
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.write_task("task-sb.txt")
+        self.run_event("task-sb.txt", timeout=15)
+        typed = self.sendkeys_log_text()
+        self.assertIn("TYPE Sutando task ready: task-sb.txt", typed)
+        self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
+        self.assertIn(f'Re-arm yours via the Monitor tool: bash {REPO}/src/watch-tasks-stream.sh "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn(f"delivering task-sb.txt as the standby: no session-role watcher holds {self.tasks_dir}", log)
+
+
 class SmallViewportTests(FakeTmuxHarness):
     """A 3-row pane: only the composer and footer are on screen. What scrolled
     off is history, whatever the scrollback capture still retains of it."""
