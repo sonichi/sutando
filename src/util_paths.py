@@ -591,6 +591,13 @@ def watcher_log_path(workspace, inbox) -> Path:
     return Path(workspace) / "logs" / f"watcher-{key}.events.log"
 
 
+def watcher_log_cursor_path(workspace, inbox) -> Path:
+    """Where this inbox's log READER records what it has consumed. Its mtime is
+    also that reader's liveness: a detached watcher outlives its reader, so
+    coverage means a live watcher AND a fresh cursor, never the watcher alone."""
+    return Path(workspace) / "state" / (watcher_log_path(workspace, inbox).name + ".cursor")
+
+
 def task_event_handler_config_path(state_dir) -> Path:
     """Where a skill declares core's task-event handler, e.g. via worker-pool's
     register_worker(). Core-only: workers never read this (their own inbox is
@@ -627,6 +634,8 @@ if __name__ == "__main__":
         print(task_event_handler_config_path(sys.argv[2]))
     elif len(sys.argv) >= 4 and sys.argv[1] == "watcher-log":
         print(watcher_log_path(sys.argv[2], sys.argv[3]))
+    elif len(sys.argv) >= 4 and sys.argv[1] == "watcher-log-cursor":
+        print(watcher_log_cursor_path(sys.argv[2], sys.argv[3]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "composer-block-path":
         print(composer_block_path(sys.argv[2]))
     else:

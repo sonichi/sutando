@@ -86,8 +86,11 @@ STARTED=$!
 disown "$STARTED" 2>/dev/null || true
 
 # Ready, not merely spawned: the sentinel is what every other reader gates on.
+# Arithmetic, not string concatenation: "0.5" would build "0.50" and `-lt` would
+# error on every pass, waiting zero iterations while looking like it waited.
 i=0
-while [ "$i" -lt "${SUTANDO_DETACH_READY_TIMEOUT:-20}0" ]; do
+TRIES=$(( ${SUTANDO_DETACH_READY_TIMEOUT:-20} * 10 ))
+while [ "$i" -lt "$TRIES" ]; do
   [ "$("$PY" "$__REPO_ROOT/src/watcher_identity.py" role-present session \
         --inbox "$INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" = "yes" ] && break
   kill -0 "$STARTED" 2>/dev/null || break

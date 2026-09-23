@@ -56,15 +56,26 @@ child_pid=""
 # The sentinel dir is derived exactly as the watcher derives it (one helper in
 # tasks-dir-resolve.sh), so both name the same file. No inbox, no gate.
 session_role_verdict() {
-  local args=(role-present session) out rc
-  [ -n "$TASKS_DIR" ] && args+=(--inbox "$TASKS_DIR" --ready "$(workspace_dir_for_inbox "$TASKS_DIR")/state")
+  local args=(role-present session) out rc state
+  [ -n "$TASKS_DIR" ] && state="$(workspace_dir_for_inbox "$TASKS_DIR")/state"
+  [ -n "$TASKS_DIR" ] && args+=(--inbox "$TASKS_DIR" --ready "$state")
   out="$("$PY" "$WATCHER_IDENTITY" "${args[@]}" 2>/dev/null)"
   rc=$?
-  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
-    printf '%s\n' "$out"
-  else
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     echo "unknown"
+    return 0
   fi
+  # A DETACHED watcher outlives the session that started it, so its presence is
+  # not coverage: its reader is what announces. A cursor that has stopped
+  # advancing means nobody consumes those events, and this supervisor is the
+  # only party that can notice. "unknown" (no cursor: a Monitor-hosted watcher
+  # needs none) leaves the verdict alone.
+  if [ "$out" = "yes" ] && [ -n "$TASKS_DIR" ]; then
+    case "$("$PY" "$WATCHER_IDENTITY" reader-fresh --inbox "$TASKS_DIR" --ready "$state" 2>/dev/null)" in
+      no) echo "no"; return 0 ;;
+    esac
+  fi
+  printf '%s\n' "$out"
 }
 
 stop_child() {

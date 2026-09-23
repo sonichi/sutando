@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional
 
@@ -275,6 +276,37 @@ def sentinel_names_pid(pid: Optional[int], state_dir: Optional[str]) -> bool:
     except Exception:  # noqa: BLE001 -- the helper itself is unavailable: not a stamp
         return False
     return False
+
+
+def reader_is_fresh(inbox: Optional[str], state_dir: Optional[str],
+                    max_age: Optional[float] = None, now=None) -> Optional[bool]:
+    """Is SOMETHING reading this inbox's detached watcher log right now?
+
+    True/False when the cursor file answers, None when there is no cursor at all
+    (no detached reader was ever armed here: a Monitor-hosted watcher's coverage
+    does not depend on one, so a caller must not read None as "nobody reads").
+
+    A detached watcher outlives its reader, so a live watcher alone is not
+    coverage: the reader touches its cursor on every line and every quiet poll,
+    and a stale cursor is a watcher whose events nobody consumes.
+    """
+    if not inbox or not state_dir:
+        return None
+    if max_age is None:
+        try:
+            max_age = float(os.environ.get("SUTANDO_READER_STALE_SEC", "90"))
+        except ValueError:
+            max_age = 90.0
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import watcher_log_cursor_path
+        cursor = watcher_log_cursor_path(Path(state_dir).parent, inbox)
+        mtime = cursor.stat().st_mtime
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except Exception:                                        # noqa: BLE001
+        return None
+    return ((now if now is not None else time.time()) - mtime) <= max_age
 
 
 def canonical_inbox(path: Optional[str]) -> Optional[str]:
@@ -584,6 +616,22 @@ def main(argv=None) -> int:
             print("usage: watcher_identity.py sentinel-names-pid <pid> --ready STATE_DIR", file=sys.stderr)
             return 64
         print("yes" if sentinel_names_pid(pid, state_dir) else "no")
+    if args and args[0] == "reader-fresh":
+        rest = args[1:]
+        inbox = state = None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--inbox" and i + 1 < len(rest):
+                inbox = rest[i + 1]; i += 2
+            elif rest[i] == "--ready" and i + 1 < len(rest):
+                state = rest[i + 1]; i += 2
+            else:
+                i = len(rest) + 1
+        if not inbox or not state:
+            print("usage: watcher_identity.py reader-fresh --inbox VALUE --ready STATE_DIR", file=sys.stderr)
+            return 64
+        v = reader_is_fresh(inbox, state)
+        print("unknown" if v is None else ("yes" if v else "no"))
         return 0
     if args and args[0] == "inbox-holders":
         rest = args[1:]

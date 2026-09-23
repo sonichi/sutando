@@ -64,13 +64,28 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    form below for this boot; the inbox migrates when that watcher is next gone.
    **1** — no watcher is ready: report it, never claim a watcher that is not there.
 
-   On **0**, arm the `Monitor` on the LOG, not on the watcher:
-   `command: 'tail -n +$((CURSOR+1)) -F "<LOG>"'`, `persistent: true`,
-   `description: 'Streaming task watcher'`, where CURSOR is the number of log
-   lines already consumed (0 on a fresh start). **On every re-arm, set CURSOR to
-   the last line you actually consumed, never to the file's current length**: the
-   lines between an expiry and the re-arm are exactly the deliveries that would
-   otherwise be skipped in silence, and nothing else announces them.
+   On **0**, arm the `Monitor` on the READER, never on a raw `tail`:
+
+   ```
+   Monitor tool — persistent: true, description 'Streaming task watcher', command:
+   bash src/tail-watcher-log.sh --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"
+   ```
+
+   The reader keeps the cursor in a file and advances it per line, so a re-arm
+   replays exactly what was never consumed. **Do not compute a cursor yourself**:
+   an event carries no line number, and a count held in the session's head does
+   not survive the compaction that a re-arm usually follows. A cursor set to the
+   log's current length silently skips the deliveries that arrived while nothing
+   was reading, which are the only ones nothing else announces.
+
+   That cursor is also the READER's liveness. A detached watcher outlives its
+   reader, so the watcher alone is not coverage: the supervisor treats a ready
+   session watcher whose cursor has gone stale as no coverage and arms its
+   standby, which is the detector a detached watcher would otherwise remove.
+
+   **Run this step on every re-arm, not only at boot**: that is how an inbox
+   still on the legacy form (rc 3) migrates once its old watcher is gone, and how
+   a detached watcher that died is replaced.
 
    The legacy form, for a build without `detach-task-watcher.sh` — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (an instance whose inbox isn't `<workspace>/tasks/` substitutes `$SUTANDO_TASKS_DIR` for the resolved path instead: that variable, when set, is what the watcher and its supervisor both resolve to, so the tag must carry it, not the workspace default; every reader compares inboxes by their real path, so a trailing slash or a `/private` prefix does not split one inbox into two), `persistent: true`, `description: 'Streaming task watcher'`. `--role session --inbox <value>` is what makes this an in-session watcher CODE can tell apart from an external one for the SAME inbox (#4477) — the watcher itself, on seeing `--role session`, proves readiness, stamps its sentinel, then waits up to 15 s for any external standby on this exact inbox to leave before its sweep (it kills nothing: #4585), and `task-notifier-supervisor.sh` (if one is running externally) polls the same inbox-scoped, sentinel-gated signal and stands the standby down; neither needs an instruction here to tear the other down, so there is no teardown step in this skill. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **The watcher checks its own inbox at startup** (`watcher_identity.py inbox-holders`): if a session watcher already covers it, the new one exits 0 naming the holder, so the Monitor call is safe to make whenever the per-inbox verdict says no session watcher is ready; never start it untagged, and use `--force-restart` only on the owner's word. The host-wide enumerator below stays for the STOP decision (which pids are ownerless), never for the start:
 
