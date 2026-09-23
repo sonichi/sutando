@@ -85,7 +85,11 @@ cleanup_notifier() {
   # The watcher goes FIRST: the ending is logged from here, and a probe that ran
   # before the watcher was stopped would delay its kill past a caller's patience.
   stop_watcher
-  [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1; standby_end_log "${STANDBY_END_WHY:-notifier exiting}" 1; }
+  # Only the hand-off waits: the standby watcher yields the moment it SEES a
+  # session watcher, which may not have stamped yet. Every other ending asks
+  # once, so nothing delays this notifier's own exit.
+  [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1
+    standby_end_log "${STANDBY_END_WHY:-notifier exiting}" "${STANDBY_END_TRIES:-1}"; }
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
     rm -rf "$event_dir/queue" 2>/dev/null || true
@@ -601,6 +605,6 @@ while :; do
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
-  STANDBY_END_WHY="standby watcher exited"
+  STANDBY_END_WHY="standby watcher exited"; STANDBY_END_TRIES=10
   break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"
