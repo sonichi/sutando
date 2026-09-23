@@ -276,9 +276,12 @@ _host() {
     # sutando.config*.json — a pin placed where the config lives is invisible to
     # a reader that only consults the process environment, and this one names
     # the vault branch.
-    if [ -f "$SCRIPT_PARENT/scripts/sutando-config.sh" ]; then
+    # Guarded: the bash parity test evals this function ALONE under `set -u`,
+    # where the main body's $SCRIPT_PARENT does not exist.
+    local _root="${SCRIPT_PARENT:-}"
+    if [ -n "$_root" ] && [ -f "$_root/scripts/sutando-config.sh" ]; then
         local _cfg
-        _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
+        _cfg="$(bash "$_root/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
         _cfg="${_cfg#"${_cfg%%[![:space:]]*}"}"
         _cfg="${_cfg%"${_cfg##*[![:space:]]}"}"
         if [ -n "$_cfg" ]; then
