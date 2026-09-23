@@ -605,6 +605,18 @@ class EventDispatchTests(FakeTmuxHarness):
                        env_extra={**env, "SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertFalse(counter.exists(), "an empty composer must reset the block count")
 
+    def test_block_counts_are_per_instance(self):
+        # Pool workers share the core's workspace; one pane's draft must not
+        # count toward, or reset, another pane's episode.
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-i.txt")
+        state = self.root / "workspace" / "state"
+        self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w1"}, timeout=8)
+        self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w2"}, timeout=8)
+        self.assertEqual((state / "task-notifier-composer-block-w1").read_text().strip(), "1")
+        self.assertEqual((state / "task-notifier-composer-block-w2").read_text().strip(), "1")
+        self.assertFalse((state / "task-notifier-composer-block").exists())
+
     def test_ghost_text_suggestion_is_not_a_draft(self):
         # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
         # capture shows it as typed, and every re-pick would stall on it.

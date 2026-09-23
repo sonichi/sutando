@@ -46,7 +46,8 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
 # Consecutive composer-not-empty refusals before the owner is told; only they can clear it.
 COMPOSER_BLOCK_ESCALATE_AFTER="${SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER:-4}"
-COMPOSER_BLOCK_FILE="$WORKSPACE_DIR/state/task-notifier-composer-block"
+# Per instance: pool workers share this workspace but each types into its own pane.
+COMPOSER_BLOCK_FILE="$WORKSPACE_DIR/state/task-notifier-composer-block${SUTANDO_INSTANCE_ID:+-$SUTANDO_INSTANCE_ID}"
 watcher_pid=""
 event_dir=""
 # FIFO of announced-but-unresolved filenames, as marker files (oldest mtime =
