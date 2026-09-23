@@ -111,8 +111,7 @@ class RePickTests(FakeTmuxHarness):
     def test_a_restart_between_the_paste_and_the_enter_resumes_at_the_enter(self):
         # The composer already holds exactly our prompt and nothing was ever pressed.
         self.write_task("task-mid.txt")
-        prompt = (f"Sutando task ready: task-mid.txt. Read {self.tasks_dir}/task-mid.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-mid.txt.")
+        prompt = self.expected_prompt("task-mid.txt")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
         t = self._finish_on("task-mid.txt", lambda log: "ENTER" in log)
         result = self.run_event("task-mid.txt")
@@ -153,8 +152,7 @@ class RePickTests(FakeTmuxHarness):
         # composer cannot say whose line it is, so neither pick presses Enter.
         self.write_task("task-a b.txt")
         self.write_task("task-ab.txt")
-        prompt = (f"Sutando task ready: task-a b.txt. Read {self.tasks_dir}/task-a b.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-a b.txt.")
+        prompt = self.expected_prompt("task-a b.txt")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
         result = self.run_event("task-ab.txt", timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -200,8 +198,7 @@ class RePickTests(FakeTmuxHarness):
     def test_a_marker_beside_a_staged_prompt_means_resume_not_await(self):
         # The crash landed after the marker and before the Enter.
         self.write_task("task-mk.txt")
-        prompt = (f"Sutando task ready: task-mk.txt. Read {self.tasks_dir}/task-mk.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-mk.txt.")
+        prompt = self.expected_prompt("task-mk.txt")
         self.inflight_dir.mkdir(parents=True, exist_ok=True)
         (self.inflight_dir / "task-mk.txt").write_text("4242\n")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")

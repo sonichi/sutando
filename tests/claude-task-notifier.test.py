@@ -373,6 +373,15 @@ esac
             timeout=timeout,
         )
 
+    def expected_prompt(self, name):
+        """The line the notifier types for `name`. ONE definition, pinned to the
+        producer by test_the_prompt_names_the_standby_and_the_rearm_command."""
+        return (f"Sutando task ready: {name}. Read {self.tasks_dir}/{name}, follow CLAUDE.md, "
+                f"complete the task, and write the result to {self.results_dir}/{name}. "
+                f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}. "
+                f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" '
+                f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"')
+
     def sendkeys_log_text(self):
         return self.sendkeys_log.read_text()
 
@@ -877,7 +886,9 @@ class StandbyReminderTests(FakeTmuxHarness):
         self.write_task("task-sb.txt")
         self.run_event("task-sb.txt", timeout=15)
         typed = self.sendkeys_log_text()
-        self.assertIn("TYPE Sutando task ready: task-sb.txt", typed)
+        # Equality, not containment: this is what pins expected_prompt() — which the
+        # inflight suite stages into its composer — to what the notifier really types.
+        self.assertIn(f"TYPE {self.expected_prompt('task-sb.txt')}", typed)
         self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
         # The script path is quoted: a desktop install lives under "Application Support".
         self.assertIn(f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)

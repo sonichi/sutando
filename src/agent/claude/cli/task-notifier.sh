@@ -71,9 +71,11 @@ trap cleanup_notifier EXIT
 # The standby watcher yields to a session watcher it sees before that watcher
 # has stamped, so "ready" is re-polled briefly before an ending is called a loss.
 standby_end_log() {
-  local i v
+  local i v=""
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    v="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)"
+    # rc 2 is "the process table could not be read", and under `set -e` a bare
+    # assignment from it would end the notifier instead of logging its ending.
+    v="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || v="unknown"
     [ "$v" = "yes" ] && break
     sleep 0.5
   done

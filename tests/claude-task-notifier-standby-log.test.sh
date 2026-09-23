@@ -45,9 +45,11 @@ wait_log "standby armed for $WORK/ws/tasks (standby watcher pid "; check "(a) th
 #     stamped), and either ending must read as a stand-down, never as a loss.
 s="$(clean_env python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       bash "$REPO/src/watch-tasks-stream.sh" "$WORK/ws/tasks" --role session --inbox "$WORK/ws/tasks" > "$WORK/s.out" 2> "$WORK/s.err" & echo $!)"; PIDS+=("$s")
-# The standby watcher wrote a sentinel too; ready means the file names the SESSION watcher.
-for i in $(seq 1 150); do [ "$(cat "$WORK/ws/state"/*.pid 2>/dev/null | head -1)" = "$s" ] && break; sleep 0.1; done
-[ "$(cat "$WORK/ws/state"/*.pid 2>/dev/null | head -1)" = "$s" ]; check "(b) a session watcher took the inbox (the readiness sentinel names it)" $? "$(tail -2 "$WORK/s.err" | tr '\n' '|')"
+# The standby watcher wrote a sentinel too, and glob order is not deterministic
+# across filesystems: ask whether ANY sentinel names the session watcher.
+names_session() { grep -qx "$s" "$WORK/ws/state"/*.pid 2>/dev/null; }
+for i in $(seq 1 150); do names_session && break; sleep 0.1; done
+names_session; check "(b) a session watcher took the inbox (a readiness sentinel names it)" $? "state=$(for f in "$WORK/ws/state"/*.pid; do printf '%s=%s ' "$(basename "$f")" "$(cat "$f")"; done) | $(tail -2 "$WORK/s.err" | tr '\n' '|')"
 sleep 1
 if grep -q "standby stood down for $WORK/ws/tasks (standby watcher exited)" "$LOG"; then
   echo "  PASS (b) the standby watcher yielded on its own and the log says it stood down"
