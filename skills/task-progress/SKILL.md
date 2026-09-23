@@ -128,6 +128,31 @@ transport the AG2 Space task bridge itself uses. The room the task came from is 
 posts to; a queue position ("Got it, right after the one I'm on." / "Got it, N in line before this
 one.") is one line, in that task's own conversation.
 
+## Browser steps: show, don't narrate afterwards
+
+When a task has you browsing (buying, booking, filling forms, searching a site), the
+person wants to see each step as it happens, not a summary at the end. Use `step.py`:
+one short line plus a screenshot of the page as it is right now.
+
+```bash
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/step.py \
+  --source ag2space --channel-id '!room:server' \
+  --message "Opened the checkout page — 2 items, $84.10" \
+  --url "https://shop.example/checkout" --screenshot          # captures via src/browser.mjs
+# or attach a screenshot you already have (Chrome extension / macos-use):
+  --message "Filled the shipping form" --screenshot /path/to/shot.png
+```
+
+Post a step after every navigation, form fill, and page-changing click, and **always
+before a purchase, payment, booking or form submit**, then wait for the owner's go-ahead
+in the room before you pay or submit. The text line follows the same rule as notify.py
+(280 chars, 4 lines); the image goes through the gateway's room media route, so this
+works for AG2 Space rooms (any gateway `--source`), and Slack/Discord/Telegram get the
+text line only. Screenshots must sit in `src/browser.mjs`'s screenshot dir
+(`$SUTANDO_SCREENSHOT_DIR`, default `<tmpdir>/sutando-screenshots`) or under the
+`[file:]` allowlist (`results/`, `/tmp/sutando-*`); anything else is refused and the
+line still lands. A failed screenshot never blocks the task.
+
 ## Supported channels
 
 - **Slack** — `chat.postMessage`, `SLACK_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/slack/.env` → vault**
