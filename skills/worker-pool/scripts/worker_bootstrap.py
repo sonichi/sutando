@@ -67,10 +67,11 @@ def _target_from_argv(command: str, pid=None, argv_vector=None):
                          f"real argv vector")
     if verdict.watcher is False:
         return None
-    for tok in verdict.operands:
-        if not tok.startswith("-"):
-            return tok
-    return ""
+    # The shared helpers, never a scan for the first bare token: --role's VALUE
+    # is bare, so such a scan reads a tagged watcher's inbox as "session".
+    inbox = (wid.watcher_inbox(verdict.operands)
+             or wid.positional_inbox(verdict.operands))
+    return inbox or ""
 
 
 def _same_path(a: str, b: str) -> bool:
