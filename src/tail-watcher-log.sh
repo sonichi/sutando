@@ -73,10 +73,15 @@ fi
 
 write_cursor() { printf '%s %s %s\n' "$1" "$INO_NOW" "$(log_size)" > "$CURSOR"; }
 write_cursor "$N"
-# `tail -F` never ends on its own: it must be OWNED here, or every re-arm leaves
-# one behind holding the log. A pipeline would hide its pid in a subshell.
-exec 3< <(tail -n +$((N + 1)) -F "$LOG" 2>/dev/null)
+# `tail -F` never ends on its own, so its real pid must be OWNED here. A FIFO,
+# not process substitution: on bash 3.2 `$!` after `exec 3< <(...)` names the
+# substitution subshell, so cleanup killed that and left the tail behind.
+FIFO="$(mktemp -u "${TMPDIR:-/tmp}/watcher-tail.XXXXXX")"
+mkfifo "$FIFO" || exit 1
+tail -n +$((N + 1)) -F "$LOG" > "$FIFO" 2>/dev/null &
 TAILPID=$!
+exec 3< "$FIFO"
+rm -f "$FIFO"
 # The heartbeat says "a reader is alive", so it must DIE with the reader — a
 # SIGKILL runs no trap, and an orphaned heartbeat would keep the cursor fresh
 # forever beside a reader that is gone. It watches the reader's own pid and
