@@ -389,6 +389,21 @@ case "$WFR_GUEST_OUT" in
   *) bad "an ordinary (non-worker) session in the same foreign repo still gets the guest exit" "got: ${WFR_GUEST_OUT:0:120}" ;;
 esac
 rm -f "$WS/tasks/$PROBE"
+
+# 8e. The MARKED CORE (SUTANDO_CORE_SESSION=1, the launcher's own mark, no
+# worker id) launched with a foreign cwd is the core, not a guest: same repo,
+# same pending task as 8d, and it must block instead of taking the guest exit.
+printf 'id: probe\ntask: marked-core-foreign-probe\n' > "$WS/tasks/$PROBE"
+WFR_CORE_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_CORE_SESSION=1 bash "$HOOK" 2>&1)"
+case "$WFR_CORE_OUT" in
+  *'"decision":"block"'*) ok "a marked core session in a foreign worktree still blocks on the pending queue" ;;
+  *) bad "a marked core session in a foreign worktree still blocks on the pending queue" "got: ${WFR_CORE_OUT:0:160}" ;;
+esac
+case "$WFR_CORE_OUT" in
+  *"$PROBE"*) ok "the marked-core block payload names the pending task" ;;
+  *) bad "the marked-core block payload names the pending task" "payload omits $PROBE" ;;
+esac
+rm -f "$WS/tasks/$PROBE"
 rm -rf "$WORKER_FOREIGN_REPO"
 
 # 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX. A shipped app bundle has no
@@ -410,6 +425,13 @@ BF_OUT="$(cd "$BUNDLE_FOREIGN" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
 case "$BF_OUT" in
   '{}') ok "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" ;;
   *) bad "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" "got: ${BF_OUT:0:120}" ;;
+esac
+# 9b. The same bundle and foreign cwd, but the session is the MARKED CORE: the
+# carve-out must not apply, so the bundle's own pending queue blocks it.
+BF_CORE_OUT="$(cd "$BUNDLE_FOREIGN" && SUTANDO_CORE_SESSION=1 bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+case "$BF_CORE_OUT" in
+  *'"decision":"block"'*) ok "non-Git bundle + foreign Git cwd + marked core -> still blocks on the bundle's queue" ;;
+  *) bad "non-Git bundle + foreign Git cwd + marked core -> still blocks on the bundle's queue" "got: ${BF_CORE_OUT:0:120}" ;;
 esac
 rm -rf "$BUNDLE_FOREIGN"
 

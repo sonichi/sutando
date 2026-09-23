@@ -12,9 +12,13 @@
 # Resolve through the same helper every other service uses, so a configured
 # workspace (sutando.config.local.json) is honored rather than assumed.
 
-# A foreign-cwd session is a guest, not the core, unless it's an enrolled
-# worker (SUTANDO_INSTANCE_ID) -- that gate applies regardless of cwd.
+# A foreign-cwd session is a guest, not the core, unless it identifies itself: an
+# enrolled worker (SUTANDO_INSTANCE_ID) or the launcher's marked core (SUTANDO_CORE_SESSION).
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+IDENTIFIED_SESSION=""
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -n "${SUTANDO_CORE_SESSION:-}" ]; then
+  IDENTIFIED_SESSION=1
+fi
 # A bare `git` can be the macOS CLT stub (REVIEW.md lesson 7) — resolve
 # through the same rules src/git_binary.py uses, not PATH directly.
 . "$REPO_DIR/scripts/git-binary.sh"
@@ -58,7 +62,7 @@ if [ -n "$GIT_BIN" ]; then
   esac
   if [ -n "$REPO_COMMON_DIR" ]; then
     if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ] \
-       && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+       && [ -z "$IDENTIFIED_SESSION" ]; then
       echo '{}'
       exit 0
     fi
@@ -67,7 +71,7 @@ if [ -n "$GIT_BIN" ]; then
   elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
     : # marker present, probe still failed -- ambiguous, fall through to gate
   elif [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_CONFIRMED_ABSENT" ] \
-       && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+       && [ -z "$IDENTIFIED_SESSION" ]; then
     # Both probes failed AND git itself confirmed no repo -- not just an
     # unresolved probe on a markerless child that IS still ours.
     echo '{}'
