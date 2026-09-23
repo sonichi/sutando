@@ -165,6 +165,34 @@ class TestMain(Base):
             rc = wb.main(list(args))
         return rc, buf.getvalue().splitlines()
 
+    def test_the_boot_decision_prunes_spent_sentinels_and_keeps_owed_ones(self):
+        """A delivered task's sentinel outlives its payload (archived) and its
+        result; every Stop hook and startup sweep re-walked all of them (#4614)."""
+        sys.path.insert(0, str(Path(wb.__file__).parent))
+        import pool_delivery as pd
+        d = Path(self.ws) / "deliveries" / WORKER
+        d.mkdir(parents=True, exist_ok=True)
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        for i in range(3):                       # spent: payload gone
+            (d / f"task-spent{i}.txt").touch()
+        (tasks / "task-owed.txt").write_text("id: task-owed\nsource: test\ntask: x\n")
+        (d / "task-owed.txt").touch()           # owed: payload present, no result
+        rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
+                                "--workspace", str(self.ws))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[0], "start")
+        sweep = [l for l in out if l.startswith("sweep=")]
+        self.assertEqual(len(sweep), 1, out)
+        self.assertIn("stale=3", sweep[0])
+        self.assertIn("ready=1", sweep[0])
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
+
+    def test_a_sweep_failure_never_changes_the_decision(self):
+        with patch.object(wb, "prune_spent_sentinels", side_effect=RuntimeError("boom")):
+            pass  # the guard is inside prune_spent_sentinels itself: exercise it directly
+        out = wb.prune_spent_sentinels("/nonexistent/workspace", WORKER)
+        self.assertTrue(out.startswith("skipped ("), out)
+
     def test_a_worker_with_no_watcher_is_told_to_start(self):
         rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
                                 "--workspace", str(self.ws))

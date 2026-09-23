@@ -167,7 +167,21 @@ def main(argv=None) -> int:
     print(decision)
     print(f"instance={a.instance or '(unset)'} inbox={a.inbox or '(unset)'}")
     print(f"why={why}")
+    if decision in ("start", "skip"):
+        print(f"sweep={prune_spent_sentinels(workspace, a.instance)}")
     return 0 if decision in ("start", "skip") else 2
+
+
+def prune_spent_sentinels(workspace: str, instance: str) -> str:
+    """Retire this worker's spent delivery sentinels (payload archived, or result
+    published and flagged) through pool_delivery's own boot sweep, so the
+    inbox holds what is owed, not the worker's history. Never changes the decision."""
+    try:
+        import pool_delivery as pd
+        acts = pd.sweep(Path(workspace), instance)
+        return " ".join(f"{k}={len(v)}" for k, v in acts.items())
+    except Exception as e:                                   # noqa: BLE001
+        return f"skipped ({e})"
 
 
 if __name__ == "__main__":
