@@ -116,6 +116,41 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 
+# The duplicate check below is a scan, so two starters at the same instant could
+# each see the other and both exit (zero announcers) or both run. A per-inbox
+# lock dir, held from the scan through the sentinel stamp, serializes them: the
+# second waits and then sees the first's sentinel. mkdir is the atomic primitive
+# (no flock binary on macOS; an flock'd fd would be inherited by fswatch).
+START_LOCK_TIMEOUT_S="${SUTANDO_WATCHER_START_LOCK_TIMEOUT_S:-30}"
+START_LOCK="$WORKSPACE_DIR/state/watch-tasks-stream.start-$(printf '%s' "$TASKS_DIR_ABS" | cksum | cut -d' ' -f1).lock"
+release_start_lock() {
+  [ -n "${START_LOCK:-}" ] || return 0
+  [ "$(cat "$START_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$START_LOCK"
+  START_LOCK=""
+}
+mkdir -p "$WORKSPACE_DIR/state" 2>/dev/null || true
+__lock_deadline=$(( $(date +%s) + START_LOCK_TIMEOUT_S ))
+while ! mkdir "$START_LOCK" 2>/dev/null; do
+  __lpid="$(cat "$START_LOCK/pid" 2>/dev/null)"
+  case "$__lpid" in
+    ''|*[!0-9]*) ;;
+    *) if ! kill -0 "$__lpid" 2>/dev/null; then
+         echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid $__lpid; taking it over" >&2
+         rm -rf "$START_LOCK"; continue
+       fi ;;
+  esac
+  if [ "$(date +%s)" -ge "$__lock_deadline" ]; then
+    # Refusing would leave the inbox with no announcer; the scan below still runs.
+    echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS held by pid ${__lpid:-unknown} for ${START_LOCK_TIMEOUT_S}s; starting without it" >&2
+    START_LOCK=""; break
+  fi
+  sleep 0.1
+done
+[ -n "$START_LOCK" ] && echo "$$" > "$START_LOCK/pid"
+# Every exit before the sentinel stamp must give the lock back; the main cleanup
+# trap armed later replaces this one and releases it too.
+trap release_start_lock EXIT
+
 # One announcer per inbox, enforced here rather than by every launcher: a start
 # over a holder exits 0 as covered and says so on stdout, and only
 # --force-restart replaces the holder, whatever its kind. The one exception is a
@@ -864,6 +899,7 @@ cleanup() {
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
   trap '' TERM HUP INT
+  release_start_lock
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
@@ -1021,6 +1057,8 @@ fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The sentinel is what a waiting starter's scan will see: the lock's job is done.
+release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
 # handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
 # INJECTED, never located: a core helper may run a path it is handed but must not
