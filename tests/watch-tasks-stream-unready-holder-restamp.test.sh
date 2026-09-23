@@ -75,6 +75,18 @@ n="$(start "$WS" "$WS/tasks" fourth)"; PIDS+=("$n")
 for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 [ "$(cat "$SENT")" = "$before" ] && [ "$before" = "$h" ] && ! grep -q 're-stamped' "$WORK/fourth.err"; check "(c) a ready holder's sentinel is not rewritten by a covered start" $? "before=$before now=$(cat "$SENT") | $(tail -2 "$WORK/fourth.err" | tr '\n' '|')"
 
+# (c3) The holder is already readable as ready through ANOTHER sentinel: nothing
+#      to restore, so no second record of the same watcher is written.
+rm -f "$SENT"
+OTHER_SENT="$(dirname "$SENT")/watch-tasks-stream-someone-else.pid"
+echo "$h" > "$OTHER_SENT"
+[ "$(role_present "$WS")" = "yes" ]; check "(c3) a holder named by any sentinel already reads as ready" $?
+n="$(start "$WS" "$WS/tasks" seventh)"; PIDS+=("$n")
+for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
+[ ! -e "$SENT" ]; check "(c3) ...so the covered start writes no second sentinel for it" $? "state=$(for f in "$(dirname "$SENT")"/*.pid; do printf '%s=%s ' "$(basename "$f")" "$(cat "$f" 2>/dev/null)"; done)"
+! grep -q 're-stamped' "$WORK/seventh.err"; check "(c3) ...and says nothing about re-stamping" $? "$(tail -2 "$WORK/seventh.err" | tr '\n' '|')"
+rm -f "$OTHER_SENT"; echo "$h" > "$SENT"
+
 # (c2) A sentinel naming a LIVE pid is never overwritten, even by its own seat.
 n="$(start "$WS" "$WS/tasks" fifth)"; PIDS+=("$n")
 for i in $(seq 1 150); do [ "$(cat "$SENT" 2>/dev/null)" != "$h" ] && break; alive "$n" || break; sleep 0.1; done
