@@ -80,17 +80,28 @@ log_notifier() {
 }
 
 # A file, not a variable: the count must span --event invocations and the main loop's retries.
+# Keyed to (core incarnation, task): a record from another episode starts the count afresh.
 note_composer_block() {
-  local n=""
-  n="$(cat "$COMPOSER_BLOCK_FILE" 2>/dev/null)" || n=""
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  local filename="$1" incarnation="$2" n=0 rec_n rec_inc rec_file tmp op
+  if read -r rec_n rec_inc rec_file <"$COMPOSER_BLOCK_FILE" 2>/dev/null \
+     && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
+    case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
+  fi
   n=$((n + 1))
   mkdir -p "$(dirname "$COMPOSER_BLOCK_FILE")" 2>/dev/null || true
-  printf '%s\n' "$n" >"$COMPOSER_BLOCK_FILE" 2>/dev/null || true
+  tmp="$(mktemp "$COMPOSER_BLOCK_FILE.XXXXXX" 2>/dev/null)" || tmp=""
+  if [ -n "$tmp" ] && printf '%s %s %s\n' "$n" "$incarnation" "$filename" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$COMPOSER_BLOCK_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    [ -n "$tmp" ] && rm -f "$tmp"
+  fi
   [ "$n" -eq "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
-  log_notifier "delivery blocked: text in the core's composer has held $1 for $n consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $filename for $n consecutive attempts; clear the composer or press Enter to resume"
   command -v osascript >/dev/null 2>&1 || return 0
-  osascript -e 'display notification "Text in the Sutando CLI composer is blocking task delivery. Clear it or press Enter." with title "Sutando"' >/dev/null 2>&1 || true
+  # Advisory only: a hung osascript must never stall delivery, so it is backgrounded and bounded.
+  osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" >/dev/null 2>&1 &
+  op=$!
+  ( sleep 2; kill "$op" 2>/dev/null ) >/dev/null 2>&1 &
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -286,7 +297,7 @@ deliver_prompt() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
-      note_composer_block "$filename"
+      note_composer_block "$filename" "$incarnation"
       return 1
     fi
     rm -f "$COMPOSER_BLOCK_FILE"
@@ -453,6 +464,8 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
+# A new notifier starts a new episode; a record left by the previous one is not its history.
+rm -f "$COMPOSER_BLOCK_FILE"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-claude-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"

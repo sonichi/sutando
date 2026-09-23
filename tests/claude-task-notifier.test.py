@@ -592,13 +592,13 @@ class EventDispatchTests(FakeTmuxHarness):
         env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
         for attempt in range(1, 6):
             self.run_event("task-e.txt", env_extra=env, timeout=8)
-            fired = calls.read_text().count("display notification") if calls.exists() else 0
+            fired = self._notifications(calls, 0 if attempt < 3 else 1)
             self.assertEqual(fired, 0 if attempt < 3 else 1,
                              f"attempt {attempt}: escalate at the 3rd refusal, never again")
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertEqual(log.count("delivery blocked:"), 1)
         counter = self.root / "workspace" / "state" / "task-notifier-composer-block"
-        self.assertEqual(counter.read_text().strip(), "5")
+        self.assertEqual(counter.read_text().split()[0], "5")
         # An empty composer ends the episode, so the next block escalates afresh.
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         self.run_event("task-e.txt", timeout=15,
@@ -613,9 +613,56 @@ class EventDispatchTests(FakeTmuxHarness):
         state = self.root / "workspace" / "state"
         self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w1"}, timeout=8)
         self.run_event("task-i.txt", env_extra={"SUTANDO_INSTANCE_ID": "w2"}, timeout=8)
-        self.assertEqual((state / "task-notifier-composer-block-w1").read_text().strip(), "1")
-        self.assertEqual((state / "task-notifier-composer-block-w2").read_text().strip(), "1")
+        self.assertEqual((state / "task-notifier-composer-block-w1").read_text().split()[0], "1")
+        self.assertEqual((state / "task-notifier-composer-block-w2").read_text().split()[0], "1")
         self.assertFalse((state / "task-notifier-composer-block").exists())
+
+    def _notifications(self, calls, expect):
+        # The notification is backgrounded, so its stub may land just after the event returns.
+        for _ in range(40):
+            got = calls.read_text().count("display notification") if calls.exists() else 0
+            if got >= expect:
+                break
+            time.sleep(0.05)
+        return got
+
+    def _osascript_stub(self, body=""):
+        calls = self.root / "osascript.calls"
+        stub = self.bin / "osascript"
+        stub.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{calls}"\n{body}\n')
+        stub.chmod(0o755)
+        return calls
+
+    def _block(self, filename, n, env):
+        for _ in range(n):
+            self.run_event(filename, env_extra=env, timeout=8)
+
+    def test_a_new_episode_escalates_again_without_an_empty_read(self):
+        # An episode can end with no empty-composer observation (the task is answered
+        # another way, or the core restarts); the next one must still reach the owner.
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "2"}
+        self.write_task("task-x.txt")
+        self._block("task-x.txt", 3, env)
+        self.assertEqual(self._notifications(calls, 1), 1)
+        self.write_task("task-y.txt")
+        self._block("task-y.txt", 2, env)
+        self.assertEqual(self._notifications(calls, 2), 2, "a block on a different task is a new episode")
+        self.pane_pid_file.write_text("5151")
+        self._block("task-y.txt", 2, env)
+        self.assertEqual(self._notifications(calls, 3), 3, "a restarted core is a new episode")
+
+    def test_a_hung_notification_does_not_stall_delivery(self):
+        self._osascript_stub("sleep 30")
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-h.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "1"}
+        started = time.monotonic()
+        result = self.run_event("task-h.txt", env_extra=env, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertIn("delivery blocked:", (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_ghost_text_suggestion_is_not_a_draft(self):
         # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
