@@ -5,6 +5,7 @@ The package shell (ag2_sparrow.sparrowd) is deliberately blind to what it
 supervises; THIS file owns the worker list and resolved paths, so the core
 never imports or locates a repo-specific loop.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,14 +19,53 @@ from workspace_default import resolve_workspace  # noqa: E402
 from ag2_sparrow.sparrowd import WorkerSpec, run  # noqa: E402
 
 
+def _presence_daemon_spec():
+    """The room-collab presence daemon, when this install has the skill AND has
+    told it which interpreter to use.
+
+    Both halves are required and neither is guessed. The script is optional —
+    a core with no room-collab skill must still boot — and it imports pycrdt
+    and websockets, which the core's own interpreter is not required to have
+    (the skill documents its own venv). An unconfigured interpreter is a
+    skipped worker with a reason, never `sys.executable` hoping for the best:
+    started under the wrong python it would crash-loop under the supervisor.
+    """
+    import json
+
+    script = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
+    manifest = REPO / "skills" / "room-collab" / "manifest.json"
+    if not script.is_file():
+        return None, "room-collab is not installed"
+    py = os.environ.get("ROOM_COLLAB_PYTHON") or ""
+    if not py and manifest.is_file():
+        try:
+            py = (json.loads(manifest.read_text(encoding="utf-8"))
+                  .get("config", {}).get("ROOM_COLLAB_PYTHON") or "")
+        except (OSError, ValueError):
+            py = ""
+    if not py:
+        return None, ("no interpreter configured: set ROOM_COLLAB_PYTHON in "
+                      "skills/room-collab/manifest.json (it needs pycrdt + websockets)")
+    if not Path(py).is_file():
+        return None, f"configured interpreter does not exist: {py}"
+    return WorkerSpec(name="room-collab-presence", argv=[py, str(script)],
+                      cwd=str(REPO)), None
+
+
 def worker_specs() -> list:
-    return [
+    specs = [
         WorkerSpec(
             name="remote-gateway-bridge",
             argv=[sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
             cwd=str(REPO),
         ),
     ]
+    spec, why = _presence_daemon_spec()
+    if spec is not None:
+        specs.append(spec)
+    else:
+        print(f"sparrowd: room-collab-presence not supervised — {why}", file=sys.stderr)
+    return specs
 
 
 def external_supervisor(marker: str) -> "str | None":

@@ -77,10 +77,14 @@ def plan(
             return True
         return _num(want[key].get("summoned_at")) > _num(was.get("since"))
 
+    # A surface dropped in THIS pass is not a candidate in it: `seen` still
+    # says CONNECTED, so `eligible` would wave the timed-out entry back in.
+    dropped = {k for k, _ in drop}
+
     # Ranked newest-summon-first so a fresh summon wins the last slot over one
     # that has been waiting since yesterday.
     queue = sorted(
-        (k for k in want if k not in holding and eligible(k)),
+        (k for k in want if k not in holding and k not in dropped and eligible(k)),
         key=lambda k: (-_num(want[k].get("summoned_at")), k),
     )
 

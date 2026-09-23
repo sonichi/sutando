@@ -504,6 +504,31 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.command == "stay":
+        # A record, not a connection: the daemon holds the socket and outlives
+        # the task that read the summon. No token, nothing kept open.
+        import presence_store
+        import presence_daemon
+        ws = _workspace(args.workspace)
+        path = presence_daemon.desired_path(ws)
+        if args.leave:
+            entries = presence_store.mutate_desired(
+                path, lambda es: presence_store.without(es, args.room, args.kind))
+            verb = "left"
+        else:
+            entry = {"room": args.room, "kind": args.kind,
+                     "identity": args.user_id, "name": args.name,
+                     "summoned_at": time.time()}
+            entries = presence_store.mutate_desired(
+                path, lambda es: presence_store.upsert(es, entry))
+            verb = "staying in"
+        if args.json:
+            print(json.dumps({"ok": True, "action": verb, "entries": entries},
+                             ensure_ascii=False))
+        else:
+            print(f"{verb} {args.room} ({args.kind}); {len(entries)} surface(s) registered")
+        return 0
+
     # Dispatched before the imports below: doctor reports missing deps as its
     # own first step, and importing the client here would exit before it runs.
     if args.command == "doctor":
@@ -787,6 +812,13 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--delta", action="store_true",
                            help="only the lines new since this agent last read the surface")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("stay",
+                       help="register this agent as resident in a surface; the presence daemon "
+                            "holds the connection and outlives this process")
+    s.add_argument("room")
+    s.add_argument("--leave", action="store_true",
+                   help="deregister instead: the daemon drops the connection on its next pass")
 
     s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")
     s.add_argument("room")

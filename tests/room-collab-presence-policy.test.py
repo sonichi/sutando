@@ -69,6 +69,9 @@ check("one second short of the timeout is still held", p["drop"] == [])
 
 p = policy.plan([want("!a")], [held("!a", last_activity=NOW - IDLE)], NOW)
 check("exactly at the timeout it is dropped as `idle`", p["drop"] == [(("!a", "markdown"), "idle")])
+# ⚠ The bug this pins: still CONNECTED in the record `plan` was given, so it
+# was waved back in on the SAME pass — and the drop assertion passed anyway.
+check("...and NOT reconnected in the same pass", p["connect"] == [])
 
 # The rule is worth nothing if the next pass rejoins what it just dropped.
 p = policy.plan([want("!a", summoned_at=NOW - 5000)],
