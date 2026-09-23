@@ -278,37 +278,49 @@ else:
 
 def scenario_dangling_symlink_config():
     """The config path is a dangling symlink: a config that exists and cannot
-    be read, so the task is held, never announced; once the link resolves to
-    a must-handle config, the task is handled once."""
+    be read, so the task is held, never announced. The target appearing
+    outside the watched dir is no watched event, so the task stays held; the
+    link being re-pointed in place is one, and the task replays exactly once."""
     tmp, ws, b = workspace("ready-dangling-")
     cfg = ws / "state" / "task-event-handler.json"
+    cfg_event = Path(os.path.realpath(cfg.parent)) / cfg.name
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hC", 4),))
     target = tmp / "real-config.json"
     os.symlink(target, cfg)  # dangling: the target does not exist yet
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1", "SUTANDO_HELD_RETRY_INTERVAL": "1"})
-    p = start(ws, env)
+    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:
-        wait_ready(ws)
         write_task(ws, "task-team")
+        emit(real_tasks / "task-team.txt")
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=4, settle=0.3)
         held_out = list(out)
         held_log = log.read_text().split() if log.exists() else []
-        target.write_text(json.dumps({"handler": str(h["hC"])}))
+        target.write_text(json.dumps({"handler": str(h["hC"])}))  # no watched event
+        pump(p, out, lambda: False, timeout=3, settle=0.0)
+        still_out = list(out)
+        still_log = log.read_text().split() if log.exists() else []
+        link = cfg.with_name(".cfg.link")
+        os.symlink(target, link)
+        os.replace(link, cfg)  # the link re-pointed in place: a genuine watched event
+        emit(cfg_event)
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=10)
         handled = log.read_text().split() if log.exists() else []
-        return held_out, held_log, out, handled
+        return held_out, held_log, still_out, still_log, out, handled
     finally:
         stop(p)
 
 
 print("the config path is a dangling symlink:")
-held_out, held_log, out, handled = scenario_dangling_symlink_config()
+held_out, held_log, still_out, still_log, out, handled = scenario_dangling_symlink_config()
 check("the task was held (a symlink that resolves nowhere is broken, not absent): no announcement, no handler run",
       not any("task-team" in ln for ln in held_out) and held_log == [],
       f"stdout={held_out!r} handler log={held_log!r}")
-check("once the link resolved, the held task was handled once by C, never announced",
+check("the target appearing outside the watched dir is no event: the task stays held",
+      not any("task-team" in ln for ln in still_out) and still_log == [],
+      f"stdout={still_out!r} handler log={still_log!r}")
+check("once the link was re-pointed in place, the held task was handled once by C, never announced",
       not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
       f"stdout={out!r} handler log={handled!r}")
 

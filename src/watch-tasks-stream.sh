@@ -1033,12 +1033,8 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# EOF (fswatch died and closed its end) ends the loop and takes the normal exit
-# path. Reads share fd 3 with the readiness replay above -- a second open of
-# the FIFO path here would race it for the same bytes; handle_event() already
-# carries the config-reload/dispatch case and its own redispatch_held_tasks,
-# so the loop body is just the idle-retry check the old poll timer used to run
-# on its own schedule.
+# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
+# readiness replay above, since a second open of the FIFO would race it for bytes.
 while IFS= read -r path <&3; do
   handle_event "$path"
   retry_held_tasks_if_due
