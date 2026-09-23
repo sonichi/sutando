@@ -250,6 +250,15 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
     exit 1
   }
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+  # fswatch names this directory by its physical path; handle_event compares to it.
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
+    mkdir -p "$HANDLER_CONFIG_DIR"
+    HANDLER_CONFIG_DIR="$(canonical_tasks_dir "$HANDLER_CONFIG_DIR")" || {
+      echo "watch-tasks-stream: could not canonicalize the task-event-handler config dir" >&2
+      exit 1
+    }
+    HANDLER_CONFIG_PATH="$HANDLER_CONFIG_DIR/${HANDLER_CONFIG_PATH##*/}"
+  fi
 fi
 
 # absent: no config on disk (the core takes every task). ready: parsed. broken: a
