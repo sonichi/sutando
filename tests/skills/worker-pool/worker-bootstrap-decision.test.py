@@ -207,6 +207,45 @@ class TestMain(Base):
         self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
                          "an in-flight delivery was renamed back to pending")
 
+    def test_every_way_a_finished_sentinel_can_be_spent(self):
+        """`_nothing_can_re_queue` has three ways to say yes, and each is a real
+        shape: the payload is gone, a ready result is still on disk, or the
+        payload is archived. All three retire; none of them can re-queue."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        results = Path(self.ws) / "results"; results.mkdir(exist_ok=True)
+        for tid in ("task-gone", "task-result", "task-arch"):
+            (d / f"{tid}.txt").touch()
+            pd.mark_done(self.ws, WORKER, tid, published=True)
+        # task-gone: no payload at all (the common case, the drain took it).
+        # task-result: payload present AND a ready result beside it.
+        (tasks / "task-result.txt").write_text("id: task-result\nsource: test\ntask: x\n")
+        pd.result_path(Path(self.ws), "task-result").write_text("done\n")
+        # task-arch: payload present, no live result, but the payload is archived.
+        (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
+        arch = pd.archived_payload(Path(self.ws), "task-arch")
+        arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
+        # Each one alone, so a shared fixture cannot mask a branch that never runs.
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("retired=3", out)
+        self.assertEqual(list(d.iterdir()), [])
+
+    def test_a_sentinel_named_by_both_stages_is_judged_once(self):
+        """The same task can sit in the folder as `.accepted` and `.txt`; the
+        walk must judge it once, not retire it twice."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        (d / f"task-two{pd.ACCEPTED_SUFFIX}").touch()
+        (d / "task-two.txt").touch()
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("stale=1", out)
+        self.assertNotIn("stale=2", out)
+        self.assertEqual(len(list(d.iterdir())), 1, "the second name was judged again")
+
     def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
         """`residue` calls a done flag alone `finished`, but with the payload still
         in tasks/ and no findable result, removing the sentinel re-queues it."""
