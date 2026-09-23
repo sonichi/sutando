@@ -120,6 +120,27 @@ took=$(( $(date +%s) - t0 ))
 check "(b3) a pid-less lock older than a few seconds is reclaimed (stamped in ${took}s, not 30)" "$([ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ] && [ "$took" -lt 10 ] && echo 0 || echo 1)" "$(tail -2 "$WS/i.err" | tr '\n' '|')"
 kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
 
+# (b4) A brand-new pid-less lock (a winner between mkdir and its pid write) is
+#      NOT reclaimed: with the takeover rename held, the test plants a fresh
+#      pid-less lock in the window; the moved dir is young, so it is given back.
+WS="$WORK/fresh"; mkdir -p "$WS/tasks" "$WS/state"
+key="$(printf '%s' "$(cd "$WS/tasks" && pwd -P)" | cksum | cut -d' ' -f1)"
+LOCK="$WS/state/watch-tasks-stream.start-$key.lock"
+# The starter judges an OLD pid-less lock (so its "dead pid" is the empty string).
+mkdir -p "$LOCK"; touch -t "$(date -v-1M +%Y%m%d%H%M.%S 2>/dev/null || date -d '1 minute ago' +%Y%m%d%H%M.%S)" "$LOCK"
+export SUTANDO_TEST_MV_ONCE="$WS/mv-once" SUTANDO_TEST_MV_LOG="$WS/mv.log" SUTANDO_TEST_MV_DELAY=1
+p="$(start "$WS" j)"; PIDS+=("$p")
+for i in $(seq 1 50); do [ -d "$WS/mv-once" ] && break; sleep 0.1; done
+/bin/mv "$LOCK" "$LOCK.gone" && rm -rf "$LOCK.gone"; mkdir "$LOCK"   # a winner in its pid gap
+sleep 1.5
+unset SUTANDO_TEST_MV_ONCE SUTANDO_TEST_MV_LOG SUTANDO_TEST_MV_DELAY
+grep -E "\.dead\.$p -> .*\.lock \(pid in source: \)" "$WS/mv.log" >/dev/null; check "(b4) a young pid-less lock moved in the window is given back, not reclaimed" $? "$(sed "s#$WS/state/##g" "$WS/mv.log" | tr '\n' '|')"
+[ -d "$LOCK" ] && [ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ] && alive "$p"; check "(b4) ...the lock stands and the starter waits" $?
+rm -rf "$LOCK"
+for i in $(seq 1 100); do [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ] && break; sleep 0.1; done
+[ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ]; check "(b4) ...and stamps once it is released" $?
+kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
+
 # (c) A lock held by a LIVE pid past the timeout does not strand the inbox: the
 #     start proceeds without the lock and says so.
 WS="$WORK/timeout"; mkdir -p "$WS/tasks" "$WS/state"

@@ -153,7 +153,15 @@ while ! mkdir "$START_LOCK" 2>/dev/null; do
       # starter creating the lock inside that window nests the returned dir
       # under its own (today's double run at worst; nothing is deleted).
       __mpid="$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)"
-      if [ "$__mpid" = "$__lpid" ]; then
+      # A pid-less lock is identified by the MOVED dir's age, never by its empty
+      # pid: a brand-new lock whose winner has not written its pid yet looks the same.
+      __mold=""
+      if [ -z "$__lpid" ] && [ -z "$__mpid" ]; then
+        __mmt="$(stat -c %Y -- "$START_LOCK.dead.$$" 2>/dev/null || true)"
+        case "$__mmt" in ''|*[!0-9]*) __mmt="$(stat -f %m -- "$START_LOCK.dead.$$" 2>/dev/null || true)" ;; esac
+        case "$__mmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __mmt )) -gt 5 ] && __mold=1 ;; esac
+      fi
+      if { [ -n "$__lpid" ] && [ "$__mpid" = "$__lpid" ]; } || [ -n "$__mold" ]; then
         echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid ${__lpid:-<none>}; taking it over" >&2
         rm -rf "$START_LOCK.dead.$$"
       elif ! mv "$START_LOCK.dead.$$" "$START_LOCK" 2>/dev/null; then
