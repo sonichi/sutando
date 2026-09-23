@@ -1853,6 +1853,37 @@ wss.on('connection', (ws: WebSocket) => {
 	ws.on('error', (err) => console.error(`${ts()} [WS] error:`, err));
 });
 
+// Point TWILIO_PHONE_NUMBER's voice + status webhooks at `base` when they
+// differ. Failures are logged, never fatal: the server still answers on the
+// URL it bound, and `twilio-setup.py set-webhook` is the manual retry.
+async function syncTwilioWebhook(base: string): Promise<void> {
+	const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+	const api = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}`;
+	const wantVoice = `${base}/twilio/connect`;
+	const wantStatus = `${base}/twilio/status`;
+	try {
+		const list = await fetch(`${api}/IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(TWILIO_PHONE_NUMBER)}`, {
+			headers: { Authorization: `Basic ${auth}` },
+		});
+		if (!list.ok) { console.error(`${ts()} [Twilio] webhook sync: list failed HTTP ${list.status}`); return; }
+		const data = await list.json() as { incoming_phone_numbers?: Array<{ sid: string; voice_url?: string; status_callback?: string }> };
+		const num = data.incoming_phone_numbers?.[0];
+		if (!num) { console.error(`${ts()} [Twilio] webhook sync: TWILIO_PHONE_NUMBER is not owned by this account`); return; }
+		if (num.voice_url === wantVoice && num.status_callback === wantStatus) {
+			console.log(`${ts()} [Twilio] webhook already points here`);
+			return;
+		}
+		const form = new URLSearchParams({ VoiceUrl: wantVoice, VoiceMethod: 'POST', StatusCallback: wantStatus, StatusCallbackMethod: 'POST' });
+		const upd = await fetch(`${api}/IncomingPhoneNumbers/${num.sid}.json`, {
+			method: 'POST', headers: { Authorization: `Basic ${auth}` }, body: form,
+		});
+		if (!upd.ok) { console.error(`${ts()} [Twilio] webhook sync: update failed HTTP ${upd.status}: ${(await upd.text()).slice(0, 200)}`); return; }
+		console.log(`${ts()} [Twilio] webhook now ${wantVoice}`);
+	} catch (err) {
+		console.error(`${ts()} [Twilio] webhook sync failed:`, err);
+	}
+}
+
 // --- Startup ---
 
 async function start(): Promise<void> {
@@ -1869,6 +1900,14 @@ async function start(): Promise<void> {
 		} else {
 			WEBHOOK_BASE_URL = await startNgrokCli(PORT);
 		}
+		// TWILIO_AUTO_WEBHOOK=1: re-point the number at THIS tunnel. Without a
+		// reserved ngrok domain the URL moves on every restart and, until now,
+		// startup.sh could only print "update the Twilio console webhook" —
+		// the step the owner had to do by hand each time (feedback 2026-09-20).
+		// Same Twilio call twilio-setup.py set-webhook makes; opt-in, because
+		// a host whose number is shared with another deployment must not
+		// steal it on boot.
+		if (process.env.TWILIO_AUTO_WEBHOOK === '1') await syncTwilioWebhook(WEBHOOK_BASE_URL);
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
