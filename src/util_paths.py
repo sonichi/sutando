@@ -640,6 +640,8 @@ if __name__ == "__main__":
         print(composer_block_path(sys.argv[2]))
     else:
         print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir|"
-              "task-event-handler-config-path|composer-block-path} <state-dir>",
+              "task-event-handler-config-path|composer-block-path} <state-dir>\n"
+              "       util_paths.py {watcher-log|watcher-log-cursor} "
+              "<workspace> <inbox>",
               file=sys.stderr)
         raise SystemExit(2)

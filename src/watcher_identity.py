@@ -641,7 +641,10 @@ def main(argv=None) -> int:
             elif rest[i] == "--holder" and i + 1 < len(rest):
                 holder = as_pid(rest[i + 1]); i += 2
             else:
-                i = len(rest) + 1
+                # Refused, never dropped: a mistyped --holder would answer
+                # from the cursor alone and call a live watcher uncovered.
+                inbox = state = None
+                break
         if not inbox or not state:
             print("usage: watcher_identity.py reader-fresh --inbox VALUE --ready STATE_DIR [--holder PID]", file=sys.stderr)
             return 64

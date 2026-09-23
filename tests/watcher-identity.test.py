@@ -917,5 +917,217 @@ class TestSentinelNamesPidCli(unittest.TestCase):
             self.assertIn("usage:", err)
 
 
+class TestReaderIsFresh(unittest.TestCase):
+    """A detached watcher outlives its reader, so a live watcher alone is not
+    coverage. The cursor's mtime IS the reader's liveness, and the three
+    answers are distinct: fresh, stale, and "this question does not apply"."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name) / "ws"
+        self.state = self.ws / "state"
+        self.state.mkdir(parents=True)
+        (self.ws / "logs").mkdir()
+        self.inbox = str(self.ws / "tasks")
+        import util_paths
+        self.cursor = util_paths.watcher_log_cursor_path(self.ws, self.inbox)
+        self.log = util_paths.watcher_log_path(self.ws, self.inbox)
+
+    def _cursor(self, age_s=0.0):
+        self.cursor.write_text("3 12345 90 999-8\n")
+        t = time.time() - age_s
+        os.utime(self.cursor, (t, t))
+
+    def test_a_cursor_touched_just_now_is_fresh(self):
+        self._cursor(0)
+        self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), True)
+
+    def test_a_cursor_older_than_the_threshold_is_stale(self):
+        self._cursor(600)
+        self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), False)
+
+    def test_exactly_at_the_threshold_still_counts_as_fresh(self):
+        # The boundary is <=, so a reader polling exactly on the limit is not
+        # declared dead by a rounding edge.
+        self._cursor(0)
+        now = self.cursor.stat().st_mtime + 90
+        self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state), now=now), True)
+        self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state), now=now + 0.5), False)
+
+    def test_no_cursor_is_unknown_never_stale(self):
+        # An inbox nobody ever read DETACHED has no cursor. Answering "no" here
+        # would report every Monitor-hosted watcher as uncovered.
+        self.assertIsNone(wid.reader_is_fresh(self.inbox, str(self.state)))
+
+    def test_a_missing_inbox_or_state_dir_is_unknown(self):
+        self.assertIsNone(wid.reader_is_fresh(None, str(self.state)))
+        self.assertIsNone(wid.reader_is_fresh("", str(self.state)))
+        self.assertIsNone(wid.reader_is_fresh(self.inbox, None))
+        self.assertIsNone(wid.reader_is_fresh(self.inbox, ""))
+
+    def test_an_unreadable_cursor_path_is_unknown_not_stale(self):
+        # state/ replaced by a file: stat() raises NotADirectoryError, which
+        # must not read as "the reader died".
+        ws2 = Path(self._t.name) / "ws2"
+        (ws2 / "state").mkdir(parents=True)
+        bad = ws2 / "state" / "x"
+        self.assertIsNone(wid.reader_is_fresh(str(ws2 / "tasks"), str(bad)))
+
+    def test_the_threshold_comes_from_the_environment(self):
+        self._cursor(120)
+        with mock.patch.dict(os.environ, {"SUTANDO_READER_STALE_SEC": "300"}):
+            self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), True)
+        with mock.patch.dict(os.environ, {"SUTANDO_READER_STALE_SEC": "30"}):
+            self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), False)
+
+    def test_an_unparseable_threshold_falls_back_to_the_default(self):
+        # A typo in the env must not make every reader read as fresh forever,
+        # nor raise inside a predicate the Stop hook calls.
+        self._cursor(600)
+        with mock.patch.dict(os.environ, {"SUTANDO_READER_STALE_SEC": "soon"}):
+            self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), False)
+        self._cursor(1)
+        with mock.patch.dict(os.environ, {"SUTANDO_READER_STALE_SEC": ""}):
+            self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state)), True)
+
+    def test_any_other_error_reading_the_cursor_is_unknown_too(self):
+        # The Stop hook calls this every turn end: an unexpected OSError must
+        # answer "cannot tell", never "dead", and never raise out of a gate.
+        self._cursor(0)
+        real = Path.stat
+
+        def boom(self_, *a, **k):
+            if self_.name.endswith(".cursor"):
+                raise PermissionError(13, "denied")
+            return real(self_, *a, **k)
+
+        with mock.patch.object(Path, "stat", boom):
+            self.assertIsNone(wid.reader_is_fresh(self.inbox, str(self.state)))
+
+    def test_an_explicit_max_age_beats_the_environment(self):
+        self._cursor(120)
+        with mock.patch.dict(os.environ, {"SUTANDO_READER_STALE_SEC": "10"}):
+            self.assertIs(wid.reader_is_fresh(self.inbox, str(self.state), max_age=999), True)
+
+
+class TestReaderIsFreshHolderSink(unittest.TestCase):
+    """With a holder named, the question only applies when that holder is the
+    DETACHED watcher writing this inbox's log. A Monitor-hosted watcher keeps
+    its coverage however stale a leftover cursor is."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        (self.ws / "logs").mkdir()
+        self.state = str(self.ws / "state")
+        self.inbox = str(self.ws / "tasks")
+        import util_paths
+        self.log = util_paths.watcher_log_path(self.ws, self.inbox)
+        cur = util_paths.watcher_log_cursor_path(self.ws, self.inbox)
+        cur.write_text("1 2 3 4\n")
+        old = time.time() - 600
+        os.utime(cur, (old, old))          # stale in every case below
+        self.cursor = cur
+
+    def _sink(self, kind, target):
+        return mock.patch.object(wid, "output_sink",
+                                 return_value=wid.OutputSink(observed=True, kind=kind,
+                                                             target=target, read=None))
+
+    def test_a_holder_writing_this_log_is_judged_by_the_cursor(self):
+        with self._sink("file", str(self.log)):
+            self.assertIs(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42), False)
+        os.utime(self.cursor, None)
+        with self._sink("file", str(self.log)):
+            self.assertIs(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42), True)
+
+    def test_a_holder_whose_sink_is_not_a_file_is_unknown(self):
+        # A Monitor-hosted watcher writes to a pipe. It needs no reader, so a
+        # stale cursor beside it is not evidence of anything.
+        with self._sink("stream", None):
+            self.assertIsNone(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42))
+
+    def test_a_holder_writing_a_different_file_is_unknown(self):
+        other = self.ws / "logs" / "somewhere-else.log"
+        other.write_text("")
+        with self._sink("file", str(other)):
+            self.assertIsNone(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42))
+
+    def test_an_unreadable_sink_target_is_unknown(self):
+        with self._sink("file", None):
+            self.assertIsNone(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42))
+
+    def test_the_log_is_compared_by_real_path_not_by_spelling(self):
+        # /var vs /private/var on macOS, and any symlinked workspace: a string
+        # compare would split one file into two and answer unknown forever.
+        link = Path(self._t.name) / "link.log"
+        try:
+            link.symlink_to(self.log)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.log.write_text("")
+        with self._sink("file", str(link)):
+            self.assertIs(wid.reader_is_fresh(self.inbox, self.state, holder_pid=42), False)
+
+
+class TestReaderFreshCli(unittest.TestCase):
+    """`reader-fresh --inbox X --ready STATE [--holder PID]` -- the form the
+    supervisor and the shell tests call, three words out, never an exception."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        (self.ws / "logs").mkdir()
+        self.state = str(self.ws / "state")
+        self.inbox = str(self.ws / "tasks")
+
+    def _run(self, args):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = wid.main(args)
+        return rc, buf.getvalue().strip(), err.getvalue()
+
+    def test_it_prints_one_of_three_words(self):
+        for verdict, word in ((True, "yes"), (False, "no"), (None, "unknown")):
+            with mock.patch.object(wid, "reader_is_fresh", return_value=verdict):
+                self.assertEqual(
+                    self._run(["reader-fresh", "--inbox", self.inbox, "--ready", self.state])[:2],
+                    (0, word), verdict)
+
+    def test_the_holder_is_passed_through_as_an_int(self):
+        with mock.patch.object(wid, "reader_is_fresh", return_value=None) as f:
+            self._run(["reader-fresh", "--inbox", self.inbox, "--ready", self.state,
+                       "--holder", "4242"])
+        self.assertEqual(f.call_args.kwargs.get("holder_pid"), 4242)
+
+    def test_a_non_numeric_holder_is_dropped_rather_than_crashing(self):
+        with mock.patch.object(wid, "reader_is_fresh", return_value=None) as f:
+            rc = self._run(["reader-fresh", "--inbox", self.inbox, "--ready", self.state,
+                            "--holder", "nope"])[0]
+        self.assertEqual(rc, 0)
+        self.assertIsNone(f.call_args.kwargs.get("holder_pid"))
+
+    def test_usage_errors_are_64(self):
+        for args in (["reader-fresh"],
+                     ["reader-fresh", "--inbox", self.inbox],
+                     ["reader-fresh", "--ready", self.state],
+                     ["reader-fresh", "--inbox", self.inbox, "--ready"],
+                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--nope", "1"]):
+            rc, out, err = self._run(args)
+            self.assertEqual(rc, 64, args)
+            self.assertIn("usage:", err)
+
+    def test_an_absent_cursor_answers_unknown_end_to_end(self):
+        # No mock: the real predicate over a real empty workspace.
+        self.assertEqual(
+            self._run(["reader-fresh", "--inbox", self.inbox, "--ready", self.state])[:2],
+            (0, "unknown"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
