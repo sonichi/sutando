@@ -47,25 +47,29 @@ jobs:
           code=true
           if [ "$EVENT" = "pull_request" ] && [ -n "$BASE_REF" ]; then
             git fetch -q origin "$BASE_REF"
-            files="$(git diff --name-only "origin/$BASE_REF...HEAD")"
-            if [ -n "$files" ]; then
+            # --name-status --no-renames: a rename is a delete plus an add, and a
+            # deleted or renamed doc may be linked from anywhere, so it is code.
+            entries="$(git diff --name-status --no-renames "origin/$BASE_REF...HEAD")"
+            if [ -n "$entries" ]; then
               code=false
-              while IFS= read -r f; do
+              while IFS=$'\t' read -r status f; do
                 [ -n "$f" ] || continue
+                case "$status" in A|M) ;; *) code=true; break ;; esac
                 case "$f" in
                   docs/*|*.md) ;;
                   *) code=true; break ;;
                 esac
-                # A doc a suite pins is code for CI's purposes. grep rc 1 is the only
-                # "not pinned"; a hit (0) or an error (2) both run the suites.
+                # A doc named by code, a script, a skill, a test or a workflow is
+                # code for CI's purposes. grep rc 1 is the only "not named"; a hit
+                # (0) or an error (2) both run the suites.
                 rc=0
-                grep -rlqF -- "$(basename "$f")" tests scripts 2>/dev/null || rc=$?
+                grep -rlqF --exclude-dir=node_modules -- "$(basename "$f")" src scripts skills tests packages .github 2>/dev/null || rc=$?
                 if [ "$rc" -ne 1 ]; then
                   code=true; break
                 fi
-              done <<< "$files"
+              done <<< "$entries"
             fi
-            echo "changed files: $(printf '%s\n' "$files" | grep -c . || true)"
+            echo "changed entries: $(printf '%s\n' "$entries" | grep -c . || true)"
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code=$code"
@@ -204,6 +208,9 @@ jobs:
   node-and-oot-tests:
     name: node + out-of-tree python tests
     needs: changes
+    # Job-level, not per step: a docs-only diff skips the whole runner, and the
+    # aggregator below treats that skip as a pass only when `changes` said so.
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -230,7 +237,6 @@ jobs:
       # change process requires for ANY package change — and tools/test_no_drift.py,
       # which is the guard against src/ and the package silently diverging.
       - name: Run out-of-tree Python tests
-        if: needs.changes.outputs.code == 'true'
         run: |
           timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
@@ -261,14 +267,13 @@ jobs:
       # one run, two outcomes. Local `npm test` still runs both halves.
       - name: Run TypeScript tests
         run: npm run test:ts
-        if: needs.changes.outputs.code == 'true' && hashFiles('tests/**/*.test.ts') != ''
+        if: hashFiles('tests/**/*.test.ts') != ''
 
 
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
       # later: these suites existed and CI discovered none of them, so a .mjs
       # suite could fail at HEAD while the run reported green.
       - name: Run ESM standalone tests
-        if: needs.changes.outputs.code == 'true'
         run: |
           failed=0
           while IFS= read -r f; do
@@ -294,6 +299,7 @@ jobs:
   shell-standalone-tests:
     name: shell tests (lanes)
     needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -317,13 +323,13 @@ jobs:
       # *.test.py and *.test.ts). Emit full output on failure so debugging
       # info isn't lost.
       - name: Run shell standalone tests
-        if: needs.changes.outputs.code == 'true'
         run: |
           bash scripts/run-shell-suites.sh lanes
 
   shell-tail-tests:
     name: shell tests (serial tail)
     needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # The process-table suites run one at a time in the checkout; on their own
     # runner they no longer sit behind the typecheck job's lanes.
@@ -334,12 +340,12 @@ jobs:
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
       - name: Run shell standalone tests (serial tail)
-        if: needs.changes.outputs.code == 'true'
         run: bash scripts/run-shell-suites.sh tail
 
   python-standalone-tests:
     name: python standalone tests (${{ matrix.shard }}/5)
     needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Five runners, each a fifth of the files by measured cost; the
     # coverage-gate job combines every leg's data.
@@ -387,7 +393,6 @@ jobs:
       # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
-        if: needs.changes.outputs.code == 'true'
         env:
           SHARD: ${{ matrix.shard }}
         run: |
@@ -468,7 +473,6 @@ jobs:
 
       # `.coverage` is a dotfile, which upload-artifact v4 skips by default.
       - name: Upload coverage data
-        if: needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-data-${{ matrix.shard }}
@@ -484,7 +488,9 @@ jobs:
     # it. pull_request only: the gate is a diff against the PR's base branch.
     # See docs/testing-coverage.md.
     needs: [python-standalone-tests, changes]
-    if: github.event_name == 'pull_request'
+    # A docs-only diff has no Python lines to measure; the required check reads
+    # a skipped job as satisfied, and `changes` is what said the diff is docs.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -499,18 +505,12 @@ jobs:
         run: python3 -m pip install coverage diff-cover
 
       - name: Download coverage data
-        if: needs.changes.outputs.code == 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: coverage-data-*
           merge-multiple: true
 
-      - name: Nothing to cover (docs-only diff)
-        if: needs.changes.outputs.code != 'true'
-        run: echo "docs-only diff, no Python lines changed; the gate passes with nothing to measure"
-
       - name: Run coverage gate
-        if: needs.changes.outputs.code == 'true'
         env:
           BASE_REF: origin/${{ github.base_ref }}
           COVERAGE_GATE_PRECOMPUTED: "1"
@@ -540,7 +540,7 @@ jobs:
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [typecheck-and-test, node-and-oot-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
+    needs: [changes, typecheck-and-test, node-and-oot-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -549,6 +549,10 @@ jobs:
       # dependency failed reports "skipped", which a required check can treat
       # as satisfied. Failing here makes the outcome explicit either way.
       - name: Require every test job to have succeeded
+        env:
+          # A skip is a pass only when `changes` itself succeeded and said the
+          # diff is docs; a `changes` failure leaves code empty, which is not that.
+          DOCS_ONLY: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
         run: |
           set -euo pipefail
           # A cancelled job still blocks the merge — an unfinished run is not a
@@ -561,10 +565,15 @@ jobs:
             case "$2" in
               success)   echo "  $1: success" ;;
               cancelled) echo "::warning::$1 was CANCELLED (job cap or superseded run) — capacity, not a test failure"; rc=1 ;;
-              skipped)   echo "::error::$1 was SKIPPED — a dependency failed, so nothing ran"; rc=1 ;;
+              skipped)   if [ "$DOCS_ONLY" = "true" ] && [ "$1" != "changes" ]; then
+                           echo "  $1: skipped (docs-only diff, nothing to run)"
+                         else
+                           echo "::error::$1 was SKIPPED — a dependency failed, so nothing ran"; rc=1
+                         fi ;;
               *)         echo "::error::$1 FAILED ($2)"; rc=1 ;;
             esac
           }
+          check "changes"                 "${{ needs.changes.result }}"
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
           check "node-and-oot-tests"      "${{ needs.node-and-oot-tests.result }}"
           check "shell-standalone-tests"  "${{ needs.shell-standalone-tests.result }}"
