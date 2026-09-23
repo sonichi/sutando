@@ -583,6 +583,14 @@ def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     return base / key if key else base
 
 
+def watcher_log_path(workspace, inbox) -> Path:
+    """Where a DETACHED watcher on `inbox` appends its stdout: one file per
+    inbox, so two inboxes never interleave and a session can tail its own."""
+    key = Path(str(inbox).rstrip("/")).name or "tasks"
+    key = re.sub(r"[^A-Za-z0-9._@+-]", "_", key)
+    return Path(workspace) / "logs" / f"watcher-{key}.events.log"
+
+
 def task_event_handler_config_path(state_dir) -> Path:
     """Where a skill declares core's task-event handler, e.g. via worker-pool's
     register_worker(). Core-only: workers never read this (their own inbox is
@@ -617,6 +625,8 @@ if __name__ == "__main__":
         print(handler_fallbacks_dir(sys.argv[2]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "task-event-handler-config-path":
         print(task_event_handler_config_path(sys.argv[2]))
+    elif len(sys.argv) >= 4 and sys.argv[1] == "watcher-log":
+        print(watcher_log_path(sys.argv[2], sys.argv[3]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "composer-block-path":
         print(composer_block_path(sys.argv[2]))
     else:
