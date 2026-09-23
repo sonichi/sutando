@@ -50,6 +50,13 @@ class TestRegularFileState(unittest.TestCase):
         ln = self.root / "ln"; ln.symlink_to(t)
         self.assertEqual(pd.regular_file_state(ln), "non-regular")
 
+    def test_a_fifo_is_non_regular_and_does_not_block(self):
+        import time
+        f = self.root / "fifo"; os.mkfifo(f)
+        t0 = time.monotonic()
+        self.assertEqual(pd.regular_file_state(f), "non-regular")
+        self.assertLess(time.monotonic() - t0, 1.0, "a FIFO with no writer must not block the open")
+
     @unittest.skipIf(os.geteuid() == 0, "root can open a mode-000 file")
     def test_an_access_error_is_unknown_not_absent(self):
         f = self.root / "f"; f.write_text("x"); f.chmod(0)

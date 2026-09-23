@@ -223,11 +223,12 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
 
 
 def regular_file_state(path) -> str:
-    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, or a
-    symlink at the name) or "unknown" (any other OSError: EACCES, EIO, EMFILE).
-    Only the first three are verdicts about the path; "unknown" is about this call."""
+    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, a
+    symlink or a FIFO at the name) or "unknown" (any other OSError: EACCES, EIO).
+    Only the first three are verdicts about the path; "unknown" is about this call.
+    O_NONBLOCK: a FIFO at the name would otherwise block the open with no writer."""
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError as e:
