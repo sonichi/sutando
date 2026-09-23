@@ -1361,5 +1361,31 @@ class LiveWordWrapTests(FakeTmuxHarness):
         self.assertNotIn("ENTER", self.sendkeys_log_text())
 
 
+class ComposerBlockPathTests(unittest.TestCase):
+    """In-process, so the path owner is measured by coverage, not only via argv."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("util_paths", REPO / "src/util_paths.py")
+        self.up = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.up)
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_the_default_instance_keeps_the_bare_name(self):
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            if k in os.environ:
+                self.addCleanup(os.environ.__setitem__, k, os.environ.pop(k))
+        p = self.up.composer_block_path(self.d)
+        self.assertEqual(p, self.d / "task-notifier-composer-block")
+
+    def test_two_instances_get_two_files(self):
+        a = self.up.composer_block_path(self.d, instance="w1", agent="@a:x")
+        b = self.up.composer_block_path(self.d, instance="w2", agent="@a:x")
+        self.assertNotEqual(a, b)
+        self.assertEqual({a.parent, b.parent}, {self.d})
+
+
 if __name__ == "__main__":
     unittest.main()
