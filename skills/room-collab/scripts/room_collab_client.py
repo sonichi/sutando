@@ -534,6 +534,17 @@ class RoomDoc:
 
         return stop
 
+    async def closed(self) -> "RoomDocError":
+        """Resolve when this surface's session ends, with the reason.
+
+        A holder that only sleeps never learns the socket died: `_read_loop`
+        sets the end, it does not raise into the caller.
+        """
+        ended = await asyncio.shield(self._ended)
+        err = RoomDocError(f"the surface session has ended: {close_reason(ended)}")
+        err.code = close_code(ended)
+        return err
+
     def on_activity(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Call `callback()` whenever ANYTHING changes in this surface, not only
         what concerns a handle.

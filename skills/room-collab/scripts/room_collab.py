@@ -516,8 +516,11 @@ async def run(args: argparse.Namespace) -> int:
                 path, lambda es: presence_store.without(es, args.room, args.kind))
             verb = "left"
         else:
+            # Resolved, not raw: no flags would register identity=None and
+            # name=None, and no name means a held socket nobody can see.
+            who = resolve_identity(args.user_id)
             entry = {"room": args.room, "kind": args.kind,
-                     "identity": args.user_id, "name": args.name,
+                     "identity": who, "name": presence_name(args.name, who),
                      "summoned_at": time.time()}
             entries = presence_store.mutate_desired(
                 path, lambda es: presence_store.upsert(es, entry))

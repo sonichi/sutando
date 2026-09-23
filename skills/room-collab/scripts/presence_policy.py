@@ -24,6 +24,7 @@ IDLE_SECONDS = 1800.0
 MAX_CONNECTIONS = 16
 
 CONNECTED = "connected"
+CAPPED_REASON = "capped"
 IDLE = "idle"
 CAPPED = "capped"
 
@@ -88,12 +89,25 @@ def plan(
         key=lambda k: (-_num(want[k].get("summoned_at")), k),
     )
 
-    # A cap lowered below what is already held sheds the quietest first.
-    over = len(holding) - max(0, cap)
-    if over > 0:
-        for key in sorted(holding, key=lambda k: (_num(holding[k].get("last_activity")), k))[:over]:
-            drop.append((key, "capped"))
-            holding.pop(key)
+    # LRU ADMISSION, not merely a ceiling. Shedding only when the cap is
+    # LOWERED leaves a fresh summon queued behind 16 idle surfaces forever.
+    quietest = sorted(holding, key=lambda k: (_num(holding[k].get("last_activity")), k))
+    room = max(0, cap) - len(holding)
 
-    room = max(0, cap - len(holding))
-    return {"connect": [want[k] for k in queue[:room]], "drop": drop}
+    def evict(key: tuple[str, str]) -> None:
+        drop.append((key, CAPPED_REASON))
+        holding.pop(key)
+
+    while room < 0 and quietest:          # already over the cap
+        evict(quietest.pop(0))
+        room += 1
+    # A candidate with no slot takes the quietest holder's if it is newer than
+    # that holder's last activity; the queue is newest-first, so one loss ends it.
+    i = 0
+    while i < len(queue) and quietest and room <= i:
+        if _num(want[queue[i]].get("summoned_at")) <= _num(holding[quietest[0]].get("last_activity")):
+            break
+        evict(quietest.pop(0))
+        room += 1
+        i += 1
+    return {"connect": [want[k] for k in queue[:max(0, room)]], "drop": drop}

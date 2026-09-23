@@ -102,6 +102,24 @@ p = policy.plan(
 )
 check("a lowered cap sheds the least recently active", p["drop"] == [(("!c", "markdown"), "capped")])
 
+# ⚠ #4646 review: at the cap, over = 0 and room = 0 queued a fresh summon forever.
+full = [held(f"!h{n}", last_activity=NOW - 100 - n) for n in range(3)]
+p = policy.plan(
+    [want(f"!h{n}", summoned_at=NOW - 500) for n in range(3)] + [want("!new", summoned_at=NOW)],
+    full, NOW, cap=3,
+)
+check("at the cap, a fresh summon evicts the least recently active",
+      p["drop"] == [(("!h2", "markdown"), "capped")])
+check("...and that summon is the one admitted", keys(p["connect"]) == [("!new", "markdown")])
+
+# The mirror: a summon OLDER than every holder's last activity waits its turn.
+p = policy.plan(
+    [want(f"!h{n}", summoned_at=NOW - 500) for n in range(3)] + [want("!old", summoned_at=NOW - 900)],
+    full, NOW, cap=3,
+)
+check("a summon older than the quietest holder does NOT evict it", p["drop"] == [])
+check("...and nothing is admitted over the cap", p["connect"] == [])
+
 # `capped` and `idle` are different states for a reason: only one needs a new
 # summon to come back.
 p = policy.plan([want("!a", summoned_at=NOW - 5000)],

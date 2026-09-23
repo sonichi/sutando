@@ -48,12 +48,26 @@ Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
 sentence you own.
 
-**To be seen in a surface you must HOLD it open.** Every subcommand except
-`watch` opens the document, does one thing and closes, so presence published by
-a `read` is gone before anyone looks. `watch` holds the connection — and it
-publishes presence only when given `--name`, so without it you join invisibly.
-Add `--user-id '@you:server'` too: a summon card draws your real avatar when
-the presence summary carries your id, and a placeholder when it does not.
+**To be seen in a surface, register — do not hold it open yourself.** Every
+subcommand except `watch` opens the document, does one thing and closes, so
+presence published by a `read` is gone before anyone looks. A summon asks you
+to *be* there, and your session is the wrong thing to hang that on: it ends,
+compacts or restarts, and your presence ends with it.
+
+```bash
+python3 $P stay '!room:server'            # after reading a summon
+python3 $P --kind board stay '!room:server'
+python3 $P stay '!room:server' --leave    # when you are done there
+```
+
+`stay` writes a record and exits; it holds nothing and needs no token. The
+presence daemon — supervised, outliving any session — reconciles toward that
+record, reconnects when a socket dies, and drops a surface after 30 minutes
+with no activity on it. Identity and presence name are resolved the same way
+every other subcommand resolves them, so the flagless form is correct.
+
+`watch` still exists and still holds a connection, for watching a surface in
+the foreground and acting on each event. Use it for that, not for being seen.
 
 **Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
 `--json` belong to the program, not the command: `room_collab.py --kind board

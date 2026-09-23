@@ -60,15 +60,21 @@ class Held:
         return policy.key_of(self.entry)
 
     def row(self, state: str) -> dict:
-        return {"room": self.entry.get("room"), "kind": self.entry.get("kind"),
-                "state": state, "since": self.since, "last_activity": self.last_activity}
+        # `state` is whether this DAEMON holds the surface; `transport` is
+        # whether the socket is up. A reconnecting surface is held and down.
+        row = {"room": self.entry.get("room"), "kind": self.entry.get("kind"),
+               "state": state, "since": self.since, "last_activity": self.last_activity}
+        if state == policy.CONNECTED:
+            row["transport"] = "up" if self.connected else "down"
+        return row
 
 
 class Daemon:
     def __init__(self, workspace: Path, url: str, token: str, *,
                  idle_seconds: float = policy.IDLE_SECONDS,
                  cap: int = policy.MAX_CONNECTIONS,
-                 insecure: bool = False, clock=time.time) -> None:
+                 insecure: bool = False, clock=time.time,
+                 max_backoff: float = 30.0) -> None:
         self.ws = workspace
         self.url = url
         self.token = token
@@ -78,10 +84,31 @@ class Daemon:
         # ONE clock: `hold` stamping time.time() against a `reconcile(now)` is
         # two clocks that agree only by luck, and an untestable idle rule.
         self.clock = clock
+        self.max_backoff = max_backoff
         self.held: dict[tuple[str, str], Held] = {}
         # A surface the daemon stopped holding, and why: `plan` reads this to
         # decide whether it may come back without a new summon.
         self.retired: dict[tuple[str, str], dict] = {}
+        self.resumed = False
+
+    def resume(self) -> None:
+        """Take back what the last run remembered. Idempotent; the first
+        reconcile calls it, so no caller has to remember to.
+
+        Only `idle` and `capped` survive a restart: a CONNECTED row describes a
+        socket that died with the process, and `plan` will reopen it. Without
+        this the 30-minute rule resets on every restart — the record was
+        written and never read, which is not durable, only written down.
+        """
+        if self.resumed:
+            return
+        self.resumed = True
+        for row in store.read_entries(live_path(self.ws)):
+            key = policy.key_of(row)
+            if all(key) and row.get("state") in (policy.IDLE, policy.CAPPED):
+                self.retired[key] = dict(row)
+        if self.retired:
+            print(f"presence: resumed {len(self.retired)} remembered surface(s)", flush=True)
 
     # --- the record the policy reads, assembled from what is actually held
     def live_rows(self) -> list[dict]:
@@ -93,42 +120,46 @@ class Daemon:
         store.write_entries(live_path(self.ws), self.live_rows())
 
     async def hold(self, held: Held) -> None:
-        """Keep one surface open and stamp every change on it.
+        """Keep one surface open, and put it back when the transport dies.
 
-        Any change counts, not only what names this agent (owner 2026-09-22):
-        a document someone else is editing is exactly when an agent's presence
-        is worth showing, so someone else's keystroke must reset the timer.
+        Any change on the surface counts as activity, not only what names this
+        agent: a document someone else is editing is when presence matters.
         """
         from room_collab_client import open_room_collab
 
         entry = held.entry
-        try:
-            async with open_room_collab(self.url, entry["room"], self.token,
-                                        kind=entry["kind"], insecure=self.insecure) as doc:
-                name = entry.get("name") or entry.get("identity")
-                if name:
-                    await doc.set_presence(str(name), user_id=entry.get("identity"))
-                held.connected = True
-                held.last_activity = self.clock()
-
-                def touched() -> None:
+        failures = 0
+        while True:
+            try:
+                async with open_room_collab(self.url, entry["room"], self.token,
+                                            kind=entry["kind"], insecure=self.insecure) as doc:
+                    name = entry.get("name") or entry.get("identity")
+                    if name:
+                        await doc.set_presence(str(name), user_id=entry.get("identity"))
+                    held.connected = True
                     held.last_activity = self.clock()
+                    failures = 0
 
-                stop = doc.on_activity(touched)
-                try:
-                    # Nothing to consume: the socket is the point, and the
-                    # callback above is what the idle rule reads.
-                    while True:
-                        await asyncio.sleep(RECONCILE_SECONDS)
-                finally:
-                    stop()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - one surface must not take the daemon down
-            print(f"presence: {entry.get('room')} ({entry.get('kind')}) ended: {exc}",
-                  flush=True)
-        finally:
-            held.connected = False
+                    def touched() -> None:
+                        held.last_activity = self.clock()
+
+                    stop = doc.on_activity(touched)
+                    try:
+                        # Awaited, not slept through: the read loop records the
+                        # end, it never raises into a holder that only sleeps.
+                        raise await doc.closed()
+                    finally:
+                        stop()
+            except asyncio.CancelledError:
+                held.connected = False
+                raise
+            except Exception as exc:  # noqa: BLE001 - one surface must not end the daemon
+                held.connected = False
+                failures += 1
+                wait = min(2 ** failures, self.max_backoff)
+                print(f"presence: {entry.get('room')} ({entry.get('kind')}) lost: {exc}; "
+                      f"reconnecting in {wait:.0f}s", flush=True)
+                await asyncio.sleep(wait)
 
     def start(self, entry: dict, now: float) -> None:
         held = Held(entry, now)
@@ -154,6 +185,7 @@ class Daemon:
         print(f"presence: left {key[0]} ({key[1]}): {reason}", flush=True)
 
     async def reconcile(self, now: float) -> None:
+        self.resume()
         desired = store.read_entries(desired_path(self.ws))
         want = {policy.key_of(e) for e in desired}
         # A surface nobody asks for any more has nothing left to remember.
