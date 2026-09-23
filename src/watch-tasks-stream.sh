@@ -139,7 +139,9 @@ while ! mkdir "$START_LOCK" 2>/dev/null; do
          # rm, and the second rm takes the first's fresh lock with it.
          if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
            # mv moves whatever is at the path: if another taker already replaced
-           # the dead lock with its live one, give that one back untouched.
+           # the dead lock with its live one, give that one back untouched. A third
+           # starter creating the lock inside that window nests the returned dir
+           # under its own (today's double run at worst; nothing is deleted).
            if [ "$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)" = "$__lpid" ]; then
              echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid $__lpid; taking it over" >&2
              rm -rf "$START_LOCK.dead.$$"
