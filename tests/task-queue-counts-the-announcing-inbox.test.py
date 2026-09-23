@@ -62,9 +62,24 @@ class Counts(unittest.TestCase):
         self.assertEqual(tq.waiting(self.ws, "task-mine"), 3)
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.ws / "tasks"), 3)
 
-    def test_an_accepted_sentinel_is_not_pending(self):
-        (self.inbox / "task-mine-2.txt").rename(self.inbox / "task-mine-2.accepted")
+    def test_a_sentinel_whose_task_has_a_ready_result_is_not_pending(self):
+        # Built the way a host builds it: sentinels are written and never retired (they
+        # stay 0-byte .txt entries); the only thing that changes is a result being published.
+        (self.ws / "results").mkdir()
+        for tid in ("task-old-a", "task-old-b", "task-old-c"):
+            _task(self.ws / "tasks" / f"{tid}.txt", tid)
+            (self.inbox / f"{tid}.txt").write_text("")
+            (self.ws / "results" / f"{tid}.txt").write_text("done: answered earlier\n")
+        (self.ws / "results" / "task-mine-2.txt").write_text("   \n")      # empty placeholder: not ready
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), sorted(
+            ["task-mine.txt", "task-mine-2.txt", "task-old-a.txt", "task-old-b.txt", "task-old-c.txt"]))
+        self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, self.inbox)), ["task-mine", "task-mine-2"])
+        self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 1)
+        (self.ws / "results" / "task-mine-2.txt").write_text("done: now answered\n")
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 0)
+        # A renamed sentinel is not an entry at all, whichever suffix a future pruner picks.
+        (self.inbox / "task-mine.txt").rename(self.inbox / "task-mine.accepted")
+        self.assertEqual(tq.pending(self.ws, self.inbox), [])
 
     def _cli(self, *argv: str) -> tuple[int, str]:
         # In-process: the entry point's own branches are what run (and what is measured).

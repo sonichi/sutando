@@ -81,11 +81,15 @@ def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> l
     ws = workspace or resolve_workspace()
     tasks_dir = Path(inbox) if inbox else ws / "tasks"
     try:
-        # In a delivery inbox only a `.txt` entry is pending: a renamed suffix means taken.
-        paths = [p for p in tasks_dir.iterdir()
-                 if p.is_file() and is_queue_task(p.name) and (not inbox or p.name.endswith(".txt"))]
+        paths = [p for p in tasks_dir.iterdir() if p.is_file() and is_queue_task(p.name)]
     except (FileNotFoundError, NotADirectoryError):
         return []
+    if inbox:
+        # A delivery sentinel is never retired on a live host, so its presence proves
+        # nothing; an entry is pending only while its task has no ready result.
+        from delivery.task_dispatch import has_ready_result
+        results_dir = ws / "results"
+        paths = [p for p in paths if p.name.endswith(".txt") and not has_ready_result(results_dir, p.name)]
     out = []
     for p in sort_tasks_by_priority(paths):
         try:
