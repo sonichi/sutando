@@ -51,11 +51,19 @@ class TestRegularFileState(unittest.TestCase):
         self.assertEqual(pd.regular_file_state(ln), "non-regular")
 
     def test_a_fifo_is_non_regular_and_does_not_block(self):
-        import time
+        import signal
         f = self.root / "fifo"; os.mkfifo(f)
-        t0 = time.monotonic()
-        self.assertEqual(pd.regular_file_state(f), "non-regular")
-        self.assertLess(time.monotonic() - t0, 1.0, "a FIFO with no writer must not block the open")
+        # A blocking open would hang the suite until CI's cap; an alarm turns
+        # that into a named failure instead.
+        def hung(signum, frame):
+            raise AssertionError("open() on a FIFO with no writer blocked: O_NONBLOCK is missing")
+        prev = signal.signal(signal.SIGALRM, hung)
+        signal.alarm(3)
+        try:
+            self.assertEqual(pd.regular_file_state(f), "non-regular")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev)
 
     @unittest.skipIf(os.geteuid() == 0, "root can open a mode-000 file")
     def test_an_access_error_is_unknown_not_absent(self):
