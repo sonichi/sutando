@@ -57,10 +57,17 @@ for t in WRITE_TOOLS:
     check(f"deny: {t.rsplit('__', 1)[-1]}",
           r.returncode == 0 and decision(r) == "deny", r.stdout[:120])
 
-# Reason must be actionable: name the IMAP/SMTP path + the escape hatch.
+# Reason must be actionable: the Station connector FIRST (user feedback 2026-09-20 was
+# told to generate an app password because the old reason led with IMAP/SMTP),
+# a read-back after sending, the app password only as the last resort, and the
+# escape hatch.
 r = run({"tool_name": "mcp__claude_ai_Gmail__create_draft", "tool_input": {}})
 reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
-check("reason points at the IMAP/SMTP path", "imaplib/smtplib" in reason)
+check("reason routes to the Station connector", "composio_find" in reason and "GMAIL_SEND_EMAIL" in reason)
+check("reason requires a read-back after sending", "read the sent message back" in reason)
+check("reason never asks the owner for an app password", "never ask" in reason and "app password" in reason)
+check("reason keeps IMAP/SMTP only as the fallback",
+      reason.index("composio_find") < reason.index("IMAP/SMTP") and "Only when the Station tools are unavailable" in reason)
 check("reason names the escape hatch", "SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES" in reason)
 
 # ── Read tools pass through (they work fine and must keep working) ────────────

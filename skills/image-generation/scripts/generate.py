@@ -41,9 +41,10 @@ ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:gene
 TIMEOUT_S = 180
 REFUSAL_REASONS = ("SAFETY", "IMAGE_SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION",
                    "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "IMAGE_OTHER")
-EXIT = {"ok": 0, "refused": 1, "no_image": 1, "api_error": 1, "no_key": 2, "sdk_missing": 2, "bad_input": 2}
+EXIT = {"ok": 0, "refused": 1, "no_image": 1, "api_error": 1, "quota": 1, "no_key": 2, "sdk_missing": 2, "bad_input": 2}
 REMEDY = {
     "no_key": "Add a Gemini key in Agent settings → Agent → Gemini API, or ask again once your plan includes the managed key.",
+    "quota": "Google returned a quota error for the image model. A free-tier Gemini key has 0 image requests per day: enable billing on the key's Google Cloud project, or use the managed key (Agent settings → Agent → Gemini API).",
     "refused": "Reword the prompt: no real people's faces, no copyrighted characters, nothing explicit.",
     "no_image": "Try a more concrete prompt that describes a picture, or name the style and the subject.",
     "api_error": "Try again in a moment; if it keeps failing, check the key and the model name (IMAGE_MODEL).",
@@ -169,6 +170,25 @@ def api_error_message(err: urllib.error.HTTPError) -> str:
         return f"HTTP {err.code}"
 
 
+def classify_http_error(err: urllib.error.HTTPError, message: str) -> str:
+    """`quota` for a 429 or a RESOURCE_EXHAUSTED / quota body, else `api_error`. Until 2026-09-23 a
+    zero-quota free-tier key (0 image requests/day) surfaced as an opaque api_error with "try again";
+    the owner had no way to learn the key needs billing enabled before any image can be generated."""
+    low = message.lower()
+    if err.code == 429 or "resource_exhausted" in low or "quota" in low:
+        return "quota"
+    return "api_error"
+
+
+def key_note(source: str) -> str:
+    """Which key ran out, so the remedy is actionable: the owner's own env key or the managed one."""
+    if source == "env":
+        return " (this install uses your own key, GEMINI_API_KEY)"
+    if source == "managed":
+        return " (the managed key)"
+    return ""
+
+
 def first_image(response: dict) -> tuple[bytes | None, str, str, str]:
     """(image bytes, mime, model text, refusal reason) from a generateContent response."""
     text, reason = "", ""
@@ -219,7 +239,7 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     return out
 
 
-def generate_image(args, key: str, opener=None) -> int:
+def generate_image(args, key: str, opener=None, source: str = "") -> int:
     parts: list[dict] = []
     for path in args.input:
         got = read_input_image(path)
@@ -235,7 +255,9 @@ def generate_image(args, key: str, opener=None) -> int:
     try:
         response = call_gemini(key, model, parts, opener)
     except urllib.error.HTTPError as err:
-        return fail("api_error", api_error_message(err))
+        message = api_error_message(err)
+        kind = classify_http_error(err, message)
+        return fail(kind, message + (key_note(source) if kind == "quota" else ""))
     except (urllib.error.URLError, OSError, ValueError) as err:
         return fail("api_error", str(getattr(err, "reason", None) or err))
     data, mime, text, reason = first_image(response if isinstance(response, dict) else {})
@@ -304,7 +326,7 @@ def main(argv: list[str] | None = None, opener=None) -> int:
     if not key:
         return fail("no_key", "There is no Gemini key for image generation on this install (managed, GEMINI_API_KEY or GEMINI_VOICE_API_KEY)")
     log(f"Key: {source}")
-    return generate_video(args, key) if args.video else generate_image(args, key, opener)
+    return generate_video(args, key) if args.video else generate_image(args, key, opener, source)
 
 
 if __name__ == "__main__":

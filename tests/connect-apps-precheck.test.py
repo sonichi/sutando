@@ -91,6 +91,15 @@ class TestTable(unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual([h["slug"] for h in hook.match_apps(text, TABLE)], want)
 
+    def test_a_longer_phrase_beats_the_shorter_one_it_contains(self):
+        # "cold email campaign" is Smartlead's phrase; the "email" inside it must not also name Gmail.
+        hits = hook.match_apps("set up a cold email campaign to founders", TABLE)
+        self.assertEqual([h["slug"] for h in hits], ["smartlead"])
+        self.assertEqual(hits[0]["prefer_skill"], "campaign-runner")
+        # Both apps genuinely named: both stay.
+        self.assertEqual([h["slug"] for h in hook.match_apps("check gmail, then the campaign stats", TABLE)],
+                         ["smartlead", "gmail"])
+
     def test_misses_and_word_boundaries(self):
         for text in ("what's the weather", "linearly interpolate these", "the emailed report", "calendars in general",
                      "", "a zoomed-in view", "slackers"):
@@ -182,6 +191,22 @@ class TestHandle(Base):
                 self.assertNotIn("needs_connect", line)
                 self.assertNotIn("connected=linear", line)
                 self.assertIn("run: python3", line, "the card hint still helps: card itself reads the cloud")
+
+    def test_a_prefer_skill_app_gets_the_skill_line_and_no_card(self):
+        # user feedback 2026-09-19: the agent used the bare Smartlead connector, which cannot attach a
+        # mailbox, upload leads or write a sequence; campaign-runner does all of it.
+        self.task(text="set up a cold email campaign in smartlead")
+        self.warm("gmail")
+        with tempfile.TemporaryDirectory() as ccd, mock.patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": ccd}):
+            line = hook.handle(self.payload(sid="s-skill-missing"), now=NOW + 1, table=TABLE)
+            self.assertIn("needs_connect=none", line)
+            self.assertIn("prefer_skill=campaign-runner for smartlead (not installed: offer to install it (marketplace skill); never the bare smartlead connector)", line)
+            self.assertNotIn("card smartlead", line)
+            self.assertNotIn("run:", line)
+            (Path(ccd) / "skills" / "campaign-runner").mkdir(parents=True)
+            (Path(ccd) / "skills" / "campaign-runner" / "SKILL.md").write_text("x")
+            line = hook.handle(self.payload(sid="s-skill-installed"), now=NOW + 1, table=TABLE)
+            self.assertIn("prefer_skill=campaign-runner for smartlead (installed; never the bare smartlead connector)", line)
 
     def test_all_matched_apps_connected_means_no_run_hint(self):
         self.task()

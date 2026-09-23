@@ -170,6 +170,32 @@ class Failures(Base):
         self.assertEqual((rc, line["error"]), (1, "api_error"))
         self.assertIn("dns down", line["message"])
 
+    def test_a_429_is_quota_with_the_billing_remedy_and_the_key_named(self):
+        # user feedback 2026-09-17: a free-tier key has 0 image requests/day; that surfaced as an opaque
+        # api_error "try again in a moment", which is exactly the wrong advice for a quota.
+        body = b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded for quota metric"}}'
+        err = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(body))
+        with mock.patch.object(gen, "resolve_key", lambda: ("k", "env")):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual((rc, line["error"]), (1, "quota"))
+        self.assertIn("Quota exceeded", line["message"])
+        self.assertIn("GEMINI_API_KEY", line["message"], "the owner's own key is named")
+        self.assertIn("billing", line["remedy"])
+        self.assertIn("0 image requests", line["remedy"])
+        with mock.patch.object(gen, "resolve_key", lambda: ("k", "managed")):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(error=urllib.error.HTTPError(
+                "u", 429, "Too Many Requests", {}, io.BytesIO(body))))
+        self.assertEqual(line["error"], "quota")
+        self.assertIn("managed key", line["message"])
+
+    def test_a_quota_body_on_another_status_is_still_quota_and_a_plain_400_is_not(self):
+        err = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b'{"error": {"message": "quota exhausted for images"}}'))
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual((rc, line["error"]), (1, "quota"))
+        err = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b'{"error": {"message": "model not found"}}'))
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual(line["error"], "api_error")
+
     def test_a_missing_input_image_is_bad_input_before_any_request(self):
         rc, line = self.run_main("--prompt", "x", "--input", str(self.ws / "nope.png"), opener=self.opener(response()))
         self.assertEqual((rc, line["error"], self.calls), (2, "bad_input", []))

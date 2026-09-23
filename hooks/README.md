@@ -143,8 +143,13 @@ events above, argv[1] = hook name as a stdin fallback. Test:
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
 label_thread, unlabel_thread, create_label, apply_sensitive_*_label, archive,
-trash, send, …) and routes the model to the app-password IMAP/SMTP path
-(docs/built-in-tools.md → Email). Field report 05cb849a: the connector's OAuth
+trash, send, …) and routes the model to the **Station Gmail connector**
+(`composio_find` → `composio_exec`, a different tool name this guard never
+matches), with a read-back after every send; the app-password IMAP/SMTP path
+(docs/built-in-tools.md → Email) is named only as the fallback when the Station
+tools are absent. (Until 2026-09-23 the reason led with IMAP/SMTP, so an owner
+with Gmail connected in Settings → Integrations was still asked to generate an
+app password by hand.) Field report 05cb849a: the connector's OAuth
 flow doesn't actually grant Gmail write scopes (label/archive fail with a raw
 "insufficient authentication scopes" error) and `create_draft` caused 7
 documented incidents incl. a wrong-recipient send — while READ tools work fine
