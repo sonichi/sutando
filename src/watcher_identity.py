@@ -627,6 +627,7 @@ def main(argv=None) -> int:
             print("usage: watcher_identity.py sentinel-names-pid <pid> --ready STATE_DIR", file=sys.stderr)
             return 64
         print("yes" if sentinel_names_pid(pid, state_dir) else "no")
+        return 0
     if args and args[0] == "reader-fresh":
         rest = args[1:]
         inbox = state = None
