@@ -135,8 +135,13 @@ while ! mkdir "$START_LOCK" 2>/dev/null; do
   case "$__lpid" in
     ''|*[!0-9]*) ;;
     *) if ! kill -0 "$__lpid" 2>/dev/null; then
-         echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid $__lpid; taking it over" >&2
-         rm -rf "$START_LOCK"; continue
+         # Rename, never rm in place: two starters over one dead lock would both
+         # rm, and the second rm takes the first's fresh lock with it.
+         if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
+           echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid $__lpid; taking it over" >&2
+           rm -rf "$START_LOCK.dead.$$"
+         fi
+         continue
        fi ;;
   esac
   if [ "$(date +%s)" -ge "$__lock_deadline" ]; then

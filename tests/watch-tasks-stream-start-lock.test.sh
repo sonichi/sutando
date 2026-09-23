@@ -74,6 +74,19 @@ grep -q 'left by dead pid 999999; taking it over' "$WS/c.err"; check "(b) ...and
 [ ! -d "$LOCK" ]; check "(b) ...and the lock is released after the stamp" $?
 kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
 
+# (b2) Two starters over the SAME dead-pid lock: the takeover is a rename, so
+#      only one of them removes it and the other waits; still one announcer.
+WS="$WORK/stale2"; mkdir -p "$WS/tasks" "$WS/state"
+key="$(printf '%s' "$(cd "$WS/tasks" && pwd -P)" | cksum | cut -d' ' -f1)"
+LOCK="$WS/state/watch-tasks-stream.start-$key.lock"
+mkdir -p "$LOCK"; echo 999999 > "$LOCK/pid"
+a="$(start "$WS" g)"; b="$(start "$WS" h)"; PIDS+=("$a" "$b")
+settle "$WS" "$a" "$b"
+live=0; alive "$a" && live=$((live+1)); alive "$b" && live=$((live+1))
+check "(b2) two starters over one dead-pid lock: exactly one announcer (live=$live, sentinels=$(ls "$WS"/state/*.pid 2>/dev/null | wc -l | tr -d ' '))" "$([ "$live" = 1 ] && echo 0 || echo 1)" "g.err: $(tail -1 "$WS/g.err")|h.err: $(tail -1 "$WS/h.err")"
+[ -z "$(ls -d "$WS"/state/watch-tasks-stream.start-*.lock* 2>/dev/null)" ]; check "(b2) ...and no lock or renamed lock is left behind" $?
+for p in "$a" "$b"; do kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done; sleep 0.3
+
 # (c) A lock held by a LIVE pid past the timeout does not strand the inbox: the
 #     start proceeds without the lock and says so.
 WS="$WORK/timeout"; mkdir -p "$WS/tasks" "$WS/state"
