@@ -49,7 +49,8 @@ class Counts(unittest.TestCase):
         self.inbox = self.ws / "deliveries" / "w1"
         self.inbox.mkdir(parents=True)
         (self.inbox / "task-mine.txt").write_text("")     # the sentinel being announced
-        (self.inbox / "task-mine-2.txt").write_text("")   # one more waiting in the worker's inbox
+        (self.inbox / "task-mine-2.txt").write_text("")
+        os.utime(self.inbox / "task-mine.txt", (1, 1))    # strictly older: order decided, not a same-second tie
         _task(self.ws / "tasks" / "task-mine-2.txt", "task-mine-2")
 
     def test_a_worker_inbox_counts_its_own_sentinels_not_the_cores_tasks(self):
