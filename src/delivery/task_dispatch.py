@@ -57,12 +57,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import iter_result_candidates  # noqa: E402
+from local_task_protocol import index_result_candidates, iter_result_candidates  # noqa: E402
 
 from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
 __all__ = [
-    "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
+    "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
     "announced_entry",
@@ -132,6 +132,25 @@ def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
     does not stop the search; `find_ready_result` walks past it.
     """
     return find_ready_result_for_filename(results_dir, filename) is not None
+
+
+def ready_result_filenames(results_dir: "Path | str", filenames, *,
+                           reader=read_ready_result) -> "set[str]":
+    """The subset of task FILENAMES that `has_ready_result` would answer True for, resolved
+    together: one listing per result layout (`index_result_candidates`), then only the
+    candidates that belong to these ids are read. A caller with many filenames (a
+    worker's inbox, hundreds of never-retired sentinels) pays for the listings once,
+    not for a glob over the flat archive per filename.
+    """
+    by_id: dict[str, list[str]] = {}
+    for f in filenames:
+        by_id.setdefault(_task_id_for_filename(f), []).append(f)
+    index = index_result_candidates(Path(results_dir), by_id)
+    ready: set[str] = set()
+    for task_id, candidates in index.items():
+        if any(reader(c) is not None for c in candidates):
+            ready.update(by_id[task_id])
+    return ready
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
