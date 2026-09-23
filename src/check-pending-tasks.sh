@@ -265,27 +265,30 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
     COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"'
   else
     COVERAGE_INBOX="$TASKS_DIR"
-    COVERAGE_REARM="bash src/watch-tasks-stream.sh --role session --inbox \"$TASKS_DIR\""
+    # Absolute: the core may run from a foreign cwd (SUTANDO_CLAUDE_WORKING_DIR).
+    COVERAGE_REARM="bash \"$REPO_DIR/src/watch-tasks-stream.sh\" --role session --inbox \"$TASKS_DIR\""
   fi
-  # Consecutive unwatched turn ends, per instance: a watcher that cannot start
-  # must not wedge the session, so the gate fails open past the cap, logged.
-  COVERAGE_COUNT_FILE="$WORKSPACE/state/stop-hook-unwatched${SUTANDO_INSTANCE_ID:+-$SUTANDO_INSTANCE_ID}"
+  # Consecutive unwatched turn ends, per runtime instance: a watcher that cannot
+  # start must not wedge the session, so the gate fails open past the cap, logged.
   COVERAGE_FAIL_OPEN_AFTER="${SUTANDO_STOP_HOOK_UNWATCHED_FAIL_OPEN_AFTER:-3}"
   COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""
   case "$COVERAGE_VERDICT" in
-    yes) rm -f "$COVERAGE_COUNT_FILE" ;;
+    yes) "$PYBIN" "$REPO_DIR/src/stop_hook_unwatched.py" clear --state "$WORKSPACE/state" 2>/dev/null || true ;;
     no)
-      COVERAGE_N="$(cat "$COVERAGE_COUNT_FILE" 2>/dev/null)"
-      case "$COVERAGE_N" in ''|*[!0-9]*) COVERAGE_N=0 ;; esac
-      COVERAGE_N=$((COVERAGE_N + 1))
-      mkdir -p "$(dirname "$COVERAGE_COUNT_FILE")" 2>/dev/null || true
-      printf '%s\n' "$COVERAGE_N" > "$COVERAGE_COUNT_FILE" 2>/dev/null || true
-      if [ "$COVERAGE_N" -le "$COVERAGE_FAIL_OPEN_AFTER" ]; then
+      # A counter that cannot be persisted can never reach the cap: fail open now.
+      COVERAGE_ERR="$(mktemp "${TMPDIR:-/tmp}/stop-hook-unwatched.XXXXXX" 2>/dev/null || echo /dev/null)"
+      if ! COVERAGE_N="$("$PYBIN" "$REPO_DIR/src/stop_hook_unwatched.py" bump --state "$WORKSPACE/state" 2>"$COVERAGE_ERR")"; then
+        echo "check-pending-tasks: $COVERAGE_INBOX is unwatched but the counter could not be written ($(tail -1 "$COVERAGE_ERR" 2>/dev/null)); failing open" >&2
+        COVERAGE_N=""
+      fi
+      [ "$COVERAGE_ERR" != /dev/null ] && rm -f "$COVERAGE_ERR"
+      case "$COVERAGE_N" in ''|*[!0-9]*) COVERAGE_N="" ;; esac
+      if [ -n "$COVERAGE_N" ] && [ "$COVERAGE_N" -le "$COVERAGE_FAIL_OPEN_AFTER" ]; then
         SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): via the Monitor tool, $COVERAGE_REARM" \
           "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ["SUTANDO_HOOK_REASON"]}, separators=(",", ":")))'
         exit 0
       fi
-      echo "check-pending-tasks: $COVERAGE_INBOX unwatched at $COVERAGE_N consecutive turn ends; failing open" >&2
+      [ -n "$COVERAGE_N" ] && echo "check-pending-tasks: $COVERAGE_INBOX unwatched at $COVERAGE_N consecutive turn ends; failing open" >&2
       ;;
     *) : ;;  # unknown or unobservable is not evidence of an unwatched inbox
   esac
