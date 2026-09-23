@@ -32,8 +32,8 @@ def check(label, cond, detail=""):
 
 
 class FakeDoc:
-    """Enough of RoomDoc for the daemon: presence, an activity hook, and a
-    session that ends when the test says so."""
+    """Enough of the collab document for the daemon: presence, an activity hook,
+    and a session that ends when the test says so."""
 
     def __init__(self, opened, ends):
         self.opened = opened
@@ -347,11 +347,9 @@ def main() -> int:
 
     print("── the entry point refuses rather than looping without credentials ──")
     import subprocess as _sp
-    bare = {k: v for k, v in os.environ.items()
-            if k not in ("AG2_MATRIX_TOKEN", "ROOM_COLLAB_TOKEN", "ROOM_DOC_TOKEN",
-                         "MATRIX_ACCESS_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN",
-                         "AG2_ROOM_COLLAB_URL", "AG2_ROOM_DOC_URL", "AG2_API_ROOT",
-                         "REMOTE_TASK_URL")}
+    # Only what an interpreter needs: naming the credential variables here
+    # would duplicate the skill's own list, and a copy of it drifts.
+    bare = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
     daemon_cli = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
     rc = _sp.run([*pybase, str(daemon_cli), "--workspace", str(TMP)],
                  capture_output=True, text=True, env=bare, timeout=120)
