@@ -100,6 +100,21 @@ def _attachment_marks(atts):
     return out
 
 
+def _payload_marks(m):
+    """Every non-text payload one message level carries, as readable marks.
+
+    The forward branch already labelled embeds; the top level did not, so an
+    embed-only post rendered as a blank line — the same defect as the forwards
+    below, one branch over.
+    """
+    out = list(_attachment_marks(m.get("attachments")))
+    for e in m.get("embeds") or []:
+        out.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
+    for s in m.get("sticker_items") or []:
+        out.append(f"<sticker: {s.get('name') or '?'}>")
+    return out
+
+
 def _render(msg, clip=CLIP):
     """One message's readable body, INCLUDING forwarded content.
 
@@ -126,15 +141,12 @@ def _render(msg, clip=CLIP):
     if not snaps:
         # A top-level attachment lives outside `content` (file-only messages
         # rendered blank); its FILENAME is user-supplied, so the marks redact too.
-        marks = [_redact(m) for m in _attachment_marks(msg.get("attachments"))]
+        marks = [_redact(m) for m in _payload_marks(msg)]
         body = body[:clip] if clip is not None else body
         return " ".join(x for x in (body, *marks) if x)
     fwd = (snaps[0].get("message") or {})
     fwd_body = (fwd.get("content") or "").strip()
-    extra = []
-    extra.extend(_attachment_marks(fwd.get("attachments")))
-    for e in fwd.get("embeds") or []:
-        extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
+    extra = _payload_marks(fwd)
     # Redact the COMPOSED inner: filenames and embed titles are user-supplied too.
     inner = _redact(" ".join(x for x in (fwd_body, *extra) if x)) \
         or "(forward with no readable body)"
