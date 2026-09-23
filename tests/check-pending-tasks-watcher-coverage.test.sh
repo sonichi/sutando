@@ -93,6 +93,37 @@ case "$OUT" in
   *'$SUTANDO_WATCHER_CMD'*) ok "the worker's re-arm is the launcher's watcher command" ;;
   *) bad "the worker's re-arm is the launcher's watcher command" "got: ${OUT:0:200}" ;;
 esac
+# The watcher refuses to start (rc 64) without a role and inbox tag, so a re-arm
+# line missing them is an instruction that cannot succeed; run it to be sure.
+REARM_LINE="$(printf '%s' "$OUT" | "$PY" -c 'import json,re,sys; r=json.load(sys.stdin)["reason"]; print(re.search(r"bash \"\$SUTANDO_WATCHER_CMD\"[^\n]*", r).group(0))' 2>/dev/null)"
+case "$REARM_LINE" in
+  *'--role session --inbox "$SUTANDO_TASKS_DIR"'*) ok "the worker's re-arm carries --role session --inbox" ;;
+  *) bad "the worker's re-arm carries --role session --inbox" "got: $REARM_LINE" ;;
+esac
+# Control first: the bare launcher line is what the watcher refuses, so a pass
+# below means the flags were read, not that the watcher stopped refusing.
+run_rearm() {  # $1 command line; prints stderr head + rc; kills a watcher that did start
+  local err="$BUNDLE/rearm.err" rc
+  : > "$err"
+  set -m
+  (cd "$BUNDLE" && env SUTANDO_WATCHER_CMD="$REPO/src/watch-tasks-stream.sh" SUTANDO_TASKS_DIR="$WS/deliveries/w1" \
+    SUTANDO_WORKSPACE_DIR="$WS" SUTANDO_INSTANCE_ID=w1 bash -c "$1" </dev/null >/dev/null 2>"$err") &
+  local p=$!
+  set +m
+  sleep 1
+  if kill -0 "$p" 2>/dev/null; then kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; rc=started; else wait "$p" 2>/dev/null; rc=$?; fi
+  printf '%s|%s' "$rc" "$(head -c 120 "$err" | tr '\n' ' ')"
+}
+CTRL="$(run_rearm 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"')"
+case "$CTRL" in
+  64\|*'refusing to start'*) ok "control: the bare launcher line is refused (rc 64)" ;;
+  *) bad "control: the bare launcher line is refused (rc 64)" "got: $CTRL" ;;
+esac
+GOT="$(run_rearm "$REARM_LINE")"
+case "$GOT" in
+  started\|*) ok "the real watcher starts on the hook's re-arm line" ;;
+  *) bad "the real watcher starts on the hook's re-arm line" "got: $GOT" ;;
+esac
 grep -q -- "--inbox $WS/deliveries/w1 " "$ARGV_LOG" && ok "the worker asked about its own inbox" || bad "the worker asked about its own inbox" "argv: $(cat "$ARGV_LOG")"
 [ "$(cat "$WS/state/stop-hook-unwatched-w1" 2>/dev/null)" = "1" ] && ok "the worker's counter is its own file" || bad "the worker's counter is its own file" "missing or wrong"
 [ ! -e "$CORE_COUNT" ] && ok "...and the core's counter is untouched" || bad "...and the core's counter is untouched" "core counter present"

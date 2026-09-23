@@ -262,7 +262,7 @@ fi
 if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
     COVERAGE_INBOX="$WORKSPACE/deliveries/$SUTANDO_INSTANCE_ID"
-    COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'
+    COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"'
   else
     COVERAGE_INBOX="$TASKS_DIR"
     COVERAGE_REARM="bash src/watch-tasks-stream.sh --role session --inbox \"$TASKS_DIR\""
