@@ -259,6 +259,14 @@ deliver_prompt() {
   done
 }
 
+# What the prompt tells the session to read: the payload a resolver-backed
+# announcement named, else the inbox entry itself (the core's tasks/ case).
+task_payload() {
+  local p=""
+  [ -n "${PAYLOAD_DIR:-}" ] && p="$(cat "$PAYLOAD_DIR/$1" 2>/dev/null)"
+  printf '%s' "${p:-$TASKS_DIR/$1}"
+}
+
 submit_task() {
   local filename="$1" wait_for_result="${2:-0}" prompt started
   case "$filename" in
@@ -268,7 +276,7 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi
@@ -325,7 +333,8 @@ fi
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"
-mkdir -p "$queue_dir"
+PAYLOAD_DIR="$event_dir/payload"
+mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
@@ -333,6 +342,7 @@ watcher_pid=$!
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
+# The core's question: on a delivery inbox the sentinel IS this instance's assignment.
 filename_is_worker_held() {
   local filename="$1" rc=0
   "$NOTIFIER_PY" "$DISPATCH_PY" worker-holds "$DELIVERIES_DIR" "$filename" || rc=$?
@@ -356,11 +366,14 @@ filename_is_claimed() {
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local filename="$1" tier
-  case "$filename" in ""|*/*|*..*) return 0 ;; esac
+  local announced="$1" entry filename payload tier
+  # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
+  # payload path a resolver-backed watcher announces. Anything else types nothing.
+  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${SUTANDO_INBOX_RESOLVER:+--resolved} 2>/dev/null)" || return 0
+  filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   has_result "$filename" && return 0
   [ -e "$queue_dir/$filename" ] && return 0
-  if filename_is_worker_held "$filename"; then
+  if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] && filename_is_worker_held "$filename"; then
     log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
     return 0
   fi
@@ -368,9 +381,10 @@ enqueue_announced_task() {
     log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
     return 0
   fi
+  printf '%s' "$payload" > "$PAYLOAD_DIR/$filename"
   # `|| tier=""`: under set -e, a bare `tier="$(...)"` on a failing
   # subprocess exits the whole notifier before the case below ever runs.
-  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$TASKS_DIR/$filename" 2>/dev/null)" || tier=""
+  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$payload" 2>/dev/null)" || tier=""
   case "$tier" in
     urgent|normal|low) ;;
     *)
