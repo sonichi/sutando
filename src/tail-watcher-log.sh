@@ -47,22 +47,30 @@ CURSOR="$("$PY" "$__REPO_ROOT/src/util_paths.py" watcher-log-cursor "$WORKSPACE"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$CURSOR")" || exit 1
 [ -e "$LOG" ] || : > "$LOG"
 
-# "<lines-consumed> <inode> <bytes>". Rotation comes in two shapes and a line
-# count alone reads both as "nothing new": a REPLACED file (new inode, possibly
-# the same length) and a TRUNCATED one (same inode, shorter). Track both.
+# "<lines-consumed> <inode> <bytes> <first-line-cksum>". Rotation comes in
+# shapes a line count reads as "nothing new", and the inode does not separate
+# them either: Linux hands a deleted file's inode number straight back to its
+# replacement, and a writer that truncates in place never changed it at all.
+# The first line is the discriminator that survives both, and unlike a prefix
+# of the file it does not change when the log is merely appended to.
 # `read` returns 1 at EOF even after setting the variables, which is every time
 # for a file with no trailing newline: the values are what matter, not its rc.
-N=""; INO_SEEN=""; SIZE_SEEN=""
-read -r N INO_SEEN SIZE_SEEN < "$CURSOR" 2>/dev/null || true
+N=""; INO_SEEN=""; SIZE_SEEN=""; HEAD_SEEN=""
+read -r N INO_SEEN SIZE_SEEN HEAD_SEEN < "$CURSOR" 2>/dev/null || true
 case "$N" in ''|*[!0-9]*) N=0 ;; esac
 INO_NOW="$(ls -di "$LOG" 2>/dev/null | awk '{print $1}')"
 case "$INO_NOW" in ''|*[!0-9]*) INO_NOW=0 ;; esac
 log_size() { wc -c < "$LOG" 2>/dev/null | tr -d ' '; }
+# One field, so the cursor stays space-separated: cksum prints "sum count".
+head_sum() { head -n 1 "$LOG" 2>/dev/null | cksum | tr -d ' \n'; }
 SIZE_NOW="$(log_size)"
 case "$SIZE_NOW" in ''|*[!0-9]*) SIZE_NOW=0 ;; esac
 case "$SIZE_SEEN" in ''|*[!0-9]*) SIZE_SEEN="" ;; esac
+HEAD_NOW="$(head_sum)"
 if [ -n "$INO_SEEN" ] && [ "$INO_SEEN" != "$INO_NOW" ]; then
   N=0                                    # a different file
+elif [ -n "$HEAD_SEEN" ] && [ "$HEAD_SEEN" != "$HEAD_NOW" ]; then
+  N=0                                    # this inode now holds another file
 elif [ -n "$SIZE_SEEN" ] && [ "$SIZE_NOW" -lt "$SIZE_SEEN" ]; then
   N=0                                    # same file, truncated under us
 else
@@ -71,7 +79,7 @@ else
   [ "$N" -gt "$LINES" ] && N=0
 fi
 
-write_cursor() { printf '%s %s %s\n' "$1" "$INO_NOW" "$(log_size)" > "$CURSOR"; }
+write_cursor() { printf '%s %s %s %s\n' "$1" "$INO_NOW" "$(log_size)" "$(head_sum)" > "$CURSOR"; }
 write_cursor "$N"
 # `tail -F` never ends on its own, so its real pid must be OWNED here. A FIFO,
 # not process substitution: on bash 3.2 `$!` after `exec 3< <(...)` names the

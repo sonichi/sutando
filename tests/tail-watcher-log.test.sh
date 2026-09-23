@@ -111,13 +111,26 @@ printf 'TASK_FILE: before\n' > "$LOG"
 P="$(run "$WORK/e0.out")"; PIDS+=("$P")
 settle 1; check $? "(e) setup: a reader consumed the pre-rotation log" "cursor=$(cur_n)"
 kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
-#     1. REPLACED: a new file at the same path (new inode), whatever its length.
+#     1. REPLACED, inode REUSED: rewritten in place and longer than before, so
+#        neither the inode nor the size says anything changed. Linux hands a
+#        deleted file's inode straight back to its replacement, which is how CI
+#        caught this while every macOS run passed; truncate-in-place reproduces
+#        it on any platform, because the inode cannot change at all.
+INO_BEFORE="$(ls -di "$LOG" | awk '{print $1}')"
+printf 'TASK_FILE: after-rewrite-in-place\n' > "$LOG"
+[ "$(ls -di "$LOG" | awk '{print $1}')" = "$INO_BEFORE" ] && [ "$(wc -c < "$LOG" | tr -d ' ')" -gt 18 ]
+check $? "(e) setup: the rewritten log kept its inode AND grew, so neither field flags it" "ino $INO_BEFORE -> $(ls -di "$LOG" | awk '{print $1}')"
+P="$(run "$WORK/e1.out")"; PIDS+=("$P")
+emitted "$WORK/e1.out" 'after-rewrite-in-place'
+check $? "(e) a log REWRITTEN under its own inode is still read from the top" "cursor=$(cur_n) out=[$(tr '\n' '|' < "$WORK/e1.out")]"
+kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
+#     2. REPLACED: a new file at the same path, whatever its length.
 rm -f "$LOG"; printf 'TASK_FILE: after-replace\n' > "$LOG"
 P="$(run "$WORK/e2.out")"; PIDS+=("$P")
 emitted "$WORK/e2.out" 'after-replace'
 check $? "(e) a REPLACED log is read from the top, so nothing in it is skipped" "cursor=$(cur_n) out=[$(tr '\n' '|' < "$WORK/e2.out")]"
 kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
-#     2. TRUNCATED in place and seen while short: the reader starts over, and the
+#     3. TRUNCATED in place and seen while short: the reader starts over, and the
 #        lines appended afterwards are read, not skipped.
 : > "$LOG"
 P="$(run "$WORK/e3.out")"; PIDS+=("$P")
@@ -125,6 +138,26 @@ settle 0; check $? "(e) a TRUNCATED log resets the cursor to 0" "cursor=$(cur_n)
 printf 'TASK_FILE: after-truncate\n' >> "$LOG"
 emitted "$WORK/e3.out" 'after-truncate'
 check $? "(e) ...and what arrives after it is read, not skipped" "cursor=$(cur_n) out=[$(tr '\n' '|' < "$WORK/e3.out")]"
+kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
+
+#     4. ...and the control the fingerprint exists to protect: a plain APPEND
+#        must not replay. A fingerprint over a growing prefix of the file would
+#        change on every append and re-dispatch every task already handled.
+: > "$LOG"; printf 'TASK_FILE: first\n' > "$LOG"
+P="$(run "$WORK/e4.out")"; PIDS+=("$P")
+# The OUTPUT, not `settle 1`: the previous reader already left a cursor at 1,
+# so settle would return before this reader had written its own fingerprint —
+# and the next step would then read a replacement where there was an append.
+emitted "$WORK/e4.out" 'first'
+check $? "(e) setup: a reader consumed one line" "cursor=$(cur_n)"
+kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
+for i in $(seq 1 30); do [ "$(cur_n)" = 1 ] && break; sleep 0.1; done
+printf 'TASK_FILE: second\n' >> "$LOG"
+P="$(run "$WORK/e5.out")"; PIDS+=("$P")
+emitted "$WORK/e5.out" 'second'
+check $? "(e) an APPEND is read from the cursor" "out=[$(tr '\n' '|' < "$WORK/e5.out")]"
+! grep -q 'first' "$WORK/e5.out"
+check $? "(e) ...and does NOT replay the line already consumed" "out=[$(tr '\n' '|' < "$WORK/e5.out")]"
 kill -TERM "$P" 2>/dev/null; wait "$P" 2>/dev/null
 
 echo
