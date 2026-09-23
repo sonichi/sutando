@@ -256,6 +256,41 @@ if [ -z "$PYBIN" ]; then
   echo '{}'
   exit 0
 fi
+
+# A turn must not end with this session's own inbox unwatched: nothing announces
+# a delivery then, and a turn end is the one moment the session can re-arm.
+if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+    COVERAGE_INBOX="$WORKSPACE/deliveries/$SUTANDO_INSTANCE_ID"
+    COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR"'
+  else
+    COVERAGE_INBOX="$TASKS_DIR"
+    COVERAGE_REARM="bash src/watch-tasks-stream.sh --role session --inbox \"$TASKS_DIR\""
+  fi
+  # Consecutive unwatched turn ends, per instance: a watcher that cannot start
+  # must not wedge the session, so the gate fails open past the cap, logged.
+  COVERAGE_COUNT_FILE="$WORKSPACE/state/stop-hook-unwatched${SUTANDO_INSTANCE_ID:+-$SUTANDO_INSTANCE_ID}"
+  COVERAGE_FAIL_OPEN_AFTER="${SUTANDO_STOP_HOOK_UNWATCHED_FAIL_OPEN_AFTER:-3}"
+  COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""
+  case "$COVERAGE_VERDICT" in
+    yes) rm -f "$COVERAGE_COUNT_FILE" ;;
+    no)
+      COVERAGE_N="$(cat "$COVERAGE_COUNT_FILE" 2>/dev/null)"
+      case "$COVERAGE_N" in ''|*[!0-9]*) COVERAGE_N=0 ;; esac
+      COVERAGE_N=$((COVERAGE_N + 1))
+      mkdir -p "$(dirname "$COVERAGE_COUNT_FILE")" 2>/dev/null || true
+      printf '%s\n' "$COVERAGE_N" > "$COVERAGE_COUNT_FILE" 2>/dev/null || true
+      if [ "$COVERAGE_N" -le "$COVERAGE_FAIL_OPEN_AFTER" ]; then
+        SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): via the Monitor tool, $COVERAGE_REARM" \
+          "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ["SUTANDO_HOOK_REASON"]}, separators=(",", ":")))'
+        exit 0
+      fi
+      echo "check-pending-tasks: $COVERAGE_INBOX unwatched at $COVERAGE_N consecutive turn ends; failing open" >&2
+      ;;
+    *) : ;;  # unknown or unobservable is not evidence of an unwatched inbox
+  esac
+fi
+
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
 STOP_RC=$?
 
