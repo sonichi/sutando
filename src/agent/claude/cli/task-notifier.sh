@@ -44,6 +44,9 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 # A queued task with nothing left to re-trigger it (composer busy, staging
 # failed) would otherwise wait forever for an unrelated wake. See the main loop.
 RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
+# Consecutive composer-not-empty refusals before the owner is told; only they can clear it.
+COMPOSER_BLOCK_ESCALATE_AFTER="${SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER:-4}"
+COMPOSER_BLOCK_FILE="$WORKSPACE_DIR/state/task-notifier-composer-block"
 watcher_pid=""
 event_dir=""
 # FIFO of announced-but-unresolved filenames, as marker files (oldest mtime =
@@ -73,6 +76,20 @@ log_notifier() {
   dir="$WORKSPACE_DIR/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/claude-task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
+}
+
+# A file, not a variable: the count must span --event invocations and the main loop's retries.
+note_composer_block() {
+  local n=""
+  n="$(cat "$COMPOSER_BLOCK_FILE" 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1))
+  mkdir -p "$(dirname "$COMPOSER_BLOCK_FILE")" 2>/dev/null || true
+  printf '%s\n' "$n" >"$COMPOSER_BLOCK_FILE" 2>/dev/null || true
+  [ "$n" -eq "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
+  log_notifier "delivery blocked: text in the core's composer has held $1 for $n consecutive attempts; clear the composer or press Enter to resume"
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e 'display notification "Text in the Sutando CLI composer is blocking task delivery. Clear it or press Enter." with title "Sutando"' >/dev/null 2>&1 || true
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -268,8 +285,10 @@ deliver_prompt() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+      note_composer_block "$filename"
       return 1
     fi
+    rm -f "$COMPOSER_BLOCK_FILE"
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"

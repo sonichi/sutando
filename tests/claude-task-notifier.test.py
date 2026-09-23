@@ -580,6 +580,31 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertFalse((self.results_dir / "task-m.txt").exists(),
                           "a task blocked on a draft composer must stay queued, not consumed")
 
+    def test_a_persistent_draft_escalates_once_then_resets(self):
+        # A silent retry loop behind a stale draft reads as a dead agent; the
+        # owner, who alone can clear it, must be told exactly once per episode.
+        calls = self.root / "osascript.calls"
+        stub = self.bin / "osascript"
+        stub.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{calls}"\n')
+        stub.chmod(0o755)
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-e.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        for attempt in range(1, 6):
+            self.run_event("task-e.txt", env_extra=env, timeout=8)
+            fired = calls.read_text().count("display notification") if calls.exists() else 0
+            self.assertEqual(fired, 0 if attempt < 3 else 1,
+                             f"attempt {attempt}: escalate at the 3rd refusal, never again")
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertEqual(log.count("delivery blocked:"), 1)
+        counter = self.root / "workspace" / "state" / "task-notifier-composer-block"
+        self.assertEqual(counter.read_text().strip(), "5")
+        # An empty composer ends the episode, so the next block escalates afresh.
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.run_event("task-e.txt", timeout=15,
+                       env_extra={**env, "SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        self.assertFalse(counter.exists(), "an empty composer must reset the block count")
+
     def test_ghost_text_suggestion_is_not_a_draft(self):
         # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
         # capture shows it as typed, and every re-pick would stall on it.
