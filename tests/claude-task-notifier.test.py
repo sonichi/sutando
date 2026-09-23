@@ -656,7 +656,7 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(self._notifications(calls, 3), 3, "a restarted core is a new episode")
 
     def test_a_hung_notification_does_not_stall_delivery(self):
-        self._osascript_stub("sleep 30")
+        calls = self._osascript_stub("exec sleep 30")
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
         self.write_task("task-h.txt")
         env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "1"}
@@ -665,6 +665,8 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - started, 6)
         self.assertIn("delivery blocked:", (self.logs_dir / "claude-task-notifier.log").read_text())
+        # The backgrounded stub writes into the temp dir; wait for it so cleanup cannot race it.
+        self.assertEqual(self._notifications(calls, 1), 1)
 
     def test_ghost_text_suggestion_is_not_a_draft(self):
         # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
