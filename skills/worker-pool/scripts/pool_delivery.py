@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -219,6 +220,22 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
         return []
     return sorted(p for p in d.iterdir()
                   if (got := parse_sentinel(p.name)) and got[1])
+
+
+def regular_file_state(path) -> str:
+    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, or a
+    symlink at the name) or "unknown" (any other OSError: EACCES, EIO, EMFILE).
+    Only the first three are verdicts about the path; "unknown" is about this call."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as e:
+        return "non-regular" if e.errno == errno.ELOOP else "unknown"
+    try:
+        return "regular" if stat.S_ISREG(os.fstat(fd).st_mode) else "non-regular"
+    finally:
+        os.close(fd)
 
 
 def is_regular_file(path) -> bool:

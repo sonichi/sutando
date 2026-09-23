@@ -8,9 +8,9 @@ this as an opaque executable (`SUTANDO_INBOX_RESOLVER`) and verifies the answer.
 Contract, because the caller enforces it and a violation fails closed there:
 stdout is the payload's ABSOLUTE path and nothing else; any other outcome is a
 non-zero exit with the reason on stderr and an empty stdout. Exit 3 is typed:
-the sentinel names no payload, a verdict about the entry rather than about this
-run of the resolver; every other failure (a timeout, a crash, a bad workspace)
-says nothing about the entry and is worth retrying.
+the sentinel names no payload (absent, a directory, a symlink), a verdict about
+the entry; every other failure (an access error, a timeout, a crash, a bad
+workspace) says nothing about the entry and is worth retrying (exit 1).
 """
 from __future__ import annotations
 
@@ -40,9 +40,13 @@ def resolve(entry: str, workspace=None) -> Path:
     # abspath, NOT resolve(): resolving would follow a symlink at the payload
     # name, and the caller adopts the returned basename as the task's identity.
     path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
-    if not pd.is_regular_file(path):
-        raise NoPayload(f"sentinel {task_id} names no payload at {path}")
-    return path
+    state = pd.regular_file_state(path)
+    if state == "regular":
+        return path
+    if state == "unknown":
+        # A failure of THIS call (EACCES, EIO, ...), not a fact about the entry.
+        raise pd.NotDelivered(f"sentinel {task_id}: payload at {path} could not be opened; retry")
+    raise NoPayload(f"sentinel {task_id} names no payload at {path} ({state})")
 
 
 def main(argv: list[str] | None = None) -> int:
