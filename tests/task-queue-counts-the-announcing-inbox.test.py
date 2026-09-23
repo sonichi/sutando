@@ -54,7 +54,8 @@ class Counts(unittest.TestCase):
 
     def test_a_worker_inbox_counts_its_own_sentinels_not_the_cores_tasks(self):
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 1)
-        self.assertEqual([t["id"] for t in tq.pending(self.ws, self.inbox)], ["task-mine", "task-mine-2"])
+        # Membership, not order: two sentinels written in the same second tie on mtime.
+        self.assertEqual(sorted(t["id"] for t in tq.pending(self.ws, self.inbox)), ["task-mine", "task-mine-2"])
 
     def test_the_core_reads_exactly_as_before(self):
         self.assertEqual(tq.waiting(self.ws, "task-mine"), 3)
