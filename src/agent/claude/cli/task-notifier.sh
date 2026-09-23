@@ -469,14 +469,19 @@ filename_is_claimed() {
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local announced="$1" entry filename payload tier
+  local announced="$1" entry filename payload tier rc=0
   # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
-  # payload path a resolver-backed watcher announces. Anything else types nothing.
-  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${SUTANDO_INBOX_RESOLVER:+--resolved} 2>/dev/null)" || return 0
+  # payload path a resolver-backed watcher announces. A refusal (rc 1) types nothing
+  # quietly; any other failure is a broken reader and is logged, never a silent drop.
+  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${SUTANDO_INBOX_RESOLVER:+--resolved} 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
+    return 0
+  fi
   filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   has_result "$filename" && return 0
   [ -e "$queue_dir/$filename" ] && return 0
-  if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] && filename_is_worker_held "$filename"; then
+  if [ "${SUTANDO_INBOX_KIND:-}" != "deliveries" ] && filename_is_worker_held "$filename"; then
     log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
     return 0
   fi
@@ -527,7 +532,7 @@ process_announced_queue() {
     filename="$(queue_head)"
     [ -n "$filename" ] || return 0
     if has_result "$filename"; then
-      rm -f "$queue_dir/$filename"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
     if ! wait_for_core_healthy; then
@@ -537,7 +542,7 @@ process_announced_queue() {
     fi
     submit_task "$filename"
     if has_result "$filename"; then
-      rm -f "$queue_dir/$filename"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
     return 0

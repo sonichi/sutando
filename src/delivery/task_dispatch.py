@@ -73,9 +73,11 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     """(queue key, payload path) for one `TASK_FILE:` announcement, or None to refuse it.
 
     A bare name is a file in `tasks_dir`. An absolute path is accepted only from a
-    resolver-backed watcher and only for an existing regular file; its basename is the
-    key. Anything else (empty, traversal, a relative path, a path from a watcher that
-    runs no resolver) is refused: the caller then types nothing.
+    resolver-backed watcher, only for an existing regular file, and only inside the
+    `tasks/` of the workspace that owns the inbox (`<workspace>/deliveries/<id>` is
+    the inbox a sentinel resolves from); its basename is the key. Anything else
+    (empty, traversal, a relative path, a path from a watcher that runs no resolver,
+    a file anywhere else) is refused: the caller then types nothing.
     """
     if not announced or ".." in announced:
         return None
@@ -84,7 +86,8 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     if not resolver_backed or not announced.startswith("/"):
         return None
     payload = Path(announced)
-    if not payload.name or not payload.is_file():
+    tasks_of_workspace = Path(tasks_dir).resolve().parent.parent / "tasks"
+    if not payload.name or payload.resolve().parent != tasks_of_workspace or not payload.is_file():
         return None
     return payload.name, payload
 
