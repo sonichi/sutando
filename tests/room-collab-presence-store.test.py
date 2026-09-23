@@ -82,6 +82,21 @@ def main() -> int:
     check("no temp file is left behind",
           [f.name for f in TMP.iterdir() if f.name.startswith(".big.json.")] == [])
 
+    print("── a failed publish leaves nothing behind ──")
+    # The temp file is the whole point of publishing atomically; leaking one on
+    # failure turns a write error into a directory that slowly fills.
+    class Unserialisable:
+        pass
+
+    before = set(TMP.iterdir())
+    try:
+        store.write_entries(TMP / "boom.json", [{"bad": Unserialisable()}])
+        check("a value json cannot encode raises", False, "no exception")
+    except (TypeError, ValueError):
+        check("a value json cannot encode raises", True)
+    leaked = [p.name for p in set(TMP.iterdir()) - before]
+    check("...and no temp file survives the failure", leaked == [], str(leaked))
+
     print("── the lock: concurrent agents must not lose a registration ──")
     race = TMP / "race.json"
     N = 16

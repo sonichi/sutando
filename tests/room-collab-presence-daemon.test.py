@@ -273,11 +273,16 @@ def main() -> int:
     # The real CLI in a real subprocess: the registration must outlive the
     # process making it, and needs nothing installed — a bare python runs it.
     import subprocess
+    # Under the coverage gate the subprocess must be measured too, or the whole
+    # `stay` handler reads as uncovered while being exercised end to end.
+    pybase = [sys.executable]
+    if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+        pybase += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
     ws4 = Path(tempfile.mkdtemp(prefix="presence-stay-"))
     cli = REPO / "skills" / "room-collab" / "scripts" / "room_collab.py"
     env = {**os.environ, "AG2SPACE_USER_ID": "@sudoo:x"}
     env.pop("AG2_MATRIX_USER_ID", None)
-    r = subprocess.run([sys.executable, str(cli), "--workspace", str(ws4), "stay", "!a:x"],
+    r = subprocess.run([*pybase, str(cli), "--workspace", str(ws4), "stay", "!a:x"],
                        capture_output=True, text=True, env=env, timeout=120)
     check("`stay` succeeds with no flags and no token", r.returncode == 0,
           (r.stdout + r.stderr)[-200:])
@@ -290,7 +295,7 @@ def main() -> int:
     check("...and a presence name, without which the daemon joins invisibly",
           bool(regd and regd[0].get("name")), str(regd))
 
-    r2 = subprocess.run([sys.executable, str(cli), "--workspace", str(ws4),
+    r2 = subprocess.run([*pybase, str(cli), "--workspace", str(ws4),
                          "stay", "!a:x", "--leave"],
                         capture_output=True, text=True, env=env, timeout=120)
     check("`--leave` deregisters through the same record",
@@ -309,6 +314,51 @@ def main() -> int:
     check("never more than the cap are held at once", len(d2.held) == 2)
     check("the newest summons win the slots",
           sorted(k[0] for k in d2.held) == ["!r2", "!r3"])
+
+    print("── the client's end-of-session signal ──")
+    # `closed()` is the whole reason a holder can notice a dead socket; without
+    # a test it is one await away from silently never resolving again.
+    try:
+        # By file, not by name: sys.modules holds this suite's stub under that
+        # name, and importing it would test the stub.
+        _spec = importlib.util.spec_from_file_location(
+            "room_collab_client_real", SCRIPTS / "room_collab_client.py")
+        rcc = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(rcc)
+    except (Exception, SystemExit) as exc:
+        # The client EXITS at import when its deps are absent, so SystemExit is
+        # the normal outcome on a bare interpreter — not a failure of this file.
+        check("client end-of-session signal (skipped: deps absent)", True, str(exc)[:60])
+    else:
+        async def ends():
+            doc = object.__new__(rcc.RoomDoc)
+            fut = asyncio.get_event_loop().create_future()
+            doc._ended = fut
+            waiting = asyncio.ensure_future(doc.closed())
+            await asyncio.sleep(0)
+            pending = not waiting.done()
+            fut.set_result(rcc.SessionEnd() if hasattr(rcc, "SessionEnd") else None)
+            return pending, await waiting
+
+        pending, err = asyncio.run(ends())
+        check("it does not resolve while the session is open", pending)
+        check("...and resolves with the reason once it ends", isinstance(err, Exception),
+              repr(err)[:80])
+
+    print("── the entry point refuses rather than looping without credentials ──")
+    import subprocess as _sp
+    bare = {k: v for k, v in os.environ.items()
+            if k not in ("AG2_MATRIX_TOKEN", "ROOM_COLLAB_TOKEN", "ROOM_DOC_TOKEN",
+                         "MATRIX_ACCESS_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN",
+                         "AG2_ROOM_COLLAB_URL", "AG2_ROOM_DOC_URL", "AG2_API_ROOT",
+                         "REMOTE_TASK_URL")}
+    daemon_cli = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
+    rc = _sp.run([*pybase, str(daemon_cli), "--workspace", str(TMP)],
+                 capture_output=True, text=True, env=bare, timeout=120)
+    check("no credentials exits non-zero instead of supervising nothing", rc.returncode == 2,
+          f"rc={rc.returncode}")
+    check("...naming what is missing", "no service URL" in (rc.stdout + rc.stderr),
+          (rc.stdout + rc.stderr)[-160:])
 
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all presence-daemon checks ok'}")
