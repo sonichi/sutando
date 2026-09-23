@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -272,9 +273,8 @@ def main() -> int:
     print("── invariant 3: a summon establishes durable membership, session-independently ──")
     # The real CLI in a real subprocess: the registration must outlive the
     # process making it, and needs nothing installed — a bare python runs it.
-    import subprocess
-    # Under the coverage gate the subprocess must be measured too, or the whole
-    # `stay` handler reads as uncovered while being exercised end to end.
+
+    # Measured under the coverage gate too, or `stay` reads as uncovered.
     pybase = [sys.executable]
     if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
         pybase += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
@@ -315,6 +315,26 @@ def main() -> int:
     check("the newest summons win the slots",
           sorted(k[0] for k in d2.held) == ["!r2", "!r3"])
 
+    print("── the CLI's json form, and the daemon's own arguments ──")
+    ws6 = Path(tempfile.mkdtemp(prefix="presence-json-"))
+    rj = subprocess.run([*pybase, str(cli), "--workspace", str(ws6), "--json", "stay", "!j:x"],
+                 capture_output=True, text=True, env=env, timeout=120)
+    ok_json = False
+    try:
+        import json as _json
+        parsed = _json.loads(rj.stdout.strip().splitlines()[-1])
+        ok_json = parsed.get("ok") is True and len(parsed.get("entries", [])) == 1
+    except Exception:
+        ok_json = False
+    check("`--json` prints a machine-readable receipt", rj.returncode == 0 and ok_json,
+          (rj.stdout + rj.stderr)[-160:])
+
+    # The knobs the owner set are arguments, not constants: a daemon whose
+    # --cap and --idle-seconds are ignored would look configured and not be.
+    d5 = dm.Daemon(TMP, "u", "t", idle_seconds=7.0, cap=3, clock=lambda: NOW)
+    check("--idle-seconds reaches the policy", d5.idle_seconds == 7.0)
+    check("--cap reaches the policy", d5.cap == 3)
+
     print("── the client's end-of-session signal ──")
     # `closed()` is the whole reason a holder can notice a dead socket; without
     # a test it is one await away from silently never resolving again.
@@ -346,12 +366,11 @@ def main() -> int:
               repr(err)[:80])
 
     print("── the entry point refuses rather than looping without credentials ──")
-    import subprocess as _sp
     # Only what an interpreter needs: naming the credential variables here
     # would duplicate the skill's own list, and a copy of it drifts.
     bare = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
     daemon_cli = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
-    rc = _sp.run([*pybase, str(daemon_cli), "--workspace", str(TMP)],
+    rc = subprocess.run([*pybase, str(daemon_cli), "--workspace", str(TMP)],
                  capture_output=True, text=True, env=bare, timeout=120)
     check("no credentials exits non-zero instead of supervising nothing", rc.returncode == 2,
           f"rc={rc.returncode}")

@@ -60,6 +60,39 @@ def main() -> int:
             check("it joins the core's worker rather than replacing it",
                   [w.name for w in mod.worker_specs()]
                   == ["remote-gateway-bridge", "room-collab-presence"])
+        print("── the manifest is the configured source, not only the env ──")
+        # An operator sets this in the skill's manifest; reading it only from
+        # the env would make the documented place the one that does not work.
+        os.environ.pop("ROOM_COLLAB_PYTHON", None)
+        man = REPO / "skills" / "room-collab" / "manifest.json"
+        keep_manifest = man.read_text(encoding="utf-8")
+        try:
+            import json as _json
+            cfg = _json.loads(keep_manifest)
+            cfg.setdefault("config", {})["ROOM_COLLAB_PYTHON"] = sys.executable
+            man.write_text(_json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+            spec, why = mod._presence_daemon_spec()
+            check("an interpreter named in the manifest is honoured",
+                  spec is not None and why is None, str(why))
+            cfg["config"]["ROOM_COLLAB_PYTHON"] = "{"          # not valid JSON below
+            man.write_text("{ not json", encoding="utf-8")
+            spec, why = mod._presence_daemon_spec()
+            check("an unreadable manifest refuses rather than raising", spec is None)
+        finally:
+            man.write_text(keep_manifest, encoding="utf-8")
+
+        print("── the skill absent entirely ──")
+        # The core must boot without room-collab installed at all.
+        script = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
+        moved = script.with_suffix(".py.hidden-for-test")
+        script.rename(moved)
+        try:
+            spec, why = mod._presence_daemon_spec()
+            check("no skill means no worker", spec is None)
+            check("...and the reason says so", "not installed" in (why or ""), str(why))
+        finally:
+            moved.rename(script)
+
     finally:
         os.environ.pop("ROOM_COLLAB_PYTHON", None)
         if keep is not None:
