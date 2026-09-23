@@ -15,9 +15,11 @@ printf '#!/bin/bash\nexit 1\n' > "$WORK/stubbin/tmux"; chmod +x "$WORK/stubbin/t
 LOG="$WORK/ws/logs/claude-task-notifier.log"
 PIDS=()
 cleanup() {
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null; [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
+  # setsid() makes each child its own process-group leader, so its pid IS the
+  # pgid: kill the GROUP, or the watcher and its stub fswatch outlive the run.
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null; done
   sleep 0.5
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -KILL "$p" 2>/dev/null; done
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -KILL -- "-$p" 2>/dev/null; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -28,10 +30,19 @@ clean_env() {  # identity stripped; the fixture is the workspace and the inbox
       SUTANDO_WORKSPACE_DIR="$WORK/ws" SUTANDO_TASKS_DIR="$WORK/ws/tasks" SUTANDO_TMUX_SOCKET="$WORK/no.sock" \
       PATH="$WORK/stubbin:$PATH" "$@"
 }
-start_notifier() {  # prints the pid; its own session (the watcher's cleanup runs kill 0)
-  clean_env python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-      bash "$NOTIFIER" > "$WORK/n.out" 2> "$WORK/n.err" &
-  echo $!
+# `clean_env <cmd> &` backgrounds the FUNCTION, so $! is the subshell that runs
+# it, not the process that execs afterwards. Each child therefore reports its own
+# pid from inside, after setsid() and before exec.
+SPAWN='import os, sys; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); os.execvp(sys.argv[2], sys.argv[2:])'
+spawned_pid() {  # spawned_pid <pidfile>; waits for the child to report itself
+  local f="$1" i
+  for i in $(seq 1 100); do [ -s "$f" ] && { cat "$f"; return 0; }; sleep 0.1; done
+  return 1
+}
+start_notifier() {  # prints the notifier's OWN pid
+  rm -f "$WORK/n.pid"
+  clean_env python3 -c "$SPAWN" "$WORK/n.pid" bash "$NOTIFIER" > "$WORK/n.out" 2> "$WORK/n.err" &
+  spawned_pid "$WORK/n.pid"
 }
 wait_log() { local i; for i in $(seq 1 100); do grep -q -- "$1" "$LOG" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
@@ -43,8 +54,10 @@ wait_log "standby armed for $WORK/ws/tasks (standby watcher pid "; check "(a) th
 # (b) a session watcher takes the inbox: the standby watcher yields to it on its
 #     own (before the supervisor's TERM, sometimes before the session watcher has
 #     stamped), and either ending must read as a stand-down, never as a loss.
-s="$(clean_env python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-      bash "$REPO/src/watch-tasks-stream.sh" "$WORK/ws/tasks" --role session --inbox "$WORK/ws/tasks" > "$WORK/s.out" 2> "$WORK/s.err" & echo $!)"; PIDS+=("$s")
+rm -f "$WORK/s.pid"
+clean_env python3 -c "$SPAWN" "$WORK/s.pid" \
+      bash "$REPO/src/watch-tasks-stream.sh" "$WORK/ws/tasks" --role session --inbox "$WORK/ws/tasks" > "$WORK/s.out" 2> "$WORK/s.err" &
+s="$(spawned_pid "$WORK/s.pid")"; PIDS+=("$s")
 # The standby watcher wrote a sentinel too, and glob order is not deterministic
 # across filesystems: ask whether ANY sentinel names the session watcher.
 names_session() { grep -qx "$s" "$WORK/ws/state"/*.pid 2>/dev/null; }
@@ -60,7 +73,7 @@ fi
 ! grep -q "with no session-role watcher ready" "$LOG"; check "(b) ...and the hand-off was never logged as a loss" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|')"
 for i in $(seq 1 50); do alive "$n" || break; sleep 0.1; done
 ! alive "$n"; check "(b) ...and the notifier exits" $?
-kill -TERM -- "-$s" 2>/dev/null; kill -TERM "$s" 2>/dev/null; wait "$s" 2>/dev/null; sleep 0.5
+kill -TERM -- "-$s" 2>/dev/null; wait 2>/dev/null; sleep 0.5
 rm -f "$WORK/ws/state"/*.pid
 
 # (c) the standby watcher dies with no session watcher ready: the log says so
@@ -71,6 +84,13 @@ wp="$(sed -n 's/.*standby watcher pid \([0-9]*\)).*/\1/p' "$LOG" | tail -1)"
 [ -n "$wp" ] && kill -KILL "$wp" 2>/dev/null
 wait_log "standby ended for $WORK/ws/tasks (standby watcher exited) with no session-role watcher ready"; check "(c) when the standby watcher dies with no session watcher, the log says so (not 'stood down')" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|')"
 ! grep -q "stood down" "$LOG"; check "(c) ...and no false 'stood down' line" $?
+
+# Nothing may outlive the run: the earlier instrument killed subshells, not the
+# watcher and its stub fswatch, so every run leaked four processes.
+for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null; done
+sleep 0.7
+left="$(pgrep -f "$(basename "$WORK")" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$left" = 0 ]; check "(z) no process from this run is left behind" $? "still running: $(pgrep -lf "$(basename "$WORK")" 2>/dev/null | head -4 | tr '\n' '|')"
 
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASS"; else echo "TESTS FAILED"; exit 1; fi
