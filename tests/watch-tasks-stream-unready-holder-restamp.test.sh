@@ -75,6 +75,17 @@ n="$(start "$WS" "$WS/tasks" fourth)"; PIDS+=("$n")
 for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 [ "$(cat "$SENT")" = "$before" ] && [ "$before" = "$h" ] && ! grep -q 're-stamped' "$WORK/fourth.err"; check "(c) a ready holder's sentinel is not rewritten by a covered start" $? "before=$before now=$(cat "$SENT") | $(tail -2 "$WORK/fourth.err" | tr '\n' '|')"
 
+# (c2) A sentinel naming a LIVE pid is never overwritten, even by its own seat.
+n="$(start "$WS" "$WS/tasks" fifth)"; PIDS+=("$n")
+for i in $(seq 1 150); do [ "$(cat "$SENT" 2>/dev/null)" != "$h" ] && break; alive "$n" || break; sleep 0.1; done
+live_other="$(cat "$SENT" 2>/dev/null)"
+echo "$$" > "$SENT"        # a live pid that is neither the holder nor a watcher
+n="$(start "$WS" "$WS/tasks" sixth)"; PIDS+=("$n")
+for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
+[ "$(cat "$SENT")" = "$$" ]; check "(c2) a sentinel naming a live pid is left alone" $? "now=$(cat "$SENT") | $(tail -2 "$WORK/sixth.err" | tr '\n' '|')"
+grep -q "not re-stamping .* it names live pid $$" "$WORK/sixth.err"; check "(c2) ...and says why" $? "$(tail -2 "$WORK/sixth.err" | tr '\n' '|')"
+echo "$h" > "$SENT"
+
 # (d) Only this seat's own sentinel is written: a start whose identity is not the
 #     inbox's owner leaves the holder unready rather than mislabelling a sentinel.
 WS2="$WORK/ws2"; mkdir -p "$WS2/deliveries/w1" "$WS2/state"

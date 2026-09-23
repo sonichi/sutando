@@ -219,8 +219,20 @@ case "$__holders" in
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
            && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"
-          mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
-          echo "$__hpid" > "$__hsent" && echo "watch-tasks-stream: re-stamped $__hsent for live holder pid $__hpid (it named '${__hprev:-<nothing>}' before)" >&2
+          # Never overwrite a LIVE pid: that file is another watcher's readiness,
+          # and taking it is the clobber this whole change exists to undo.
+          if [ -n "$__hprev" ] && kill -0 "$__hprev" 2>/dev/null; then
+            echo "watch-tasks-stream: not re-stamping $__hsent: it names live pid $__hprev" >&2
+          else
+            mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
+            # Temp + rename, so no reader sees the empty file a truncating write leaves.
+            if __htmp="$(mktemp "$__hsent.XXXXXX" 2>/dev/null)" \
+               && echo "$__hpid" > "$__htmp" && mv -f "$__htmp" "$__hsent"; then
+              echo "watch-tasks-stream: re-stamped $__hsent for live holder pid $__hpid (it named '${__hprev:-<nothing>}' before)" >&2
+            else
+              rm -f "${__htmp:-}" 2>/dev/null || true
+            fi
+          fi
         fi
         # stdout, in the TASK_FILE shape: a Monitor-hosted caller sees stdout as
         # its event stream and would never read the stderr line.
