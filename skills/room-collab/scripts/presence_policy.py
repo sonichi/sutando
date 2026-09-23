@@ -17,7 +17,7 @@ Two records feed it, each with one writer:
 """
 from __future__ import annotations
 
-# Owner 2026-09-22: drop after 30 minutes with no activity on the surface.
+# Drop a surface after 30 minutes with no activity on it.
 IDLE_SECONDS = 1800.0
 # A fuse, not a capacity plan: with the idle rule doing the real work the cap
 # is not normally reached. 3 rooms x 3 surfaces = 9 is a full day's use.

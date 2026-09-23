@@ -51,19 +51,27 @@ class RecordUnreadable(OSError):
 def read_entries(path: Path) -> list[dict]:
     """The record's entries, or none.
 
-    Absent, empty, truncated or of another schema reads as empty: there is
-    nothing to act on. A record that EXISTS and cannot be read raises instead
-    — read as empty it says "the user wants nothing", and the daemon would
-    evict the agent from every surface over a transient permission blip.
+    Absent reads as empty: nothing has been asked for. Anything that EXISTS
+    but cannot be understood raises — unreadable (a permission blip) and
+    unparseable (a truncated or corrupt write) are different causes with the
+    same consequence: read as empty they say "the user wants nothing", and the
+    daemon evicts the agent from every surface it holds.
+
+    Another schema still reads as empty. That is a version this build does not
+    speak, not damage, and the writer replaces the file wholesale.
     """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
-    except ValueError:
         return []
     except OSError as exc:
         raise RecordUnreadable(f"{path}: {exc}") from exc
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise RecordUnreadable(f"{path}: not JSON: {exc}") from exc
     if not isinstance(data, dict) or data.get("v") != SCHEMA:
         return []
     entries = data.get("entries")

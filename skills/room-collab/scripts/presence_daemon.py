@@ -44,6 +44,30 @@ def desired_path(workspace: Path) -> Path:
 def live_path(workspace: Path) -> Path:
     return workspace / "state" / "room-collab-presence-live.json"
 
+def acquire_singleton(workspace: Path):
+    """An exclusive lock for the whole run, or None if another copy holds it.
+
+    Two daemons would open duplicate sockets for the same agent and both write
+    `live`, so each would see the other's surfaces as unheld and fight over
+    them. The handle is returned because closing it releases the lock.
+    """
+    import fcntl
+
+    lock = workspace / "state" / "room-collab-presence.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock.open("a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"{os.getpid()}\n")
+    fh.flush()
+    return fh
+
+
 
 class Held:
     """One surface this daemon is holding open, and when it last saw activity."""
@@ -235,11 +259,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - a missing credential is a message, not a trace
         print(f"presence daemon: {exc}", file=sys.stderr)
         return 2
+    held = acquire_singleton(ws)
+    if held is None:
+        print("presence daemon: another copy is already running for this workspace",
+              file=sys.stderr)
+        return 3
     d = Daemon(ws, url, token, idle_seconds=a.idle_seconds, cap=a.cap, insecure=a.insecure)
     try:
         return asyncio.run(d.run())
     except KeyboardInterrupt:
         return 0
+    finally:
+        held.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

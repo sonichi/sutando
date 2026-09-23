@@ -18,38 +18,72 @@ for _p in (str(_SRC), str(REPO / "packages" / "ag2-sparrow")):
 from workspace_default import resolve_workspace  # noqa: E402
 from ag2_sparrow.sparrowd import WorkerSpec, run  # noqa: E402
 
+import re  # noqa: E402
 
-def _presence_daemon_spec():
-    """The room-collab presence daemon, when this install has the skill AND has
-    told it which interpreter to use.
+# A worker name reaches a state-dir path and a log line; keep it a plain name.
+_WORKER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
-    Both halves are required and neither is guessed. The script is optional —
-    a core with no room-collab skill must still boot — and it imports pycrdt
-    and websockets, which the core's own interpreter is not required to have
-    (the skill documents its own venv). An unconfigured interpreter is a
-    skipped worker with a reason, never `sys.executable` hoping for the best:
-    started under the wrong python it would crash-loop under the supervisor.
+
+def _skill_worker_specs() -> "tuple[list, list[str]]":
+    """Every installed skill that declares a `supervised_worker`, found by
+    scanning manifests. Returns (specs, reasons-for-the-ones-skipped).
+
+    No skill is named here. A skill is optional and self-contained, so the
+    core cannot know which ones exist; it reads the declaration each one
+    publishes (`skills/MANIFEST.md`) and supervises what it finds.
+
+    A declared interpreter is required and never guessed. These loops are
+    free to need packages the core's own python does not have, and started
+    under the wrong one a worker crash-loops under the supervisor, which reads
+    as a broken daemon rather than a missing config. Unset is a skipped worker
+    with a reason.
     """
     import json
 
-    script = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
-    manifest = REPO / "skills" / "room-collab" / "manifest.json"
-    if not script.is_file():
-        return None, "room-collab is not installed"
-    py = os.environ.get("ROOM_COLLAB_PYTHON") or ""
-    if not py and manifest.is_file():
+    specs, skipped = [], []
+    for manifest in sorted((REPO / "skills").glob("*/manifest.json")):
+        skill_dir = manifest.parent
         try:
-            py = (json.loads(manifest.read_text(encoding="utf-8"))
-                  .get("config", {}).get("ROOM_COLLAB_PYTHON") or "")
-        except (OSError, ValueError):
-            py = ""
-    if not py:
-        return None, ("no interpreter configured: set ROOM_COLLAB_PYTHON in "
-                      "skills/room-collab/manifest.json (it needs pycrdt + websockets)")
-    if not Path(py).is_file():
-        return None, f"configured interpreter does not exist: {py}"
-    return WorkerSpec(name="room-collab-presence", argv=[py, str(script)],
-                      cwd=str(REPO)), None
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            skipped.append(f"{skill_dir.name}: manifest unreadable ({exc})")
+            continue
+        decl = data.get("supervised_worker")
+        if not isinstance(decl, dict):
+            continue
+        name, rel = decl.get("name"), decl.get("script")
+        if not isinstance(name, str) or not _WORKER_NAME.match(name):
+            skipped.append(f"{skill_dir.name}: supervised_worker.name is missing or not a name")
+            continue
+        if not isinstance(rel, str) or not rel:
+            skipped.append(f"{name}: supervised_worker.script is missing")
+            continue
+        # A manifest is attacker-adjacent (skills/trusted-capabilities installs
+        # third-party skills), so the script must resolve inside its own skill.
+        script = (skill_dir / rel).resolve()
+        if not script.is_relative_to(skill_dir.resolve()) or not script.is_file():
+            skipped.append(f"{name}: script is not a file inside {skill_dir.name}/")
+            continue
+        interp = decl.get("interpreter")
+        if not isinstance(interp, dict) or not isinstance(interp.get("config"), str):
+            skipped.append(f"{name}: supervised_worker.interpreter.config is missing")
+            continue
+        key = interp["config"]
+        py = os.environ.get(key) or ""
+        if not py:
+            cfg = data.get("config")
+            py = (cfg.get(key) or "") if isinstance(cfg, dict) else ""
+        if not py:
+            needs = interp.get("needs")
+            specs_needs = f" (it needs {needs})" if isinstance(needs, str) and needs else ""
+            skipped.append(f"{name}: no interpreter configured: set {key} in "
+                           f"skills/{skill_dir.name}/manifest.json{specs_needs}")
+            continue
+        if not Path(py).is_file():
+            skipped.append(f"{name}: configured interpreter does not exist: {py}")
+            continue
+        specs.append(WorkerSpec(name=name, argv=[py, str(script)], cwd=str(REPO)))
+    return specs, skipped
 
 
 def worker_specs() -> list:
@@ -60,11 +94,10 @@ def worker_specs() -> list:
             cwd=str(REPO),
         ),
     ]
-    spec, why = _presence_daemon_spec()
-    if spec is not None:
-        specs.append(spec)
-    else:
-        print(f"sparrowd: room-collab-presence not supervised — {why}", file=sys.stderr)
+    skill_specs, skipped = _skill_worker_specs()
+    specs.extend(skill_specs)
+    for why in skipped:
+        print(f"sparrowd: not supervised — {why}", file=sys.stderr)
     return specs
 
 

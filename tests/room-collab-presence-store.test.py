@@ -56,13 +56,13 @@ def main() -> int:
           store.read_entries(p) == [{"room": "!a", "kind": "markdown"}])
     check("the record carries its schema version", json.loads(p.read_text())["v"] == store.SCHEMA)
 
-    print("── a record that cannot be trusted reads as empty ──")
+    print("── absent or unspoken reads as empty ──")
     check("a missing file", store.read_entries(TMP / "nope.json") == [])
     (TMP / "empty.json").write_text("")
     check("an empty file (the truncate window a `>` redirect opens)",
           store.read_entries(TMP / "empty.json") == [])
-    (TMP / "half.json").write_text('{"v": 1, "entries": [{"room": "!a"')
-    check("a half-written file", store.read_entries(TMP / "half.json") == [])
+    (TMP / "blank.json").write_text("   \n")
+    check("a whitespace-only file", store.read_entries(TMP / "blank.json") == [])
     (TMP / "old.json").write_text(json.dumps({"v": 99, "entries": [{"room": "!a", "kind": "x"}]}))
     check("a record of another schema is NOT read as entries",
           store.read_entries(TMP / "old.json") == [])
@@ -70,6 +70,29 @@ def main() -> int:
         json.dumps({"v": 1, "entries": ["not a dict", {"room": "!a", "kind": "x"}]}))
     check("non-dict entries are dropped, the rest kept",
           store.read_entries(TMP / "junk.json") == [{"room": "!a", "kind": "x"}])
+
+    print("── damage RAISES, it does not read as empty ──")
+    # Both are "the file exists and cannot be understood". Answering [] would
+    # tell reconcile the user wants nothing, and it would evict every surface.
+    (TMP / "half.json").write_text('{"v": 1, "entries": [{"room": "!a"')
+    try:
+        store.read_entries(TMP / "half.json")
+        check("a half-written file raises rather than evicting", False, "returned instead")
+    except store.RecordUnreadable as exc:
+        check("a half-written file raises rather than evicting", True)
+        check("...naming the file", "half.json" in str(exc), str(exc))
+    unreadable = TMP / "denied.json"
+    unreadable.write_text(json.dumps({"v": store.SCHEMA, "entries": []}))
+    unreadable.chmod(0)
+    try:
+        store.read_entries(unreadable)
+        check("an unreadable file raises too", False, "returned instead")
+    except store.RecordUnreadable:
+        check("an unreadable file raises too", True)
+    except PermissionError:
+        check("an unreadable file raises RecordUnreadable, not the raw OSError", False)
+    finally:
+        unreadable.chmod(0o600)
 
     print("── publication is atomic ──")
     big = TMP / "big.json"

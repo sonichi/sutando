@@ -70,6 +70,8 @@ AUTHORS_KEY = "authors"
 SYNC_TIMEOUT_S = 20.0
 # Marks a transaction as ours, so the reconcile observer can ignore its own writes.
 LOCAL_ORIGIN = "room-collab-client"
+# pycrdt stamps an awareness change this process made with this origin.
+LOCAL_AWARENESS_ORIGIN = "local"
 
 
 class RoomDoc:
@@ -273,7 +275,7 @@ class RoomDoc:
         def on_change(kind: str, changes: tuple) -> None:
             # Only our OWN state, changed locally. Re-sending a peer's update
             # makes this socket a holder of that peer's id, so it never expires.
-            if kind != "update" or changes[1] != "local":
+            if kind != "update" or changes[1] != LOCAL_AWARENESS_ORIGIN:
                 return
             mine = self._awareness.client_id
             if mine not in [i for group in changes[0].values() for i in group]:
@@ -504,11 +506,19 @@ class RoomDoc:
 
     def _observe_changes(self, fn: Callable[[], None]) -> Callable[[], None]:
         """Subscribe `fn` to every change in this surface — any remote document
-        edit and any awareness change — and return an unsubscribe.
+        edit, and any awareness change that carries new peer state — and return
+        an unsubscribe.
 
         One switch over the document kinds, shared by `events` and
         `on_activity`: two copies drift the moment a fourth kind lands and only
         one of them is taught about it.
+
+        Awareness is filtered to remote `change` events. `Awareness.start()`
+        re-sends this client's own state every `outdated_timeout/2` to stop the
+        server expiring it, and each of those emits a local `update`: counting
+        them made an idle timer read a silent surface as busy forever, so the
+        30-minute drop could never fire. A remote renewal is an `update` too and
+        carries no new state, so only `change` is activity.
         """
         subs = []
 
@@ -525,7 +535,11 @@ class RoomDoc:
         elif self._kind == KANBAN_KIND:
             m = self._doc.get(CARDS_KEY, type=Map)
             subs.append((m, m.observe(on_doc)))
-        aw_sub = self._awareness.observe(lambda *_: fn())
+        def on_awareness(kind: str, changes: tuple) -> None:
+            if kind == "change" and (len(changes) < 2 or changes[1] != LOCAL_AWARENESS_ORIGIN):
+                fn()
+
+        aw_sub = self._awareness.observe(on_awareness)
 
         def stop() -> None:
             for obj, sub in subs:

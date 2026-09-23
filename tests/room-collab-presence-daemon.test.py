@@ -441,6 +441,19 @@ def main() -> int:
     check("...naming what is missing", "no service URL" in (rc.stdout + rc.stderr),
           (rc.stdout + rc.stderr)[-160:])
 
+    print("── one daemon per workspace ──")
+    # Two copies would open duplicate sockets for the same agent and both write
+    # `live`, so each would read the other's surfaces as unheld.
+    lock_ws = Path(tempfile.mkdtemp())
+    first = dm.acquire_singleton(lock_ws)
+    check("the first copy acquires the lock", first is not None)
+    check("a second copy is refused", dm.acquire_singleton(lock_ws) is None)
+    if first is not None:
+        first.close()
+    check("...and the lock is free once it exits",
+          dm.acquire_singleton(lock_ws) is not None)
+    shutil.rmtree(lock_ws, ignore_errors=True)
+
     shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all presence-daemon checks ok'}")
     return 1 if FAILS else 0
