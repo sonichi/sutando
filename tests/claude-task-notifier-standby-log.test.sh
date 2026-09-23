@@ -40,14 +40,22 @@ echo "task-notifier standby log:"
 n="$(start_notifier)"; PIDS+=("$n")
 wait_log "standby armed for $WORK/ws/tasks (standby watcher pid "; check "(a) the notifier logs that its standby is armed, naming the inbox and the watcher pid" $? "$(tail -3 "$WORK/n.err" | tr '\n' '|')"
 
-# (b) a session watcher takes the inbox: the standby stands down and says so
+# (b) a session watcher takes the inbox: the standby watcher yields to it on its
+#     own (before the supervisor's TERM, sometimes before the session watcher has
+#     stamped), and either ending must read as a stand-down, never as a loss.
 s="$(clean_env python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       bash "$REPO/src/watch-tasks-stream.sh" "$WORK/ws/tasks" --role session --inbox "$WORK/ws/tasks" > "$WORK/s.out" 2> "$WORK/s.err" & echo $!)"; PIDS+=("$s")
 # The standby watcher wrote a sentinel too; ready means the file names the SESSION watcher.
 for i in $(seq 1 150); do [ "$(cat "$WORK/ws/state"/*.pid 2>/dev/null | head -1)" = "$s" ] && break; sleep 0.1; done
 [ "$(cat "$WORK/ws/state"/*.pid 2>/dev/null | head -1)" = "$s" ]; check "(b) a session watcher took the inbox (the readiness sentinel names it)" $? "$(tail -2 "$WORK/s.err" | tr '\n' '|')"
-kill -TERM -- "-$n" 2>/dev/null || kill -TERM "$n" 2>/dev/null   # what the supervisor does on 'yes'
-wait_log "standby stood down for $WORK/ws/tasks (stopped by signal): a session-role watcher is ready"; check "(b) when stopped while a session watcher is ready, the log says the standby stood down" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|') | n.err: $(tail -2 "$WORK/n.err" | tr '\n' '|')"
+sleep 1
+if grep -q "standby stood down for $WORK/ws/tasks (standby watcher exited)" "$LOG"; then
+  echo "  PASS (b) the standby watcher yielded on its own and the log says it stood down"
+else
+  kill -TERM -- "-$n" 2>/dev/null || kill -TERM "$n" 2>/dev/null   # what the supervisor does on 'yes'
+  wait_log "standby stood down for $WORK/ws/tasks (stopped by signal): a session-role watcher is ready"; check "(b) when stopped while a session watcher is ready, the log says the standby stood down" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|') | n.err: $(tail -2 "$WORK/n.err" | tr '\n' '|')"
+fi
+! grep -q "with no session-role watcher ready" "$LOG"; check "(b) ...and the hand-off was never logged as a loss" $? "log: $(sed 's/^.*task-notifier: //' "$LOG" | tr '\n' '|')"
 for i in $(seq 1 50); do alive "$n" || break; sleep 0.1; done
 ! alive "$n"; check "(b) ...and the notifier exits" $?
 kill -TERM -- "-$s" 2>/dev/null; kill -TERM "$s" 2>/dev/null; wait "$s" 2>/dev/null; sleep 0.5

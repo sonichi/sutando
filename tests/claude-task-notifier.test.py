@@ -879,9 +879,14 @@ class StandbyReminderTests(FakeTmuxHarness):
         typed = self.sendkeys_log_text()
         self.assertIn("TYPE Sutando task ready: task-sb.txt", typed)
         self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
-        self.assertIn(f'Re-arm yours via the Monitor tool: bash {REPO}/src/watch-tasks-stream.sh "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
+        # The script path is quoted: a desktop install lives under "Application Support".
+        self.assertIn(f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
+        import shlex
+        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1].split("\n", 1)[0]
+        self.assertEqual(shlex.split(rearm)[1], f"{REPO}/src/watch-tasks-stream.sh", "the script path survives shell parsing as ONE word")
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertIn(f"delivering task-sb.txt as the standby: no session-role watcher holds {self.tasks_dir}", log)
+
 
 
 class SmallViewportTests(FakeTmuxHarness):

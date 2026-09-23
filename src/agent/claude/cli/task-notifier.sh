@@ -68,8 +68,16 @@ cleanup_notifier() {
 trap cleanup_notifier EXIT
 # The supervisor stops this notifier with TERM once a session watcher is ready;
 # say which ending this is, so the log answers "how often was the standby needed".
+# The standby watcher yields to a session watcher it sees before that watcher
+# has stamped, so "ready" is re-polled briefly before an ending is called a loss.
 standby_end_log() {
-  if [ "$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "yes" ]; then
+  local i v
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    v="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)"
+    [ "$v" = "yes" ] && break
+    sleep 0.5
+  done
+  if [ "$v" = "yes" ]; then
     log_notifier "standby stood down for $TASKS_DIR ($1): a session-role watcher is ready"
   else
     log_notifier "standby ended for $TASKS_DIR ($1) with no session-role watcher ready"
@@ -369,7 +377,7 @@ task_payload() {
 # down), so the prompt says so and names the re-arm: the session reading it is
 # looking at exactly the problem the Stop hook would otherwise block on later.
 task_prompt() {
-  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash %s/src/watch-tasks-stream.sh "%s" --role session --inbox "%s"' \
+  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
     "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
@@ -391,11 +399,11 @@ submit_task() {
   esac
   has_result "$filename" && return 0
   prompt="$(task_prompt "$filename")"
-  log_notifier "delivering $filename as the standby: no session-role watcher holds $TASKS_DIR"
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
+  log_notifier "delivering $filename as the standby: no session-role watcher holds $TASKS_DIR"
   # A capture can fail (the pane is gone); the liveness wait below is what decides that.
   raw="$(capture_raw)" || raw=""
   incarnation="$(core_incarnation)"
