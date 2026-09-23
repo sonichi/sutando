@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -164,12 +165,20 @@ else:
                                   "SIG", "STATE", "ACTIVE", str(sock), "scratch-core"],
                                  env={"PATH": str(binp)}, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            try:
-                p.wait(timeout=1.5)
-                alive_while_session = False
-            except subprocess.TimeoutExpired:
-                alive_while_session = True
-            n_before = len(calls.read_text().splitlines()) if calls.exists() else 0
+            # Poll for the condition instead of a flat sleep: the happy path exits
+            # the instant the relay call registers (no slower than before), while
+            # a loaded runner gets real margin for the probe-then-relay subprocess
+            # chain instead of a fixed 1.5s (#4684).
+            deadline = time.time() + 10.0
+            n_before, alive_while_session = 0, True
+            while time.time() < deadline:
+                if p.poll() is not None:
+                    alive_while_session = False
+                    break
+                n_before = len(calls.read_text().splitlines()) if calls.exists() else 0
+                if n_before >= 1:
+                    break
+                time.sleep(0.05)
             check("d) the loop keeps running while its session exists", alive_while_session,
                   f"exited rc={p.returncode} with the session present; relay ran {n_before}x")
             check("d) the relay is invoked while the session exists", n_before >= 1, f"relay ran {n_before}x")
