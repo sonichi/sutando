@@ -67,10 +67,11 @@ def _target_from_argv(command: str, pid=None, argv_vector=None):
                          f"real argv vector")
     if verdict.watcher is False:
         return None
-    for tok in verdict.operands:
-        if not tok.startswith("-"):
-            return tok
-    return ""
+    # The tag first: a bare "first token without a dash" reads --role's VALUE as
+    # the inbox, and an env-supplied inbox leaves no positional at all.
+    return (wid.watcher_inbox(verdict.operands)
+            or wid.positional_inbox(verdict.operands)
+            or "")
 
 
 def _same_path(a: str, b: str) -> bool:

@@ -346,6 +346,34 @@ class TestTheShippedStartupNamesTheInbox(Base):
         self.assertEqual(wb._target_from_argv(
             argv, 4242, argv_vector=lambda pid: shlex.split(argv)), self.inbox)
 
+    def test_a_tagged_watcher_is_read_by_its_tag_not_by_the_roles_value(self):
+        """`--role session --inbox X X` is the shape /startup --worker starts and
+        the shape a hand re-arm uses. Reading the first dash-less token made the
+        inbox "session", so this gate said start over a live watcher (#4698)."""
+        for argv in (f"bash src/watch-tasks-stream.sh --role session --inbox {self.inbox} {self.inbox}",
+                     f"bash src/watch-tasks-stream.sh {self.inbox} --role session --inbox {self.inbox}",
+                     f"bash src/watch-tasks-stream.sh --role=session --inbox={self.inbox} {self.inbox}"):
+            self.assertEqual(wb._target_from_argv(
+                argv, 4242, argv_vector=lambda pid, a=argv: shlex.split(a)), self.inbox, argv)
+
+    def test_the_tag_wins_over_a_positional_that_disagrees(self):
+        """Only the tag is a reliable cross-process identity: an inbox that came
+        from $SUTANDO_TASKS_DIR leaves no positional at all."""
+        argv = f"bash src/watch-tasks-stream.sh /somewhere/else --role session --inbox {self.inbox}"
+        self.assertEqual(wb._target_from_argv(
+            argv, 4242, argv_vector=lambda pid: shlex.split(argv)), self.inbox)
+
+    def test_a_tagged_live_watcher_makes_the_gate_skip_not_start(self):
+        """The end-to-end shape of #4698: the gate must not start a duplicate."""
+        argv = f"bash src/watch-tasks-stream.sh --role session --inbox {self.inbox} {self.inbox}"
+        self.sentinel(WORKER).write_text("4242\n")
+        decision, why = wb.decide(
+            instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+            alive=lambda pid: True,
+            watcher_target=lambda pid: wb._target_from_argv(
+                argv, pid, argv_vector=lambda _p: shlex.split(argv)))
+        self.assertEqual(decision, "skip", why)
+
     def test_an_argv_without_an_inbox_is_still_unknown(self):
         self.assertEqual(wb._target_from_argv("bash src/watch-tasks-stream.sh"), "")
 
