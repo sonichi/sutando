@@ -43,6 +43,15 @@ function shellParsedPath(command: string): string {
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
+const GDOCS_WRITE_GUARD = '/x/hooks/gdocs-write-guard.py';
+
+function buildCoreAll(): any {
+	return JSON.parse(
+		execFileSync('node', [CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD], {
+			encoding: 'utf8',
+		}),
+	);
+}
 
 describe('build-core-settings.mjs', () => {
 	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
@@ -146,6 +155,34 @@ describe('build-core-settings.mjs', () => {
 		assert.ok(re.test('mcp__gmail__send_email'));
 		assert.ok(!re.test('mcp__claude_ai_Slack__slack_send_message'));
 		assert.ok(!re.test('Bash'));
+	});
+
+	// A Google Doc was wiped by a whole-document replace (2026-09-20): the guard's
+	// read half (PostToolUse snapshot) and write half (PreToolUse deny) must land
+	// together on the Station's composio_exec tool, or the deny can never be lifted.
+	it('registers the Google Docs write guard on composio_exec for BOTH hook events', () => {
+		const o = buildCoreAll();
+		for (const event of ['PreToolUse', 'PostToolUse']) {
+			const blk = o.hooks[event].find((b: any) => b.hooks.some((h: any) => h.command.includes('gdocs-write-guard')));
+			assert.ok(blk, `no ${event} block registers gdocs-write-guard`);
+			assert.equal(blk.matcher, 'mcp__.*__composio_exec');
+			assert.equal(shellParsedPath(blk.hooks[0].command), GDOCS_WRITE_GUARD);
+			const re = new RegExp(blk.matcher);
+			assert.ok(re.test('mcp__sutando-station__composio_exec'));
+			assert.ok(!re.test('mcp__sutando-station__composio_find'));
+			assert.ok(!re.test('mcp__claude_ai_Google_Drive__create_file'));
+		}
+		// The other guards stay: concat, not replace.
+		assert.deepEqual(
+			o.hooks.PreToolUse.map((b: any) => b.matcher),
+			['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'mcp__.*__composio_exec'],
+		);
+	});
+
+	it('omitting the Google Docs guard path leaves the four-argument shape untouched', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		assert.ok(!JSON.stringify(o).includes('gdocs-write-guard'));
+		assert.equal(o.hooks.PostToolUse.length, 1, 'only the skill telemetry PostToolUse entry');
 	});
 
 	it('omitting the Gmail guard path leaves the previous shape untouched', () => {

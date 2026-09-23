@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -27,6 +27,12 @@
 //                    script honors the telemetry opt-out on its own.
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
+//   arg5 (optional): path to hooks/gdocs-write-guard.py — registered under BOTH
+//                    PreToolUse and PostToolUse for the Station's composio_exec
+//                    tool: the Pre half denies a whole-document Google Docs
+//                    replace without a fresh read-back, the Post half keeps
+//                    every read as a restorable snapshot (one script, two
+//                    events, so the two halves can never be registered apart).
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -104,6 +110,18 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
+// A whole-document Google Docs replace wiped an owner's doc (2026-09-20); the
+// guard needs the read (PostToolUse) and the write (PreToolUse) on the same
+// tool, so both events point at one script. The hook re-checks toolkit/action.
+const gdocsWriteGuardHook = process.argv[6] || '';
+let gdocsWriteGuardSettings = null;
+if (gdocsWriteGuardHook.trim()) {
+	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command: `python3 ${shq(gdocsWriteGuardHook)}` }] };
+	gdocsWriteGuardSettings = { hooks: { PreToolUse: [entry], PostToolUse: [entry] } };
+}
+
 process.stdout.write(
-	JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings)),
+	JSON.stringify(
+		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings),
+	),
 );

@@ -185,6 +185,27 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `gdocs-write-guard.py`
+
+One script on two events for the Station's `composio_exec` tool, toolkit
+`googledocs`. **PreToolUse** denies a body-replacing action
+(`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` — "replaces the entire content of an
+existing document" — plus `UPDATE_EXISTING_DOCUMENT`, `REPLACE_DOCUMENT`,
+`DELETE_CONTENT_RANGE`) unless a snapshot of that document younger than
+`SUTANDO_GDOCS_BACKUP_MAX_AGE_S` (900 s) exists, with a reason that says to read
+the doc first and to prefer the partial-edit actions (`INSERT_TEXT_ACTION`,
+`REPLACE_ALL_TEXT`, `INSERT_TEXT_IN_TABLE_CELL`, always allowed).
+**PostToolUse** keeps every read (`GET_DOCUMENT_PLAINTEXT`, `GET_DOCUMENT_BY_ID`)
+as `<workspace>/data/gdocs-backups/<doc id>/<epoch>.md` (newest 20), so a wrong
+rewrite can be restored from the last thing the owner had. Owner report
+2026-09-20: a doc "gets unexpectedly cleared, or unrelated content is inserted
+or rewritten" — the whole-replace action was the natural pick for "update the
+doc", and nothing warned or kept a copy.
+
+Escape hatch: `SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1`. Fail-OPEN on hook errors.
+Registered for every core session by `build-core-settings.mjs` (arg 5, matcher
+`mcp__.*__composio_exec` on both events). Test: `python3 tests/gdocs-write-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

@@ -391,6 +391,11 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
 - Never disconnect an app, and never switch one without the owner's card tap.
+- A Google Doc is edited in place, never rewritten from memory: read it first
+  (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`), then insert / replace-text actions for the change.
+  `GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the whole document and is denied without a read from
+  the last 15 minutes (`hooks/gdocs-write-guard.py`, which also keeps each read as a snapshot under
+  `<workspace>/data/gdocs-backups/`); it is for a full rewrite the owner asked for, and you say so.
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
