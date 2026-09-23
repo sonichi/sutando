@@ -85,8 +85,7 @@ def start_watcher(ws_spelling):
     # The symlinked spelling, verbatim: this is what the launcher hands a core.
     env["SUTANDO_WORKSPACE_DIR"] = str(ws_spelling)
     env["SUTANDO_RESULTS_DIR"] = str(ws_spelling / "results")
-    # Any timer must not be what makes (2) pass: keep it far beyond the wait.
-    env["SUTANDO_HANDLER_POLL_INTERVAL"] = "600"
+    # The held-set retry spacing must not be what makes (2) pass: far beyond the wait.
     env["SUTANDO_HELD_RETRY_INTERVAL"] = "600"
     return subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws_spelling / "tasks"),

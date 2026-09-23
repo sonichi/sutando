@@ -74,7 +74,7 @@ def scenario_runtime_dir_unwritable():
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hB", 3), ("hC", 4)))
     publish(cfg, h["hB"])
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     runtime = None
@@ -189,7 +189,7 @@ def scenario_absent_then_unreadable_config_appears():
     cfg = ws / "state" / "task-event-handler.json"
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hC", 4),))
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:
@@ -229,7 +229,7 @@ def scenario_held_task_own_event_after_recovery():
     h = handlers(tmp, log, (("hO", 0),))  # optional handler: accepts and runs, writes no result
     publish(cfg, h["hO"])
     os.chmod(cfg, 0)
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p = start(ws, env)
     out: list[str] = []
     try:
@@ -288,7 +288,7 @@ def scenario_dangling_symlink_config():
     h = handlers(tmp, log, (("hC", 4),))
     target = tmp / "real-config.json"
     os.symlink(target, cfg)  # dangling: the target does not exist yet
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:
