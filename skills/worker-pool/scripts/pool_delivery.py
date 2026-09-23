@@ -241,18 +241,9 @@ def regular_file_state(path) -> str:
 def is_regular_file(path) -> bool:
     """A REGULAR file at that exact name, never followed. `exists()` accepts a
     directory or a symlink, and authorising delivery on one lets a planted link
-    decide which body the caller reads.
+    decide which body the caller reads. Fail-closed: an unopenable path is False.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError:
-        return False  # ELOOP on a symlink: not a delivery, not an error to raise
-    try:
-        return stat.S_ISREG(os.fstat(fd).st_mode)
-    finally:
-        os.close(fd)
+    return regular_file_state(path) == "regular"
 
 
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
