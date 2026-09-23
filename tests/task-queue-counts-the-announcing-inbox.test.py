@@ -65,22 +65,34 @@ class Counts(unittest.TestCase):
         (self.inbox / "task-mine-2.txt").rename(self.inbox / "task-mine-2.accepted")
         self.assertEqual(tq.waiting(self.ws, "task-mine", inbox=self.inbox), 0)
 
+    def _cli(self, *argv: str) -> tuple[int, str]:
+        # In-process: the entry point's own branches are what run (and what is measured).
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = tq.main(list(argv))
+        return rc, out.getvalue().strip()
+
     def test_the_cli_takes_inbox_and_does_not_overwrite_the_cores_snapshot(self):
-        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt"),
-                            "--inbox", str(self.inbox)], capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "1"))
+        task_file = str(self.ws / "tasks" / "task-mine.txt")
+        self.assertEqual(self._cli("waiting", "--task-file", task_file, "--inbox", str(self.inbox)), (0, "1"))
         self.assertFalse((self.ws / "state" / "task-queue.json").exists())
+        rc, out = self._cli("pending", "--workspace", str(self.ws), "--inbox", str(self.inbox))
+        self.assertEqual((rc, sorted(t["id"] for t in json.loads(out))), (0, ["task-mine", "task-mine-2"]))
+        self.assertEqual(self._cli("position", "--task-file", task_file, "--inbox", str(self.inbox)),
+                         (0, json.dumps({"depth": 2, "position": 1})))
         # The shipped core passes its own inbox, which is tasks/: same count, snapshot written.
-        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt"),
-                            "--inbox", str(self.ws / "tasks")], capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "3"))
+        self.assertEqual(self._cli("waiting", "--task-file", task_file, "--inbox", str(self.ws / "tasks")), (0, "3"))
         snap = json.loads((self.ws / "state" / "task-queue.json").read_text())
         self.assertEqual(snap["depth"], 4)
         (self.ws / "state" / "task-queue.json").unlink()
-        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", str(self.ws / "tasks" / "task-mine.txt")],
-                           capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "3"))
+        self.assertEqual(self._cli("waiting", "--task-file", task_file), (0, "3"))
         self.assertTrue((self.ws / "state" / "task-queue.json").exists())
+        # The watcher reaches the same entry point through an interpreter path.
+        r = subprocess.run([sys.executable, str(TQ), "waiting", "--task-file", task_file, "--inbox", str(self.inbox)],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "1"))
 
 
 class EmitPassesTheInbox(unittest.TestCase):
