@@ -37,8 +37,11 @@ PIDS+=("$PID")
 [ -n "$LOG" ] && [ -n "$PID" ] && alive "$PID"; check $? "(a) it reports a log and a live pid ($PID)" "out: $(tr '\n' '|' < "$WORK/a.out")"
 [ "$(python3 "$REPO/src/watcher_identity.py" role-present session --inbox "$WS/tasks" --ready "$WS/state")" = "yes" ]
 check $? "(a) ...and the watcher is ready, not merely spawned"
-[ "$LOG" = "$(python3 "$REPO/src/util_paths.py" watcher-log "$WS" "$WS/tasks")" ]
-check $? "(a) ...at the path util_paths names for this inbox"
+# Physical on both sides: the script prints the path a reader of the process
+# table would report, and on macOS /var and /private/var are one file.
+WANT="$(python3 "$REPO/src/util_paths.py" watcher-log "$WS" "$WS/tasks")"
+WANT="$(cd "$(dirname "$WANT")" && pwd -P)/$(basename "$WANT")"
+[ "$LOG" = "$WANT" ]; check $? "(a) ...at the path util_paths names for this inbox" "got $LOG want $WANT"
 
 # (b) It is DETACHED: not in the caller's process group, and its parent is gone.
 [ "$(ps -o pgid= -p "$PID" | tr -d ' ')" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]
@@ -59,10 +62,29 @@ for i in $(seq 1 100); do [ "$(wc -l < "$LOG" | tr -d ' ')" -gt "$BEFORE" ] && b
 detach "$WS" "$WS/tasks" "$WORK/d.out"; rc=$?
 check "$rc" "(d) a second call exits 0" "$(tail -2 "$WORK/d.err" | tr '\n' '|')"
 [ "$(sed -n 's/^PID: //p' "$WORK/d.out")" = "$PID" ]; check $? "(d) ...reporting the SAME pid, not a second watcher" "got $(sed -n 's/^PID: //p' "$WORK/d.out")"
-grep -q 'already has a ready session watcher' "$WORK/d.err"; check $? "(d) ...and says nothing was started"
+grep -q 'already has a ready detached watcher on this log; nothing started' "$WORK/d.err"; check $? "(d) ...and says nothing was started" "$(tail -1 "$WORK/d.err")"
 # By holder, not by pgrep: pgrep -f also matches the python exec wrapper's argv.
 [ "$(python3 "$REPO/src/watcher_identity.py" inbox-holders --inbox "$WS/tasks" | grep -c 'session$')" = 1 ]
 check $? "(d) ...leaving exactly one session watcher on the inbox" "holders: $(python3 "$REPO/src/watcher_identity.py" inbox-holders --inbox "$WS/tasks" | tr '\n' '|')"
+
+# (d2) Held by a Monitor-hosted watcher (every live core today): the caller must
+#      NOT be told to tail a log that watcher never writes.
+WS3="$WORK/ws3"; mkdir -p "$WS3/tasks" "$WS3/state" "$WS3/logs"
+env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_CORE_SESSION \
+    SUTANDO_WORKSPACE_DIR="$WS3" PATH="$WORK/stubbin:$PATH" \
+    python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$REPO/src/watch-tasks-stream.sh" "$WS3/tasks" --role session --inbox "$WS3/tasks" | cat > "$WORK/mon.out" 2> "$WORK/mon.err" &
+MONP=$!
+for i in $(seq 1 150); do [ -n "$(ls "$WS3"/state/*.pid 2>/dev/null)" ] && break; sleep 0.1; done
+MONW="$(cat "$WS3"/state/*.pid 2>/dev/null | head -1)"; PIDS+=("$MONW")
+[ -n "$MONW" ]; check $? "(d2) a pipe-hosted watcher is ready on its inbox" "$(tail -2 "$WORK/mon.err" | tr '\n' '|')"
+detach "$WS3" "$WS3/tasks" "$WORK/d2.out"; rc=$?
+[ "$rc" = 3 ]; check $? "(d2) detaching over it exits 3, not 0" "rc=$rc $(tail -1 "$WORK/d2.err")"
+! grep -q '^LOG: ' "$WORK/d2.out"; check $? "(d2) ...and prints NO log to tail" "out: $(tr '\n' '|' < "$WORK/d2.out")"
+grep -q "whose output is" "$WORK/d2.err"; check $? "(d2) ...saying what holds it instead" "$(tail -1 "$WORK/d2.err")"
+[ "$(python3 "$REPO/src/watcher_identity.py" inbox-holders --inbox "$WS3/tasks" | grep -c 'session$')" = 1 ]
+check $? "(d2) ...and starts no second watcher"
+kill -TERM -- "-$MONW" 2>/dev/null; sleep 0.3
 
 # (e) Two inboxes get two logs: one session tailing its own never sees the other's.
 mkdir -p "$WS/deliveries/w1"

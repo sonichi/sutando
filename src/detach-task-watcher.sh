@@ -14,8 +14,11 @@
 # Prints, on stdout:
 #   LOG: <path>     the file the watcher's stdout is appended to
 #   PID: <n>        the detached watcher
-# Exit 0 when a watcher is live on that inbox afterwards (started here, or
-# already running), 1 when it could not be started, 64 on a usage error.
+# Exit 0 when a DETACHED watcher writing that log is live afterwards (started
+# here, or already running), 3 when the inbox is held by a watcher whose output
+# goes elsewhere (a Monitor: nothing is started and no LOG is printed, because
+# tailing it would read a file nobody writes), 1 when it could not be started,
+# 64 on a usage error.
 set -u
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -45,18 +48,34 @@ INBOX="$(canonical_tasks_dir "$INBOX")"
 [ -n "$WORKSPACE" ] || WORKSPACE="${SUTANDO_WORKSPACE_DIR:-$(workspace_dir_for_inbox "$INBOX")}"
 PY="$(require_python "$__REPO_ROOT" "detach the task watcher")" || exit 1
 
-# Already covered: the watcher's own self-check would exit 0 as covered anyway,
-# but saying so here keeps a re-arm from writing a second log nobody tails.
-if [ "$("$PY" "$__REPO_ROOT/src/watcher_identity.py" role-present session \
-          --inbox "$INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" = "yes" ]; then
-  echo "LOG: $("$PY" "$__REPO_ROOT/src/util_paths.py" watcher-log "$WORKSPACE" "$INBOX")"
-  echo "PID: $("$PY" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders --inbox "$INBOX" 2>/dev/null | awk '$2=="session"{print $1; exit}')"
-  echo "detach-task-watcher: $INBOX already has a ready session watcher; nothing started." >&2
-  exit 0
-fi
-
 LOG="$("$PY" "$__REPO_ROOT/src/util_paths.py" watcher-log "$WORKSPACE" "$INBOX")" || exit 1
 mkdir -p "$(dirname "$LOG")" || exit 1
+# PHYSICAL, because that is what a reader of /proc or lsof reports back: on macOS
+# a workspace under /var is reported as /private/var, and a string compare splits
+# one file into two.
+LOG="$(cd "$(dirname "$LOG")" && pwd -P)/$(basename "$LOG")"
+
+# Already covered — but by WHICH kind of watcher? A Monitor-hosted one writes to
+# its Monitor, not to this log, so reporting the log here would send the caller
+# to tail a file nobody writes and lose every task when that Monitor expires.
+if [ "$("$PY" "$__REPO_ROOT/src/watcher_identity.py" role-present session \
+          --inbox "$INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" = "yes" ]; then
+  HOLDER="$("$PY" "$__REPO_ROOT/src/watcher_identity.py" inbox-holders --inbox "$INBOX" 2>/dev/null | awk '$2=="session"{print $1; exit}')"
+  SINK="$("$PY" "$__REPO_ROOT/src/watcher_identity.py" output-sink "${HOLDER:-0}" 2>/dev/null | head -1)"
+  case "$SINK" in
+    "file $LOG")
+      echo "LOG: $LOG"
+      echo "PID: $HOLDER"
+      echo "detach-task-watcher: $INBOX already has a ready detached watcher on this log; nothing started." >&2
+      exit 0 ;;
+    *)
+      # rc 3: covered, but NOT by a watcher writing this log. The caller keeps
+      # whatever is hosting it (a Monitor) and must not tail the log.
+      echo "PID: ${HOLDER:-unknown}"
+      echo "detach-task-watcher: $INBOX is held by pid ${HOLDER:-unknown} whose output is '${SINK:-unreadable}', not $LOG; leaving it alone. Stop that watcher first to detach this inbox." >&2
+      exit 3 ;;
+  esac
+fi
 
 # nohup + setsid-by-python: `setsid` is not on macOS, and a watcher that stays in
 # the caller's process group dies with the session it was meant to outlive.

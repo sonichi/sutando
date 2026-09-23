@@ -55,10 +55,16 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    ```
 
    (an instance whose inbox is not `<workspace>/tasks/` passes `--inbox "$SUTANDO_TASKS_DIR"`).
-   It prints `LOG: <path>` and `PID: <n>`, starts nothing when a ready session
-   watcher already holds the inbox, and exits non-zero if no watcher is ready —
-   report that, never claim a watcher that is not there. Then arm the `Monitor`
-   on the LOG, not on the watcher:
+   Read its exit code, because it decides which hosting mode you are in:
+   **0** — a detached watcher writing `LOG:` is live (started here, or already
+   running): arm the `Monitor` on that log, as below.
+   **3** — the inbox is already held by a watcher whose output goes somewhere
+   else (today's `Monitor`-hosted one). Nothing was started and no `LOG:` was
+   printed, because tailing it would read a file nobody writes. Keep the legacy
+   form below for this boot; the inbox migrates when that watcher is next gone.
+   **1** — no watcher is ready: report it, never claim a watcher that is not there.
+
+   On **0**, arm the `Monitor` on the LOG, not on the watcher:
    `command: 'tail -n +$((CURSOR+1)) -F "<LOG>"'`, `persistent: true`,
    `description: 'Streaming task watcher'`, where CURSOR is the number of log
    lines already consumed (0 on a fresh start). **On every re-arm, set CURSOR to
