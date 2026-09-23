@@ -165,10 +165,8 @@ else:
                                   "SIG", "STATE", "ACTIVE", str(sock), "scratch-core"],
                                  env={"PATH": str(binp)}, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            # Poll for the condition instead of a flat sleep: the happy path exits
-            # the instant the relay call registers (no slower than before), while
-            # a loaded runner gets real margin for the probe-then-relay subprocess
-            # chain instead of a fixed 1.5s (#4684).
+            # Poll, not a flat sleep: exits the instant the relay call registers,
+            # while a loaded runner still gets real margin for the probe chain.
             deadline = time.time() + 10.0
             n_before, alive_while_session = 0, True
             while time.time() < deadline:
