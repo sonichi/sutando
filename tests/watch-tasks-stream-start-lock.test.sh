@@ -10,6 +10,14 @@ fail=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-startlock.XXXXXX")"
 mkdir -p "$WORK/stubbin"
 cp "$REPO/tests/fixtures/fswatch-poll-stub.sh" "$WORK/stubbin/fswatch"; chmod +x "$WORK/stubbin/fswatch"
+# A mv that holds the FIRST takeover rename once ($SUTANDO_TEST_MV_ONCE names the
+# once-flag) and logs every takeover rename: (b2) uses the hold to take the lock
+# over as a live holder, so the held rename moves a LIVE lock every run.
+printf '%s\n' '#!/bin/bash' \
+  'case "$*" in *.dead.*) [ -n "${SUTANDO_TEST_MV_ONCE:-}" ] && mkdir "$SUTANDO_TEST_MV_ONCE" 2>/dev/null && sleep "${SUTANDO_TEST_MV_DELAY:-0.5}" ;; esac' \
+  '[ -n "${SUTANDO_TEST_MV_LOG:-}" ] && printf "%s -> %s (pid in source: %s)\n" "$1" "$2" "$(cat "$1/pid" 2>/dev/null)" >> "$SUTANDO_TEST_MV_LOG"' \
+  'exec /bin/mv "$@"' > "$WORK/stubbin/mv"
+chmod +x "$WORK/stubbin/mv"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null; [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
@@ -74,18 +82,43 @@ grep -q 'left by dead pid 999999; taking it over' "$WS/c.err"; check "(b) ...and
 [ ! -d "$LOCK" ]; check "(b) ...and the lock is released after the stamp" $?
 kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
 
-# (b2) Two starters over the SAME dead-pid lock: the takeover is a rename, so
-#      only one of them removes it and the other waits; still one announcer.
-WS="$WORK/stale2"; mkdir -p "$WS/tasks" "$WS/state"
+# (b2) The steal window, forced: a starter judges the lock dead, and before its
+#      rename lands (the mv shim holds it 1 s) the TEST takes the lock over as a
+#      live holder. The delayed rename then moves a LIVE lock, which must be given
+#      back by rename, and the starter must not stamp while the test holds it.
+WS="$WORK/steal"; mkdir -p "$WS/tasks" "$WS/state"
 key="$(printf '%s' "$(cd "$WS/tasks" && pwd -P)" | cksum | cut -d' ' -f1)"
 LOCK="$WS/state/watch-tasks-stream.start-$key.lock"
 mkdir -p "$LOCK"; echo 999999 > "$LOCK/pid"
-a="$(start "$WS" g)"; b="$(start "$WS" h)"; PIDS+=("$a" "$b")
-settle "$WS" "$a" "$b"
-live=0; alive "$a" && live=$((live+1)); alive "$b" && live=$((live+1))
-check "(b2) two starters over one dead-pid lock: exactly one announcer (live=$live, sentinels=$(ls "$WS"/state/*.pid 2>/dev/null | wc -l | tr -d ' '))" "$([ "$live" = 1 ] && echo 0 || echo 1)" "g.err: $(tail -1 "$WS/g.err")|h.err: $(tail -1 "$WS/h.err")"
-[ -z "$(ls -d "$WS"/state/watch-tasks-stream.start-*.lock* 2>/dev/null)" ]; check "(b2) ...and no lock or renamed lock is left behind" $?
-for p in "$a" "$b"; do kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done; sleep 0.3
+export SUTANDO_TEST_MV_ONCE="$WS/mv-once" SUTANDO_TEST_MV_LOG="$WS/mv.log" SUTANDO_TEST_MV_DELAY=1
+p="$(start "$WS" g)"; PIDS+=("$p")
+for i in $(seq 1 50); do [ -d "$WS/mv-once" ] && break; sleep 0.1; done
+[ -d "$WS/mv-once" ]; check "(b2) the starter judged the lock dead and its rename is held" $?
+# The other taker: replace the dead lock with this test's own live lock.
+/bin/mv "$LOCK" "$LOCK.gone" && rm -rf "$LOCK.gone"; mkdir "$LOCK"; echo $$ > "$LOCK/pid"
+sleep 1.5
+unset SUTANDO_TEST_MV_ONCE SUTANDO_TEST_MV_LOG SUTANDO_TEST_MV_DELAY
+grep -E "\.lock -> .*\.dead\.$p \(pid in source: $$\)" "$WS/mv.log" >/dev/null; check "(b2) ...the delayed rename moved the test's LIVE lock" $? "$(sed "s#$WS/state/##g" "$WS/mv.log" | tr '\n' '|')"
+grep -E "\.dead\.$p -> .*\.lock \(pid in source: $$\)" "$WS/mv.log" >/dev/null; check "(b2) ...and gave it back by rename (a mutant that deletes it fails here)" $? "$(sed "s#$WS/state/##g" "$WS/mv.log" | tr '\n' '|')"
+[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; check "(b2) ...so the test still holds the lock" $?
+[ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ] && alive "$p"; check "(b2) ...and the starter has not stamped while the lock is held (waiting, alive)" $?
+rm -rf "$LOCK"
+for i in $(seq 1 100); do [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ] && break; sleep 0.1; done
+[ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ]; check "(b2) ...and stamps once the lock is released" $?
+kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
+
+# (b3) A lock with no pid file (a winner died between mkdir and its pid write)
+#      is reclaimed after a few seconds, not waited out for the full timeout.
+WS="$WORK/nopid"; mkdir -p "$WS/tasks" "$WS/state"
+key="$(printf '%s' "$(cd "$WS/tasks" && pwd -P)" | cksum | cut -d' ' -f1)"
+LOCK="$WS/state/watch-tasks-stream.start-$key.lock"
+mkdir -p "$LOCK"; touch -t "$(date -v-1M +%Y%m%d%H%M.%S 2>/dev/null || date -d '1 minute ago' +%Y%m%d%H%M.%S)" "$LOCK"
+t0=$(date +%s)
+p="$(start "$WS" i)"; PIDS+=("$p")
+for i in $(seq 1 150); do [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ] && break; sleep 0.1; done
+took=$(( $(date +%s) - t0 ))
+check "(b3) a pid-less lock older than a few seconds is reclaimed (stamped in ${took}s, not 30)" "$([ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$p" ] && [ "$took" -lt 10 ] && echo 0 || echo 1)" "$(tail -2 "$WS/i.err" | tr '\n' '|')"
+kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; sleep 0.3
 
 # (c) A lock held by a LIVE pid past the timeout does not strand the inbox: the
 #     start proceeds without the lock and says so.

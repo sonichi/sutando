@@ -132,26 +132,36 @@ mkdir -p "$WORKSPACE_DIR/state" 2>/dev/null || true
 __lock_deadline=$(( $(date +%s) + START_LOCK_TIMEOUT_S ))
 while ! mkdir "$START_LOCK" 2>/dev/null; do
   __lpid="$(cat "$START_LOCK/pid" 2>/dev/null)"
+  # A lock with no pid file is a winner that died between mkdir and its pid
+  # write; older than a few seconds it is nobody's, so it is reclaimed like a dead pid.
+  __ldead=""
+  if [ -z "$__lpid" ]; then
+    __lmt="$(stat -c %Y -- "$START_LOCK" 2>/dev/null || true)"
+    case "$__lmt" in ''|*[!0-9]*) __lmt="$(stat -f %m -- "$START_LOCK" 2>/dev/null || true)" ;; esac
+    case "$__lmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __lmt )) -gt 5 ] && __ldead=1 ;; esac
+  fi
   case "$__lpid" in
     ''|*[!0-9]*) ;;
-    *) if ! kill -0 "$__lpid" 2>/dev/null; then
-         # Rename, never rm in place: two starters over one dead lock would both
-         # rm, and the second rm takes the first's fresh lock with it.
-         if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
-           # mv moves whatever is at the path: if another taker already replaced
-           # the dead lock with its live one, give that one back untouched. A third
-           # starter creating the lock inside that window nests the returned dir
-           # under its own (today's double run at worst; nothing is deleted).
-           if [ "$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)" = "$__lpid" ]; then
-             echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid $__lpid; taking it over" >&2
-             rm -rf "$START_LOCK.dead.$$"
-           elif ! mv "$START_LOCK.dead.$$" "$START_LOCK" 2>/dev/null; then
-             rm -rf "$START_LOCK.dead.$$"
-           fi
-         fi
-         continue
-       fi ;;
+    *) kill -0 "$__lpid" 2>/dev/null || __ldead=1 ;;
   esac
+  if [ -n "$__ldead" ]; then
+    # Rename, never rm in place: two starters over one dead lock would both
+    # rm, and the second rm takes the first's fresh lock with it.
+    if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
+      # mv moves whatever is at the path: if another taker already replaced
+      # the dead lock with its live one, give that one back untouched. A third
+      # starter creating the lock inside that window nests the returned dir
+      # under its own (today's double run at worst; nothing is deleted).
+      __mpid="$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)"
+      if [ "$__mpid" = "$__lpid" ]; then
+        echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid ${__lpid:-<none>}; taking it over" >&2
+        rm -rf "$START_LOCK.dead.$$"
+      elif ! mv "$START_LOCK.dead.$$" "$START_LOCK" 2>/dev/null; then
+        rm -rf "$START_LOCK.dead.$$"
+      fi
+    fi
+    continue
+  fi
   if [ "$(date +%s)" -ge "$__lock_deadline" ]; then
     # Refusing would leave the inbox with no announcer; the scan below still runs.
     echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS held by pid ${__lpid:-unknown} for ${START_LOCK_TIMEOUT_S}s; starting without it" >&2
