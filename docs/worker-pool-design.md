@@ -267,9 +267,13 @@ watcher beat that is stale or absent AND an inbox no session-role watcher holds
 the same three-tick sustain and 90 s line issue one `rearm_watcher`, which
 ensures the inbox's hosting-mode supervisor, whose standby arms once nobody
 serves the inbox; still lost at 3 minutes escalates to the owner like a dead
-session. A stale beat whose inbox is held is a watcher that beats nothing (one
-launched before beat injection), never a lost one; a holder check that could
-not be told is not evidence either way.
+session. A stale beat whose inbox is held is never a lost watcher, and it covers
+two populations: a watcher launched before beat injection, which beats nothing,
+and a beat-injected watcher still inside its startup scan, which starts its beat
+only once fswatch is up and is deaf for as long as the scan lasts (a window that
+grows with the inbox's stale sentinels, #4588). The ladder deliberately does not
+act on either: re-arming into a live process is the double-arm it exists to
+prevent. A holder check that could not be told is not evidence either way.
 
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
