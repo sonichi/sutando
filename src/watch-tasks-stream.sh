@@ -152,7 +152,14 @@ case "$__holders" in
       # Each child is captured with its start time: a recycled pid has another.
       __hkids=""
       for __k in $(pgrep -P "$__hpid" 2>/dev/null || true); do
-        __hkids="$__hkids$__k|$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//; s/ *$//')
+        __kstart="$(ps -o lstart= -p "$__k" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+        # An empty start time could never be re-proven later; say so instead of
+        # carrying a child that would be silently left running.
+        if [ -z "$__kstart" ]; then
+          echo "watch-tasks-stream: --force-restart: child pid $__k of $__hpid has no readable start time; not signaled" >&2
+          continue
+        fi
+        __hkids="$__hkids$__k|$__kstart
 "
       done
       # Live means "not proven gone": kill -0 also answers for a zombie, so ps stat
