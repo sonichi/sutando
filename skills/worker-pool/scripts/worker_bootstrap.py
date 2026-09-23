@@ -28,6 +28,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
+# ...and this skill's own scripts dir, which is sys.path[0] only when this file is
+# RUN as a script: the sibling import below must not depend on how it was loaded.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import watcher_identity as wid  # noqa: E402
 
@@ -173,12 +177,13 @@ def main(argv=None) -> int:
 
 
 def prune_spent_sentinels(workspace: str, instance: str) -> str:
-    """Retire this worker's spent delivery sentinels (payload archived, or result
-    published and flagged) through pool_delivery's own boot sweep, so the
-    inbox holds what is owed, not the worker's history. Never changes the decision."""
+    """Retire this worker's spent delivery sentinels so the inbox holds what is
+    owed, not its history. prune_spent, never sweep: the boot sweep also RELEASES
+    an accepted delivery back to pending, which on a `skip` (this worker's watcher
+    is live) would re-offer work the session is answering. Never changes the decision."""
     try:
         import pool_delivery as pd
-        acts = pd.sweep(Path(workspace), instance)
+        acts = pd.prune_spent(Path(workspace), instance)
         return " ".join(f"{k}={len(v)}" for k, v in acts.items())
     except Exception as e:                                   # noqa: BLE001
         return f"skipped ({e})"

@@ -362,6 +362,43 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
 
 
+def prune_spent(workspace: Path, recipient: str) -> dict:
+    """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
+    re-offer. A sentinel is spent when its payload is gone (`stale-sentinel`),
+    or the work is finished AND nothing could hand it back — the flag alone is
+    not enough, because the core re-queues a payload whose sentinel is gone and
+    whose result it cannot find. Safe beside a live watcher, which `sweep` is not.
+    """
+    ws = Path(workspace)
+    seen = set()
+    actions = {"retired": [], "stale": [], "kept": []}
+    for p in accepted(ws, recipient) + pending(ws, recipient):
+        task_id = parse_sentinel(p.name)[0]
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        state = residue(ws, recipient, task_id)
+        if state == "stale-sentinel":
+            p.unlink()
+            actions["stale"].append(task_id)
+        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
+            p.unlink()
+            actions["retired"].append(task_id)
+        else:
+            actions["kept"].append(task_id)
+    return actions
+
+
+def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
+    """True when removing the sentinel cannot put the task back in the core's
+    queue: either the payload is gone, or a result the core can find remains."""
+    if not payload_path(ws, task_id).is_file():
+        return True
+    if read_ready_result(result_path(ws, task_id)) is not None:
+        return True
+    return archived_payload(ws, task_id).is_file()
+
+
 def sweep(workspace: Path, recipient: str) -> dict:
     """Boot reconciliation. An event that fired while nobody listened is gone,
     so a reader that only streams never learns about it."""

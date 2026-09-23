@@ -165,13 +165,20 @@ class TestMain(Base):
             rc = wb.main(list(args))
         return rc, buf.getvalue().splitlines()
 
-    def test_the_boot_decision_prunes_spent_sentinels_and_keeps_owed_ones(self):
-        """A delivered task's sentinel outlives its payload (archived) and its
-        result; every Stop hook and startup sweep re-walked all of them (#4614)."""
-        sys.path.insert(0, str(Path(wb.__file__).parent))
-        import pool_delivery as pd
+    def _pd(self):
+        """pool_delivery, reached exactly as the bootstrap reaches it."""
+        import pool_delivery
+        return pool_delivery
+
+    def _inbox_dir(self):
         d = Path(self.ws) / "deliveries" / WORKER
         d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_the_boot_decision_prunes_spent_sentinels_and_keeps_owed_ones(self):
+        """A delivered task's sentinel outlived its payload and its result; every
+        Stop hook and startup sweep re-walked all of them (#4614)."""
+        d = self._inbox_dir()
         tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
         for i in range(3):                       # spent: payload gone
             (d / f"task-spent{i}.txt").touch()
@@ -184,14 +191,75 @@ class TestMain(Base):
         sweep = [l for l in out if l.startswith("sweep=")]
         self.assertEqual(len(sweep), 1, out)
         self.assertIn("stale=3", sweep[0])
-        self.assertIn("ready=1", sweep[0])
+        self.assertIn("kept=1", sweep[0])
         self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
 
-    def test_a_sweep_failure_never_changes_the_decision(self):
-        with patch.object(wb, "prune_spent_sentinels", side_effect=RuntimeError("boom")):
-            pass  # the guard is inside prune_spent_sentinels itself: exercise it directly
-        out = wb.prune_spent_sentinels("/nonexistent/workspace", WORKER)
-        self.assertTrue(out.startswith("skipped ("), out)
+    def test_the_prune_never_releases_an_accepted_delivery(self):
+        """On `skip` this worker's own watcher is live, so an accepted sentinel is
+        work the session is answering; the boot sweep would re-offer it as pending."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        (tasks / "task-live.txt").write_text("id: task-live\nsource: test\ntask: x\n")
+        (d / f"task-live{pd.ACCEPTED_SUFFIX}").touch()
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("kept=1", out)
+        self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
+                         "an in-flight delivery was renamed back to pending")
+
+    def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
+        """`residue` calls a done flag alone `finished`, but with the payload still
+        in tasks/ and no findable result, removing the sentinel re-queues it."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        for tid in ("task-fin", "task-done"):
+            (tasks / f"{tid}.txt").write_text(f"id: {tid}\nsource: test\ntask: x\n")
+            (d / f"{tid}.txt").touch()
+            pd.mark_done(self.ws, WORKER, tid, published=True)
+        # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
+        arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
+        arch.write_text("archived")
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("retired=1", out)
+        self.assertIn("kept=1", out)
+        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+
+    def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
+        """A prune that raises must leave the decision, its exit code and its first
+        line untouched; only the sweep= line says what happened."""
+        import contextlib
+        import io
+        for decision, why in (("start", "no sentinel"), ("skip", "live")):
+            with patch.object(wb, "decide", return_value=(decision, why)), \
+                 patch.object(wb, "prune_spent_sentinels", wraps=wb.prune_spent_sentinels) as spy:
+                with patch.dict(sys.modules, {"pool_delivery": None}):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = wb.main(["--instance", WORKER, "--inbox", self.inbox,
+                                      "--workspace", str(self.ws)])
+                    out = buf.getvalue().splitlines()
+            self.assertEqual(rc, 0, decision)
+            self.assertEqual(out[0], decision)
+            self.assertEqual(spy.call_count, 1, f"the prune must run on {decision}")
+            sweep = [l for l in out if l.startswith("sweep=")]
+            self.assertEqual(len(sweep), 1, out)
+            self.assertTrue(sweep[0].startswith("sweep=skipped ("), sweep[0])
+
+    def test_no_sweep_runs_on_an_unknown_decision(self):
+        """`unknown` means the state could not be read; touching the inbox there
+        would act on a picture the gate itself refused to trust."""
+        import contextlib
+        import io
+        with patch.object(wb, "decide", return_value=("unknown", "ps did not run")), \
+             patch.object(wb, "prune_spent_sentinels") as spy:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wb.main(["--instance", WORKER, "--inbox", self.inbox,
+                              "--workspace", str(self.ws)])
+        self.assertEqual(rc, 2)
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual([l for l in buf.getvalue().splitlines() if l.startswith("sweep=")], [])
 
     def test_a_worker_with_no_watcher_is_told_to_start(self):
         rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
