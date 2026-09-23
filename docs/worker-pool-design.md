@@ -260,6 +260,26 @@ marks a worker `abandoned` is the same process that recovers it.
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
 is why a release is not authorised by staleness: it keys on `abandoned`.
 
+**A live session with no watcher is the other rung.** The watcher has its own
+beat (`state/watchers/<id>.alive`). Under a session that answered alive, a
+watcher beat that is stale or absent AND an inbox no session-role watcher holds
+(the process table, read only when the beat cannot vouch) is a lost watcher:
+the same three-tick sustain and 90 s line issue one `rearm_watcher`, which
+ensures the inbox's hosting-mode supervisor, whose standby arms once nobody
+serves the inbox; still lost at 3 minutes escalates to the owner like a dead
+session. A stale beat whose inbox is held is never a lost watcher: it is a
+watcher launched before beat injection, which beats nothing, and re-arming into
+a live process is the double-arm the ladder exists to prevent. A session-role
+watcher stamps its sentinel and starts its beat before its startup sweep, so
+inside the sweep it reads as live and events queue rather than drop; its only
+held-and-beatless window is the readiness round-trip, a few seconds the
+three-tick sustain absorbs. A watcher on the non-session order sweeps before it
+subscribes and is deaf for as long as a stale-sentinel backlog stalls that sweep
+(#4588); it is not a session-role holder, so its stale beat counts as a lost
+watcher and the rung acts on it after the sustain, which is the right outcome
+for a watcher that cannot hear. A holder check that could not be told is not
+evidence either way.
+
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the

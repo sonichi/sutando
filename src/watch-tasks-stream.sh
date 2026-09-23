@@ -250,6 +250,15 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
     exit 1
   }
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+  # fswatch names this directory by its physical path; handle_event compares to it.
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
+    mkdir -p "$HANDLER_CONFIG_DIR"
+    HANDLER_CONFIG_DIR="$(canonical_tasks_dir "$HANDLER_CONFIG_DIR")" || {
+      echo "watch-tasks-stream: could not canonicalize the task-event-handler config dir" >&2
+      exit 1
+    }
+    HANDLER_CONFIG_PATH="$HANDLER_CONFIG_DIR/${HANDLER_CONFIG_PATH##*/}"
+  fi
 fi
 
 # absent: no config on disk (the core takes every task). ready: parsed. broken: a
@@ -273,7 +282,11 @@ task_file_identity() {
   sum="$(cksum < "$1" 2>/dev/null | awk 'NR==1 {print $1 "-" $2}')"
   printf '%s' "${inode}:${sum}"
 }
-HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+# A held set replays at once on a task or config event; on any other watched
+# event it replays at most this often. No timer exists.
+HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-30}"
+# A sentinel older than this is not racing its payload's write (see dispatch_task).
+RESOLVE_RACE_WINDOW_S="${SUTANDO_RESOLVE_RACE_WINDOW_S:-10}"
 # One read per routing decision: the bytes are copied once into a private
 # snapshot and parsed from there; no cache, no compare, nothing to go stale.
 read_handler_config_now() {
@@ -309,8 +322,7 @@ redispatch_held_tasks() {
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
   done <<< "$held"
 }
-# An elapsed deadline, checked after every event: a busy stream never resets it
-# the way it resets the read timeout.
+# An elapsed deadline, checked after every event; a busy stream never resets it.
 retry_held_tasks_if_due() {
   [ -n "$HELD_NAMES" ] || return 0
   [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
@@ -654,10 +666,24 @@ dispatch_task() {
   # resolve is retried briefly rather than treated as permanent. Same bounded
   # shape as acquire_task_claim's lock race, applied to filesystem visibility
   # instead of lock contention.
+  # Only a fresh sentinel can be racing its payload, and only the resolver's
+  # typed "no payload" verdict (rc 4) is about the entry rather than the run.
+  local max_attempts=3 mtime now age=0
+  # GNU first: on GNU, `stat -f` answers a different question and succeeds, so
+  # the result is validated as numeric rather than trusted by exit status.
+  mtime="$(stat -c %Y -- "$task_path" 2>/dev/null || true)"
+  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m -- "$task_path" 2>/dev/null || true)" ;; esac
+  now="$(date +%s)"
+  case "$mtime" in ''|*[!0-9]*) ;; *) age=$((now - mtime)) ;; esac
   attempt=0
   until resolved="$(resolve_inbox_entry "$task_path")"; do
+    rc=$?
     attempt=$((attempt + 1))
-    if [ "$attempt" -ge 3 ]; then
+    if [ "$rc" -eq 4 ] && [ "$age" -gt "$RESOLVE_RACE_WINDOW_S" ]; then
+      echo "watch-tasks-stream: $task_path names no payload and is ${age}s old, past the ${RESOLVE_RACE_WINDOW_S}s race window; not dispatching (1 attempt)" >&2
+      return 0
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
       echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
       return 0
     fi
@@ -1024,28 +1050,9 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# -t bounds the read so a stretch with no fswatch event still gets a periodic,
-# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
-# event shape the platform's fswatch monitor backend turns out to use.
-while true; do
-  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path <&3
-  read_rc=$?
-  if [ "$read_rc" -ne 0 ]; then
-    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
-    # exit code alone can't distinguish them -- ask whether fswatch is still
-    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
-    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      if [ -n "$HANDLER_CONFIG_PATH" ]; then
-        reload_current_handler
-        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
-        redispatch_held_tasks
-      fi
-      continue
-    fi
-    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
-    # to the script's normal exit path rather than spinning on a dead FIFO.
-    break
-  fi
+# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
+# readiness replay above, since a second open of the FIFO would race it for bytes.
+while IFS= read -r path <&3; do
   handle_event "$path"
   retry_held_tasks_if_due
 done

@@ -32,6 +32,9 @@ import tempfile
 # The hook's gate is session-scoped; unset so this suite drives its own ledger
 # rather than whatever session happens to be running it.
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+# The watcher-coverage gate has its own suite; a temp inbox nobody watches would
+# block before the ledger gate's text under test is reached.
+os.environ["SUTANDO_STOP_HOOK_WATCHER_GATE"] = "0"
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 HOOK = REPO / "src" / "check-pending-tasks.sh"

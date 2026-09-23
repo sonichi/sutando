@@ -37,6 +37,7 @@ from readiness_window_helpers import (  # noqa: E402
     REPO, watcher_env, handlers, workspace, publish, write_task, start,
     pump, stop, wait_ready,
 )
+from clean_watcher_env import clean_env  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -75,14 +76,12 @@ def scenario(config_first: bool):
     handler.chmod(0o755)
     cfg = ws / "state" / "task-event-handler.json"
 
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    env.pop("SUTANDO_INSTANCE_ID", None)
-    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
     p = subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
@@ -209,14 +208,12 @@ def scenario_config_changes_between_swept_items():
         (ws / "tasks" / f"{name}.txt").write_text(f"id: {name}\naccess_tier: team\ntask: restricted\n")
         time.sleep(0.05)
 
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    env.pop("SUTANDO_INSTANCE_ID", None)
-    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
     p = subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
@@ -302,14 +299,12 @@ def scenario_same_second_equal_size_replacements():
 
     publish_local("hA")
     sizes = {cfg.stat().st_size}
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    env.pop("SUTANDO_INSTANCE_ID", None)
-    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
     p = subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],
@@ -428,15 +423,13 @@ def scenario_replacement_between_parse_and_stamp():
         'printf \'%s\\n\' "$out"; exit $rc\n')
     shim.chmod(0o755)
 
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_PY"] = str(shim)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    env.pop("SUTANDO_INSTANCE_ID", None)
-    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
     p = subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"),
          "--role", "session", "--inbox", str(ws / "tasks")],

@@ -27,7 +27,7 @@ ESCALATE_AFTER_S = 180.0
 # Beat readings, as pool_beat classifies them.
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
-NOTHING, RECOVER, ESCALATE = "nothing", "recover", "escalate"
+NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 
 
 @dataclass(frozen=True)
@@ -37,11 +37,18 @@ class Observation:
     `session_alive` is None when the probe could not answer. Unknown is not
     death: the design requires the session to be *gone*, so an unanswered probe
     authorises nothing.
+
+    `watcher_beat` is the watcher's own beat; `watcher_held` says whether a
+    session-role watcher provably serves the inbox (None: could not be told). A
+    watcher that predates beat injection beats nothing yet holds the inbox, so
+    a stale beat alone is never a lost watcher.
     """
 
     beat: str
     session_alive: bool | None
     paused: bool = False
+    watcher_beat: str = UNKNOWN
+    watcher_held: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,11 @@ class WorkerEvidence:
     consecutive: int = 0
     recover_issued_at: float | None = None
     escalated: bool = False
+    # The watcher ladder runs its own clock: a lost watcher under a live session.
+    watcher_first_detected_at: float | None = None
+    watcher_consecutive: int = 0
+    rearm_issued_at: float | None = None
+    watcher_escalated: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,54 @@ def _is_death_evidence(obs: Observation) -> bool:
     return obs.beat in (STALE, ABSENT) and obs.session_alive is False
 
 
+def _is_watcher_loss(obs: Observation) -> bool:
+    """Session alive, watcher beat expired or missing, AND no session-role
+    watcher provably holds the inbox. A held inbox with a stale beat is a watcher
+    that beats nothing (launched before beat injection), not a lost one; an
+    unproven holder check (None) is not evidence either way."""
+    return (obs.session_alive is True and obs.watcher_beat in (STALE, ABSENT)
+            and obs.watcher_held is False)
+
+
+def _cleared_session(ev: WorkerEvidence) -> WorkerEvidence:
+    return replace(ev, first_detected_at=None, consecutive=0,
+                   recover_issued_at=None, escalated=False)
+
+
+def _cleared_watcher(ev: WorkerEvidence) -> WorkerEvidence:
+    return replace(ev, watcher_first_detected_at=None, watcher_consecutive=0,
+                   rearm_issued_at=None, watcher_escalated=False)
+
+
+def _watcher_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
+                  sustained_ticks: int, detect_after_s: float,
+                  escalate_after_s: float) -> tuple[WorkerEvidence, str]:
+    """The watcher ladder, same rungs and clocks as the session's: sustained loss
+    past the stale line asks the supervisor to re-arm once; still lost past the
+    owner's line escalates once. Runs only under a session that answered alive."""
+    if obs.watcher_beat == LIVE or obs.watcher_held is True:
+        return _cleared_watcher(ev), NOTHING
+    if not _is_watcher_loss(obs):
+        return ev, NOTHING
+    ev = replace(
+        ev,
+        watcher_consecutive=ev.watcher_consecutive + 1,
+        watcher_first_detected_at=(ev.watcher_first_detected_at
+                                   if ev.watcher_first_detected_at is not None else now),
+    )
+    elapsed = now - ev.watcher_first_detected_at
+    decision = NOTHING
+    if ev.watcher_consecutive >= sustained_ticks:
+        if ev.rearm_issued_at is None and elapsed >= detect_after_s:
+            decision = REARM_WATCHER
+            ev = replace(ev, rearm_issued_at=now)
+        elif (ev.rearm_issued_at is not None and not ev.watcher_escalated
+                and elapsed >= escalate_after_s):
+            decision = ESCALATE
+            ev = replace(ev, watcher_escalated=True)
+    return ev, decision
+
+
 def evaluate(state: SupervisionState, observations: dict[str, Observation], now: float,
              *, expected_period_s: float = SAMPLE_PERIOD_S,
              slack_s: float = WAKE_SLACK_S,
@@ -107,9 +167,13 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
 
         # A session that answers contradicts "the session is gone", so it clears a
         # death as surely as a beat does; an UNANSWERED probe does not, and holds.
+        # Under a live session the watcher ladder runs instead, on its own clock.
         if obs.beat == LIVE or obs.session_alive is True:
-            workers[worker_id] = WorkerEvidence()
-            decisions[worker_id] = NOTHING
+            ev, decision = _watcher_rung(
+                _cleared_session(ev), obs, now, sustained_ticks=sustained_ticks,
+                detect_after_s=detect_after_s, escalate_after_s=escalate_after_s)
+            workers[worker_id] = ev
+            decisions[worker_id] = decision
             continue
 
         if not _is_death_evidence(obs):
