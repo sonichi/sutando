@@ -20,6 +20,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 
@@ -42,12 +45,11 @@ def run(real_run_rc: int, probe_rc: int = 0):
                  f'exit {real_run_rc}\n')
     h.chmod(0o755)
     (ws / "tasks" / "task-demo.txt").write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
-    env.pop("SUTANDO_INSTANCE_ID", None)
     # stderr is kept: a FAIL with nothing to read cannot be diagnosed (#4645).
     errf = open(tmp / "watcher.err", "w+")
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
@@ -98,11 +100,10 @@ def restart_witness():
     h = tmp / "handler.sh"
     h.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && exit 0; done\nexit 4\n')
     h.chmod(0o755)
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
-    env.pop("SUTANDO_INSTANCE_ID", None)
 
     def start(errf):
         return subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
