@@ -591,7 +591,9 @@ class EventDispatchTests(FakeTmuxHarness):
         self.write_task("task-e.txt")
         env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
         for attempt in range(1, 6):
-            self.run_event("task-e.txt", env_extra=env, timeout=8)
+            res = self.run_event("task-e.txt", env_extra=env, timeout=8)
+            self.assertNotIn("No such file", res.stderr,
+                             f"attempt {attempt}: a missing block record is the normal first case")
             fired = self._notifications(calls, 0 if attempt < 3 else 1)
             self.assertEqual(fired, 0 if attempt < 3 else 1,
                              f"attempt {attempt}: escalate at the 3rd refusal, never again")

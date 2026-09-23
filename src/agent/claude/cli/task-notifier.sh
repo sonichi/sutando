@@ -81,9 +81,10 @@ log_notifier() {
 
 # A file, not a variable: the count must span --event invocations and the main loop's retries.
 # Keyed to (core incarnation, task): a record from another episode starts the count afresh.
+# Needs no lock: each instance's supervisor runs one notifier child at a time, so there is one writer.
 note_composer_block() {
   local filename="$1" incarnation="$2" n=0 rec_n rec_inc rec_file tmp op
-  if read -r rec_n rec_inc rec_file <"$COMPOSER_BLOCK_FILE" 2>/dev/null \
+  if read -r rec_n rec_inc rec_file 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
      && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
     case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
   fi
