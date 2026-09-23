@@ -63,6 +63,13 @@ and zero or more **workers**, each with its own tmux session, watcher and inbox
 what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
 the owner can see, and a reply is an ordinary result.
 
+**A worker's queue is its own inbox and nothing else.** `tasks/` holds every
+instance's payloads, the core's and every other worker's in flight; a task is yours
+only while its sentinel sits in `deliveries/<your id>/`. Never list `tasks/` to find
+work, and never answer a task file you found there: the result would be posted as a
+reply in a room bound to someone else. The watcher's `QUEUE: n pending after this`
+counts your inbox, and that count is the only queue you have.
+
 ```
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|core> --ask "..." [--wait 300]
