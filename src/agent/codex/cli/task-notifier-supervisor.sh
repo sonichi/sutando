@@ -70,8 +70,12 @@ session_role_verdict() {
   # advancing means nobody consumes those events, and this supervisor is the
   # only party that can notice. "unknown" (no cursor: a Monitor-hosted watcher
   # needs none) leaves the verdict alone.
+  # --holder: the question only applies to a watcher that writes the log a reader
+  # would tail. A Monitor-hosted one answers `unknown` and keeps its verdict.
   if [ "$out" = "yes" ] && [ -n "$TASKS_DIR" ]; then
-    case "$("$PY" "$WATCHER_IDENTITY" reader-fresh --inbox "$TASKS_DIR" --ready "$state" 2>/dev/null)" in
+    local holder
+    holder="$("$PY" "$WATCHER_IDENTITY" inbox-holders --inbox "$TASKS_DIR" 2>/dev/null | awk '$2=="session"{print $1; exit}')"
+    case "$("$PY" "$WATCHER_IDENTITY" reader-fresh --inbox "$TASKS_DIR" --ready "$state" ${holder:+--holder "$holder"} 2>/dev/null)" in
       no) echo "no"; return 0 ;;
     esac
   fi

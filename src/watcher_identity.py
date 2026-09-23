@@ -279,12 +279,15 @@ def sentinel_names_pid(pid: Optional[int], state_dir: Optional[str]) -> bool:
 
 
 def reader_is_fresh(inbox: Optional[str], state_dir: Optional[str],
-                    max_age: Optional[float] = None, now=None) -> Optional[bool]:
+                    max_age: Optional[float] = None, now=None,
+                    holder_pid=None) -> Optional[bool]:
     """Is SOMETHING reading this inbox's detached watcher log right now?
 
-    True/False when the cursor file answers, None when there is no cursor at all
-    (no detached reader was ever armed here: a Monitor-hosted watcher's coverage
-    does not depend on one, so a caller must not read None as "nobody reads").
+    True/False when the cursor file answers, None when the question does not
+    apply: no cursor was ever written, or `holder_pid` names a watcher whose
+    output is NOT that log. A Monitor-hosted watcher announces through its
+    Monitor and needs no reader, so a cursor left behind by an earlier detached
+    period must never make a live legacy watcher read as uncovered.
 
     A detached watcher outlives its reader, so a live watcher alone is not
     coverage: the reader touches its cursor on every line and every quiet poll,
@@ -299,8 +302,16 @@ def reader_is_fresh(inbox: Optional[str], state_dir: Optional[str],
             max_age = 90.0
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from util_paths import watcher_log_cursor_path
-        cursor = watcher_log_cursor_path(Path(state_dir).parent, inbox)
+        from util_paths import watcher_log_cursor_path, watcher_log_path
+        workspace = Path(state_dir).parent
+        cursor = watcher_log_cursor_path(workspace, inbox)
+        if holder_pid is not None:
+            sink = output_sink(holder_pid)
+            if sink.kind != "file":
+                return None
+            log = watcher_log_path(workspace, inbox)
+            if os.path.realpath(sink.target or "") != os.path.realpath(log):
+                return None
         mtime = cursor.stat().st_mtime
     except (FileNotFoundError, NotADirectoryError):
         return None
@@ -619,18 +630,21 @@ def main(argv=None) -> int:
     if args and args[0] == "reader-fresh":
         rest = args[1:]
         inbox = state = None
+        holder = None
         i = 0
         while i < len(rest):
             if rest[i] == "--inbox" and i + 1 < len(rest):
                 inbox = rest[i + 1]; i += 2
             elif rest[i] == "--ready" and i + 1 < len(rest):
                 state = rest[i + 1]; i += 2
+            elif rest[i] == "--holder" and i + 1 < len(rest):
+                holder = as_pid(rest[i + 1]); i += 2
             else:
                 i = len(rest) + 1
         if not inbox or not state:
-            print("usage: watcher_identity.py reader-fresh --inbox VALUE --ready STATE_DIR", file=sys.stderr)
+            print("usage: watcher_identity.py reader-fresh --inbox VALUE --ready STATE_DIR [--holder PID]", file=sys.stderr)
             return 64
-        v = reader_is_fresh(inbox, state)
+        v = reader_is_fresh(inbox, state, holder_pid=holder)
         print("unknown" if v is None else ("yes" if v else "no"))
         return 0
     if args and args[0] == "inbox-holders":

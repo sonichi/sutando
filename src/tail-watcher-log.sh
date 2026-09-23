@@ -47,23 +47,50 @@ CURSOR="$("$PY" "$__REPO_ROOT/src/util_paths.py" watcher-log-cursor "$WORKSPACE"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$CURSOR")" || exit 1
 [ -e "$LOG" ] || : > "$LOG"
 
-N="$(cat "$CURSOR" 2>/dev/null)"
+# "<lines-consumed> <inode> <bytes>". Rotation comes in two shapes and a line
+# count alone reads both as "nothing new": a REPLACED file (new inode, possibly
+# the same length) and a TRUNCATED one (same inode, shorter). Track both.
+# `read` returns 1 at EOF even after setting the variables, which is every time
+# for a file with no trailing newline: the values are what matter, not its rc.
+N=""; INO_SEEN=""; SIZE_SEEN=""
+read -r N INO_SEEN SIZE_SEEN < "$CURSOR" 2>/dev/null || true
 case "$N" in ''|*[!0-9]*) N=0 ;; esac
-# A cursor past the end means the log was rotated or replaced under us: start
-# over rather than skip whatever the new file already holds.
-LINES="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"
-case "$LINES" in ''|*[!0-9]*) LINES=0 ;; esac
-[ "$N" -gt "$LINES" ] && N=0
+INO_NOW="$(ls -di "$LOG" 2>/dev/null | awk '{print $1}')"
+case "$INO_NOW" in ''|*[!0-9]*) INO_NOW=0 ;; esac
+log_size() { wc -c < "$LOG" 2>/dev/null | tr -d ' '; }
+SIZE_NOW="$(log_size)"
+case "$SIZE_NOW" in ''|*[!0-9]*) SIZE_NOW=0 ;; esac
+case "$SIZE_SEEN" in ''|*[!0-9]*) SIZE_SEEN="" ;; esac
+if [ -n "$INO_SEEN" ] && [ "$INO_SEEN" != "$INO_NOW" ]; then
+  N=0                                    # a different file
+elif [ -n "$SIZE_SEEN" ] && [ "$SIZE_NOW" -lt "$SIZE_SEEN" ]; then
+  N=0                                    # same file, truncated under us
+else
+  LINES="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"
+  case "$LINES" in ''|*[!0-9]*) LINES=0 ;; esac
+  [ "$N" -gt "$LINES" ] && N=0
+fi
 
-printf '%s' "$N" > "$CURSOR"
-# Touched on every line AND on every quiet poll, so "the reader is alive" and
-# "the reader has seen everything" are one fact with one mtime.
-( while :; do sleep "${SUTANDO_TAIL_HEARTBEAT_SEC:-20}"; touch "$CURSOR" 2>/dev/null || exit 0; done ) &
-HEARTBEAT=$!
+write_cursor() { printf '%s %s %s\n' "$1" "$INO_NOW" "$(log_size)" > "$CURSOR"; }
+write_cursor "$N"
 # `tail -F` never ends on its own: it must be OWNED here, or every re-arm leaves
 # one behind holding the log. A pipeline would hide its pid in a subshell.
 exec 3< <(tail -n +$((N + 1)) -F "$LOG" 2>/dev/null)
 TAILPID=$!
+# The heartbeat says "a reader is alive", so it must DIE with the reader — a
+# SIGKILL runs no trap, and an orphaned heartbeat would keep the cursor fresh
+# forever beside a reader that is gone. It watches the reader's own pid and
+# takes the tail with it.
+READER=$$
+( while :; do
+    sleep "${SUTANDO_TAIL_HEARTBEAT_SEC:-20}"
+    if ! kill -0 "$READER" 2>/dev/null; then
+      kill -TERM "$TAILPID" 2>/dev/null
+      exit 0
+    fi
+    touch "$CURSOR" 2>/dev/null || exit 0
+  done ) &
+HEARTBEAT=$!
 cleanup() {
   kill -TERM "$HEARTBEAT" 2>/dev/null || true
   kill -TERM "$TAILPID" 2>/dev/null || true
@@ -75,5 +102,5 @@ trap 'cleanup; exit 0' HUP INT TERM
 while IFS= read -r line <&3; do
   printf '%s\n' "$line"
   N=$((N + 1))
-  printf '%s' "$N" > "$CURSOR"
+  write_cursor "$N"
 done
