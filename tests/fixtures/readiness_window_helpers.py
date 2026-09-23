@@ -6,21 +6,25 @@ original combined file; nothing here changes what any scenario does.
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clean_watcher_env import clean_env  # noqa: E402
 
 
 def watcher_env(tmp, ws, b, extra=None):
-    env = dict(os.environ)
+    # clean_env(), not dict(os.environ): a live pool worker's real SUTANDO_*
+    # state (SUTANDO_INBOX_RESOLVER, ...) otherwise leaks into the watcher
+    # subprocess under test. See #4649.
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "1"
-    env.pop("SUTANDO_INSTANCE_ID", None)
-    env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
     env.update(extra or {})
     return env
 

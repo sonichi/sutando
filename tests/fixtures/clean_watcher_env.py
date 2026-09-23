@@ -11,7 +11,7 @@ shell rather than on the code under test. See issue #4649.
 import os
 
 _DROP_PREFIXES = ("SUTANDO_", "TMUX", "GIT_")
-_DROP_EXACT = {"AGENT_ID", "AG2_AGENT_NAME"}
+_DROP_EXACT = {"AGENT_ID", "AG2_AGENT_NAME", "CLAUDECODE"}
 
 
 def clean_env():
