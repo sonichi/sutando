@@ -454,5 +454,48 @@ class TestThroughTheProcessInspectionBoundary(Base):
         self.assertEqual(out.getvalue().splitlines()[0], "unknown")
 
 
+class TestATaggedWatcherIsOwnedNotDisowned(Base):
+    """`--role VALUE` is a bare token, so a scan for the first bare operand
+    reads a tagged watcher's inbox as the ROLE. Every watcher is tagged since
+    the script began refusing to start untagged, so that scan disowns every
+    live watcher and answers `start` -- a second watcher on an inbox that has
+    one, and each delivery processed twice."""
+
+    def _target(self, vec):
+        return wb._target_from_argv("", 1, lambda _pid: vec)
+
+    def test_the_inbox_tag_is_the_inbox_not_the_role_value(self):
+        vec = ["bash", "/r/src/watch-tasks-stream.sh",
+               "--role", "session", "--inbox", self.inbox, self.inbox]
+        self.assertEqual(self._target(vec), self.inbox)
+
+    def test_a_tag_only_invocation_still_names_its_inbox(self):
+        """The inbox may reach the watcher by env, leaving no positional."""
+        vec = ["bash", "/r/src/watch-tasks-stream.sh",
+               "--role", "standby", "--inbox", self.inbox]
+        self.assertEqual(self._target(vec), self.inbox)
+
+    def test_an_untagged_watcher_still_names_its_positional(self):
+        vec = ["bash", "/r/src/watch-tasks-stream.sh", self.inbox]
+        self.assertEqual(self._target(vec), self.inbox)
+
+    def test_the_role_value_is_never_mistaken_for_an_inbox(self):
+        """The control: with the tag removed the role value is the only bare
+        token left, and it must not be returned as an inbox."""
+        vec = ["bash", "/r/src/watch-tasks-stream.sh", "--role", "session"]
+        self.assertEqual(self._target(vec), "")
+
+    def test_the_gate_skips_for_its_own_tagged_watcher(self):
+        """End to end, through `decide`: the sentinel's live pid is a tagged
+        watcher of THIS inbox, so the answer is `skip`, never `start`."""
+        vec = ["bash", "/r/src/watch-tasks-stream.sh",
+               "--role", "session", "--inbox", self.inbox, self.inbox]
+        self.sentinel(WORKER).write_text("4242\n")
+        d, why = wb.decide(instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+                           alive=lambda p: True,
+                           watcher_target=lambda pid: self._target(vec))
+        self.assertEqual(d, "skip", why)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
