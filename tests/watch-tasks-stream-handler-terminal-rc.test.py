@@ -48,9 +48,11 @@ def run(real_run_rc: int, probe_rc: int = 0):
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     env.pop("SUTANDO_INSTANCE_ID", None)
+    # stderr is kept: a FAIL with nothing to read cannot be diagnosed (#4645).
+    errf = open(tmp / "watcher.err", "w+")
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
                          cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+                         stderr=errf, text=True, start_new_session=True)
     out, t0 = [], time.time()
     try:
         os.set_blocking(p.stdout.fileno(), False)
@@ -70,6 +72,7 @@ def run(real_run_rc: int, probe_rc: int = 0):
         except Exception:
             pass
         p.wait(timeout=5)
+        errf.seek(0); LAST_STDERR[0] = errf.read(); errf.close()
     emitted = any("TASK_FILE" in c for c in out)
     published = sorted(q.name for q in (ws / "results").glob("*.txt"))
     return emitted, published
@@ -101,10 +104,10 @@ def restart_witness():
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     env.pop("SUTANDO_INSTANCE_ID", None)
 
-    def start():
+    def start(errf):
         return subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
                                 cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+                                stderr=errf, text=True, start_new_session=True)
 
     def stop(p):
         try: os.killpg(os.getpgid(p.pid), 15)
@@ -112,15 +115,19 @@ def restart_witness():
         try: p.wait(timeout=10)
         except Exception: p.kill()
 
-    first = start()
+    first_errf = open(tmp / "watcher-first.err", "w+")
+    first = start(first_errf)
     time.sleep(2.0)                      # let the first generation come up and settle
     first_pid = first.pid
     stop(first)                          # THE RESTART BOUNDARY
+    first_errf.close()
 
     # Written while NO watcher runs, so the restarted process admits it on its own
     # startup sweep; created later, the stub fswatch never fires and nothing runs.
     (ws / "tasks" / "task-restart.txt").write_text("id: task-restart\naccess_tier: owner\ntask: probe\n")
-    second = start()
+    # stderr is kept: a FAIL with nothing to read cannot be diagnosed (#4645).
+    second_errf = open(tmp / "watcher-second.err", "w+")
+    second = start(second_errf)
     out, t0 = [], time.time()
     published = []
     try:
@@ -137,6 +144,7 @@ def restart_witness():
                 break
     finally:
         stop(second)
+        second_errf.seek(0); LAST_STDERR[0] = second_errf.read(); second_errf.close()
     emitted = any("TASK_FILE" in c for c in out)
     body = ""
     if published:
@@ -144,10 +152,16 @@ def restart_witness():
     return first_pid, second.pid, emitted, published, body
 
 
+LAST_STDERR = [""]
+
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
+        if LAST_STDERR[0].strip():
+            print("  watcher stderr:")
+            for line in LAST_STDERR[0].strip().splitlines()[-20:]:
+                print("    " + line)
 
 
 emitted, published = run(real_run_rc=4)
