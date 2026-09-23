@@ -43,14 +43,27 @@ def _publish(path: Path, payload: dict) -> None:
         raise
 
 
+class RecordUnreadable(OSError):
+    """The record exists but could not be read. Distinct from absent, because
+    the two mean opposite things about what the user wants."""
+
+
 def read_entries(path: Path) -> list[dict]:
-    """The record's entries, or none. A file that is missing, empty, truncated
-    or not of this schema reads as empty — the daemon then reconciles toward
-    nothing rather than acting on a shape it does not understand."""
+    """The record's entries, or none.
+
+    Absent, empty, truncated or of another schema reads as empty: there is
+    nothing to act on. A record that EXISTS and cannot be read raises instead
+    — read as empty it says "the user wants nothing", and the daemon would
+    evict the agent from every surface over a transient permission blip.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return []
+    except ValueError:
+        return []
+    except OSError as exc:
+        raise RecordUnreadable(f"{path}: {exc}") from exc
     if not isinstance(data, dict) or data.get("v") != SCHEMA:
         return []
     entries = data.get("entries")

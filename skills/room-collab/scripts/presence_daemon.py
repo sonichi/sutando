@@ -186,7 +186,13 @@ class Daemon:
 
     async def reconcile(self, now: float) -> None:
         self.resume()
-        desired = store.read_entries(desired_path(self.ws))
+        try:
+            desired = store.read_entries(desired_path(self.ws))
+        except store.RecordUnreadable as exc:
+            # Keep holding what we hold. An unreadable record is not a request
+            # to leave, and evicting on one drops the agent everywhere.
+            print(f"presence: desired record unreadable, holding: {exc}", flush=True)
+            return
         want = {policy.key_of(e) for e in desired}
         # A surface nobody asks for any more has nothing left to remember.
         for key in [k for k in self.retired if k not in want]:

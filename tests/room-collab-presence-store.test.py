@@ -82,6 +82,27 @@ def main() -> int:
     check("no temp file is left behind",
           [f.name for f in TMP.iterdir() if f.name.startswith(".big.json.")] == [])
 
+    print("── unreadable is not empty ──")
+    # ⚠ Found by running the daemon for real: an unreadable record read as
+    # empty, and the agent was evicted with reason `left` over a TCC blip.
+    import stat as _stat
+    locked = TMP / "locked.json"
+    store.write_entries(locked, [{"room": "!a", "kind": "markdown"}])
+    locked.chmod(0)
+    try:
+        try:
+            store.read_entries(locked)
+            unreadable_raised = False
+        except store.RecordUnreadable:
+            unreadable_raised = True
+        except OSError:
+            unreadable_raised = True
+    finally:
+        locked.chmod(_stat.S_IRUSR | _stat.S_IWUSR)
+    check("a record that exists but cannot be read RAISES", unreadable_raised)
+    check("...while a record that is simply absent is empty",
+          store.read_entries(TMP / "never-written.json") == [])
+
     print("── a failed publish leaves nothing behind ──")
     # The temp file is the whole point of publishing atomically; leaking one on
     # failure turns a write error into a directory that slowly fills.

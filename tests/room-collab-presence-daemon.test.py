@@ -315,6 +315,25 @@ def main() -> int:
     check("the newest summons win the slots",
           sorted(k[0] for k in d2.held) == ["!r2", "!r3"])
 
+    print("── an unreadable desired record must not evict anyone ──")
+    ws8 = Path(tempfile.mkdtemp(prefix="presence-unreadable-"))
+    store.write_entries(dm.desired_path(ws8), [entry("!hold")])
+    d7 = dm.Daemon(ws8, "u", "t", clock=lambda: NOW, max_backoff=0.01)
+    asyncio.run(d7.reconcile(NOW))
+    check("the surface is held to begin with", ("!hold", "markdown") in d7.held)
+    import stat as _stat
+    dm.desired_path(ws8).chmod(0)
+    try:
+        asyncio.run(d7.reconcile(NOW + 1))
+        # The live run evicted here, with reason `left`, over a permission blip.
+        check("an unreadable record leaves the surface held",
+              ("!hold", "markdown") in d7.held)
+    finally:
+        dm.desired_path(ws8).chmod(_stat.S_IRUSR | _stat.S_IWUSR)
+    asyncio.run(d7.reconcile(NOW + 2))
+    check("...and it is still held once the record is readable again",
+          ("!hold", "markdown") in d7.held)
+
     print("── the loop itself: it keeps going, and a bad pass does not end it ──")
     ws7 = Path(tempfile.mkdtemp(prefix="presence-run-"))
     store.write_entries(dm.desired_path(ws7), [entry("!loop")])
