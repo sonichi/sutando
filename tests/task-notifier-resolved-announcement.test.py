@@ -62,7 +62,7 @@ class AnnouncedEntry(_Workspace):
                          ("task-abc.txt", self.inbox / "task-abc.txt"))
 
     def test_an_absolute_payload_is_accepted_only_from_a_resolver_backed_watcher(self):
-        self.assertEqual(td.announced_entry(self.inbox, str(self.payload), resolver_backed=True),
+        self.assertEqual(td.announced_entry(self.inbox, str(self.payload), payload_dir=self.ws / "tasks"),
                          ("task-abc.txt", self.payload))
         self.assertIsNone(td.announced_entry(self.inbox, str(self.payload)))
 
@@ -74,17 +74,20 @@ class AnnouncedEntry(_Workspace):
         for bad in (str(elsewhere / "task-abc.txt"),            # another workspace's tasks/
                     str(self.ws / "deliveries" / "w1" / "task-abc.txt"),  # the sentinel itself
                     "/etc/hosts"):
-            self.assertIsNone(td.announced_entry(self.inbox, bad, resolver_backed=True), bad)
+            self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
     def test_traversal_relative_and_missing_payloads_are_refused(self):
         for bad in ("", "../task-abc.txt", "tasks/task-abc.txt", str(self.ws / "tasks" / "task-none.txt"),
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
-            self.assertIsNone(td.announced_entry(self.inbox, bad, resolver_backed=True), bad)
+            self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
     def test_the_cli_prints_key_tab_payload_and_refuses_with_1(self):
         r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
-                            str(self.payload), "--resolved"], capture_output=True, text=True)
+                            str(self.payload), "--resolved", str(self.ws / "tasks")], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (0, f"task-abc.txt\t{self.payload}\n"))
+        r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
+                            str(self.payload), "--resolved"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
         r = subprocess.run([sys.executable, str(DISPATCH), "announced-entry", str(self.inbox),
                             str(self.payload)], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (1, ""))
@@ -118,7 +121,8 @@ class ShippedEnqueue(_Workspace):
             fn,
             f'enqueue_announced_task "{announced}"',
         ])
-        env = {**os.environ, "TASKS_DIR": str(inbox), "DELIVERIES_DIR": str(self.ws / "deliveries"),
+        env = {**os.environ, "TASKS_DIR": str(inbox), "WORKSPACE_DIR": str(self.ws),
+               "DELIVERIES_DIR": str(self.ws / "deliveries"),
                "queue_dir": str(self.queue), "PAYLOAD_DIR": str(self.payloads), "LOG": str(self.ws / "log"),
                "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(dispatch)}
         for k in ("SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_KIND"):

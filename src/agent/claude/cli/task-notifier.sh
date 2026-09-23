@@ -469,11 +469,13 @@ filename_is_claimed() {
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local announced="$1" entry filename payload tier rc=0
+  local announced="$1" entry filename payload tier rc=0 resolved=()
   # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
-  # payload path a resolver-backed watcher announces. A refusal (rc 1) types nothing
-  # quietly; any other failure is a broken reader and is logged, never a silent drop.
-  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${SUTANDO_INBOX_RESOLVER:+--resolved} 2>/dev/null)" || rc=$?
+  # payload path a resolver-backed watcher announces, which must sit in the workspace's
+  # task store. A refusal (rc 1) types nothing quietly; any other failure is a broken
+  # reader and is logged, never a silent drop.
+  [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] || resolved=(--resolved "$WORKSPACE_DIR/tasks")
+  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${resolved[@]+"${resolved[@]}"} 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
     return 0
