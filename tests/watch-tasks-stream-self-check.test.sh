@@ -49,11 +49,21 @@ run_watcher_fg() {  # same, in the foreground: returns the watcher's exit code
       bash "$WATCHER" "$@" > /dev/null 2> "$err"
 }
 run_watcher_fg_out() {  # same as run_watcher_fg, stdout kept: run_watcher_fg_out <ws> <errfile> <outfile> <args...>
-  local ws="$1" err="$2" out="$3"; shift 3
+  # Bounded: a watcher expected to exit that is still up after 20 s is killed and
+  # reads as rc 124, so a regression fails the case instead of hanging the suite.
+  local ws="$1" err="$2" out="$3" p i=0; shift 3
   env -u SUTANDO_INSTANCE_ID -u AGENT_ID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE \
       SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" \
       python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-      bash "$WATCHER" "$@" > "$out" 2> "$err"
+      bash "$WATCHER" "$@" > "$out" 2> "$err" &
+  p=$!
+  while kill -0 "$p" 2>/dev/null && [ "$i" -lt 40 ]; do sleep 0.5; i=$((i + 1)); done
+  if kill -0 "$p" 2>/dev/null; then
+    kill -TERM -- "-$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null
+    echo "run_watcher_fg_out: still running after 20 s; killed" >> "$err"
+    return 124
+  fi
+  wait "$p"
 }
 alive() { kill -0 "$1" 2>/dev/null; }
 
