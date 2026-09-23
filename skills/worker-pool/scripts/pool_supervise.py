@@ -37,6 +37,9 @@ pb = _sibling("pool_beat")
 pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
 prr = _sibling("pool_routing_receipt")
+pd = _sibling("pool_delivery")
+
+_SRC = _HERE.parents[2] / "src"
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -117,12 +120,47 @@ def observe(workspace, now: float, *, worker_ids=None,
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
     for wid, row in rows.items():
+        session_alive = probe_session(workspace, wid, runner=runner)
+        watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
+        # The process table is read only when the beat cannot answer: a live
+        # beat proves the watcher, and a dead session has no watcher ladder.
+        held = None
+        if session_alive is True and watcher_beat != pb.LIVE:
+            held = session_watcher_holds(workspace, wid, runner=runner)
         obs[wid] = ps.Observation(
             beat=pb.classify(pb.beat_path(workspace, "worker", wid), now),
-            session_alive=probe_session(workspace, wid, runner=runner),
+            session_alive=session_alive,
             paused=is_paused(workspace, wid),
+            watcher_beat=watcher_beat,
+            watcher_held=held,
         )
     return obs
+
+
+def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
+    """Does a session-role watcher provably serve this worker's inbox?
+
+    True: one holds it. False: the table was read, nothing undecidable was seen,
+    and no session-role holder exists. None: unobservable, or undecided lines
+    remain, because refusing evidence is cheaper than a re-arm on a watcher that
+    merely could not be read.
+    """
+    inbox = pd.deliveries_dir(workspace, worker_id)
+    try:
+        done = runner([sys.executable, str(_SRC / "watcher_identity.py"),
+                       "inbox-holders", "--inbox", str(inbox)],
+                      capture_output=True, text=True, timeout=15)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    roles = [line.split()[1] for line in (done.stdout or "").splitlines()
+             if len(line.split()) == 2]
+    if "session" in roles:
+        return True
+    if "undecided=" in (done.stderr or ""):
+        return None
+    return False
 
 
 def routing_status(workspace) -> dict:
@@ -179,6 +217,10 @@ def load_state(workspace) -> ps.SupervisionState:
                 consecutive=int(ev.get("consecutive") or 0),
                 recover_issued_at=ev.get("recover_issued_at"),
                 escalated=bool(ev.get("escalated")),
+                watcher_first_detected_at=ev.get("watcher_first_detected_at"),
+                watcher_consecutive=int(ev.get("watcher_consecutive") or 0),
+                rearm_issued_at=ev.get("rearm_issued_at"),
+                watcher_escalated=bool(ev.get("watcher_escalated")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -194,7 +236,11 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
         "workers": {w: {"first_detected_at": e.first_detected_at,
                         "consecutive": e.consecutive,
                         "recover_issued_at": e.recover_issued_at,
-                        "escalated": e.escalated}
+                        "escalated": e.escalated,
+                        "watcher_first_detected_at": e.watcher_first_detected_at,
+                        "watcher_consecutive": e.watcher_consecutive,
+                        "rearm_issued_at": e.rearm_issued_at,
+                        "watcher_escalated": e.watcher_escalated}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -226,7 +272,8 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
-                                 "paused": o.paused} for w, o in obs.items()},
+                                 "paused": o.paused, "watcher_beat": o.watcher_beat,
+                                 "watcher_held": o.watcher_held} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
 
 
@@ -253,8 +300,9 @@ def main(argv=None) -> int:
     else:
         for wid, decision in sorted(out["decisions"].items()):
             o = out["observations"][wid]
-            print(f"{wid[:8]}  {decision:8}  beat={o['beat']:7} "
-                  f"session={o['session_alive']!s:5} paused={o['paused']}")
+            print(f"{wid[:8]}  {decision:13}  beat={o['beat']:7} "
+                  f"session={o['session_alive']!s:5} paused={o['paused']!s:5} "
+                  f"watcher={o['watcher_beat']:7} held={o['watcher_held']}")
         for wid in out["not_supervised"]:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
         if out["resumed"]:

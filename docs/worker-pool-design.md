@@ -260,6 +260,17 @@ marks a worker `abandoned` is the same process that recovers it.
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
 is why a release is not authorised by staleness: it keys on `abandoned`.
 
+**A live session with no watcher is the other rung.** The watcher has its own
+beat (`state/watchers/<id>.alive`). Under a session that answered alive, a
+watcher beat that is stale or absent AND an inbox no session-role watcher holds
+(the process table, read only when the beat cannot vouch) is a lost watcher:
+the same three-tick sustain and 90 s line issue one `rearm_watcher`, which
+ensures the inbox's hosting-mode supervisor, whose standby arms once nobody
+serves the inbox; still lost at 3 minutes escalates to the owner like a dead
+session. A stale beat whose inbox is held is a watcher that beats nothing (one
+launched before beat injection), never a lost one; a holder check that could
+not be told is not evidence either way.
+
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the

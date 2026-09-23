@@ -145,14 +145,21 @@ def ensure_supervisors(workspace, repo, observations: dict, *, runner=None) -> d
 
 
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
-    """Act on a tick's decisions. Only `recover` acts; `escalate` is returned
-    untouched, because asking the owner is the core's, not a timer's."""
+    """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
+    ensures the inbox's supervisor, whose standby arms once no session watcher
+    holds the inbox. `escalate` is returned untouched, because asking the owner
+    is the core's, not a timer's."""
     done = {}
+    rearms = {}
     for worker_id, decision in decisions.items():
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
+        elif decision == ps.REARM_WATCHER:
+            rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
+                                                  runner=runner)
     return {"recoveries": done,
+            "rearms": rearms,
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
@@ -174,7 +181,7 @@ def main(argv=None) -> int:
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    acted = ({"recoveries": {}, "escalations": [], "dry_run": True} if a.dry_run
+    acted = ({"recoveries": {}, "rearms": {}, "escalations": [], "dry_run": True} if a.dry_run
              else apply(a.workspace, a.repo, tick["decisions"]))
     if not a.dry_run:
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
