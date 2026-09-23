@@ -315,6 +315,51 @@ def main() -> int:
     check("the newest summons win the slots",
           sorted(k[0] for k in d2.held) == ["!r2", "!r3"])
 
+    print("── the loop itself: it keeps going, and a bad pass does not end it ──")
+    ws7 = Path(tempfile.mkdtemp(prefix="presence-run-"))
+    store.write_entries(dm.desired_path(ws7), [entry("!loop")])
+    d6 = dm.Daemon(ws7, "u", "t", clock=lambda: NOW, max_backoff=0.01)
+    passes = {"n": 0}
+    real = d6.reconcile
+
+    async def counted(now):
+        passes["n"] += 1
+        # The second pass raises: a reconciler that dies on one bad pass leaves
+        # the agent absent everywhere until someone notices.
+        if passes["n"] == 2:
+            raise RuntimeError("one bad pass")
+        await real(now)
+
+    d6.reconcile = counted
+    dm.RECONCILE_SECONDS, keep_interval = 0.01, dm.RECONCILE_SECONDS
+
+    async def run_briefly():
+        task = asyncio.ensure_future(d6.run())
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if passes["n"] >= 3:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(run_briefly())
+    finally:
+        dm.RECONCILE_SECONDS = keep_interval
+    check("run() reconciles repeatedly rather than once", passes["n"] >= 3, str(passes))
+    check("...and survives a pass that raises", ("!loop", "markdown") in d6.held)
+
+    print("── the entry point's own arguments ──")
+    entry = REPO / "skills" / "room-collab" / "scripts" / "presence_daemon.py"
+    rc_help = subprocess.run([*pybase, str(entry), "--help"],
+                             capture_output=True, text=True, env=env, timeout=120)
+    check("--help lists the knobs the owner set", rc_help.returncode == 0
+          and "--idle-seconds" in rc_help.stdout and "--cap" in rc_help.stdout,
+          rc_help.stdout[:120])
+
     print("── the CLI's json form, and the daemon's own arguments ──")
     ws6 = Path(tempfile.mkdtemp(prefix="presence-json-"))
     rj = subprocess.run([*pybase, str(cli), "--workspace", str(ws6), "--json", "stay", "!j:x"],
