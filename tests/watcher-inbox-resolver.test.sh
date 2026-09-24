@@ -120,7 +120,7 @@ run_sweep() {
   set -m
   SUTANDO_INBOX_RESOLVER="$resolver" SUTANDO_WORKSPACE_DIR="$WS" \
     SUTANDO_RESULTS_DIR="$WS/results" SUTANDO_INSTANCE=w-test \
-    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
+    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" --role standby --inbox "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
   pid=$!
   set +m
   for i in $(seq 1 40); do grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && break; sleep 0.25; done

@@ -3,19 +3,20 @@ name: Coverage Comment
 # Posts the Coverage Gate result as a sticky PR comment (created once,
 # updated on every subsequent run — no comment spam).
 #
-# Two-stage pattern: the gate itself runs on `pull_request`, where fork PRs
-# get a read-only GITHUB_TOKEN that cannot comment. This workflow fires on
-# workflow_run in the BASE-repo context with write permission, downloads the
-# summary artifact the gate uploaded, and posts it. It never checks out or
-# executes PR code — it only reads two small artifact files — which is what
-# keeps the write token safe (the reason pull_request_target is avoided).
+# Two-stage pattern: the gate itself (the `coverage-gate` job of the CI
+# workflow) runs on `pull_request`, where fork PRs get a read-only GITHUB_TOKEN
+# that cannot comment. This workflow fires on workflow_run in the BASE-repo
+# context with write permission, downloads the summary artifact the gate
+# uploaded, and posts it. It never checks out or executes PR code — it only
+# reads two small artifact files — which is what keeps the write token safe
+# (the reason pull_request_target is avoided).
 #
 # NOTE: workflow_run workflows execute from the default branch's copy of
 # this file, so the comment step activates once this file lands on main.
 
 on:
   workflow_run:
-    workflows: ["Coverage Gate"]
+    workflows: ["CI"]
     types: [completed]
 
 permissions:

@@ -53,6 +53,9 @@ resolve_inbox_entry() {
 	esac
 	if [ "$rc" -ne 0 ] || [ -z "$resolved" ] || [ "$not_absolute" -eq 1 ] || [ ! -f "$resolved" ]; then
 		echo "watch-tasks-stream: resolver $SUTANDO_INBOX_RESOLVER did not name an existing ABSOLUTE file for $entry (rc=$rc, first line: ${resolved:-<empty>}); not dispatching it" >&2
+		# rc 3 is the resolver's typed verdict (no payload behind the sentinel);
+		# everything else is a failure of this run and says nothing about the entry.
+		[ "$rc" -eq 3 ] && [ -z "$resolved" ] && return 4
 		return 3
 	fi
 	printf '%s\n' "$resolved"

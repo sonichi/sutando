@@ -77,6 +77,7 @@ from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # n
 import process_pins  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
@@ -1265,6 +1266,10 @@ def check_session_cron_registration(
 
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry_owner(entry) != CRON_CORE:
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
             return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
@@ -6820,16 +6825,18 @@ def check_gateway_bridge() -> "dict | None":
     if not configured:
         return None
     try:
-        gw = subprocess.run(
-            # remote-relay-bridge.py is a shipped compat stub running the same
-            # client, so an instance under the old name is a real duplicate.
-            ["/usr/bin/pgrep", "-f", r"remote-(gateway|relay)-bridge\.py$"],
-            capture_output=True, text=True,
-        )
-        pids = [p for p in gw.stdout.strip().split("\n") if p] if gw.returncode == 0 else []
+        # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
+        # apart. The relay name is a compat stub, so it is a real duplicate.
+        pids, probe_ok = probe_pids(r"remote-(gateway|relay)-bridge\.py$")
     except Exception:
-        pids = []
+        pids, probe_ok = [], False
     if not pids:
+        if not probe_ok:
+            return {
+                "name": "gateway-bridge",
+                "status": "warn",
+                "detail": "process probe failed — gateway bridge state unknown",
+            }
         return {
             "name": "gateway-bridge",
             "status": "warn",
@@ -8725,12 +8732,26 @@ def check_proactive_quarantine() -> dict:
                 "detail": "no quarantined proactive bodies (undelivered/ absent)"}
     now = time.time()
     try:
-        entries = list(quarantine.iterdir())
+        top = list(quarantine.iterdir())
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
     kept: list[tuple[str, int, int]] = []
     unreadable = 0
+    # Explicit walk, not `rglob`: rglob swallows an unreadable subdirectory,
+    # and a dropped body is the one failure this probe exists to prevent.
+    entries: list[Path] = []
+    pending = list(top)
+    while pending:
+        item = pending.pop()
+        try:
+            if item.is_dir():
+                pending.extend(item.iterdir())
+                continue
+        except OSError:
+            unreadable += 1
+            continue
+        entries.append(item)
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
         # unreadable entry must not decide the answer for the directory.
@@ -8755,7 +8776,9 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age), int(arrived)))
+        # Relative to the quarantine root: two subdirectories can hold the
+        # same filename, and this label is what a reader opens.
+        kept.append((str(path.relative_to(quarantine)), int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:
@@ -9221,7 +9244,9 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+                          "restart via Monitor: bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set)"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
@@ -9397,6 +9422,20 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # A watcher holds its inbox whether or not anything consumes what it
+    # announces; the reader is the only difference visible from outside.
+    unread = []
+    for _p in sorted(live):
+        _sink = watcher_identity.output_sink(_p)
+        if _sink.observed and _sink.read is False:
+            unread.append(f"{_p} -> {_sink.kind} {_sink.target}".rstrip())
+    if unread:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(unread)} announce(s) where nothing is reading: "
+                          f"{'; '.join(unread)}. That inbox is held but not served — "
+                          "a session start will exit naming the holder, so clearing it "
+                          "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
         return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
     return {"name": name, "status": "ok",
@@ -9590,6 +9629,61 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
                           "each with a live counter (measured zero)"}
     return {"name": name, "status": "ok",
             "detail": "no migrated outbox roots — dual-read window not active"}
+
+
+
+def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
+    """A PARKED outbound item is a reply the owner never received, and nothing
+    retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
+    that nothing in production could lift. Until now it was visible only to
+    someone who ran the CLI by hand."""
+    name = "outbox-parked"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
+    if not roots:
+        return {"name": name, "status": "ok",
+                "detail": "no outbox root — nothing to park (this 0 is untestable)"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
+    parked: list[str] = []
+    unreadable: list[str] = []
+    for root in roots:
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
+        items_dir = outbox._items_dir(Path(root))
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
+        for d in outbox.list_items(root, status="PARKED"):
+            parked.append(str(d.get("item_id") or "?"))
+    if unreadable:
+        return {"name": name, "status": "warn",
+                "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
+                          + "; ".join(unreadable)}
+    if parked:
+        shown = ", ".join(sorted(parked)[:4])
+        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+        return {"name": name, "status": "warn",
+                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
+                          f"nothing retries them: {shown}{more}. Recover with "
+                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+    return {"name": name, "status": "ok",
+            "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -9969,8 +10063,17 @@ def _command_runs_script(command: str, expected: Path) -> bool:
 
 
 def _probe_codex_task_notifier(target: dict) -> dict:
-    """Inspect the exact managed notifier tmux session for one healthy pane."""
-    name = "codex-task-notifier"
+    return _probe_task_notifier(target, name="codex-task-notifier",
+                                expected=_expected_codex_notifier_entrypoint())
+
+
+def _probe_task_notifier(target: dict, *, name: str, expected: Path,
+                         script: "Path | None" = None) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane.
+
+    `script`, when given, is the notifier the supervisor must be running; the
+    supervisor's own default is another runtime's, so the pane command alone
+    cannot certify which one is live."""
     socket_path = target["socket"]
     watcher_session = f"{target['session']}-watcher"
     exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
@@ -10011,7 +10114,6 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             "status": "warn",
             "detail": f"managed tmux session {watcher_session!r} has a dead pane",
         }
-    expected = _expected_codex_notifier_entrypoint()
     if not _command_runs_script(command, expected):
         return {
             "name": name,
@@ -10021,12 +10123,27 @@ def _probe_codex_task_notifier(target: dict) -> dict:
                 f"command; expected {expected.name}"
             ),
         }
+    if script is not None:
+        env = _run_tmux(socket_path, "show-environment", "-t", f"={watcher_session}",
+                        "SUTANDO_NOTIFIER_SCRIPT")
+        configured = ""
+        if env is not None and env.returncode == 0:
+            configured = env.stdout.strip().partition("=")[2]
+        if configured != str(script):
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"managed tmux session {watcher_session!r} runs notifier "
+                    f"{configured or '(supervisor default)'!r}; expected {script}"
+                ),
+            }
     return {
         "name": name,
         "status": "ok",
         "detail": (
             f"managed notifier healthy in {watcher_session!r} "
-            f"({expected.name})"
+            f"({(script or expected).name})"
         ),
     }
 
@@ -10196,6 +10313,50 @@ def check_codex_task_notifier() -> dict:
             ),
         }
     return _probe_codex_task_notifier(target)
+
+
+def _claude_runtime_selected() -> bool:
+    try:
+        return resolve_core_runtime(REPO_DIR) == "claude"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_claude_notifier_target(heartbeat: "dict | None" = None) -> "dict | None":
+    """Socket + session of the live Claude core, from its own heartbeat record."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    session = heartbeat.get("session")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(session, str) or not session:
+        return None
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def check_claude_task_notifier() -> dict:
+    """The Claude core's standby notifier lives in `<session>-watcher`, like Codex's."""
+    name = "claude-task-notifier"
+    if not _claude_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "Claude runtime not selected — notifier not expected"}
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {"name": name, "status": "ok",
+                "detail": "no fresh local core heartbeat — notifier not expected"}
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return {"name": name, "status": "warn",
+                "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
+    supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
+    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
 
 
 def fix_codex_task_notifier() -> str:
@@ -12983,12 +13144,10 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
-            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
                            "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is recovered by nothing "
-                                     "while the CLI is busy"})
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -13024,7 +13183,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
+    checks.append(check_outbox_parked())
     checks.append(check_codex_task_notifier())
+    checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
@@ -14190,9 +14351,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -14276,9 +14436,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:
@@ -14531,6 +14690,31 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
+
+
+def publish_health_report(checks, state_dir=None):
+    """Publish only aggregate health; diagnostics and user data stay local."""
+    state_dir = Path(state_dir) if state_dir is not None else WORKSPACE_DIR / "state"
+    tmp = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report = {"version": 1, "checked_at": time.time(), "total": len(checks),
+                  "failures": sum(is_issue(c) for c in checks)}
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir,
+                                         prefix=".agent-health-", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump(report, out)
+        os.replace(tmp, state_dir / "agent-health.json")
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -14542,6 +14726,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    publish_health_report(checks)
     track_health_fix(checks)
     if do_fix:
         track_health_fix(checks, start=True)
@@ -14829,6 +15014,7 @@ def main():
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
         residual_checks = run_all_checks()
+        publish_health_report(residual_checks)
         emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)

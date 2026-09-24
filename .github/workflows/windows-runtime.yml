@@ -3,14 +3,27 @@ name: Windows runtime
 on:
   pull_request:
     branches: [main, staging-interaction-planes, support-windows-11]
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, staging-interaction-planes]
+  schedule:
+    # Off-peak daily; the job-level `if` below is what actually gates execution.
+    - cron: '37 8 * * *'
+  workflow_dispatch: {}
+
+env:
+  SUTANDO_TELEMETRY: "0"
 
 jobs:
   windows-runtime:
     name: PowerShell + Windows runtime
     runs-on: windows-latest
     timeout-minutes: 20
+    # Not a required check (see main's ruleset); skip on ordinary push/PR to save CI minutes.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'windows-ci'))
 
     steps:
       - name: Checkout
@@ -204,6 +217,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'health-check-memory-dir-override.test.py failed' }
           python tests/core-heartbeat.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'core-heartbeat.test.py failed' }
+          python tests/core-lineage-concurrent-writers.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'core-lineage-concurrent-writers.test.py failed' }
           python tests/cli-wedge.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'cli-wedge.test.py failed' }
           python tests/cli-wedge-health-probe.test.py

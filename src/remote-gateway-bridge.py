@@ -47,6 +47,8 @@ from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: 
                                should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
+from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
+                                   RoomMembershipVerifier, members_from_room_op)
 
 WS = resolve_workspace()
 
@@ -184,12 +186,104 @@ def _routed_bridge_still_owns(routed: str, path: Path, now: float) -> bool:
     return (now - last) < _PROACTIVE_ABANDONED_S
 
 
+def _gateway_room_members(room: str):
+    """Joined mxids as the gateway reads them for this agent; None on any error."""
+    return members_from_room_op(
+        _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10))  # noqa: F821
+
+
+# An unusable owner reading is remembered this long: the gate runs every
+# outbound scan, and each re-read is a blocking gateway call on that thread.
+VOICE_OWNER_RETRY_S = 5.0
+_VOICE_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
+_voice_owner_clock = time.time
+
+
+def _voice_owner_read_failed(err: Exception) -> None:
+    _log(f"voice-room: owner read failed: {err}")  # noqa: F821
+
+
+def _voice_room_owner() -> str:
+    """The owner the gateway registry binds to this agent, cached for one TTL.
+    Kept apart from _gateway_owner(): that one also rewrites the DM hint global."""
+    now = _voice_owner_clock()
+    if _VOICE_OWNER["mxid"] and now - _VOICE_OWNER["at"] < VERDICT_TTL_S:
+        return _VOICE_OWNER["mxid"]
+    bad_at = _VOICE_OWNER["bad_at"]
+    if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
+        return ""
+    identity = _reenroll_identity()  # noqa: F821
+    try:
+        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+    except Exception as e:  # noqa: BLE001
+        _voice_owner_read_failed(e)
+        answer = None
+    agents = answer.get("agents") if isinstance(answer, dict) else None
+    row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
+    owner = str((row or {}).get("owner") or "")
+    if not (owner.startswith("@") and ":" in owner):
+        _VOICE_OWNER.update(mxid="", bad_at=now)
+        return ""
+    _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
+    return owner
+
+
+VOICE_ROOM_VERIFIER = RoomMembershipVerifier(
+    WS / "state" / CHECK_DIR_NAME, members=_gateway_room_members,
+    agent_mxid=lambda: _reenroll_identity(), owner_mxid=_voice_room_owner, log=lambda m: _log(m))  # noqa: F821
+_VOICE_ROOM_HELD: set = set()
+
+
+def _voice_result_room(path: Path) -> "str | None":
+    """The room a voice result addresses through its own `[channel: !room]`
+    line, None for the owner-DM shape, "" for a file that cannot be read or
+    decoded (no room verifies as "", so it is held)."""
+    try:
+        route, room, _ = _proactive_route(path.read_text(encoding="utf-8"))  # noqa: F821
+    except (OSError, ValueError):
+        return ""
+    return room if route == "send" else None
+
+
+def _voice_room_allowed(name: str, room: str) -> bool:
+    """The result named `name` may post into `room` only once the gateway
+    confirms owner AND agent are joined; an unreadable room ("") never may."""
+    if room and VOICE_ROOM_VERIFIER.verified(room):
+        _VOICE_ROOM_HELD.discard(name)
+        return True
+    if name not in _VOICE_ROOM_HELD:
+        _VOICE_ROOM_HELD.add(name)
+        why = f"{room} is not a verified owner+agent room" if room else "its body could not be read"
+        _log(f"voice-room: holding {name} — {why}")  # noqa: F821
+    return False
+
+
+def _voice_result_room_verified(path: Path) -> bool:
+    """Pre-claim: the room the file names on disk right now must verify."""
+    room = _voice_result_room(path)
+    return True if room is None else _voice_room_allowed(path.name, room)
+
+
+def _tagged_voice_result(name: str) -> bool:
+    """The task bridge's gateway-tagged room shape. An untagged forward is any
+    bridge's to deliver and is never held here."""
+    return name.startswith("proactive-result-") and proactive_destination(name) == _CHANNEL
+
+
+def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
+    """Post-claim: the room the CLAIMED body names must verify as well — the
+    pre-claim peek can have read a body still being written."""
+    return not _tagged_voice_result(path.name) or _voice_room_allowed(path.name, room)
+
+
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
+    if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
+        return False
+    dest = proactive_destination(path.name)
     # A filename destination outranks everything below, incl. the grace:
     # a destined file strands visibly rather than leak to the gateway room.
-    dest = proactive_destination(path.name)
     if dest is not None:
         return dest == _CHANNEL
     state = WS / "state" / "last-owner-activity.json"
@@ -215,7 +309,9 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
+    VOICE_ROOM_VERIFIER.start()
     main()  # noqa: F821  (defined by the exec above)

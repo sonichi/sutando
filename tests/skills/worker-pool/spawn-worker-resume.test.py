@@ -49,7 +49,7 @@ class FakeTmux:
         self.envs.append(dict(kw.get("env") or {}))
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return cp(argv, 0, self.runtime + "\n", "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return cp(argv, 0, "Started detached.", "")
         sub = argv[3] if len(argv) > 3 else ""
@@ -61,7 +61,7 @@ class FakeTmux:
 
     def launches(self):
         return [e for a, e in zip(self.calls, self.envs)
-                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+                if a[0] == "bash" and a[1].endswith("launch-worker-session.sh")]
 
 
 def _spawned(ws, repo, runner, label="alpha"):
@@ -176,6 +176,79 @@ class ResumeKeepsIdentity(unittest.TestCase):
             _spawned(self.ws, self.repo, t)
         self.assertEqual(t.launches()[-1].get("SUTANDO_CORE_SESSION"), "",
                          "the worker inherited the core's session flag")
+
+
+class FailingLauncher(FakeTmux):
+    """The launcher exits non-zero and starts NO session, from `fail_from` on."""
+
+    def __init__(self, fail_from=2, **kw):
+        super().__init__(**kw)
+        self.fail_from, self.launched = fail_from, 0
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
+            self.launched += 1
+            if self.launched >= self.fail_from:
+                self.calls.append(argv)
+                self.envs.append(dict(kw.get("env") or {}))
+                return self._sp.CompletedProcess(argv, 1, "", "claude: not logged in")
+        return super().__call__(argv, **kw)
+
+
+class AFailedResumeLeavesNoOpenRun(unittest.TestCase):
+    """A run that never started must not stay open: an open incarnation is what a
+    liveness probe reads as "this worker has a run", pointing at a session that
+    was never created."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        self.repo = REPO
+
+    def _fail_a_resume(self):
+        t = FailingLauncher(fail_from=2)
+        first = _spawned(self.ws, self.repo, t)
+        t.existing.clear()
+        with self.assertRaises(sw.SpawnRefused) as cm:
+            sw.spawn(self.ws, self.repo, cwd=str(self.repo), socket="/tmp/t.sock",
+                     runner=t, require_sentinel=False,
+                     resume=first["runtime_session_id"])
+        return first, cm.exception
+
+    def test_the_failed_run_is_closed_not_left_open(self):
+        first, _ = self._fail_a_resume()
+        runs = wi.incarnations(self.ws, first["worker_id"])
+        self.assertEqual(len(runs), 2, "the failed attempt should still be on record")
+        self.assertIsNotNone(
+            runs[-1]["ended_at"],
+            "the launcher failed and started no session, yet its incarnation is still "
+            "open: a probe now reads a run that never existed")
+        self.assertEqual(runs[-1]["end_reason"], "crashed")
+
+    def test_current_does_not_point_at_the_run_that_never_started(self):
+        first, _ = self._fail_a_resume()
+        runs = wi.incarnations(self.ws, first["worker_id"])
+        self.assertNotEqual(wi.current(self.ws, first["worker_id"]).get("incarnation_id"),
+                            runs[-1]["incarnation_id"])
+
+    def test_the_refusal_still_carries_the_launchers_reason(self):
+        _, err = self._fail_a_resume()
+        self.assertIn("not logged in", str(err))
+
+    def test_the_resumed_workers_records_and_inbox_are_kept(self):
+        first, _ = self._fail_a_resume()
+        self.assertTrue(wi.worker_dir(self.ws, first["worker_id"]).is_dir(),
+                        "a failed RESUME deleted a worker that existed before the call")
+        self.assertTrue(Path(first["delivery_dir"]).is_dir(),
+                        "a failed RESUME deleted the worker's inbox")
+
+    def test_control_a_successful_resume_stays_open(self):
+        t = FakeTmux()
+        first = _spawned(self.ws, self.repo, t)
+        t.existing.clear()
+        sw.spawn(self.ws, self.repo, cwd=str(self.repo), socket="/tmp/t.sock",
+                 runner=t, require_sentinel=False, resume=first["runtime_session_id"])
+        self.assertIsNone(wi.incarnations(self.ws, first["worker_id"])[-1]["ended_at"],
+                          "the fix closed a run that DID start")
 
 
 if __name__ == "__main__":

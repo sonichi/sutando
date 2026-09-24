@@ -33,7 +33,7 @@ run_sweep() {
   SUTANDO_INBOX_RESOLVER="$RESOLVER" SUTANDO_WORKSPACE_DIR="$WS" \
     SUTANDO_RESULTS_DIR="$WS/results" SUTANDO_INSTANCE=w-test \
     SUTANDO_TASK_EVENT_HANDLER="$HANDLER" \
-    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
+    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" --role standby --inbox "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
   pid=$!
   set +m
   # A failed handler run takes a beat: probe, queue, spawn the real run, HANDLER_DONE.

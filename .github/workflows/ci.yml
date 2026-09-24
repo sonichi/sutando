@@ -19,8 +19,63 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Classifies the PR's diff once so the test jobs can skip their suites when no
+  # suite can see the change. Every required check still reports: the jobs run,
+  # only their heavy steps are skipped, so the aggregator and the coverage gate
+  # turn green instead of hanging as "expected". `code=false` needs every changed
+  # file to be a doc (docs/** or *.md) that no test or script names, because a
+  # suite may pin a doc's wording (worker-pool-design-retractions does).
+  changes:
+    name: classify the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: classify
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          code=true
+          if [ "$EVENT" = "pull_request" ] && [ -n "$BASE_REF" ]; then
+            git fetch -q origin "$BASE_REF"
+            # --name-status --no-renames: a rename is a delete plus an add, and a
+            # deleted or renamed doc may be linked from anywhere, so it is code.
+            entries="$(git diff --name-status --no-renames "origin/$BASE_REF...HEAD")"
+            if [ -n "$entries" ]; then
+              code=false
+              while IFS=$'\t' read -r status f; do
+                [ -n "$f" ] || continue
+                case "$status" in A|M) ;; *) code=true; break ;; esac
+                case "$f" in
+                  docs/*|*.md) ;;
+                  *) code=true; break ;;
+                esac
+                # A doc named by code, a script, a skill, a test or a workflow is
+                # code for CI's purposes. grep rc 1 is the only "not named"; a hit
+                # (0) or an error (2) both run the suites.
+                rc=0
+                grep -rlqF --exclude-dir=node_modules -- "$(basename "$f")" src scripts skills tests packages .github 2>/dev/null || rc=$?
+                if [ "$rc" -ne 1 ]; then
+                  code=true; break
+                fi
+              done <<< "$entries"
+            fi
+            echo "changed entries: $(printf '%s\n' "$entries" | grep -c . || true)"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code=$code"
+
   typecheck-and-test:
-    name: typecheck + node & shell tests
+    name: lints + typecheck
     runs-on: ubuntu-latest
     # 20, not 10: measured 2026-08-03, this job is at capacity on legitimate work,
     # not hanging. Run 30801403218 spent 3.9 min (node tests) + 3.2 min (python) +
@@ -115,7 +170,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -145,10 +200,38 @@ jobs:
         run: |
           timeout -k 5 120 python3 scripts/lint-skill.test.py
           timeout -k 5 120 python3 scripts/lint-skill.py --all --strict
+          # The rename keeps a few old spellings alive on purpose; this refuses NEW ones.
+          timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
+
+  # The suites that used to run after the typecheck in the job above, now beside
+  # it: three runners of ~2 min each instead of one of ~5, same commands, same env.
+  node-and-oot-tests:
+    name: node + out-of-tree python tests
+    needs: changes
+    # Job-level, not per step: a docs-only diff skips the whole runner, and the
+    # aggregator below treats that skip as a pass only when `changes` said so.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
-      # `find tests -name '*.test.py'` step below. Same reason the skill-manifest
-      # test above is wired by hand. Without this they run only when someone
+      # `find tests -name '*.test.py'` discovery. Same reason the skill-manifest
+      # test is wired by hand. Without this they run only when someone
       # remembers to run them locally, which is indistinguishable from passing.
       # Notably src/remote-gateway-bridge.test.py — the suite the transport
       # change process requires for ANY package change — and tools/test_no_drift.py,
@@ -187,57 +270,6 @@ jobs:
         if: hashFiles('tests/**/*.test.ts') != ''
 
 
-      # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
-      # existed but were never wired into CI (the discovery glob only covered
-      # *.test.py and *.test.ts). Mirrors the Python step above — emit full
-      # output on failure so debugging info isn't lost.
-      - name: Run shell standalone tests
-        run: |
-          failed=0
-          # Load the known-failures allowlist (suites that fail on ubuntu-latest
-          # due to macOS-specific tooling or timing). Allowlisted suites still run
-          # and their output is printed, but a failure does NOT set failed=1.
-          # New regressions in the other suites still fail CI immediately.
-          # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
-          known_failures_file="tests/shell-ci-known-failures.txt"
-          while IFS= read -r f; do
-            echo "→ $f"
-            # `if ! assignment=$(...)` exempts the command from `bash -e` (GitHub's
-            # default for run: steps) while still capturing output + status. A bare
-            # `output=$(bash "$f")` would abort the whole step on the first failing
-            # suite — losing this step's diagnostics and masking every later suite.
-            #
-            # `timeout -k 5 300` bounds each suite: a hanging suite (e.g. a bounded-
-            # runner test whose --max backstop misfires under CI) would otherwise
-            # burn the whole job's timeout-minutes budget and get the job *canceled*
-            # mid-suite — masking every later suite AND this step's own diagnostics,
-            # the very failure this loop was written to avoid. On overrun timeout
-            # SIGTERMs (then SIGKILLs after 5s) and returns 124, so the suite fails
-            # loudly and in isolation instead of hanging CI.
-            # 300s, not 120s: graceful-restart.test.sh measures 73s on an idle dev
-            # box, leaving under 2x headroom on a slower, contended CI runner.
-            if ! output=$(timeout -k 5 300 bash "$f" 2>&1); then
-              echo "✖ shell test failed: $f"
-              echo "$output"
-              # Only gate CI if this suite is not in the known-failures allowlist.
-              if ! grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
-                failed=1
-              else
-                echo "  (known failure — not gating CI; see $known_failures_file)"
-              fi
-            else
-              echo "$output" | grep -E 'FAIL|^Summary' || true
-              # A listed suite that PASSES is a stale entry, and a stale entry
-              # un-gates a suite nobody thinks is un-gated. Fail so the list
-              # cannot silently outlive the failures it excuses.
-              if grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
-                echo "✖ stale allowlist entry: $f passed — delete its line from $known_failures_file"
-                failed=1
-              fi
-            fi
-          done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
-          exit "$failed"
-
       # Run standalone ESM tests (*.test.mjs). Same gap as #1934, one extension
       # later: these suites existed and CI discovered none of them, so a .mjs
       # suite could fail at HEAD while the run reported green.
@@ -264,12 +296,69 @@ jobs:
           done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
 
-  python-standalone-tests:
-    name: python standalone tests
+  shell-standalone-tests:
+    name: shell tests (lanes)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+
+      # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
+      # existed but were never wired into CI (the discovery glob only covered
+      # *.test.py and *.test.ts). Emit full output on failure so debugging
+      # info isn't lost.
+      - name: Run shell standalone tests
+        run: |
+          bash scripts/run-shell-suites.sh lanes
+
+  shell-tail-tests:
+    name: shell tests (serial tail)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The process-table suites run one at a time in the checkout; on their own
+    # runner they no longer sit behind the typecheck job's lanes.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+      - name: Run shell standalone tests (serial tail)
+        run: bash scripts/run-shell-suites.sh tail
+
+  python-standalone-tests:
+    name: python standalone tests (${{ matrix.shard }}/5)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # Five runners, each a fifth of the files by measured cost; the
+    # coverage-gate job combines every leg's data.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
-    timeout-minutes: 15
+    # 20, not 15: the suite now runs under coverage instrumentation (the only
+    # run of it per push; the diff-coverage job below consumes its data instead
+    # of running the suite again), and instrumentation costs ~40% wall time.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -288,7 +377,14 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+
+      # watch-tasks-stream-config-hot-reload.test.py exercises the real
+      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # fswatch, so that test silently exercised nothing (its subprocess died
+      # at exec with no writer, indistinguishable from "no event" downstream).
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
 
       # Run standalone Python tests (*.test.py).
       # Covers telegram-bridge TOFU tri-state, slack-bridge tier-map, discord-bridge
@@ -297,6 +393,8 @@ jobs:
       # Quiet mode: suppress PASS lines (only FAIL + summary shown) to keep CI
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           # Records are collected per file and replayed SERIALLY in sorted
           # order below, so `failed_files` keeps its order.
@@ -306,28 +404,47 @@ jobs:
           RECDIR="$(mktemp -d)"
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
-          find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # `skills` too: a skill owns its own tests/, so a suite that moves into one
+          # keeps running; the root is optional, so it is added only when present.
+          bash scripts/discover-python-tests.sh > "$RECDIR/all"
+          # Measured cost, heaviest first onto the lightest leg: every file lands in
+          # exactly one leg, and the legs finish together instead of by line parity.
+          bash scripts/shard-by-cost.sh 5 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/all" > "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
+          # A zero-file discovery is never legitimate on this repo; treat it as
+          # the runner never reaching the discovery call, not an empty suite.
+          if [ "$N" -eq 0 ]; then
+            echo "::error::discover-python-tests.sh found 0 files — refusing rather than silently passing an empty suite"
+            exit 1
+          fi
           # Per-file cap: without it one hung suite burns the job budget and
-          # the job is CANCELED mid-suite.
+          # the job is CANCELED mid-suite. 240s, not 120s: instrumentation slows
+          # race/bench-style tests well past their bare runtime (same cap as
+          # scripts/coverage-gate.sh, which ran this suite before).
+          FILE_TIMEOUT=240
+          rm -f .coverage coverage.xml
+          find . -maxdepth 1 -name '.coverage.*' -delete
 
           # Shared scheduler: one SERIAL worker per worktree, so a slot can never
-          # hold two suites — and the regression drives this same script.
+          # hold two suites — and the regression drives this same script. Under
+          # coverage.py, one fragment per file; parallel-suite-lane.sh brings the
+          # worktrees' fragments home for the combine below.
           bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
-            timeout -k 5 120 python3
+            env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 \
+            timeout -k 5 -s ABRT "$FILE_TIMEOUT" python3 -m coverage run --rcfile=.coveragerc
           _idx=0
           while IFS= read -r f; do
-            echo "→ $f"
             _idx=$((_idx + 1))
             rec="$RECDIR/$_idx"
+            echo "→ $f ($(cat "$rec.time" 2>/dev/null || echo '?')s)"
             rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
             output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::TIMED OUT (>120s): $f"
+                echo "::error::TIMED OUT (>${FILE_TIMEOUT}s): $f"
               else
                 echo "::error::FAILED: $f (exit $rc)"
               fi
@@ -347,15 +464,83 @@ jobs:
             # tests actually failed. Review nit, and a correct one.
             echo "::notice::${#failed_files[@]} python test file(s) failed:"
             printf '  %s\n' "${failed_files[@]}"
+            exit "$failed"
           fi
-          exit "$failed"
+          # Green leg: merge the per-file fragments once, here; the
+          # diff-coverage job combines the legs and measures this run.
+          python3 -m coverage combine --quiet
+          mv .coverage ".coverage.shard${SHARD:-1}"
+
+      # `.coverage` is a dotfile, which upload-artifact v4 skips by default.
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-${{ matrix.shard }}
+          path: .coverage.shard${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  coverage-gate:
+    name: diff coverage >= 95% (python)
+    # Enforces >= 95% coverage on the Python lines this PR changes, judged from
+    # the instrumented run above — the suite is never run a second time for
+    # it. pull_request only: the gate is a diff against the PR's base branch.
+    # See docs/testing-coverage.md.
+    needs: [python-standalone-tests, changes]
+    # A docs-only diff has no Python lines to measure; the required check reads
+    # a skipped job as satisfied, and `changes` is what said the diff is docs.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # diff-cover needs the base branch locally to compute changed lines.
+          fetch-depth: 0
+
+      - name: Install coverage tooling
+        run: python3 -m pip install coverage diff-cover
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      - name: Run coverage gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          COVERAGE_GATE_PRECOMPUTED: "1"
+        run: bash scripts/coverage-gate.sh
+
+      # The companion workflow_run job (.github/workflows/coverage-comment.yml)
+      # posts the summary as a sticky PR comment. Two-stage on purpose: fork PRs
+      # run here with a read-only GITHUB_TOKEN, so the comment must be posted by
+      # a workflow that runs in the base-repo context WITHOUT checking out PR code.
+      - name: Stamp PR number for the comment workflow
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: |
+            coverage-summary.md
+            pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
   required-tests:
     name: tsc + tests (clean install)
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [typecheck-and-test, python-standalone-tests]
+    needs: [changes, typecheck-and-test, node-and-oot-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -364,6 +549,10 @@ jobs:
       # dependency failed reports "skipped", which a required check can treat
       # as satisfied. Failing here makes the outcome explicit either way.
       - name: Require every test job to have succeeded
+        env:
+          # A skip is a pass only when `changes` itself succeeded and said the
+          # diff is docs; a `changes` failure leaves code empty, which is not that.
+          DOCS_ONLY: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
         run: |
           set -euo pipefail
           # A cancelled job still blocks the merge — an unfinished run is not a
@@ -376,10 +565,18 @@ jobs:
             case "$2" in
               success)   echo "  $1: success" ;;
               cancelled) echo "::warning::$1 was CANCELLED (job cap or superseded run) — capacity, not a test failure"; rc=1 ;;
-              skipped)   echo "::error::$1 was SKIPPED — a dependency failed, so nothing ran"; rc=1 ;;
+              skipped)   if [ "$DOCS_ONLY" = "true" ] && [ "$1" != "changes" ]; then
+                           echo "  $1: skipped (docs-only diff, nothing to run)"
+                         else
+                           echo "::error::$1 was SKIPPED — a dependency failed, so nothing ran"; rc=1
+                         fi ;;
               *)         echo "::error::$1 FAILED ($2)"; rc=1 ;;
             esac
           }
+          check "changes"                 "${{ needs.changes.result }}"
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
+          check "node-and-oot-tests"      "${{ needs.node-and-oot-tests.result }}"
+          check "shell-standalone-tests"  "${{ needs.shell-standalone-tests.result }}"
+          check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
           exit "$rc"

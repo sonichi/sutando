@@ -43,6 +43,12 @@ the compatibility window.
 
 ## Transport
 
+The orphan-result sweep leaves local tasks with a pre-body `source: cron`
+header untouched, including archived tasks and old completion files. A local
+scheduled task has no gateway lease to close. Its completion does not become a
+remote reply; owner notifications use the separate proactive delivery path.
+Gateway task results retain the existing recovery, suppression, and retry behavior.
+
 - All requests carry `Authorization: Bearer <REMOTE_TASK_TOKEN>`.
 - Request/response bodies are JSON.
 - The protocol is versioned under the `/v1` path prefix.
@@ -252,6 +258,25 @@ than store a second copy.
   local cap values fail closed to Guest.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.
+- **A room named by the voice client is a claim, not a destination.** The
+  desktop's in-room voice session announces its room with a `session.context`
+  frame (handled by the optional `skills/ag2space-voice/` plugin, which writes the
+  request), but only the gateway can prove membership. The bridge answers
+  `state/voice-room-checks/<key>.request.json` with `<key>.verdict.json`
+  (`src/voice_room_membership.py`): `verified` only when `/v1/room`
+  `{"op": "members"}` lists BOTH the agent and the owner from `GET /v1/agents`;
+  an unreadable room, a missing identity or no bridge at all is a refusal and
+  the session stays on the owner DM. The same verdict gates the claim of a
+  voice result, and only this shape: a file named
+  `results/proactive-result-*.to-ag2space.txt` whose body's `[channel: !room]`
+  redirect names a Matrix room. An unverified room's file is left in place,
+  logged once per hold, and re-checked on every scan; it is released when the
+  room verifies and is never posted or rerouted to the owner DM before that,
+  with no age limit. Nothing else is ever held by this check: an untagged
+  `proactive-result-*.txt` (whatever its body opens with), a tagged file with
+  no room line or a skip marker, and any other `proactive-*.txt` follow the
+  ordinary claim rules. Verdicts are cached 60 s per room on both sides;
+  an unusable owner reading is retried after 5 s, not per scan.
 
 ## Writing your own relay
 
@@ -259,3 +284,31 @@ A minimal relay needs only: an authenticated queue behind `GET /v1/tasks`
 (long-poll or return-immediately), an `ack` sink, a `results` sink, and a
 heartbeat sink. The four endpoints above are the entire contract — anything that
 implements them can drive Sutando.
+
+
+### Independent health-check reporting
+
+Each completed `health-check.py` run atomically publishes a compact
+`state/agent-health.json` record (`version`, `checked_at`, `total`, `failures`).
+It uses the same failure predicate as the local check's exit code. Warnings
+remain warnings; check names, diagnostic output, task text, and paths are not
+included in the record.
+
+The gateway overlays a recent failing report onto its next heartbeat as
+`status: error` with a failure count. This works even without a core status
+file, allowing the independent health checker to report a failed core.
+A later passing check removes the override and resumes the core's status.
+Repair attempts do not imply recovery: another completed check must verify it.
+
+Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
+as the five-minute fallback. Expired, malformed, or empty reports emit
+`status: unknown`, preventing cached health from being refreshed indefinitely.
+An absent report preserves legacy core-status reporting for installations
+without the health checker. A passing report alone does not invent a core
+status. If the gateway or host is down, no heartbeat can be sent; the broker's
+existing contact timeout still yields disconnected/unknown.
+
+The AG2 Space dashboard already classifies `error` as unhealthy, so this
+requires updating Sutando's health checker and restarting its gateway bridge;
+no dashboard schema change is needed. Reporting starts after the first health
+check completes and follows the installed check cadence.

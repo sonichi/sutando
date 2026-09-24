@@ -28,6 +28,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
+# ...and this skill's own scripts dir, which is sys.path[0] only when this file is
+# RUN as a script: the sibling import below must not depend on how it was loaded.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import watcher_identity as wid  # noqa: E402
 
@@ -67,10 +71,11 @@ def _target_from_argv(command: str, pid=None, argv_vector=None):
                          f"real argv vector")
     if verdict.watcher is False:
         return None
-    for tok in verdict.operands:
-        if not tok.startswith("-"):
-            return tok
-    return ""
+    # The tag first: a bare "first token without a dash" reads --role's VALUE as
+    # the inbox, and an env-supplied inbox leaves no positional at all.
+    return (wid.watcher_inbox(verdict.operands)
+            or wid.positional_inbox(verdict.operands)
+            or "")
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -167,7 +172,22 @@ def main(argv=None) -> int:
     print(decision)
     print(f"instance={a.instance or '(unset)'} inbox={a.inbox or '(unset)'}")
     print(f"why={why}")
+    if decision in ("start", "skip"):
+        print(f"sweep={prune_spent_sentinels(workspace, a.instance)}")
     return 0 if decision in ("start", "skip") else 2
+
+
+def prune_spent_sentinels(workspace: str, instance: str) -> str:
+    """Retire this worker's spent delivery sentinels so the inbox holds what is
+    owed, not its history. prune_spent, never sweep: the boot sweep also RELEASES
+    an accepted delivery back to pending, which on a `skip` (this worker's watcher
+    is live) would re-offer work the session is answering. Never changes the decision."""
+    try:
+        import pool_delivery as pd
+        acts = pd.prune_spent(Path(workspace), instance)
+        return " ".join(f"{k}={len(v)}" for k, v in acts.items())
+    except Exception as e:                                   # noqa: BLE001
+        return f"skipped ({e})"
 
 
 if __name__ == "__main__":
