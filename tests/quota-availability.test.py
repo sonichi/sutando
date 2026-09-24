@@ -38,8 +38,12 @@ def _iso(epoch: float, millis: bool = True) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if millis else dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+MODEL = "claude-fable-5-1"
+
+
 def _record(status="allowed", available=True, age_s=30.0, **extra) -> dict:
     d = {"available": available, "last_checked": _iso(NOW - age_s),
+         "last_request": {"model": MODEL, "at": _iso(NOW - age_s)},
          "headers": {"anthropic-ratelimit-unified-status": status,
                      "anthropic-ratelimit-unified-7d-reset": "1790499600"}}
     d.update(extra)
@@ -172,6 +176,8 @@ class RecordFixture(unittest.TestCase):
         self.ws = Path(self._t.name) / "ws"
         (self.ws / "state").mkdir(parents=True)
         self.path = self.ws / "state" / "quota-state.json"
+        # The seat's model is known by default; the model tests overwrite this.
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": MODEL}))
 
     def write(self, data) -> None:
         self.path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
@@ -228,6 +234,12 @@ class TestSeatEnvBaseUrl(unittest.TestCase):
         env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
         self.assertEqual((env.observed, env.base_url), (True, PROXY))
 
+    def test_the_seats_cwd_and_config_dir_travel_with_its_env(self):
+        tm = lambda sock, *a: _R(0, "6648 /seat/cwd\n")  # noqa: E731
+        ps = lambda pid: _R(0, f"ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR=/seat/cfg claude --name {SEAT}")  # noqa: E731
+        env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
+        self.assertEqual((env.cwd, env.config_dir), ("/seat/cwd", "/seat/cfg"))
+
     def test_a_seat_without_the_variable_is_observed_and_unrouted(self):
         tm, ps = _seat(base_url=None)
         env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
@@ -278,10 +290,14 @@ class TestProviderAllowsNow(RecordFixture):
         self.write(_record())
         self.assertTrue(self._allows())
 
-    def test_an_allowed_warning_with_the_flag_set_is_still_accepted(self):
-        # The one shape the two old readers split on: the authority decides, once.
-        self.write(_record("allowed_warning", True))
-        self.assertTrue(self._allows())
+    def test_an_allowed_warning_is_accepted_by_the_policy_and_held_by_the_gate(self):
+        # The shape the two old readers split on. One resolve_available decides the
+        # policy; the gate's all-windows reading is stricter ON TOP of it.
+        rec = _record("allowed_warning", True)
+        self.assertTrue(qa.availability_decision(rec, base_url=PROXY, stale=False)["available"])
+        self.assertFalse(qa.gate_windows_allowed(rec))
+        self.write(rec)
+        self.assertFalse(self._allows())
 
     def test_false_when_the_seat_is_unrouted(self):
         self.write(_record())
@@ -312,6 +328,75 @@ class TestProviderAllowsNow(RecordFixture):
         self.assertFalse(self._allows(), "absent")
         self.write("{broken")
         self.assertFalse(self._allows(), "malformed")
+
+    def test_a_rejected_window_holds_even_when_the_overall_status_is_allowed(self):
+        # bassil's record: the unified status says allowed and the flag is true, but
+        # a window is rejected -- what a cheap probe writes for a model-scoped limit.
+        for window in ("5h", "7d", "7d_oi"):
+            rec = _record("allowed", True)
+            rec["headers"][f"anthropic-ratelimit-unified-{window}-status"] = "rejected"
+            self.assertTrue(qa.availability_decision(rec, base_url=PROXY, stale=False)["available"], window)
+            self.write(rec)
+            self.assertFalse(self._allows(), window)
+
+    def test_overage_status_is_not_a_window(self):
+        # The live record carries overage-status: rejected while fully allowed; it is
+        # overage-purchase eligibility, not a limit on included usage.
+        rec = _record("allowed", True)
+        rec["headers"]["anthropic-ratelimit-unified-5h-status"] = "allowed"
+        rec["headers"]["anthropic-ratelimit-unified-7d-status"] = "allowed"
+        rec["headers"]["anthropic-ratelimit-unified-overage-status"] = "rejected"
+        self.write(rec)
+        self.assertTrue(self._allows())
+
+    def test_no_window_headers_at_all_is_silence_and_holds(self):
+        rec = {"available": True, "last_checked": _iso(NOW - 30), "headers": {"x-other": "1"}}
+        self.assertFalse(qa.gate_windows_allowed(rec))
+        self.write(rec)
+        self.assertFalse(self._allows())
+
+    def _seat_settings(self, model):
+        cfg = self.ws / "cfg"
+        cfg.mkdir(exist_ok=True)
+        (cfg / "settings.json").write_text(json.dumps({"model": model}))
+        return str(cfg)
+
+    def _seat_with_config(self, cfg):
+        tm, ps = _seat(PROXY)
+        argv = f"ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR={cfg} HOME=/x claude --name {SEAT}"
+        return tm, (lambda pid: _R(0, argv))
+
+    def test_the_record_must_speak_for_this_seats_model(self):
+        # Refreshed by a request on another model, a record can say allowed while
+        # THIS seat's model is limited: both known and different holds.
+        cfg = self._seat_settings("claude-sonnet-5[1m]")
+        self.write(_record(last_request={"model": "claude-haiku-4-5-20251001", "at": _iso(NOW - 5)}))
+        self.assertFalse(self._allows(seat=self._seat_with_config(cfg)))
+
+    def test_a_context_window_tag_names_the_same_model(self):
+        cfg = self._seat_settings("claude-fable-5-1[1m]")
+        self.write(_record(last_request={"model": "claude-fable-5-1", "at": _iso(NOW - 5)}))
+        self.assertTrue(self._allows(seat=self._seat_with_config(cfg)))
+
+    def test_an_unknown_model_on_either_side_holds(self):
+        # The headers carry no per-model window (measured: status, 5h, 7d, overage),
+        # so nothing else can catch a model-scoped limit; unknown fails closed.
+        (self.ws / "state" / "model-switch.json").unlink()
+        self.write(_record(last_request={"model": "claude-fable-5-1", "at": _iso(NOW - 5)}))
+        self.assertFalse(self._allows())                      # seat model unknown
+        cfg = self._seat_settings("claude-fable-5-1")
+        rec = _record(); del rec["last_request"]               # record names no model
+        self.write(rec)
+        self.assertFalse(self._allows(seat=self._seat_with_config(cfg)))
+
+    def test_model_switch_state_is_the_fallback_when_settings_do_not_say(self):
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-sonnet-5[1m]"}))
+        self.write(_record(last_request={"model": "claude-fable-5-1", "at": _iso(NOW - 5)}))
+        self.assertFalse(self._allows())                      # switch record says sonnet: mismatch
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-fable-5-1"}))
+        self.assertTrue(self._allows())                       # switch record agrees
+        cfg = self._seat_settings("claude-sonnet-5")          # settings outrank the switch record
+        self.assertFalse(self._allows(seat=self._seat_with_config(cfg)))
 
     def test_the_freshness_window_is_a_parameter(self):
         self.write(_record(age_s=3000))
@@ -352,14 +437,45 @@ class TestProbeRefreshesRecord(RecordFixture):
             self.assertFalse(qa.probe_refreshes_record(self.ws, url, now=NOW, runner=self._runner(calls)), url)
         self.assertEqual(calls, [])
 
-    def test_one_cheapest_model_request_through_the_proxy(self):
+    def test_one_request_on_the_seats_own_model_in_the_seats_own_place(self):
+        # No --model: what a bare `claude` resolves in the seat's cwd + config dir IS the
+        # seat's model, so a model-scoped limit on that seat shows in the refreshed record.
         calls = []
-        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner(calls)))
+        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner(calls),
+                                                  cwd="/seat/cwd", config_dir="/seat/cfg"))
         self.assertEqual(len(calls), 1)
         argv, kw = calls[0]
-        self.assertEqual(argv, ["claude", "-p", "ok", "--model", qa.PROBE_MODEL])
+        self.assertEqual(argv, ["claude", "-p", "ok"])
+        self.assertNotIn("--model", argv)
         self.assertEqual(kw["env"]["ANTHROPIC_BASE_URL"], PROXY)
+        self.assertEqual(kw["env"]["CLAUDE_CONFIG_DIR"], "/seat/cfg")
+        self.assertEqual(kw["cwd"], "/seat/cwd")
         self.assertLessEqual(kw["timeout"], 90)
+
+    def test_the_default_runner_returns_at_once_in_its_own_session(self):
+        # The gate must never block a health poll on a full `claude -p`; the next
+        # poll reads whatever the proxy wrote.
+        with mock.patch.object(qa.subprocess, "Popen") as popen:
+            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, cwd="/seat/cwd"))
+        self.assertEqual(popen.call_count, 1)
+        self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+        self.assertEqual(popen.call_args.kwargs.get("cwd"), "/seat/cwd")
+        self.assertFalse(popen.return_value.wait.called)
+
+    def test_the_marker_is_claimed_under_a_sibling_lock_not_the_marker_itself(self):
+        # Locking creates its file; if the marker were the lock, its fresh mtime
+        # would read as "probed a moment ago" and no probe could ever go out.
+        seen = []
+        import file_lock
+        real = file_lock.locked_file
+
+        def spy(path, **kw):
+            seen.append(Path(path).name)
+            return real(path, **kw)
+
+        with mock.patch.object(file_lock, "locked_file", spy):
+            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner([])))
+        self.assertEqual(seen, [qa.PROBE_MARK + ".lock"])
 
     def test_at_most_one_probe_per_window_host_wide(self):
         calls = []
@@ -447,6 +563,17 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertFalse(self._allows(self._proxy_that_writes(calls, _record(age_s=0)),
                                       seat=(lambda s, *a: _R(1, ""), _seat()[1])))
         self.assertEqual(calls, [])
+
+    def test_a_fresh_record_on_another_model_is_probed_on_the_seats_model(self):
+        # Measured live: the record stayed fresh on sonnet-5 traffic while the seat ran
+        # fable-5-1, so "probe only when stale" would have held that seat forever.
+        self.write(_record(age_s=5, last_request={"model": "claude-sonnet-5", "at": _iso(NOW - 5)}))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
+        self.assertEqual(len(calls), 1)
+        refreshed = _record(age_s=0)   # the proxy rewrote it from the seat's own request
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, refreshed), now=NOW + qa.FRESH_SEC))
+        self.assertEqual(len(calls), 2)
 
     def test_the_second_notifier_in_the_window_does_not_probe_again(self):
         self.write(_record(age_s=3600))

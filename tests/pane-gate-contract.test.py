@@ -975,6 +975,9 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
         self.record = self.ws / "state" / "quota-state.json"
         self.socket, self.session = "/tmp/gate-test.sock", "sutando-worker-test"
         self._seat(qa.SeatEnv(True, "http://localhost:7846"))
+        # The seat's model is known and the record names the same one, so the
+        # model check is satisfied unless a test says otherwise.
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-fable-5-1"}))
 
     def _seat(self, env):
         """What the seat's process environment reads as, through the one probe."""
@@ -991,6 +994,7 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
         self.record.write_text(json.dumps({
             "available": allowed,
             "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-fable-5-1"},
             "headers": {
                 "anthropic-ratelimit-unified-status": "allowed",
                 "anthropic-ratelimit-unified-5h-status": "allowed",
@@ -1019,6 +1023,38 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
 
     def test_a_record_that_says_rejected_keeps_the_hold(self):
         self._write(allowed=False, age_s=30)
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_rejected_window_under_an_allowed_overall_status_keeps_the_hold(self):
+        # bassil's regression record at the gate: overall allowed, flag true, 7d rejected.
+        # bfd4a51e held on it; the head that adopted the skill's reader released. Never again.
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - 30, tz=timezone.utc)
+        self.record.write_text(json.dumps({
+            "available": True,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-fable-5-1"},
+            "headers": {"anthropic-ratelimit-unified-status": "allowed",
+                        "anthropic-ratelimit-unified-5h-status": "allowed",
+                        "anthropic-ratelimit-unified-7d-status": "rejected"},
+        }))
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_record_refreshed_on_another_model_keeps_the_hold(self):
+        # A haiku probe on a seat whose own model is limited writes exactly this.
+        # (The seat's settings outrank the fixture's model-switch record.)
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - 30, tz=timezone.utc)
+        cfg = self.ws / "cfg"; cfg.mkdir()
+        (cfg / "settings.json").write_text(json.dumps({"model": "claude-fable-5-1[1m]"}))
+        self._seat(qa.SeatEnv(True, "http://localhost:7846", "/seat", str(cfg)))
+        self.record.write_text(json.dumps({
+            "available": True,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-haiku-4-5-20251001"},
+            "headers": {"anthropic-ratelimit-unified-status": "allowed",
+                        "anthropic-ratelimit-unified-7d-status": "allowed"},
+        }))
         self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
 
     def test_an_unreadable_record_keeps_the_hold(self):

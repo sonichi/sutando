@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Shared authority for whether Claude quota telemetry is usable.
 
-Three readers interpret the same workspace state -- the credential proxy's
+Several readers interpret the same workspace state -- the credential proxy's
 `state/quota-state.json` -- so the policy lives here and each reader calls it:
 the quota tools (`skills/quota-tracker`, `skills/proactive-loop`), health-check,
-and the delivery gate (`src/delivery/pane_gate.py`).
+the dashboard, and the delivery gate (`src/delivery/pane_gate.py`).
 
 The record is the provider's own statement, refreshed by real traffic, but it
 only speaks for a seat whose requests go THROUGH the proxy: a fresh `allowed`
@@ -111,6 +111,31 @@ def availability_decision(
     }
 
 
+#: Every `anthropic-ratelimit-unified-<window>-status` header, and the bare
+#: `-status`; `overage-status` is overage-purchase eligibility, not a window.
+_WINDOW_STATUS = re.compile(r"^anthropic-ratelimit-unified-(?:([0-9a-z_]+)-)?status$")
+
+
+def gate_windows_allowed(quota: Any) -> bool:
+    """The DELIVERY GATE's stricter reading, on top of `availability_decision`:
+    every window the proxy reported must be exactly `allowed`. A record that is
+    `allowed` overall with one window `rejected` -- what a cheap probe writes
+    for a seat that hit a model-scoped limit -- or any `allowed_warning`, holds.
+    No window headers at all is silence, and silence holds."""
+    payload = quota if isinstance(quota, dict) else {}
+    headers = payload.get("headers")
+    headers = headers if isinstance(headers, dict) else {}
+    seen = False
+    for key, value in headers.items():
+        m = _WINDOW_STATUS.match(str(key))
+        if not m or m.group(1) == "overage":
+            continue
+        seen = True
+        if value != "allowed":
+            return False
+    return seen
+
+
 # ---- the record on disk ---------------------------------------------------
 
 #: A limit can begin at any moment, so only a RECENT observation vouches for now.
@@ -172,8 +197,14 @@ def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaR
 
 @dataclass(frozen=True)
 class SeatEnv:
-    observed: bool            # False: the environment could not be read -- unknown, not a bypass
-    base_url: Optional[str]   # ANTHROPIC_BASE_URL as the process carries it; None when absent
+    """What the running seat carries. `observed` False means its environment could
+    not be read: unknown, never a bypass. `base_url` and `config_dir` are the
+    process's ANTHROPIC_BASE_URL and CLAUDE_CONFIG_DIR (None when absent); `cwd`
+    is its pane's current path, where a probe must run."""
+    observed: bool
+    base_url: Optional[str]
+    cwd: Optional[str] = None
+    config_dir: Optional[str] = None
 
 
 def _run_tmux(socket_path: str, *args: str, tmux_bin: str = "tmux"):
@@ -208,10 +239,11 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
     ps_runner = ps_runner or _run_ps
     if not socket_path:
         return SeatEnv(False, None)
-    panes = tmux_runner(socket_path, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
+    panes = tmux_runner(socket_path, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid} #{pane_current_path}")
     if panes is None or getattr(panes, "returncode", 1) != 0:
         return SeatEnv(False, None)
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
+    rows = [ln.split(None, 1) for ln in (panes.stdout or "").splitlines() if ln.strip()]
+    pids = [(r[0], r[1].strip() if len(r) > 1 else None) for r in rows if r[0].isdigit()]
     if not pids:
         return SeatEnv(False, None)
 
@@ -225,7 +257,7 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
         return False
 
     matches = []
-    for pid in pids:
+    for pid, cwd in pids:
         try:
             proc = ps_runner(pid)
         except Exception:  # noqa: BLE001 -- a probe failure is unknown
@@ -234,73 +266,140 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
             continue
         out = proc.stdout or ""
         if _names_this_session(out):
-            matches.append(out)
+            matches.append((out, cwd))
     if len(matches) != 1:
         return SeatEnv(False, None)
-    pairs = [t for t in matches[0].split() if _ENV_PAIR.match(t)]
+    argv, cwd = matches[0]
+    pairs = [t for t in argv.split() if _ENV_PAIR.match(t)]
     if not pairs:
         return SeatEnv(False, None)
-    for t in pairs:
-        if t.startswith("ANTHROPIC_BASE_URL="):
-            return SeatEnv(True, t[len("ANTHROPIC_BASE_URL="):])
-    return SeatEnv(True, None)
+    env = {t.split("=", 1)[0]: t.split("=", 1)[1] for t in pairs}
+    return SeatEnv(True, env.get("ANTHROPIC_BASE_URL"), cwd, env.get("CLAUDE_CONFIG_DIR"))
+
+
+# ---- whose model the record speaks for ------------------------------------
+
+_MODEL_TAG = re.compile(r"\[[^\]]*\]$")   # `claude-x[1m]` names the same model as `claude-x`
+
+
+def _norm_model(value) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _MODEL_TAG.sub("", value.strip())
+
+
+def seat_model(env: SeatEnv, workspace) -> Optional[str]:
+    """The model the seat is running: its config dir's `settings.json` (what a
+    bare `claude` in that seat resolves), else `state/model-switch.json`. None
+    when neither says."""
+    candidates = []
+    if env.config_dir:
+        candidates.append(Path(env.config_dir) / "settings.json")
+    candidates.append(Path(workspace) / "state" / "model-switch.json")
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        model = _norm_model(data.get("model")) if isinstance(data, dict) else None
+        if model:
+            return model
+    return None
+
+
+def record_model(quota: Any) -> Optional[str]:
+    """The model of the request that last refreshed the record, if it says."""
+    payload = quota if isinstance(quota, dict) else {}
+    last = payload.get("last_request")
+    return _norm_model(last.get("model")) if isinstance(last, dict) else None
+
+
+def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
+    """True only when the seat's model and the record's are both known and equal.
+    A record refreshed on another model may say allowed while THIS seat's model
+    is limited, and the proxy's headers carry no per-model window to catch that
+    (measured: status, 5h, 7d, overage -- nothing per model), so unknown holds."""
+    mine, theirs = seat_model(env, workspace), record_model(quota)
+    return mine is not None and theirs is not None and mine == theirs
 
 
 # ---- refreshing a stale record on purpose ---------------------------------
 
-#: The cheapest model the CLI accepts; the probe exists to make ONE routed request.
-PROBE_MODEL = "claude-haiku-4-5-20251001"
 PROBE_TIMEOUT_S = 60
-#: Under state/: the last probe attempt, so four notifiers on one host send one probe per window.
+#: Under state/: the last probe attempt, so every notifier on one host sends one probe per window.
 PROBE_MARK = "quota-probe.last"
+
+
+def _launch_detached(argv, env, timeout, cwd=None):
+    """The default probe runner: start the request and return at once. The gate
+    holds on this poll; the next poll reads the record the proxy has refreshed."""
+    subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
+    """Take the marker under the shared file lock: two notifiers that both find it
+    stale serialize here, and only the first one out of the lock sends a probe.
+    The lock is a sibling file, because locking creates its file and the marker's
+    own mtime is the record being judged."""
+    from file_lock import locked_file
+    with locked_file(mark.with_name(mark.name + ".lock")):
+        try:
+            if at - mark.stat().st_mtime < fresh_sec:
+                return False
+        except OSError:
+            pass
+        mark.write_text(str(at), encoding="utf-8")
+        os.utime(mark, (at, at))
+        return True
 
 
 def probe_refreshes_record(workspace, base_url: Optional[str], now: Optional[float] = None,
                            fresh_sec: float = FRESH_SEC, runner: Optional[Callable] = None,
-                           model: str = PROBE_MODEL, timeout: float = PROBE_TIMEOUT_S) -> bool:
+                           timeout: float = PROBE_TIMEOUT_S, cwd: Optional[str] = None,
+                           config_dir: Optional[str] = None) -> bool:
     """Send one minimal request THROUGH the proxy so it rewrites the record, and
     say whether a probe was sent. The verdict is then read from the record, never
-    from the probe's exit code: a request the limit refuses still refreshes the
-    headers, and that refusal is the answer. Only toward a proxy address, and at
-    most once per `fresh_sec` host-wide -- the marker is claimed BEFORE sending,
-    so a slow probe cannot invite a second. Login state is the caller's environment."""
+    from the probe's outcome: a request the limit refuses still refreshes the
+    headers, and that refusal is the answer. No `--model`, and run in the seat's
+    own cwd and config dir: seats launch without a flag, so what a bare `claude`
+    resolves THERE is the seat's model, and a model-scoped limit on it shows in
+    the record this refreshes. Only toward
+    a proxy address, at most once per `fresh_sec` host-wide, and the marker is
+    claimed under a lock before the request goes out. Login state is the caller's."""
     if not points_at_credential_proxy(base_url):
         return False
     mark = Path(workspace) / "state" / PROBE_MARK
     at = time.time() if now is None else now
     try:
-        if at - mark.stat().st_mtime < fresh_sec:
+        if not _claim_probe_marker(mark, at, fresh_sec):
             return False
     except OSError:
-        pass
-    try:
-        mark.parent.mkdir(parents=True, exist_ok=True)
-        mark.write_text(str(at), encoding="utf-8")
-        os.utime(mark, (at, at))
-    except OSError:
         return False
-    run = runner or subprocess.run
+    run = runner or _launch_detached
+    env = dict(os.environ, ANTHROPIC_BASE_URL=str(base_url))
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
     try:
-        run(["claude", "-p", "ok", "--model", model],
-            env=dict(os.environ, ANTHROPIC_BASE_URL=str(base_url)),
-            capture_output=True, text=True, timeout=timeout)
+        run(["claude", "-p", "ok"], env=env, timeout=timeout, cwd=cwd)
     except (OSError, subprocess.SubprocessError):
         pass
     return True
-
 
 def provider_allows_now(workspace, socket_path: Optional[str], session: Optional[str],
                         now: Optional[float] = None, fresh_sec: float = FRESH_SEC,
                         tmux_runner: Optional[Callable] = None,
                         ps_runner: Optional[Callable] = None,
                         probe: bool = False, probe_runner: Optional[Callable] = None) -> bool:
-    """True only when a FRESH record says accepted AND the named seat is routed
-    through the proxy. Absent, stale, rejected, an unreadable record, an unobserved
-    or unrouted seat all answer False: silence never overrides a limit banner.
+    """True only when a FRESH record says accepted on EVERY window AND the named
+    seat is routed through the proxy. Absent, stale, rejected anywhere, an
+    unreadable record, an unobserved or unrouted seat all answer False: silence
+    never overrides a limit banner.
 
-    With `probe`, a record too old to vouch for a ROUTED seat is refreshed first by
-    one request through the proxy, then read again; the probe's own outcome is never
-    the verdict."""
+    With `probe`, a record that cannot vouch for a ROUTED seat -- absent, stale, or
+    last refreshed on another model -- is refreshed first by one request through the
+    proxy on the seat's own model, then read again; the probe's outcome is never the
+    verdict."""
     if not session:
         return False
     rec = read_quota_record(workspace, now)
@@ -308,14 +407,20 @@ def provider_allows_now(workspace, socket_path: Optional[str], session: Optional
         return False
     # An unobserved seat carries no base URL, so the decision reads it as unrouted.
     env = seat_env_base_url(socket_path, session, tmux_runner, ps_runner)
-    if probe and (rec is None or not rec.fresh(fresh_sec)) and points_at_credential_proxy(env.base_url):
-        if probe_refreshes_record(workspace, env.base_url, now, fresh_sec, runner=probe_runner):
+    # Absent, stale, or refreshed on another model: a record kept fresh by
+    # another seat's traffic would otherwise hold this seat forever.
+    cannot_vouch = (rec is None or not rec.fresh(fresh_sec)
+                    or not record_speaks_for_seat(rec.payload, env, workspace))
+    if probe and cannot_vouch and points_at_credential_proxy(env.base_url):
+        if probe_refreshes_record(workspace, env.base_url, now, fresh_sec, runner=probe_runner,
+                                  cwd=env.cwd, config_dir=env.config_dir):
             rec = read_quota_record(workspace, now)
     if rec is None:
         return False
     decision = availability_decision(rec.payload, base_url=env.base_url,
                                      stale=not rec.fresh(fresh_sec))
-    return bool(decision["available"])
+    return (bool(decision["available"]) and gate_windows_allowed(rec.payload)
+            and record_speaks_for_seat(rec.payload, env, workspace))
 
 
 if __name__ == "__main__":
