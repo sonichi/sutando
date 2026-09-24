@@ -718,6 +718,20 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertIn("sent=0 why=no-seat-model", self._log_lines()[0])
         self.assertEqual(calls, [])
 
+    def test_an_unclaimable_marker_is_logged_and_holds(self):
+        # The lock's own file cannot be opened (a directory sits at its path): no
+        # request goes out, the hold stands, and the log says why.
+        (self.ws / "state" / (qa.PROBE_MARK + ".lock")).mkdir()
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
+        self.assertEqual(calls, [])
+        self.assertIn("sent=0 why=marker-unwritable", self._log_lines()[0])
+
+    def test_a_record_with_no_usable_time_writes_no_re_read(self):
+        qa._log_reread(self.ws, SEAT, qa.QuotaRecord(_record(), None), qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW)
+        self.assertEqual(self._log_lines(), [])
+
     def test_an_unwritable_log_changes_nothing(self):
         # logs/ is a FILE here, so every append fails: the gate still probes and decides.
         (self.ws / "logs").write_text("not a directory")

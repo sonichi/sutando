@@ -410,21 +410,23 @@ def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> No
         pass
 
 
-def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
+def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> Optional[float]:
     """Take the marker under the shared file lock: two notifiers that both find it
     stale serialize here, and only the first one out of the lock sends a probe.
     The lock is a sibling file, because locking creates its file and the marker's
-    own mtime is the record being judged."""
+    own mtime is the record being judged. None when claimed; on refusal, the
+    holder's time, which names the window."""
     from file_lock import locked_file
     with locked_file(mark.with_name(mark.name + ".lock")):
         try:
-            if at - mark.stat().st_mtime < fresh_sec:
-                return False
+            held = mark.stat().st_mtime
+            if at - held < fresh_sec:
+                return held
         except OSError:
             pass
         mark.write_text(str(at), encoding="utf-8")
         os.utime(mark, (at, at))
-        return True
+        return None
 
 
 def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[str],
@@ -451,14 +453,11 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
         return False
     mark = Path(workspace) / "state" / PROBE_MARK
     try:
-        if not _claim_probe_marker(mark, at, fresh_sec):
-            # Once per window: the mark's own time is the dedup token.
-            try:
-                token = f"mark={int(mark.stat().st_mtime)}"
-            except OSError:
-                token = "mark=?"
-            _log_probe(workspace, at, once=token, seat=seat, model=model, sent=0, why="marker-fresh",
-                       mark=token.split("=", 1)[1], reason=why)
+        held = _claim_probe_marker(mark, at, fresh_sec)
+        if held is not None:
+            # Once per window: the holder's time is the dedup token.
+            _log_probe(workspace, at, once=f"mark={int(held)}", seat=seat, model=model, sent=0,
+                       why="marker-fresh", mark=int(held), reason=why)
             return False
     except OSError:
         _log_probe(workspace, at, seat=seat, model=model, sent=0, why="marker-unwritable", reason=why)
