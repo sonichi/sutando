@@ -7,9 +7,7 @@ one. The pool tick now ensures one per live worker seat, idempotently by its
 tmux session, spelled so the core launchers' liveness match (`--socket <sock>`)
 never mistakes a worker's watcher for the core's and skips starting it. A card
 raised with `--seat` names that seat and its terminal jump names its session;
-without it the core's card is unchanged. cli_wedge's work signal takes the same
-per-target scoping: `inbox=` counts that queue only and never reads the core's
-status.
+without it the core's card is unchanged.
 """
 import importlib.util
 import json
@@ -39,7 +37,6 @@ def _load(name, path):
 rem = _load("pool_remedy", SCRIPTS / "pool_remedy.py")
 wi = rem.wi
 ciw = _load("core_input_watch", REPO / "src" / "core-input-watch.py")
-import cli_wedge  # noqa: E402
 
 WID = "7c54b230a8d94ea9b86f52d70134ac68"
 SOCK = "/tmp/pool-input-watch-test.sock"
@@ -158,23 +155,6 @@ class SeatOnTheCard(unittest.TestCase):
         a = ciw.escalate(m, "blocked-human", "d", "selection", "Pick one:", NAME, seat="worker comm")
         b = ciw.escalate(m, "blocked-human", "d", "selection", "Pick one:", "sutando-worker-b", seat="worker b")
         self.assertNotEqual(a.id, b.id)
-
-
-class PerTargetWorkSignal(unittest.TestCase):
-    def test_inbox_scopes_the_queue_and_skips_the_core_status(self):
-        ws = Path(tempfile.mkdtemp(prefix="cli-wedge-inbox-"))
-        (ws / "state").mkdir()
-        (ws / "tasks").mkdir()
-        (ws / "tasks" / "task-1.txt").write_text("")
-        (ws / "state" / "core-status.json").write_text(json.dumps({"status": "running", "ts": 1000.0}))
-        inbox = ws / "deliveries" / "w1"
-        inbox.mkdir(parents=True)
-        self.assertTrue(cli_wedge.work_outstanding(ws, 1001.0)[0], "control: the core's own call")
-        self.assertEqual(cli_wedge.work_outstanding(ws, 1001.0, inbox=inbox), (False, ""))
-        (inbox / "task-9.txt").write_text("")
-        (inbox / "task-8.accepted").write_text("")
-        self.assertEqual(cli_wedge.work_outstanding(ws, 1001.0, inbox=inbox),
-                         (True, "1 queued task(s) in w1"))
 
 
 if __name__ == "__main__":

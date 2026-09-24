@@ -132,12 +132,12 @@ class InputWatchRefuses(unittest.TestCase):
 class ReadersSayUnknown(unittest.TestCase):
     def test_an_unreadable_queue_is_none(self):
         ws = pool()
-        orig = sup.pd.accepted
-        sup.pd.accepted = lambda *a: (_ for _ in ()).throw(OSError("EIO"))
+        orig = sup.td.owned_task_ids
+        sup.td.owned_task_ids = lambda *a: (_ for _ in ()).throw(sup.td.WorkerHoldUnreadable("EIO"))
         try:
-            self.assertIsNone(sup.work_outstanding(ws, WID, 1000.0))
+            self.assertIsNone(sup.work_outstanding(ws, WID))
         finally:
-            sup.pd.accepted = orig
+            sup.td.owned_task_ids = orig
 
     def test_an_empty_or_unrecognised_pane_is_unknown(self):
         self.assertEqual(sup.classify_pane_text(""), ps.PANE_UNKNOWN)

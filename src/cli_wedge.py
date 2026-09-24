@@ -543,17 +543,10 @@ def pane_identity(socket_path: str, target: str, tmux_bin: str = "tmux",
     return out if getattr(proc, "returncode", 1) == 0 and _PANE_ID.match(out) else None
 
 
-def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Optional[float] = None,
-                     inbox: Optional[Path] = None) -> tuple:
+def work_outstanding(workspace: Path, now: Optional[float] = None, ttl_s: Optional[float] = None) -> tuple:
     """True when the core says it is running AND said so recently, or a task file
     is queued. Same contract as graceful-restart.sh busy(): a "running" older
-    than the TTL is a crashed core's last word, not work.
-
-    `inbox` scopes the answer to one target's own queue: its `task-*.txt` entries
-    count, and the core's status, which belongs to another pane, is not read."""
-    if inbox is not None:
-        queued = list(Path(inbox).glob("task-*.txt"))
-        return (bool(queued), f"{len(queued)} queued task(s) in {Path(inbox).name}" if queued else "")
+    than the TTL is a crashed core's last word, not work."""
     now = time.time() if now is None else now
     ttl = PROVISIONAL_THRESHOLDS["status_ttl_s"] if ttl_s is None else ttl_s
     reasons = []

@@ -41,7 +41,7 @@ pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
-from delivery import pane_gate  # noqa: E402
+from delivery import pane_gate, task_dispatch as td  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -98,19 +98,13 @@ def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
     return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
 
 
-def work_outstanding(workspace, worker_id, now: float) -> bool | None:
-    """Does this worker owe work? Its queued sentinels (cli_wedge, scoped to its
-    inbox) or one it accepted and has not flagged done. None when unreadable."""
+def work_outstanding(workspace, worker_id) -> bool | None:
+    """Does this worker owe a reply? What task_dispatch says was handed to it, less
+    what already has a ready result (live or archived). None when undecidable."""
     try:
-        queued, _ = cw.work_outstanding(Path(workspace), now,
-                                        inbox=pd.deliveries_dir(workspace, worker_id))
-        if queued:
-            return True
-        for sentinel in pd.accepted(workspace, worker_id):
-            task_id = pd.parse_sentinel(sentinel.name)[0]
-            if not pd.is_done_flag(pd.done_flag(workspace, worker_id, task_id)):
-                return True
-        return False
+        owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+        results = pd.results_dir(workspace)
+        return any(not td.has_ready_result(results, f"{t}.txt") for t in owned)
     except (OSError, ValueError):
         return None
 
@@ -199,7 +193,7 @@ def observe(workspace, now: float, *, worker_ids=None,
             paused=is_paused(workspace, wid),
             watcher_beat=watcher_beat,
             watcher_held=held,
-            work_outstanding=work_outstanding(workspace, wid, now),
+            work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
         )

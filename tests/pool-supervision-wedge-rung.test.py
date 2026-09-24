@@ -136,13 +136,15 @@ inbox.mkdir(parents=True, exist_ok=True)
 (ws / "tasks" / "task-core-1.txt").write_text("the core's own queue")
 
 wo = getattr(sup, "work_outstanding", lambda *a: "missing")
-check("the core's queue is not this worker's work", wo(ws, WID, 1000.0), False)
+results = pd.results_dir(ws)
+results.mkdir(parents=True, exist_ok=True)
+check("the core's queue is not this worker's work", wo(ws, WID), False)
 (inbox / "task-a.txt").write_text("")
-check("a queued sentinel in its inbox is work", wo(ws, WID, 1000.0), True)
+check("a sentinel handed to it with no reply yet is work", wo(ws, WID), True)
 (inbox / "task-a.txt").rename(inbox / "task-a.accepted")
-check("an accepted sentinel with no done flag is work in flight", wo(ws, WID, 1000.0), True)
-pd.mark_done(ws, WID, "task-a", published=True)
-check("an accepted sentinel whose done flag exists is spent", wo(ws, WID, 1000.0), False)
+check("an accepted sentinel with no reply is work in flight", wo(ws, WID), True)
+(results / "task-a.txt").write_text("done\n")
+check("a sentinel whose reply is ready is spent, whatever its suffix", wo(ws, WID), False)
 
 # --- the observation: the pane, read by the core's readers ------------------------
 

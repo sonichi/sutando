@@ -283,10 +283,13 @@ evidence either way.
 **A live session that will not progress is the third rung.** A seat's session can
 answer alive while its pane holds a limit menu, a permission dialog, an error it
 parked on, or a turn whose frame never changes. Each tick reads that pane with the
-core's readers (`pane_gate`, `cli_wedge`) and the worker's own queue
-(`cli_wedge.work_outstanding` scoped to its inbox, plus accepted sentinels with no
-done flag). Only a worker that owes work is wedged; one at its prompt with work
-queued is the watcher rung's. The same sustain and lines apply: one
+core's readers (`pane_gate`, `cli_wedge`) and what the worker owes: the tasks
+`task_dispatch owned-by` says were handed to it, less those with a ready result,
+live or archived (the contract `check-pending-tasks.sh` uses; sentinels are never
+renamed or flagged done on a live pool, so their mere presence is not work). Only a
+worker that owes work is wedged; one at its prompt with work queued is the watcher
+rung's. "Frozen" compares the raw frame across ticks, so a static custom pane that
+owes work would read as stuck; a running Claude turn's timer keeps it changing. The same sustain and lines apply: one
 `restart_wedged` (end the session, resume the same conversation), then the owner.
 A gate or a limit is never restarted into, and the remedy re-reads the pane before
 acting: it escalates at the stale line instead. Every live seat also runs its own
