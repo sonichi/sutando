@@ -96,6 +96,75 @@ class TestPolicyUnchanged(unittest.TestCase):
         self.assertEqual(qa.availability_decision(_record("rejected", False), base_url=PROXY, stale=False)["unavailable_reason"], "rejected")
 
 
+class TestPerWindowRejection(unittest.TestCase):
+    """A per-model or weekly window can be rejected while the headline status
+    and the proxy's `available` flag both still read allowed -- the proxy only
+    sets `available:false` on an overall/5h rejection. The gate must hold on
+    ANY reported window's own rejection, not just the headline's."""
+
+    def test_quota_windows_pairs_each_utilization_with_its_own_status(self):
+        headers = {
+            "anthropic-ratelimit-unified-5h-utilization": "0.2",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+            "anthropic-ratelimit-unified-7d-utilization": "0.4",
+            "anthropic-ratelimit-unified-7d-status": "allowed",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+            "anthropic-ratelimit-unified-status": "allowed",  # not a -utilization key -> excluded
+        }
+        windows = qa.quota_windows(headers)
+        self.assertEqual(set(windows), {"5h", "7d", "7d_oi"})
+        self.assertEqual(windows["7d_oi"], (1.0, "rejected"))
+        self.assertEqual(windows["5h"], (0.2, "allowed"))
+
+    def test_a_rejected_7d_window_holds_even_with_an_allowed_headline_and_flag(self):
+        headers = {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-7d-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d-status": "rejected",
+        }
+        self.assertFalse(qa.resolve_available("allowed", True, headers))
+
+    def test_a_rejected_model_scoped_window_holds_too(self):
+        headers = {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.1",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+            "anthropic-ratelimit-unified-7d-utilization": "0.3",
+            "anthropic-ratelimit-unified-7d-status": "allowed",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+        }
+        self.assertFalse(qa.resolve_available("allowed", True, headers))
+
+    def test_no_rejected_window_is_unaffected(self):
+        headers = {
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.1",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+            "anthropic-ratelimit-unified-7d-utilization": "0.3",
+            "anthropic-ratelimit-unified-7d-status": "allowed",
+        }
+        self.assertTrue(qa.resolve_available("allowed", True, headers))
+
+    def test_headers_omitted_keeps_the_headline_only_contract(self):
+        # Back-compat: the two-arg call shape still decides on the headline
+        # status and the flag alone.
+        self.assertTrue(qa.resolve_available("allowed", True))
+        self.assertTrue(qa.resolve_available("allowed", True, None))
+        self.assertTrue(qa.resolve_available("allowed", True, {}))
+
+    def test_availability_decision_holds_on_a_rejected_non_headline_window(self):
+        rec = _record("allowed", True, headers={
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+        })
+        d = qa.availability_decision(rec, base_url=PROXY, stale=False)
+        self.assertFalse(d["available"])
+        self.assertEqual(d["unavailable_reason"], "rejected")
+
+
 class RecordFixture(unittest.TestCase):
     def setUp(self):
         self._t = tempfile.TemporaryDirectory()

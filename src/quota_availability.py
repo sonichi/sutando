@@ -49,9 +49,35 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
     )
 
 
-def resolve_available(status: str, proxy_available: Any) -> bool:
-    """Resolve the proxy's persisted availability signal without coercion."""
+def quota_windows(headers: dict) -> dict:
+    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
+    window, as (utilization or None, that window's own status or None)."""
+    out = {}
+    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
+    for k, v in headers.items():
+        if not (k.startswith(prefix) and k.endswith(suffix)):
+            continue
+        w = k[len(prefix):-len(suffix)]
+        try:
+            u = float(v)
+        except (TypeError, ValueError):
+            u = None
+        st = headers.get(f"{prefix}{w}-status")
+        out[w] = (u, str(st) if st is not None else None)
+    return out
+
+
+def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None) -> bool:
+    """Resolve the proxy's persisted availability signal without coercion.
+
+    `headers`, when given, gates on EVERY reported window, not just the
+    headline: the proxy's `available` flag only reflects the overall/5h
+    windows, so a per-model or weekly window (e.g. `7d_oi`) can be rejected
+    while the headline and `available` both still read allowed.
+    """
     if status == "rejected":
+        return False
+    if headers and any(st == "rejected" for _u, st in quota_windows(headers).values()):
         return False
     if isinstance(proxy_available, bool):
         return proxy_available
@@ -70,7 +96,7 @@ def availability_decision(
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     routed = points_at_credential_proxy(base_url)
-    accepted = resolve_available(str(status), payload.get("available"))
+    accepted = resolve_available(str(status), payload.get("available"), headers)
     available = accepted and routed and not stale
     return {
         "available": available,
