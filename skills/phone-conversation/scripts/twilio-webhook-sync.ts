@@ -28,6 +28,13 @@ export const TWILIO_SYNC_TIMEOUT_MS = 10_000;
 
 type OwnedNumber = { sid: string; voice_url?: string; status_callback?: string };
 
+// A ref'd timer: AbortSignal.timeout() unrefs its own, so with nothing else pending it never fires.
+function deadline(ms: number): { signal: AbortSignal; clear: () => void } {
+	const ctl = new AbortController();
+	const timer = setTimeout(() => ctl.abort(new DOMException(`no answer within ${ms} ms`, 'TimeoutError')), ms);
+	return { signal: ctl.signal, clear: () => clearTimeout(timer) };
+}
+
 export async function syncTwilioWebhook(creds: TwilioCreds, base: string, opts: SyncOptions = {}): Promise<SyncOutcome> {
 	const fetchImpl = opts.fetchImpl ?? fetch;
 	const timeoutMs = opts.timeoutMs ?? TWILIO_SYNC_TIMEOUT_MS;
@@ -37,10 +44,13 @@ export async function syncTwilioWebhook(creds: TwilioCreds, base: string, opts: 
 	const api = `https://api.twilio.com/2010-04-01/Accounts/${creds.sid}`;
 	const wantVoice = `${base}/twilio/connect`;
 	const wantStatus = `${base}/twilio/status`;
+	const call = async (url: string, init: RequestInit): Promise<Response> => {
+		const d = deadline(timeoutMs);
+		try { return await fetchImpl(url, { ...init, signal: d.signal }); } finally { d.clear(); }
+	};
 	try {
-		const list = await fetchImpl(`${api}/IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(creds.number)}`, {
+		const list = await call(`${api}/IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(creds.number)}`, {
 			headers: { Authorization: `Basic ${auth}` },
-			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!list.ok) { error(`[Twilio] webhook sync: list failed HTTP ${list.status}`); return 'skipped'; }
 		const data = await list.json() as { incoming_phone_numbers?: OwnedNumber[] };
@@ -51,11 +61,10 @@ export async function syncTwilioWebhook(creds: TwilioCreds, base: string, opts: 
 			return 'unchanged';
 		}
 		const form = new URLSearchParams({ VoiceUrl: wantVoice, VoiceMethod: 'POST', StatusCallback: wantStatus, StatusCallbackMethod: 'POST' });
-		const upd = await fetchImpl(`${api}/IncomingPhoneNumbers/${num.sid}.json`, {
+		const upd = await call(`${api}/IncomingPhoneNumbers/${num.sid}.json`, {
 			method: 'POST',
 			headers: { Authorization: `Basic ${auth}` },
 			body: form,
-			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!upd.ok) { error(`[Twilio] webhook sync: update failed HTTP ${upd.status}: ${(await upd.text()).slice(0, 200)}`); return 'skipped'; }
 		log(`[Twilio] webhook now ${wantVoice}`);

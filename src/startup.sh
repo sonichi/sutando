@@ -1199,13 +1199,11 @@ fi
 # 3 definitively absent), so `vault set TWILIO_ACCOUNT_SID` alone starts the phone server.
 twilio_creds_present() {
   local _rc=0
-  if [ -n "${PY:-}" ]; then
-    "$PY" "$REPO/src/channel_token.py" --has TWILIO_ACCOUNT_SID --env-file .env 2>/dev/null || _rc=$?
-    if [ "$_rc" -eq 0 ]; then return 0; fi
-    if [ "$_rc" -eq 3 ]; then return 1; fi
-  fi
-  # Resolver unavailable: anchored + non-empty, because the substring form matched the
-  # commented placeholder and opened a PUBLIC tunnel. Mirrors health-check twilio_configured().
+  "$PY" "$REPO/src/channel_token.py" --has TWILIO_ACCOUNT_SID --env-file .env 2>/dev/null || _rc=$?
+  if [ "$_rc" -eq 0 ]; then return 0; fi
+  if [ "$_rc" -eq 3 ]; then return 1; fi
+  # Resolver unavailable (an empty $PY included): anchored + non-empty, because the substring
+  # form matched the commented placeholder and opened a PUBLIC tunnel. Mirrors health-check twilio_configured().
   grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null
 }
 if [ "${SKIP_PHONE:-}" = "1" ]; then

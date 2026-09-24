@@ -219,6 +219,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
+- **`vault-secret.ts`** — Read a secret the owner stored with `vault set KEY …` from the Keychain item that src/vault_intercept.py writes (`security add-generic-password -a sutando -s KEY`).
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
 - **`vault_set_grammar.py`** — Pure, dependency-free `vault set KEY VALUE` grammar — regex + redact-only.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification

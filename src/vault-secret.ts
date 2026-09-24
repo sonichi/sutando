@@ -1,7 +1,6 @@
 /**
  * Read a secret the owner stored with `vault set KEY …` from the Keychain item
- * `security add-generic-password -a sutando -s KEY` that src/vault_intercept.py
- * writes (tests/twilio-setup.test.py pins the account name to that module).
+ * that src/vault_intercept.py writes (`security add-generic-password -a sutando -s KEY`).
  *
  * TypeScript twin of src/channel_token.py's vault tier: a service that reads
  * its credentials from process.env alone makes `vault set` a no-op for it.
