@@ -5460,64 +5460,14 @@ def core_env_has_proxy_url(
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
     """
-    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
-    if ps_runner is None:
-        def ps_runner(pid):
-            return subprocess.run(
-                ["ps", "eww", "-o", "command=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=15,
-            )
+    from quota_availability import seat_env_base_url  # src/ is on sys.path
     sock = socket_path or _local_core_socket()
     if not sock:
         return None                       # no live LOCAL core -> unknown, not a bypass
-    # `-s` = every pane in the SESSION, not just the current window's.
-    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
-    if panes is None or getattr(panes, "returncode", 1) != 0:
-        return None                       # no such session / tmux unavailable
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
-    if not pids:
-        return None
-    # Identify the core by argv, not by position: `--name <session>` is what
-    # start-cli.sh passes and no sibling window carries it.
-    #
-    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
-    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
-    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
-    # True where the contract is None). This is the SAME lookalike class as the
-    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
-    # axis and then introduced the identical hole on the session-name axis.
-    def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":  # the =-joined spelling
-                return True
-        return False
-
-    matches = []
-    for pid in pids:
-        try:
-            proc = ps_runner(pid)
-        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
-            return None
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            continue                      # this pane vanished; keep looking
-        out = proc.stdout or ""
-        if _names_this_session(out):
-            matches.append(out)
-    # Zero matches: the core is not in this session (or ps could not read any pane).
-    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
-    if len(matches) != 1:
-        return None
-    tokens = matches[0].split()
-    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
-    # is what keeps an unreadable env reporting None rather than an empty env.
-    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-    if not env_pairs:
-        return None
-    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
-
+    env = seat_env_base_url(sock, session,
+                            tmux_runner=tmux_runner or (lambda s, *a: _run_tmux(s, *a)),
+                            ps_runner=ps_runner)
+    return None if not env.observed else env.base_url is not None
 
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.

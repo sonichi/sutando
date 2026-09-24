@@ -143,8 +143,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
+- **`quota_availability.py`** — Shared authority for whether Claude quota telemetry is usable.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
-- **`quota_record.py`** — The credential proxy's quota record, read as one fact: did the provider allow requests at its last observation, and how long ago was that.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)

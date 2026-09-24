@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Shared authority for whether Claude quota telemetry is usable.
+
+Three readers interpret the same workspace state -- the credential proxy's
+`state/quota-state.json` -- so the policy lives here and each reader calls it:
+the quota tools (`skills/quota-tracker`, `skills/proactive-loop`), health-check,
+and the delivery gate (`src/delivery/pane_gate.py`).
+
+The record is the provider's own statement, refreshed by real traffic, but it
+only speaks for a seat whose requests go THROUGH the proxy: a fresh `allowed`
+written by some other process says nothing about an unrouted seat. So the one
+decision is routed AND fresh AND accepted, never any of those alone.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+from urllib.parse import urlparse
+
+from workspace_default import status_read_path
+
+PROXY_PORT = 7846
+PROXY_SCHEME = "http"
+PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def points_at_credential_proxy(base_url: "str | None") -> bool:
+    """Return whether *base_url* targets this host's credential proxy."""
+    if not base_url:
+        return False
+    try:
+        parsed = urlparse(base_url if "//" in base_url else "//" + base_url)
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except ValueError:
+        return False
+    scheme = (parsed.scheme or PROXY_SCHEME).lower()
+    return (
+        scheme == PROXY_SCHEME
+        and host in PROXY_HOSTS
+        and port == PROXY_PORT
+    )
+
+
+def resolve_available(status: str, proxy_available: Any) -> bool:
+    """Resolve the proxy's persisted availability signal without coercion."""
+    if status == "rejected":
+        return False
+    if isinstance(proxy_available, bool):
+        return proxy_available
+    return status == "allowed"
+
+
+def availability_decision(
+    quota: Any,
+    *,
+    base_url: "str | None",
+    stale: bool,
+) -> dict[str, Any]:
+    """Return the one authoritative routed/fresh/accepted quota decision."""
+    payload = quota if isinstance(quota, dict) else {}
+    headers = payload.get("headers")
+    headers = headers if isinstance(headers, dict) else {}
+    status = headers.get("anthropic-ratelimit-unified-status", "unknown")
+    routed = points_at_credential_proxy(base_url)
+    accepted = resolve_available(str(status), payload.get("available"))
+    available = accepted and routed and not stale
+    return {
+        "available": available,
+        "routed": routed,
+        "status": status,
+        "unavailable_reason": (
+            None if available
+            else "not-routed" if not routed
+            else "stale" if stale
+            else "rejected"
+        ),
+    }
+
+
+# ---- the record on disk ---------------------------------------------------
+
+#: A limit can begin at any moment, so only a RECENT observation vouches for now.
+#: Health-check's six-hour horizon asks "is the proxy wired"; this asks "is it lifted".
+FRESH_SEC = 10 * 60
+
+
+@dataclass(frozen=True)
+class QuotaRecord:
+    payload: dict
+    age_s: Optional[float]    # None: no usable timestamp on the record
+
+    def fresh(self, fresh_sec: float = FRESH_SEC) -> bool:
+        return self.age_s is not None and 0 <= self.age_s <= fresh_sec
+
+
+def _parse_when(value) -> Optional[float]:
+    """An ISO-8601 timestamp (the proxy writes `...Z`) as epoch seconds, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                dt = datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaRecord]:
+    """The record at `<workspace>/state/quota-state.json`, or None when absent or
+    unreadable. Never raises: every caller is on a path that must fail closed."""
+    path = status_read_path("quota-state.json", Path(workspace))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    when = _parse_when(data.get("last_checked"))
+    if when is None:
+        try:
+            when = path.stat().st_mtime
+        except OSError:
+            when = None
+    at = time.time() if now is None else now
+    return QuotaRecord(data, None if when is None else at - when)
+
+
+# ---- the running seat's routing -------------------------------------------
+
+@dataclass(frozen=True)
+class SeatEnv:
+    observed: bool            # False: the environment could not be read -- unknown, not a bypass
+    base_url: Optional[str]   # ANTHROPIC_BASE_URL as the process carries it; None when absent
+
+
+def _run_tmux(socket_path: str, *args: str, tmux_bin: str = "tmux"):
+    try:
+        return subprocess.run([tmux_bin, "-S", socket_path, *args],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _run_ps(pid: str):
+    return subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                          capture_output=True, text=True, timeout=15)
+
+
+_ENV_PAIR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def seat_env_base_url(socket_path: Optional[str], session: str,
+                      tmux_runner: Optional[Callable] = None,
+                      ps_runner: Optional[Callable] = None) -> SeatEnv:
+    """ANTHROPIC_BASE_URL as the RUNNING seat carries it, read from its process.
+
+    The pid comes from tmux, never `pgrep -f` (which matches any argv holding the
+    string, this probe's own shell included). EVERY pane of the session is
+    enumerated, because the runtime keeps sibling windows in one session and
+    `list-panes -t` resolves to the current window; the seat is the one process
+    whose argv carries `--name <session>`, which is how the launcher starts it.
+    Zero or several matches, no readable environment, no such session: unobserved.
+    """
+    tmux_runner = tmux_runner or _run_tmux
+    ps_runner = ps_runner or _run_ps
+    if not socket_path:
+        return SeatEnv(False, None)
+    panes = tmux_runner(socket_path, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
+    if panes is None or getattr(panes, "returncode", 1) != 0:
+        return SeatEnv(False, None)
+    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
+    if not pids:
+        return SeatEnv(False, None)
+
+    def _names_this_session(argv: str) -> bool:
+        toks = argv.split()
+        for i, t in enumerate(toks):
+            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
+                return True
+            if t == f"--name={session}":
+                return True
+        return False
+
+    matches = []
+    for pid in pids:
+        try:
+            proc = ps_runner(pid)
+        except Exception:  # noqa: BLE001 -- a probe failure is unknown
+            return SeatEnv(False, None)
+        if proc is None or getattr(proc, "returncode", 1) != 0:
+            continue
+        out = proc.stdout or ""
+        if _names_this_session(out):
+            matches.append(out)
+    if len(matches) != 1:
+        return SeatEnv(False, None)
+    pairs = [t for t in matches[0].split() if _ENV_PAIR.match(t)]
+    if not pairs:
+        return SeatEnv(False, None)
+    for t in pairs:
+        if t.startswith("ANTHROPIC_BASE_URL="):
+            return SeatEnv(True, t[len("ANTHROPIC_BASE_URL="):])
+    return SeatEnv(True, None)
+
+
+# ---- refreshing a stale record on purpose ---------------------------------
+
+#: The cheapest model the CLI accepts; the probe exists to make ONE routed request.
+PROBE_MODEL = "claude-haiku-4-5-20251001"
+PROBE_TIMEOUT_S = 60
+#: Under state/: the last probe attempt, so four notifiers on one host send one probe per window.
+PROBE_MARK = "quota-probe.last"
+
+
+def probe_refreshes_record(workspace, base_url: Optional[str], now: Optional[float] = None,
+                           fresh_sec: float = FRESH_SEC, runner: Optional[Callable] = None,
+                           model: str = PROBE_MODEL, timeout: float = PROBE_TIMEOUT_S) -> bool:
+    """Send one minimal request THROUGH the proxy so it rewrites the record, and
+    say whether a probe was sent. The verdict is then read from the record, never
+    from the probe's exit code: a request the limit refuses still refreshes the
+    headers, and that refusal is the answer. Only toward a proxy address, and at
+    most once per `fresh_sec` host-wide -- the marker is claimed BEFORE sending,
+    so a slow probe cannot invite a second. Login state is the caller's environment."""
+    if not points_at_credential_proxy(base_url):
+        return False
+    mark = Path(workspace) / "state" / PROBE_MARK
+    at = time.time() if now is None else now
+    try:
+        if at - mark.stat().st_mtime < fresh_sec:
+            return False
+    except OSError:
+        pass
+    try:
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text(str(at), encoding="utf-8")
+        os.utime(mark, (at, at))
+    except OSError:
+        return False
+    run = runner or subprocess.run
+    try:
+        run(["claude", "-p", "ok", "--model", model],
+            env=dict(os.environ, ANTHROPIC_BASE_URL=str(base_url)),
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return True
+
+
+def provider_allows_now(workspace, socket_path: Optional[str], session: Optional[str],
+                        now: Optional[float] = None, fresh_sec: float = FRESH_SEC,
+                        tmux_runner: Optional[Callable] = None,
+                        ps_runner: Optional[Callable] = None,
+                        probe: bool = False, probe_runner: Optional[Callable] = None) -> bool:
+    """True only when a FRESH record says accepted AND the named seat is routed
+    through the proxy. Absent, stale, rejected, an unreadable record, an unobserved
+    or unrouted seat all answer False: silence never overrides a limit banner.
+
+    With `probe`, a record too old to vouch for a ROUTED seat is refreshed first by
+    one request through the proxy, then read again; the probe's own outcome is never
+    the verdict."""
+    if not session:
+        return False
+    rec = read_quota_record(workspace, now)
+    if rec is None and not probe:
+        return False
+    # An unobserved seat carries no base URL, so the decision reads it as unrouted.
+    env = seat_env_base_url(socket_path, session, tmux_runner, ps_runner)
+    if probe and (rec is None or not rec.fresh(fresh_sec)) and points_at_credential_proxy(env.base_url):
+        if probe_refreshes_record(workspace, env.base_url, now, fresh_sec, runner=probe_runner):
+            rec = read_quota_record(workspace, now)
+    if rec is None:
+        return False
+    decision = availability_decision(rec.payload, base_url=env.base_url,
+                                     stale=not rec.fresh(fresh_sec))
+    return bool(decision["available"])
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(prog="quota_availability")
+    ap.add_argument("--workspace", default=None)
+    ap.add_argument("--socket", default=None)
+    ap.add_argument("--session", default="sutando-core")
+    ap.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    a = ap.parse_args()
+    ws = a.workspace
+    if ws is None:
+        from workspace_default import resolve_workspace
+        ws = resolve_workspace()
+    rec = read_quota_record(ws)
+    env = seat_env_base_url(a.socket, a.session)
+    if rec is None:
+        print("quota-availability: record absent or unreadable")
+        raise SystemExit(2)
+    d = availability_decision(rec.payload, base_url=env.base_url, stale=not rec.fresh())
+    age = "unknown age" if rec.age_s is None else f"{int(rec.age_s)}s old"
+    print(f"quota-availability: status={d['status']} {age} fresh={rec.fresh()} "
+          f"seat={'unobserved' if not env.observed else (env.base_url or '<no base url>')} "
+          f"routed={d['routed']} -> {'available' if d['available'] else d['unavailable_reason']}")
+    raise SystemExit(0 if provider_allows_now(ws, a.socket, a.session, probe=a.probe) else 1)

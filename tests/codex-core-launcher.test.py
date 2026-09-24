@@ -76,6 +76,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/pane_gate.py",
+            # pane_gate consults the proxy's quota record through this authority.
+            "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
