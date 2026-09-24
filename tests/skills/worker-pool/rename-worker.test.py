@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
+
 import pool_sessions  # noqa: E402
 import rename_worker as rw  # noqa: E402
 
