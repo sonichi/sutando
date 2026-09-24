@@ -1,5 +1,5 @@
 name: scratch-4568-probe
-on: workflow_dispatch
+on: pull_request
 
 jobs:
   isolated:
