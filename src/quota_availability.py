@@ -50,14 +50,25 @@ def points_at_credential_proxy(base_url: "str | None") -> bool:
 
 
 def quota_windows(headers: dict) -> dict:
-    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
-    window, as (utilization or None, that window's own status or None)."""
+    """Every window the proxy reported, keyed by window, as (utilization or None,
+    that window's own status or None). A window is named by its `-utilization`
+    header OR its `-status` header: a rejected status can arrive with no
+    utilization, and a scan keyed on utilization alone would never see it.
+    The headline `-status` is not a window."""
     out = {}
-    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
-    for k, v in headers.items():
-        if not (k.startswith(prefix) and k.endswith(suffix)):
+    prefix = "anthropic-ratelimit-unified-"
+    names = []
+    for k in headers:
+        if not k.startswith(prefix):
             continue
-        w = k[len(prefix):-len(suffix)]
+        rest = k[len(prefix):]
+        for suffix in ("-utilization", "-status"):
+            if rest.endswith(suffix):
+                w = rest[:-len(suffix)]
+                if w and w not in names:
+                    names.append(w)
+    for w in names:
+        v = headers.get(f"{prefix}{w}-utilization")
         try:
             u = float(v)
         except (TypeError, ValueError):
@@ -65,6 +76,12 @@ def quota_windows(headers: dict) -> dict:
         st = headers.get(f"{prefix}{w}-status")
         out[w] = (u, str(st) if st is not None else None)
     return out
+
+
+def limit_windows(headers: dict) -> dict:
+    """`quota_windows` minus `overage`: overage is purchase eligibility, not a
+    limit. The live record carries it rejected while the account is fully allowed."""
+    return {w: v for w, v in quota_windows(headers).items() if w != "overage"}
 
 
 def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None) -> bool:
@@ -77,7 +94,7 @@ def resolve_available(status: str, proxy_available: Any, headers: Optional[dict]
     """
     if status == "rejected":
         return False
-    if headers and any(st == "rejected" for _u, st in quota_windows(headers).values()):
+    if headers and any(st == "rejected" for _u, st in limit_windows(headers).values()):
         return False
     if isinstance(proxy_available, bool):
         return proxy_available
@@ -111,29 +128,19 @@ def availability_decision(
     }
 
 
-#: Every `anthropic-ratelimit-unified-<window>-status` header, and the bare
-#: `-status`; `overage-status` is overage-purchase eligibility, not a window.
-_WINDOW_STATUS = re.compile(r"^anthropic-ratelimit-unified-(?:([0-9a-z_]+)-)?status$")
-
-
 def gate_windows_allowed(quota: Any) -> bool:
     """The DELIVERY GATE's stricter reading, on top of `availability_decision`:
-    every window the proxy reported must be exactly `allowed`. A record that is
-    `allowed` overall with one window `rejected` -- what a cheap probe writes
-    for a seat that hit a model-scoped limit -- or any `allowed_warning`, holds.
-    No window headers at all is silence, and silence holds."""
+    the headline and every window `quota_windows` reports must be exactly
+    `allowed`. `resolve_available` already refuses a rejected window; this also
+    refuses `allowed_warning`, and a record with no headline at all is silence,
+    and silence holds."""
     payload = quota if isinstance(quota, dict) else {}
     headers = payload.get("headers")
     headers = headers if isinstance(headers, dict) else {}
-    seen = False
-    for key, value in headers.items():
-        m = _WINDOW_STATUS.match(str(key))
-        if not m or m.group(1) == "overage":
-            continue
-        seen = True
-        if value != "allowed":
-            return False
-    return seen
+    headline = headers.get("anthropic-ratelimit-unified-status")
+    if headline != "allowed":
+        return False
+    return all(st in (None, "allowed") for _u, st in limit_windows(headers).values())
 
 
 # ---- the record on disk ---------------------------------------------------

@@ -335,7 +335,10 @@ class TestProviderAllowsNow(RecordFixture):
         for window in ("5h", "7d", "7d_oi"):
             rec = _record("allowed", True)
             rec["headers"][f"anthropic-ratelimit-unified-{window}-status"] = "rejected"
-            self.assertTrue(qa.availability_decision(rec, base_url=PROXY, stale=False)["available"], window)
+            # The policy refuses it too now (resolve_available reads every window),
+            # and the gate agrees; a status with no utilization header still counts.
+            self.assertFalse(qa.availability_decision(rec, base_url=PROXY, stale=False)["available"], window)
+            self.assertFalse(qa.gate_windows_allowed(rec), window)
             self.write(rec)
             self.assertFalse(self._allows(), window)
 
