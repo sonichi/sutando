@@ -248,10 +248,14 @@ unless the ask names another (then pass `account` to composio_exec, as in Rules)
   mapletyres@gmail.com from now on": run `set-default <slug> <account>` (label, part of it, or
   id). Exit 0: say "<App> now uses <label> by default." Exit 1 with `reason: ambiguous`: name the
   `candidates` and ask which. Exit 1 with `no_match` or `none`: that account is not connected,
-  so offer to add it (next bullet). Exit 2 `unsupported`: the cloud has no defaults yet; say so.
+  so offer to add it (next bullet). Exit 1 with `no_id`: the account is there but the cloud gave
+  it no id, so you cannot change it; say "Pick the default in Settings → Integrations → <App>."
+  Exit 2 `unsupported`: the cloud has no defaults yet; say so. Exit 2 `cloud_error` (a 404, or
+  409 `not_active`: the account went away between the read and the write): run `status <slug>`
+  and tell the owner which accounts are still connected, then ask again.
 - "Add my other Gmail", "connect a second Slack": no card and no switch. Tell them: "Settings →
-  Apps → Integrations → <App> → Add account", then ask which one should be the default once it
-  is there. A switch card (Step 3c) replaces the current account; adding keeps both.
+  Integrations → <App> → Add account", then ask which one should be the default once it is
+  there. A switch card (Step 3c) replaces the current account; adding keeps both.
 
 ## Step 3c: switch an app to another account
 
