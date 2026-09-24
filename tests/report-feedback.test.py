@@ -601,7 +601,8 @@ class TestAskFirst(unittest.TestCase):
         repo = Path(__file__).resolve().parent.parent
         sys.path.insert(0, str(repo / "src"))
         from skill_hooks import discover
-        hooks = [r for r in discover(repo) if r[1] == "apply-clicks.py"]
+        # discover()'s marker is skills/<name>/<relative-command>, not the basename.
+        hooks = [r for r in discover(repo) if r[1] == "skills/report-feedback/hooks/apply-clicks.py"]
         self.assertEqual([h[0] for h in hooks], ["Stop"])
         spec = importlib.util.spec_from_file_location("apply_clicks_hook", repo / "skills" / "report-feedback" / "hooks" / "apply-clicks.py")
         h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)

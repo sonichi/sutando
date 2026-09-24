@@ -102,7 +102,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
 - **`inline-tools.ts`** — Inline tools — lightweight platform actions that execute instantly without going through the core agent.
 - **`install-channel-bridge-launchd.sh`** — Install / uninstall / inspect a launchd-supervised channel bridge.
-- **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
+- **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned core-session Claude Code hooks (PreCompact + SessionEnd + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.

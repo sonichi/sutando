@@ -384,6 +384,32 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
     _migrate_script_sentinels_present=1
   fi
 
+  # A per-source sentinel means the copy succeeded, not that the hook bridge
+  # did -- consult its retry marker before treating sentinels as "done".
+  _hook_bridge_retry_marker="${_ws_new}/state/.hook-bridge-retry-needed"
+  if [ -n "$_ws_new" ] && [ -f "$_hook_bridge_retry_marker" ]; then
+    echo "⚠️  a previous migration's hook bridge failed — retrying (bash src/install-claude-hooks.sh)" >&2
+    # Replay the original attempt's archive-consent decision -- a bare retry
+    # would default to "omit" and silently re-add archiving for a run that
+    # never opted in (or vice versa) regardless of what the operator chose.
+    _retry_archive_opted_in="$(sed -n 's/^archive_opted_in=//p' "$_hook_bridge_retry_marker" 2>/dev/null | tail -1)"
+    if [ "$_retry_archive_opted_in" = "1" ]; then
+      _retry_rc=0; bash "$REPO/src/install-claude-hooks.sh" || _retry_rc=$?
+    else
+      _retry_rc=0; SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" || _retry_rc=$?
+    fi
+    if [ "$_retry_rc" -eq 0 ]; then
+      rm -f "$_hook_bridge_retry_marker"
+      echo "✅ hook bridge retry succeeded — marker cleared." >&2
+    else
+      # Matches this file's own documented invariant above: a failed hook
+      # bridge means split state, and startup must not proceed with it.
+      echo "❌ hook bridge retry failed again — aborting (core hooks would be incomplete)." >&2
+      echo "   Diagnose manually: bash src/install-claude-hooks.sh" >&2
+      exit 1
+    fi
+  fi
+
   if [ -n "$_ws_new" ] && [ ! -f "$_migrate_sentinel" ] \
      && [ "$_migrate_script_sentinels_present" = "0" ] \
      && [ -d "$_ws_legacy" ] && [ -n "$(ls -A "$_ws_legacy" 2>/dev/null)" ]; then

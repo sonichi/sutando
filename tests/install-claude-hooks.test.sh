@@ -13,6 +13,10 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$HERE/../src/install-claude-hooks.sh"
 
+# Same shq() the installer uses (src/install-claude-hooks.sh) — a fixture that
+# quotes a path its own way tests a shape the installer never actually emits.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 pass=0; fail=0
 ok() {  # ok <name> <condition-rc>
     if [ "$2" = 0 ]; then echo "ok   $1"; pass=$((pass+1))
@@ -27,7 +31,7 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks test.XXXXXX")"
 # invocation below must run against a throwaway home, not the developer's.
 export HOME="$ROOT/home"; mkdir -p "$HOME"
 REPO="$ROOT/repo with spaces"
-mkdir -p "$REPO/src" "$REPO/.claude"
+mkdir -p "$REPO/src" "$REPO/.claude" "$REPO/workspace/.claude-sutando"
 cp "$INSTALLER" "$REPO/src/install-claude-hooks.sh"
 # Stub the hook targets so an executed command can prove WHICH file it reached.
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n'      > "$REPO/src/session-handoff.sh"
@@ -36,7 +40,11 @@ printf '#!/bin/bash\necho "PENDING-RAN"\n'      > "$REPO/src/check-pending-tasks
 # than stubbing: a stub would assert the hook string, not that it archives.
 cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$REPO/src/"
 chmod +x "$REPO/src/"*.sh
-SETTINGS="$REPO/.claude/settings.json"
+# The installer writes to the CORE's config dir. With no scripts/ in the
+# fixture, its resolver falls back to <repo>/workspace/.claude-sutando.
+SETTINGS="$REPO/workspace/.claude-sutando/settings.json"
+LEGACY_SETTINGS="$REPO/.claude/settings.json"
+ARCHIVE_DIR="$REPO/workspace/logs/conversations"
 
 # Seed the legacy state a real install would have: Desktop-hardcoded hooks plus
 # the transcript-archive hook, which must SURVIVE (it legitimately points at
@@ -58,6 +66,7 @@ cat > "$SETTINGS" <<'JSON'
   }
 }
 JSON
+cp "$SETTINGS" "$LEGACY_SETTINGS"   # pre-move install: same hooks at project level
 
 OUT1="$(bash "$REPO/src/install-claude-hooks.sh" 2>&1)"; RC1=$?
 ok "installer exits 0 on a path with spaces" "$([ $RC1 = 0 ] && echo 0 || echo 1)"
@@ -89,16 +98,16 @@ ok "PreCompact handoff stored command executes the intended script" \
 # assertion that matters is not "the directory exists" but "the stored command
 # executed by a shell actually archives a file" — the same standard as above.
 ok "installer created the archive hook's destination directory" \
-   "$([ -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+   "$([ -d "$ARCHIVE_DIR" ] && echo 0 || echo 1)"
 
-AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
+AR_CMD="$(cmds PreCompact | grep logs/conversations || true)"
 printf 'transcript\n' > "$ROOT/transcript.jsonl"
 # Drive it the way Claude Code does — transcript_path on stdin JSON, no env var.
 # Feeding $TRANSCRIPT_PATH instead passed only while the legacy `cp` co-existed.
 printf '{"transcript_path": "%s"}' "$ROOT/transcript.jsonl" \
   | bash -c "$AR_CMD" >/dev/null 2>&1
 ok "PreCompact archive stored command actually writes a transcript" \
-   "$([ "$(ls "$HOME/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+   "$([ "$(ls "$ARCHIVE_DIR" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
 
 # --- 2. legacy Desktop repo hooks are migrated away -------------------------
 ok "legacy Desktop session-handoff hook removed (PreCompact)" \
@@ -112,7 +121,7 @@ ok "legacy Desktop check-pending-tasks hook removed (Stop)" \
 # The fixture seeds the legacy bare-`cp` archiver, which this PR migrates rather
 # than sweeps — so name the surviving form, or the grep passes on either one.
 ok "an archive hook on PreCompact, in the archive-transcript.sh form" \
-   "$(cmds PreCompact | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
+   "$(cmds PreCompact | grep -q 'archive-transcript\.sh.*logs/conversations' && echo 0 || echo 1)"
 ok "operator-added unrelated hook preserved" \
    "$(cmds Stop | grep -q 'operator-added-keepme' && echo 0 || echo 1)"
 
@@ -121,6 +130,26 @@ ok "exactly one SessionEnd handoff hook (no old+new double-fire)" \
    "$([ "$(cmds SessionEnd | grep -c session-handoff)" = 1 ] && echo 0 || echo 1)"
 ok "exactly one Stop pending-tasks hook" \
    "$([ "$(cmds Stop | grep -c check-pending-tasks)" = 1 ] && echo 0 || echo 1)"
+
+# --- 4b. the pre-move project-level copy is cleaned up -----------------------
+# These hooks are core-only, but project-level settings fire for EVERY session
+# with this cwd. Leaving the old copy behind would keep conscripting guests and
+# double-register the core, so a re-run must sweep it — without touching hooks
+# the operator added there.
+legacy_cmds() {
+    jq -r --arg e "$1" '(.hooks // {})[$e] // [] | map(.hooks // []) | flatten | map(.command) | .[]' \
+       "$LEGACY_SETTINGS" 2>/dev/null
+}
+ok "project-level Stop hook removed from the pre-move settings" \
+   "$(legacy_cmds Stop | grep -q 'check-pending-tasks' && echo 1 || echo 0)"
+ok "project-level session-handoff hooks removed (PreCompact)" \
+   "$(legacy_cmds PreCompact | grep -q 'session-handoff' && echo 1 || echo 0)"
+ok "project-level session-handoff hooks removed (SessionEnd)" \
+   "$(legacy_cmds SessionEnd | grep -q 'session-handoff' && echo 1 || echo 0)"
+ok "project-level archiver removed from the pre-move settings" \
+   "$(legacy_cmds PreCompact | grep -q 'sutando-conversations' && echo 1 || echo 0)"
+ok "operator's own hook in the project settings survives the move" \
+   "$(legacy_cmds Stop | grep -q 'operator-added-keepme' && echo 0 || echo 1)"
 
 # --- 5. re-run is idempotent ------------------------------------------------
 BEFORE="$(cat "$SETTINGS")"
@@ -192,13 +221,18 @@ ok "and ours is still the one that actually executes" \
 
 # A stale INSTALLER-SHAPED entry from a different clone must still be swept —
 # the fix must not be "stop sweeping", it must be "sweep only our own shapes".
+# Properly quoted (shq() has quoted every installer-written path for a long
+# time now, on any clone) — an UNQUOTED path containing literal spaces is a
+# different, narrower scenario (this clone's own pre-shq legacy form, covered
+# by the "unquoted stale variant" checks above via its known $REPO_DIR), not
+# a realistic shape for a different clone's installer output.
 python3 - "$SETTINGS" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 d["hooks"]["SessionEnd"][0]["hooks"].append(
     {"type": "command",
-     "command": 'bash /a different clone/src/session-handoff.sh "$TRANSCRIPT_PATH"'})
+     "command": "bash '/a different clone/src/session-handoff.sh' \"$TRANSCRIPT_PATH\""})
 json.dump(d, open(p, "w"), indent=2)
 PY
 bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
@@ -206,6 +240,27 @@ ok "another clone's installer-shaped entry is still swept" \
    "$(cmds SessionEnd | grep -q 'a different clone' && echo 1 || echo 0)"
 ok "sweeping it did not take the operator hooks with it" \
    "$([ "$(cmds SessionEnd | grep -cE -- '--verbose|echo custom|env FOO=1')" = 3 ] && echo 0 || echo 1)"
+
+# An operator's OWN hook using an unexpanded shell-variable path prefix must
+# survive — its double-quoted argv[1] contains our marker as a plain substring
+# even though nothing here wrote it. #4309 review round 6 (keweichen,
+# 2026-09-16): candidate_is_owned() accepted any argv[1] containing the
+# marker with no check that it is shaped like something WE could have
+# written; repro `bash "$CUSTOM_ROOT/src/session-handoff.sh" "$TRANSCRIPT_PATH"`.
+python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["SessionEnd"][0]["hooks"].append(
+    {"type": "command",
+     "command": 'bash "$CUSTOM_ROOT/src/session-handoff.sh" "$TRANSCRIPT_PATH"'})
+json.dump(d, open(p, "w"), indent=2)
+PY
+bash "$REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "operator's own \$VAR-prefixed hook survives the sweep" \
+   "$(cmds SessionEnd | grep -qF 'CUSTOM_ROOT' && echo 0 || echo 1)"
+ok "and our own hook is still the one that actually executes" \
+   "$([ "$(TRANSCRIPT_PATH=/dev/null bash -c "$(cmds SessionEnd | grep session-handoff | grep -vE -- '--verbose|echo custom|env FOO=1|CUSTOM_ROOT')" 2>&1)" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
 # --- 8. a checkout path containing an APOSTROPHE ----------------------------
 # An apostrophe is legal in a path, and `shq` escapes it as '\'' — so any
@@ -215,7 +270,7 @@ ok "sweeping it did not take the operator hooks with it" \
 # Fixture path has a space AND an apostrophe on purpose.
 AROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks apos.XXXXXX")"
 AREPO="$AROOT/repo'quote with spaces"
-mkdir -p "$AREPO/src" "$AREPO/.claude"
+mkdir -p "$AREPO/src" "$AREPO/.claude" "$AREPO/workspace/.claude-sutando"
 cp "$INSTALLER" "$AREPO/src/install-claude-hooks.sh"
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$AREPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$AREPO/src/check-pending-tasks.sh"
@@ -223,7 +278,7 @@ chmod +x "$AREPO/src/"*.sh
 echo '{}' > "$AREPO/.claude/settings.json"
 bash "$AREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 
-export A_SETTINGS="$AREPO/.claude/settings.json" A_REPO="$AREPO"
+export A_SETTINGS="$AREPO/workspace/.claude-sutando/settings.json" A_REPO="$AREPO"
 # Seed the prior UNQUOTED installer variant, exactly as an older revision wrote it.
 python3 - <<'PY'
 import json, os
@@ -263,7 +318,7 @@ rm -rf "$AROOT"
 # while `$HOME/…`, which the legacy migration depends on, still qualifies.
 BROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks flag.XXXXXX")"
 BREPO="$BROOT/repo with spaces"
-mkdir -p "$BREPO/src" "$BREPO/.claude"
+mkdir -p "$BREPO/src" "$BREPO/.claude" "$BREPO/workspace/.claude-sutando"
 cp "$INSTALLER" "$BREPO/src/install-claude-hooks.sh"
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$BREPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$BREPO/src/check-pending-tasks.sh"
@@ -271,7 +326,7 @@ chmod +x "$BREPO/src/"*.sh
 echo '{}' > "$BREPO/.claude/settings.json"
 bash "$BREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 
-export B_SETTINGS="$BREPO/.claude/settings.json" B_REPO="$BREPO"
+export B_SETTINGS="$BREPO/workspace/.claude-sutando/settings.json" B_REPO="$BREPO"
 python3 - <<'PY'
 import json, os
 p = os.environ['B_SETTINGS']; repo = os.environ['B_REPO']
@@ -316,12 +371,12 @@ rm -rf "$BROOT"
 # variable matched "our shape" and was deleted and replaced on re-run.
 CROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks archive.XXXXXX")"
 CREPO="$CROOT/repo with spaces"
-mkdir -p "$CREPO/src" "$CREPO/.claude"
+mkdir -p "$CREPO/src" "$CREPO/.claude" "$CREPO/workspace/.claude-sutando"
 cp "$INSTALLER" "$CREPO/src/install-claude-hooks.sh"
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$CREPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$CREPO/src/check-pending-tasks.sh"
 chmod +x "$CREPO/src/"*.sh
-export C_SETTINGS="$CREPO/.claude/settings.json"
+export C_SETTINGS="$CREPO/workspace/.claude-sutando/settings.json"
 python3 - <<'PY'
 import json, os
 json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command":
@@ -339,7 +394,7 @@ ok "operator's custom transcript-archive command survives re-run" \
 # Match OUR script, not just the destination: the operator's custom command above
 # also names sutando-conversations, so a destination-only grep passes vacuously.
 ok "our archive hook is still installed alongside it" \
-   "$(echo "$CCMDS" | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
+   "$(echo "$CCMDS" | grep -q 'archive-transcript\.sh.*logs/conversations' && echo 0 || echo 1)"
 ok "and the repo-path hook is still installed on the same event" \
    "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
 rm -rf "$CROOT"
@@ -352,13 +407,13 @@ rm -rf "$CROOT"
 # opt-in into live ~/Desktop egress, which an unattended re-run must not decide.
 LEG_CMD='cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
 seed_legacy_repo() {  # $1 = destination repo dir
-  mkdir -p "$1/src" "$1/.claude"
+  mkdir -p "$1/src" "$1/.claude" "$1/workspace/.claude-sutando"
   cp "$INSTALLER" "$1/src/install-claude-hooks.sh"
   printf '#!/bin/bash\n:\n' > "$1/src/session-handoff.sh"
   printf '#!/bin/bash\n:\n' > "$1/src/check-pending-tasks.sh"
   printf '#!/bin/bash\n:\n' > "$1/src/archive-transcript.sh"
   chmod +x "$1/src/"*.sh
-  LEG_SETTINGS="$1/.claude/settings.json" LEG_CMD="$LEG_CMD" python3 - <<'PY'
+  LEG_SETTINGS="$1/workspace/.claude-sutando/settings.json" LEG_CMD="$LEG_CMD" python3 - <<'PY'
 import json, os
 json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command",
     "command": os.environ["LEG_CMD"]}]}]}},
@@ -370,27 +425,27 @@ archive_cmds() {  # $1 = settings path -> one command per line, archiver-targeti
 import json, os
 d = json.load(open(os.environ['LEG_SETTINGS']))
 print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', [])
-                   for h in g['hooks'] if 'sutando-conversations' in h['command']))
+                   for h in g['hooks'] if 'conversations' in h['command']))
 "
 }
 
 LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy.XXXXXX")"
 seed_legacy_repo "$LROOT/repo with spaces"
 bash "$LROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
-LCMDS="$(archive_cmds "$LROOT/repo with spaces/.claude/settings.json")"
+LCMDS="$(archive_cmds "$LROOT/repo with spaces/workspace/.claude-sutando/settings.json")"
 ok "legacy bare-cp archiver is removed on upgrade" \
    "$(echo "$LCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
 ok "and replaced by the archive-transcript.sh form" \
    "$(echo "$LCMDS" | grep -q 'archive-transcript\.sh' && echo 0 || echo 1)"
 ok "leaving exactly one archiver hook, not two" \
-   "$([ "$(echo "$LCMDS" | grep -c 'sutando-conversations')" = 1 ] && echo 0 || echo 1)"
+   "$([ "$(echo "$LCMDS" | grep -c 'conversations')" = 1 ] && echo 0 || echo 1)"
 rm -rf "$LROOT"
 
 OROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy omit.XXXXXX")"
 seed_legacy_repo "$OROOT/repo with spaces"
 SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
   bash "$OROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
-OCMDS="$(archive_cmds "$OROOT/repo with spaces/.claude/settings.json")"
+OCMDS="$(archive_cmds "$OROOT/repo with spaces/workspace/.claude-sutando/settings.json")"
 ok "under the omit flag the opt-in survives untouched" \
    "$(echo "$OCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 0 || echo 1)"
 ok "and no archiver is installed in its place" \
@@ -400,7 +455,7 @@ rm -rf "$OROOT"
 # ---- upgrade path: a pre-existing runner-first skill hook must be MIGRATED ----
 # The outage case: a re-run must replace the old `python3 <path>` entry, not add beside it.
 UROOT="$(mktemp -d)"; UREPO="$UROOT/repo"
-mkdir -p "$UREPO/.claude" "$UREPO/src" "$UREPO/skills/demo/hooks"
+mkdir -p "$UREPO/.claude" "$UREPO/src" "$UREPO/skills/demo/hooks" "$UREPO/workspace/.claude-sutando"
 cp "$HERE/../src/install-claude-hooks.sh" "$UREPO/src/"
 cp "$HERE/../src/skill_hooks.py" "$UREPO/src/"
 printf '#!/bin/bash\n:\n' > "$UREPO/src/session-handoff.sh"
@@ -412,7 +467,7 @@ printf 'import sys; sys.exit(2)\n' > "$UREPO/skills/demo/hooks/g.py"
 # Resolve the fixture path: skill_hooks writes RESOLVED paths, and macOS mktemp's
 # /var/... alias would seed a string no installer ever wrote (false migration failure).
 GPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$UREPO/skills/demo/hooks/g.py")"
-export U_SETTINGS="$UREPO/.claude/settings.json"
+export U_SETTINGS="$UREPO/workspace/.claude-sutando/settings.json"
 # Seed EXACTLY what a previous installer wrote, plus an operator variant that
 # invokes the same script — the negative control the sweep must not eat.
 U_OLD="python3 $GPATH" python3 - <<'PY'
@@ -444,7 +499,7 @@ rm -rf "$UROOT"
 # ---- same upgrade, on a repo path containing `exec ` and `|` ----
 # `${CMD#*exec }` splits inside such a path; the `|` exercises the NUL field framing.
 EROOT="$(mktemp -d)"; EREPO="$EROOT/exec repo|x/repo"
-mkdir -p "$EREPO/.claude" "$EREPO/src" "$EREPO/skills/demo/hooks"
+mkdir -p "$EREPO/.claude" "$EREPO/src" "$EREPO/skills/demo/hooks" "$EREPO/workspace/.claude-sutando"
 cp "$HERE/../src/install-claude-hooks.sh" "$EREPO/src/"
 cp "$HERE/../src/skill_hooks.py" "$EREPO/src/"
 printf '#!/bin/bash\n:\n' > "$EREPO/src/session-handoff.sh"
@@ -454,7 +509,7 @@ printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"}]
     > "$EREPO/skills/demo/manifest.json"
 printf 'import sys; sys.exit(2)\n' > "$EREPO/skills/demo/hooks/g.py"
 EPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$EREPO/skills/demo/hooks/g.py")"
-export E_SETTINGS="$EREPO/.claude/settings.json"
+export E_SETTINGS="$EREPO/workspace/.claude-sutando/settings.json"
 # shq quotes the path, so the seeded legacy entry must be quoted the same way an
 # installer would have written it — otherwise the fixture is not what it claims.
 E_OLD="python3 $(python3 -c "import shlex,sys;print(shlex.quote(sys.argv[1]))" "$EPATH")"
@@ -478,6 +533,639 @@ ok "path containing 'exec ': legacy entry is REMOVED, not left blocking" \
 ok "path containing 'exec ': guarded hook registered exactly once" \
    "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
 rm -rf "$EROOT"
+
+# --- 8. Phase 3 (project-level migration) must not eat hooks it does not own -
+# Same false-positive as section 7, at the OTHER settings file: Phase 3 used to
+# remove any project-level command CONTAINING our marker, so an operator's own
+# customized `session-handoff.sh` invocation — sitting right beside the
+# canonical entry it migrates — was deleted along with it. Reproduced: before
+# the fix, `--operator-flag` below is gone after one re-run.
+CROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy-owner.XXXXXX")"
+CREPO="$CROOT/repo with spaces"
+mkdir -p "$CREPO/src" "$CREPO/.claude" "$CREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$CREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$CREPO/src/session-handoff.sh"
+chmod +x "$CREPO/src/"*.sh
+echo '{}' > "$CREPO/workspace/.claude-sutando/settings.json"   # nothing at the core dir yet
+
+export C_LEGACY="$CREPO/.claude/settings.json" C_REPO="$CREPO"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['C_LEGACY'], os.environ['C_REPO']
+json.dump({"hooks": {"SessionEnd": [{"matcher": "", "hooks": [
+    # (a) today's EXACT canonical shape, pre-move — must be SWEPT (Phase 3 has
+    #     no "leave the current shape" exclusion; none of it belongs here).
+    {"type": "command",
+     "command": f'bash {repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    # (b) operator-customized: same script, extra flag — must SURVIVE.
+    {"type": "command",
+     "command": f'bash {repo}/src/session-handoff.sh "$TRANSCRIPT_PATH" --operator-flag'},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+CSURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$C_LEGACY")"
+ok "Phase 3: operator's customized project-level hook survives the migration" \
+   "$(echo "$CSURV" | grep -q -- '--operator-flag' && echo 0 || echo 1)"
+ok "Phase 3: today's canonical project-level shape is still swept" \
+   "$(echo "$CSURV" | grep -qxF "bash $CREPO/src/session-handoff.sh \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
+ok "Phase 3: the operator's hook did not get duplicated" \
+   "$([ "$(echo "$CSURV" | grep -c -- '--operator-flag')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$CROOT"
+
+# --- 9. deprecated archive sweep must not eat an operator's own Desktop hook -
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): DEPRECATED_HOOKS swept the
+# two pre-move archiver shapes via a bare `contains("Desktop/sutando-conversations/")`,
+# which also matches ANY operator command that merely targets that directory —
+# reproduced: before the fix, a custom wrapper below is gone after one run.
+DROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks archive-owner.XXXXXX")"
+DREPO="$DROOT/repo with spaces"
+mkdir -p "$DREPO/src" "$DREPO/.claude" "$DREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$DREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$DREPO/src/"
+chmod +x "$DREPO/src/"*.sh
+echo '{}' > "$DREPO/workspace/.claude-sutando/settings.json"
+
+# Normalize through cd+pwd, same as the installer's own $REPO_DIR resolution —
+# $TMPDIR can carry a trailing slash (macOS), and an un-normalized double slash
+# in the fixture would not byte-match the installer's own anchored regex.
+export D_LEGACY="$DREPO/.claude/settings.json" D_REPO="$(cd "$DREPO" && pwd)"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['D_LEGACY'], os.environ['D_REPO']
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # (a) ancient bare-cp archiver, fully static — must be SWEPT.
+    {"type": "command",
+     "command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'},
+    # (b) intermediate archive-transcript.sh-with-Desktop-destination shape,
+    #     this clone's exact historical form — must be SWEPT.
+    {"type": "command",
+     "command": f'bash \'{repo}/src/archive-transcript.sh\' "$HOME/Desktop/sutando-conversations/"'},
+    # (c) operator's OWN differently-shaped command that merely mentions the
+    #     same directory as a substring — must SURVIVE.
+    {"type": "command",
+     "command": 'bash "$HOME/my-custom-archiver.sh" --dest "$HOME/Desktop/sutando-conversations/" --verbose'},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$DREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+DSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$D_LEGACY")"
+ok "archive sweep: operator's own Desktop-targeting wrapper survives" \
+   "$(echo "$DSURV" | grep -q 'my-custom-archiver.sh' && echo 0 || echo 1)"
+ok "archive sweep: the ancient bare-cp form is still removed" \
+   "$(echo "$DSURV" | grep -q 'cp \\"\$TRANSCRIPT_PATH\\"' && echo 1 || echo 0)"
+ok "archive sweep: the intermediate archive-transcript.sh+Desktop form is still removed" \
+   "$(echo "$DSURV" | grep -q 'archive-transcript.sh.*Desktop/sutando-conversations' && echo 1 || echo 0)"
+rm -rf "$DROOT"
+
+# --- 10. an EXISTING but FAILING resolver must not be silently guessed past --
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): with a readable but exit-9
+# sutando-config.sh, the installer previously "succeeded" against a guessed
+# workspace/.claude-sutando path — on a configured clone that can write the
+# wrong file and sweep project hooks with no replacement where the core reads.
+EROOT2="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks resolver-fail.XXXXXX")"
+EREPO2="$EROOT2/repo with spaces"
+mkdir -p "$EREPO2/src" "$EREPO2/scripts" "$EREPO2/.claude" "$EREPO2/workspace/.claude-sutando"
+cp "$INSTALLER" "$EREPO2/src/install-claude-hooks.sh"
+printf '#!/bin/bash\nexit 9\n' > "$EREPO2/scripts/sutando-config.sh"
+chmod +x "$EREPO2/scripts/sutando-config.sh"
+OUT_FAIL="$(bash "$EREPO2/src/install-claude-hooks.sh" 2>&1)"; RC_FAIL=$?
+ok "an existing-but-failing resolver makes the installer exit non-zero" \
+   "$([ "$RC_FAIL" -ne 0 ] && echo 0 || echo 1)"
+ok "it does not silently write the guessed fallback settings file" \
+   "$([ ! -s "$EREPO2/workspace/.claude-sutando/settings.json" ] && echo 0 || echo 1)"
+rm -rf "$EROOT2"
+
+# --- 11. omit flag must not leave a stale archiver visible to GUEST sessions --
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): "the unattended auto-fix can
+# migrate the other hooks while leaving this core-only hook visible to guest
+# sessions." A legacy Desktop-shaped archiver sitting in PROJECT settings (not
+# core settings) must be swept even under omit — it's guest-exposed, unlike the
+# core-scoped case in section "the omit flag the opt-in survives untouched".
+FROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks omit-project.XXXXXX")"
+FREPO="$FROOT/repo with spaces"
+mkdir -p "$FREPO/src" "$FREPO/.claude" "$FREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$FREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/check-pending-tasks.sh"
+printf '#!/bin/bash\n:\n' > "$FREPO/src/archive-transcript.sh"
+chmod +x "$FREPO/src/"*.sh
+echo '{}' > "$FREPO/workspace/.claude-sutando/settings.json"
+python3 - "$FREPO/.claude/settings.json" <<'PY'
+import json, sys
+json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command",
+    "command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'}]}]}},
+    open(sys.argv[1], "w"), indent=2)
+PY
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$FREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+FCMDS="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$FREPO/.claude/settings.json")"
+ok "under omit, a legacy archiver at PROJECT level is still swept (guest-exposed)" \
+   "$(echo "$FCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
+ok "and no successor is installed in its place at project level" \
+   "$(echo "$FCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
+rm -rf "$FROOT"
+
+# --- 12. a WRAPPER before the marker must survive, not just a flag -----------
+# #4309 review (keweichen/qingyun-wu, 2026-09-16): the SHAPE's middle wildcard
+# used to be `.*` (unbounded) after the "starts like a path" check — it could
+# cross a CLOSING quote + space into a SECOND shell argument, so an operator
+# wrapper that merely PASSES our script as an argument
+# (`bash '/op/wrap.sh' '<repo>/src/session-handoff.sh' ...`) matched the shape
+# and got deleted. Reproduced live: before the fix, both survivor lines below
+# read 0. Same class for the archive destination as a later argument.
+GROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks wrapper-before-marker.XXXXXX")"
+GREPO="$GROOT/repo with spaces"
+mkdir -p "$GREPO/src" "$GREPO/.claude" "$GREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$GREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$GREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$GREPO/src/check-pending-tasks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$GREPO/src/"
+chmod +x "$GREPO/src/"*.sh
+
+export G_LEGACY="$GREPO/.claude/settings.json" G_REPO="$GREPO"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['G_LEGACY'], os.environ['G_REPO']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        # canonical, pre-move — must be SWEPT (this is a Phase 3 migration fixture).
+        {"type": "command",
+         "command": f'bash \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # operator's OWN wrapper, our script passed as its argument — must SURVIVE.
+        {"type": "command",
+         "command": f'bash \'/tmp/operator-wrapper.sh\' \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # same, but the wrapper's OWN path is UNQUOTED (no spaces in it, so
+        # it's syntactically valid unquoted) — must also SURVIVE. This is the
+        # exact counterexample that broke the quote+space-only lookahead: no
+        # quote precedes the argv-separating space at all (qingyun-wu,
+        # 2026-09-16, reproduced live on bd2ddd51).
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper-unquoted.sh \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # BOTH wrapper and marker path unquoted, no space-adjacent quote at
+        # all anywhere in the command — must also SURVIVE. This is the third
+        # round on the same defect class: `bd2ddd51` closed the quoted-wrapper
+        # crossing, `88edc83f` closed the unquoted-wrapper-into-quoted-marker
+        # crossing, and qingyun-wu reproduced THIS shape live against
+        # `88edc83f` (2026-09-16) — a plain space + slash separator, no quote
+        # on either side of it to key off of.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper-bothunquoted.sh {repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+    "PreCompact": [{"matcher": "", "hooks": [
+        # same shape, the archive destination as the wrapper's argument — SURVIVE.
+        {"type": "command",
+         "command": f'bash \'/tmp/archive-wrapper.sh\' \'{repo}/workspace/logs/conversations/\''},
+        # unquoted-wrapper-path variant of the same, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper-unquoted.sh \'{repo}/workspace/logs/conversations/\''},
+        # both-unquoted variant of the same, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper-bothunquoted.sh {repo}/workspace/logs/conversations/'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$GREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+GSURV_SE="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+GSURV_PC="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+ok "wrapper-before-marker: operator's session-handoff wrapper survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: UNQUOTED session-handoff wrapper path survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper-unquoted.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: BOTH-UNQUOTED session-handoff wrapper path survives" \
+   "$(echo "$GSURV_SE" | grep -qF 'operator-wrapper-bothunquoted.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: today's canonical session-handoff shape is still swept" \
+   "$(echo "$GSURV_SE" | grep -qxF "bash '$GREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
+ok "wrapper-before-marker: operator's archive-destination wrapper survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: UNQUOTED archive-destination wrapper path survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-unquoted.sh' && echo 0 || echo 1)"
+ok "wrapper-before-marker: BOTH-UNQUOTED archive-destination wrapper path survives" \
+   "$(echo "$GSURV_PC" | grep -qF 'archive-wrapper-bothunquoted.sh' && echo 0 || echo 1)"
+rm -rf "$GROOT"
+
+# --- 13. a COMPOUND command joined by a shell control operator, no space --
+# `;` `&&` `||` `|` and friends separate shell commands exactly like a space
+# separates argv words — but the round-12 tokenizer only knew about
+# whitespace, so `bash /op/wrap.sh;<repo>/src/session-handoff.sh ...` (no
+# space anywhere near the `;`) fused the wrapper's word onto the marker's
+# word into ONE argv[1] that contains the marker, and got deleted
+# (qingyun-wu 2026-09-16, reproduced live on 46132a6d).
+#
+# Deliberately a SPACE-FREE repo path here (unlike every other fixture in
+# this file, which uses "repo with spaces" on purpose) — a repo path
+# containing spaces ALSO forces the tokenizer into the bucket-B fallback for
+# an unrelated reason (the wrapper's own unquoted word already splits on
+# those spaces), which happens to reject the same candidate for the wrong
+# reason and would silently pass this check even without the fix. Confirmed
+# by mutation: the round-12 fixture (spaces-in-path) fixture did NOT
+# reproduce this bug; only a clean, space-free path does.
+KROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-compound-op.XXXXXX")"
+KREPO="$KROOT/repo-no-spaces"
+mkdir -p "$KREPO/src" "$KREPO/.claude" "$KREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$KREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\n:\n' > "$KREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$KREPO/src/check-pending-tasks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$KREPO/src/"
+chmod +x "$KREPO/src/"*.sh
+
+export K_LEGACY="$KREPO/.claude/settings.json" K_REPO="$KREPO"
+python3 - <<'PY'
+import json, os
+p, repo = os.environ['K_LEGACY'], os.environ['K_REPO']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": f'bash \'{repo}/src/session-handoff.sh\' "$TRANSCRIPT_PATH"'},
+        # SEMICOLON-joined compound command — must SURVIVE.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper.sh;{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        # ANDAND-joined compound command — must SURVIVE.
+        {"type": "command",
+         "command": f'bash /tmp/operator-wrapper.sh&&{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        # the operator sits DIRECTLY after the command word, no wrapper word
+        # at all — `bash` alone is one (no-op) command, and the marker's own
+        # path is argv[0] of a SEPARATE second command, never an argument to
+        # `bash`. Flattening argv into one array without segment boundaries
+        # still read the marker as argv[1] of the first command (qingyun-wu
+        # 2026-09-16, reproduced live on 16a1c6a8: this exact repro deleted
+        # both variants below even though the round-4 fix already handled
+        # the wrapper-plus-operator shape correctly). Must SURVIVE.
+        {"type": "command",
+         "command": f'bash ;{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+        {"type": "command",
+         "command": f'bash &&{repo}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+    "PreCompact": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": f'bash \'/tmp/archive-wrapper.sh\' \'{repo}/workspace/logs/conversations/\''},
+        # SEMICOLON-joined variant, for the archive hook.
+        {"type": "command",
+         "command": f'bash /tmp/archive-wrapper.sh;{repo}/workspace/logs/conversations/'},
+        # operator directly after the command word, for the archive hook.
+        {"type": "command",
+         "command": f'bash ;{repo}/workspace/logs/conversations/'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$KREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+KSURV_SE="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_LEGACY")"
+KSURV_PC="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_LEGACY")"
+ok "compound-op (space-free repo): today's canonical shape is still swept" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash '$KREPO/src/session-handoff.sh' \"\$TRANSCRIPT_PATH\"" && echo 1 || echo 0)"
+ok "compound-op: SEMICOLON-joined command survives" \
+   "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh;' && echo 0 || echo 1)"
+ok "compound-op: ANDAND-joined command survives" \
+   "$(echo "$KSURV_SE" | grep -qF 'operator-wrapper.sh&&' && echo 0 || echo 1)"
+ok "compound-op: bare SEMICOLON right after command word survives" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash ;$KREPO/src/session-handoff.sh \"\$TRANSCRIPT_PATH\"" && echo 0 || echo 1)"
+ok "compound-op: bare ANDAND right after command word survives" \
+   "$(echo "$KSURV_SE" | grep -qxF "bash &&$KREPO/src/session-handoff.sh \"\$TRANSCRIPT_PATH\"" && echo 0 || echo 1)"
+ok "compound-op: SEMICOLON-joined archive-destination command survives" \
+   "$(echo "$KSURV_PC" | grep -qF 'archive-wrapper.sh;' && echo 0 || echo 1)"
+ok "compound-op: bare SEMICOLON archive-destination command survives" \
+   "$(echo "$KSURV_PC" | grep -qxF "bash ;$KREPO/workspace/logs/conversations/" && echo 0 || echo 1)"
+rm -rf "$KROOT"
+
+# --- 14. RELOCATED CHECKOUT — the archiver hook a prior installer run wrote
+# at the OLD checkout path must still be swept after the checkout moved.
+# #4309 review round 6 (keweichen, 2026-09-16): ARCHIVE_LEGACY_SHAPES baked
+# the CURRENT $REPO_DIR into its regex at construction time, so a relocated
+# checkout's own pre-move hook (OLD path baked in) never matched a freshly
+# built regex using the NEW path.
+LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks relocated-checkout.XXXXXX")"
+LREPO="$LROOT/repo with spaces"
+mkdir -p "$LREPO/src" "$LREPO/.claude" "$LREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$LREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$LREPO/src/"
+chmod +x "$LREPO/src/"*.sh
+echo '{}' > "$LREPO/workspace/.claude-sutando/settings.json"
+
+# The old path is a DIFFERENT, nonexistent location — simulating a checkout
+# that was later moved to where $LREPO now lives. One old path is plain; the
+# other carries a legal apostrophe (#4309 review round 7, keweichen), which
+# shq() spells `'\''` mid-string — a shape the OLD regex's `'/[^']*` could
+# never match, since it assumes zero apostrophes between the quotes.
+# shq()-quote the apostrophe path the way the REAL installer would (Python's
+# shlex.quote uses a different, also-valid escaping — '"'"' — that this
+# fixture must NOT use, or it tests a shape shq() never actually produces).
+export L_LEGACY="$LREPO/.claude/settings.json" \
+       L_OLDREPO="$LROOT/an old checkout path that no longer exists" \
+       L_OLDREPO_APOS_QUOTED="$(shq "$LROOT/an old'checkout path that no longer exists/src/archive-transcript.sh")" \
+       L_OLDREPO_APOS="$LROOT/an old'checkout path that no longer exists"
+python3 - <<'PY'
+import json, os
+p = os.environ['L_LEGACY']
+old_repo, old_repo_apos_quoted = os.environ['L_OLDREPO'], os.environ['L_OLDREPO_APOS_QUOTED']
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # written by a PRIOR run of this installer at the OLD checkout path,
+    # before the checkout moved to where it lives now — must be SWEPT.
+    {"type": "command",
+     "command": f'bash \'{old_repo}/src/archive-transcript.sh\' "$HOME/Desktop/sutando-conversations/"'},
+    # same, but the OLD path itself contains an apostrophe, shq()-quoted the
+    # way the real installer spells it — must ALSO be SWEPT.
+    {"type": "command",
+     "command": f'bash {old_repo_apos_quoted} "$HOME/Desktop/sutando-conversations/"'},
+    # operator's own differently-shaped command mentioning the same
+    # directory as a substring — must SURVIVE.
+    {"type": "command",
+     "command": 'bash "$HOME/my-custom-archiver.sh" --dest "$HOME/Desktop/sutando-conversations/" --verbose'},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$LREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+LSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$L_LEGACY")"
+ok "relocated checkout: pre-move archiver hook (OLD path baked in) is swept" \
+   "$(echo "$LSURV" | grep -qF "$L_OLDREPO/src/archive-transcript.sh" && echo 1 || echo 0)"
+# Search for the shq()-QUOTED value, not the raw path: shq() rewrites the
+# apostrophe itself as `'\''`, so the raw (unescaped) path is never a literal
+# substring of the stored, quoted command — only its quoted form is.
+ok "relocated checkout: pre-move archiver hook (OLD path WITH APOSTROPHE) is swept" \
+   "$(echo "$LSURV" | grep -qF "$L_OLDREPO_APOS_QUOTED" && echo 1 || echo 0)"
+ok "relocated checkout: operator's own Desktop-targeting wrapper still survives" \
+   "$(echo "$LSURV" | grep -q 'my-custom-archiver.sh' && echo 0 || echo 1)"
+rm -rf "$LROOT"
+
+# --- 15. RELOCATED CHECKOUT — a skill-declared hook (src/skill_hooks.py) left
+# behind at project scope must also be swept after the checkout moved.
+# #4309 review round 7 (keweichen, 2026-09-16): its `[ -f Q ] || exit 0; exec
+# RUNNER Q` guard command carries an unquoted `||`/`;`, which candidate_is_owned()
+# rejects outright for every OTHER shape — so this one, alone, never matched.
+SROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks skill-relocated.XXXXXX")"
+SREPO="$SROOT/repo with spaces"
+mkdir -p "$SREPO/src" "$SREPO/.claude" "$SREPO/workspace/.claude-sutando" \
+         "$SREPO/skills/testhook"
+cp "$INSTALLER" "$SREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$SREPO/src/"
+echo '{}' > "$SREPO/workspace/.claude-sutando/settings.json"
+cat > "$SREPO/skills/testhook/manifest.json" <<'JSON'
+{"hooks": [{"event": "PreToolUse", "command": "hook.sh"}]}
+JSON
+printf '#!/bin/bash\ntrue\n' > "$SREPO/skills/testhook/hook.sh"
+chmod +x "$SREPO/skills/testhook/hook.sh"
+
+# The OLD path is a different, nonexistent location — the hook file only
+# exists at the NEW ($SREPO) path, exactly like a checkout that moved.
+export S_LEGACY="$SREPO/.claude/settings.json" \
+       S_OLDREPO="$SROOT/an old checkout path that no longer exists"
+python3 - <<'PY'
+import json, os, shlex
+p, old_repo = os.environ['S_LEGACY'], os.environ['S_OLDREPO']
+old_hook = f"{old_repo}/skills/testhook/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    # written by a PRIOR run at the OLD checkout path — must be SWEPT.
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+    # operator's own command that merely mentions the same filename — must SURVIVE.
+    {"type": "command", "command": "bash /Users/dev/my-own-hook.sh --target hook.sh"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$SREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+SSURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$S_LEGACY")"
+ok "relocated checkout: pre-move SKILL hook (guard shape, OLD path baked in) is swept" \
+   "$(echo "$SSURV" | grep -qF "old checkout path that no longer exists" && echo 1 || echo 0)"
+ok "relocated checkout: operator's own hook.sh-mentioning command still survives" \
+   "$(echo "$SSURV" | grep -qF 'my-own-hook.sh' && echo 0 || echo 1)"
+rm -rf "$SROOT"
+
+# --- 15b. RELOCATED CHECKOUT, RUNNER-FIRST shape (no guard) -- the
+# intersection #15 and the runner-first migration test never covered.
+# #4309 review round 17 (keweichen): candidate_is_owned() recognized a
+# relocated GUARD-shaped skill hook (#15) and a same-checkout RUNNER-FIRST
+# skill hook, but not a runner-first skill hook left behind after a move --
+# byte equality against THIS checkout's own current path can't match it,
+# and the generic branch requires the guard's leading `[`, which a bare
+# `bash Q` command never has.
+T2ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks skill-relocated-runnerfirst.XXXXXX")"
+T2REPO="$T2ROOT/repo"
+mkdir -p "$T2REPO/src" "$T2REPO/.claude" "$T2REPO/workspace/.claude-sutando" \
+         "$T2REPO/skills/testhook"
+cp "$INSTALLER" "$T2REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$T2REPO/src/"
+echo '{}' > "$T2REPO/workspace/.claude-sutando/settings.json"
+cat > "$T2REPO/skills/testhook/manifest.json" <<'JSON'
+{"hooks": [{"event": "PreToolUse", "command": "hook.sh"}]}
+JSON
+printf '#!/bin/bash\ntrue\n' > "$T2REPO/skills/testhook/hook.sh"
+chmod +x "$T2REPO/skills/testhook/hook.sh"
+export T2_LEGACY="$T2REPO/.claude/settings.json" \
+       T2_OLDREPO="$T2ROOT/an old checkout path that no longer exists"
+python3 - <<'PY'
+import json, os, shlex
+p, old_repo = os.environ['T2_LEGACY'], os.environ['T2_OLDREPO']
+old_hook = f"{old_repo}/skills/testhook/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    # written by a PRIOR run, at the OLD path, in the RUNNER-FIRST (no
+    # guard) shape -- must be SWEPT after the checkout moved.
+    {"type": "command", "command": f"bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$T2REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+T2SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$T2_LEGACY")"
+ok "relocated checkout: pre-move SKILL hook (runner-first, no guard, OLD path baked in) is swept" \
+   "$(echo "$T2SURV" | grep -qF "old checkout path that no longer exists" && echo 1 || echo 0)"
+rm -rf "$T2ROOT"
+
+# --- 16. An OPERATOR'S OWN guard-shaped command around a BUILT-IN marker must
+# survive -- only a skill-declared entry may wear the skill_hooks.py guard
+# shape. #4309 review round 7 (keweichen, 2026-09-16): candidate_is_owned()
+# recognized `[ -f Q ] || exit 0; exec RUNNER Q` for EVERY HOOKS entry, not
+# only skill-declared ones, so this operator command -- never emitted by
+# skill_hooks.py, which only guards files under skills/*/ -- was classified
+# as ours and swept.
+GROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks guard-scope.XXXXXX")"
+GREPO="$GROOT/repo"
+mkdir -p "$GREPO/src" "$GREPO/.claude" "$GREPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$GREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\ntrue\n' > "$GREPO/src/session-handoff.sh"
+echo '{}' > "$GREPO/workspace/.claude-sutando/settings.json"
+export G_LEGACY="$GREPO/.claude/settings.json" \
+       G_OPERATOR_TARGET="/tmp/an operator path/src/session-handoff.sh"
+python3 - <<'PY'
+import json, os, shlex
+p, target = os.environ['G_LEGACY'], os.environ['G_OPERATOR_TARGET']
+q = shlex.quote(target)
+json.dump({"hooks": {"PreCompact": [{"matcher": "", "hooks": [
+    # the operator's own guard around a DIFFERENT absolute path than this
+    # checkout's -- skill_hooks.py never emits a guard for a built-in
+    # marker like session-handoff.sh, so this is not ours -- must SURVIVE.
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$GREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+GSURV="$(jq -r '(.hooks.PreCompact // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$G_LEGACY")"
+ok "operator's own guard around a built-in marker survives (not skill-declared)" \
+   "$(echo "$GSURV" | grep -qF "$G_OPERATOR_TARGET" && echo 0 || echo 1)"
+rm -rf "$GROOT"
+
+# --- 17. #4309 review round 6/7 (keweichen, 2026-09-17), BOTH exact repros in
+# one installer run. skill_hooks.py's marker used to be just target.name (a
+# bare basename), and _is_installer_path_shape accepted any absolute path,
+# so an operator's own guard sharing a discovered skill's filename -- or an
+# operator's built-in-shaped command carrying an unexpanded shell-variable
+# path prefix -- both got misclassified as ours and swept.
+KROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-repro.XXXXXX")"
+KREPO="$KROOT/repo"
+mkdir -p "$KREPO/src" "$KREPO/.claude" "$KREPO/workspace/.claude-sutando" \
+         "$KREPO/skills/discoveredskill"
+cp "$INSTALLER" "$KREPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$KREPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$KREPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$KREPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$KREPO/skills/discoveredskill/hook.sh"
+chmod +x "$KREPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$KREPO/workspace/.claude-sutando/settings.json"
+export K_SETTINGS="$KREPO/workspace/.claude-sutando/settings.json"
+python3 - <<'PY'
+import json, os
+p = os.environ['K_SETTINGS']
+json.dump({"hooks": {
+    "PreToolUse": [{"matcher": "", "hooks": [
+        # PoC #1: a discovered skill is ALSO named hook.sh -- an unrelated
+        # operator guard sharing only that basename must not be swept.
+        {"type": "command",
+         "command": "[ -f '/tmp/operator/hook.sh' ] || exit 0; exec bash '/tmp/operator/hook.sh'"},
+    ]}],
+    "SessionEnd": [{"matcher": "", "hooks": [
+        # PoC #2: an operator's own built-in-shaped command whose path
+        # carries an unexpanded shell-variable prefix -- must not be swept.
+        {"type": "command",
+         "command": 'bash "/tmp/${CUSTOM_ROOT}/src/session-handoff.sh" "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$KREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+KP_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_SETTINGS")"
+KS_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K_SETTINGS")"
+ok "PoC #1: operator guard sharing a discovered skill's basename survives" \
+   "$(echo "$KP_SURV" | grep -qF '/tmp/operator/hook.sh' && echo 0 || echo 1)"
+ok "our own discovered-skill hook is still installed alongside it" \
+   "$(echo "$KP_SURV" | grep -qF 'discoveredskill/hook.sh' && echo 0 || echo 1)"
+ok "PoC #2: operator command with an unexpanded \$CUSTOM_ROOT path prefix survives" \
+   "$(echo "$KS_SURV" | grep -qF 'CUSTOM_ROOT' && echo 0 || echo 1)"
+ok "our own SessionEnd hook is still installed alongside it" \
+   "$([ "$(echo "$KS_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$KROOT"
+
+# --- 18. #4309 review round 13 (keweichen, 2026-09-17), 2 more exact repros.
+# PoC #1: the skill-guard branch matched a suffix but never ran the literal-
+# char check -- an operator's own guard with an unexpanded $-bearing path that
+# HAPPENS to end in the exact discovered-skill suffix still got swept.
+# PoC #2: the built-in-bucket literal check covered $/`/*\/?/~ but not bracket
+# glob syntax -- an operator path like "/tmp/[o]perator/..." still got swept.
+K2ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r13.XXXXXX")"
+K2REPO="$K2ROOT/repo"
+mkdir -p "$K2REPO/src" "$K2REPO/.claude" "$K2REPO/workspace/.claude-sutando" \
+         "$K2REPO/skills/discoveredskill"
+cp "$INSTALLER" "$K2REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$K2REPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$K2REPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$K2REPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$K2REPO/skills/discoveredskill/hook.sh"
+chmod +x "$K2REPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$K2REPO/workspace/.claude-sutando/settings.json"
+export K2_SETTINGS="$K2REPO/workspace/.claude-sutando/settings.json"
+python3 - << 'PY'
+import json, os
+p = os.environ['K2_SETTINGS']
+json.dump({"hooks": {
+    "PreToolUse": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": '[ -f "/tmp/${OPERATOR_ROOT}/skills/discoveredskill/hook.sh" ] || exit 0; '
+                    'exec bash "/tmp/${OPERATOR_ROOT}/skills/discoveredskill/hook.sh"'},
+    ]}],
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         "command": 'bash /tmp/[o]perator/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$K2REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K2P_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K2_SETTINGS")"
+K2S_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K2_SETTINGS")"
+ok "round 13 PoC #1: skill-guard operator command with unexpanded var + exact suffix survives" \
+   "$(echo "$K2P_SURV" | grep -qF 'OPERATOR_ROOT' && echo 0 || echo 1)"
+ok "round 13: our own discovered-skill hook still installed alongside PoC #1" \
+   "$([ "$(echo "$K2P_SURV" | grep -c 'discoveredskill/hook.sh')" = 2 ] && echo 0 || echo 1)"
+ok "round 13 PoC #2: bracket-glob operator path survives" \
+   "$(echo "$K2S_SURV" | grep -qF '[o]perator' && echo 0 || echo 1)"
+ok "round 13: our own SessionEnd hook still installed alongside PoC #2" \
+   "$([ "$(echo "$K2S_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$K2ROOT"
+
+# --- 19. #4309 review round 14 (keweichen), the brace-expansion pair.
+# PoC #1: an operator's own hook path containing an UNQUOTED brace-expansion
+# construct (`{operator,other}`) must survive -- a shell running this string
+# expands it into a DIFFERENT path than the literal text appears to name, so
+# the installer cannot know which path it would actually execute and must
+# refuse to claim it. Before the fix, `_is_installer_path_literal()` did not
+# check for `{`/`}` at all, so the false-owned check happily matched it.
+K3ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r14.XXXXXX")"
+K3REPO="$K3ROOT/repo"
+mkdir -p "$K3REPO/src" "$K3REPO/.claude" "$K3REPO/workspace/.claude-sutando"
+cp "$INSTALLER" "$K3REPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\ntrue\n' > "$K3REPO/src/session-handoff.sh"
+echo '{}' > "$K3REPO/workspace/.claude-sutando/settings.json"
+export K3_SETTINGS="$K3REPO/workspace/.claude-sutando/settings.json"
+python3 - << 'PY'
+import json, os
+p = os.environ['K3_SETTINGS']
+json.dump({"hooks": {
+    "SessionEnd": [{"matcher": "", "hooks": [
+        {"type": "command",
+         # unquoted brace expansion -- bash would run
+         # /tmp/operator/src/session-handoff.sh at runtime, NOT the literal
+         # string; the installer must not treat this as its own written path.
+         "command": 'bash /tmp/{operator,other}/src/session-handoff.sh "$TRANSCRIPT_PATH"'},
+    ]}],
+}}, open(p, "w"), indent=2)
+PY
+bash "$K3REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K3S_SURV="$(jq -r '(.hooks.SessionEnd // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K3_SETTINGS")"
+ok "round 14 PoC #1: brace-expansion operator path survives" \
+   "$(echo "$K3S_SURV" | grep -qF '{operator,other}' && echo 0 || echo 1)"
+ok "round 14: our own SessionEnd hook still installed alongside PoC #1" \
+   "$([ "$(echo "$K3S_SURV" | grep -c 'session-handoff.sh')" = 2 ] && echo 0 || echo 1)"
+rm -rf "$K3ROOT"
+
+# PoC #2 (the paired quoted-literal control the review asked for): a SKILL
+# hook written by a PRIOR run at an OLD checkout path that itself contained
+# literal brackets must still be recognized as ours and swept after the
+# checkout moved -- shlex.quote() single-quotes the whole token because `[`
+# isn't in its safe set, so the guard-path branch must read that quoting
+# (TOKENIZE_UNSAFE) rather than re-derive "unsafe" from the dequoted string,
+# or the bracketed-but-safely-quoted OLD entry is mistaken for a foreign
+# command and left behind duplicated alongside the newly-installed one.
+K4ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks kewei-r14.XXXXXX")"
+K4REPO="$K4ROOT/repo"
+mkdir -p "$K4REPO/src" "$K4REPO/.claude" "$K4REPO/workspace/.claude-sutando" \
+         "$K4REPO/skills/discoveredskill"
+cp "$INSTALLER" "$K4REPO/src/install-claude-hooks.sh"
+cp "$HERE/../src/skill_hooks.py" "$K4REPO/src/"
+printf '#!/bin/bash\ntrue\n' > "$K4REPO/src/session-handoff.sh"
+printf '{"hooks":[{"event":"PreToolUse","command":"hook.sh"}]}\n' \
+    > "$K4REPO/skills/discoveredskill/manifest.json"
+printf '#!/bin/bash\ntrue\n' > "$K4REPO/skills/discoveredskill/hook.sh"
+chmod +x "$K4REPO/skills/discoveredskill/hook.sh"
+echo '{}' > "$K4REPO/workspace/.claude-sutando/settings.json"
+export K4_SETTINGS="$K4REPO/workspace/.claude-sutando/settings.json" \
+       K4_OLDREPO="$K4ROOT/old checkout[x]/that no longer exists"
+python3 - << 'PY'
+import json, os, shlex
+p, old_repo = os.environ['K4_SETTINGS'], os.environ['K4_OLDREPO']
+old_hook = f"{old_repo}/skills/discoveredskill/hook.sh"
+q = shlex.quote(old_hook)
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": f"[ -f {q} ] || exit 0; exec bash {q}"},
+]}]}}, open(p, "w"), indent=2)
+PY
+bash "$K4REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+K4P_SURV="$(jq -r '(.hooks.PreToolUse // []) | map(.hooks // []) | flatten | map(.command) | .[]' "$K4_SETTINGS")"
+ok "round 14 PoC #2: pre-move SKILL hook at a BRACKETED old path is swept, not left duplicated" \
+   "$(echo "$K4P_SURV" | grep -qF 'old checkout[x]' && echo 1 || echo 0)"
+ok "round 14: our own discovered-skill hook still installed after sweeping the bracketed old entry" \
+   "$([ "$(echo "$K4P_SURV" | grep -c 'discoveredskill/hook.sh')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$K4ROOT"
 
 rm -rf "$ROOT"
 echo "---"

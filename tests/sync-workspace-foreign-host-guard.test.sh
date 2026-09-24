@@ -3,6 +3,14 @@
 # and propagate deletion of a peer's hosts/<label>/ subtree.
 
 set -euo pipefail
+# HERMETICITY (same fix as tests/sync-workspace.test.sh:27): `_host()` resolves
+# ${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}, so on a live Sutando core
+# (which exports SUTANDO_HOST_LABEL) the fixtures' SUTANDO_HOST_OVERRIDE=local-host
+# shim is silently defeated -- own_host resolves to the REAL host label, the
+# hosts/local-host/ -> hosts/*/ widening this suite depends on never fires, and
+# Test 1/2 fail for an environment reason having nothing to do with the code
+# under test (#4309 follow-up investigation, 2026-09-16).
+unset SUTANDO_HOST_LABEL
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -170,7 +178,14 @@ done
 echo
 echo "Test 3: foreign-host deletion guard survives customized exclude rules"
 setup_fixture "push-guard"
-printf '%s\n' '# operator customization' \
+# A REAL rule, not a bare comment (#4309 follow-up, 2026-09-16): a comment is
+# inert to _exclude_rules_only's comparison and to gitignore itself, so once
+# _is_safe_carveout_addition also recognizes hard-deny lines (closing the
+# qingyun-wu/keweichen #4309 gap) a comment-only "customization" no longer
+# blocks the SAME safe hosts/local-host/ -> hosts/*/ widening Test 1 already
+# expects to succeed unprompted -- it was never a meaningful customization to
+# begin with. An operator's own RULE is what this guard must survive.
+printf '%s\n' '!my/operator/rule' \
     >> "$FIXTURE_WS/.git/info/exclude"
 set +e
 out="$(
@@ -237,6 +252,37 @@ fi
 check "own-host deletion preserves peer state" \
     git --git-dir="$FIXTURE_VAULT" cat-file -e \
         refs/heads/host/local-host/guard1:hosts/peer-host/state.json
+
+echo
+echo "Test 6: PULL-only path never commits a foreign-host deletion either"
+# Every test above drives --push-only; _refuse_foreign_host_deletions only
+# inspects the STAGED diff, and _commit_local_pre_pull (--pull-only's own
+# pre-fetch commit) can COMMIT the untrack before that guard ever runs --
+# by push time the deletion is already in HEAD, so nothing is left staged
+# to catch (#4309 round 11, keweichen).
+setup_fixture "pull-guard"
+printf '%s\n' '!my/operator/rule' \
+    >> "$FIXTURE_WS/.git/info/exclude"
+set +e
+out="$(
+    env "${SYNC_ENV[@]}" bash "$SYNC" \
+        --vault-url "$FIXTURE_VAULT" --pull-only 2>&1
+)"
+rc=$?
+set -e
+check "pull-only itself still succeeds (nothing to fetch/merge)" test "$rc" -eq 0
+check "THE POINT: peer file is still tracked after the pre-pull commit" \
+    git -C "$FIXTURE_WS" ls-files --error-unmatch \
+        hosts/peer-host/state.json
+del_commits="$(git -C "$FIXTURE_WS" log --all --diff-filter=D --name-only \
+    --format='' -- hosts/peer-host/state.json)"
+if [ -z "$del_commits" ]; then
+    echo "OK: THE POINT: no commit on this branch ever removed the peer file"
+    pass=$((pass + 1))
+else
+    echo "FAIL: THE POINT: no commit on this branch ever removed the peer file"
+    fail=$((fail + 1))
+fi
 
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"

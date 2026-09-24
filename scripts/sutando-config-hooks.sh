@@ -2,19 +2,12 @@
 # sutando-config-hooks.sh — hook helper for the per-runtime CLAUDE_CONFIG_DIR
 # migration (Option D from #design 2026-06-07 design discussion).
 #
-# Background: when Sutando migrates a user from `~/.claude/` to a per-runtime
-# `$CLAUDE_CONFIG_DIR` (typically `<workspace>/.claude-sutando/`), hooks that
-# reference literal `~/.claude/hooks/...` paths in their `command:` strings
-# can't move cleanly. Owner's design (Option D, 01:38Z): drop those hooks at
-# migration time and (i) auto-re-install Sutando-owned hooks pointing at the
-# correct workspace paths, and (ii) print a notice listing dropped non-Sutando
-# entries so the user can re-add manually.
+# A `~/.claude/` → `$CLAUDE_CONFIG_DIR` migration can't carry literal
+# `~/.claude/hooks/...` command strings, so this re-installs Sutando's own
+# and notices any dropped non-Sutando entries for manual re-add.
 #
-# This script is parametric on the target settings.json path — unlike the two
-# existing installers (`src/install-claude-hooks.sh` writes to repo's
-# `.claude/settings.json`; `skills/catchup-after-startup/scripts/install-hook.sh`
-# writes to `~/.claude/settings.json`), this one can target any settings.json,
-# making it suitable for `$CLAUDE_CONFIG_DIR/settings.json` post-migration.
+# Parametric on the target settings.json path — unlike the two existing
+# installers, which each write one fixed file, this one can target any.
 #
 # Subcommands:
 #   detect-missing <settings.json>
@@ -52,23 +45,58 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-# Sutando-owned hook commands (canonical forms — must match what the existing
-# installers write, so detect-missing recognizes them). The catchup hook
-# resolves SUTANDO_REPO_DIR/src/session-handoff.sh; the project hooks live in
-# project-level .claude/settings.json (NOT user-level), so they're not part of
-# this migration's scope unless --with-project-hooks is set.
-#
-# Per `feedback_claude_code_hook_scoping`: catchup hook is USER-level (fires
-# everywhere), project hooks are PROJECT-level (fire only when Claude runs in
-# this repo). The migration target is USER-level CLAUDE_CONFIG_DIR.
+# Canonical command forms, matched against what the two installers write.
+# --with-project-hooks is named for its origin, not its scope: both hook sets are core-session (CLAUDE_CONFIG_DIR), same as this script's migration target.
 
+# install-claude-hooks.sh owns the command strings; this asks it for them. Exit
+# codes differ: 1 = genuinely absent (safe to guess a fallback); 2 = present but this hook didn't come back — never guess, only skip or propagate.
+_installer_hook_command() {  # $1 = event, $2 = marker
+  local repo="${SUTANDO_REPO_DIR:-$REPO_DIR}" line out
+  [ -f "$repo/src/install-claude-hooks.sh" ] || return 1
+  out="$(bash "$repo/src/install-claude-hooks.sh" --print-hooks 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      "$1|$2|"*) printf '%s\n' "${line#*|*|}"; return 0 ;;
+    esac
+  done <<< "$out"
+  return 2
+}
+
+# Propagates _installer_hook_command's rc=2 (installer present but failed)
+# instead of masking it as a guessable absence — callers must check the exit code.
 _catchup_hook_command() {
-  # Mirror skills/catchup-after-startup/scripts/install-hook.sh logic.
-  if [ -n "${SUTANDO_REPO_DIR:-}" ]; then
-    echo "bash \"$SUTANDO_REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
-  else
-    echo "bash \"$REPO_DIR/src/session-handoff.sh\" \"\${TRANSCRIPT_PATH:-}\""
+  local repo="${SUTANDO_REPO_DIR:-$REPO_DIR}" cmd rc
+  cmd="$(_installer_hook_command SessionEnd "src/session-handoff.sh")"; rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$cmd" ;;
+    1) printf '%s\n' "bash \"$repo/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\"" ;;
+    *) return "$rc" ;;
+  esac
+}
+
+# Resolves the workspace via the shared config helper, not a hardcoded
+# $REPO_DIR/workspace guess — sutando.config.local.json can relocate it.
+_workspace_dir() {
+  local dir helper out err
+  dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  helper="$dir/sutando-config.sh"
+  if [ ! -f "$helper" ]; then
+    printf '%s\n' "$REPO_DIR/workspace"
+    return 0
   fi
+  # Stdout is the value, stderr is warnings — a success-plus-warning run
+  # must not bake the warning into the resolved path (resolver contract).
+  err="$(mktemp)"
+  out="$(bash "$helper" workspace 2>"$err")"
+  local rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "sutando-config-hooks: workspace resolution failed: $(cat "$err")" >&2
+    rm -f "$err"
+    return 1
+  fi
+  [ -s "$err" ] && cat "$err" >&2
+  rm -f "$err"
+  printf '%s\n' "$out"
 }
 
 _sutando_hook_manifest() {
@@ -160,7 +188,11 @@ cmd_detect_missing() {
   if ! _validate_json "$settings"; then
     return 1
   fi
-  local want_cmd; want_cmd="$(_catchup_hook_command)"
+  local want_cmd
+  if ! want_cmd="$(_catchup_hook_command)"; then
+    echo "detect-missing: installer present but failed to yield the catchup hook command — refusing to guess" >&2
+    return 1
+  fi
   # Check SessionEnd entries for the catchup hook (the one we auto-install).
   local found
   found="$(jq --arg cmd "$want_cmd" '
@@ -203,7 +235,11 @@ cmd_install() {
   fi
 
   if [ "$with_catchup" = "1" ]; then
-    local cmd; cmd="$(_catchup_hook_command)"
+    local cmd
+    if ! cmd="$(_catchup_hook_command)"; then
+      echo "install: installer present but failed to yield the catchup hook command — refusing to guess" >&2
+      return 1
+    fi
     # Idempotent jq edit: skip if an equivalent command already exists.
     local exists
     exists="$(jq --arg cmd "$cmd" '
@@ -224,15 +260,47 @@ cmd_install() {
   fi
 
   if [ "$with_project" = "1" ]; then
-    # Project hooks installation. These belong in REPO/.claude/settings.json,
-    # not user-level settings.json. The flag exists for callers that want
-    # one-stop install of both classes; for migration use, default-off.
-    local pre1="cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
-    local pre2="bash \"$REPO_DIR/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\""
-    local stop1="bash \"$REPO_DIR/src/check-pending-tasks.sh\""
+    # Each of the 3 hooks below only guesses a fallback on rc=1 (installer
+    # absent); rc=2 (failed or omitted) skips it. Use `rc=0; x="$(fn)" || rc=$?`, never bare — under `set -e` a bare failing assignment exits before any case runs.
+    local pre1 pre2 stop1 failed=0 rc
+    if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
+      pre1=""  # opt-out: never fabricate a fallback for the omitted hook
+    else
+      rc=0; pre1="$(_installer_hook_command PreCompact "logs/conversations/")" || rc=$?
+      case "$rc" in
+        0) ;;
+        1)
+          local ws
+          if ws="$(_workspace_dir)"; then
+            pre1="bash \"$REPO_DIR/src/archive-transcript.sh\" \"$ws/logs/conversations/\""
+          else
+            echo "install: cannot resolve the workspace for the archive-hook fallback" >&2
+            failed=1; pre1=""
+          fi
+          ;;
+        *)
+          echo "install: could not resolve the PreCompact archive hook command — refusing to guess" >&2
+          failed=1; pre1="" ;;
+      esac
+    fi
+    rc=0; pre2="$(_installer_hook_command PreCompact "src/session-handoff.sh")" || rc=$?
+    case "$rc" in
+      0) ;;
+      1) pre2="bash \"$REPO_DIR/src/session-handoff.sh\" \"\$TRANSCRIPT_PATH\"" ;;
+      *) echo "install: could not resolve the PreCompact session-handoff hook command — refusing to guess" >&2
+         failed=1; pre2="" ;;
+    esac
+    rc=0; stop1="$(_installer_hook_command Stop "src/check-pending-tasks.sh")" || rc=$?
+    case "$rc" in
+      0) ;;
+      1) stop1="bash \"$REPO_DIR/src/check-pending-tasks.sh\"" ;;
+      *) echo "install: could not resolve the Stop check-pending-tasks hook command — refusing to guess" >&2
+         failed=1; stop1="" ;;
+    esac
     for spec in "PreCompact|$pre1" "PreCompact|$pre2" "Stop|$stop1"; do
       local event="${spec%%|*}"
       local cmd="${spec#*|}"
+      [ -n "$cmd" ] || continue   # omitted or unresolved — nothing to install
       local exists
       exists="$(jq --arg ev "$event" --arg cmd "$cmd" '
         [.hooks[$ev] // [] | .[] | .hooks // [] | .[] | select(.type=="command" and .command==$cmd)] | length
@@ -250,6 +318,7 @@ cmd_install() {
         echo "install: added $event project hook → $settings"
       fi
     done
+    [ "$failed" = "0" ] || return 1
   fi
 }
 
