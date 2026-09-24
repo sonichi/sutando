@@ -1105,19 +1105,24 @@ class TestReaderFreshCli(unittest.TestCase):
                        "--holder", "4242"])
         self.assertEqual(f.call_args.kwargs.get("holder_pid"), 4242)
 
-    def test_a_non_numeric_holder_is_dropped_rather_than_crashing(self):
+    def test_a_non_numeric_holder_is_refused_not_silently_dropped(self):
+        # Same hazard as a mistyped flag: dropping the value answers from the
+        # cursor alone and can call a live Monitor-hosted watcher uncovered.
         with mock.patch.object(wid, "reader_is_fresh", return_value=None) as f:
-            rc = self._run(["reader-fresh", "--inbox", self.inbox, "--ready", self.state,
-                            "--holder", "nope"])[0]
-        self.assertEqual(rc, 0)
-        self.assertIsNone(f.call_args.kwargs.get("holder_pid"))
+            rc, out, err = self._run(["reader-fresh", "--inbox", self.inbox,
+                                      "--ready", self.state, "--holder", "nope"])
+        self.assertEqual(rc, 64)
+        self.assertIn("usage:", err)
+        f.assert_not_called()
 
     def test_usage_errors_are_64(self):
         for args in (["reader-fresh"],
                      ["reader-fresh", "--inbox", self.inbox],
                      ["reader-fresh", "--ready", self.state],
                      ["reader-fresh", "--inbox", self.inbox, "--ready"],
-                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--nope", "1"]):
+                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--nope", "1"],
+                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--holder", "-1"],
+                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--holder", ""]):
             rc, out, err = self._run(args)
             self.assertEqual(rc, 64, args)
             self.assertIn("usage:", err)

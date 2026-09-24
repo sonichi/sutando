@@ -639,7 +639,13 @@ def main(argv=None) -> int:
             elif rest[i] == "--ready" and i + 1 < len(rest):
                 state = rest[i + 1]; i += 2
             elif rest[i] == "--holder" and i + 1 < len(rest):
-                holder = as_pid(rest[i + 1]); i += 2
+                # A bad VALUE is refused like a bad flag: both would otherwise
+                # answer from the cursor alone, which is the wrong answer.
+                holder = as_pid(rest[i + 1])
+                if holder is None or holder <= 0:
+                    inbox = state = None
+                    break
+                i += 2
             else:
                 # Refused, never dropped: a mistyped --holder would answer
                 # from the cursor alone and call a live watcher uncovered.
