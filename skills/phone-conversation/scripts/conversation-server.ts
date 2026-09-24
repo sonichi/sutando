@@ -1900,13 +1900,8 @@ async function start(): Promise<void> {
 		} else {
 			WEBHOOK_BASE_URL = await startNgrokCli(PORT);
 		}
-		// TWILIO_AUTO_WEBHOOK=1: re-point the number at THIS tunnel. Without a
-		// reserved ngrok domain the URL moves on every restart and, until now,
-		// startup.sh could only print "update the Twilio console webhook" —
-		// the step the owner had to do by hand each time (feedback 2026-09-20).
-		// Same Twilio call twilio-setup.py set-webhook makes; opt-in, because
-		// a host whose number is shared with another deployment must not
-		// steal it on boot.
+		// Opt-in: re-point the number at the tunnel bound just above (the runtime
+		// URL, never a recorded one); a number shared with another host stays put.
 		if (process.env.TWILIO_AUTO_WEBHOOK === '1') await syncTwilioWebhook(WEBHOOK_BASE_URL);
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);

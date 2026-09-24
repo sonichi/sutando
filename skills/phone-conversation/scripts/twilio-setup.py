@@ -7,22 +7,30 @@ Usage:
     python3 twilio-setup.py buy +14155551234 [--base https://x.ngrok-free.app]
     python3 twilio-setup.py set-webhook [BASE] [--number +14155551234]
 
-Why (owner feedback, 2026-09-20): after signing up for Twilio the person was
-sent to the Twilio console to buy a number and paste a webhook URL by hand.
-Everything after sign-up + card is an API call, so the agent does it:
-the account SID and auth token are the only manual inputs (vault them:
-`vault set TWILIO_ACCOUNT_SID …`, `vault set TWILIO_AUTH_TOKEN …`, or put
-them in <repo>/.env).
+Why (user feedback): after signing up for Twilio the person was sent to the
+Twilio console to buy a number and paste a webhook URL by hand. Everything
+after sign-up + card is an API call, so the agent does it: the account SID and
+auth token are the only manual inputs (vault them: `vault set
+TWILIO_ACCOUNT_SID …`, `vault set TWILIO_AUTH_TOKEN …`, or put them in
+<repo>/.env).
 
 Credentials resolve process env -> <repo>/.env -> vault through the same
 resolver the channel bridges use (src/channel_token.py), so a vaulted token
-works here without copying it anywhere. `buy` and `set-webhook` write
-TWILIO_PHONE_NUMBER / TWILIO_WEBHOOK_URL into .env in place (other lines are
-kept byte-for-byte; a commented template placeholder gets the live line
-right under it) so startup.sh and conversation-server.ts pick them up on
-the next restart. The webhook base defaults to what the running server
-reports (GET localhost:3100/health -> webhookUrl), else TWILIO_WEBHOOK_URL,
-else WEBHOOK_BASE_URL from .env.
+works here without copying it anywhere.
+
+The webhook base is, in order: the explicit argument; what the running server
+bound (GET localhost:<PHONE_PORT|3100>/health -> webhookUrl — the tunnel Twilio
+must post to, whatever started it); TWILIO_WEBHOOK_URL (an operator-set fixed
+external URL such as a Funnel, which the server binds instead of starting
+ngrok); WEBHOOK_BASE_URL (startup.sh's record of its ngrok tunnel).
+
+`buy` and `set-webhook` write TWILIO_PHONE_NUMBER and TWILIO_WEBHOOK_PUSHED (the
+last base pushed to Twilio, for drift reports) into .env in place: mode,
+line endings, a symlinked file and every other byte are preserved; a commented
+template placeholder gets the live line right under it. They never write
+TWILIO_WEBHOOK_URL: the server treats that key as authoritative and skips its
+own tunnel, so recording a moving ngrok URL there would bind the stale URL on
+the next restart and, with TWILIO_AUTO_WEBHOOK=1, push it to Twilio again.
 
 Twilio's own error text is printed verbatim (a trial account cannot buy a
 number, an unverified account cannot call out): the fix is on their side and
@@ -35,6 +43,8 @@ import argparse
 import base64
 import json
 import os
+import re
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -47,8 +57,11 @@ sys.path.insert(0, str(_REPO / "src"))
 API_BASE = (os.environ.get("TWILIO_API_BASE") or "https://api.twilio.com").rstrip("/")
 VOICE_PATH = "/twilio/connect"     # the TwiML route conversation-server serves
 STATUS_PATH = "/twilio/status"     # its status-callback route
-LOCAL_HEALTH = os.environ.get("PHONE_SERVER_HEALTH") or "http://localhost:3100/health"
+LOCAL_HEALTH = (os.environ.get("PHONE_SERVER_HEALTH")
+                or f"http://localhost:{os.environ.get('PHONE_PORT') or 3100}/health")
 DEFAULT_ENV_FILE = _REPO / ".env"
+PUSHED_KEY = "TWILIO_WEBHOOK_PUSHED"   # the last base pushed to Twilio; never a base to push
+_LINE_END = re.compile(r"\r?\n$")
 
 
 # ---------- credentials ----------
@@ -100,19 +113,29 @@ def set_env_var(path: Path, key: str, value: str) -> None:
     An active line is replaced where it is. When only the commented template
     placeholder (`# KEY=…`) exists, the live line goes right under it so the
     file keeps its documentation. Otherwise the line is appended. Every other
-    byte is preserved.
+    byte is preserved: the file's mode, its line endings, bytes that are not
+    UTF-8, and a symlink (the target is rewritten, the link stays).
     """
+    real = Path(os.path.realpath(path))
     try:
-        text = path.read_text()
+        raw = real.read_bytes()
+        mode = stat.S_IMODE(real.stat().st_mode)
     except OSError:
-        text = ""
-    lines = text.splitlines()
+        raw, mode = b"", 0o600   # a new .env holds secrets: owner-only
+    text = raw.decode("utf-8", "surrogateescape")
+    lines = [ln for ln in re.split(r"(?<=\n)", text) if ln]
+    nl = "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
+
+    def ending(line: str) -> str:
+        m = _LINE_END.search(line)
+        return m.group(0) if m else ""
+
     new_line = f"{key}={value}"
     replaced = False
     for i, line in enumerate(lines):
         s = line.strip()
         if s.startswith(f"{key}=") and not s.startswith("#"):
-            lines[i] = new_line
+            lines[i] = new_line + (ending(line) or nl)
             replaced = True
             break
     if not replaced:
@@ -121,14 +144,14 @@ def set_env_var(path: Path, key: str, value: str) -> None:
             s = line.lstrip()
             if s.startswith("#") and s.lstrip("#").strip().startswith(f"{key}="):
                 placeholder = i
-        if placeholder is not None:
-            lines.insert(placeholder + 1, new_line)
-        else:
-            lines.append(new_line)
-    out = "\n".join(lines) + "\n"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(out)
-    os.replace(tmp, path)
+        at = len(lines) if placeholder is None else placeholder + 1
+        if at and not ending(lines[at - 1]):
+            lines[at - 1] += nl
+        lines.insert(at, new_line + nl)
+    tmp = real.with_name(f".{real.name}.{os.getpid()}.tmp")
+    tmp.write_bytes("".join(lines).encode("utf-8", "surrogateescape"))
+    os.chmod(tmp, mode)
+    os.replace(tmp, real)
 
 
 # ---------- Twilio REST ----------
@@ -212,6 +235,7 @@ def running_server_webhook() -> str:
 
 
 def webhook_base(explicit: str | None, env_file: Path) -> str:
+    """The base Twilio should post to; TWILIO_WEBHOOK_PUSHED is never one (it is the record)."""
     if explicit:
         return explicit.rstrip("/")
     live = running_server_webhook()
@@ -237,6 +261,7 @@ def cmd_status(args, sid, token, env_file) -> int:
     env = env_file_dict(env_file)
     configured = os.environ.get("TWILIO_PHONE_NUMBER") or env.get("TWILIO_PHONE_NUMBER", "")
     base = webhook_base(None, env_file)
+    pushed = env.get(PUSHED_KEY, "").rstrip("/")
     expected_voice = (base + VOICE_PATH) if base else ""
     rows = []
     for n in nums:
@@ -247,6 +272,7 @@ def cmd_status(args, sid, token, env_file) -> int:
     payload = {"account": {"friendly_name": acct.get("friendly_name"), "status": acct.get("status"),
                            "type": acct.get("type")},
                "numbers": rows, "configured_number": configured, "webhook_base": base,
+               "last_pushed": pushed, "pushed_stale": bool(base and pushed and pushed != base),
                "server_running": bool(running_server_webhook())}
     lines = [f"Twilio account: {acct.get('friendly_name')} ({acct.get('type')}, {acct.get('status')})"]
     if acct.get("type") == "Trial":
@@ -259,6 +285,8 @@ def cmd_status(args, sid, token, env_file) -> int:
         lines.append(f"Number {r['number']} {mark}; voice webhook: {r['voice_url'] or '(none)'}"
                      + ("  ⚠ differs from this machine — run set-webhook" if r["webhook_drift"] else ""))
     lines.append(f"Webhook base here: {base or '(unknown — server not running and nothing in .env)'}")
+    if payload["pushed_stale"]:
+        lines.append(f"  ⚠ last pushed to Twilio: {pushed} — run set-webhook, or set TWILIO_AUTO_WEBHOOK=1")
     _out(args, payload, "\n".join(lines))
     return 0
 
@@ -285,7 +313,7 @@ def cmd_buy(args, sid, token, env_file) -> int:
     number = bought.get("phone_number") or args.number
     set_env_var(env_file, "TWILIO_PHONE_NUMBER", number)
     if base:
-        set_env_var(env_file, "TWILIO_WEBHOOK_URL", base)
+        set_env_var(env_file, PUSHED_KEY, base)
     payload = {"number": number, "sid": bought.get("sid"), "voice_url": bought.get("voice_url"),
                "webhook_base": base, "env_file": str(env_file)}
     human = f"Bought {number} (sid {bought.get('sid')}); TWILIO_PHONE_NUMBER written to {env_file}."
@@ -299,8 +327,8 @@ def cmd_buy(args, sid, token, env_file) -> int:
 def cmd_set_webhook(args, sid, token, env_file) -> int:
     base = webhook_base(args.base, env_file)
     if not base:
-        print("[twilio-setup] no webhook base: pass one, start the phone server, or set "
-              "TWILIO_WEBHOOK_URL in .env", file=sys.stderr)
+        print("[twilio-setup] no webhook base: pass one, or start the phone server "
+              "(its /health reports the tunnel)", file=sys.stderr)
         return 1
     env = env_file_dict(env_file)
     want = args.number or os.environ.get("TWILIO_PHONE_NUMBER") or env.get("TWILIO_PHONE_NUMBER", "")
@@ -317,13 +345,13 @@ def cmd_set_webhook(args, sid, token, env_file) -> int:
             print(f"[twilio-setup] which number? owned: {owned} (pass --number)", file=sys.stderr)
             return 1
     updated = update_number(sid, token, target["sid"], base)
-    set_env_var(env_file, "TWILIO_WEBHOOK_URL", base)
+    set_env_var(env_file, PUSHED_KEY, base)
     if not want:
         set_env_var(env_file, "TWILIO_PHONE_NUMBER", target["phone_number"])
     payload = {"number": target.get("phone_number"), "voice_url": updated.get("voice_url"),
                "status_callback": updated.get("status_callback"), "webhook_base": base}
     _out(args, payload, f"{target.get('phone_number')} now posts calls to {base}{VOICE_PATH} "
-                        f"(status → {base}{STATUS_PATH}); TWILIO_WEBHOOK_URL written to {env_file}.")
+                        f"(status → {base}{STATUS_PATH}); {PUSHED_KEY} written to {env_file}.")
     return 0
 
 

@@ -29,11 +29,16 @@ an API call, so do it for them with `scripts/twilio-setup.py`:
    point at https://console.twilio.com/billing), numbers owned, webhook drift.
 3. `… numbers --country US --area 415` — list voice-capable numbers; let the owner pick.
 4. `… buy +14155551234` — buys it, points its voice webhook at this machine (the running
-   server's tunnel from `GET localhost:3100/health`, else `TWILIO_WEBHOOK_URL` /
-   `WEBHOOK_BASE_URL` in `.env`), and writes `TWILIO_PHONE_NUMBER` + `TWILIO_WEBHOOK_URL`
-   into `<repo>/.env` in place. Then restart the phone server (`startup.sh`).
-5. `… set-webhook [BASE]` — re-point an owned number after the tunnel URL moved.
-   With `TWILIO_AUTO_WEBHOOK=1` in `.env` the server does this itself on every start.
+   server's tunnel from `GET localhost:3100/health`; else `TWILIO_WEBHOOK_URL`, an
+   operator-set fixed external URL; else `WEBHOOK_BASE_URL`), and writes
+   `TWILIO_PHONE_NUMBER` + `TWILIO_WEBHOOK_PUSHED` (the base it pushed) into `<repo>/.env`
+   in place. It never writes `TWILIO_WEBHOOK_URL`: the server binds that key instead of
+   starting its own tunnel, so a moving ngrok URL recorded there goes stale on the next
+   restart. Then restart the phone server (`startup.sh`).
+5. `… set-webhook [BASE]` — re-point an owned number after the tunnel URL moved (`status`
+   says "last pushed to Twilio … run set-webhook" when it did). With `TWILIO_AUTO_WEBHOOK=1`
+   in `.env` the server pushes the tunnel it just bound on every start, so a restart with
+   an unreserved ngrok needs no hand step.
 6. Confirm: `curl localhost:3100/health` shows the tunnel; `status` shows no drift.
 
 Twilio's refusals are printed verbatim (error code + message + more_info link); relay

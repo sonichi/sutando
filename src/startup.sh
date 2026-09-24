@@ -1255,7 +1255,9 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
           | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
         NGROK_CMP="${NGROK_URL%/}"
         if [ -z "$TWILIO_CFG_URL" ]; then
-          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
+          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL — run"
+          echo "      python3 skills/phone-conversation/scripts/twilio-setup.py set-webhook"
+          echo "      or set TWILIO_AUTO_WEBHOOK=1 so the phone server does it on start (no TWILIO_WEBHOOK_URL recorded)"
         elif [ "$TWILIO_CFG_URL" = "$NGROK_CMP" ]; then
           :
         elif ! printf '%s' "$TWILIO_CFG_URL" | grep -qE '\.ngrok(-free)?\.(app|io)$'; then
@@ -1268,7 +1270,8 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
           echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
           echo "      was: $TWILIO_CFG_URL"
           echo "      now: $NGROK_URL"
-          echo "      1. update the Twilio console webhook to the new URL"
+          echo "      1. run python3 skills/phone-conversation/scripts/twilio-setup.py set-webhook $NGROK_URL"
+          echo "         (or set TWILIO_AUTO_WEBHOOK=1 so the phone server does it on start)"
           echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
           echo "         phone conversation server — it binds this at startup"
         fi
