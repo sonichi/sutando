@@ -50,14 +50,14 @@ class Base(unittest.TestCase):
         return util_paths.watcher_sentinel_path(self.ws / "state", instance=instance)
 
     def ask(self, *, instance=WORKER, alive=lambda pid: True,
-            watcher_target=None):
+            watcher_target=None, in_session=lambda pid: True):
         """`watcher_target` defaults to "this pid watches MY inbox", which is
         what every pre-ownership test meant by a live watcher."""
         if watcher_target is None:
             watcher_target = lambda pid: self.inbox          # noqa: E731
         return wb.decide(instance=instance, inbox=self.inbox,
                          workspace=str(self.ws), alive=alive,
-                         watcher_target=watcher_target)
+                         watcher_target=watcher_target, in_session=in_session)
 
 
 class TestInstanceScoped(Base):
@@ -456,6 +456,62 @@ class TestOwnershipIsScopedToTheInbox(Base):
         self.assertIsNone(wb._watcher_target(os.getpid()))
 
 
+class TestOwnershipIsScopedToThisSession(Base):
+    """A watcher on this inbox left by an ENDED session still holds the inbox,
+    but its stdout reaches no one: reading it as coverage strands every task."""
+
+    def test_a_watcher_this_session_did_not_start_means_start(self):
+        self.sentinel(WORKER).write_text("4242\n")
+        d, why = self.ask(in_session=lambda pid: False)
+        self.assertEqual(d, "start", why)
+        self.assertIn("not started by this session", why)
+
+    def test_an_unobservable_ancestry_is_unknown_not_skip(self):
+        def blind(pid):
+            raise wb.Unobserved("ps failed")
+        self.sentinel(WORKER).write_text("4242\n")
+        d, why = self.ask(in_session=blind)
+        self.assertEqual(d, "unknown", why)
+
+    def test_the_session_is_the_nearest_ancestor_that_is_not_a_shell(self):
+        table = {50: (40, "python3"), 40: (30, "zsh"), 30: (20, "claude"),
+                 20: (1, "tmux"), 60: (30, "zsh"), 61: (60, "bash"),
+                 70: (1, "bash")}
+        self.assertEqual(wb.session_root(table, 40), 30)
+        self.assertTrue(wb.descends_from(table, 61, 30))
+        self.assertFalse(wb.descends_from(table, 70, 30))
+
+    def test_a_chain_of_shells_up_to_init_scopes_nothing(self):
+        self.assertIsNone(wb.session_root({40: (1, "-zsh")}, 40))
+
+    def test_a_detached_watcher_on_this_inbox_is_not_this_sessions(self):
+        """The real shape: a watcher reparented away from this session."""
+        script = self.ws / "watch-tasks-stream.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n")
+        out = subprocess.run(
+            ["bash", "-c", f'nohup bash "{script}" "{self.inbox}" >/dev/null 2>&1 & echo $!'],
+            capture_output=True, text=True, check=True).stdout.strip()
+        pid = int(out)
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        import watcher_identity
+        for _ in range(50):
+            if watcher_identity.proc_argv_vector(pid) is not None:
+                break
+            time.sleep(0.02)
+        else:
+            self.skipTest("no authoritative argv read on this platform")
+        table = wb._process_table()
+        if wb.session_root(table, os.getppid()) is None:
+            self.skipTest("this test process has no non-shell ancestor to scope to")
+        if table.get(pid, (0,))[0] != 1:
+            self.skipTest("a subreaper adopted the detached process")
+        self.sentinel(WORKER).write_text(f"{pid}\n")
+        d, why = wb.decide(instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+                           alive=lambda p: True)
+        self.assertEqual(d, "start", why)
+        self.assertIn("not started by this session", why)
+
+
 class TestTheShippedStartupNamesTheInbox(Base):
     """F1: the ownership check reads the watched inbox from argv, so the
     instruction that starts a worker's watcher has to put it there."""
@@ -504,7 +560,7 @@ class TestTheShippedStartupNamesTheInbox(Base):
         self.sentinel(WORKER).write_text("4242\n")
         decision, why = wb.decide(
             instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
-            alive=lambda pid: True,
+            alive=lambda pid: True, in_session=lambda pid: True,
             watcher_target=lambda pid: wb._target_from_argv(
                 argv, pid, argv_vector=lambda _p: shlex.split(argv)))
         self.assertEqual(decision, "skip", why)
@@ -531,7 +587,7 @@ class TestTheShippedStartupNamesTheInbox(Base):
         vec = ["bash", "src/watch-tasks-stream.sh", spaced]
         decision, _ = wb.decide(
             instance=WORKER, inbox=spaced, workspace=str(self.ws),
-            alive=lambda pid: True,
+            alive=lambda pid: True, in_session=lambda pid: True,
             watcher_target=lambda pid: wb._target_from_argv(
                 f"bash src/watch-tasks-stream.sh {spaced}", pid, argv_vector=lambda p: vec))
         self.assertEqual(decision, "skip")
