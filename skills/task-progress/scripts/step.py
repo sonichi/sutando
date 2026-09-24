@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""Post one browser step into the task's room: a short line, optionally with
-a screenshot of the page as it is right now.
+"""Post one browser step into a conversation: a short line, optionally with a
+screenshot of the page.
 
 Usage:
     python3 step.py --source ag2space --channel-id '!room:server' \
-        --message "Opened the checkout page — 2 items, $84.10" \
-        --screenshot                       # capture --url now via src/browser.mjs
-    python3 step.py ... --message "Filled the shipping form" --screenshot /path/to/shot.png
-    python3 step.py ... --message "Searching flights" --url https://example.com --screenshot
+        --message "Filled the shipping form" --screenshot /path/to/shot.png
+    python3 step.py ... --message "Searching flights" --capture https://example.com
 
-Why this exists (owner feedback, 2026-09-20): a browsing task that reports
-only "done" hides what the agent saw and did; the person wants each step in
-the chat, text and picture, and a screenshot before anything is bought or
-submitted. The line goes through notify.py's gateway sender (same worker
-stamp, same length rule); the image goes through the gateway's
-POST /v1/rooms/<room>/media, the route `[file:]` markers already take, under
-the same allowlist. Screenshots from src/browser.mjs land in
-$SUTANDO_SCREENSHOT_DIR (default <tmpdir>/sutando-screenshots), which is
-admitted here as this script's own extra root — nothing else may send from
-there.
+`--screenshot <path>` attaches a picture the session doing the work took of the
+page it is on (src/browser.mjs's `screenshot` action at the end of its action
+chain, or a window capture): that is the only picture that shows the live page
+with its form state, and the only one to ask an approval on. `--capture <url>`
+is a FRESH load of the URL in the Sutando browser profile through
+src/browser.mjs: logged-in cookies apply, in-page state does not, and the page
+gets a second GET — a public page or a listing, never a checkout or a review
+step. stderr says which one was posted.
+
+Why this exists (user feedback): a browsing task that reports only "done" hides
+what the agent saw and did; the person wants each step in the chat, text and
+picture, and a screenshot before anything is bought or submitted. The line goes
+through notify.py's gateway sender (same worker stamp, same length rule); the
+image goes through the gateway's POST /v1/rooms/<room>/media, the route
+`[file:]` markers already take, under the same allowlist. Screenshots from
+src/browser.mjs land in $SUTANDO_SCREENSHOT_DIR (default
+<tmpdir>/sutando-screenshots), which is admitted here as this script's own
+extra root — nothing else may send from there.
+
+Where the step goes is the caller's rule (skills/task-progress/SKILL.md): an
+owner errand, and anything read from the owner's logged-in accounts, goes to
+the owner DM even when the task arrived in a shared room.
 
 Exit 0 when the text step was posted (a failed screenshot is a warning: the
 line is the load-bearing part, and a step must never block the task). Exit 1
@@ -49,10 +59,8 @@ def screenshot_dir() -> str:
 
 
 def capture(url: str) -> "tuple[str, str]":
-    """Full-page screenshot of `url` through src/browser.mjs. (path, "") or
-    ("", reason). The last stdout line is the path browser.mjs printed."""
-    if not url:
-        return "", "no --url to capture (pass --screenshot <path> for an existing image)"
+    """Full-page screenshot of a fresh load of `url` through src/browser.mjs.
+    (path, "") or ("", reason). The last stdout line is the path it printed."""
     try:
         proc = subprocess.run(
             ["node", str(BROWSER_MJS), url, "screenshot", "--timeout=60000"],
@@ -82,13 +90,15 @@ def send_text(source: str, channel: str, message: str, thread_ts: str | None) ->
 def run(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description="Post one browser step (text + optional screenshot).")
     parser.add_argument("--source", required=True)
-    parser.add_argument("--channel-id", help="Room / channel id")
+    parser.add_argument("--channel-id", help="Room / channel id: the conversation this step belongs in")
     parser.add_argument("--chat-id", help="Telegram chat id (alias)")
     parser.add_argument("--thread-ts", default=None, help="Slack thread timestamp")
     parser.add_argument("--message", required=True, help="One short line: what you just did / see")
-    parser.add_argument("--url", default=None, help="Page to capture when --screenshot has no path")
-    parser.add_argument("--screenshot", nargs="?", const="", default=None,
-                        help="Attach a screenshot: a path, or bare to capture --url now")
+    picture = parser.add_mutually_exclusive_group()
+    picture.add_argument("--screenshot", default=None, metavar="PATH",
+                         help="A screenshot the working session took of the page it is on (the live page)")
+    picture.add_argument("--capture", default=None, metavar="URL",
+                         help="A FRESH load of URL via src/browser.mjs — not the live tab; never for an approval")
     args = parser.parse_args(argv)
 
     channel = args.channel_id or args.chat_id
@@ -105,14 +115,16 @@ def run(argv: "list[str] | None" = None) -> int:
         print("[task-progress] step text not sent", file=sys.stderr)
         return 1
 
-    if args.screenshot is None:
-        return 0
     path = args.screenshot
-    if not path:
-        path, reason = capture(args.url or "")
+    if args.capture:
+        path, reason = capture(args.capture)
         if not path:
             print(f"[task-progress] screenshot skipped: {reason}", file=sys.stderr)
             return 0
+        print(f"[task-progress] captured a fresh load of {args.capture} — not the live tab",
+              file=sys.stderr)
+    if not path:
+        return 0
     ok, reason = notify.upload_room_media(args.source, channel, path,
                                          extra_roots=(screenshot_dir(),))
     if not ok:
