@@ -65,14 +65,25 @@ check("fixture: a delivered reply is ready to task_dispatch",
 check("fixture: no sentinel was ever accepted", list(inbox.glob("*.accepted")), [])
 check("148 answered zero-byte sentinels owe nothing", worker_owes(ws, WID), False)
 
+# (a) a zero-byte sentinel, never accepted, no result anywhere: owed.
 (inbox / "task-1799999999.txt").write_bytes(b"")
-check("one more sentinel with no reply anywhere is owed", worker_owes(ws, WID), True)
+check("(a) zero-byte .txt, no .accepted, no result: owed", worker_owes(ws, WID), True)
 
 (pd.results_dir(ws) / "task-1799999999.txt").write_text("")
-check("an EMPTY live result delivers nothing: still owed", worker_owes(ws, WID), True)
+check("(a) an EMPTY live result delivers nothing: still owed", worker_owes(ws, WID), True)
 
+# (b) the same task once answered, live in results/ or drained to results/archive/.
 (pd.results_dir(ws) / "task-1799999999.txt").write_text("answered\n")
-check("once its reply is ready, owed again drops to nothing", worker_owes(ws, WID), False)
+check("(b) its reply live in results/: not owed", worker_owes(ws, WID), False)
+(pd.results_dir(ws) / "task-1799999999.txt").unlink()
+(archive / "task-1799999999.txt").write_text("answered\n")
+check("(b) its reply in results/archive/: not owed", worker_owes(ws, WID), False)
+
+# (c) a task the worker really accepted and has not answered: owed.
+(inbox / "task-1800000000.accepted").write_bytes(b"")
+check("(c) accepted, no result: owed", worker_owes(ws, WID), True)
+(archive / "task-1800000000.txt").write_text("answered\n")
+check("(c) accepted, then answered: not owed", worker_owes(ws, WID), False)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — worker work signal on real sentinels")
 for f in fails:
