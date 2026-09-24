@@ -2,9 +2,9 @@
 """The wedge remedies and readers refuse rather than guess.
 
 A timer with nobody watching runs these, so every expected failure is a value:
-a paused or unrecorded worker is not restarted, an unread pane authorises no
-kill, a kill or a tmux start that fails is reported, and an unreadable queue or
-pane is None (not evidence), never False.
+an unrecorded worker or an unread pane raises no card, a pane that moved on is
+cleared, a tmux start that fails is reported, and an unreadable queue or pane is
+None (not evidence), never False.
 """
 import importlib.util
 import json
@@ -30,6 +30,7 @@ def _load(name):
 
 rem = _load("pool_remedy")
 sup, ps, wi = rem.sup, rem.ps, rem.wi
+wc = rem.wc
 
 WID = "w1"
 SOCK = "/tmp/pool-wedge-refusals.sock"
@@ -70,34 +71,21 @@ def pool(with_run=True):
     return ws
 
 
-def never_spawn(*a, **k):
-    raise AssertionError("spawn must not run")
-
-
-class RestartRefuses(unittest.TestCase):
-    def outcome(self, ws, runner):
-        return rem.restart_wedged(ws, REPO, WID, runner=runner, spawn=never_spawn)["outcome"]
-
-    def test_paused(self):
-        ws = pool()
-        (wi.worker_dir(ws, WID) / sup.PAUSED_MARKER).touch()
-        self.assertEqual(self.outcome(ws, Runner()), rem.PAUSED)
+class CardRefuses(unittest.TestCase):
+    def outcome(self, ws, runner, which="card_frozen"):
+        return wc.raise_card(ws, WID, which, runner=runner, routed=lambda *a: False)["outcome"]
 
     def test_no_recorded_run(self):
-        self.assertEqual(self.outcome(pool(with_run=False), Runner()), rem.NO_SESSION)
+        self.assertEqual(self.outcome(pool(with_run=False), Runner()), "no-recorded-session")
 
-    def test_pane_unread_authorises_no_kill(self):
+    def test_pane_unread_raises_nothing(self):
         r = Runner(capture_pane=Done(1, err="no server running"))
-        self.assertEqual(self.outcome(pool(), r), rem.INDETERMINATE)
-        self.assertFalse([c for c in r.calls if "kill-session" in c])
+        self.assertEqual(self.outcome(pool(), r), "indeterminate")
 
-    def test_kill_that_raises(self):
-        r = Runner(capture_pane=Done(0, WORKING), kill_session=OSError("tmux gone"))
-        self.assertEqual(self.outcome(pool(), r), rem.FAILED)
-
-    def test_kill_that_fails(self):
-        r = Runner(capture_pane=Done(0, WORKING), kill_session=Done(1, err="denied"))
-        self.assertEqual(self.outcome(pool(), r), rem.FAILED)
+    def test_a_pane_that_moved_on_is_cleared(self):
+        self.assertEqual(self.outcome(pool(), Runner(capture_pane=Done(0, f"❯ \n{FOOTER}\n"))), "cleared")
+        self.assertEqual(self.outcome(pool(), Runner(capture_pane=Done(0, WORKING)), "card_cause"),
+                         "cleared")
 
 
 class InputWatchRefuses(unittest.TestCase):

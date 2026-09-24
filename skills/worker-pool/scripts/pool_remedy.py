@@ -37,6 +37,7 @@ sys.path.insert(0, str(_HERE))
 sup = _sibling("pool_supervise")
 sw = _sibling("spawn_worker")
 pd = _sibling("pool_delivery")
+wc = _sibling("pool_wedge_cards")
 ps, wi = sup.ps, sup.wi
 
 RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
@@ -146,45 +147,11 @@ def ensure_supervisors(workspace, repo, observations: dict, *, runner=None) -> d
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
-RESTARTED, HELD_GATE = "restarted", "held-gate"
-
-
-def restart_wedged(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
-    """End a wedged session and resume it. The pane is read again first: a gate or
-    limit on it now is the owner's to answer, so it is never killed into."""
-    run = runner or subprocess.run
-    if sup.is_paused(workspace, worker_id):
-        return {"worker_id": worker_id, "outcome": PAUSED}
-    socket, name = sup._open_tmux(workspace, worker_id)
-    if not socket:
-        return {"worker_id": worker_id, "outcome": NO_SESSION}
-    pane, _ = sup.observe_pane(workspace, worker_id, runner=run)
-    if pane is None:
-        return {"worker_id": worker_id, "outcome": INDETERMINATE, "probe": "pane unread"}
-    if pane in (ps.PANE_GATE, ps.PANE_LIMIT):
-        return {"worker_id": worker_id, "outcome": HELD_GATE, "pane": pane}
-    try:
-        done = run(["tmux", "-S", str(socket), "kill-session", "-t", f"={name}"],
-                   capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"worker_id": worker_id, "outcome": FAILED, "why": str(e)}
-    if done.returncode != 0:
-        return {"worker_id": worker_id, "outcome": FAILED,
-                "why": (done.stderr or "").strip()[-300:]}
-    back = recover(workspace, repo, worker_id, runner=runner, spawn=spawn)
-    return {"worker_id": worker_id,
-            "outcome": RESTARTED if back["outcome"] == RECOVERED else back["outcome"],
-            "pane": pane, "recover": back}
-
-
 INPUT_WATCH_SUFFIX = "-input"
 WATCHING = "watching"
 
 
-def seat_label(workspace, worker_id) -> str:
-    row = sup.supervised_workers(workspace).get(worker_id) or {}
-    label = row.get("label") or worker_id
-    return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id[:8]})"
+seat_label = wc.seat_label
 
 
 def input_watch_command(workspace, repo, worker_id, socket, seat) -> list:
@@ -243,22 +210,25 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
-    holds the inbox. `escalate` is returned untouched, because asking the owner
-    is the core's, not a timer's."""
+    holds the inbox. A wedge card is raised and never acts on the session: only a
+    dead session is ever respawned. `escalate` is returned untouched, because
+    asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
+    cards = {}
     for worker_id, decision in decisions.items():
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision == ps.RESTART_WEDGED:
-            done[worker_id] = restart_wedged(workspace, repo, worker_id,
-                                             runner=runner, spawn=spawn)
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN):
+            cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
+                                             runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
     return {"recoveries": done,
             "rearms": rearms,
+            "cards": cards,
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
@@ -280,11 +250,15 @@ def main(argv=None) -> int:
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    acted = ({"recoveries": {}, "rearms": {}, "escalations": [], "dry_run": True} if a.dry_run
-             else apply(a.workspace, a.repo, tick["decisions"]))
+    acted = ({"recoveries": {}, "rearms": {}, "cards": {}, "escalations": [], "dry_run": True}
+             if a.dry_run else apply(a.workspace, a.repo, tick["decisions"]))
     if not a.dry_run:
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
+        acted["escapes"] = wc.drive_escapes(a.workspace)
+        clear = {w for w, o in tick["observations"].items()
+                 if o.get("session_alive") is True and w not in tick.get("wedged", [])}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear)
     print(json.dumps({"decisions": tick["decisions"], **acted}, indent=2, sort_keys=True))
     failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
     return 1 if failed else 0

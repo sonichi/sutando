@@ -8,9 +8,9 @@ sleep, in microseconds.
 
 The rungs come from docs/worker-pool-design.md and the owner's settlement:
 detection at the design's 90 s stale line, silent recovery, and only if recovery
-has not brought the worker back by 3 minutes does the owner get asked. The
-same ladder covers a live session that is wedged: its pane shows a gate, a limit,
-abnormal text or a frozen turn while the worker owes work.
+has not brought the worker back by 3 minutes does the owner get asked. A live
+session that is wedged (a gate, a limit, abnormal text or a frozen turn while the
+worker owes work) is never restarted: it only ever reaches the owner as a card.
 """
 from __future__ import annotations
 
@@ -33,10 +33,12 @@ FAST_SUSTAINED_TICKS = 2
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
-RESTART_WEDGED = "restart_wedged"
+# A wedged live session's card: the cause named (abnormal text), or a frozen turn
+# offering an Escape the owner must press. Neither decision ends or types into a session.
+CARD_CAUSE, CARD_FROZEN = "card_cause", "card_frozen"
 
 # The worker's pane, as the caller reads one capture. GATE and LIMIT wait on a
-# human (a dialog, a spend or wait decision); a restart must never answer them.
+# human (a dialog, a spend or wait decision), so they escalate as a gate does.
 PANE_IDLE, PANE_WORKING, PANE_GATE, PANE_LIMIT, PANE_ABNORMAL, PANE_UNKNOWN = (
     "idle", "working", "gate", "limit", "abnormal", "unknown")
 _HUMAN_PANES = (PANE_GATE, PANE_LIMIT)
@@ -82,7 +84,6 @@ class WorkerEvidence:
     # The wedge ladder: a live session whose pane will not progress while it owes work.
     wedge_first_detected_at: float | None = None
     wedge_consecutive: int = 0
-    wedge_restart_issued_at: float | None = None
     wedge_escalated: bool = False
     last_pane_id: str | None = None
 
@@ -142,15 +143,14 @@ def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
 
 def _cleared_wedge(ev: WorkerEvidence) -> WorkerEvidence:
     return replace(ev, wedge_first_detected_at=None, wedge_consecutive=0,
-                   wedge_restart_issued_at=None, wedge_escalated=False)
+                   wedge_escalated=False)
 
 
 def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
-                sustained_ticks: int, detect_after_s: float,
-                escalate_after_s: float) -> tuple[WorkerEvidence, str]:
-    """Same rungs and clocks as death: sustained past the stale line asks for one
-    restart, still wedged past the owner's line escalates once. A human gate is
-    never restarted into: it escalates at the stale line instead."""
+                sustained_ticks: int, detect_after_s: float) -> tuple[WorkerEvidence, str]:
+    """Same sustain and stale line as death, and one decision per episode: a gate
+    or limit escalates; abnormal text asks for a card naming its cause; a frozen
+    turn asks for a card offering Escape. No wedge kind restarts a session."""
     kind = _wedge_kind(obs, ev)
     ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
@@ -164,15 +164,10 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     elapsed = now - ev.wedge_first_detected_at
     if ev.wedge_consecutive < sustained_ticks or elapsed < detect_after_s:
         return ev, NOTHING
-    if kind == "human":
-        if not ev.wedge_escalated:
-            return replace(ev, wedge_escalated=True), ESCALATE
+    if ev.wedge_escalated:
         return ev, NOTHING
-    if ev.wedge_restart_issued_at is None:
-        return replace(ev, wedge_restart_issued_at=now), RESTART_WEDGED
-    if not ev.wedge_escalated and elapsed >= escalate_after_s:
-        return replace(ev, wedge_escalated=True), ESCALATE
-    return ev, NOTHING
+    decision = {"human": ESCALATE, "abnormal": CARD_CAUSE, "stuck": CARD_FROZEN}[kind]
+    return replace(ev, wedge_escalated=True), decision
 
 
 def _cleared_session(ev: WorkerEvidence) -> WorkerEvidence:
@@ -261,7 +256,7 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
                 detect_after_s=detect_after_s, escalate_after_s=escalate_after_s)
             ev, wedge = _wedge_rung(
                 ev, obs, now, sustained_ticks=sustained_ticks,
-                detect_after_s=detect_after_s, escalate_after_s=escalate_after_s)
+                detect_after_s=detect_after_s)
             workers[worker_id] = ev
             decisions[worker_id] = wedge if wedge != NOTHING else decision
             continue

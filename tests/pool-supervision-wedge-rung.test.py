@@ -4,10 +4,10 @@
 A worker whose session answers alive never reaches the death ladder, so a limit
 menu, a permission dialog or a frozen turn used to hold its work with nobody
 acting. The wedge rung reads the pane the caller captured (pane_gate + cli_wedge)
-and the worker's own queue (cli_wedge.work_outstanding scoped to its inbox):
-sustained past the stale line it asks for one restart, still wedged past the
-owner's line it escalates, and a human gate or limit is never restarted into —
-it escalates instead. Every subprocess here is a stub answered by argv.
+and what the worker owes (task_dispatch): sustained past the stale line it asks
+once per episode for the owner — a gate or limit escalates, abnormal text asks for
+a card naming its cause, a frozen turn for a card offering Escape. No wedge kind
+restarts a session. Every subprocess here is a stub answered by argv.
 """
 import importlib.util
 import json
@@ -44,7 +44,8 @@ def check(name, got, want):
         fails.append(f"{name}: got {got!r}, want {want!r}")
 
 
-RESTART = getattr(ps, "RESTART_WEDGED", "restart_wedged")
+CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
+FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
     ("PANE_GATE", "gate"), ("PANE_LIMIT", "limit"), ("PANE_ABNORMAL", "abnormal"),
     ("PANE_WORKING", "working"), ("PANE_IDLE", "idle")))
@@ -83,12 +84,12 @@ got, _ = run([obs(LIMIT)] * 4)
 check("a limit is a human's wait-or-spend decision: escalate, never restart", got, [N, N, E, N])
 
 got, _ = run([obs(ABN)] * 5)
-check("abnormal text sustained asks for one restart, then escalates if it persists",
-      got, [N, N, RESTART, E, N])
+check("abnormal text sustained asks once for a card naming its cause, never a restart",
+      got, [N, N, CAUSE, N, N])
 
 got, _ = run([obs(WORK, "same")] * 5)
 check("a turn whose raw frame never changes is stuck: the 2nd identical frame is the 1st detection",
-      got, [N, N, N, RESTART, E])
+      got, [N, N, N, FROZEN, N])
 
 got, _ = run([obs(WORK, f"f{i}") for i in range(6)])
 check("a turn whose frame moves is working, whatever the queue says", got, [N] * 6)
@@ -194,36 +195,6 @@ o = sup.observe(ws, 1000.0, runner=Stub(PANES["permission"][0]))[WID]
 check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))
 check("observe carries a raw frame id for the stuck test", bool(getattr(o, "pane_id", None)), True)
-
-# --- the remedy never kills into a human gate ---------------------------------------
-
-restart = getattr(rem, "restart_wedged", None)
-stub = Stub(PANES["limit menu"][0])
-out = restart(ws, REPO, WID, runner=stub, spawn=lambda *a, **k: {}) if restart else {}
-check("a gate on the pane at action time holds: no kill", (out.get("outcome"), stub.killed()),
-      (getattr(rem, "HELD_GATE", "held-gate"), []))
-
-spawned = []
-
-
-class Gone(Stub):
-    """After kill-session, has-session answers gone so recover() resumes."""
-
-    def __call__(self, argv, **kw):
-        if argv[0] == "tmux" and "has-session" in argv and self.killed():
-            self.calls.append(list(argv))
-            return Done(1, err="can't find session: x")
-        return super().__call__(argv, **kw)
-
-
-stub = Gone(PANES["api error"][0])
-out = (rem.apply(ws, REPO, {WID: RESTART}, runner=stub,
-                 spawn=lambda *a, **k: spawned.append(k) or {"runtime_session_id": "s1"})
-       ["recoveries"].get(WID, {}))
-check("restart_wedged ends the wedged session by its exact name",
-      stub.killed(), [["tmux", "-S", SOCK, "kill-session", "-t", f"={wi.tmux_session_name(WID)}"]])
-check("...then resumes the same conversation", [k.get("resume") for k in spawned], ["s1"])
-check("...and reports it", out.get("outcome"), getattr(rem, "RESTARTED", "restarted"))
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision wedge rung")
 for f in fails:

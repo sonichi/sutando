@@ -286,7 +286,6 @@ def load_state(workspace) -> ps.SupervisionState:
                 watcher_escalated=bool(ev.get("watcher_escalated")),
                 wedge_first_detected_at=ev.get("wedge_first_detected_at"),
                 wedge_consecutive=int(ev.get("wedge_consecutive") or 0),
-                wedge_restart_issued_at=ev.get("wedge_restart_issued_at"),
                 wedge_escalated=bool(ev.get("wedge_escalated")),
                 last_pane_id=ev.get("last_pane_id"),
             )
@@ -311,7 +310,6 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "watcher_escalated": e.watcher_escalated,
                         "wedge_first_detected_at": e.wedge_first_detected_at,
                         "wedge_consecutive": e.wedge_consecutive,
-                        "wedge_restart_issued_at": e.wedge_restart_issued_at,
                         "wedge_escalated": e.wedge_escalated,
                         "last_pane_id": e.last_pane_id}
                     for w, e in state.workers.items()},
@@ -342,6 +340,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
         save_state(workspace, new_state)
     asked = list(worker_ids or [])
     return {"decisions": decisions,
+            "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
