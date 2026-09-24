@@ -185,6 +185,33 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `native-pim-guard.py`
+
+Denies **Bash commands that drive the native macOS Calendar, Reminders or Contacts
+app** — `osascript`/JXA (`tell application "Calendar"`, `Application("Reminders")`),
+`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal` and `.app` paths for Calendar,
+iCal, Reminders, Contacts and Address Book — with a reason that gives the order:
+the Station connector first (`composio_find {"apps": ["google calendar"]}` →
+`composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
+present, then ask the owner; and never re-prompt once the owner denied the
+permission. Driving those apps raises a macOS Automation prompt on the owner's
+screen (user report, 2026-09-24). Unrelated `osascript`/`open` commands and every
+non-Bash tool pass through.
+
+Escape hatch: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` (or that
+variable in the hook's own environment) — set it only when the owner asked for the
+local app in this conversation. Fail-OPEN on hook errors.
+
+### Registration
+
+**Auto-registered** for every core session, next to `gmail-write-guard.py`:
+`session-launch.sh` passes this hook to `build-core-settings.mjs`, which registers
+it under `PreToolUse` with matcher `Bash`. For a non-core session, add the same
+`PreToolUse` entry by hand as in the block above, with matcher `Bash` and
+command `python3 <deployed path>/native-pim-guard.py`.
+
+Test: `python3 tests/native-pim-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

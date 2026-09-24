@@ -2,15 +2,17 @@
 """
 Sutando reminders — read/write macOS Reminders via AppleScript.
 
-Usage:
-  python3 src/reminders.py list                              # all incomplete reminders
-  python3 src/reminders.py list --all                        # include completed
-  python3 src/reminders.py list --due-today                  # only today's + overdue
-  python3 src/reminders.py add "Buy groceries"               # add to default list
-  python3 src/reminders.py add "Call Bob" "2026-03-17"       # add with due date
-  python3 src/reminders.py add "Fix bug" "" "Work"           # add to specific list
-  python3 src/reminders.py complete "Buy groceries"          # mark as done
-  python3 src/reminders.py lists                             # show all reminder lists
+Usage (``--owner-asked`` only when the owner asked for the local Reminders app —
+it raises a macOS permission prompt; without it the script refuses, exit 2; a
+macOS denial (-1743) exits 3 with no retry):
+  python3 reminders.py list --owner-asked                    # all incomplete reminders
+  python3 reminders.py list --all --owner-asked              # include completed
+  python3 reminders.py list --due-today --owner-asked        # only today's + overdue
+  python3 reminders.py add "Buy groceries" --owner-asked     # add to default list
+  python3 reminders.py add "Call Bob" "2026-03-17" --owner-asked   # add with due date
+  python3 reminders.py add "Fix bug" "" "Work" --owner-asked # add to specific list
+  python3 reminders.py complete "Buy groceries" --owner-asked      # mark as done
+  python3 reminders.py lists --owner-asked                   # show all reminder lists
 """
 
 import json
@@ -19,6 +21,11 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
+# Sibling helper: the scripts run by path, so their directory is not on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import native_pim_consent as consent  # noqa: E402
 
 _app_launched = False
 
@@ -36,6 +43,7 @@ def run_applescript(script: str) -> tuple[str, str]:
         ["osascript", "-e", script],
         capture_output=True, text=True, timeout=15,
     )
+    consent.exit_if_denied("Reminders", result.stderr)
     return result.stdout.strip(), result.stderr.strip()
 
 
@@ -150,20 +158,21 @@ end tell
     return out or f"Not found: {name}"
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 src/reminders.py [list|add|complete|lists]")
+def main(argv=None):
+    argv = consent.require_consent("Reminders", argv)
+    if len(argv) < 2:
+        print("Usage: python3 reminders.py [list|add|complete|lists] --owner-asked")
         sys.exit(1)
 
-    cmd = sys.argv[1]
+    cmd = argv[1]
 
     if cmd == "lists":
         for name in list_reminder_lists():
             print(f"  - {name}")
 
     elif cmd == "list":
-        include_all = "--all" in sys.argv
-        due_today = "--due-today" in sys.argv
+        include_all = "--all" in argv
+        due_today = "--due-today" in argv
         reminders = list_reminders(include_completed=include_all)
         if not reminders:
             print("No reminders.")
@@ -182,19 +191,19 @@ def main():
             print(f"  [{r['list']}] {r['name']}{due}{done}")
 
     elif cmd == "add":
-        if len(sys.argv) < 3:
-            print("Usage: python3 src/reminders.py add 'name' ['due_date'] ['list']")
+        if len(argv) < 3:
+            print("Usage: python3 reminders.py add 'name' ['due_date'] ['list'] --owner-asked")
             sys.exit(1)
-        name = sys.argv[2]
-        due = sys.argv[3] if len(sys.argv) > 3 else ""
-        lst = sys.argv[4] if len(sys.argv) > 4 else ""
+        name = argv[2]
+        due = argv[3] if len(argv) > 3 else ""
+        lst = argv[4] if len(argv) > 4 else ""
         print(add_reminder(name, due, lst))
 
     elif cmd == "complete":
-        if len(sys.argv) < 3:
-            print("Usage: python3 src/reminders.py complete 'name'")
+        if len(argv) < 3:
+            print("Usage: python3 reminders.py complete 'name' --owner-asked")
             sys.exit(1)
-        print(complete_reminder(sys.argv[2]))
+        print(complete_reminder(argv[2]))
 
     else:
         print(f"Unknown command: {cmd}")

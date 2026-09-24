@@ -7,6 +7,15 @@ description: "macOS native integrations: screen capture, calendar, reminders, co
 
 Native macOS integrations via AppleScript. No API keys needed — works on any Mac.
 
+**Calendar, Reminders and Contacts need the owner's consent.** Driving those apps raises a macOS
+permission prompt on the owner's screen. The order: (1) the Superpower Station connector
+(`composio_find` → `composio_exec`); (2) if it is not connected, the owner's own tools when they
+are in the tool list (`mcp__claude_ai_Google_Calendar__*`); (3) otherwise ask the owner. Run the
+scripts below with `--owner-asked` only when the owner asked for the local app in this
+conversation — without it they refuse (exit 2). A macOS denial (exit 3) is final: say so, never
+retry or re-prompt. The `native-pim-guard` hook denies raw `osascript`/`open -a` commands against
+these apps for the same reason.
+
 ## When to Use
 
 - **Screen**: "What's on my screen?", "help me with this", "describe what I'm looking at"
@@ -26,25 +35,25 @@ Returns path to PNG screenshot. Use the Read tool on the path to view it.
 
 ### Calendar
 Prefer the Superpower Station connector (`composio_find` / `composio_exec`); when the owner's calendar
-app isn't connected, follow the `connect-apps` skill instead of falling back here. macOS Calendar is a
-fallback only when the Station tools aren't available, and an empty result from it is not an answer
+app isn't connected, follow the `connect-apps` skill instead of falling back here. macOS Calendar is
+only for an owner who asked for the local app, and an empty result from it is not an answer
 (the owner's real calendar may live in Google): say you couldn't read their calendar.
 ```bash
-python3 "$SKILL_DIR/scripts/calendar-reader.py" 7          # next 7 days, JSON
-python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text     # today, plain text
+python3 "$SKILL_DIR/scripts/calendar-reader.py" 7 --owner-asked          # next 7 days, JSON
+python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text --owner-asked     # today, plain text
 ```
 
 ### Reminders
 ```bash
-python3 "$SKILL_DIR/scripts/reminders.py" list              # all incomplete
-python3 "$SKILL_DIR/scripts/reminders.py" add "Call Bob"     # add reminder
-python3 "$SKILL_DIR/scripts/reminders.py" add "Fix bug" "2026-03-17"  # with due date
-python3 "$SKILL_DIR/scripts/reminders.py" complete "Call Bob" # mark done
+python3 "$SKILL_DIR/scripts/reminders.py" list --owner-asked              # all incomplete
+python3 "$SKILL_DIR/scripts/reminders.py" add "Call Bob" --owner-asked     # add reminder
+python3 "$SKILL_DIR/scripts/reminders.py" add "Fix bug" "2026-03-17" --owner-asked  # with due date
+python3 "$SKILL_DIR/scripts/reminders.py" complete "Call Bob" --owner-asked # mark done
 ```
 
 ### Contacts
 ```bash
-python3 "$SKILL_DIR/scripts/contacts.py" search "Bob"       # find by name
+python3 "$SKILL_DIR/scripts/contacts.py" search "Bob" --owner-asked       # find by name
 ```
 Returns name, emails, phones. Use before sending email to resolve names to addresses.
 
@@ -65,4 +74,4 @@ mdfind -name "resume.pdf"                    # search by filename only
 
 - macOS (uses AppleScript)
 - Calendar, Reminders, Contacts, Mail apps (built into macOS)
-- Grant Accessibility permissions if prompted
+- The owner grants the Automation permission when macOS asks them; once denied, do not ask again

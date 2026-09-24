@@ -17,9 +17,12 @@ function buildCore(
 	obsJson?: string,
 	skillTelemetryHook?: string,
 	gmailWriteGuardHook?: string,
+	nativePimGuardHook?: string,
 ): any {
 	const args =
-		gmailWriteGuardHook !== undefined
+		nativePimGuardHook !== undefined
+			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook ?? '', nativePimGuardHook]
+			: gmailWriteGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
 			: skillTelemetryHook === undefined
 				? obsJson === undefined
@@ -43,6 +46,7 @@ function shellParsedPath(command: string): string {
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
+const NATIVE_PIM_GUARD = '/x/hooks/native-pim-guard.py';
 
 describe('build-core-settings.mjs', () => {
 	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
@@ -155,6 +159,28 @@ describe('build-core-settings.mjs', () => {
 	});
 
 	it('keeps the AskUserQuestion guard alongside the Gmail guard (concat, not replace)', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
+		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
+	});
+
+	it('registers the native PIM guard on Bash when its path is supplied', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, NATIVE_PIM_GUARD);
+		const blk = o.hooks.PreToolUse.find((b: any) =>
+			b.hooks.some((h: any) => h.command.includes('native-pim-guard')),
+		);
+		assert.ok(blk, 'no PreToolUse block registers native-pim-guard');
+		assert.equal(blk.matcher, 'Bash');
+		assert.equal(shellParsedPath(blk.hooks[0].command), NATIVE_PIM_GUARD);
+	});
+
+	it('keeps every earlier PreToolUse guard beside the native PIM guard (concat, not replace)', () => {
+		const o = buildCore(GUARD, buildObs('/x/obs-hook.sh'), SKILL_TELEMETRY, GMAIL_WRITE_GUARD, NATIVE_PIM_GUARD);
+		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
+		assert.deepEqual(matchers, ['AskUserQuestion', '*', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'Bash']);
+	});
+
+	it('omitting the native PIM guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);

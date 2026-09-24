@@ -11,8 +11,15 @@ connector tools, first:
 Not connected → follow the `connect-apps` skill: one Connect card (a message in the owner's DM; in a
 room with other people a private card under their message that only they see), the task closes, and
 the answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
-Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
-macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
+
+The order, always: (1) the Station connector above; (2) if it is not connected, the owner's own
+calendar tools when they are in your tool list (`mcp__claude_ai_Google_Calendar__*`, or `gws calendar`
+if installed); (3) otherwise ask the owner what to do. **Never open the native macOS Calendar,
+Reminders or Contacts app on your own** — an `osascript`/`open -a` against them raises a macOS
+permission prompt on the owner's screen (the `native-pim-guard` hook denies it). Only when the owner
+asked for the local app in this conversation: run the `skills/macos-tools` script with `--owner-asked`
+(raw commands need the `SUTANDO_ALLOW_NATIVE_PIM=1` prefix). Once the owner denied the permission,
+never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
 ```bash
 gws calendar +agenda --today            # fallback: today's events (table format by default)
@@ -72,9 +79,12 @@ gws gmail users messages list --params 'q=keyword'  # search
 
 **Finding a specific email** — when the obvious query fails, invoke `/email-find <description>`. Broad-before-narrow playbook (full-inbox scan → partner-domain fanout → thread re-walk) that refuses to give up after one or two failed queries. See `skills/email-find/SKILL.md` for the workflow and rules around subject-mismatch + `get_thread` truncation. Per-user partner-domain mappings live in your own memory (the skill describes the file format).
 
-**Contacts** — look up people by name or email:
+**Contacts** — look up people by name or email. The Station's People store and connectors come first
+(`people__list_people`, `composio_find {"apps": ["google contacts"]}`); the native macOS Contacts app
+only when the owner asked for it (`--owner-asked`; without it the script refuses, exit 2; a macOS
+denial exits 3 and is never retried):
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"   # find by name
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob" --owner-asked   # find by name
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
@@ -154,12 +164,14 @@ OAuth1-only; `user-timeline` reads the same endpoint by handle over bearer, so i
 `timeline` cannot. Its `--limit` is 5..100 (`search`'s is 10..100 — different endpoints).
 Always confirm post content with user before publishing.
 
-**Reminders** — read/write macOS Reminders (to-do list):
+**Reminders** — read/write macOS Reminders (to-do list). Same rule as Calendar: a connected task app
+via the Station first (`composio_find {"apps": ["google tasks"]}`), the native app only when the owner
+asked for it (`--owner-asked`; without it the script refuses, exit 2; a macOS denial exits 3, no retry):
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob"    # add reminder
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17"  # with due date
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob"  # mark done
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py list --owner-asked             # incomplete reminders
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob" --owner-asked    # add reminder
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17" --owner-asked  # with due date
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob" --owner-asked  # mark done
 ```
 Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
 

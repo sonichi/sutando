@@ -25,6 +25,9 @@ ln -s /path/to/sutando/skills/macos-tools "$CLAUDE_CONFIG_DIR/skills/macos-tools
 - `calendar-reader.py` — calendar reader
 - `email-sender.py` — email sender
 
+Calendar, Reminders and Contacts run only with `--owner-asked` (the owner asked for the local app);
+`native_pim_consent.py` is the shared gate. Connected apps via the Superpower Station come first.
+
 ## Usage
 
 - **Screen**: "What's on my screen?", "help me with this", "describe what I'm looking at"

@@ -11,7 +11,8 @@ Fix: prefer a Google-calendar cache the core agent writes at
 `state/calendar-today.json` (the agent can reach the Station connector; this
 standalone script cannot). And when MORNING_BRIEFING_CALENDAR_SOURCE=google is
 set, the cache is the ONLY trusted source — a missing/stale cache returns None
-(→ "couldn't read your calendar"), never a misleading empty local read.
+(→ "couldn't read your calendar"), never a misleading empty local read. The local
+macOS read itself is opt-in (`macos`): it raises a permission prompt.
 
 No real osascript / network runs here.
 """
@@ -161,17 +162,29 @@ class TestGoogleSourceGate(unittest.TestCase):
             events = self.mod.get_calendar_events()
         self.assertIsNone(events)
 
-    def test_no_env_falls_back_to_local(self):
-        """Without the env, behavior is unchanged: the AppleScript path runs."""
+    def test_no_env_reports_no_source_not_local(self):
+        """Without the env the local Calendar.app is NOT read (it prompts): None
+        plus the note that names the fix. osascript must not be consulted."""
+        def boom(*a, **k):
+            raise AssertionError("Local Calendar.app read without the macos opt-in")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MORNING_BRIEFING_CALENDAR_SOURCE", None)
+            os.environ.pop("SUTANDO_ALLOW_NATIVE_PIM", None)
+            with patch.object(self.mod.subprocess, "run", side_effect=boom):
+                events = self.mod.get_calendar_events()
+        self.assertIsNone(events)
+        self.assertEqual(self.mod.CALENDAR_UNREAD_NOTE, self.mod.NO_CALENDAR_SOURCE_NOTE)
+
+    def test_macos_opt_in_reads_local(self):
+        """MORNING_BRIEFING_CALENDAR_SOURCE=macos is the owner's opt-in for the local read."""
         import subprocess
         ok = subprocess.CompletedProcess(
             args=["osascript"], returncode=0, stdout="Work\t9:00am Planning\n", stderr=""
         )
-        # Ensure the env var is absent for this case.
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("MORNING_BRIEFING_CALENDAR_SOURCE", None)
-            with patch.object(self.mod.subprocess, "run", return_value=ok):
-                events = self.mod.get_calendar_events()
+        with patch.dict(os.environ, {"MORNING_BRIEFING_CALENDAR_SOURCE": "macos"}), \
+             patch.object(self.mod.subprocess, "run", return_value=ok):
+            events = self.mod.get_calendar_events()
         self.assertEqual(events, [{"raw": "9:00am Planning", "calendar": "Work"}])
 
     def test_synthesize_none_under_google_says_couldnt_read(self):

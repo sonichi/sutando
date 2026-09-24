@@ -13,12 +13,14 @@ file that exists but is not today's is the evidence that distinguishes the two:
 it says the owner's real calendar lives in Google, so the local read is blind.
 
 The macOS-only host is unaffected — with no cache file ever written, an empty
-local read stays a verified empty.
+local read stays a verified empty. (The local read itself is the owner's opt-in,
+MORNING_BRIEFING_CALENDAR_SOURCE=macos: it raises a macOS permission prompt.)
 
 No real osascript / network runs here.
 """
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -55,8 +57,10 @@ class TestLocalEmptyIsNotClear(unittest.TestCase):
 
     def _run(self, applescript_out=""):
         """Every case drives the SAME successful, empty osascript result, so the
-        only variable across cases is what is on disk."""
-        with patch.object(self.mod.subprocess, "run",
+        only variable across cases is what is on disk. The local read is the
+        owner's opt-in (`macos`), so every case sets it."""
+        with patch.dict(os.environ, {"MORNING_BRIEFING_CALENDAR_SOURCE": "macos"}), \
+             patch.object(self.mod.subprocess, "run",
                           return_value=_R(applescript_out)):
             return self.mod.get_calendar_events()
 

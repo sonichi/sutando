@@ -455,7 +455,7 @@ owner-requested code change is still allowed.
 - **Screen Recording** → add your selected core CLI (`claude` or `codex`) and `node`. Required for `describe_screen`, `capture_screen`, and the screen-capture server (port 7845) — lets Sutando see what you're looking at when you ask "what's on my screen?". Also used by the screen-record skill for subtitled recordings.
 - **Accessibility** → add the Sutando menu-bar app. Required for the global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) and for the `macos-use` skill to click/type into native apps on your behalf.
 - **Microphone** → Chrome (and Terminal, for the screen-record skill). Chrome asks on first voice connect — click Allow.
-- **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
+- **Contacts / Calendar / Reminders** → only when you ask Sutando to use the local Mac app (calendar and contacts otherwise come from your connected Google account via the Station). macOS asks the first time; if you deny, Sutando does not ask again.
 
 See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
 
