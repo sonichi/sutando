@@ -17,6 +17,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -205,13 +207,13 @@ def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaR
 @dataclass(frozen=True)
 class SeatEnv:
     """What the running seat carries. `observed` False means its environment could
-    not be read: unknown, never a bypass. `base_url` and `config_dir` are the
-    process's ANTHROPIC_BASE_URL and CLAUDE_CONFIG_DIR (None when absent); `cwd`
-    is its pane's current path, where a probe must run."""
+    not be read: unknown, never a bypass. `base_url`, `config_dir` and `model` are
+    the process's ANTHROPIC_BASE_URL, CLAUDE_CONFIG_DIR and ANTHROPIC_MODEL (None
+    when absent)."""
     observed: bool
     base_url: Optional[str]
-    cwd: Optional[str] = None
     config_dir: Optional[str] = None
+    model: Optional[str] = None
 
 
 def _run_tmux(socket_path: str, *args: str, tmux_bin: str = "tmux"):
@@ -230,6 +232,21 @@ def _run_ps(pid: str):
 _ENV_PAIR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def _env_pairs(argv: str) -> dict:
+    """The environment `ps eww` appends to the argv, space-separated and unquoted.
+    A token that is not `KEY=` continues the previous value: the desktop default
+    config dir is `.../Library/Application Support/...`, cut at the space otherwise."""
+    env: dict = {}
+    key = None
+    for tok in argv.split(" "):
+        if _ENV_PAIR.match(tok):
+            key, _, val = tok.partition("=")
+            env[key] = val
+        elif key is not None and tok:
+            env[key] += " " + tok
+    return env
+
+
 def seat_env_base_url(socket_path: Optional[str], session: str,
                       tmux_runner: Optional[Callable] = None,
                       ps_runner: Optional[Callable] = None) -> SeatEnv:
@@ -246,11 +263,10 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
     ps_runner = ps_runner or _run_ps
     if not socket_path:
         return SeatEnv(False, None)
-    panes = tmux_runner(socket_path, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid} #{pane_current_path}")
+    panes = tmux_runner(socket_path, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
     if panes is None or getattr(panes, "returncode", 1) != 0:
         return SeatEnv(False, None)
-    rows = [ln.split(None, 1) for ln in (panes.stdout or "").splitlines() if ln.strip()]
-    pids = [(r[0], r[1].strip() if len(r) > 1 else None) for r in rows if r[0].isdigit()]
+    pids = [ln.strip() for ln in (panes.stdout or "").splitlines() if ln.strip().isdigit()]
     if not pids:
         return SeatEnv(False, None)
 
@@ -264,7 +280,7 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
         return False
 
     matches = []
-    for pid, cwd in pids:
+    for pid in pids:
         try:
             proc = ps_runner(pid)
         except Exception:  # noqa: BLE001 -- a probe failure is unknown
@@ -273,15 +289,20 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
             continue
         out = proc.stdout or ""
         if _names_this_session(out):
-            matches.append((out, cwd))
+            matches.append(out)
     if len(matches) != 1:
         return SeatEnv(False, None)
-    argv, cwd = matches[0]
-    pairs = [t for t in argv.split() if _ENV_PAIR.match(t)]
-    if not pairs:
+    env = _env_pairs(matches[0])
+    if not env:
         return SeatEnv(False, None)
-    env = {t.split("=", 1)[0]: t.split("=", 1)[1] for t in pairs}
-    return SeatEnv(True, env.get("ANTHROPIC_BASE_URL"), cwd, env.get("CLAUDE_CONFIG_DIR"))
+    base_url, config_dir = env.get("ANTHROPIC_BASE_URL"), env.get("CLAUDE_CONFIG_DIR")
+    # A value this parse cannot have read whole is unknown, never a guess: a URL
+    # holds no space, and a config dir the seat runs under exists on this host.
+    if base_url is not None and base_url.split() != [base_url]:
+        return SeatEnv(False, None)
+    if config_dir is not None and not Path(config_dir).is_dir():
+        return SeatEnv(False, None)
+    return SeatEnv(True, base_url, config_dir, _norm_model(env.get("ANTHROPIC_MODEL")))
 
 
 # ---- whose model the record speaks for ------------------------------------
@@ -296,9 +317,11 @@ def _norm_model(value) -> Optional[str]:
 
 
 def seat_model(env: SeatEnv, workspace) -> Optional[str]:
-    """The model the seat is running: its config dir's `settings.json` (what a
-    bare `claude` in that seat resolves), else `state/model-switch.json`. None
-    when neither says."""
+    """The model the seat is running: its own ANTHROPIC_MODEL, else its config
+    dir's `settings.json` (what a bare `claude` in that seat resolves), else
+    `state/model-switch.json`. None when none says."""
+    if env.model:
+        return env.model
     candidates = []
     if env.config_dir:
         candidates.append(Path(env.config_dir) / "settings.json")
@@ -335,13 +358,32 @@ def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
 PROBE_TIMEOUT_S = 60
 #: Under state/: the last probe attempt, so every notifier on one host sends one probe per window.
 PROBE_MARK = "quota-probe.last"
+#: Under the system temp dir, OUTSIDE any repo: a cwd under a checkout loads that
+#: project's CLAUDE.md and hooks (the default workspace is in-repo), measured at 60 s vs 7 s.
+PROBE_CWD = "sutando-quota-probe"
+#: Hooks off in every settings layer, no tools, no transcript: one request whose only output is the record.
+PROBE_FLAGS = ("--settings", '{"disableAllHooks": true}', "--tools", "", "--no-session-persistence")
+
+# The detached child is this watchdog, not the request: it waits at most `timeout`
+# seconds, kills what is left, and reaps it, so an unbounded probe cannot linger.
+_WATCHDOG = """\
+import subprocess, sys
+p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+try:
+    p.wait(float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    p.kill()
+    p.wait()
+"""
 
 
 def _launch_detached(argv, env, timeout, cwd=None):
-    """The default probe runner: start the request and return at once. The gate
-    holds on this poll; the next poll reads the record the proxy has refreshed."""
-    subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    """The default probe runner: start the request under a watchdog and return at
+    once. The gate holds on this poll; the next poll reads the refreshed record."""
+    return subprocess.Popen([sys.executable, "-c", _WATCHDOG, str(timeout), *argv], env=env, cwd=cwd,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
@@ -361,20 +403,21 @@ def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
         return True
 
 
-def probe_refreshes_record(workspace, base_url: Optional[str], now: Optional[float] = None,
-                           fresh_sec: float = FRESH_SEC, runner: Optional[Callable] = None,
-                           timeout: float = PROBE_TIMEOUT_S, cwd: Optional[str] = None,
+def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[str],
+                           now: Optional[float] = None, fresh_sec: float = FRESH_SEC,
+                           runner: Optional[Callable] = None, timeout: float = PROBE_TIMEOUT_S,
                            config_dir: Optional[str] = None) -> bool:
-    """Send one minimal request THROUGH the proxy so it rewrites the record, and
-    say whether a probe was sent. The verdict is then read from the record, never
-    from the probe's outcome: a request the limit refuses still refreshes the
-    headers, and that refusal is the answer. No `--model`, and run in the seat's
-    own cwd and config dir: seats launch without a flag, so what a bare `claude`
-    resolves THERE is the seat's model, and a model-scoped limit on it shows in
-    the record this refreshes. Only toward
-    a proxy address, at most once per `fresh_sec` host-wide, and the marker is
-    claimed under a lock before the request goes out. Login state is the caller's."""
-    if not points_at_credential_proxy(base_url):
+    """Send one minimal request THROUGH the proxy on the seat's `model` so it
+    rewrites the record, and say whether a probe was sent. The verdict is then
+    read from the record, never from the probe's outcome: a request the limit
+    refuses still refreshes the headers, and that refusal is the answer. The
+    request runs with the seat's config dir (its login), from a scratch dir
+    outside any repo, with hooks and tools off and no transcript, under a
+    watchdog: one request, no side effects in the seat's project. Only toward a proxy address, only for a
+    known model (the record could never vouch for an unknown one), at most once
+    per `fresh_sec` host-wide, the marker claimed under a lock before the request
+    goes out."""
+    if not points_at_credential_proxy(base_url) or not model:
         return False
     mark = Path(workspace) / "state" / PROBE_MARK
     at = time.time() if now is None else now
@@ -387,8 +430,10 @@ def probe_refreshes_record(workspace, base_url: Optional[str], now: Optional[flo
     env = dict(os.environ, ANTHROPIC_BASE_URL=str(base_url))
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
+    cwd = Path(tempfile.gettempdir()) / PROBE_CWD
     try:
-        run(["claude", "-p", "ok"], env=env, timeout=timeout, cwd=cwd)
+        cwd.mkdir(parents=True, exist_ok=True)
+        run(["claude", "-p", "ok", "--model", model, *PROBE_FLAGS], env=env, timeout=timeout, cwd=str(cwd))
     except (OSError, subprocess.SubprocessError):
         pass
     return True
@@ -419,8 +464,8 @@ def provider_allows_now(workspace, socket_path: Optional[str], session: Optional
     cannot_vouch = (rec is None or not rec.fresh(fresh_sec)
                     or not record_speaks_for_seat(rec.payload, env, workspace))
     if probe and cannot_vouch and points_at_credential_proxy(env.base_url):
-        if probe_refreshes_record(workspace, env.base_url, now, fresh_sec, runner=probe_runner,
-                                  cwd=env.cwd, config_dir=env.config_dir):
+        if probe_refreshes_record(workspace, env.base_url, seat_model(env, workspace), now, fresh_sec,
+                                  runner=probe_runner, config_dir=env.config_dir):
             rec = read_quota_record(workspace, now)
     if rec is None:
         return False

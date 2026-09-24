@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,9 +57,10 @@ def _R(rc: int, out: str = "") -> SimpleNamespace:
 
 def _seat(base_url=PROXY, session=SEAT, pids=("6648",), extra_argv=""):
     """Runners that describe one seat: `list-panes` names `pids`, and each pid's
-    argv carries `--name <session>` plus the env pairs `ps eww` prints."""
-    env = f"ANTHROPIC_BASE_URL={base_url} " if base_url is not None else ""
-    argv = f"{env}HOME=/x claude --name {session} {extra_argv}".strip()
+    line is what `ps eww` prints: the argv carrying `--name <session>`, THEN the
+    environment as unquoted KEY=VALUE pairs (measured order)."""
+    env = f" ANTHROPIC_BASE_URL={base_url}" if base_url is not None else ""
+    argv = f"claude --name {session} {extra_argv}".strip() + f"{env} HOME=/x"
     return (lambda sock, *a: _R(0, "\n".join(pids) + "\n"),
             lambda pid: _R(0, argv))
 
@@ -234,11 +236,35 @@ class TestSeatEnvBaseUrl(unittest.TestCase):
         env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
         self.assertEqual((env.observed, env.base_url), (True, PROXY))
 
-    def test_the_seats_cwd_and_config_dir_travel_with_its_env(self):
-        tm = lambda sock, *a: _R(0, "6648 /seat/cwd\n")  # noqa: E731
-        ps = lambda pid: _R(0, f"ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR=/seat/cfg claude --name {SEAT}")  # noqa: E731
+    def test_the_seats_config_dir_travels_with_its_env(self):
+        tm, _ = _seat(PROXY)
+        with tempfile.TemporaryDirectory() as cfg:
+            ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR={cfg}")  # noqa: E731
+            self.assertEqual(qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps).config_dir, cfg)
+
+    def test_a_config_dir_with_a_space_is_read_whole(self):
+        # `ps eww` prints the environment unquoted; a whitespace split cut the
+        # desktop default `~/Library/Application Support/...` at the space (measured).
+        tm, _ = _seat(PROXY)
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "Library", "Application Support", "claude")
+            os.makedirs(cfg)
+            ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR={cfg} HOME={d} TERM=xterm")  # noqa: E731
+            env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
+            self.assertEqual((env.observed, env.base_url, env.config_dir), (True, PROXY, cfg))
+
+    def test_a_config_dir_that_does_not_exist_here_is_unobserved(self):
+        # A value the parse cannot have read whole would send the probe to the
+        # wrong login and the model check to a missing settings file: hold instead.
+        tm, _ = _seat(PROXY)
+        ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR=/no/such/dir")  # noqa: E731
         env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)
-        self.assertEqual((env.cwd, env.config_dir), ("/seat/cwd", "/seat/cfg"))
+        self.assertEqual((env.observed, env.base_url, env.config_dir), (False, None, None))
+
+    def test_the_seats_own_anthropic_model_travels_with_its_env(self):
+        tm, _ = _seat(PROXY)
+        ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} ANTHROPIC_MODEL=claude-sonnet-5[1m]")  # noqa: E731
+        self.assertEqual(qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps).model, "claude-sonnet-5")
 
     def test_a_seat_without_the_variable_is_observed_and_unrouted(self):
         tm, ps = _seat(base_url=None)
@@ -247,7 +273,7 @@ class TestSeatEnvBaseUrl(unittest.TestCase):
 
     def test_the_equals_spelling_of_name_is_recognised(self):
         tm = lambda sock, *a: _R(0, "6648\n")  # noqa: E731
-        ps = lambda pid: _R(0, f"ANTHROPIC_BASE_URL={PROXY} claude --name={SEAT}")  # noqa: E731
+        ps = lambda pid: _R(0, f"claude --name={SEAT} ANTHROPIC_BASE_URL={PROXY}")  # noqa: E731
         self.assertEqual(qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps).base_url, PROXY)
 
     def test_unobserved_when_nothing_can_vouch(self):
@@ -272,7 +298,7 @@ class TestSeatEnvBaseUrl(unittest.TestCase):
 
         def ps(pid):
             if pid == "20":
-                return _R(0, f"ANTHROPIC_BASE_URL={PROXY} claude --name {SEAT}")
+                return _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY}")
             return _R(0, "node gateway-bridge.js")
 
         self.assertEqual(qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps).base_url, PROXY)
@@ -366,7 +392,7 @@ class TestProviderAllowsNow(RecordFixture):
 
     def _seat_with_config(self, cfg):
         tm, ps = _seat(PROXY)
-        argv = f"ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR={cfg} HOME=/x claude --name {SEAT}"
+        argv = f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} CLAUDE_CONFIG_DIR={cfg} HOME=/x"
         return tm, (lambda pid: _R(0, argv))
 
     def test_the_record_must_speak_for_this_seats_model(self):
@@ -400,6 +426,14 @@ class TestProviderAllowsNow(RecordFixture):
         self.assertTrue(self._allows())                       # switch record agrees
         cfg = self._seat_settings("claude-sonnet-5")          # settings outrank the switch record
         self.assertFalse(self._allows(seat=self._seat_with_config(cfg)))
+
+    def test_the_seats_anthropic_model_outranks_its_settings_file(self):
+        cfg = self._seat_settings("claude-sonnet-5")
+        self.write(_record(last_request={"model": "claude-fable-5-1", "at": _iso(NOW - 5)}))
+        self.assertFalse(self._allows(seat=self._seat_with_config(cfg)))
+        tm, _ = _seat(PROXY)
+        ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} ANTHROPIC_MODEL=claude-fable-5-1 CLAUDE_CONFIG_DIR={cfg}")  # noqa: E731
+        self.assertTrue(self._allows(seat=(tm, ps)))
 
     def test_the_freshness_window_is_a_parameter(self):
         self.write(_record(age_s=3000))
@@ -437,33 +471,65 @@ class TestProbeRefreshesRecord(RecordFixture):
     def test_only_toward_the_proxy(self):
         calls = []
         for url in (None, "", "https://api.anthropic.com", "http://localhost:7847"):
-            self.assertFalse(qa.probe_refreshes_record(self.ws, url, now=NOW, runner=self._runner(calls)), url)
+            self.assertFalse(qa.probe_refreshes_record(self.ws, url, MODEL, now=NOW, runner=self._runner(calls)), url)
         self.assertEqual(calls, [])
 
-    def test_one_request_on_the_seats_own_model_in_the_seats_own_place(self):
-        # No --model: what a bare `claude` resolves in the seat's cwd + config dir IS the
-        # seat's model, so a model-scoped limit on that seat shows in the refreshed record.
+    def test_one_request_on_the_seats_model_with_its_login_and_nothing_of_its_project(self):
+        # --model names the seat's model outright, so nothing runs in the seat's
+        # repo cwd, whose hooks would fire (a SessionEnd rewrites the core's handoff).
         calls = []
-        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner(calls),
-                                                  cwd="/seat/cwd", config_dir="/seat/cfg"))
+        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW, runner=self._runner(calls),
+                                                  config_dir="/seat/cfg"))
         self.assertEqual(len(calls), 1)
         argv, kw = calls[0]
-        self.assertEqual(argv, ["claude", "-p", "ok"])
-        self.assertNotIn("--model", argv)
+        self.assertEqual(argv[:5], ["claude", "-p", "ok", "--model", MODEL])
+        self.assertIn("--settings", argv)
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {"disableAllHooks": True})
+        self.assertIn("--no-session-persistence", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
         self.assertEqual(kw["env"]["ANTHROPIC_BASE_URL"], PROXY)
         self.assertEqual(kw["env"]["CLAUDE_CONFIG_DIR"], "/seat/cfg")
-        self.assertEqual(kw["cwd"], "/seat/cwd")
+        # Outside the workspace and the repo: a cwd under a checkout loads its CLAUDE.md.
+        self.assertEqual(Path(kw["cwd"]), Path(tempfile.gettempdir()) / qa.PROBE_CWD)
+        self.assertNotIn(self.ws, Path(kw["cwd"]).parents)
+        self.assertTrue(Path(kw["cwd"]).is_dir())
         self.assertLessEqual(kw["timeout"], 90)
+
+    def test_no_known_model_means_no_probe_and_no_claim(self):
+        # The record could never vouch for an unknown model, so a request would
+        # spend the window's one probe on nothing.
+        calls = []
+        for model in (None, ""):
+            self.assertFalse(qa.probe_refreshes_record(self.ws, PROXY, model, now=NOW, runner=self._runner(calls)))
+        self.assertEqual(calls, [])
+        self.assertFalse((self.ws / "state" / qa.PROBE_MARK).exists())
 
     def test_the_default_runner_returns_at_once_in_its_own_session(self):
         # The gate must never block a health poll on a full `claude -p`; the next
         # poll reads whatever the proxy wrote.
         with mock.patch.object(qa.subprocess, "Popen") as popen:
-            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, cwd="/seat/cwd"))
+            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW))
         self.assertEqual(popen.call_count, 1)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[argv.index("claude"):][:5], ["claude", "-p", "ok", "--model", MODEL])
         self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
-        self.assertEqual(popen.call_args.kwargs.get("cwd"), "/seat/cwd")
+        self.assertEqual(Path(popen.call_args.kwargs.get("cwd")), Path(tempfile.gettempdir()) / qa.PROBE_CWD)
         self.assertFalse(popen.return_value.wait.called)
+
+    def test_the_default_runner_bounds_the_request_and_reaps_it(self):
+        # A probe that hangs must die at the timeout; one that finishes must not.
+        late = self.ws / "late"
+        child = [sys.executable, "-c", f"import time; time.sleep(1.5); open({str(late)!r}, 'w').write('x')"]
+        watchdog = qa._launch_detached(child, env=dict(os.environ), timeout=0.3, cwd=str(self.ws))
+        watchdog.wait(10)                      # the watchdog itself exits once the child is reaped
+        self.assertEqual(watchdog.returncode, 0)
+        time.sleep(2.0)                        # past the child's own finish: killed, or it writes
+        self.assertFalse(late.exists())
+        done = self.ws / "done"
+        quick = [sys.executable, "-c", f"open({str(done)!r}, 'w').write('x')"]
+        qa._launch_detached(quick, env=dict(os.environ), timeout=10, cwd=str(self.ws)).wait(10)
+        self.assertTrue(done.exists())
 
     def test_the_marker_is_claimed_under_a_sibling_lock_not_the_marker_itself(self):
         # Locking creates its file; if the marker were the lock, its fresh mtime
@@ -477,21 +543,21 @@ class TestProbeRefreshesRecord(RecordFixture):
             return real(path, **kw)
 
         with mock.patch.object(file_lock, "locked_file", spy):
-            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner([])))
+            self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW, runner=self._runner([])))
         self.assertEqual(seen, [qa.PROBE_MARK + ".lock"])
 
     def test_at_most_one_probe_per_window_host_wide(self):
         calls = []
-        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW, runner=self._runner(calls)))
-        self.assertFalse(qa.probe_refreshes_record(self.ws, PROXY, now=NOW + 5, runner=self._runner(calls)))
-        self.assertFalse(qa.probe_refreshes_record(self.ws, PROXY, now=NOW + qa.FRESH_SEC - 1, runner=self._runner(calls)))
-        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW + qa.FRESH_SEC, runner=self._runner(calls)))
+        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW, runner=self._runner(calls)))
+        self.assertFalse(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW + 5, runner=self._runner(calls)))
+        self.assertFalse(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW + qa.FRESH_SEC - 1, runner=self._runner(calls)))
+        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW + qa.FRESH_SEC, runner=self._runner(calls)))
         self.assertEqual(len(calls), 2)
 
     def test_a_failing_probe_still_counts_as_sent(self):
         # The limit refusing the request is the answer the record will now carry.
         calls = []
-        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, now=NOW,
+        self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW,
                                                   runner=self._runner(calls, raise_=OSError("boom"))))
         self.assertEqual(len(calls), 1)
 
@@ -574,9 +640,17 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         calls = []
         self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][calls[0].index("--model") + 1], MODEL)
         refreshed = _record(age_s=0)   # the proxy rewrote it from the seat's own request
         self.assertTrue(self._allows(self._proxy_that_writes(calls, refreshed), now=NOW + qa.FRESH_SEC))
         self.assertEqual(len(calls), 2)
+
+    def test_a_seat_whose_model_is_unknown_is_held_and_never_probed(self):
+        (self.ws / "state" / "model-switch.json").unlink()
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
+        self.assertEqual(calls, [])
 
     def test_the_second_notifier_in_the_window_does_not_probe_again(self):
         self.write(_record(age_s=3600))

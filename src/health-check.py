@@ -5832,11 +5832,12 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # Every unified window is read, not just 5h/7d: a per-model window such as
-    # 7d_oi can be the one rejected while the headline windows sit low.
-    from quota_availability import quota_windows as _quota_windows  # src/ is on sys.path
+    # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
+    # low); overage is shown but never pages, it is purchase eligibility.
+    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
-    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    full = [w for w, (u, st) in _limit_windows(headers).items()
+            if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
         summary = _window_summary(windows)
         check["status"] = "warn"

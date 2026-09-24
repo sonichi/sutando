@@ -1047,7 +1047,7 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
         when = datetime.fromtimestamp(__import__("time").time() - 30, tz=timezone.utc)
         cfg = self.ws / "cfg"; cfg.mkdir()
         (cfg / "settings.json").write_text(json.dumps({"model": "claude-fable-5-1[1m]"}))
-        self._seat(qa.SeatEnv(True, "http://localhost:7846", "/seat", str(cfg)))
+        self._seat(qa.SeatEnv(True, "http://localhost:7846", str(cfg)))
         self.record.write_text(json.dumps({
             "available": True,
             "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
