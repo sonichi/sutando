@@ -226,6 +226,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
+    sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
     return {"recoveries": done,
             "rearms": rearms,
             "cards": cards,

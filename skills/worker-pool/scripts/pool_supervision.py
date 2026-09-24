@@ -166,8 +166,19 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
         return ev, NOTHING
     if ev.wedge_escalated:
         return ev, NOTHING
-    decision = {"human": ESCALATE, "abnormal": CARD_CAUSE, "stuck": CARD_FROZEN}[kind]
-    return replace(ev, wedge_escalated=True), decision
+    if kind == "human":
+        return replace(ev, wedge_escalated=True), ESCALATE
+    # A card decision repeats each tick until `acknowledge` records that it was raised.
+    return ev, CARD_CAUSE if kind == "abnormal" else CARD_FROZEN
+
+
+def acknowledge(state: SupervisionState, worker_ids) -> SupervisionState:
+    """Record that these workers' wedge cards exist, so the episode asks no more."""
+    workers = dict(state.workers)
+    for w in worker_ids:
+        if w in workers:
+            workers[w] = replace(workers[w], wedge_escalated=True)
+    return replace(state, workers=workers)
 
 
 def _cleared_session(ev: WorkerEvidence) -> WorkerEvidence:

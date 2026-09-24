@@ -103,8 +103,9 @@ def work_outstanding(workspace, worker_id) -> bool | None:
     what already has a ready result (live or archived). None when undecidable."""
     try:
         owned = td.owned_task_ids(pd.deliveries_dir(workspace, worker_id).parent, worker_id)
-        results = pd.results_dir(workspace)
-        return any(not td.has_ready_result(results, f"{t}.txt") for t in owned)
+        names = [f"{t}.txt" for t in owned]
+        # One index pass for the whole inbox: a live one holds hundreds of answered sentinels.
+        return bool(set(names) - td.ready_result_filenames(pd.results_dir(workspace), names))
     except (OSError, ValueError):
         return None
 
@@ -322,6 +323,13 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def acknowledge_cards(workspace, worker_ids) -> None:
+    """Persist that these workers' wedge cards were created; a card that was not
+    stays owed, and the next tick asks again."""
+    if worker_ids:
+        save_state(workspace, ps.acknowledge(load_state(workspace), worker_ids))
 
 
 def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,

@@ -61,12 +61,15 @@ def obs(pane, pane_id="f1", work=True, **kw):
         return ps.Observation(**fields, **kw)
 
 
-def run(seq, period=300.0):
-    """Feed one observation per tick; return the decisions in order."""
+def run(seq, period=300.0, ack=True):
+    """Feed one observation per tick; return the decisions in order. With `ack`, a
+    card decision is acknowledged as the remedy does once the card exists."""
     st, out, t = ps.SupervisionState(), [], 1000.0
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
+        if ack and d["w"] in (CAUSE, FROZEN):
+            st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
 
@@ -90,6 +93,15 @@ check("abnormal text sustained asks once for a card naming its cause, never a re
 got, _ = run([obs(WORK, "same")] * 5)
 check("a turn whose raw frame never changes is stuck: the 2nd identical frame is the 1st detection",
       got, [N, N, N, FROZEN, N])
+
+got, _ = run([obs(ABN)] * 5, ack=False)
+check("a card not yet raised is asked for again every tick", got, [N, N, CAUSE, CAUSE, CAUSE])
+
+got, st = run([obs(WORK, "a")] * 3 + [obs(WORK, "b")])
+check("a CHANGED frame id clears the frozen reading", (got, st.workers["w"].wedge_consecutive,
+                                                      st.workers["w"].last_pane_id), ([N] * 4, 0, "b"))
+got, _ = run([obs(WORK, "a")] * 3 + [obs(WORK, "b")] * 4)
+check("...and the sustain starts over from the new frame", got, [N, N, N, N, N, N, FROZEN])
 
 got, _ = run([obs(WORK, f"f{i}") for i in range(6)])
 check("a turn whose frame moves is working, whatever the queue says", got, [N] * 6)

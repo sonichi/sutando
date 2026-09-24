@@ -305,6 +305,13 @@ turn in flight. With the same sustain and stale line, once per episode:
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
 
+A card decision repeats on each tick until the card is actually created, so one
+unreadable capture delays it by a tick rather than suppressing it. The clocks are
+tick-bound: with the 300 s timer the three-sighting sustain, not the 90 s line,
+decides, so a card lands about ten minutes after first sighting, and a pressed
+Escape is typed on the tick after the press. The 90 s line binds only for a tick
+of 45 s or less.
+
 Only a dead session is respawned (the death rung below). Every live seat also runs
 its own `core-input-watch.py`, ensured by the same tick, so a gate reaches the owner
 as a card naming the seat within seconds rather than at the ladder's pace.
