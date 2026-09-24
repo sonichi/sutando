@@ -656,43 +656,67 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         log = self.ws / "logs" / qa.PROBE_LOG
         return log.read_text().splitlines() if log.exists() else []
 
-    def test_every_probe_is_logged_with_seat_model_reason_and_the_re_read(self):
+    def test_a_sent_probe_is_logged_with_seat_model_and_reason(self):
         # The probe spends a request; the log is the only record that it did, and why.
         self.write(_record(age_s=3600))
         calls = []
-        self.assertTrue(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
-        sent, reread = self._log_lines()
+        self._allows(self._proxy_that_writes(calls, None))
+        (sent,) = self._log_lines()
         for want in (f"seat={SEAT}", f"model={MODEL}", "sent=1", "reason=stale:3600s"):
             self.assertIn(want, sent)
-        for want in (f"seat={SEAT}", "reread=vouches", f"record={MODEL}", "windows=allowed"):
-            self.assertIn(want, reread)
         self.assertRegex(sent, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ")
 
-    def test_the_reason_names_absent_and_other_model_and_the_re_read_names_a_hold(self):
-        calls = []
-        self.assertFalse(self._allows(self._proxy_that_writes(calls, _record("rejected", False, age_s=0))))
-        sent, reread = self._log_lines()
-        self.assertIn("reason=absent", sent)
-        self.assertIn("windows=rejected", reread)
-        later = NOW + qa.FRESH_SEC                          # past the marker window; record 5 s old THEN
-        self.write(_record(age_s=NOW - later + 5, last_request={"model": "claude-sonnet-5", "at": _iso(later - 5)}))
-        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=later))
-        self.assertIn("reason=other-model:claude-sonnet-5", self._log_lines()[2])
-        self.assertIn("reread=other-model:claude-sonnet-5", self._log_lines()[3])
-
-    def test_a_probe_the_marker_refuses_and_an_unknown_model_are_logged_as_not_sent(self):
+    def test_the_re_read_is_logged_by_the_poll_that_first_sees_the_probe_land(self):
+        # The probe is detached: the poll that sent it still reads the OLD record, so no
+        # re-read line then; the next poll finds a record newer than the marker and logs it once.
         self.write(_record(age_s=3600))
         calls = []
         self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
-        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + 30))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self._log_lines()), 1)                        # sent only
+        self.write(_record(age_s=-3, last_request={"model": MODEL, "at": _iso(NOW + 3)}))   # dated NOW+3: after the mark
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, None), now=NOW + 5))
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, None), now=NOW + 9))
         lines = self._log_lines()
-        self.assertEqual(len(lines), 3)                      # sent, re-read, refused
-        self.assertIn("sent=0 why=marker-fresh", lines[2])
-        (self.ws / "state" / "model-switch.json").unlink()
-        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + qa.FRESH_SEC))
-        self.assertIn("sent=0 why=no-seat-model", self._log_lines()[3])
+        rereads = [ln for ln in lines if "reread=" in ln]
+        self.assertEqual(len(rereads), 1, lines)
+        for want in (f"seat={SEAT}", "reread=vouches", f"record={MODEL}", "windows=allowed", f"stamp={int(NOW + 3)}"):
+            self.assertIn(want, rereads[0])
         self.assertEqual(len(calls), 1)
+
+    def test_the_reason_names_absent_and_other_model_and_a_rejected_re_read(self):
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
+        self.assertIn("reason=absent", self._log_lines()[0])
+        self.write(_record("rejected", False, age_s=-3))                                   # dated NOW+3: after the mark
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + 5))
+        self.assertIn("windows=rejected", [ln for ln in self._log_lines() if "reread=" in ln][0])
+        later = NOW + qa.FRESH_SEC                          # past the marker window; record 5 s old THEN
+        self.write(_record(age_s=NOW - later + 5, last_request={"model": "claude-sonnet-5", "at": _iso(later - 5)}))
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=later))
+        self.assertIn("reason=other-model:claude-sonnet-5", [ln for ln in self._log_lines() if "sent=1" in ln][1])
+
+    def test_a_refused_probe_is_logged_once_per_window_not_once_per_poll(self):
+        # A held banner is polled every few seconds for as long as the limit lasts.
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
+        for dt in (5, 10, 15, 20):
+            self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + dt))
+        refused = [ln for ln in self._log_lines() if "why=marker-fresh" in ln]
+        self.assertEqual(len(refused), 1, self._log_lines())
+        self.assertIn(f"mark={int(NOW)}", refused[0])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, _record(age_s=0)), now=NOW + qa.FRESH_SEC))
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + qa.FRESH_SEC + 5))
+        self.assertEqual(len([ln for ln in self._log_lines() if "why=marker-fresh" in ln]), 2)   # a new window, one more line
+
+    def test_an_unknown_model_is_logged_as_not_sent(self):
+        (self.ws / "state" / "model-switch.json").unlink()
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
+        self.assertIn("sent=0 why=no-seat-model", self._log_lines()[0])
+        self.assertEqual(calls, [])
 
     def test_an_unwritable_log_changes_nothing(self):
         # logs/ is a FILE here, so every append fails: the gate still probes and decides.

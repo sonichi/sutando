@@ -388,14 +388,22 @@ def _launch_detached(argv, env, timeout, cwd=None):
                             stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def _log_probe(workspace, at: float, **fields) -> None:
-    """Append one `k=v` line to `<workspace>/logs/quota-probe.log`. Never raises:
-    the gate is on a fail-closed path and a log that cannot be written changes nothing."""
+def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> None:
+    """Append one `k=v` line to `<workspace>/logs/quota-probe.log`. With `once`, a
+    line already carrying that token for the same seat (in the last 200 lines) is
+    not repeated: a held banner is polled every few seconds for as long as it
+    lasts. Never raises: the gate is on a fail-closed path and a log that cannot
+    be written changes nothing."""
     stamp = datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = stamp + "".join(f" {k}={v}" for k, v in fields.items() if v is not None) + "\n"
     try:
         log = Path(workspace) / "logs" / PROBE_LOG
         log.parent.mkdir(parents=True, exist_ok=True)
+        if once is not None and log.exists():
+            seat_tok = f" seat={fields.get('seat')} "
+            tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+            if any(seat_tok in ln + " " and f" {once} " in ln + " " for ln in tail):
+                return
         with log.open("a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
@@ -444,7 +452,13 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
     mark = Path(workspace) / "state" / PROBE_MARK
     try:
         if not _claim_probe_marker(mark, at, fresh_sec):
-            _log_probe(workspace, at, seat=seat, model=model, sent=0, why="marker-fresh", reason=why)
+            # Once per window: the mark's own time is the dedup token.
+            try:
+                token = f"mark={int(mark.stat().st_mtime)}"
+            except OSError:
+                token = "mark=?"
+            _log_probe(workspace, at, once=token, seat=seat, model=model, sent=0, why="marker-fresh",
+                       mark=token.split("=", 1)[1], reason=why)
             return False
     except OSError:
         _log_probe(workspace, at, seat=seat, model=model, sent=0, why="marker-unwritable", reason=why)
@@ -461,6 +475,24 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
     except (OSError, subprocess.SubprocessError):
         pass
     return True
+
+def _log_reread(workspace, seat: str, rec: QuotaRecord, env: SeatEnv, fresh_sec: float, at: float) -> None:
+    """The record as read AFTER a probe landed: written by whichever poll first
+    sees a record newer than the marker (the probe is detached, so the poll that
+    sent it reads the old record), once per record stamp."""
+    if rec.age_s is None:
+        return
+    try:
+        marked = (Path(workspace) / "state" / PROBE_MARK).stat().st_mtime
+    except OSError:
+        return
+    stamp = int(at - rec.age_s)
+    if stamp <= int(marked):
+        return
+    _log_probe(workspace, at, once=f"stamp={stamp}", seat=seat, reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
+               record=record_model(rec.payload), stamp=stamp,
+               windows="allowed" if gate_windows_allowed(rec.payload) else "rejected")
+
 
 def _vouch_reason(rec: Optional[QuotaRecord], env: SeatEnv, workspace, fresh_sec: float) -> Optional[str]:
     """Why the record cannot vouch for this seat, for the probe log; None when it can."""
@@ -501,10 +533,8 @@ def provider_allows_now(workspace, socket_path: Optional[str], session: Optional
         if probe_refreshes_record(workspace, env.base_url, seat_model(env, workspace), now, fresh_sec,
                                   runner=probe_runner, config_dir=env.config_dir, seat=session, why=why):
             rec = read_quota_record(workspace, now)
-            _log_probe(workspace, time.time() if now is None else now, seat=session,
-                       reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
-                       record=None if rec is None else record_model(rec.payload),
-                       windows=("allowed" if rec is not None and gate_windows_allowed(rec.payload) else "rejected"))
+    if probe and rec is not None and points_at_credential_proxy(env.base_url):
+        _log_reread(workspace, session, rec, env, fresh_sec, time.time() if now is None else now)
     if rec is None:
         return False
     decision = availability_decision(rec.payload, base_url=env.base_url,
