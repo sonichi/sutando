@@ -77,15 +77,16 @@ def load_table(path: Path = TABLE_PATH) -> list[dict]:
 
 
 def match_apps(text: str, table: list[dict]) -> list[dict]:
-    """The apps the text names, in table order, each with the keyword that matched. A keyword inside
-    another app's longer phrase does not count ("email" in "cold email"); an app stays if any other does."""
+    """The apps the text names, in table order, each with the keyword that matched. A match lying strictly
+    inside another app's longer match at that spot does not count ("email" in "cold email"); one elsewhere does."""
     low = " ".join(text.lower().split())
-    matched = [(app, [kw for kw, pat in zip(app["keywords"], app["patterns"]) if pat.search(low)]) for app in table]
-    matched = [(app, kws) for app, kws in matched if kws]
+    matched = [(app, [(kw, m.span()) for kw, pat in zip(app["keywords"], app["patterns"]) for m in pat.finditer(low)])
+               for app in table]
+    matched = [(app, spans) for app, spans in matched if spans]
     hits = []
-    for app, kws in matched:
-        others = [o.lower() for other, okws in matched if other is not app for o in okws]
-        own = [kw for kw in kws if not any(kw.lower() != o and kw.lower() in o for o in others)]
+    for app, spans in matched:
+        others = [sp for other, ospans in matched if other is not app for _, sp in ospans]
+        own = [kw for kw, (s, e) in spans if not any(a <= s and e <= b and (a, b) != (s, e) for a, b in others)]
         if own:
             hits.append({"slug": app["slug"], "name": app["name"], "keyword": own[0],
                          "prefer_skill": app.get("prefer_skill")})

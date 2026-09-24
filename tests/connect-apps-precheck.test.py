@@ -104,6 +104,24 @@ class TestTable(unittest.TestCase):
         self.assertEqual([h["slug"] for h in hook.match_apps("check gmail, then the campaign stats", TABLE)],
                          ["smartlead", "gmail"])
 
+    def test_suppression_is_by_match_span_not_by_keyword_string(self):
+        # Gmail's only word is "email": it is dropped only where it sits inside Smartlead's longer match,
+        # never because "email" is a substring of a Smartlead keyword matched somewhere else in the text.
+        both = ("reply to the cold email from Bob in my inbox",
+                "email me when the email sequence finishes",
+                "send an email about the cold email campaign",
+                "draft an email to Bob and check my email campaign stats",
+                "set up a cold email campaign, then email Bob the results")
+        for text in both:
+            with self.subTest(text):
+                self.assertEqual([h["slug"] for h in hook.match_apps(text, TABLE)], ["smartlead", "gmail"])
+        for text in ("set up a Smartlead campaign", "cold email campaign"):
+            with self.subTest(text):
+                self.assertEqual([h["slug"] for h in hook.match_apps(text, TABLE)], ["smartlead"])
+        # The reported keyword is the first one with a match of its own, not the first one that matched at all.
+        hits = hook.match_apps("send an email about the cold email campaign", TABLE)
+        self.assertEqual([(h["slug"], h["keyword"]) for h in hits], [("smartlead", "cold email"), ("gmail", "email")])
+
     def test_misses_and_word_boundaries(self):
         for text in ("what's the weather", "linearly interpolate these", "the emailed report", "calendars in general",
                      "", "a zoomed-in view", "slackers"):
