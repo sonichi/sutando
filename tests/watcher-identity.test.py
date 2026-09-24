@@ -1122,6 +1122,7 @@ class TestReaderFreshCli(unittest.TestCase):
                      ["reader-fresh", "--inbox", self.inbox, "--ready"],
                      ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--nope", "1"],
                      ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--holder", "-1"],
+                     ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--holder", "0"],
                      ["reader-fresh", "--inbox", self.inbox, "--ready", self.state, "--holder", ""]):
             rc, out, err = self._run(args)
             self.assertEqual(rc, 64, args)
