@@ -45,7 +45,10 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, frame_abnormal, frame_working  # noqa: E402
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
+                       frame_abnormal, frame_working)
+from quota_record import provider_allows_now  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -312,8 +315,24 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
-    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle."""
+def _limit_is_stale(abn, workspace) -> bool:
+    """A quota-only banner beside a FRESH proxy record that says allowed is a line
+    from before the reset -- scrollback, not a hold. Anything else keeps the hold:
+    another abnormal family, or a record that is absent, stale or rejected. A
+    retry never reaches here: classify_pane returns on it before any gate."""
+    if abn.kind != "provider-limit":
+        return False
+    if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
+        return False
+    try:
+        return provider_allows_now(workspace if workspace is not None else resolve_workspace())
+    except Exception:  # noqa: BLE001 -- an unreadable record is not permission
+        return False
+
+
+def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None) -> Verdict:
+    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle.
+    `workspace` locates the proxy's quota record; None resolves the configured one."""
     if capture is None:
         return Verdict("unknown", "no capture")
     if not capture.strip():
@@ -333,7 +352,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
-    if abn:
+    if abn and not _limit_is_stale(abn, workspace):
         return Verdict("abnormal", ",".join(abn.names))
     if frame_working(tail):
         return Verdict("busy", "working")
@@ -345,7 +364,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
 
 
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
-            runner: Callable = subprocess.run, env: Optional[dict] = None) -> Verdict:
+            runner: Callable = subprocess.run, env: Optional[dict] = None, workspace=None) -> Verdict:
     """Capture the core window through cli_wedge's one capture path, then classify it."""
     target = core_target(socket_path, session, tmux_bin, runner, env)
     if target is None:
@@ -353,7 +372,7 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
     # Both runtimes need attributes: Codex draws a dim placeholder, Claude a
     # grey ghost suggestion, and prompt_line() strips either before deciding pending.
     text = capture_pane(socket_path, target, tmux_bin, runner, env, escapes=True)
-    return classify_pane(text, adapter)
+    return classify_pane(text, adapter, workspace)
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
@@ -400,10 +419,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--width", type=int, default=0)
         if name == "classify":
             p.add_argument("--json", action="store_true")
+        if name in ("classify", "safe"):
+            p.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -420,7 +442,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None))
         print(json.dumps(v.as_dict()) if a.json else v.state)
         return 0
     if a.cmd == "pending":
@@ -435,7 +457,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "healthy":
         # The notifier's pre-typing question, answered by the same verdict every
         # caller gets: exit 0 when typed input reaches the composer, else refuse.
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None))
         if not accepts_input(v):
             print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
             return EXIT_UNSAFE
@@ -451,7 +473,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(text)
         return 0
     if a.cmd == "safe":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None))
         if state_is_unsafe(v.state):
             print(f"pane_gate: {v.state} — not safe to type into", file=sys.stderr)
             return EXIT_UNSAFE

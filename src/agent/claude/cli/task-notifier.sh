@@ -204,7 +204,7 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # cli_wedge) or a dialog holds; a running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude >/dev/null 2>&1
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude --workspace "$WORKSPACE_DIR" >/dev/null 2>&1
 }
 
 pane_text_composer_is_empty() {

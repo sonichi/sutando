@@ -930,5 +930,155 @@ class CliInProcess(unittest.TestCase):
         self.assertIn("half typed", err)
 
 
+
+class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
+    """A weekly-limit row that has scrolled into the transcript reads as a live
+    limit for as long as it stays in the tail window, so the hold outlives the
+    reset. The provider's own record, written by the credential proxy on every
+    request, outranks that screenshot -- and ONLY when it is fresh, says allowed,
+    and the banner is the sole abnormality. Everything else still holds."""
+
+    BANNER = "  ⎿  You've hit your weekly limit · resets Sep 27 at 2am (America/Los_Angeles)"
+    GHOST = "❯ \x1b[2mcheck the watcher's still running\x1b[0m"
+    # The seat measured on 2026-09-24: banner 7 non-blank rows from the bottom, then
+    # an idle footer under an empty composer holding a dimmed CLI suggestion.
+    PANE = (
+        "⏺ Re-armed. Holding.\n"
+        "✻ Worked for 10s · done 4:26 AM\n"
+        "⏺ Monitor event: \"worker task watcher on its own delivery inbox\"\n"
+        f"{BANNER}\n"
+        "✻ Crunched for 1s · done 4:56 AM\n"
+        "                    0% until auto-compact\n"
+        "──────────────────────────── sutando-worker ─\n"
+        f"{GHOST}\n"
+        "─────────────────────────────────────────────\n"
+        f"  {FOOTER} · 1 feedback draft\n"
+    )
+    MENU = (
+        "⏺ Writing the result file.\n"
+        f"{BANNER}\n"
+        "✻ Churned for 49s · done 4:37 AM\n"
+        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+        "   What do you want to do?\n"
+        "   ❯ 1. Stop and wait for limit to reset\n"
+        "     2. Wait here, then continue automatically at Sep 27 at 2am\n"
+        "     3. Switch to usage credits\n"
+        "   Enter to confirm · Esc to cancel\n"
+    )
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.record = self.ws / "state" / "quota-state.json"
+
+    def _write(self, allowed=True, age_s=30):
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - age_s, tz=timezone.utc)
+        status = "allowed" if allowed else "rejected"
+        self.record.write_text(json.dumps({
+            "available": allowed,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "headers": {
+                "anthropic-ratelimit-unified-status": "allowed",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-7d-status": status,
+            },
+        }))
+
+    def _verdict(self, pane):
+        return pg.classify_pane(pane, pg.CLAUDE, self.ws)
+
+    def test_the_fixture_itself_reads_as_a_quota_only_limit(self):
+        # Control: without a record the banner holds, and for exactly the family named.
+        v = self._verdict(self.PANE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_fresh_allowed_record_makes_the_banner_scrollback(self):
+        self._write(allowed=True, age_s=30)
+        v = self._verdict(self.PANE)
+        self.assertEqual(v.state, "idle-ready", v)
+        self.assertTrue(pg.accepts_input(v))
+
+    def test_a_stale_record_does_not_vouch(self):
+        self._write(allowed=True, age_s=3600)
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_record_that_says_rejected_keeps_the_hold(self):
+        self._write(allowed=False, age_s=30)
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_an_unreadable_record_keeps_the_hold(self):
+        self.record.write_text("{not json")
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_workspace_that_does_not_exist_keeps_the_hold(self):
+        self._write(allowed=True, age_s=30)
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, Path(self._t.name) / "nowhere")
+        self.assertEqual(v.reason, "quota-limit")
+
+    def test_the_record_never_overrides_a_second_abnormal_family(self):
+        self._write(allowed=True, age_s=30)
+        pane = self.PANE.replace("✻ Crunched for 1s · done 4:56 AM\n",
+                                 "✻ Crunched for 1s · done 4:56 AM\nSession expired\n")
+        v = self._verdict(pane)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("needs-login", v.reason)
+        self.assertIn("quota-limit", v.reason)
+
+    def test_the_record_never_overrides_a_retry(self):
+        self._write(allowed=True, age_s=30)
+        pane = self.PANE.replace("✻ Crunched for 1s · done 4:56 AM\n",
+                                 "  ⎿  Connection error. Retrying in 2 seconds…\n")
+        v = self._verdict(pane)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("retry:retrying", v.reason)
+
+    def test_the_record_never_overrides_a_live_limit_dialog(self):
+        # The menu IS the limit, live and waiting on a key; the gate reads it first.
+        self._write(allowed=True, age_s=30)
+        v = self._verdict(self.MENU)
+        self.assertEqual(v.state, "busy", v)
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_plain_capture_still_passes_healthy_as_pending(self):
+        # The notifier hands `healthy` a colour-stripped capture, where the dimmed
+        # suggestion reads as typed text: pending, and pending accepts input.
+        self._write(allowed=True, age_s=30)
+        plain = pg._SGR.sub("", self.PANE)
+        v = self._verdict(plain)
+        self.assertEqual(v.state, "pending", v)
+        self.assertTrue(pg.accepts_input(v))
+
+    def _healthy(self, stdin, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pg.main(["healthy", "--runtime", "claude", *extra])
+        return code, out.getvalue().strip(), err.getvalue().strip()
+
+    def test_healthy_cli_honours_workspace_end_to_end(self):
+        code, out, err = self._healthy(self.PANE, "--workspace", str(self.ws))
+        self.assertEqual(code, pg.EXIT_UNSAFE, (out, err))
+        self.assertIn("quota-limit", err)
+        self._write(allowed=True, age_s=30)
+        code, out, err = self._healthy(self.PANE, "--workspace", str(self.ws))
+        self.assertEqual((code, out), (0, "idle-ready"), err)
+
+    def test_healthy_cli_without_workspace_resolves_the_configured_one(self):
+        # No --workspace: the configured workspace is consulted, and its record
+        # (whatever it holds) must never turn a live dialog into a pass.
+        with mock.patch.object(pg, "resolve_workspace", return_value=self.ws):
+            self._write(allowed=True, age_s=30)
+            self.assertEqual(self._healthy(self.PANE)[:2], (0, "idle-ready"))
+            self.assertEqual(self._healthy(self.MENU)[0], pg.EXIT_UNSAFE)
+
+    def test_a_resolver_that_raises_keeps_the_hold(self):
+        with mock.patch.object(pg, "resolve_workspace", side_effect=RuntimeError("no config")):
+            v = pg.classify_pane(self.PANE, pg.CLAUDE)
+        self.assertEqual(v.reason, "quota-limit")
+
 if __name__ == "__main__":
     unittest.main()
