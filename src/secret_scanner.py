@@ -213,9 +213,8 @@ def scan_and_redact(text: str) -> tuple[list[SecretHit], str]:
     return hits, redact_secrets(text, hits)
 
 
-# The desktop's bundled interpreter lives inside the engine tree the app
-# replaces on every update (rsync --delete): a pip install there is erased by
-# the next update. Seen twice on one host, 2026-09-16/17 (owner report).
+# The desktop's bundled interpreter lives inside the engine tree the app replaces
+# on every update, so a pip install there is erased by the next update.
 BUNDLED_PY_MARKER = "/engine/runtime/python/"
 
 

@@ -30,10 +30,9 @@ for skill_dir in "$SKILLS_DIR"/*/; do
   fi
 done
 
-# The owner's own skills live in <workspace>/skills/ — the folder that survives an
-# engine update (the engine tree is replaced on update; 2026-09-17 an owner's skill
-# written under engine/sutando/skills/ was erased). A repo skill wins a name collision.
-WS="${SUTANDO_WORKSPACE_DIR:-$(bash "$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh" workspace 2>/dev/null || true)}"
+# The owner's own skills live in <workspace>/skills/, the folder that survives an engine
+# update (the engine tree is replaced). A shipped skill wins a name collision.
+WS="$(bash "$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
 if [ -n "$WS" ] && [ -d "$WS/skills" ]; then
   for skill_dir in "$WS"/skills/*/; do
     [ -d "$skill_dir" ] || continue
