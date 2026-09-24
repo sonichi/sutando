@@ -188,19 +188,46 @@ Test: `python3 tests/gmail-write-guard.test.py`.
 ## `native-pim-guard.py`
 
 Denies **Bash commands that drive the native macOS Calendar, Reminders or Contacts
-app** — `osascript`/JXA (`tell application "Calendar"`, `Application("Reminders")`),
-`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal` and `.app` paths for Calendar,
-iCal, Reminders, Contacts and Address Book — with a reason that gives the order:
-the Station connector first (`composio_find {"apps": ["google calendar"]}` →
+app** — `osascript`/JXA by app name or bundle id (`tell application "Calendar"`,
+`application id "com.apple.iCal"`, `Application("com.apple.reminders")`), an
+`osascript` script file whose name or first 64 KB scripts one of the apps,
+`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal`, `.app` paths, `open
+x-apple-reminderkit://…`, and `shortcuts run` (a shortcut can drive any of the
+three; `shortcuts list`/`view` pass) — with a reason that gives the order: the
+Station connector first (`composio_find {"apps": ["google calendar"]}` →
 `composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
 present, then ask the owner; and never re-prompt once the owner denied the
 permission. Driving those apps raises a macOS Automation prompt on the owner's
 screen (user report, 2026-09-24). Unrelated `osascript`/`open` commands and every
-non-Bash tool pass through.
+non-Bash tool pass through. Known gaps: a script file that names the app only
+indirectly, and read-only commands that quote an app command (`grep "open -a
+Calendar"`) are denied like the real thing — re-run with the prefix.
 
-Escape hatch: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` (or that
-variable in the hook's own environment) — set it only when the owner asked for the
-local app in this conversation. Fail-OPEN on hook errors.
+Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
+position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
+SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count), that variable in the
+hook's own environment, or the owner's persisted host opt-in
+`<workspace>/state/native-pim-consent`, written by `python3
+skills/macos-tools/scripts/native_pim_consent.py grant` in the **owner's own
+terminal** — the hook denies the agent running `grant` itself. Fail-OPEN on hook
+errors.
+
+**What this consent is, honestly.** The prefix and the env var are strings the
+model writes, so on their own they guard against the agent acting on its own
+initiative; they are **not an authorisation boundary** for who asked. The hook
+binds them where the session tells it whose task is running: when
+`<workspace>/state/bindings/active-execution.json` names the task and
+`<workspace>/tasks/<task_id>.txt` resolves (via `policy.egress.result.
+resolve_access_tier`) to a non-owner tier (`team`, `guest`, unreadable), every form
+of consent is ignored and the command is denied with a reason saying so. Without a
+binding — a chat session, a cron, a binding the core did not write — the consent is
+self-attested and a task's injected text saying "the owner asked" is not
+distinguishable from the owner asking. Do not rely on this hook as access control.
+
+**Codex cores.** This is a Claude-runtime `PreToolUse` hook. On a Codex core only
+the script gate (`native_pim_consent.py`, exit 2 without consent) and the inline
+`call_contact` tool's own check protect; ad-hoc `osascript`/`open` commands there
+are not intercepted.
 
 ### Registration
 

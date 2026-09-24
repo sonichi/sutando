@@ -12,9 +12,19 @@ permission prompt on the owner's screen. The order: (1) the Superpower Station c
 (`composio_find` → `composio_exec`); (2) if it is not connected, the owner's own tools when they
 are in the tool list (`mcp__claude_ai_Google_Calendar__*`); (3) otherwise ask the owner. Run the
 scripts below with `--owner-asked` only when the owner asked for the local app in this
-conversation — without it they refuse (exit 2). A macOS denial (exit 3) is final: say so, never
-retry or re-prompt. The `native-pim-guard` hook denies raw `osascript`/`open -a` commands against
-these apps for the same reason.
+conversation — without it they refuse (exit 2). A macOS denial (exit 3) is final and stored in
+`<workspace>/state/<app>-automation-denied`: say so, never retry or re-prompt. The `native-pim-guard`
+hook denies raw `osascript`/`open -a` commands against these apps for the same reason.
+
+The owner can allow the local apps for this host once, in their own terminal (never run it yourself
+— the hook denies it to you):
+```bash
+python3 "$SKILL_DIR/scripts/native_pim_consent.py" grant     # writes state/native-pim-consent, clears stored denials
+python3 "$SKILL_DIR/scripts/native_pim_consent.py" status    # marker, env var, per-app denial
+python3 "$SKILL_DIR/scripts/native_pim_consent.py" revoke
+```
+`--owner-asked` and `SUTANDO_ALLOW_NATIVE_PIM=1` are strings you write: they stop you acting on your
+own initiative, they do not prove who asked (see `hooks/README.md`, native-pim-guard).
 
 ## When to Use
 

@@ -160,6 +160,7 @@ end tell
 
 def main(argv=None):
     argv = consent.require_consent("Reminders", argv)
+    consent.exit_if_denied_earlier("Reminders")
     if len(argv) < 2:
         print("Usage: python3 reminders.py [list|add|complete|lists] --owner-asked")
         sys.exit(1)

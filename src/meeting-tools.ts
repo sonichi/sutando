@@ -3,7 +3,8 @@
  * Zoom tools (summon, dismiss, join_zoom) live in skills/zoom/tools.ts.
  *
  * macOS-only: joinGmeet and callContact drive Chrome via AppleScript. On
- * Windows they degrade to a `macOSOnly` error.
+ * Windows they degrade to a `macOSOnly` error. callContact opens the native
+ * Contacts app only behind the host opt-in in native-pim-consent.ts.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -11,6 +12,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { isMacOS, macOSOnlyError } from './platform.js';
 import { requirePython } from './python-binary.js';
+import { checkNativePimConsent, denialMessage, isDenialError, recordNativePimDenial } from './native-pim-consent.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -162,29 +164,50 @@ export const lookupMeetingIdTool: ToolDefinition = {
 
 // --- Contact lookup + phone call (inline, bypasses task bridge) ---
 
-export const callContactTool: ToolDefinition = {
-	name: 'call_contact',
-	description:
-		'Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. ' +
-		'Use for ANY contact lookup or phone call — "find Bob\'s number", "call Mary", "look up Susan\'s phone".',
-	parameters: z.object({
-		name: z.string().describe('Contact name to search for (e.g. "Bob", "Mary Smith")'),
-		message: z.string().optional().describe('What to tell the person. They have no tools — include all details they might need.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { name, message } = args as { name: string; message?: string };
-		if (!isMacOS()) return macOSOnlyError('call_contact');
-		try {
-			// Ensure Contacts.app is running
-			execFileSync('open', ['-ga', 'Contacts'], { timeout: 5_000 });
+export interface CallContactDeps {
+	execFileSync: typeof execFileSync;
+	fetch: typeof fetch;
+	isMacOS: () => boolean;
+	env: NodeJS.ProcessEnv;
+	workspace?: string;
+}
 
-			// Search contacts via AppleScript — use first name for fuzzy matching
-			// (voice transcription often garbles last names, e.g. "Gmeets" vs "GMeet")
-			const firstName = name.split(/\s+/)[0];
-			// Only AppleScript escaping needed now — execFileSync bypasses shell interpretation
-			const safeName = firstName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			const script = `tell application "Contacts"
+const defaultCallContactDeps = (): CallContactDeps => ({
+	execFileSync,
+	fetch: (...args) => fetch(...args),
+	isMacOS,
+	env: process.env,
+});
+
+// The voice process has no Station client, so the connector step of the order
+// cannot run here: the gate below is the host opt-in, else the tool asks the owner.
+export function makeCallContactTool(overrides: Partial<CallContactDeps> = {}): ToolDefinition {
+	const deps = { ...defaultCallContactDeps(), ...overrides };
+	return {
+		name: 'call_contact',
+		description:
+			'Look up a phone number and call a contact. Searches macOS Contacts by name (only when the owner allowed the local Contacts app on this host; otherwise it tells you what to ask the owner). Instant. ' +
+			'Use for ANY contact lookup or phone call — "find Bob\'s number", "call Mary", "look up Susan\'s phone".',
+		parameters: z.object({
+			name: z.string().describe('Contact name to search for (e.g. "Bob", "Mary Smith")'),
+			message: z.string().optional().describe('What to tell the person. They have no tools — include all details they might need.'),
+		}),
+		execution: 'inline',
+		async execute(args) {
+			const { name, message } = args as { name: string; message?: string };
+			if (!deps.isMacOS()) return macOSOnlyError('call_contact');
+			const consent = checkNativePimConsent('Contacts', { env: deps.env, workspace: deps.workspace });
+			if (!consent.allowed) {
+				console.log(`${ts()} [CallContact] Contacts not opened (${consent.reason})`);
+				return { status: consent.reason, contactsSearched: false, instruction: consent.message };
+			}
+			try {
+				// Search contacts via AppleScript — use first name for fuzzy matching
+				// (voice transcription often garbles last names, e.g. "Gmeets" vs "GMeet")
+				const firstName = name.split(/\s+/)[0];
+				// Only AppleScript escaping needed now — execFileSync bypasses shell interpretation
+				const safeName = firstName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+				const script = `tell application "Contacts"
 	set output to ""
 	set results to (every person whose name contains "${safeName}")
 	if (count of results) > 10 then set results to items 1 thru 10 of results
@@ -198,56 +221,71 @@ export const callContactTool: ToolDefinition = {
 	end repeat
 	return output
 end tell`;
-			const raw = execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 15_000 }).toString().trim();
+				let raw: string;
+				try {
+					raw = deps.execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+				} catch (err) {
+					const stderr = (err as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
+					const text = `${stderr} ${err instanceof Error ? err.message : String(err)}`;
+					if (isDenialError(text)) {
+						recordNativePimDenial('Contacts', deps.workspace);
+						console.log(`${ts()} [CallContact] macOS denied Contacts automation; recorded, not retrying`);
+						return { status: 'denied', contactsSearched: false, instruction: denialMessage('Contacts') };
+					}
+					throw err;
+				}
 
-			// Parse results
-			const contacts: { name: string; phones: string[] }[] = [];
-			for (const line of raw.split('\n')) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				const parts = trimmed.split('|||');
-				if (parts.length < 2) continue;
-				const cName = parts[0].trim();
-				const phones = parts[1].split(',').map(p => p.trim()).filter(Boolean);
-				if (phones.length > 0) contacts.push({ name: cName, phones });
+				// Parse results
+				const contacts: { name: string; phones: string[] }[] = [];
+				for (const line of raw.split('\n')) {
+					const trimmed = line.trim();
+					if (!trimmed) continue;
+					const parts = trimmed.split('|||');
+					if (parts.length < 2) continue;
+					const cName = parts[0].trim();
+					const phones = parts[1].split(',').map(p => p.trim()).filter(Boolean);
+					if (phones.length > 0) contacts.push({ name: cName, phones });
+				}
+
+				if (contacts.length === 0) {
+					console.log(`${ts()} [CallContact] no contacts with phone found for "${name}"`);
+					return { error: `No contacts with a phone number found for "${name}". Ask the user for the number or a different name.` };
+				}
+
+				if (contacts.length > 1) {
+					console.log(`${ts()} [CallContact] multiple matches for "${name}": ${contacts.map(c => c.name).join(', ')}`);
+					return {
+						status: 'multiple_matches',
+						matches: contacts.map(c => ({ name: c.name, phones: c.phones })),
+						instruction: 'Multiple contacts found. Ask the user which one to call.',
+					};
+				}
+
+				// Single match — look up and call
+				const contact = contacts[0];
+				const phone = contact.phones[0];
+
+				const purpose = message || `Calling ${contact.name}`;
+
+				console.log(`${ts()} [CallContact] calling ${contact.name}`);
+				const res = await deps.fetch(`http://localhost:${getPhonePort()}/call`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ to: phone, message: purpose }),
+				});
+				const data = await res.json() as { callSid?: string; status?: string; error?: string };
+
+				if (!res.ok) {
+					return { error: `Phone server error: ${data.error || res.statusText}` };
+				}
+
+				console.log(`${ts()} [CallContact] call started: ${data.callSid}, purpose: ${purpose}`);
+				return { status: 'calling', contact: contact.name, callSid: data.callSid, messageSent: purpose };
+			} catch (err) {
+				return { error: `call_contact failed: ${err instanceof Error ? err.message : err}` };
 			}
+		},
+	};
+}
 
-			if (contacts.length === 0) {
-				console.log(`${ts()} [CallContact] no contacts with phone found for "${name}"`);
-				return { error: `No contacts with a phone number found for "${name}". Ask the user for the number or a different name.` };
-			}
-
-			if (contacts.length > 1) {
-				console.log(`${ts()} [CallContact] multiple matches for "${name}": ${contacts.map(c => c.name).join(', ')}`);
-				return {
-					status: 'multiple_matches',
-					matches: contacts.map(c => ({ name: c.name, phones: c.phones })),
-					instruction: 'Multiple contacts found. Ask the user which one to call.',
-				};
-			}
-
-			// Single match — look up and call
-			const contact = contacts[0];
-			const phone = contact.phones[0];
-
-			const purpose = message || `Calling ${contact.name}`;
-
-			console.log(`${ts()} [CallContact] calling ${contact.name}`);
-			const res = await fetch(`http://localhost:${getPhonePort()}/call`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ to: phone, message: purpose }),
-			});
-			const data = await res.json() as { callSid?: string; status?: string; error?: string };
-
-			if (!res.ok) {
-				return { error: `Phone server error: ${data.error || res.statusText}` };
-			}
-
-			console.log(`${ts()} [CallContact] call started: ${data.callSid}, purpose: ${purpose}`);
-			return { status: 'calling', contact: contact.name, callSid: data.callSid, messageSent: purpose };
-		} catch (err) {
-			return { error: `call_contact failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+export const callContactTool: ToolDefinition = makeCallContactTool();

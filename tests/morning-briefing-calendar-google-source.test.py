@@ -19,6 +19,7 @@ No real osascript / network runs here.
 import importlib.util
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,9 @@ def _today():
 class TestCacheRead(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
+        self._state = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state.cleanup)
+        self.mod.STATE_DIR = Path(self._state.name)
 
     def _point_cache(self, tmp, payload):
         p = Path(tmp) / "calendar-today.json"
@@ -150,6 +154,9 @@ class TestGoogleSourceGate(unittest.TestCase):
         self.mod = _load()
         # No cache file present.
         self.mod.CALENDAR_CACHE_FILE = Path("/nonexistent/calendar-today.json")
+        self._state = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state.cleanup)
+        self.mod.STATE_DIR = Path(self._state.name)
 
     def test_google_source_no_cache_returns_none_not_local(self):
         """MORNING_BRIEFING_CALENDAR_SOURCE=google + no cache → None; never a

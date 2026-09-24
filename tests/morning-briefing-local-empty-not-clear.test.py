@@ -50,6 +50,7 @@ class TestLocalEmptyIsNotClear(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.cache = Path(self.tmp.name) / "calendar-today.json"
         self.mod.CALENDAR_CACHE_FILE = self.cache
+        self.mod.STATE_DIR = Path(self.tmp.name) / "state"
 
     def _stale_cache(self):
         y = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")

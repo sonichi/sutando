@@ -8,9 +8,14 @@ for skills/macos-tools/scripts/{calendar-reader,reminders,contacts}.py:
 - without `--owner-asked` (or SUTANDO_ALLOW_NATIVE_PIM=1): exit 2, no `open`,
   no osascript, and a stderr message naming the Station-connector order;
 - with consent: the flag is stripped and the AppleScript path runs;
-- a macOS denial (-1743): exit 3 with a clear message and no second attempt.
+- a macOS denial (-1743): exit 3 with a clear message and no second attempt,
+  recorded in state/<app>-automation-denied so no later run re-asks;
+- the owner's persisted host opt-in (state/native-pim-consent, written by
+  `native_pim_consent.py grant`) counts like the env var, and `grant` clears
+  stored denials.
 
-All subprocess calls are mocked — no real osascript runs here.
+All subprocess calls are mocked — no real osascript runs here, and every marker
+lands in a per-test temp dir, never the real workspace.
 """
 import contextlib
 import importlib.util
@@ -18,6 +23,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -54,6 +60,14 @@ class _Base:  # mixin: the per-script classes below are the TestCases
         self.calls = []
         self.err = io.StringIO()
         self.out = io.StringIO()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self._tmp.name)
+        self._state_patch = patch.object(self.mod.consent, "state_dir", return_value=self.state)
+        self._state_patch.start()
+
+    def tearDown(self):
+        self._state_patch.stop()
+        self._tmp.cleanup()
 
     def _run(self, argv, responder):
         def fake_run(cmd, **kwargs):
@@ -105,10 +119,28 @@ class _Base:  # mixin: the per-script classes below are the TestCases
         msg = self.err.getvalue()
         self.assertIn("Privacy & Security", msg)
         self.assertIn("not asking again", msg)
+        self.assertTrue((self.state / f"{self.app.lower()}-automation-denied").exists(),
+                        "the denial is persisted for every other reader")
+
+    def test_stored_denial_is_final_without_any_subprocess(self):
+        (self.state / f"{self.app.lower()}-automation-denied").write_text("earlier")
+        with _no_consent_env():
+            code = self._run(self.argv_ok, lambda cmd: _done(cmd, stdout=self.ok_stdout))
+        self.assertEqual(code, self.mod.consent.EXIT_DENIED)
+        self.assertEqual(self.calls, [], "a stored denial must not be re-asked")
+        self.assertIn("not asking again", self.err.getvalue())
+
+    def test_persisted_consent_marker_counts_as_consent(self):
+        (self.state / "native-pim-consent").write_text("owner")
+        with _no_consent_env():
+            code = self._run(self.argv_bare, lambda cmd: _done(cmd, stdout=self.ok_stdout))
+        self.assertEqual(code, 0)
+        self.assertIn("osascript", [c[0] for c in self.calls])
 
 
 class TestCalendarReader(_Base, unittest.TestCase):
     script = "calendar-reader"
+    app = "Calendar"
     argv_ok = ["calendar-reader.py", "1", "text", "--owner-asked"]
     argv_bare = ["calendar-reader.py", "1", "text"]
     ok_stdout = "Work|||Standup|||Monday, March 16, 2026 at 9:00:00 AM|||Monday, March 16, 2026 at 9:30:00 AM|||Room|||notes|||false\n"
@@ -135,6 +167,7 @@ class TestCalendarReader(_Base, unittest.TestCase):
 
 class TestReminders(_Base, unittest.TestCase):
     script = "reminders"
+    app = "Reminders"
     argv_ok = ["reminders.py", "list", "--due-today", "--owner-asked"]
     argv_bare = ["reminders.py", "list", "--due-today"]
     ok_stdout = "Work|||Call Bob|||missing value|||false|||\n"
@@ -170,6 +203,7 @@ class TestReminders(_Base, unittest.TestCase):
 
 class TestContacts(_Base, unittest.TestCase):
     script = "contacts"
+    app = "Contacts"
     argv_ok = ["contacts.py", "search", "Bob", "--owner-asked"]
     argv_bare = ["contacts.py", "search", "Bob"]
     ok_stdout = "Bob Smith|||bob@x.com,|||123,\n"
@@ -182,6 +216,8 @@ class TestContacts(_Base, unittest.TestCase):
         for argv in (["contacts.py", "add", "Bob Smith", "--phone", "1", "--owner-asked"],
                      ["contacts.py", "update", "Bob", "--email", "b@x.com", "--owner-asked"]):
             self.calls = []
+            # Each path is exercised fresh: the first denial persisted, so forget it here.
+            (self.state / "contacts-automation-denied").unlink(missing_ok=True)
             with _no_consent_env():
                 code = self._run(argv, responder)
             self.assertEqual(code, self.mod.consent.EXIT_DENIED, argv)
@@ -209,6 +245,14 @@ class TestContacts(_Base, unittest.TestCase):
 class TestConsentHelper(unittest.TestCase):
     def setUp(self):
         self.c = _load("native_pim_consent")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self._tmp.name)
+        self._state_patch = patch.object(self.c, "state_dir", return_value=self.state)
+        self._state_patch.start()
+
+    def tearDown(self):
+        self._state_patch.stop()
+        self._tmp.cleanup()
 
     def test_owner_asked_reads_flag_or_env(self):
         with _no_consent_env():
@@ -232,6 +276,78 @@ class TestConsentHelper(unittest.TestCase):
 
     def test_exit_if_denied_is_a_no_op_otherwise(self):
         self.c.exit_if_denied("Calendar", "some other error")
+        self.assertFalse(self.c.denied_earlier("Calendar"))
+
+    def test_markers_are_per_app_and_named_like_the_briefing_one(self):
+        self.assertEqual(self.c.denial_marker("Calendar").name, "calendar-automation-denied")
+        self.assertEqual(self.c.denial_marker("Contacts").name, "contacts-automation-denied")
+        self.assertEqual(self.c.consent_marker().name, "native-pim-consent")
+
+    def test_record_denial_survives_an_unwritable_state_dir(self):
+        with patch.object(self.c, "state_dir", return_value=Path("/nonexistent/ro/state")), \
+             patch.object(Path, "mkdir", side_effect=OSError("read-only")):
+            marker = self.c.record_denial("Reminders")
+        self.assertEqual(marker.name, "reminders-automation-denied")
+
+    def test_grant_writes_consent_and_clears_stored_denials(self):
+        self.c.record_denial("Calendar")
+        self.c.record_denial("Contacts")
+        with _no_consent_env():
+            self.assertFalse(self.c.host_opted_in())
+            out = self.c.grant()
+            self.assertTrue(self.c.host_opted_in())
+            self.assertTrue(self.c.owner_asked(["x.py"]))
+        self.assertFalse(self.c.denied_earlier("Calendar"))
+        self.assertFalse(self.c.denied_earlier("Contacts"))
+        self.assertIn("calendar-automation-denied", out)
+        self.assertIn("contacts-automation-denied", out)
+
+    def test_revoke_removes_consent_only(self):
+        self.c.grant()
+        self.c.record_denial("Reminders")
+        self.assertIn("removed", self.c.revoke())
+        self.assertIn("not set", self.c.revoke())
+        with _no_consent_env():
+            self.assertFalse(self.c.host_opted_in())
+        self.assertTrue(self.c.denied_earlier("Reminders"), "revoke does not forget a macOS denial")
+
+    def test_status_names_marker_env_and_each_app(self):
+        self.c.record_denial("Contacts")
+        with patch.dict(os.environ, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+            text = self.c.status()
+        self.assertIn("consent marker: absent", text)
+        self.assertIn("SUTANDO_ALLOW_NATIVE_PIM: 1", text)
+        self.assertIn("Contacts: DENIED by macOS (stored)", text)
+        self.assertIn("Calendar: not denied", text)
+
+    def test_cli_grant_revoke_status_and_usage(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(self.c.main(["grant"]), 0)
+            self.assertEqual(self.c.main(["status"]), 0)
+            self.assertEqual(self.c.main([]), 0)
+            self.assertEqual(self.c.main(["revoke"]), 0)
+            self.assertEqual(self.c.main(["bogus"]), 1)
+        self.assertIn("native PIM allowed on this host", out.getvalue())
+        self.assertIn("consent marker: present", out.getvalue())
+        self.assertIn("Usage:", err.getvalue())
+
+    def test_no_consent_message_names_the_grant_command(self):
+        msg = self.c.no_consent_message("Contacts")
+        self.assertIn("native_pim_consent.py grant", msg)
+        self.assertIn("--owner-asked", msg)
+
+    def test_state_dir_falls_back_to_the_config_dir_walk(self):
+        self._state_patch.stop()
+        try:
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/nonexistent/ws/.claude-sutando"}), \
+                 patch.dict(sys.modules, {"workspace_default": None}):
+                self.assertEqual(self.c.state_dir(), Path("/nonexistent/ws/state"))
+                self.assertEqual(self.c._config_dir_workspace(), Path("/nonexistent/ws"))
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/nonexistent/plain"}):
+                self.assertTrue(str(self.c._config_dir_workspace()).endswith("sutando-workspace"))
+        finally:
+            self._state_patch.start()
 
 
 if __name__ == "__main__":

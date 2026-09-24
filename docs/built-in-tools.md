@@ -18,8 +18,12 @@ if installed); (3) otherwise ask the owner what to do. **Never open the native m
 Reminders or Contacts app on your own** — an `osascript`/`open -a` against them raises a macOS
 permission prompt on the owner's screen (the `native-pim-guard` hook denies it). Only when the owner
 asked for the local app in this conversation: run the `skills/macos-tools` script with `--owner-asked`
-(raw commands need the `SUTANDO_ALLOW_NATIVE_PIM=1` prefix). Once the owner denied the permission,
-never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
+(raw commands need the `SUTANDO_ALLOW_NATIVE_PIM=1` prefix). The owner can allow the local apps for
+the host once with `python3 skills/macos-tools/scripts/native_pim_consent.py grant` in their own
+terminal (`revoke` / `status` too) — tell them the command, never run it yourself. That flag and
+prefix are strings you write: they keep you from acting on your own initiative, they do not prove
+who asked, and on a non-owner task the hook ignores them (`hooks/README.md`). Once the owner denied
+the permission (`-1743`, stored in `state/<app>-automation-denied`), never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
 ```bash
 gws calendar +agenda --today            # fallback: today's events (table format by default)
@@ -87,6 +91,11 @@ denial exits 3 and is never retried):
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob" --owner-asked   # find by name
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
+The voice/phone `call_contact` inline tool ("call Mary", "find Bob's number") is the second native
+Contacts path: it runs in the voice process, which has no Station client, so it searches the local
+Contacts app only behind the host opt-in (`SUTANDO_ALLOW_NATIVE_PIM=1` in the server env, or the
+`native_pim_consent.py grant` marker); otherwise it answers with what the owner must do once, and a
+stored macOS denial makes it answer "denied" without opening the app.
 
 **Google Contacts — writable in practice, but NOT via a contract Google supports.** The entry above
 is macOS Contacts and is lookup-only. It is not the only contacts path: on 2026-09-04 an agent that

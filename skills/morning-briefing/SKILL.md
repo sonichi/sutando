@@ -17,8 +17,9 @@ ARGUMENTS: $ARGUMENTS
 **Step 0 — Calendar cache. CONDITIONAL: Google-calendar hosts only.**
 
 `src/morning-briefing.py` cannot reach the owner's Google Workspace calendar; it reads a cache the
-*agent* writes. Omitting this is silent: the briefing reports "no calendar source is configured;
-connect Google Calendar via Settings → Apps → Integrations". Pull today's local-day events from the
+*agent* writes. Omitting this is silent: the briefing reports "no calendar source is configured.
+Connect Google Calendar via Settings → Integrations, or set MORNING_BRIEFING_CALENDAR_SOURCE=macos to
+use the local Calendar app". Pull today's local-day events from the
 Google connector (order: the Station connector; if not connected, the owner's own
 `mcp__claude_ai_Google_Calendar__*` tools when present; otherwise the one-line note below), then:
 
@@ -73,8 +74,8 @@ echo "📧 Email: [count] unread. [summary]" > "$WORKSPACE/results/proactive-$(d
   echo '[{"raw":"9:00-9:30am 1:1 w/ Sam","calendar":"work"}]' | python3 src/write_calendar_cache.py
   python3 src/write_calendar_cache.py --empty   # verified no events today
   ```
-- **Reader:** `get_calendar_events()` reads the cache. Set `MORNING_BRIEFING_CALENDAR_SOURCE=google` to make the cache the *only trusted source* — if it's missing/stale the briefing reports "couldn't read your calendar" rather than reading a local macOS Calendar that may not include the work account (the 2026-07-21 "falsely clear" bug, #2256). With no source at all it says "no calendar source is configured; connect Google Calendar via Settings → Apps → Integrations".
-- **Local macOS Calendar + Reminders are opt-in:** `MORNING_BRIEFING_CALENDAR_SOURCE=macos` (set by the owner, never by you). Reading them raises a macOS Automation prompt, so the default never touches them. One AppleScript read, no app launch, no retry; a denial (`-1743`) is recorded once in `state/calendar-automation-denied` and never re-asked — delete that file after the owner grants access.
+- **Reader:** `get_calendar_events()` reads the cache. Set `MORNING_BRIEFING_CALENDAR_SOURCE=google` to make the cache the *only trusted source* — if it's missing/stale the briefing reports "couldn't read your calendar" rather than reading a local macOS Calendar that may not include the work account (the 2026-07-21 "falsely clear" bug, #2256). With no source at all it says "no calendar source is configured. Connect Google Calendar via Settings → Integrations, or set MORNING_BRIEFING_CALENDAR_SOURCE=macos to use the local Calendar app", and while reminders are not read: "Reminders not read: the local Reminders app is opt-in (set MORNING_BRIEFING_CALENDAR_SOURCE=macos to include it)".
+- **Local macOS Calendar + Reminders are opt-in:** `MORNING_BRIEFING_CALENDAR_SOURCE=macos` (set by the owner, never by you), or the owner's host opt-in `python3 skills/macos-tools/scripts/native_pim_consent.py grant`. Reading them raises a macOS Automation prompt, so the default never touches them. One AppleScript read, no app launch, no retry; a denial (`-1743`) is recorded once in `state/calendar-automation-denied` (the shared `native_pim_consent` marker) and never re-asked — the owner grants access in System Settings and runs `grant`, which clears stored denials.
 
 Nothing writes the cache automatically, so **a briefing that only runs the reader reports unread on a Google-source host.** The producer is therefore step 0 of this skill's own flow (above), which covers both `/morning-briefing` and a cron declared as `"prompt_skill": "morning-briefing"` — the natural config. The expanded cron prompt under "Scheduling" below remains valid but is no longer the only place the producer appears.
 

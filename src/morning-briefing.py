@@ -28,6 +28,10 @@ sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
+_MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
+sys.path.insert(0, str(_MACOS_TOOLS_SCRIPTS))
+import native_pim_consent as consent  # noqa: E402  (the one denial/opt-in policy)
+
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
@@ -40,12 +44,19 @@ CALENDAR_CACHE_FILE = STATE_DIR / "calendar-today.json"
 # Why the calendar came back None, when the owner can act on it; None = plain "couldn't read".
 CALENDAR_UNREAD_NOTE: str | None = None
 NO_CALENDAR_SOURCE_NOTE = (
-    "I couldn't read your calendar: no calendar source is configured; "
-    "connect Google Calendar via Settings → Apps → Integrations."
+    "I couldn't read your calendar: no calendar source is configured. "
+    "Connect Google Calendar via Settings → Integrations, or set "
+    "MORNING_BRIEFING_CALENDAR_SOURCE=macos to use the local Calendar app."
 )
 CALENDAR_DENIED_NOTE = (
     "I couldn't read your calendar: macOS denied Calendar access "
     "(System Settings → Privacy & Security → Automation); I won't ask again."
+)
+# Why reminders came back None, when the owner can act on it; None = say nothing extra.
+REMINDERS_UNREAD_NOTE: str | None = None
+NO_REMINDERS_SOURCE_NOTE = (
+    "Reminders not read: the local Reminders app is opt-in "
+    "(set MORNING_BRIEFING_CALENDAR_SOURCE=macos to include it)."
 )
 
 # Weather codes → one-word description
@@ -257,11 +268,13 @@ def _native_pim_opted_in() -> bool:
     from sutando_config import config_get_env_first
     if _calendar_source() == "macos":
         return True
-    return (config_get_env_first("SUTANDO_ALLOW_NATIVE_PIM", "") or "").strip() == "1"
+    if (config_get_env_first("SUTANDO_ALLOW_NATIVE_PIM", "") or "").strip() == "1":
+        return True
+    return consent.consent_marker(STATE_DIR).exists()
 
 
 def _calendar_denied_marker() -> Path:
-    return STATE_DIR / "calendar-automation-denied"
+    return consent.denial_marker("Calendar", STATE_DIR)
 
 
 def get_calendar_events() -> list[dict] | None:
@@ -344,15 +357,11 @@ return output
 
 
 def _record_calendar_denial(marker: Path) -> None:
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(datetime.now().isoformat())
-    except OSError:
-        pass
+    consent.record_denial("Calendar", STATE_DIR)
     print(
         "  calendar: Automation permission denied (-1743). Recorded in "
         f"{marker.name}; the local read stays off until the owner grants Calendar under "
-        "System Settings → Privacy & Security → Automation and deletes that file.",
+        f"System Settings → Privacy & Security → Automation and runs `{consent.GRANT_COMMAND}`.",
         file=sys.stderr,
     )
 
@@ -371,7 +380,7 @@ def _read_local_calendar() -> list[dict] | None:
     if result is None:
         if err:
             print(f"  calendar: AppleScript error — {err}", file=sys.stderr)
-        if "-1743" in err:
+        if consent.is_denied(err):
             CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
             _record_calendar_denial(marker)
         return None
@@ -425,11 +434,14 @@ def get_reminders() -> "list[str] | None":
     clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
     (#2256), which is why `get_calendar_events()` already draws this line.
     """
+    global REMINDERS_UNREAD_NOTE
+    REMINDERS_UNREAD_NOTE = None
     if not _native_pim_opted_in():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SOURCE_NOTE
         print("  reminders: local Reminders.app is opt-in "
               "(MORNING_BRIEFING_CALENDAR_SOURCE=macos); not read", file=sys.stderr)
         return None
-    script_path = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
+    script_path = _MACOS_TOOLS_SCRIPTS / "reminders.py"
     if not script_path.exists():
         return None
     try:
@@ -808,6 +820,8 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         shown = reminders[:3]
         more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
         parts.append(f"Reminders due: {', '.join(shown)}{more}.")
+    elif reminders is None and REMINDERS_UNREAD_NOTE:
+        parts.append(REMINDERS_UNREAD_NOTE)
 
     # Pending questions
     if pending_qs:

@@ -91,7 +91,9 @@ class TestNativeCalendarGate(unittest.TestCase):
         self.assertEqual(self.mod.CALENDAR_UNREAD_NOTE, self.mod.NO_CALENDAR_SOURCE_NOTE)
         text = self.mod.synthesize(weather=None, events=events, reminders=[],
                                    discord_msgs=[], pending_qs=[], health_issues=[])
-        self.assertIn("connect Google Calendar via Settings → Apps → Integrations", text)
+        self.assertIn("Connect Google Calendar via Settings → Integrations", text)
+        self.assertIn("MORNING_BRIEFING_CALENDAR_SOURCE=macos", text,
+                      "the spoken note must name the opt-in, not only stderr")
         self.assertNotIn("clear", text)
 
     def test_google_source_wins_over_native_escape_hatch(self):
@@ -198,6 +200,56 @@ class TestRemindersGate(unittest.TestCase):
 
         with _env_without_optin(), patch.object(self.mod.subprocess, "run", side_effect=boom):
             self.assertIsNone(self.mod.get_reminders())
+
+    def test_not_opted_in_briefing_says_reminders_were_not_read(self):
+        with _env_without_optin(), patch.object(self.mod.subprocess, "run", side_effect=AssertionError):
+            reminders = self.mod.get_reminders()
+        text = self.mod.synthesize(weather=None, events=[], reminders=reminders,
+                                   discord_msgs=[], pending_qs=[], health_issues=[])
+        self.assertIn("Reminders not read", text)
+        self.assertIn("MORNING_BRIEFING_CALENDAR_SOURCE=macos", text)
+        self.assertNotIn("Everything looks clean", text)
+
+    def test_opted_in_reminders_carry_no_unread_note(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="No reminders.\n", stderr="")
+        with patch.dict(os.environ, OPT_IN), patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            reminders = self.mod.get_reminders()
+        self.assertEqual(reminders, [])
+        text = self.mod.synthesize(weather=None, events=[], reminders=[],
+                                   discord_msgs=[], pending_qs=[], health_issues=[])
+        self.assertNotIn("Reminders not read", text)
+
+    def test_persisted_consent_marker_opts_in(self):
+        """`native_pim_consent.py grant` writes state/native-pim-consent; the briefing honours it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.mod.STATE_DIR = Path(tmp.name)
+        (self.mod.STATE_DIR / "native-pim-consent").write_text("owner")
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="No reminders.\n", stderr="")
+        with _env_without_optin(), patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(self.mod.get_reminders(), [])
+        self.assertIn("--owner-asked", seen["cmd"])
+
+    def test_denial_detection_is_the_shared_policy(self):
+        """Either spelling of the macOS refusal is a denial, via native_pim_consent.is_denied."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.mod.STATE_DIR = Path(tmp.name)
+        self.mod.CALENDAR_CACHE_FILE = Path("/nonexistent/calendar-today.json")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="",
+                stderr="execution error: Not authorized to send Apple events to Calendar.")
+        with patch.dict(os.environ, OPT_IN), patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(self.mod.get_calendar_events())
+        self.assertTrue(self.mod._calendar_denied_marker().exists())
+        self.assertEqual(self.mod._calendar_denied_marker().name, "calendar-automation-denied")
 
     def test_opted_in_passes_owner_asked(self):
         seen = {}

@@ -83,6 +83,7 @@ end tell
 
 def main(argv=None):
     argv = consent.require_consent("Contacts", argv)
+    consent.exit_if_denied_earlier("Contacts")
     if len(argv) < 2:
         print("Usage: python3 contacts.py search 'name or email' --owner-asked")
         sys.exit(1)

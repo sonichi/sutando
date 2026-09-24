@@ -69,6 +69,7 @@ end tell
     if result.returncode != 0:
         err = result.stderr.strip()
         if consent.is_denied(err):
+            consent.record_denial("Calendar")
             return {"error": consent.denial_message("Calendar"), "denied": True,
                     "events": [], "count": 0}
         # Calendar access denied
@@ -126,6 +127,7 @@ def format_for_humans(data: dict) -> str:
 
 def main(argv=None) -> None:
     argv = consent.require_consent("Calendar", argv)
+    consent.exit_if_denied_earlier("Calendar")
     days = int(argv[1]) if len(argv) > 1 else 7
     fmt = argv[2] if len(argv) > 2 else "json"
 
