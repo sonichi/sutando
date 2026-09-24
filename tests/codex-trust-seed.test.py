@@ -91,6 +91,24 @@ class SeedTest(unittest.TestCase):
         with open(self.cfg) as f:
             self.assertEqual(f.read(), "this is = = not toml\n")
 
+    def test_an_unwritable_config_is_skipped_not_raised(self):
+        blocker = os.path.join(self._tmp.name, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        # A path under a regular file cannot be created: a real OSError, no mocking.
+        self.assertTrue(seed(os.path.join(blocker, "codex", "config.toml"), _DIR)
+                        .startswith("skipped: not writable"))
+
+    def test_main_reports_the_status_and_never_fails(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(_mod.main(["trust-seed.py", self.cfg, _DIR]), 0)
+            self.assertEqual(_mod.main(["trust-seed.py"]), 0)
+        self.assertEqual(out.getvalue().splitlines()[0], "added")
+        self.assertTrue(out.getvalue().splitlines()[1].startswith("skipped: usage"))
+
     def test_cli_prints_one_status_and_exits_zero(self):
         r = subprocess.run([sys.executable, _SEED, self.cfg, _DIR], capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "added"))
