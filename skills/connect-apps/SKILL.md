@@ -307,9 +307,11 @@ lists them under the app's `accounts` (`id`, `label`, `is_default`) only when th
 - **`account_ambiguous` / `account_not_found`:** the error's `accounts` lists the candidates. Ask in
   the owner's DM which one, naming the labels ("Your work Gmail (me@work.com) or the personal one
   (me@gmail.com)?"). Labels are personal: never in a room with other people.
-- **"Use my work account by default" / "add my other Gmail":** no card. Say "You can add an account
-  and pick the default in Settings → Integrations (Add account / Use by default)." You never change
-  the default yourself.
+- **"Use my work account by default":** the owner asked, so change it: `set-default <slug>
+  <account>` (Step 3b2). You change the default only when the owner asks for that, never on your
+  own and never to make one call easier: a call that means the other account passes `account`.
+- **"Add my other Gmail":** no card, no switch. Say "Settings → Integrations → <App> → Add account",
+  then ask which one should be the default once it is there.
 
 ## Which apps am I connected to? Disconnect <app>
 
@@ -424,8 +426,9 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
-- Never disconnect an app, and never switch one without the owner's card tap. Never change which of
-  two accounts is the default: that is Settings → Integrations.
+- Never disconnect an app, and never switch one without the owner's card tap. Change which of two
+  accounts is the default only when the owner asks for that (`set-default`, Step 3b2); never on your
+  own, and never to make one call easier (a call that means the other account passes `account`).
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
