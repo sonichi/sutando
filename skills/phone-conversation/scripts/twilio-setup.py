@@ -62,6 +62,7 @@ LOCAL_HEALTH = (os.environ.get("PHONE_SERVER_HEALTH")
 DEFAULT_ENV_FILE = _REPO / ".env"
 PUSHED_KEY = "TWILIO_WEBHOOK_PUSHED"   # the last base pushed to Twilio; never a base to push
 _LINE_END = re.compile(r"\r?\n$")
+_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 # ---------- credentials ----------
@@ -115,7 +116,17 @@ def set_env_var(path: Path, key: str, value: str) -> None:
     file keeps its documentation. Otherwise the line is appended. Every other
     byte is preserved: the file's mode, its line endings, bytes that are not
     UTF-8, and a symlink (the target is rewritten, the link stays).
+
+    A line break or NUL in the key or the value is refused (ValueError): a
+    value such as "x\\nEVIL=1" would otherwise land as a second line. The key
+    must be an env-var name. The temp file is created at the final mode from
+    its first byte (O_CREAT|O_EXCL with the mode, then fchmod for the bits
+    the umask stripped), so a token is never readable by others in between.
     """
+    if not _ENV_KEY.fullmatch(key):
+        raise ValueError(f"set_env_var: key {key!r} is not an env-var name")
+    if any(ch in value for ch in ("\r", "\n", "\0")):
+        raise ValueError(f"set_env_var: value for {key} must not contain a line break or NUL")
     real = Path(os.path.realpath(path))
     try:
         raw = real.read_bytes()
@@ -149,8 +160,14 @@ def set_env_var(path: Path, key: str, value: str) -> None:
             lines[at - 1] += nl
         lines.insert(at, new_line + nl)
     tmp = real.with_name(f".{real.name}.{os.getpid()}.tmp")
-    tmp.write_bytes("".join(lines).encode("utf-8", "surrogateescape"))
-    os.chmod(tmp, mode)
+    try:
+        os.unlink(tmp)   # a leftover of an interrupted run: ours by name
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, "wb") as f:
+        os.fchmod(fd, mode)   # the umask can only have narrowed the creation mode
+        f.write("".join(lines).encode("utf-8", "surrogateescape"))
     os.replace(tmp, real)
 
 

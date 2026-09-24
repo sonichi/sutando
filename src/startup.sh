@@ -1195,15 +1195,24 @@ else
 fi
 
 # 8. Phone conversation server + ngrok (optional — needs Twilio + Gemini credentials)
+# The channel bridges' gate: the resolver answers env -> .env -> vault (0 present,
+# 3 definitively absent), so `vault set TWILIO_ACCOUNT_SID` alone starts the phone server.
+twilio_creds_present() {
+  local _rc=0
+  if [ -n "${PY:-}" ]; then
+    "$PY" "$REPO/src/channel_token.py" --has TWILIO_ACCOUNT_SID --env-file .env 2>/dev/null || _rc=$?
+    if [ "$_rc" -eq 0 ]; then return 0; fi
+    if [ "$_rc" -eq 3 ]; then return 1; fi
+  fi
+  # Resolver unavailable: anchored + non-empty, because the substring form matched the
+  # commented placeholder and opened a PUBLIC tunnel. Mirrors health-check twilio_configured().
+  grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null
+}
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
 elif ! phone_stack_enabled; then
   echo "  ~ conversation server (disabled — no Gemini voice key)"
-# Anchored + non-empty value: the unanchored substring form also matched the
-# commented template placeholder (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), starting
-# conversation-server and a PUBLIC ngrok tunnel on hosts with no Twilio at all.
-# Mirrors twilio_configured() in src/health-check.py — keep the two in sync.
-elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
+elif twilio_creds_present; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
@@ -1214,8 +1223,8 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
   if ! pgrep -f "ngrok" > /dev/null 2>&1; then
     echo "  Starting ngrok tunnel..."
     # If NGROK_DOMAIN is set in .env, use the reserved domain for a stable URL.
-    # Otherwise ngrok picks a random subdomain and the Twilio webhook must be
-    # updated manually on every restart.
+    # Otherwise ngrok picks a random subdomain: TWILIO_AUTO_WEBHOOK=1 (or
+    # `twilio-setup.py set-webhook`) re-points Twilio at it after each restart.
     NGROK_DOMAIN_VAL=$(grep -E '^NGROK_DOMAIN=' .env 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
     if [ -n "$NGROK_DOMAIN_VAL" ]; then
       ngrok http 3100 --domain="$NGROK_DOMAIN_VAL" --log=stdout > /tmp/ngrok.log 2>&1 &
@@ -1265,15 +1274,17 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
           # binds it and never starts ngrok, so this ngrok is not its tunnel.
           :
         else
-          # The server binds WEBHOOK_BASE_URL from this var, so a stale value
-          # leaves TwiML and <Stream> pointing at a tunnel that no longer exists.
+          # The server binds WEBHOOK_BASE_URL from this var and skips its own
+          # tunnel, so a moving ngrok URL recorded here is bound stale on every restart.
           echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
           echo "      was: $TWILIO_CFG_URL"
           echo "      now: $NGROK_URL"
-          echo "      1. run python3 skills/phone-conversation/scripts/twilio-setup.py set-webhook $NGROK_URL"
-          echo "         (or set TWILIO_AUTO_WEBHOOK=1 so the phone server does it on start)"
-          echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
-          echo "         phone conversation server — it binds this at startup"
+          echo "      1. remove TWILIO_WEBHOOK_URL from .env — keep that key only for a fixed"
+          echo "         external URL (a reserved domain or a Funnel), never a moving ngrok URL"
+          echo "      2. restart the phone conversation server: it starts its own tunnel and,"
+          echo "         with TWILIO_AUTO_WEBHOOK=1 in .env, points Twilio at it on every start;"
+          echo "         otherwise run python3 skills/phone-conversation/scripts/twilio-setup.py set-webhook"
+          echo "         after the restart (no argument: it reads the tunnel the server bound)"
         fi
       fi
     else
@@ -1300,7 +1311,7 @@ fi
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
-if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
+if phone_stack_enabled && twilio_creds_present; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
 if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then

@@ -655,21 +655,25 @@ def _vault_remote_url(vault: "dict | None" = None) -> str:
 # Checks
 # ---------------------------------------------------------------------------
 
-def twilio_configured(env_content: str) -> bool:
-    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+def twilio_configured(env_content: str, vault_get=None) -> bool:
+    """True when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value, or the
+    Keychain vault holds one (`vault set TWILIO_ACCOUNT_SID …`).
 
     A plain substring test also matched the commented placeholder shipped in
     the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
     never configured Twilio still ran the conversation-server + tunnel
     checks — and startup.sh's matching gate kept a public ngrok tunnel open
     to a port with nothing behind it (caught 2026-07-02). startup.sh's
-    phone block carries the anchored-grep equivalent of this test.
+    phone block (`twilio_creds_present`) answers the same question through
+    the channel-token resolver with this anchored test as its grep fallback;
+    tests/health-check-twilio-gate.test.py drives both. `vault_get` is the
+    test seam for the vault tier (None reads the real Keychain).
     """
     for line in env_content.splitlines():
         stripped = line.strip()
         if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
             return True
-    return False
+    return bool(token_from_vault("TWILIO_ACCOUNT_SID", vault_get=vault_get))
 
 
 def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:

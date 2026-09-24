@@ -54,6 +54,7 @@ import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, exi
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
+import { envOrVault } from '../../../src/vault-secret.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
@@ -66,6 +67,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
+import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -98,8 +100,10 @@ function detachVisionFromCall(): void {
 // chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
 // billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
 const GEMINI_API_KEY = voiceApiKey();
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
+// `vault set TWILIO_ACCOUNT_SID …` is enough: the environment (sourced .env
+// included) wins, the Keychain vault answers when it is empty — as twilio-setup.py resolves.
+const TWILIO_ACCOUNT_SID = envOrVault('TWILIO_ACCOUNT_SID');
+const TWILIO_AUTH_TOKEN = envOrVault('TWILIO_AUTH_TOKEN');
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? '';
 const PORT = Number(process.env.PHONE_PORT) || 3100;
@@ -1853,37 +1857,6 @@ wss.on('connection', (ws: WebSocket) => {
 	ws.on('error', (err) => console.error(`${ts()} [WS] error:`, err));
 });
 
-// Point TWILIO_PHONE_NUMBER's voice + status webhooks at `base` when they
-// differ. Failures are logged, never fatal: the server still answers on the
-// URL it bound, and `twilio-setup.py set-webhook` is the manual retry.
-async function syncTwilioWebhook(base: string): Promise<void> {
-	const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
-	const api = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}`;
-	const wantVoice = `${base}/twilio/connect`;
-	const wantStatus = `${base}/twilio/status`;
-	try {
-		const list = await fetch(`${api}/IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(TWILIO_PHONE_NUMBER)}`, {
-			headers: { Authorization: `Basic ${auth}` },
-		});
-		if (!list.ok) { console.error(`${ts()} [Twilio] webhook sync: list failed HTTP ${list.status}`); return; }
-		const data = await list.json() as { incoming_phone_numbers?: Array<{ sid: string; voice_url?: string; status_callback?: string }> };
-		const num = data.incoming_phone_numbers?.[0];
-		if (!num) { console.error(`${ts()} [Twilio] webhook sync: TWILIO_PHONE_NUMBER is not owned by this account`); return; }
-		if (num.voice_url === wantVoice && num.status_callback === wantStatus) {
-			console.log(`${ts()} [Twilio] webhook already points here`);
-			return;
-		}
-		const form = new URLSearchParams({ VoiceUrl: wantVoice, VoiceMethod: 'POST', StatusCallback: wantStatus, StatusCallbackMethod: 'POST' });
-		const upd = await fetch(`${api}/IncomingPhoneNumbers/${num.sid}.json`, {
-			method: 'POST', headers: { Authorization: `Basic ${auth}` }, body: form,
-		});
-		if (!upd.ok) { console.error(`${ts()} [Twilio] webhook sync: update failed HTTP ${upd.status}: ${(await upd.text()).slice(0, 200)}`); return; }
-		console.log(`${ts()} [Twilio] webhook now ${wantVoice}`);
-	} catch (err) {
-		console.error(`${ts()} [Twilio] webhook sync failed:`, err);
-	}
-}
-
 // --- Startup ---
 
 async function start(): Promise<void> {
@@ -1902,7 +1875,12 @@ async function start(): Promise<void> {
 		}
 		// Opt-in: re-point the number at the tunnel bound just above (the runtime
 		// URL, never a recorded one); a number shared with another host stays put.
-		if (process.env.TWILIO_AUTO_WEBHOOK === '1') await syncTwilioWebhook(WEBHOOK_BASE_URL);
+		if (process.env.TWILIO_AUTO_WEBHOOK === '1') {
+			await syncTwilioWebhook({ sid: TWILIO_ACCOUNT_SID, token: TWILIO_AUTH_TOKEN, number: TWILIO_PHONE_NUMBER }, WEBHOOK_BASE_URL, {
+				log: (line) => console.log(`${ts()} ${line}`),
+				error: (line) => console.error(`${ts()} ${line}`),
+			});
+		}
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);

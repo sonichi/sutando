@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """twilio-setup.py against a fake Twilio (plus a fake phone-server /health):
 numbers, buy, set-webhook, status, verbatim error surfacing, credential
-resolution, the byte-preserving .env writer, and the restart round trip — a
-moved tunnel is reported as drift and re-pushed, never recorded as
-TWILIO_WEBHOOK_URL.
+resolution, the byte-preserving .env writer (private from its first byte,
+line-break and NUL injection refused), the restart round trip — a moved
+tunnel is reported as drift and re-pushed, never recorded as
+TWILIO_WEBHOOK_URL — and the pin that the phone server resolves its
+credentials the way the script does (env, then the Keychain vault).
 
 Run: python3 tests/twilio-setup.test.py
 """
@@ -13,6 +15,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import stat
 import sys
 import tempfile
@@ -394,6 +397,73 @@ class TwilioSetupTests(unittest.TestCase):
         self.assertEqual(os.path.realpath(link), os.path.realpath(target))
         self.assertEqual(target.read_text(), "A=2\n")
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_set_env_var_rejects_line_breaks_and_nul_so_nothing_injects_a_line(self):
+        p = pathlib.Path(self.tmp, "i.env")
+        p.write_text("A=1\n")
+        for bad in ("x\nEVIL=1", "x\rEVIL=1", "x\r\nEVIL=1", "x\0"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.mod.set_env_var(p, "A", bad)
+        for bad_key in ("A\n", "A\rB", "A B", "1A", "", "A=B", "A\0"):
+            with self.assertRaises(ValueError, msg=repr(bad_key)):
+                self.mod.set_env_var(p, bad_key, "v")
+        self.assertEqual(p.read_text(), "A=1\n")
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith(".tmp")], [])
+
+    def test_set_env_var_creates_the_temp_file_at_its_final_mode_from_the_first_byte(self):
+        p = pathlib.Path(self.tmp, "m.env")
+        p.write_text("TWILIO_AUTH_TOKEN=secret\n")
+        os.chmod(p, 0o600)
+        seen = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, *a, **kw):
+            fd = real_open(path, flags, mode, *a, **kw)
+            if str(path).endswith(".tmp"):
+                seen.append((flags, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
+            return fd
+
+        old_umask = os.umask(0o000)   # the widest umask: only the creation mode keeps others out
+        try:
+            with mock.patch("os.open", spy):
+                self.mod.set_env_var(p, "TWILIO_PHONE_NUMBER", "+1")
+        finally:
+            os.umask(old_umask)
+        flags, mode, at_creation = seen[0]
+        self.assertEqual(flags & (os.O_CREAT | os.O_EXCL), os.O_CREAT | os.O_EXCL)
+        self.assertEqual((mode, at_creation), (0o600, 0o600), "the token was readable before the chmod")
+        self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+        # A restrictive umask narrows the creation mode; the file's own mode is restored.
+        os.chmod(p, 0o640)
+        old_umask = os.umask(0o077)
+        try:
+            self.mod.set_env_var(p, "TWILIO_PHONE_NUMBER", "+2")
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o640)
+        self.assertEqual(p.read_text(), "TWILIO_AUTH_TOKEN=secret\nTWILIO_PHONE_NUMBER=+2\n")
+
+    def test_set_env_var_replaces_a_leftover_temp_file_instead_of_failing(self):
+        p = pathlib.Path(self.tmp, "l.env")
+        p.write_text("A=1\n")
+        stale = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+        stale.write_text("junk from an interrupted run")
+        self.mod.set_env_var(p, "A", "2")
+        self.assertEqual(p.read_text(), "A=2\n")
+        self.assertFalse(stale.exists())
+
+    # ---------- the phone server reads the same vault ----------
+
+    def test_the_phone_server_resolves_credentials_the_way_the_script_does(self):
+        repo = _SCRIPT.parents[3]
+        server = (repo / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts").read_text()
+        self.assertIn("envOrVault('TWILIO_ACCOUNT_SID')", server)
+        self.assertIn("envOrVault('TWILIO_AUTH_TOKEN')", server)
+        self.assertNotIn("process.env.TWILIO_ACCOUNT_SID", server, "a vault-only setup would start the script but not the server")
+        self.assertNotIn("process.env.TWILIO_AUTH_TOKEN", server)
+        ts_account = re.search(r"VAULT_KEYCHAIN_ACCOUNT = '([^']+)'", (repo / "src" / "vault-secret.ts").read_text()).group(1)
+        py_account = re.search(r'^_ACCOUNT = "([^"]+)"', (repo / "src" / "vault_intercept.py").read_text(), re.M).group(1)
+        self.assertEqual(ts_account, py_account, "the server must read the Keychain item `vault set` writes")
 
 
 if __name__ == "__main__":

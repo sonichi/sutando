@@ -23,7 +23,10 @@ The owner signs up at twilio.com and adds a payment method; everything after tha
 an API call, so do it for them with `scripts/twilio-setup.py`:
 
 1. Ask for the **Account SID** and **Auth Token** (Twilio console → Account info) and
-   store them: `vault set TWILIO_ACCOUNT_SID …`, `vault set TWILIO_AUTH_TOKEN …`.
+   store them: `vault set TWILIO_ACCOUNT_SID …`, `vault set TWILIO_AUTH_TOKEN …`. That is
+   enough: the script, `startup.sh`'s phone gate and the phone server itself all resolve
+   the environment (`.env` included) first and the vault when it is empty, so nothing is
+   copied into `.env`.
 2. `python3 skills/phone-conversation/scripts/twilio-setup.py status` — account type
    (a **Trial** account cannot buy a number or call unverified numbers; say so and
    point at https://console.twilio.com/billing), numbers owned, webhook drift.
@@ -38,7 +41,9 @@ an API call, so do it for them with `scripts/twilio-setup.py`:
 5. `… set-webhook [BASE]` — re-point an owned number after the tunnel URL moved (`status`
    says "last pushed to Twilio … run set-webhook" when it did). With `TWILIO_AUTO_WEBHOOK=1`
    in `.env` the server pushes the tunnel it just bound on every start, so a restart with
-   an unreserved ngrok needs no hand step.
+   an unreserved ngrok needs no hand step. That push gives api.twilio.com 10 s per call and
+   logs a skip (`webhook sync skipped … run twilio-setup.py set-webhook`) instead of holding
+   the start; `set-webhook` is the retry.
 6. Confirm: `curl localhost:3100/health` shows the tunnel; `status` shows no drift.
 
 Twilio's refusals are printed verbatim (error code + message + more_info link); relay
