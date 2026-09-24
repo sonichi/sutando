@@ -4,8 +4,9 @@ numbers, buy, set-webhook, status, verbatim error surfacing, credential
 resolution, the byte-preserving .env writer (private from its first byte,
 line-break and NUL injection refused), the restart round trip — a moved
 tunnel is reported as drift and re-pushed, never recorded as
-TWILIO_WEBHOOK_URL — and the pin that the phone server resolves its
-credentials the way the script does (env, then the Keychain vault).
+TWILIO_WEBHOOK_URL — and the structural pin that the phone server keeps no
+private `process.env.TWILIO_*` reader beside the shared env-then-vault resolver
+(whose behaviour tests/vault-secret.test.ts covers).
 
 Run: python3 tests/twilio-setup.test.py
 """
@@ -454,13 +455,16 @@ class TwilioSetupTests(unittest.TestCase):
 
     # ---------- the phone server reads the same vault ----------
 
-    def test_the_phone_server_resolves_credentials_the_way_the_script_does(self):
+    def test_the_phone_server_has_no_private_credential_reader(self):
+        """STRUCTURAL pins (REVIEW.md lesson 14, second exception), not a
+        behaviour test: the resolver's behaviour is tests/vault-secret.test.ts.
+        What no behaviour test can see is a duplicate: a `process.env.TWILIO_*`
+        read beside the shared resolver agrees with it until the vault is the
+        only source, and then the script starts while the server exits."""
         repo = _SCRIPT.parents[3]
         server = (repo / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts").read_text()
-        self.assertIn("envOrVault('TWILIO_ACCOUNT_SID')", server)
-        self.assertIn("envOrVault('TWILIO_AUTH_TOKEN')", server)
-        self.assertNotIn("process.env.TWILIO_ACCOUNT_SID", server, "a vault-only setup would start the script but not the server")
-        self.assertNotIn("process.env.TWILIO_AUTH_TOKEN", server)
+        for var in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER"):
+            self.assertNotIn(f"process.env.{var}", server, f"{var}: a vault-only setup would start the script but not the server")
         ts_account = re.search(r"VAULT_KEYCHAIN_ACCOUNT = '([^']+)'", (repo / "src" / "vault-secret.ts").read_text()).group(1)
         py_account = re.search(r'^_ACCOUNT = "([^"]+)"', (repo / "src" / "vault_intercept.py").read_text(), re.M).group(1)
         self.assertEqual(ts_account, py_account, "the server must read the Keychain item `vault set` writes")

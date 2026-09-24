@@ -100,11 +100,14 @@ function detachVisionFromCall(): void {
 // chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
 // billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
 const GEMINI_API_KEY = voiceApiKey();
-// `vault set TWILIO_ACCOUNT_SID …` is enough: the environment (sourced .env
-// included) wins, the Keychain vault answers when it is empty — as twilio-setup.py resolves.
+// Each Twilio credential resolves the way twilio-setup.py and startup.sh's
+// phone gate resolve it: the environment (sourced .env included) wins, the
+// Keychain vault answers when it is empty. All three are required below, and
+// the gate starts this server only when all three resolve — a `vault set` of
+// the SID alone is not a start signal.
 const TWILIO_ACCOUNT_SID = envOrVault('TWILIO_ACCOUNT_SID');
 const TWILIO_AUTH_TOKEN = envOrVault('TWILIO_AUTH_TOKEN');
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
+const TWILIO_PHONE_NUMBER = envOrVault('TWILIO_PHONE_NUMBER');
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? '';
 const PORT = Number(process.env.PHONE_PORT) || 3100;
 const WORKSPACE_DIR = resolveWorkspace();

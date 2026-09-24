@@ -1195,30 +1195,62 @@ else
 fi
 
 # 8. Phone conversation server + ngrok (optional — needs Twilio + Gemini credentials)
-# The channel bridges' gate: the resolver answers env -> .env -> vault (0 present,
-# 3 definitively absent), so `vault set TWILIO_ACCOUNT_SID` alone starts the phone server.
+# The channel bridges' gate, asked for everything conversation-server.ts exits
+# without: account SID, auth token AND phone number. The resolver answers
+# env -> .env -> vault (0 present, 3 definitively absent), so `vault set` serves
+# all three. A SID alone is NOT a start signal: the documented setup vaults the
+# SID + token first and `twilio-setup.py buy` writes TWILIO_PHONE_NUMBER later,
+# and in that gap the server exits at once — starting it anyway opened a PUBLIC
+# ngrok tunnel to its dead port on every restart (review of #4666).
 twilio_creds_present() {
-  local _rc=0
-  "$PY" "$REPO/src/channel_token.py" --has TWILIO_ACCOUNT_SID --env-file .env 2>/dev/null || _rc=$?
-  if [ "$_rc" -eq 0 ]; then return 0; fi
-  if [ "$_rc" -eq 3 ]; then return 1; fi
-  # Resolver unavailable (an empty $PY included): anchored + non-empty, because the substring
-  # form matched the commented placeholder and opened a PUBLIC tunnel. Mirrors health-check twilio_configured().
-  grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null
+  local _var _rc
+  for _var in TWILIO_ACCOUNT_SID TWILIO_AUTH_TOKEN TWILIO_PHONE_NUMBER; do
+    _rc=0
+    "$PY" "$REPO/src/channel_token.py" --has "$_var" --env-file .env 2>/dev/null || _rc=$?
+    if [ "$_rc" -eq 0 ]; then continue; fi
+    if [ "$_rc" -eq 3 ]; then return 1; fi
+    # Resolver unavailable (an empty $PY included): anchored + non-empty, because the substring
+    # form matched the commented placeholder and opened a PUBLIC tunnel. Mirrors health-check twilio_configured().
+    grep -qE "^[[:space:]]*${_var}=[^[:space:]]" .env 2>/dev/null || return 1
+  done
+  return 0
 }
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
 elif ! phone_stack_enabled; then
   echo "  ~ conversation server (disabled — no Gemini voice key)"
 elif twilio_creds_present; then
+  _cs_up=0
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
     run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
-    echo "  ✓ conversation server (port 3100)"
+    _cs_pid=$!
+    # Wait for the server to bind :3100 — or exit — before opening a tunnel to
+    # it. ngrok to a port nothing answers on is a PUBLIC URL to a dead socket,
+    # and the server exits at once on a missing credential or a rejected key.
+    # The gate above keeps the credential case out; this keeps every other exit
+    # out. Bounded by the verify pass's own settle window: a server merely
+    # slower than that gets no startup tunnel and reports itself below.
+    _cs_deadline=$(( $(date +%s) + ${VERIFY_SETTLE_S:-15} ))
+    while ! lsof -i :3100 > /dev/null 2>&1 && kill -0 "$_cs_pid" 2>/dev/null \
+        && [ "$(date +%s)" -lt "$_cs_deadline" ]; do
+      sleep 1
+    done
+    if lsof -i :3100 > /dev/null 2>&1; then
+      _cs_up=1
+      echo "  ✓ conversation server (port 3100)"
+    elif kill -0 "$_cs_pid" 2>/dev/null; then
+      echo "  ✗ conversation server did not bind port 3100 within ${VERIFY_SETTLE_S:-15}s — check /tmp/conversation-server.log; ngrok not started"
+    else
+      echo "  ✗ conversation server exited — check /tmp/conversation-server.log; ngrok not started"
+    fi
   else
+    _cs_up=1
     echo "  ✓ conversation server (already running)"
   fi
-  if ! pgrep -f "ngrok" > /dev/null 2>&1; then
+  if [ "$_cs_up" -ne 1 ]; then
+    : # nothing behind the port, so no tunnel to it (reported above)
+  elif ! pgrep -f "ngrok" > /dev/null 2>&1; then
     echo "  Starting ngrok tunnel..."
     # If NGROK_DOMAIN is set in .env, use the reserved domain for a stable URL.
     # Otherwise ngrok picks a random subdomain: TWILIO_AUTO_WEBHOOK=1 (or

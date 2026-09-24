@@ -1,7 +1,8 @@
 /**
  * The phone server's startup webhook sync (TWILIO_AUTO_WEBHOOK=1) against a
  * fake fetch: the same two calls as `twilio-setup.py set-webhook`, every call
- * under a deadline, and every failure — a Twilio API that never answers
+ * under a deadline that holds until its body is read, and every failure — a
+ * Twilio API that never answers, or answers the headers and then stalls,
  * included — a logged skip that returns instead of holding the start.
  *
  * Runs under `tsx --test` (npm test); needs no build and no network.
@@ -83,6 +84,32 @@ test('a Twilio API that never answers is a logged skip at the deadline, not a st
 	assert.equal(s.err.length, 1);
 	assert.match(s.err[0], /webhook sync skipped: api\.twilio\.com did not answer within 40 ms/);
 	assert.match(s.err[0], /twilio-setup\.py set-webhook/);
+	assert.deepEqual(s.out, []);
+});
+
+test('a body that stalls after the headers is aborted at the same deadline', async () => {
+	// A Response built by the double is not tied to the fetch signal, so nothing
+	// but the sync's own race ends the read — the shape the review reproduced:
+	// 200 + headers, then a body that never ends, and the sync pending past its timeout.
+	const stalled = () => new Response(new ReadableStream({ start() {} }), { status: 200 });
+	let f = fetchWith(() => stalled());
+	let s = sink();
+	let t0 = Date.now();
+	assert.equal(await syncTwilioWebhook(CREDS, BASE, { fetchImpl: f.fetchImpl, timeoutMs: 40, log: s.log, error: s.error }), 'skipped');
+	assert.ok(Date.now() - t0 < 2_000, 'the list body stalled past the deadline');
+	assert.equal(f.calls.length, 1);
+	assert.match(s.err[0], /webhook sync skipped: api\.twilio\.com did not answer within 40 ms/);
+
+	// The update's error body too: a 400 whose text never arrives.
+	f = fetchWith((url) => url.endsWith('/PN1.json')
+		? new Response(new ReadableStream({ start() {} }), { status: 400 })
+		: json(200, { incoming_phone_numbers: [ELSEWHERE] }));
+	s = sink();
+	t0 = Date.now();
+	assert.equal(await syncTwilioWebhook(CREDS, BASE, { fetchImpl: f.fetchImpl, timeoutMs: 40, log: s.log, error: s.error }), 'skipped');
+	assert.ok(Date.now() - t0 < 2_000, 'the update body stalled past the deadline');
+	assert.equal(f.calls.length, 2);
+	assert.match(s.err[0], /did not answer within 40 ms/);
 	assert.deepEqual(s.out, []);
 });
 

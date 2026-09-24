@@ -24,9 +24,11 @@ an API call, so do it for them with `scripts/twilio-setup.py`:
 
 1. Ask for the **Account SID** and **Auth Token** (Twilio console → Account info) and
    store them: `vault set TWILIO_ACCOUNT_SID …`, `vault set TWILIO_AUTH_TOKEN …`. That is
-   enough: the script, `startup.sh`'s phone gate and the phone server itself all resolve
-   the environment (`.env` included) first and the vault when it is empty, so nothing is
-   copied into `.env`.
+   enough for the script: it, `startup.sh`'s phone gate and the phone server itself all
+   resolve the environment (`.env` included) first and the vault when it is empty, so
+   nothing is copied into `.env`. The phone server and its tunnel stay OFF until step 4
+   has written `TWILIO_PHONE_NUMBER`: the gate asks for all three (SID, token, number),
+   because the server exits without the number and a tunnel to it would be public and dead.
 2. `python3 skills/phone-conversation/scripts/twilio-setup.py status` — account type
    (a **Trial** account cannot buy a number or call unverified numbers; say so and
    point at https://console.twilio.com/billing), numbers owned, webhook drift.
