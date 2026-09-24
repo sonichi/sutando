@@ -652,6 +652,56 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertFalse(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
         self.assertEqual(calls, [])
 
+    def _log_lines(self):
+        log = self.ws / "logs" / qa.PROBE_LOG
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_every_probe_is_logged_with_seat_model_reason_and_the_re_read(self):
+        # The probe spends a request; the log is the only record that it did, and why.
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
+        sent, reread = self._log_lines()
+        for want in (f"seat={SEAT}", f"model={MODEL}", "sent=1", "reason=stale:3600s"):
+            self.assertIn(want, sent)
+        for want in (f"seat={SEAT}", "reread=vouches", f"record={MODEL}", "windows=allowed"):
+            self.assertIn(want, reread)
+        self.assertRegex(sent, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ")
+
+    def test_the_reason_names_absent_and_other_model_and_the_re_read_names_a_hold(self):
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, _record("rejected", False, age_s=0))))
+        sent, reread = self._log_lines()
+        self.assertIn("reason=absent", sent)
+        self.assertIn("windows=rejected", reread)
+        later = NOW + qa.FRESH_SEC                          # past the marker window; record 5 s old THEN
+        self.write(_record(age_s=NOW - later + 5, last_request={"model": "claude-sonnet-5", "at": _iso(later - 5)}))
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=later))
+        self.assertIn("reason=other-model:claude-sonnet-5", self._log_lines()[2])
+        self.assertIn("reread=other-model:claude-sonnet-5", self._log_lines()[3])
+
+    def test_a_probe_the_marker_refuses_and_an_unknown_model_are_logged_as_not_sent(self):
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None)))
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + 30))
+        self.assertEqual(len(calls), 1)
+        lines = self._log_lines()
+        self.assertEqual(len(lines), 3)                      # sent, re-read, refused
+        self.assertIn("sent=0 why=marker-fresh", lines[2])
+        (self.ws / "state" / "model-switch.json").unlink()
+        self.assertFalse(self._allows(self._proxy_that_writes(calls, None), now=NOW + qa.FRESH_SEC))
+        self.assertIn("sent=0 why=no-seat-model", self._log_lines()[3])
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unwritable_log_changes_nothing(self):
+        # logs/ is a FILE here, so every append fails: the gate still probes and decides.
+        (self.ws / "logs").write_text("not a directory")
+        self.write(_record(age_s=3600))
+        calls = []
+        self.assertTrue(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
+        self.assertEqual(len(calls), 1)
+
     def test_the_second_notifier_in_the_window_does_not_probe_again(self):
         self.write(_record(age_s=3600))
         calls = []

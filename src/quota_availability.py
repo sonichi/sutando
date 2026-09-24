@@ -358,6 +358,8 @@ def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
 PROBE_TIMEOUT_S = 60
 #: Under state/: the last probe attempt, so every notifier on one host sends one probe per window.
 PROBE_MARK = "quota-probe.last"
+#: Under logs/: one line per probe decision and one per re-read, the only record that a request was spent.
+PROBE_LOG = "quota-probe.log"
 #: Under the system temp dir, OUTSIDE any repo: a cwd under a checkout loads that
 #: project's CLAUDE.md and hooks (the default workspace is in-repo), measured at 60 s vs 7 s.
 PROBE_CWD = "sutando-quota-probe"
@@ -386,6 +388,20 @@ def _launch_detached(argv, env, timeout, cwd=None):
                             stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+def _log_probe(workspace, at: float, **fields) -> None:
+    """Append one `k=v` line to `<workspace>/logs/quota-probe.log`. Never raises:
+    the gate is on a fail-closed path and a log that cannot be written changes nothing."""
+    stamp = datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = stamp + "".join(f" {k}={v}" for k, v in fields.items() if v is not None) + "\n"
+    try:
+        log = Path(workspace) / "logs" / PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
 def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
     """Take the marker under the shared file lock: two notifiers that both find it
     stale serialize here, and only the first one out of the lock sends a probe.
@@ -406,7 +422,8 @@ def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> bool:
 def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[str],
                            now: Optional[float] = None, fresh_sec: float = FRESH_SEC,
                            runner: Optional[Callable] = None, timeout: float = PROBE_TIMEOUT_S,
-                           config_dir: Optional[str] = None) -> bool:
+                           config_dir: Optional[str] = None, seat: Optional[str] = None,
+                           why: Optional[str] = None) -> bool:
     """Send one minimal request THROUGH the proxy on the seat's `model` so it
     rewrites the record, and say whether a probe was sent. The verdict is then
     read from the record, never from the probe's outcome: a request the limit
@@ -416,16 +433,23 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
     watchdog: one request, no side effects in the seat's project. Only toward a proxy address, only for a
     known model (the record could never vouch for an unknown one), at most once
     per `fresh_sec` host-wide, the marker claimed under a lock before the request
-    goes out."""
-    if not points_at_credential_proxy(base_url) or not model:
+    goes out. Every decision past the routing check is logged (`seat`, `why`):
+    the request spends quota, so its absence is as reportable as its sending."""
+    if not points_at_credential_proxy(base_url):
+        return False
+    at = time.time() if now is None else now
+    if not model:
+        _log_probe(workspace, at, seat=seat, sent=0, why="no-seat-model", reason=why)
         return False
     mark = Path(workspace) / "state" / PROBE_MARK
-    at = time.time() if now is None else now
     try:
         if not _claim_probe_marker(mark, at, fresh_sec):
+            _log_probe(workspace, at, seat=seat, model=model, sent=0, why="marker-fresh", reason=why)
             return False
     except OSError:
+        _log_probe(workspace, at, seat=seat, model=model, sent=0, why="marker-unwritable", reason=why)
         return False
+    _log_probe(workspace, at, seat=seat, model=model, sent=1, reason=why)
     run = runner or _launch_detached
     env = dict(os.environ, ANTHROPIC_BASE_URL=str(base_url))
     if config_dir:
@@ -437,6 +461,17 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
     except (OSError, subprocess.SubprocessError):
         pass
     return True
+
+def _vouch_reason(rec: Optional[QuotaRecord], env: SeatEnv, workspace, fresh_sec: float) -> Optional[str]:
+    """Why the record cannot vouch for this seat, for the probe log; None when it can."""
+    if rec is None:
+        return "absent"
+    if not rec.fresh(fresh_sec):
+        return "stale" if rec.age_s is None else f"stale:{int(rec.age_s)}s"
+    if not record_speaks_for_seat(rec.payload, env, workspace):
+        return f"other-model:{record_model(rec.payload) or 'unknown'}"
+    return None
+
 
 def provider_allows_now(workspace, socket_path: Optional[str], session: Optional[str],
                         now: Optional[float] = None, fresh_sec: float = FRESH_SEC,
@@ -461,12 +496,15 @@ def provider_allows_now(workspace, socket_path: Optional[str], session: Optional
     env = seat_env_base_url(socket_path, session, tmux_runner, ps_runner)
     # Absent, stale, or refreshed on another model: a record kept fresh by
     # another seat's traffic would otherwise hold this seat forever.
-    cannot_vouch = (rec is None or not rec.fresh(fresh_sec)
-                    or not record_speaks_for_seat(rec.payload, env, workspace))
-    if probe and cannot_vouch and points_at_credential_proxy(env.base_url):
+    why = _vouch_reason(rec, env, workspace, fresh_sec)
+    if probe and why is not None and points_at_credential_proxy(env.base_url):
         if probe_refreshes_record(workspace, env.base_url, seat_model(env, workspace), now, fresh_sec,
-                                  runner=probe_runner, config_dir=env.config_dir):
+                                  runner=probe_runner, config_dir=env.config_dir, seat=session, why=why):
             rec = read_quota_record(workspace, now)
+            _log_probe(workspace, time.time() if now is None else now, seat=session,
+                       reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
+                       record=None if rec is None else record_model(rec.payload),
+                       windows=("allowed" if rec is not None and gate_windows_allowed(rec.payload) else "rejected"))
     if rec is None:
         return False
     decision = availability_decision(rec.payload, base_url=env.base_url,
