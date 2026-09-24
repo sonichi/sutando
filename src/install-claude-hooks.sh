@@ -162,7 +162,10 @@ fi
 mkdir -p "$REPO_DIR/.claude"
 # The PreCompact archive hook is a bare `cp`, which cannot create its own
 # destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
+# The archive folder is made by archive-transcript.sh the first time it has a
+# transcript to save (PreCompact). Making it here left an empty
+# ~/Desktop/sutando-conversations on every install and health check, which the
+# owner kept finding and deleting (2026-09-24).
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi

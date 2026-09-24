@@ -85,11 +85,12 @@ RUN_OUT3="$(TRANSCRIPT_PATH=/dev/null bash -c "$PC_CMD" 2>&1)"
 ok "PreCompact handoff stored command executes the intended script" \
    "$([ "$RUN_OUT3" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
-# The archive hook is a bare `cp`, so it cannot create its own destination. The
-# assertion that matters is not "the directory exists" but "the stored command
-# executed by a shell actually archives a file" — the same standard as above.
-ok "installer created the archive hook's destination directory" \
-   "$([ -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+# The archiver makes its own destination the first time it has a transcript to
+# save, so an install leaves no empty ~/Desktop/sutando-conversations behind
+# (the owner kept finding and deleting one, 2026-09-24). The assertion that
+# matters is still "the stored command executed by a shell archives a file".
+ok "installer leaves no empty archive folder behind" \
+   "$([ ! -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
 
 AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
 printf 'transcript\n' > "$ROOT/transcript.jsonl"
