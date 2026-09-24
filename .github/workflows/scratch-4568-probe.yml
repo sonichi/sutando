@@ -1,0 +1,57 @@
+name: scratch-4568-probe
+on: workflow_dispatch
+
+jobs:
+  isolated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+      - name: nproc
+        run: nproc
+      - name: 25x isolated
+        run: |
+          pass=0; fail=0
+          for i in $(seq 1 25); do
+            if python3 tests/watch-tasks-stream-config-hot-reload.test.py >/tmp/out.txt 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- FAIL run $i ---"; cat /tmp/out.txt
+            fi
+          done
+          echo "ISOLATED RESULT: $pass/25 pass, $fail fail"
+
+  contended:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: 'npm' }
+      - run: npm ci
+      - run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+      - name: nproc
+        run: nproc
+      - name: 25x under real 4-lane contention (three other watcher suites running concurrently, same as CI's own scheduler)
+        run: |
+          N="$(nproc)"
+          echo "starting $((N-1)) busy loops to match a saturated $N-core runner"
+          for i in $(seq 1 $((N-1))); do
+            ( while true; do :; done ) &
+          done
+          sleep 1
+          pass=0; fail=0
+          for i in $(seq 1 25); do
+            if python3 tests/watch-tasks-stream-config-hot-reload.test.py >/tmp/out.txt 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- FAIL run $i ---"; cat /tmp/out.txt
+            fi
+          done
+          echo "CONTENDED RESULT: $pass/25 pass, $fail fail"
