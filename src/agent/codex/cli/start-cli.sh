@@ -394,6 +394,13 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
 else
   _sd_py=""
 fi
+# Codex parks a detached core at "Trust this folder?" until someone answers; seed the
+# answer with the one interpreter resolved above.
+if [ -n "$_HB_PY" ]; then
+  _trust_status="$("$_HB_PY" "$REPO/src/agent/codex/cli/trust-seed.py" \
+    "${CODEX_HOME:-$HOME/.codex}/config.toml" "$WORKING_DIR" 2>/dev/null || true)"
+  echo "  ✓ trust-seed: ${_trust_status:-skipped: no result} ($WORKING_DIR)"
+fi
 clear_shutdown_sentinel() {
   if [ -n "$_sd_py" ]; then
     "$_sd_py" "$REPO/src/shutdown.py" clear >/dev/null \

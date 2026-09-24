@@ -885,5 +885,65 @@ class TestMainOnce(unittest.TestCase):
         self.assertEqual(sig["state"], "running")
 
 
+# Both captured from a Codex core on a fresh macOS VM (codex-cli, 2026-09-24).
+_CODEX_TRUST = (
+    "  Folder access\n  /tmp/codex-trust-fixture\n\n"
+    "  Trust this folder? Codex can read, edit, and run files here, subject to your\n"
+    "  permission settings. Folder settings can run code automatically, even\n"
+    "  without a model request. Continue only if you trust these files. Your trust\n"
+    "  decision will be saved.\n\n"
+    "› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n")
+_CODEX_IDLE = (
+    "• Hi Vidhu! I’m Sutando, your personal AI assistant—ready whenever you\n  are.\n\n"
+    "  6:16 PM\n\n"
+    "  ↳ Recap: The goal is to complete Sutando’s queued tasks under\n"
+    "           AGENTS.md and save each result to its designated file.\n\n"
+    "› Ask Codex to do anything\n\n"
+    "  GPT-6-Astra default · ~/Library/Application Support/space.ag2.app/eng…\n")
+
+
+class CodexRuntimeTest(unittest.TestCase):
+    """The watcher reads a Codex core with Codex's dialog glyph and key hints."""
+
+    def setUp(self):
+        self.codex = _mod.ADAPTERS["codex"]
+
+    def test_codex_trust_prompt_is_a_gate(self):
+        kind, _ = classify(_CODEX_TRUST, self.codex)
+        state, _, prompt, got = compose_state(_CODEX_TRUST, "unknown", True, adapter=self.codex)
+        self.assertEqual((state, got), ("blocked-human", kind))
+        self.assertIn("Trust and continue", prompt)
+
+    def test_claude_patterns_alone_miss_the_codex_trust_prompt(self):
+        self.assertIsNone(classify(_CODEX_TRUST))
+
+    def test_codex_idle_composer_is_not_a_gate(self):
+        self.assertIsNone(classify(_CODEX_IDLE, self.codex))
+
+    def test_claude_is_the_default_adapter(self):
+        self.assertEqual(classify(_BYPASS), classify(_BYPASS, _mod.CLAUDE))
+
+    def test_session_adapter_follows_the_session_runtime(self):
+        orig = _mod.subprocess.run
+        answers = {"codex": "SUTANDO_CORE_RUNTIME=codex\n", "claude": "SUTANDO_CORE_RUNTIME=claude\n",
+                   "bogus": "SUTANDO_CORE_RUNTIME=nope\n", "unset": ""}
+
+        def fake(out, rc=0):
+            return lambda *a, **k: type("R", (), {"returncode": rc, "stdout": out})()
+        try:
+            for name, want in (("codex", "codex"), ("claude", "claude"), ("bogus", "claude")):
+                _mod.subprocess.run = fake(answers[name])
+                self.assertEqual(_mod.session_adapter("/s", "sutando-core").name, want, name)
+            _mod.subprocess.run = fake("", rc=1)
+            self.assertEqual(_mod.session_adapter("/s", "sutando-core").name, "claude")
+
+            def boom(*a, **k):
+                raise FileNotFoundError("tmux")
+            _mod.subprocess.run = boom
+            self.assertEqual(_mod.session_adapter("/s", "sutando-core").name, "claude")
+        finally:
+            _mod.subprocess.run = orig
+
+
 if __name__ == "__main__":
     unittest.main()
