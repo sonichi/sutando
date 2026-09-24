@@ -47,7 +47,22 @@ class FakeCloud(connectors.Cloud):
         self.enabled = enabled
         self.users = list(user) if isinstance(user, list) else [user]
         self.paths = []
+        self.posts = []
         self.error = None
+
+    def post(self, path, body=None):
+        if not self.signed_in():
+            raise connectors.Setup("not_signed_in", "not signed in")
+        self.posts.append((path, body))
+        if path.endswith("/default"):
+            wanted = path.split("/")[-2]
+            for c in self.connections:
+                if c.get("id") == wanted:
+                    for o in self.connections:
+                        if o.get("toolkit") == c.get("toolkit"):
+                            o["isDefault"] = o is c
+                    return {"ok": True}
+        raise cloud_auth.CloudError(404, "not_found", path)
 
     def get(self, path):
         if not self.signed_in():
@@ -1608,6 +1623,67 @@ class TestReadCache(Base):
         connectors.ConnectCache(self.ws, now=lambda: NOW).put_connections(self.rows("linear"))
         self.assertEqual(hook.connected_set(self.ws, NOW + 1), {"linear"})
         self.assertIsNone(hook.connected_set(self.ws, NOW + connectors.CACHE_TTL_S))
+
+
+
+class SetDefaultTests(unittest.TestCase):
+    """set-default: the agent changes which account an app uses (agent-universe #279)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.rows = [
+            {"id": "c1", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@personal.com", "isDefault": True},
+            {"id": "c2", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@work.com", "isDefault": False},
+            {"id": "c3", "toolkit": "gmail", "name": "Gmail", "status": "expired",
+             "accountLabel": "old@work.com", "isDefault": False},
+            {"id": "c4", "toolkit": "slack", "name": "Slack", "status": "active",
+             "accountLabel": None, "isDefault": True},
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_label_or_part_of_it_or_an_id_picks_the_account(self):
+        for sel in ("me@work.com", "ME@WORK.COM", "work", "c2"):
+            cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+            code, out = run(self.ws, ["set-default", "gmail", sel], cloud=cloud)
+            self.assertEqual(code, 0, sel)
+            self.assertEqual(out["account"]["id"], "c2")
+            self.assertEqual(cloud.posts, [("/api/connectors/c2/default", None)], sel)
+
+    def test_an_expired_account_cannot_become_the_default(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "gmail", "old@work.com"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "no_match")
+        self.assertEqual([c["id"] for c in out["candidates"]], ["c1", "c2"])
+        self.assertEqual(cloud.posts, [])
+
+    def test_a_name_that_fits_several_accounts_asks_instead_of_guessing(self):
+        rows = [dict(r) for r in self.rows]
+        rows[0]["accountLabel"] = "me@work.com"
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "ambiguous")
+        self.assertEqual(cloud.posts, [])
+
+    def test_an_app_with_nothing_connected_is_none(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "linear", "anything"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "none")
+
+    def test_a_cloud_without_defaults_is_a_setup_answer(self):
+        rows = [dict(r, isDefault=None) for r in self.rows]
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "unsupported")
+        self.assertEqual(cloud.posts, [])
 
 
 if __name__ == "__main__":

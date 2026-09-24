@@ -278,6 +278,20 @@ class Cloud:
             raise cloud_auth.CloudError(0, "network", str(exc)) from None
         return data if isinstance(data, dict) else {}
 
+    def post(self, path: str, body: dict | None = None) -> dict:
+        """One authenticated POST; the same error mapping as `get`."""
+        if not self.signed_in():
+            raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        try:
+            data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "POST", path, body or {})
+        except cloud_auth.CloudError as exc:
+            if exc.status == 401:
+                self.token = None
+            raise
+        except (OSError, ValueError) as exc:
+            raise cloud_auth.CloudError(0, "network", str(exc)) from None
+        return data if isinstance(data, dict) else {}
+
     def user_id(self) -> str | None:
         """The signed-in account's id, with auth re-read so a sign-in as someone else is seen."""
         self.token = None
@@ -1034,6 +1048,50 @@ def cmd_status(
     return EXIT_OK if payload["all_connected"] else EXIT_NO
 
 
+def pick_account(rows: list, toolkit: str, account: str) -> tuple[dict | None, str, list]:
+    """The active connection of `toolkit` the owner means by `account`: its id, its label
+    (case-insensitive), or a substring of exactly one label. Returns (row, reason, candidates);
+    reason is '' on a match, else no_match / ambiguous / none (nothing connected)."""
+    active = [r for r in rows if isinstance(r, dict) and str(r.get("toolkit") or "").lower() == toolkit
+              and r.get("status") == "active"]
+    cands = [{"id": r.get("id"), "accountLabel": r.get("accountLabel"), "isDefault": r.get("isDefault")}
+             for r in active]
+    if not active:
+        return None, "none", cands
+    sel = (account or "").strip()
+    for r in active:
+        if sel and r.get("id") == sel:
+            return r, "", cands
+    low = sel.lower()
+    exact = [r for r in active if str(r.get("accountLabel") or "").lower() == low]
+    if len(exact) == 1:
+        return exact[0], "", cands
+    partial = [r for r in active if low and low in str(r.get("accountLabel") or "").lower()]
+    if len(partial) == 1:
+        return partial[0], "", cands
+    return None, ("ambiguous" if len(exact) > 1 or len(partial) > 1 else "no_match"), cands
+
+
+def cmd_set_default(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
+    """Make one of the app's connected accounts the one the agent uses unless told otherwise
+    (agent-universe #279, POST /api/connectors/<id>/default). Exit 1 with the candidates when the
+    account is unknown or the name fits several, so the caller can ask the owner which one."""
+    toolkit = _require(args.slug, SLUG_RE, "toolkit").lower()
+    rows = cloud.connection_rows()
+    row, reason, cands = pick_account(rows, toolkit, args.account)
+    if row is None:
+        emit({"toolkit": toolkit, "ok": False, "reason": reason, "candidates": cands})
+        return EXIT_NO
+    if row.get("isDefault") is None:
+        raise Setup("unsupported", "This AG2 Cloud has no default accounts yet; the newest account is used.")
+    cloud.post(f"/api/connectors/{row.get('id')}/default")
+    if cloud.cache is not None:
+        cloud.cache.put_connections(cloud.connection_rows())
+    emit({"toolkit": toolkit, "ok": True, "account": {"id": row.get("id"), "accountLabel": row.get("accountLabel")},
+          "candidates": cands})
+    return EXIT_OK
+
+
 def _require(value: str, pattern: re.Pattern, what: str) -> str:
     value = (value or "").strip()
     if not pattern.match(value):
@@ -1461,6 +1519,9 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status")
     s.add_argument("slugs", nargs="*")
     s.add_argument("--room", help="only this room's waits")
+    d = sub.add_parser("set-default", help="make one of an app's accounts the one the agent uses")
+    d.add_argument("slug", help="the app, e.g. gmail")
+    d.add_argument("account", help="the account: its label (me@work.com), part of it (work), or its id")
     a = sub.add_parser("await")
     a.add_argument("slugs", nargs="+")
     a.add_argument("--room", required=True)
@@ -1507,7 +1568,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "claim": cmd_claim,
-            "verify-account": cmd_verify_account, "note": cmd_note}
+            "verify-account": cmd_verify_account, "note": cmd_note, "set-default": cmd_set_default}
 
 
 def main(

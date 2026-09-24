@@ -59,6 +59,7 @@ SUTANDO_REQUEST
 python3 "$C" note '<wait id>' "YouTube is connected. On it." [--status connected]   # a private-card line
 python3 "$C" claim '<room id>'                 # before answering in a room that may have a wait
 python3 "$C" verify-account '<wait id>'        # a resume: is the wait's AG2 Cloud account the one in use now?
+python3 "$C" set-default gmail work@x.io      # the account the agent uses for gmail unless told otherwise
 python3 "$C" rearm                             # restart dead waiters (startup + proactive loop run it)
 ```
 
@@ -236,6 +237,21 @@ message, no "I sent you a card in our DM", no outro.
    and the lines under the owner's message. A card already waiting for these apps in the room is
    folded in by `card` itself: the old card points at the new one, so no `status` or `note` first.
 3. Go to step 4 (`mode: private`, `message: null`).
+
+## Step 3b2: several accounts on one app, and which one is the default
+
+The owner can keep any number of accounts on one app (two Gmails, three Slacks). `status` lists
+every connection with `accountLabel` and `isDefault`; the default is the one every call uses
+unless the ask names another (then pass `account` to composio_exec, as in Rules).
+
+- "Make my work Gmail the default", "switch the default Gmail to bassil@ag2.ai", "use
+  mapletyres@gmail.com from now on": run `set-default <slug> <account>` (label, part of it, or
+  id). Exit 0: say "<App> now uses <label> by default." Exit 1 with `reason: ambiguous`: name the
+  `candidates` and ask which. Exit 1 with `no_match` or `none`: that account is not connected,
+  so offer to add it (next bullet). Exit 2 `unsupported`: the cloud has no defaults yet; say so.
+- "Add my other Gmail", "connect a second Slack": no card and no switch. Tell them: "Settings →
+  Apps → Integrations → <App> → Add account", then ask which one should be the default once it
+  is there. A switch card (Step 3c) replaces the current account; adding keeps both.
 
 ## Step 3c: switch an app to another account
 
