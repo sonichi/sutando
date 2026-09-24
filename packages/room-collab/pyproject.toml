@@ -9,7 +9,7 @@ description = "Client for AG2 Space collaborative surfaces (doc, whiteboard, kan
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "AG2 Space" }]
+authors = [{ name = "Qingyun Wu" }]
 keywords = ["ag2", "agent", "crdt", "yjs", "collaboration", "whiteboard"]
 # pycrdt pinned to the server's minor: both ends of the wire run one CRDT implementation.
 dependencies = ["pycrdt>=0.14,<0.15", "websockets>=13"]
