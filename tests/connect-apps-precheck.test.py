@@ -9,6 +9,7 @@ Run: python3 tests/connect-apps-precheck.test.py
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,9 @@ class TestTable(unittest.TestCase):
         hits = hook.match_apps("set up a cold email campaign to founders", TABLE)
         self.assertEqual([h["slug"] for h in hits], ["smartlead"])
         self.assertEqual(hits[0]["prefer_skill"], "campaign-runner")
+        # Gmail is still named by a word of its own ("inbox") even though "email" sits inside "cold email".
+        hits = hook.match_apps("reply to the cold email from Bob in my inbox", TABLE)
+        self.assertEqual([(h["slug"], h["keyword"]) for h in hits], [("smartlead", "cold email"), ("gmail", "inbox")])
         # Both apps genuinely named: both stay.
         self.assertEqual([h["slug"] for h in hook.match_apps("check gmail, then the campaign stats", TABLE)],
                          ["smartlead", "gmail"])
@@ -193,8 +197,8 @@ class TestHandle(Base):
                 self.assertIn("run: python3", line, "the card hint still helps: card itself reads the cloud")
 
     def test_a_prefer_skill_app_gets_the_skill_line_and_no_card(self):
-        # user feedback 2026-09-19: the agent used the bare Smartlead connector, which cannot attach a
-        # mailbox, upload leads or write a sequence; campaign-runner does all of it.
+        # The bare Smartlead connector cannot attach a mailbox, upload leads or write a sequence;
+        # campaign-runner does all of it, so the line must route there and never offer a card.
         self.task(text="set up a cold email campaign in smartlead")
         self.warm("gmail")
         with tempfile.TemporaryDirectory() as ccd, mock.patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": ccd}):
@@ -207,6 +211,25 @@ class TestHandle(Base):
             (Path(ccd) / "skills" / "campaign-runner" / "SKILL.md").write_text("x")
             line = hook.handle(self.payload(sid="s-skill-installed"), now=NOW + 1, table=TABLE)
             self.assertIn("prefer_skill=campaign-runner for smartlead (installed; never the bare smartlead connector)", line)
+
+    def test_skill_installed_resolves_claude_home_through_the_canonical_helper(self):
+        # A setup that only sets $CLAUDE_HOME (no $CLAUDE_CONFIG_DIR) is the helper's second level.
+        with tempfile.TemporaryDirectory() as ch, mock.patch.dict("os.environ", {"CLAUDE_HOME": ch}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertFalse(hook.skill_installed("campaign-runner"))
+            (Path(ch) / "skills" / "campaign-runner").mkdir(parents=True)
+            (Path(ch) / "skills" / "campaign-runner" / "SKILL.md").write_text("x")
+            self.assertTrue(hook.skill_installed("campaign-runner"))
+            with tempfile.TemporaryDirectory() as ccd, mock.patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": ccd}):
+                self.assertFalse(hook.skill_installed("campaign-runner"), "$CLAUDE_CONFIG_DIR outranks $CLAUDE_HOME")
+        # No core tree (the helper cannot be imported): the stock ~/.claude default, never a crash.
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(sys.modules, {"util_paths": None}), \
+                mock.patch.dict("os.environ", {"HOME": home}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None); os.environ.pop("CLAUDE_HOME", None)
+            self.assertFalse(hook.skill_installed("campaign-runner"))
+            (Path(home) / ".claude" / "skills" / "campaign-runner").mkdir(parents=True)
+            (Path(home) / ".claude" / "skills" / "campaign-runner" / "SKILL.md").write_text("x")
+            self.assertTrue(hook.skill_installed("campaign-runner"))
 
     def test_all_matched_apps_connected_means_no_run_hint(self):
         self.task()

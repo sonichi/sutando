@@ -57,10 +57,8 @@ for t in WRITE_TOOLS:
     check(f"deny: {t.rsplit('__', 1)[-1]}",
           r.returncode == 0 and decision(r) == "deny", r.stdout[:120])
 
-# Reason must be actionable: the Station connector FIRST (user feedback 2026-09-20 was
-# told to generate an app password because the old reason led with IMAP/SMTP),
-# a read-back after sending, the app password only as the last resort, and the
-# escape hatch.
+# Reason must be actionable: the Station connector first, a read-back after sending,
+# the app password only as the last resort, and the escape hatch.
 r = run({"tool_name": "mcp__claude_ai_Gmail__create_draft", "tool_input": {}})
 reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
 check("reason routes to the Station connector", "composio_find" in reason and "GMAIL_SEND_EMAIL" in reason)

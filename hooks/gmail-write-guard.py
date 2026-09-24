@@ -21,12 +21,10 @@ discover it by getting burned. This hook is the generalized version of the
 per-install block Michael built: deny the connector's Gmail write tools BEFORE
 they run, with a reason that points the model at the path that works.
 
-Where the write goes instead (2026-09-23, user feedback): the Station
-Gmail connector (``composio_find`` → ``composio_exec``), which is a different
-tool name and is NOT matched by this guard. The old reason sent the model to
-the app-password IMAP/SMTP path first, so an owner with Gmail connected in
-Settings → Integrations was still told to generate an app password by hand.
-The app password is the last resort, only when the Station tools are absent.
+Where the write goes instead: the Station Gmail connector (``composio_find`` →
+``composio_exec``), a different tool name that this guard does not match. The
+app-password IMAP/SMTP path is the last resort, only when the Station tools are
+absent; an owner with Gmail connected must never be told to make one by hand.
 
 Scope — deliberately narrow:
   * Only MCP tools (``mcp__…``) whose server/tool name mentions gmail.

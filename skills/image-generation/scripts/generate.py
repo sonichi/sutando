@@ -170,20 +170,26 @@ def api_error_message(err: urllib.error.HTTPError) -> str:
         return f"HTTP {err.code}"
 
 
+# Wording Google uses for a plan-level (per-day / free-tier / zero) limit, as opposed to a
+# per-minute rate limit, which is also a 429 but is answered by waiting, not by billing.
+QUOTA_WORDS = ("per day", "perday", "per_day", "daily", "free tier", "free_tier", "freetier",
+               "limit: 0", "quota_value: 0", "billing")
+
+
 def classify_http_error(err: urllib.error.HTTPError, message: str) -> str:
-    """`quota` for a 429 or a RESOURCE_EXHAUSTED / quota body, else `api_error`. Until 2026-09-23 a
-    zero-quota free-tier key (0 image requests/day) surfaced as an opaque api_error with "try again";
-    the owner had no way to learn the key needs billing enabled before any image can be generated."""
+    """`quota` when the body names a plan-level limit (any status), else `api_error` (retryable)."""
     low = message.lower()
-    if err.code == 429 or "resource_exhausted" in low or "quota" in low:
+    if any(w in low for w in QUOTA_WORDS):
         return "quota"
     return "api_error"
 
 
-def key_note(source: str) -> str:
-    """Which key ran out, so the remedy is actionable: the owner's own env key or the managed one."""
+def key_note(source: str, key: str) -> str:
+    """Which key ran out, so the remedy is actionable: the env variable actually in use, or the managed key."""
     if source == "env":
-        return " (this install uses your own key, GEMINI_API_KEY)"
+        var = next((v for v in ("GEMINI_API_KEY", "GEMINI_VOICE_API_KEY") if os.environ.get(v) == key),
+                   "GEMINI_API_KEY or GEMINI_VOICE_API_KEY")
+        return f" (this install uses your own key, {var})"
     if source == "managed":
         return " (the managed key)"
     return ""
@@ -257,7 +263,7 @@ def generate_image(args, key: str, opener=None, source: str = "") -> int:
     except urllib.error.HTTPError as err:
         message = api_error_message(err)
         kind = classify_http_error(err, message)
-        return fail(kind, message + (key_note(source) if kind == "quota" else ""))
+        return fail(kind, message + (key_note(source, key) if kind == "quota" else ""))
     except (urllib.error.URLError, OSError, ValueError) as err:
         return fail("api_error", str(getattr(err, "reason", None) or err))
     data, mime, text, reason = first_image(response if isinstance(response, dict) else {})

@@ -77,25 +77,30 @@ def load_table(path: Path = TABLE_PATH) -> list[dict]:
 
 
 def match_apps(text: str, table: list[dict]) -> list[dict]:
-    """The apps the text names, in table order, each with the keyword that matched. A longer phrase
-    beats a shorter one it contains, across apps: "cold email campaign" names Smartlead, and the
-    "email" inside it does not also name Gmail."""
+    """The apps the text names, in table order, each with the keyword that matched. A keyword inside
+    another app's longer phrase does not count ("email" in "cold email"); an app stays if any other does."""
     low = " ".join(text.lower().split())
+    matched = [(app, [kw for kw, pat in zip(app["keywords"], app["patterns"]) if pat.search(low)]) for app in table]
+    matched = [(app, kws) for app, kws in matched if kws]
     hits = []
-    for app in table:
-        for kw, pat in zip(app["keywords"], app["patterns"]):
-            if pat.search(low):
-                hits.append({"slug": app["slug"], "name": app["name"], "keyword": kw,
-                             "prefer_skill": app.get("prefer_skill")})
-                break
-    phrases = [h["keyword"].lower() for h in hits]
-    return [h for h in hits if not any(h["keyword"].lower() != o and h["keyword"].lower() in o for o in phrases)]
+    for app, kws in matched:
+        others = [o.lower() for other, okws in matched if other is not app for o in okws]
+        own = [kw for kw in kws if not any(kw.lower() != o and kw.lower() in o for o in others)]
+        if own:
+            hits.append({"slug": app["slug"], "name": app["name"], "keyword": own[0],
+                         "prefer_skill": app.get("prefer_skill")})
+    return hits
 
 
 def skill_installed(name: str) -> bool:
-    """True when the skill is materialised where the core loads skills from ($CLAUDE_CONFIG_DIR/skills)."""
-    root = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-    return (Path(root) / "skills" / name / "SKILL.md").is_file()
+    """True when the skill is materialised where the core loads skills from (<claude home>/skills)."""
+    try:
+        sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+        from util_paths import claude_home_path  # noqa: PLC0415
+        root = claude_home_path("skills")
+    except Exception:  # noqa: BLE001 — no core tree: the stock default only
+        root = Path.home() / ".claude" / "skills"
+    return (root / name / "SKILL.md").is_file()
 
 
 # --------------------------------------------------------------------------- the task
