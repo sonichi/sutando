@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
+sys.path.insert(0, str(REPO / "packages" / "room-collab"))
 
 from room_collab_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,

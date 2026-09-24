@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPTS = REPO / "skills" / "room-collab" / "scripts"
+SCRIPTS = REPO / "packages" / "room-collab"
 
 FAILS = []
 

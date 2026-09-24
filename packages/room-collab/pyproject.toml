@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "room-collab"
+version = "1.0.0"
+description = "Client for AG2 Space collaborative surfaces (doc, whiteboard, kanban): read, write, comment, summon, and stay resident as an agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AG2 Space" }]
+keywords = ["ag2", "agent", "crdt", "yjs", "collaboration", "whiteboard"]
+# pycrdt pinned to the server's minor: both ends of the wire run one CRDT implementation.
+dependencies = ["pycrdt>=0.14,<0.15", "websockets>=13"]
+
+[project.urls]
+Homepage = "https://ag2.space"
+Source = "https://github.com/sonichi/sutando"
+
+[project.scripts]
+room-collab = "room_collab:main"
+room-collab-presence = "presence_daemon:main"
+
+[tool.setuptools]
+py-modules = [
+  "presence_daemon", "presence_policy", "presence_store",
+  "room_collab", "room_collab_board", "room_collab_client", "room_collab_positions",
+  "room_collab_protocol", "room_collab_watch", "room_composer", "room_kanban", "skill_claims",
+]
