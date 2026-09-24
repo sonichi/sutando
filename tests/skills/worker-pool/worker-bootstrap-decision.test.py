@@ -484,6 +484,37 @@ class TestOwnershipIsScopedToThisSession(Base):
     def test_a_chain_of_shells_up_to_init_scopes_nothing(self):
         self.assertIsNone(wb.session_root({40: (1, "-zsh")}, 40))
 
+    def test_a_ps_that_raises_leaves_the_session_unobserved(self):
+        def ps(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 5))
+        self.assertIsNone(wb._process_table(run=ps))
+        with self.assertRaises(wb.Unobserved):
+            wb._in_this_session(4242, run=ps)
+
+    def test_a_ps_that_exits_non_zero_leaves_the_session_unobserved(self):
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "ps: denied")
+        self.assertIsNone(wb._process_table(run=ps))
+        with self.assertRaises(wb.Unobserved):
+            wb._in_this_session(4242, run=ps)
+
+    def test_a_snapshot_with_no_session_root_cannot_disown_the_watcher(self):
+        """Every ancestor of this gate is a shell up to init: nothing scopes
+        the session, so the watcher keeps the pre-ancestry answer."""
+        me = os.getppid()
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 0, f"{me} 1 -zsh\n4242 1 bash\n", "")
+        self.assertTrue(wb._in_this_session(4242, run=ps))
+
+    def test_a_snapshot_decides_descent_from_the_session_root(self):
+        me = os.getppid()
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 0, f"{me} 30 zsh\n30 20 claude\n20 1 tmux\n4242 30 bash\n4343 1 bash\n", "")
+        self.assertTrue(wb._in_this_session(4242, run=ps))
+        self.assertFalse(wb._in_this_session(4343, run=ps))
+
     def test_a_detached_watcher_on_this_inbox_is_not_this_sessions(self):
         """The real shape: a watcher reparented away from this session."""
         script = self.ws / "watch-tasks-stream.sh"
