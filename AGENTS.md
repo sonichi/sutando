@@ -305,7 +305,7 @@ with `python3 skills/agent-activity/scripts/activity.py append "<line>" --kind t
 - Vision + docs: `README.md`
 - Voice agent: `src/voice-agent.ts`
 - Task bridge: `src/task-bridge.ts`
-- Skills: `skills/`; yours: `<workspace>/skills/` (a synced workspace runs them on every host, so only skills you trust belong there)
+- Skills: `skills/`; yours: `<workspace>/skills/`
 
 **Looking for where an existing module lives?** [`docs/src-map.md`](docs/src-map.md)
 indexes every agent-facing source module under `src/` with a one-line purpose
