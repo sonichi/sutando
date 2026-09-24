@@ -16,10 +16,9 @@ import json
 import sys
 from pathlib import Path
 
-_SCRIPTS = Path(__file__).resolve().parent
-for _p in (str(_SCRIPTS), str(_SCRIPTS.parents[2] / "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# helpers live in the core; repo root is parents[3] from this directory
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_roster as pr  # noqa: E402
 
