@@ -180,8 +180,30 @@ def _derive_backend() -> "dict | None":
         return None            # fail-open: an unknown target degrades to generic phrasing
 
 
-def compose_message(signal: dict) -> str:
-    """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
+# The HITL card is projected into AG2 Space rooms only (src/hitl/projector.py).
+_CARD_SURFACE = re.compile(r"ag2[.-]?space")
+
+
+def _card_projected(signal: dict, surface: str) -> bool:
+    """True only when the owner's surface shows the HITL card AND tui_gate gives it option
+    buttons; a trust/bypass/limit dialog or an unparseable prompt keeps the button-less card."""
+    if not surface or not _CARD_SURFACE.search(surface):
+        return False
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from hitl import tui_gate
+        req = tui_gate.requirement_for(signal.get("state") or "", signal.get("kind"), signal.get("prompt"),
+                                       signal.get("session") or "", "", "")
+        return any(a.kind != "open_terminal" for a in req.actions)
+    except Exception:  # noqa: BLE001 - no card known for sure: name the terminal
+        return False
+
+
+def compose_message(signal: dict, surface: str = "") -> str:
+    """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
+    the channel it goes to, which decides whether a choice card can be named."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
@@ -242,12 +264,9 @@ def compose_message(signal: dict) -> str:
         where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
                  f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
                  if be else f"where the core is running on {host}")
-        if kind in ("selection", "permission"):
-            # A numbered picker (a model prompt, a login-method menu) or a permission
-            # dialog is also projected to the owner's DM as a HITL card whose buttons
-            # type the answer (src/hitl/tui_gate.py); the card is the owner's first
-            # option, the terminal the second. user feedback 2026-09-17: the core sat on a
-            # model-selection prompt for hours with a notice that only named tmux.
+        if kind in ("selection", "permission") and _card_projected(signal, surface):
+            # The card's buttons type the answer into the dialog, so it is the first option
+            # and the terminal the second; a card is named only when one is really there.
             msg += (f" — tap an option on the choice card in our DM (it answers for you), or answer it"
                     f" {where}. A typed chat reply can't answer it.")
         else:
@@ -318,7 +337,7 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
-    msg = compose_message(signal)
+    msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
     if macos:
