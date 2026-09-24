@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -484,8 +485,22 @@ class TestApply(unittest.TestCase):
         self.assertEqual(pr.load_bindings(self.ws), {})
         self.assertNotIn(ROOM, self._advertised())
 
-    def test_a_set_of_two_is_refused_untouched(self):
-        cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W1} {W2} — bound set, "
+    def test_a_set_of_two_is_bound_in_the_sentences_order_and_advertised(self):
+        """The owner-facing pin path is the only production `bind_room` caller,
+        so a set that cannot travel it cannot exist on a real install."""
+        cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W2} {W1} — bound set, "
+                               "pool-restriction routing (worker picker)")
+        out = wpc.apply(self.ws, cmd, task_id="task-set")
+        self.assertEqual(out["action"], "pin")
+        self.assertEqual(pr.load_bindings(self.ws), {ROOM: [W2, W1]})
+        roster = pr.load_roster(self.ws)
+        self.assertEqual(pr.members_of(roster["bindings"][ROOM]), [W2, W1])
+        self.assertEqual(pr.targets_for(roster, ROOM), [W2])
+        ad = json.loads(pa.advertisement_path(self.ws).read_text())
+        self.assertEqual(ad["workers"]["bindings"][ROOM]["instances"], [W2, W1])
+
+    def test_a_set_naming_one_worker_twice_is_refused_untouched(self):
+        cmd = wpc.parse(hdr(), f"Pin room {ROOM} to workers {W1} {W1} — bound set, "
                                "pool-restriction routing (worker picker)")
         before = pa.advertisement_path(self.ws).read_bytes()
         with self.assertRaises(pr.RosterError):

@@ -108,9 +108,9 @@ location records nothing, because it does not move until `finish`. Two records, 
 different facts — who owns it, what it says — so nothing can disagree.
 
 **Why not move the payload into the folder instead** (the rescue line's shape, and a
-draft of this section): a set to N workers then costs N copies of the payload plus a
-persisted member list so a crash mid-copy resumes rather than repeats. With sentinels a
-set is N empty files and one payload, and that machinery does not exist. The price is
+draft of this section): delivering one task to N recipients then costs N copies of the
+payload plus a persisted member list so a crash mid-copy resumes rather than repeats.
+With sentinels it is N empty files and one payload, and that machinery does not exist. The price is
 two extra residue rows below — a sentinel whose payload was archived, and a payload
 archived between noticing the sentinel and reading it — both bounded and cheap.
 
@@ -188,9 +188,11 @@ roster is a refusal, never a default.
 | the task declares | the router does |
 |---|---|
 | one target, on the roster | writes a sentinel in that worker's folder |
-| a target set, all on the roster | one sentinel per member, one payload; selects no subset |
+| a bound set, all on the roster | one sentinel, in the folder of the member the task addresses |
+| a bound set, addressing no member | one sentinel, in the first-ranked member's folder |
 | nothing | the core's folder |
 | a target not on the roster | the core's folder — a name never created is not a worker |
+| a name outside the room's bound set | the core's folder — the set is that room's whole reachable membership |
 
 **The router asks one question — is every target on the roster? — and never asks
 whether a target is up.** A sentinel is a file in a folder; a worker that starts
@@ -203,7 +205,8 @@ to the core, which is a recipient rather than a fallback.
 
 `requested_worker` is honoured when the envelope carries it; the gateway maps the
 broker's `target_worker` onto that name at the boundary, so one field reaches the
-router. A set is declared by a binding, never by a header. **Bindings hold until
+router. A set is declared by a binding, never by a header, and a header selects
+*within* a set — it can never widen one. **Bindings hold until
 the owner changes them**; nothing is learned or decayed, which is why no affinity
 table exists.
 
@@ -347,10 +350,23 @@ and no record, so it cannot place work — a debugging affordance, not a path.
 
 ## Sets
 
-A declared set delivers to **every** member: one delivery each, ids from
-`(parent_id, worker_id)`, member list persisted so a restart finishes minting. First
-answer cancels nothing; results are kept and grouped under the parent. Stable ids
-prevent duplicate tasks, not duplicate effects.
+A bound set is an **address space, not a fan-out**. It names which workers a room
+may reach; each task still has exactly one recipient. A task that addresses a member
+goes to that member; a task that addresses nobody goes to the first-ranked member,
+the primary. Order in the binding is rank, and the owner writes it.
+
+**Nothing is delivered twice.** One task carries one payload and one result path, so
+two recipients would run the same work and race the same result file — the first to
+finish archives the other's. Delivering to every member needs per-member ids, a
+per-member result path and a persisted member list so a restart finishes minting;
+none of that exists, so a set does not fan out. A name outside the set is unknown
+*for that room*: it falls to the core rather than to a member that was not addressed.
+
+**The persisted form of a set is one name, not a list.** Rolling the code back does
+not roll the workspace back, and a reader that predates sets resolves a list to every
+member — the fan-out this section rules out. Compiled to a single name no worker id
+can spell, that reader resolves it to nothing and its existing rule sends the task to
+the core.
 
 ## Phases and staging
 
@@ -405,7 +421,7 @@ parses the headers with `local_task_protocol`, never by hand.
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
  "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","state":"live","model":"…","scopes":["…"]}},
- "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
+ "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":"set:7c54b230a8d94ea9b86f52d70134ac68+e1f0a94c73bd4a1e8c6f2b5d09a7e341"}}
 ```
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
@@ -415,10 +431,10 @@ A sentinel is empty, so an assignment carries no roster `version`; the router re
 Input is the roster and one admitted task; nothing else may be read.
 
 1. Load `state/roster.json`. **Unreadable or absent → refuse the pass and report.** Never default to the core.
-2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
+2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to ONE member — the addressed one, or the first-ranked member. A `requested_worker` outside a bound set resolves to a name the roster does not carry, so step 3 takes it.
 3. Any target not in the roster resolves to `core`. State is not read.
 4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do nothing. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
-5. A set is step 4 once per member; the payload is never copied.
+5. Step 4 runs once per task, never once per set member: a set has one recipient, so the payload is neither copied nor minted again.
 
 The name keeps `.txt` because the watcher a worker runs emits for no other extension; accepting substitutes the suffix, so a accepted file stops waking anyone.
 
@@ -504,7 +520,8 @@ Scope: roster compiler, router pass, per-recipient folders, worker states, the s
 
 Acceptance:
 - Replay: same roster and task in, same deliveries out, with no pool running.
-- A declared set writes one sentinel per member and exactly one payload.
+- A bound set writes exactly one sentinel: the addressed member's, or the primary's when nothing is addressed; a name outside the set writes the core's and no member's.
+- A roster this stage writes, read by the reader that predates sets, yields no worker — never every member.
 - A target not on the roster is delivered to the core; a target on the roster but not live still receives its delivery, and nothing is written to any other folder.
 - A missing roster refuses rather than defaulting to the core.
 - Concurrent accept and release leave exactly one winner, the loser seeing `OSError`.

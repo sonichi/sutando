@@ -169,7 +169,11 @@ class Router:
         if declared is None:
             targets = ["core"]
         elif isinstance(declared, (list, tuple)):
-            targets = list(declared)          # every member; no subset
+            # A set is an address space, not a fan-out: the addressed member, the
+            # first-ranked one when none is addressed, the core when it is outside.
+            members, asked = list(declared), task.get("addressed")
+            targets = members[:1] if asked is None else (
+                [asked] if asked in members else ["core"])
         else:
             targets = [declared]
         for t in targets:
@@ -180,7 +184,7 @@ class Router:
             if self.pool.states.get(t) not in (None, "live"):
                 placed.append((t, None))      # holds; substitutes nobody
                 continue
-            tid = task["id"] if len(targets) == 1 else f"{task['id']}-{t}"
+            tid = task["id"]                 # one recipient, so one id and one payload
             # the payload is written ONCE and never copied per recipient
             pay = self.pool.payload(tid)
             if not pay.exists():
@@ -280,9 +284,9 @@ class PoolCase(unittest.TestCase):
         self.w1 = Worker(self.pool, "worker-1")
         self.w2 = Worker(self.pool, "worker-2")
 
-    def admit_and_place(self, tid, declared, tier="owner"):
+    def admit_and_place(self, tid, declared, tier="owner", addressed=None):
         task = self.bridge.admit(tid, tier)
-        return self.router.place(task, declared)
+        return self.router.place({**task, "addressed": addressed}, declared)
 
 
 class Admission(PoolCase):
@@ -310,23 +314,30 @@ class Placement(PoolCase):
         self.assertEqual(path.parent.name, "worker-2")
         self.assertTrue(self.pool.payload("task-1").is_file(), "payload not written")
 
-    def test_a_set_writes_one_payload_and_one_sentinel_per_member(self):
-        """The reason content and delivery are separate: N recipients must not
-        mean N copies of the task."""
-        placed = self.admit_and_place("task-1", ["worker-1", "worker-2"])
-        for _, path in placed:
-            self.assertEqual(path.stat().st_size, 0, "a sentinel carried content")
+    def test_an_unaddressed_task_from_a_set_goes_to_its_first_ranked_member(self):
+        """A set is an address space: one task, one recipient, one payload — so
+        no second member can run the same work or write the same result."""
+        [(target, path)] = self.admit_and_place("task-1", ["worker-1", "worker-2"])
+        self.assertEqual(target, "worker-1")
+        self.assertEqual(path.stat().st_size, 0, "a sentinel carried content")
         payloads = sorted(q.name for q in (self.pool.root / "tasks").glob("*.json"))
-        self.assertEqual(payloads, ["task-1-worker-1.json", "task-1-worker-2.json"])
-        for _, path in placed:
-            self.assertTrue(self.pool.payload(parse(path.name)[0]).is_file())
+        self.assertEqual(payloads, ["task-1.json"])
+        self.assertEqual(list(self.pool.inbox("worker-2").iterdir()), [])
 
-    def test_a_set_delivers_to_every_member_and_selects_no_subset(self):
-        placed = self.admit_and_place("task-1", ["worker-1", "worker-2"])
-        self.assertEqual([t for t, _ in placed], ["worker-1", "worker-2"])
-        # Ids derive from (parent, worker), so a restart re-mints the same names.
-        self.assertEqual([parse(p.name)[0] for _, p in placed],
-                         ["task-1-worker-1", "task-1-worker-2"])
+    def test_addressing_selects_within_a_set_and_never_widens_it(self):
+        [(target, path)] = self.admit_and_place("task-1", ["worker-1", "worker-2"],
+                                                addressed="worker-2")
+        self.assertEqual((target, parse(path.name)[0]), ("worker-2", "task-1"))
+        self.assertEqual(list(self.pool.inbox("worker-1").iterdir()), [])
+
+    def test_a_name_outside_the_set_goes_to_the_core_not_to_a_member(self):
+        self.core.compile_roster({"worker-1": {}, "worker-2": {}, "worker-3": {}})
+        self.core.set_state("worker-3", "live")
+        [(target, _)] = self.admit_and_place("task-1", ["worker-1", "worker-2"],
+                                             addressed="worker-3")
+        self.assertEqual(target, "core")
+        for w in ("worker-1", "worker-2", "worker-3"):
+            self.assertEqual(list(self.pool.inbox(w).iterdir()), [], w)
 
     def test_an_unavailable_target_holds_and_is_never_substituted(self):
         self.core.set_state("worker-2", "recovering")

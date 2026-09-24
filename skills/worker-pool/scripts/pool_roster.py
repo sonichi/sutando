@@ -36,6 +36,11 @@ from util_paths import task_event_handler_config_path  # noqa: E402
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
 
+# A bound SET is compiled to ONE name under this prefix, which WORKER_ID_RE can
+# never produce, so a reader that predates sets resolves it to nothing.
+SET_PREFIX = "set:"
+SET_SEP = "+"
+
 # The states the design gives the router a rule for; anything else is a typo we
 # refuse rather than silently treat as not-live.
 STATES = ("live", "recovering", "abandoned", "retired")
@@ -170,19 +175,54 @@ def requested_worker_of(task: dict, warn=None) -> "str | None":
     return canonical
 
 
+def encode_set(members) -> str:
+    """The compiled form of a set of two or more members.
+
+    A list would be read as fan-out by every reader that predates this file; an
+    unresolvable single name is read as a target that is not on the roster, and
+    that path already sends the task to the core rather than to a worker.
+    """
+    return SET_PREFIX + SET_SEP.join(members)
+
+
+def members_of(bound) -> list:
+    """The ordered members behind one binding value, declared or compiled.
+
+    The ONE decoder: a declaration is a name or a list, a compiled set is the
+    encoded name, and nothing else may read either shape directly.
+    """
+    if bound is None:
+        return []
+    if isinstance(bound, str):
+        if bound.startswith(SET_PREFIX):
+            return [m for m in bound[len(SET_PREFIX):].split(SET_SEP) if m]
+        return [bound]
+    if isinstance(bound, (list, tuple)):
+        return list(bound)
+    return []
+
+
 def targets_for(roster: dict, source: str, requested_worker=None) -> list:
     """Resolve one task to its recipients: `requested_worker`, else the binding
-    for its source, else the core. A set resolves to its member list.
+    for its source, else the core. A set resolves to ONE member: the addressed
+    one, or the primary (`members[0]`) when nothing is addressed. Fan-out is not
+    a routing outcome here; every task has exactly one recipient.
 
     An envelope names a worker the way a person does — by label — while the
     roster is keyed by id, so a requested worker is resolved before use.
     """
+    members = members_of((roster.get("bindings") or {}).get(source))
     if requested_worker:
-        return [resolve_label(roster, requested_worker)]
-    bound = (roster.get("bindings") or {}).get(source)
-    if bound is None:
+        wid = resolve_label(roster, requested_worker)
+        # Addressing cannot reach past a bound set: a name outside it is unknown
+        # HERE even if the roster knows it, so the router fails it by name.
+        if len(members) > 1 and wid not in members:
+            return [f"{wid}:not-a-member-of:{source}"]
+        return [wid]
+    if not members:
         return [CORE]
-    return list(bound) if isinstance(bound, list) else [bound]
+    # The primary answers an unaddressed task. Never the whole set (fan-out).
+    return [members[0]]
 
 
 def unknown_targets(roster: dict, targets) -> list:
@@ -241,29 +281,30 @@ def validate_current_roster(workspace) -> None:
 def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
-    bindings = dict(bindings if bindings is not None else load_bindings(workspace))
+    declared = dict(bindings if bindings is not None else load_bindings(workspace))
     validate_workers(workers)
 
     known = set(workers or {}) | {CORE}
-    for source, bound in bindings.items():
-        members = list(bound) if isinstance(bound, list) else [bound]
+    compiled = {}
+    for source, bound in declared.items():
+        members = members_of(bound)
         if not members:
             raise RosterError(f"binding {source!r} names no target")
-        if len(members) > 1:
-            # Members would share one payload and one result path; the first to
-            # finish archives the other's work. Refused until members get their own.
-            raise RosterError(f"binding {source!r} names {len(members)} targets; "
-                              "fan-out is not supported yet")
+        if len(set(members)) != len(members):
+            raise RosterError(f"binding {source!r} names a member twice")
         missing = [m for m in members if m not in known]
         if missing:
             raise RosterError(
                 f"binding {source!r} names {missing} which are not workers — "
                 "a binding to a nonexistent target fails every task from that source")
+        # A set is ADDRESSED, never fanned out: one task, one recipient, one
+        # result path — and it is compiled to a name no older reader resolves.
+        compiled[source] = members[0] if len(members) == 1 else encode_set(members)
 
     prev = _load_existing_roster_strict(workspace) or {}
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "workers": dict(workers or {}), "bindings": bindings}
+              "workers": dict(workers or {}), "bindings": compiled}
     _write_atomic(roster_path(workspace), roster)
     _publish(workspace, roster)
     return roster
@@ -337,36 +378,63 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
         return compile_roster(workspace, workers, bindings)
 
 
-def bind_room(workspace, room: str, target: str) -> dict:
-    """Bind one room to one worker, named by id or by a unique label — the one
-    production writer for a pin, and it publishes: the compile it ends in writes
-    the advertisement too. Same locked read-merge-write as `register_worker`; an
-    unknown or ambiguous name is refused BEFORE the declaration is saved, so
-    bindings.json never names a target the roster would reject on its next
-    compile."""
+def bind_room(workspace, room: str, target, mode: str = "replace") -> dict:
+    """Bind one room to one worker or to a COMPLETE ordered set, named by id or
+    by unique label — the one production writer for a pin, and it publishes: the
+    compile it ends in writes the advertisement too.
+
+    The whole set is resolved, saved and compiled inside one hold of the lock, so
+    a two-member pin never passes through a published one-member state. Same
+    locked read-merge-write as `register_worker`; an unknown, ambiguous or
+    repeated name is refused BEFORE the declaration is saved, so bindings.json
+    never names a target the roster would reject on its next compile.
+    """
+    names = [target] if isinstance(target, str) else list(target or [])
+    if not names or not all(isinstance(n, str) and n.strip() for n in names):
+        raise RosterError(f"binding {room!r} names no target")
+    if mode not in ("replace", "add"):
+        raise RosterError(f"bind mode {mode!r} is not 'replace' or 'add'")
     with _locked(workspace):
         raw = _load_existing_roster_strict(workspace)
         if raw is None:
             raise RosterError("no roster; nothing to bind to")
         workers = dict(raw.get("workers") or {})
-        wid = resolve_label(raw, target)
-        if wid != CORE and wid not in workers:
-            raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        wids: list = []
+        for name in names:
+            wid = resolve_label(raw, name.strip())
+            if wid != CORE and wid not in workers:
+                raise RosterError(f"binding {room!r} names {name!r}, which is not a worker")
+            if wid in wids:
+                raise RosterError(f"binding {room!r} names {name!r} twice")
+            wids.append(wid)  # the owner's order is rank; the first is the primary
         bindings = dict(load_bindings(workspace))
-        bindings[room] = wid
+        if mode == "add":
+            held = members_of(bindings.get(room))
+            wids = held + [w for w in wids if w not in held]
+        bindings[room] = wids if len(wids) > 1 else wids[0]
         save_bindings(workspace, bindings)
         return compile_roster(workspace, workers, bindings)
 
 
-def unbind_room(workspace, room: str) -> dict:
-    """Drop a room's binding; its tasks go to the core again. Absent is not an
-    error: an unpin of an unbound room is the state the owner asked for."""
+def unbind_room(workspace, room: str, worker: str | None = None) -> dict:
+    """Drop a room's binding, or one member of its set. Absent is not an error:
+    an unpin of an unbound room is the state the owner asked for."""
     with _locked(workspace):
         raw = _load_existing_roster_strict(workspace)
         if raw is None:
             raise RosterError("no roster; nothing to unbind")
         workers = dict(raw.get("workers") or {})
         bindings = dict(load_bindings(workspace))
-        bindings.pop(room, None)
+        if worker is None:
+            bindings.pop(room, None)
+        else:
+            members = members_of(bindings.get(room))
+            wid = resolve_label(raw, worker)
+            members = [m for m in members if m != wid]
+            # Removing the primary promotes the next member; an emptied set unpins.
+            if not members:
+                bindings.pop(room, None)
+            else:
+                bindings[room] = members if len(members) > 1 else members[0]
         save_bindings(workspace, bindings)
         return compile_roster(workspace, workers, bindings)

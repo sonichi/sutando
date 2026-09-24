@@ -108,10 +108,14 @@ class TestTargets(Base):
         r = pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": W1})
         self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W1])
 
-    def test_a_set_is_refused_until_members_have_their_own_result(self):
-        with self.assertRaises(pr.RosterError) as e:
-            pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": [W1, W2]})
-        self.assertIn("fan-out", str(e.exception))
+    def test_a_set_compiles_but_never_routes_to_more_than_one_member(self):
+        """The fan-out guard moved from compile to routing: a set is admitted,
+        and no reading of it — addressed or not — yields two recipients."""
+        r = pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": [W1, W2]})
+        self.assertEqual(r["bindings"]["room:!x:ag2.space"], pr.encode_set([W1, W2]))
+        self.assertEqual(pr.members_of(r["bindings"]["room:!x:ag2.space"]), [W1, W2])
+        for req in (None, W1, W2):
+            self.assertEqual(len(pr.targets_for(r, "room:!x:ag2.space", requested_worker=req)), 1)
 
     def test_a_one_member_list_is_still_one_target(self):
         r = pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": [W1]})
@@ -405,6 +409,125 @@ class TestRequestedWorkerField(Base):
         task = {"requested_worker": W2, pr.LEGACY_WORKER_FIELD: W1}
         self.assertEqual(pr.targets_for(roster, "!r:x", pr.requested_worker_of(task, warn=lambda m: None)),
                          [W1], "a conflicting pair must land on the binding, not on either name")
+
+
+
+class TestAddressedSet(Base):
+    """A room bound to a SET of workers: addressed routing, primary by rank."""
+
+    def _set(self):
+        return pr.compile_roster(self.ws, live(W1, W2), {"room:!x:ag2.space": [W1, W2]})
+
+    def test_unaddressed_goes_to_the_primary_only(self):
+        self.assertEqual(pr.targets_for(self._set(), "room:!x:ag2.space"), [W1])
+
+    def test_addressed_member_is_the_recipient(self):
+        self.assertEqual(pr.targets_for(self._set(), "room:!x:ag2.space", requested_worker=W2), [W2])
+
+    def test_addressed_non_member_is_unknown_by_name_not_substituted(self):
+        W3 = "c5f13e4d6a7b8c9d0e1f2a3b4c5d6e7f"
+        r = pr.compile_roster(self.ws, live(W1, W2, W3), {"room:!x:ag2.space": [W1, W2]})
+        t = pr.targets_for(r, "room:!x:ag2.space", requested_worker=W3)
+        self.assertEqual(len(t), 1)
+        self.assertNotIn(t[0], (W1, W2, W3, pr.CORE))       # never a reachable substitute
+        self.assertTrue(pr.unknown_targets(r, t))            # so the router declines by name
+        self.assertIn(W3, t[0]); self.assertIn("not-a-member", t[0])
+
+    def test_a_member_named_twice_is_refused(self):
+        with self.assertRaises(pr.RosterError) as e:
+            pr.compile_roster(self.ws, live(W1), {"room:!x:ag2.space": [W1, W1]})
+        self.assertIn("twice", str(e.exception))
+
+    def test_add_then_remove_promotes_the_next_member(self):
+        pr.compile_roster(self.ws, live(W1, W2), {})
+        pr.bind_room(self.ws, "room:!x:ag2.space", W1)                  # replace: singleton
+        r = pr.bind_room(self.ws, "room:!x:ag2.space", W2, mode="add")   # now a set, W1 primary
+        self.assertEqual(pr.members_of(r["bindings"]["room:!x:ag2.space"]), [W1, W2])
+        self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W1])
+        r = pr.unbind_room(self.ws, "room:!x:ag2.space", worker=W1)     # remove the primary
+        self.assertEqual(r["bindings"]["room:!x:ag2.space"], W2)         # promoted, back to singleton
+        self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [W2])
+        r = pr.unbind_room(self.ws, "room:!x:ag2.space", worker=W2)     # empty the set
+        self.assertNotIn("room:!x:ag2.space", r["bindings"])             # unpinned
+        self.assertEqual(pr.targets_for(r, "room:!x:ag2.space"), [pr.CORE])
+
+    def test_add_is_idempotent_and_replace_still_replaces(self):
+        pr.compile_roster(self.ws, live(W1, W2), {})
+        pr.bind_room(self.ws, "room:!x:ag2.space", W1, mode="add")
+        r = pr.bind_room(self.ws, "room:!x:ag2.space", W1, mode="add")
+        self.assertEqual(r["bindings"]["room:!x:ag2.space"], W1)         # still a singleton
+        pr.bind_room(self.ws, "room:!x:ag2.space", W2, mode="add")
+        r = pr.bind_room(self.ws, "room:!x:ag2.space", W2)               # default = replace
+        self.assertEqual(r["bindings"]["room:!x:ag2.space"], W2)         # the set is gone
+
+    def test_an_unknown_bind_mode_is_refused(self):
+        pr.compile_roster(self.ws, live(W1), {})
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, "room:!x:ag2.space", W1, mode="fanout")
+
+
+class TestBindRoomWritesTheWholeSet(Base):
+    """`bind_room` takes the complete ordered set: one lock, one declaration,
+    one compile — no prefix of the set is ever published."""
+
+    ROOM = "room:!x:ag2.space"
+
+    def setUp(self):
+        super().setUp()
+        pr.compile_roster(self.ws, live(W1, W2), {})
+
+    def test_a_two_member_pin_is_one_write_in_the_owners_order(self):
+        r = pr.bind_room(self.ws, self.ROOM, [W2, W1])
+        self.assertEqual(pr.load_bindings(self.ws), {self.ROOM: [W2, W1]})
+        self.assertEqual(pr.members_of(r["bindings"][self.ROOM]), [W2, W1])
+        self.assertEqual(pr.targets_for(r, self.ROOM), [W2])   # first named is primary
+
+    def _published(self, call):
+        """Every binding value this call writes to roster.json, in order."""
+        seen = []
+        real = pr._write_atomic
+
+        def record(path, payload):
+            if Path(path).name == "roster.json":
+                seen.append(payload["bindings"].get(self.ROOM))
+            return real(path, payload)
+
+        pr._write_atomic = record
+        try:
+            call()
+        finally:
+            pr._write_atomic = real
+        return seen
+
+    def test_no_intermediate_one_member_state_is_ever_published(self):
+        self.assertEqual(self._published(lambda: pr.bind_room(self.ws, self.ROOM, [W1, W2])),
+                         [pr.encode_set([W1, W2])])
+
+    def test_control_a_per_name_loop_does_publish_the_intermediate_state(self):
+        """The same recorder over the shape this replaced: without it the
+        assertion above could not fail."""
+        def loop():
+            for w in (W1, W2):
+                pr.bind_room(self.ws, self.ROOM, w, mode="add")
+        self.assertEqual(self._published(loop), [W1, pr.encode_set([W1, W2])])
+
+    def test_a_name_repeated_in_one_pin_is_refused_before_anything_is_saved(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, self.ROOM, [W1, W1])
+        self.assertEqual(pr.load_bindings(self.ws), {})
+
+    def test_an_unknown_member_refuses_the_whole_pin(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, self.ROOM, [W1, "ghost"])
+        self.assertEqual(pr.load_bindings(self.ws), {})
+
+    def test_an_empty_set_is_refused(self):
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room(self.ws, self.ROOM, [])
+
+    def test_a_set_may_be_named_by_label(self):
+        r = pr.bind_room(self.ws, self.ROOM, [W1[:6], W2[:6]])   # by label
+        self.assertEqual(pr.members_of(r["bindings"][self.ROOM]), [W1, W2])
 
 
 if __name__ == "__main__":
