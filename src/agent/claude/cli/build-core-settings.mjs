@@ -28,13 +28,11 @@
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
 //   arg5 (optional): path to hooks/gdocs-write-guard.py — registered under BOTH
-//                    PreToolUse and PostToolUse for the Station's composio_exec
-//                    tool: the Pre half denies a whole-document Google Docs
-//                    replace without a fresh read-back, the Post half keeps
-//                    every read as a restorable snapshot (one script, two
-//                    events, so the two halves can never be registered apart).
+//                    PreToolUse and PostToolUse for the Station's composio_exec tool.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
+
+import path from 'node:path';
 
 const guardHook = process.argv[2];
 if (!guardHook) {
@@ -110,13 +108,16 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
-// A whole-document Google Docs replace wiped an owner's doc (2026-09-20); the
-// guard needs the read (PostToolUse) and the write (PreToolUse) on the same
-// tool, so both events point at one script. The hook re-checks toolkit/action.
+// Both events point at one script: the read (PostToolUse) records the snapshot the
+// write (PreToolUse) requires. The hook re-checks toolkit/action itself.
 const gdocsWriteGuardHook = process.argv[6] || '';
 let gdocsWriteGuardSettings = null;
 if (gdocsWriteGuardHook.trim()) {
-	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command: `python3 ${shq(gdocsWriteGuardHook)}` }] };
+	// The hook imports src/ from a CONFIGURED root, never a walk from __file__:
+	// the registration embeds this checkout (the hook file's grandparent).
+	const repoRoot = path.resolve(gdocsWriteGuardHook, '..', '..');
+	const command = `python3 ${shq(gdocsWriteGuardHook)} --repo ${shq(repoRoot)}`;
+	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command }] };
 	gdocsWriteGuardSettings = { hooks: { PreToolUse: [entry], PostToolUse: [entry] } };
 }
 

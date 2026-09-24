@@ -1,40 +1,33 @@
 #!/usr/bin/env python3
-"""gdocs-write-guard — a whole-document replace on a Google Doc needs a fresh
-read-back first; every read is kept as a restorable snapshot.
+"""gdocs-write-guard — a whole-document replace on a Google Doc is denied until the
+document was read back recently; every successful read is kept as a restorable snapshot.
 
-Why (user feedback, 2026-09-20): "when I ask Sutando to edit a Google Doc, the
-document sometimes gets unexpectedly cleared, or unrelated content is inserted
-or rewritten." The Station's Google Docs connector exposes
-``GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN``, whose contract is "replaces the entire
-content of an existing document" — the natural tool for a model that wants to
-"update the doc", and the one that wipes everything the owner had in it when
-the model rewrites from a partial memory. Nothing warned the model, and nothing
-kept a copy to restore from.
+One script on two hook events for the Station's ``composio_exec`` tool, toolkit
+``googledocs`` (registered by build-core-settings.mjs):
 
-Two hook events, one script (registered by build-core-settings.mjs on the
-``mcp__sutando-station__composio_exec`` tool, toolkit ``googledocs``):
+  PreToolUse   — a body-replacing action (UPDATE_DOCUMENT_MARKDOWN, UPDATE_EXISTING_DOCUMENT,
+                 REPLACE_DOCUMENT, DELETE_CONTENT_RANGE) is DENIED unless a snapshot of that
+                 document younger than the max age (900 s by default) exists. The reason says
+                 to read the document first and to prefer the partial-edit actions
+                 (INSERT_TEXT_ACTION, REPLACE_ALL_TEXT, INSERT_TEXT_IN_TABLE_CELL), which are
+                 always allowed.
+  PostToolUse  — a SUCCESSFUL read (GET_DOCUMENT_PLAINTEXT, GET_DOCUMENT_BY_ID, any
+                 GET_DOCUMENT*) is written to ``<workspace>/data/gdocs-backups/<doc
+                 id>/<epoch>.md`` (atomic tmp+rename, newest 20 kept). A failed, errored or
+                 empty read is never a snapshot: it could restore nothing, so it must not
+                 lift the deny.
 
-  PreToolUse   — a body-replacing action (UPDATE_DOCUMENT_MARKDOWN,
-                 UPDATE_EXISTING_DOCUMENT, REPLACE_DOCUMENT, DELETE_CONTENT_RANGE)
-                 is DENIED unless a snapshot of that document younger than
-                 ``SUTANDO_GDOCS_BACKUP_MAX_AGE_S`` (default 900 s) exists. The
-                 reason tells the model to read the document first and to
-                 prefer the partial-edit actions (INSERT_TEXT_ACTION,
-                 REPLACE_ALL_TEXT, INSERT_TEXT_IN_TABLE_CELL), which are always
-                 allowed.
-  PostToolUse  — a read (GET_DOCUMENT_PLAINTEXT, GET_DOCUMENT_BY_ID, any
-                 GET_DOCUMENT*) writes ``<workspace>/data/gdocs-backups/<doc
-                 id>/<epoch>.md`` (atomic tmp+rename, newest 20 kept), so a
-                 wrong rewrite can be undone from the last thing the owner had.
+Settings, read through ``sutando_config`` (the ``env`` stanza of
+``sutando.config.local.json``, the environment as the fallback):
+  SUTANDO_GDOCS_BACKUP_MAX_AGE_S     how old a snapshot may be and still vouch (default 900).
+  SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE  ``1`` lifts the guard — an operator override; the
+                                     in-session way past the deny is the read itself.
 
-Scope: only ``composio_exec`` calls whose ``toolkit`` is googledocs; every
-other tool, toolkit and action is a no-op (exit 0, no output), so it is safe
-under the broad ``composio_exec`` matcher. Escape hatch:
-``SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1`` (an intentional full rewrite the owner
-asked for, when the snapshot dance is in the way).
-
-Fail-OPEN on any error — a crashing hook must never wedge the core (same
-contract as gmail-write-guard.py). Test: tests/gdocs-write-guard.test.py.
+The repo root is configured, never discovered: ``--repo <path>`` in the registration or
+``$SUTANDO_REPO_ROOT``. The workspace comes from ``workspace_default.resolve_workspace``.
+Without a root no snapshot can be recorded, so a whole replace stays denied and stderr says
+why. Every other tool, toolkit and action is a no-op (exit 0, no output). Fail-OPEN on any
+uncaught error, so a crashing hook never wedges the core. Test: tests/gdocs-write-guard.test.py.
 """
 from __future__ import annotations
 
@@ -55,9 +48,15 @@ PARTIAL_EDITS = "GOOGLEDOCS_INSERT_TEXT_ACTION, GOOGLEDOCS_REPLACE_ALL_TEXT, GOO
 BACKUP_DIR = ("data", "gdocs-backups")
 KEEP = 20
 DEFAULT_MAX_AGE_S = 900.0
+MAX_AGE_KEY = "SUTANDO_GDOCS_BACKUP_MAX_AGE_S"
+ALLOW_KEY = "SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE"
 DOC_ID_KEYS = ("document_id", "documentId", "id", "file_id", "fileId", "documentid")
 DOC_URL = re.compile(r"/document/d/([A-Za-z0-9_-]+)")
 SAFE_ID = re.compile(r"[^A-Za-z0-9_-]")
+# How a connector envelope says the call failed, and where it carries the document text.
+FAILURE_FLAGS = ("successful", "success")
+ERROR_KEYS = ("error", "is_error", "isError")
+BODY_KEYS = ("plain_text", "plainText", "text", "markdown", "content", "body")
 
 
 def is_exec_tool(tool_name: str) -> bool:
@@ -87,16 +86,48 @@ def classify(action: str) -> str:
     return "other"
 
 
-def workspace() -> Path | None:
-    env = os.environ.get("SUTANDO_WORKSPACE_DIR")
-    if env:
-        return Path(env).expanduser()
+def repo_root(argv) -> str | None:
+    """Configured, never discovered: ``--repo <path>`` / ``--repo=<path>``, else $SUTANDO_REPO_ROOT."""
+    for i, a in enumerate(argv):
+        if a == "--repo" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--repo="):
+            return a.split("=", 1)[1]
+    return os.environ.get("SUTANDO_REPO_ROOT") or None
+
+
+def _src_on_path(root: str) -> None:
+    src = os.path.join(root, "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+
+def workspace(root: str | None) -> Path | None:
+    """The workspace through the repo helper; None (with a stderr note) when it cannot be resolved."""
+    if not root:
+        print("[gdocs-write-guard] repo root not configured (--repo or SUTANDO_REPO_ROOT): no snapshots",
+              file=sys.stderr)
+        return None
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        _src_on_path(root)
         from workspace_default import resolve_workspace  # noqa: PLC0415
         return Path(resolve_workspace())
-    except Exception:  # noqa: BLE001 — no workspace, no verdict
+    except Exception as e:  # noqa: BLE001
+        print(f"[gdocs-write-guard] workspace unresolved, no snapshots: {e}", file=sys.stderr)
         return None
+
+
+def setting(root: str | None, key: str, env_first: bool = False) -> str:
+    """A hook setting via sutando_config (config file ``env`` stanza / env var); the bare env without a repo."""
+    if root:
+        try:
+            _src_on_path(root)
+            import sutando_config  # noqa: PLC0415
+            read = sutando_config.config_get_env_first if env_first else sutando_config.config_get
+            return str(read(key) or "")
+        except Exception as e:  # noqa: BLE001
+            print(f"[gdocs-write-guard] config unreadable, using the environment: {e}", file=sys.stderr)
+    return os.environ.get(key, "")
 
 
 def backup_dir(ws: Path, doc_id: str) -> Path:
@@ -116,8 +147,25 @@ def fresh_backup(ws: Path, doc_id: str, now: float, max_age: float) -> Path | No
     return newest if 0 <= now - newest.stat().st_mtime <= max_age else None
 
 
-def response_text(tool_response) -> str:
-    """The readable body of a hook's tool_response: a string, a list of content blocks, or JSON."""
+def _failed(envelope: dict) -> bool:
+    """A connector envelope that says the call failed: successful/success False, or an error set."""
+    if any(envelope.get(k) is False for k in FAILURE_FLAGS):
+        return True
+    return any(bool(envelope.get(k)) for k in ERROR_KEYS)
+
+
+def _body(envelope: dict) -> str | None:
+    """The document text inside an envelope (top level or under ``data``), else None."""
+    for holder in (envelope, envelope.get("data")):
+        if isinstance(holder, dict):
+            for key in BODY_KEYS:
+                if isinstance(holder.get(key), str):
+                    return holder[key]
+    return None
+
+
+def response_text(tool_response) -> str | None:
+    """The readable body of a hook's tool_response; None when the response itself reports a failure."""
     if isinstance(tool_response, str):
         return tool_response
     if isinstance(tool_response, list):
@@ -127,21 +175,43 @@ def response_text(tool_response) -> str:
                 parts.append(block["text"])
             elif isinstance(block, str):
                 parts.append(block)
-        if parts:
-            return "\n".join(parts)
+        return "\n".join(parts) if parts else None
     if isinstance(tool_response, dict):
+        if _failed(tool_response):
+            return None
         inner = tool_response.get("content")
         if inner is not None and inner is not tool_response:
             got = response_text(inner)
             if got:
                 return got
-        for key in ("plain_text", "text"):
-            if isinstance(tool_response.get(key), str):
-                return tool_response[key]
+        body = _body(tool_response)
+        if body is not None:
+            return body
+        try:
+            return json.dumps(tool_response, ensure_ascii=False, indent=1)
+        except (TypeError, ValueError):
+            return str(tool_response)
+    return None if tool_response is None else str(tool_response)
+
+
+def snapshot_text(tool_response) -> str | None:
+    """The document text a read returned; None for a failed, errored or empty read (nothing to restore)."""
+    text = response_text(tool_response)
+    if text is None:
+        return None
     try:
-        return json.dumps(tool_response, ensure_ascii=False, indent=1)
-    except (TypeError, ValueError):
-        return str(tool_response)
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        if _failed(parsed):
+            return None
+        body = _body(parsed)
+        if body is not None:
+            text = body
+        elif "data" in parsed and not parsed["data"]:
+            return None
+    return text if text.strip() else None
 
 
 def write_backup(ws: Path, doc_id: str, text: str, now: float) -> Path:
@@ -161,20 +231,26 @@ def write_backup(ws: Path, doc_id: str, text: str, now: float) -> Path:
     return out
 
 
-def deny_reason(doc_id: str | None, ws: Path | None) -> str:
+def _age_label(max_age: float) -> str:
+    minutes = max_age / 60
+    return f"{int(minutes)} minutes" if minutes >= 1 and minutes == int(minutes) else f"{int(max_age)} seconds"
+
+
+def deny_reason(doc_id: str | None, ws: Path | None, max_age: float = DEFAULT_MAX_AGE_S) -> str:
     where = f"{Path(*BACKUP_DIR)}/<doc id>/" if ws is None else str(backup_dir(ws, doc_id or "<doc id>"))
+    age = _age_label(max_age)
     return (
         f"Whole-document replace on Google Doc {doc_id or '(id not named in the arguments)'} is blocked: "
-        f"no read-back from the last {int(DEFAULT_MAX_AGE_S // 60)} minutes exists to restore from, and this "
-        "action rewrites the ENTIRE document (owner report 2026-09-20: a doc was cleared and rewritten). "
-        "First read it — GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT (or GET_DOCUMENT_BY_ID) with the document_id; the "
-        f"PostToolUse hook keeps that read as a snapshot under {where}. Then prefer the partial-edit actions for "
-        f"an edit: {PARTIAL_EDITS}. Run the full replace only for a rewrite the owner explicitly asked for, "
-        "after the read. Set SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1 to lift this guard. [gdocs-write-guard]"
+        f"no read-back from the last {age} exists to restore from, and this action rewrites the ENTIRE "
+        "document. First read it — GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT (or GET_DOCUMENT_BY_ID) with the "
+        f"document_id; a successful read is kept as a snapshot under {where} and lifts this block for {age}. "
+        f"Then prefer the partial-edit actions for an edit: {PARTIAL_EDITS}. Run the full replace only for a "
+        "rewrite the owner explicitly asked for, after the read. Operator override: "
+        f"{ALLOW_KEY}=1 in the env stanza of sutando.config.local.json or the environment. [gdocs-write-guard]"
     )
 
 
-def handle(payload: dict, now: float | None = None) -> dict | None:
+def handle(payload: dict, now: float | None = None, argv: list[str] | None = None) -> dict | None:
     """The hook's stdout JSON for this payload, or None for silence."""
     now = time.time() if now is None else now
     tool_name = str(payload.get("tool_name") or "")
@@ -186,30 +262,35 @@ def handle(payload: dict, now: float | None = None) -> dict | None:
     kind = classify(str(inp.get("action") or ""))
     event = payload.get("hook_event_name")
     doc_id = doc_id_of(inp.get("arguments"))
-    ws = workspace()
+    root = repo_root(sys.argv[1:] if argv is None else argv)
     if event == "PostToolUse":
-        if kind == "read" and doc_id and ws is not None:
-            text = response_text(payload.get("tool_response"))
-            if text.strip():
-                write_backup(ws, doc_id, text, now)
+        if kind != "read" or not doc_id:
+            return None
+        text = snapshot_text(payload.get("tool_response"))
+        if text is None:
+            return None
+        ws = workspace(root)
+        if ws is not None:
+            write_backup(ws, doc_id, text, now)
         return None
     if event != "PreToolUse" or kind != "whole-replace":
         return None
-    if os.environ.get("SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE", "").strip() == "1":
+    if setting(root, ALLOW_KEY, env_first=True).strip() == "1":
         return None
     try:
-        max_age = float(os.environ.get("SUTANDO_GDOCS_BACKUP_MAX_AGE_S") or DEFAULT_MAX_AGE_S)
+        max_age = float(setting(root, MAX_AGE_KEY) or DEFAULT_MAX_AGE_S)
     except ValueError:
         max_age = DEFAULT_MAX_AGE_S
+    ws = workspace(root)
     if doc_id and ws is not None and fresh_backup(ws, doc_id, now, max_age):
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": deny_reason(doc_id, ws)}}
+                                   "permissionDecisionReason": deny_reason(doc_id, ws, max_age)}}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     payload = json.loads(sys.stdin.read() or "{}")
-    out = handle(payload) if isinstance(payload, dict) else None
+    out = handle(payload, argv=argv) if isinstance(payload, dict) else None
     if out:
         print(json.dumps(out))
     sys.exit(0)
