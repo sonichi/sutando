@@ -8,7 +8,9 @@ sleep, in microseconds.
 
 The rungs come from docs/worker-pool-design.md and the owner's settlement:
 detection at the design's 90 s stale line, silent recovery, and only if recovery
-has not brought the worker back by 3 minutes does the owner get asked.
+has not brought the worker back by 3 minutes does the owner get asked. The
+same ladder covers a live session that is wedged: its pane shows a gate, a limit,
+abnormal text or a frozen turn while the worker owes work.
 """
 from __future__ import annotations
 
@@ -23,11 +25,21 @@ WAKE_SLACK_S = 60.0
 SUSTAINED_TICKS = 3
 DETECT_AFTER_S = 90.0
 ESCALATE_AFTER_S = 180.0
+# A dead worker that still owes work recovers on the tick that confirms its
+# first detection, not after the full sustain.
+FAST_SUSTAINED_TICKS = 2
 
 # Beat readings, as pool_beat classifies them.
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
+RESTART_WEDGED = "restart_wedged"
+
+# The worker's pane, as the caller reads one capture. GATE and LIMIT wait on a
+# human (a dialog, a spend or wait decision); a restart must never answer them.
+PANE_IDLE, PANE_WORKING, PANE_GATE, PANE_LIMIT, PANE_ABNORMAL, PANE_UNKNOWN = (
+    "idle", "working", "gate", "limit", "abnormal", "unknown")
+_HUMAN_PANES = (PANE_GATE, PANE_LIMIT)
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,11 @@ class Observation:
     paused: bool = False
     watcher_beat: str = UNKNOWN
     watcher_held: bool | None = None
+    # This worker's own queue (None: not read), its pane's kind, and the raw
+    # frame's identity, which a frozen turn repeats tick after tick.
+    work_outstanding: bool | None = None
+    pane: str | None = None
+    pane_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +79,12 @@ class WorkerEvidence:
     watcher_consecutive: int = 0
     rearm_issued_at: float | None = None
     watcher_escalated: bool = False
+    # The wedge ladder: a live session whose pane will not progress while it owes work.
+    wedge_first_detected_at: float | None = None
+    wedge_consecutive: int = 0
+    wedge_restart_issued_at: float | None = None
+    wedge_escalated: bool = False
+    last_pane_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +122,57 @@ def _is_watcher_loss(obs: Observation) -> bool:
     unproven holder check (None) is not evidence either way."""
     return (obs.session_alive is True and obs.watcher_beat in (STALE, ABSENT)
             and obs.watcher_held is False)
+
+
+def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
+    """"human" (a gate or limit on screen), "abnormal" (cli_wedge text), "stuck"
+    (a turn whose raw frame has not changed since the last tick), else None.
+    Only a worker that owes work is wedged: an idle pane at rest is healthy, and
+    one that owes work but sits at its prompt is the watcher rung's case."""
+    if obs.session_alive is not True or obs.work_outstanding is not True:
+        return None
+    if obs.pane in _HUMAN_PANES:
+        return "human"
+    if obs.pane == PANE_ABNORMAL:
+        return "abnormal"
+    if obs.pane == PANE_WORKING and obs.pane_id and obs.pane_id == ev.last_pane_id:
+        return "stuck"
+    return None
+
+
+def _cleared_wedge(ev: WorkerEvidence) -> WorkerEvidence:
+    return replace(ev, wedge_first_detected_at=None, wedge_consecutive=0,
+                   wedge_restart_issued_at=None, wedge_escalated=False)
+
+
+def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
+                sustained_ticks: int, detect_after_s: float,
+                escalate_after_s: float) -> tuple[WorkerEvidence, str]:
+    """Same rungs and clocks as death: sustained past the stale line asks for one
+    restart, still wedged past the owner's line escalates once. A human gate is
+    never restarted into: it escalates at the stale line instead."""
+    kind = _wedge_kind(obs, ev)
+    ev = replace(ev, last_pane_id=obs.pane_id)
+    if kind is None:
+        return _cleared_wedge(ev), NOTHING
+    ev = replace(
+        ev,
+        wedge_consecutive=ev.wedge_consecutive + 1,
+        wedge_first_detected_at=(ev.wedge_first_detected_at
+                                 if ev.wedge_first_detected_at is not None else now),
+    )
+    elapsed = now - ev.wedge_first_detected_at
+    if ev.wedge_consecutive < sustained_ticks or elapsed < detect_after_s:
+        return ev, NOTHING
+    if kind == "human":
+        if not ev.wedge_escalated:
+            return replace(ev, wedge_escalated=True), ESCALATE
+        return ev, NOTHING
+    if ev.wedge_restart_issued_at is None:
+        return replace(ev, wedge_restart_issued_at=now), RESTART_WEDGED
+    if not ev.wedge_escalated and elapsed >= escalate_after_s:
+        return replace(ev, wedge_escalated=True), ESCALATE
+    return ev, NOTHING
 
 
 def _cleared_session(ev: WorkerEvidence) -> WorkerEvidence:
@@ -146,12 +220,25 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
              sustained_ticks: int = SUSTAINED_TICKS,
              detect_after_s: float = DETECT_AFTER_S,
              escalate_after_s: float = ESCALATE_AFTER_S,
+             fast_sustained_ticks: int = FAST_SUSTAINED_TICKS,
              ) -> tuple[SupervisionState, dict[str, str]]:
     """Advance one tick. Returns the new state and one decision per worker."""
     if is_resume(now, state.last_sample_at,
                  expected_period_s=expected_period_s, slack_s=slack_s):
         # Discarded as evidence: the clock moved, the pool did not necessarily die.
-        return replace(state, last_sample_at=now), {w: NOTHING for w in observations}
+        # A gone session is not explained by a sleep, so one that still owes work
+        # is noted as first detection, and the next tick can confirm it.
+        workers = dict(state.workers)
+        for worker_id, obs in observations.items():
+            if (not obs.paused and obs.work_outstanding is True
+                    and _is_death_evidence(obs)):
+                ev = workers.get(worker_id, WorkerEvidence())
+                workers[worker_id] = replace(
+                    ev, consecutive=ev.consecutive + 1,
+                    first_detected_at=(ev.first_detected_at
+                                       if ev.first_detected_at is not None else now))
+        return (SupervisionState(last_sample_at=now, workers=workers),
+                {w: NOTHING for w in observations})
 
     workers = dict(state.workers)
     decisions: dict[str, str] = {}
@@ -172,8 +259,11 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             ev, decision = _watcher_rung(
                 _cleared_session(ev), obs, now, sustained_ticks=sustained_ticks,
                 detect_after_s=detect_after_s, escalate_after_s=escalate_after_s)
+            ev, wedge = _wedge_rung(
+                ev, obs, now, sustained_ticks=sustained_ticks,
+                detect_after_s=detect_after_s, escalate_after_s=escalate_after_s)
             workers[worker_id] = ev
-            decisions[worker_id] = decision
+            decisions[worker_id] = wedge if wedge != NOTHING else decision
             continue
 
         if not _is_death_evidence(obs):
@@ -193,7 +283,8 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
 
         elapsed = now - ev.first_detected_at
         decision = NOTHING
-        if ev.consecutive >= sustained_ticks:
+        needed = fast_sustained_ticks if obs.work_outstanding is True else sustained_ticks
+        if ev.consecutive >= needed:
             if ev.recover_issued_at is None and elapsed >= detect_after_s:
                 decision = RECOVER
                 ev = replace(ev, recover_issued_at=now)

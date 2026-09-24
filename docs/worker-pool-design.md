@@ -280,6 +280,25 @@ watcher and the rung acts on it after the sustain, which is the right outcome
 for a watcher that cannot hear. A holder check that could not be told is not
 evidence either way.
 
+**A live session that will not progress is the third rung.** A seat's session can
+answer alive while its pane holds a limit menu, a permission dialog, an error it
+parked on, or a turn whose frame never changes. Each tick reads that pane with the
+core's readers (`pane_gate`, `cli_wedge`) and the worker's own queue
+(`cli_wedge.work_outstanding` scoped to its inbox, plus accepted sentinels with no
+done flag). Only a worker that owes work is wedged; one at its prompt with work
+queued is the watcher rung's. The same sustain and lines apply: one
+`restart_wedged` (end the session, resume the same conversation), then the owner.
+A gate or a limit is never restarted into, and the remedy re-reads the pane before
+acting: it escalates at the stale line instead. Every live seat also runs its own
+`core-input-watch.py`, ensured by the same tick, so the gate reaches the owner as a
+card naming the seat within seconds rather than at the ladder's pace.
+
+**A dead worker that still owes work recovers at the first confirming tick.** A
+gone session is not something a host sleep explains, so for such a worker the
+resume sample after a reboot counts as first detection and the next tick recovers
+it; without a resume, the tick after first detection does. A worker that owes
+nothing keeps the full sustain.
+
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the
@@ -322,6 +341,7 @@ remedy or to the core for diagnosis.
 |---|---|---|
 | process death | beat expired, session gone, not owner-paused, sustained | a pre-authorised restart |
 | task stalled | unfinished work whose progress has not advanced | diagnosis only |
+| wedged | session alive, work owed, pane on a gate, limit, abnormal text or a frozen turn, sustained | one restart; a gate or limit escalates instead |
 
 **Sub-agent activity counts as progress**, or the detector escalates the busiest
 workers. Owner-paused outranks every signal. Detection and the pre-authorised remedy

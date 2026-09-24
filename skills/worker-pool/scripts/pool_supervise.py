@@ -40,6 +40,8 @@ prr = _sibling("pool_routing_receipt")
 pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
+import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
+from delivery import pane_gate  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
@@ -88,6 +90,67 @@ def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None
     return None
 
 
+def _open_tmux(workspace, worker_id) -> tuple[str | None, str]:
+    """(socket, session) of the worker's open run; socket None when there is none."""
+    open_runs = [r for r in wi.incarnations(workspace, worker_id)
+                 if isinstance(r, dict) and r.get("ended_at") is None]
+    tmux = (open_runs[-1].get("tmux") or {}) if open_runs else {}
+    return tmux.get("socket") or None, tmux.get("session_name") or wi.tmux_session_name(worker_id)
+
+
+def work_outstanding(workspace, worker_id, now: float) -> bool | None:
+    """Does this worker owe work? Its queued sentinels (cli_wedge, scoped to its
+    inbox) or one it accepted and has not flagged done. None when unreadable."""
+    try:
+        queued, _ = cw.work_outstanding(Path(workspace), now,
+                                        inbox=pd.deliveries_dir(workspace, worker_id))
+        if queued:
+            return True
+        for sentinel in pd.accepted(workspace, worker_id):
+            task_id = pd.parse_sentinel(sentinel.name)[0]
+            if not pd.is_done_flag(pd.done_flag(workspace, worker_id, task_id)):
+                return True
+        return False
+    except (OSError, ValueError):
+        return None
+
+
+def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
+                       socket=None, session=None) -> str:
+    """One capture as a pool_supervision PANE_* kind. The gate and the abnormal
+    text are the core's readers (pane_gate, cli_wedge); only the mapping is here."""
+    if not text or not text.strip():
+        return ps.PANE_UNKNOWN
+    adapter = pane_gate.ADAPTERS.get(runtime, pane_gate.CLAUDE)
+    verdict = pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    if verdict.state == "abnormal":
+        abn = cw.frame_abnormal(text)
+        return ps.PANE_LIMIT if abn and abn.kind == "provider-limit" else ps.PANE_ABNORMAL
+    if verdict.state == "busy":
+        return ps.PANE_WORKING if verdict.reason == "working" else ps.PANE_GATE
+    if verdict.state in ("idle-ready", "pending"):
+        return ps.PANE_IDLE
+    return ps.PANE_UNKNOWN
+
+
+def observe_pane(workspace, worker_id, runtime: str = "claude", *,
+                 runner=subprocess.run) -> tuple[str | None, str | None]:
+    """(pane kind, raw frame id) of this worker's pane; (None, None) when unread."""
+    socket, name = _open_tmux(workspace, worker_id)
+    if not socket:
+        return None, None
+    try:
+        done = runner(["tmux", "-S", str(socket), "capture-pane", "-p", "-t", f"={name}:0"],
+                      capture_output=True, text=True, timeout=8)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, None
+    text = done.stdout if done.returncode == 0 else None
+    if not text or not text.strip():
+        return None, None
+    return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
+            cw.raw_state_id(text))
+
+
 def supervised_workers(workspace) -> dict:
     """Worker rows the pool may recover, from the roster. Empty when unreadable —
     a caller must not invent a pool from a missing file.
@@ -127,12 +190,18 @@ def observe(workspace, now: float, *, worker_ids=None,
         held = None
         if session_alive is True and watcher_beat != pb.LIVE:
             held = session_watcher_holds(workspace, wid, runner=runner)
+        pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
+                                      runner=runner)
+                         if session_alive is True else (None, None))
         obs[wid] = ps.Observation(
             beat=pb.classify(pb.beat_path(workspace, "worker", wid), now),
             session_alive=session_alive,
             paused=is_paused(workspace, wid),
             watcher_beat=watcher_beat,
             watcher_held=held,
+            work_outstanding=work_outstanding(workspace, wid, now),
+            pane=pane,
+            pane_id=pane_id,
         )
     return obs
 
@@ -221,6 +290,11 @@ def load_state(workspace) -> ps.SupervisionState:
                 watcher_consecutive=int(ev.get("watcher_consecutive") or 0),
                 rearm_issued_at=ev.get("rearm_issued_at"),
                 watcher_escalated=bool(ev.get("watcher_escalated")),
+                wedge_first_detected_at=ev.get("wedge_first_detected_at"),
+                wedge_consecutive=int(ev.get("wedge_consecutive") or 0),
+                wedge_restart_issued_at=ev.get("wedge_restart_issued_at"),
+                wedge_escalated=bool(ev.get("wedge_escalated")),
+                last_pane_id=ev.get("last_pane_id"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -240,7 +314,12 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "watcher_first_detected_at": e.watcher_first_detected_at,
                         "watcher_consecutive": e.watcher_consecutive,
                         "rearm_issued_at": e.rearm_issued_at,
-                        "watcher_escalated": e.watcher_escalated}
+                        "watcher_escalated": e.watcher_escalated,
+                        "wedge_first_detected_at": e.wedge_first_detected_at,
+                        "wedge_consecutive": e.wedge_consecutive,
+                        "wedge_restart_issued_at": e.wedge_restart_issued_at,
+                        "wedge_escalated": e.wedge_escalated,
+                        "last_pane_id": e.last_pane_id}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -273,7 +352,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
-                                 "watcher_held": o.watcher_held} for w, o in obs.items()},
+                                 "watcher_held": o.watcher_held,
+                                 "work_outstanding": o.work_outstanding,
+                                 "pane": o.pane} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
 
 
@@ -302,7 +383,8 @@ def main(argv=None) -> int:
             o = out["observations"][wid]
             print(f"{wid[:8]}  {decision:13}  beat={o['beat']:7} "
                   f"session={o['session_alive']!s:5} paused={o['paused']!s:5} "
-                  f"watcher={o['watcher_beat']:7} held={o['watcher_held']}")
+                  f"watcher={o['watcher_beat']:7} held={o['watcher_held']} "
+                  f"work={o['work_outstanding']} pane={o['pane']}")
         for wid in out["not_supervised"]:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
         if out["resumed"]:
