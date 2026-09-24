@@ -140,9 +140,9 @@ def main(argv=None) -> int:
         addition = a.adding
 
     r = evaluate(mod, index.read_text(errors="ignore"), addition, a.at_top)
-    # Name the file. A verdict with no path reads as a verdict about whichever
-    # index the caller had in mind, and $SUTANDO_MEMORY_DIR decides which it is.
-    src = " ($SUTANDO_MEMORY_DIR)" if os.environ.get("SUTANDO_MEMORY_DIR") else ""
+    # Name the file: a verdict with no path reads as one about whichever index the caller
+    # had in mind. Only an index the env chose (no --index given) earns the env marker.
+    src = " ($SUTANDO_MEMORY_DIR)" if a.index is None and os.environ.get("SUTANDO_MEMORY_DIR") else ""
     print(f"index: {index}{src}")
     print(format_head(r))
 

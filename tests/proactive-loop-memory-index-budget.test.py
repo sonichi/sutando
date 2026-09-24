@@ -123,9 +123,8 @@ with tempfile.TemporaryDirectory() as d:
     check("the budget line names the BYTE limit", "/ 25,000 B" in out, out.splitlines()[:2])
     check("the budget line names the LINE limit too", "/ 200 lines" in out, out.splitlines()[:2])
     check("the verdict names the index it measured", f"index: {p}" in out, out.splitlines()[:2])
-    check("no $SUTANDO_MEMORY_DIR marker when the var is unset",
-          ("SUTANDO_MEMORY_DIR" in out) == bool(os.environ.get("SUTANDO_MEMORY_DIR")),
-          out.splitlines()[:1])
+    check("an explicit --index never carries the $SUTANDO_MEMORY_DIR marker",
+          "SUTANDO_MEMORY_DIR" not in out, out.splitlines()[:1])
     add = pathlib.Path(d) / "add.md"; add.write_text(row(7000))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -203,23 +202,31 @@ with tempfile.TemporaryDirectory() as d:
           out.splitlines()[:2])
     check("it also refuses, because rows past the cut already do not load", rc == 1, f"rc={rc}")
 
-# --- the env marker: the var is what decides which corpus was measured -------
-with tempfile.TemporaryDirectory() as d:
-    p = pathlib.Path(d) / "MEMORY.md"
-    p.write_text("# Index\n- f:a\n")
+# --- the env marker: only the index the var selected is attributed to it -----
+def _with_env(value, argv):
     buf = io.StringIO()
     old = os.environ.get("SUTANDO_MEMORY_DIR")
-    os.environ["SUTANDO_MEMORY_DIR"] = d
+    os.environ["SUTANDO_MEMORY_DIR"] = value
     try:
         with contextlib.redirect_stdout(buf):
-            mib.main(["--repo", str(REPO), "--index", str(p)])
+            rc = mib.main(argv)
     finally:
         if old is None:
             os.environ.pop("SUTANDO_MEMORY_DIR", None)
         else:
             os.environ["SUTANDO_MEMORY_DIR"] = old
-    check("with the override set, the index line says so",
-          "($SUTANDO_MEMORY_DIR)" in buf.getvalue(), buf.getvalue().splitlines()[:1])
+    return rc, buf.getvalue()
+
+with tempfile.TemporaryDirectory() as d:
+    p = pathlib.Path(d) / "MEMORY.md"
+    p.write_text("# Index\n- f:a\n")
+    rc, out = _with_env(d, ["--repo", str(REPO)])
+    check("with the override selecting the index, the index line says so",
+          rc == 0 and f"index: {p} ($SUTANDO_MEMORY_DIR)" in out, out.splitlines()[:1])
+    rc, out = _with_env("/definitely/not/the/index", ["--repo", str(REPO), "--index", str(p)])
+    check("an explicit --index is not attributed to a set $SUTANDO_MEMORY_DIR",
+          rc == 0 and f"index: {p}\n" in out and "SUTANDO_MEMORY_DIR" not in out,
+          out.splitlines()[:1])
 
 # Report mode alone left the adding-mode header uncovered: dropping line_limit
 # there survived every assertion above.
