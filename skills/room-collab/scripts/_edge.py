@@ -5,8 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-SKILL = Path(__file__).resolve().parent.parent
-REPO = SKILL.parent.parent
+SKILL = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[3]
 PACKAGE = REPO / "packages" / "room-collab"
 
 
