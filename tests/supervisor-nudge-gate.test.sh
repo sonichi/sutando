@@ -114,6 +114,18 @@ if [ -n "$HOST" ]; then
   # idle-ready pane with a live beat -- nudging it would wedge on its event loop.
   NNACT="$(run_decide "$NONUDGE" | sed -n 's/.*action=//p')"
   check "decide_action (no-nudge notifier, idle-ready + fresh) -> arm" "arm" "$NNACT"
+
+  # notifier_supports_nudge is a grep for the entrypoint, so it is brittle to a
+  # reword; pin that the REAL Claude notifier keeps matching it and the REAL
+  # Codex notifier does not. A reword of either entrypoint fails here.
+  supports() { # notifier-script -> yes/no
+    ( export SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_NOTIFIER_SCRIPT="$1"
+      # shellcheck source=/dev/null
+      source "$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
+      notifier_supports_nudge && echo yes || echo no ) 2>/dev/null
+  }
+  check "the real Claude notifier passes notifier_supports_nudge" "yes" "$(supports "$REPO/src/agent/claude/cli/task-notifier.sh")"
+  check "the real Codex notifier does not" "no" "$(supports "$REPO/src/agent/codex/cli/task-notifier.sh")"
 else
   echo "ok   decide_action core-beat case skipped (no host-label)"
 fi
