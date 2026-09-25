@@ -370,6 +370,14 @@ _mention_msg.role_mentions = []
 check("bare-mention: a raw <@id> mention is rendered as @name",
       rc.bare_mention_context_line("chi", _mention_msg) == "  chi: hey @sonichi ping")
 
+_role_mention_msg = _M("hey <@&9> team")
+class _R:
+    id, name = 9, "devs"
+_role_mention_msg.mentions = []
+_role_mention_msg.role_mentions = [_R()]
+check("bare-mention: a raw <@&id> role mention is rendered as @&name",
+      rc.bare_mention_context_line("chi", _role_mention_msg) == "  chi: hey @&devs team")
+
 print()
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

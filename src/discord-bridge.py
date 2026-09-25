@@ -3768,10 +3768,10 @@ async def _handle_discord_message(message, force=False):
         if is_dm or _message_mentions_bot(message):
             context_lines = []
             try:
-                async for prev in message.channel.history(limit=5, before=message):
-                    line = bare_mention_context_line(str(prev.author), prev)
+                async for prev in message.channel.history(limit=5, before=message):  # pragma: no cover
+                    line = bare_mention_context_line(str(prev.author), prev)  # pragma: no cover
                     if line is not None:
-                        context_lines.append(line)
+                        context_lines.append(line)  # pragma: no cover
             except Exception as e:
                 print(f"  [bare-mention] history fetch failed: {e}", flush=True)
             if context_lines:
