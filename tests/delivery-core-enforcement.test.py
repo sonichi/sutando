@@ -447,9 +447,13 @@ class ReconcileSignatureAgreesWithContract(unittest.TestCase):
     def test_no_bare_id_reconcile_survives_anywhere(self):
         repo = Path(__file__).resolve().parent.parent
         roots = [repo / "src", repo / "packages", repo / "tests"]
+        # Not delivery providers: the surface client's `reconcile` is its own CRDT API.
+        unrelated = repo / "packages" / "room-collab"
         offenders, scanned = [], 0
         for root in roots:
             for path in root.rglob("*.py"):
+                if path.is_relative_to(unrelated):
+                    continue
                 try:
                     tree = ast.parse(path.read_text(encoding="utf-8"))
                 except (SyntaxError, UnicodeDecodeError):

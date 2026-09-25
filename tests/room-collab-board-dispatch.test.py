@@ -17,7 +17,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "packages" / "room-collab"))
+# The Sutando CLI, as the skill runs it: the edge fills the host slots.
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
+__import__("_edge").install()
 
 import room_collab  # noqa: E402
 import room_collab_client  # noqa: E402

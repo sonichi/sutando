@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
+sys.path.insert(0, str(REPO / "packages" / "room-collab"))
 
 from skill_claims import MAX_AGE_DAYS, refusal_claims, stale_claims  # noqa: E402
 

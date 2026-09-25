@@ -324,7 +324,7 @@ Three things that matter more than they look:
    Rewriting the whole text would be a last-writer-wins overwrite.
 
 **Before you design where something is stored, read
-[`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
+[`CRDT-SHAPES.md`](../../packages/room-collab/CRDT-SHAPES.md).** It is the measured answer to which
 arrangements merge and which silently drop a write — many text roots, one map
 key per row, an order derived from `(created, id)` rather than stored. The
 failure it describes does not look like a failure: a row that was written is

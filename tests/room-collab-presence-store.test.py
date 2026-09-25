@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct coverage for skills/room-collab/scripts/presence_store.py.
+"""Direct coverage for packages/room-collab/presence_store.py.
 
 The concurrency case runs the PRODUCTION writer in real subprocesses. A
 threaded stand-in would prove nothing here: the contract is an `flock`, which
@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MODULE = REPO / "skills" / "room-collab" / "scripts" / "presence_store.py"
+MODULE = REPO / "packages" / "room-collab" / "presence_store.py"
 
 FAILS = []
 

@@ -13,7 +13,7 @@ import pathlib
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-CLI = REPO / "skills" / "room-collab" / "scripts" / "room_collab.py"
+CLI = REPO / "packages" / "room-collab" / "room_collab.py"
 # The client module exits at import without its deps; load the CLI as a module
 # without executing main, and skip if the deps are genuinely absent.
 sys.path.insert(0, str(CLI.parent))

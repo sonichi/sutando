@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
+sys.path.insert(0, str(REPO / "packages" / "room-collab"))
 
 from room_collab_protocol import (  # noqa: E402
     CLOSE_BAD_KIND, CLOSE_BAD_ROOM, CLOSE_FORBIDDEN, RECONNECT_CODES, RECONNECT_STATUSES,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct coverage for skills/room-collab/scripts/presence_daemon.py.
+"""Direct coverage for packages/room-collab/presence_daemon.py.
 
 No server and no clock: `reconcile(now)` takes the time as an argument and the
 room-collab client is a stub, so every case here is the daemon's own bookkeeping
@@ -21,7 +21,7 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPTS = REPO / "skills" / "room-collab" / "scripts"
+SCRIPTS = REPO / "packages" / "room-collab"
 
 FAILS = []
 

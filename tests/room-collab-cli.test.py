@@ -10,7 +10,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "packages" / "room-collab"))
+# The Sutando CLI, as the skill runs it: the edge fills the host slots.
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
+__import__("_edge").install()
 
 import json  # noqa: E402
 
@@ -589,6 +592,30 @@ def test_without_room_ops_installed_the_refusal_names_the_dry_run_route():
 def test_room_ops_is_looked_for_beside_this_skill():
     found = room_collab.room_ops_script()
     assert found == REPO / "skills" / "agent-room-ops" / "room_ops.py", found
+
+
+def test_the_package_alone_names_no_room_ops_script():
+    saved = room_collab.ROOM_OPS_SCRIPT
+    room_collab.ROOM_OPS_SCRIPT = None
+    try:
+        assert room_collab.room_ops_script() is None
+    finally:
+        room_collab.ROOM_OPS_SCRIPT = saved
+
+
+def test_the_package_alone_refuses_a_command_that_needs_the_workspace():
+    saved = room_collab.WORKSPACE_RESOLVER
+    room_collab.WORKSPACE_RESOLVER = None
+    try:
+        try:
+            room_collab._workspace(None)
+        except room_collab.RoomDocError as e:
+            assert "--workspace" in str(e), e
+        else:
+            raise AssertionError("resolved a workspace with no host resolver")
+        assert room_collab._workspace("/w") == Path("/w")
+    finally:
+        room_collab.WORKSPACE_RESOLVER = saved
 
 
 def test_comment_runs_end_to_end_through_a_fake_surface():

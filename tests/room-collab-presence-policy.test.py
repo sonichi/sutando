@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct coverage for skills/room-collab/scripts/presence_policy.py.
+"""Direct coverage for packages/room-collab/presence_policy.py.
 
 The module is pure, so every case is in-memory: no sockets, no files, no
 clock. `now` is an argument, which is what makes the 30-minute rule testable
@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MODULE = REPO / "skills" / "room-collab" / "scripts" / "presence_policy.py"
+MODULE = REPO / "packages" / "room-collab" / "presence_policy.py"
 
 FAILS = []
 
