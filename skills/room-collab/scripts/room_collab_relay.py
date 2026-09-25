@@ -85,9 +85,8 @@ ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
 
 def visible_words(html: str) -> str:
     """The page's words, lower-cased and single-spaced, to tell a speaker whether a spotlight will land."""
-    text = re.sub(r"(?is)<(script|style)\b.*?</\1>|<[^>]+>", " ", html)
-    import html as _html
-    return " ".join(_html.unescape(text).lower().split())
+    from room_search import visible_text
+    return visible_text(html).lower()
 
 
 def route(method: str, path: str, family: str = "html") -> tuple[str, object] | tuple[int, dict]:
