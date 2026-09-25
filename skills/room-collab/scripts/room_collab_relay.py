@@ -26,6 +26,8 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   POST /db/<db>/row?set=Prop%3DValue&set=...  add a row, values by property name
   POST /db/<db>/row/<row>?set=...             set values on a row (by id or title)
   POST /db/<db>/move?row=<row>&to=<group>     move a row on the board view (&view=<name>)
+  GET  /db/<db>/row/<row>   the row as a page: its properties by name, then its markdown body
+  POST /db/<db>/row/<row>/body?text=...[&append=1]  set (or append to) the row page's body
 
 On the board a slide is a frame (in Present order) and on the Doc a heading;
 topic highlights exist only on the page. The /db routes use the held database surface,
@@ -46,6 +48,8 @@ TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
 SURFACES = {"html": "html", "board": "board", "doc": DEFAULT_KIND, "db": "db"}
 DB_NAME_MAX, DB_SET_MAX = 200, 2000
+# A body rides the query string: the request line must stay under the reader's limit.
+DB_BODY_MAX, LINE_LIMIT = 16_000, 1 << 18
 PAGE_ID_RE = re.compile(r"[a-z0-9]{8}")
 
 
@@ -150,9 +154,19 @@ def db_route(method: str, path: str, raw_query: str) -> tuple:
     from urllib.parse import parse_qs, unquote
     segs = [unquote(x) for x in path.strip("/").split("/")][1:]
     q = parse_qs(raw_query, keep_blank_values=True)
-    if any(len(x) > DB_NAME_MAX for x in segs) or any(len(x) > DB_SET_MAX for v in q.values() for x in v):
+    if any(len(x) > DB_NAME_MAX for x in segs) or any(
+            len(x) > (DB_BODY_MAX if k == "text" else DB_SET_MAX) for k, v in q.items() for x in v):
         return (400, {"ok": False, "error": "a name or value is too long"})
     reads = {0: "list", 1: "view"}
+    if len(segs) == 3 and segs[1] == "row" and method == "GET":
+        return ("db", {"op": "row", "db": segs[0], "row": segs[2]})
+    if len(segs) == 4 and segs[1] == "row" and segs[3] == "body":
+        if method != "POST":
+            return (405, {"ok": False, "error": "not found"})
+        if "text" not in q:
+            return (400, {"ok": False, "error": "a body write needs text=<markdown> (empty clears it)"})
+        return ("db", {"op": "body", "db": segs[0], "row": segs[2], "text": q["text"][0],
+                       "append": (q.get("append") or [""])[0] in ("1", "true", "yes")})
     if method == "GET":
         if len(segs) in reads or (len(segs) == 3 and segs[1] == "view"):
             return ("db", {"op": reads.get(len(segs), "view"), "db": segs[0] if segs else None,
@@ -182,7 +196,7 @@ async def db_request(doc, req: dict, identity=None) -> tuple[int, dict]:
     """One /db request against an open database surface; a refusal is a 400 and writes nothing."""
     from room_database import (DbRefusal, add_row_plan, assignments, cell_writes, group_target, list_dbs,
                                move_plan, read_db, resolve_db, resolve_prop, resolve_row, resolve_view,
-                               view_json)
+                               row_json, view_json)
     maps = doc.database
     names = {x["id"]: x["name"] for x in list_dbs(maps)}
     try:
@@ -193,10 +207,18 @@ async def db_request(doc, req: dict, identity=None) -> tuple[int, dict]:
         d = resolve_db(maps, req["db"])
         if req["op"] == "view":
             return 200, {"ok": True, **view_json(d, resolve_view(d, req.get("view")), names[d["id"]])}
+        if req["op"] == "row":
+            row = resolve_row(d, req["row"])
+            return 200, {"ok": True, **row_json(d, row, doc.row_body(d["id"], row["id"]), names[d["id"]])}
         if identity is None:
             raise RoomDocError("this relay was started without an identity to sign writes (--user-id)")
         by = identity()
         body: dict = {"ok": True, "db": d["id"], "name": names[d["id"]]}
+        if req["op"] == "body":
+            row = resolve_row(d, req["row"])["id"]
+            chars = await doc.put_row_body(d["id"], row, req["text"], append=req["append"])
+            return 200, {"ok": True, "db": d["id"], "name": names[d["id"]], "row": row, "chars": chars,
+                         "appended" if req["append"] else "set": True}
         if req["op"] == "add":
             row, writes = add_row_plan(d, by, assignments(d, req["set"]))
         elif req["op"] == "update":
@@ -372,7 +394,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 else:
                     async with open_kind(holder["room"], SURFACES["db"]) as doc:
                         status, body = await db_request(doc, what[1], identity)
-                        if what[1]["op"] not in ("list", "view") and status == 200:
+                        if what[1]["op"] not in ("list", "view", "row") and status == 200:
                             await doc.settle(0.3)  # a refusal from the server surfaces before close
                 body["room"] = holder["room"]
             elif what[0] == "pages":
@@ -455,9 +477,9 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
         finally:
             writer.close()
 
-    server = await asyncio.start_server(handle, host, port)
+    server = await asyncio.start_server(handle, host, port, limit=LINE_LIMIT)
     log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
-        "/surface/html|html-<id>|board|doc|db, /page/<id>, /room/<id>, /db/<db>/row, /db/<db>/move; "
-        "GET /state, /outline, /rooms, /pages, /db")
+        "/surface/html|html-<id>|board|doc|db, /page/<id>, /room/<id>, /db/<db>/row, /db/<db>/move, "
+        "/db/<db>/row/<row>/body; GET /state, /outline, /rooms, /pages, /db, /db/<db>/row/<row>")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())

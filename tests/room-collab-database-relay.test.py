@@ -82,6 +82,14 @@ async def test_routes():
     assert route("POST", "/db/d1/move?row=Mark")[0] == 400
     assert route("GET", "/db/d1/row")[0] == 405 and route("POST", "/db")[0] == 405
     assert route("POST", "/surface/db") == ("surface", "db")
+    assert route("GET", "/db/d1/row/Mark") == ("db", {"op": "row", "db": "d1", "row": "Mark"})
+    assert route("POST", "/db/d1/row/Mark/body?text=%23%20Hi%26more&append=1") == \
+        ("db", {"op": "body", "db": "d1", "row": "Mark", "text": "# Hi&more", "append": True})
+    assert route("POST", "/db/d1/row/Mark/body?text=")[1]["text"] == "", "an empty body clears it"
+    assert route("POST", "/db/d1/row/Mark/body")[0] == 400, "a body write needs text="
+    assert route("GET", "/db/d1/row/Mark/body")[0] == 405
+    assert route("POST", "/db/d1/row/Mark/body?text=" + "x" * 16_001)[0] == 400
+    assert route("POST", "/db/d1/row/Mark/body?text=" + "x" * 16_000)[0] == "db", "bodies get a larger cap"
 
 
 async def test_the_voice_calls_read_and_write_the_databases():
@@ -126,6 +134,20 @@ async def test_the_voice_calls_read_and_write_the_databases():
         got = {g["name"]: g["rows"] for g in body["groups"]}
         assert got["Tried by others"] == [row] and body["rows"][0]["values"]["Minutes"] == "10", body
 
+        status, body = await http(port, "GET", "/db/-/row/shared%20browser")
+        assert status == 200 and body["title"] == "Shared browser" and body["body"] == "", body
+        assert body["values"]["Presenter"] == "Mark" and body["row"] == row, body
+        status, body = await http(port, "POST", "/db/-/row/shared%20browser/body?text=%23%20Plan%0A%0A-%20d%C3%A9mo")
+        assert status == 200 and body["set"] is True and dbs.row_body(db, row) == "# Plan\n\n- démo", body
+        status, body = await http(port, "POST", f"/db/-/row/{row}/body?text=%0A-%20ship&append=1")
+        assert status == 200 and body["appended"] is True and dbs.row_body(db, row) == "# Plan\n\n- démo\n- ship"
+        status, body = await http(port, "GET", "/db/-/row/nope")
+        assert status == 400 and "no row" in body["error"], body
+        status, body = await http(port, "POST", "/db/-/row/nope/body?text=x")
+        assert status == 400 and "no row" in body["error"], body
+        big = "x" * 16_000
+        status, body = await http(port, "POST", f"/db/-/row/{row}/body?text={big}")
+        assert status == 200 and len(dbs.row_body(db, row)) == 16_000, "a long body fits the request line"
         status, body = await http(port, "POST", "/surface/db")
         assert status == 200 and body["surface"] == "db" and body["parts"] == 1, body
         n = len(opened)
@@ -162,6 +184,8 @@ async def test_writes_need_an_identity():
         assert status == 200, body
         status, body = await http(port, "POST", "/db/tasks/row?set=Name%3Dx")
         assert status == 503 and "identity" in body["error"], body
+        status, body = await http(port, "POST", "/db/tasks/row/x/body?text=hi")
+        assert status == 503 and "identity" in body["error"], "a body write is signed too"
     finally:
         task.cancel()
 
