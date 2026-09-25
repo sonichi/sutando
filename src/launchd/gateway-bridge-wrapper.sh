@@ -61,8 +61,10 @@ export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
 if [ -z "$REMOTE_TASK_TOKEN" ]; then
-    echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
-    exit 0
+    # Wait idle rather than exit 0: a clean exit leaves the launchd job idle
+    # (KeepAlive is crash-only) and nothing brings it back when the token appears.
+    echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — waiting idle" >&2
+    while :; do sleep 300; done
 fi
 
 # Evict an already-running gateway bridge that belongs to THIS checkout: it has no
@@ -77,4 +79,60 @@ if [ -f "$_EVICT_HELPER" ]; then
   sleep 0.3
 fi
 
-exec python3 "$REPO/src/remote-gateway-bridge.py"
+# Supervise the bridge instead of exec-ing it, the same way channel-bridge-wrapper.sh
+# does: a bridge that exits (restart.sh's pkill, a crash, a clean stop) is relaunched
+# by this wrapper, so the launchd job never sits idle after a clean exit. An exit
+# inside the deliberate-restart window is expected and raises no alert; rc 75 is
+# the bridge's own stand-down and ends the wrapper for good.
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || echo "$REPO/workspace")"
+STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
+mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
+MARKER="$STATE_DIR/gateway.started"
+DELIBERATE="$STATE_DIR/deliberate-restart"
+DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
+ALERT_STAMP="$STATE_DIR/gateway.last-alert"
+ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
+RESTART_DELAY="${SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY:-10}"
+_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
+emit_restart_alert() {
+  NOW="$(date +%s)"
+  echo "[gateway-bridge-wrapper] previous process exited; automatically restarting" >&2
+  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
+    echo "[gateway-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
+    return 0
+  fi
+  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
+    echo "[gateway-bridge-wrapper] alert cooldown active; not repeating" >&2
+    return 0
+  fi
+  echo "$NOW" > "$ALERT_STAMP"
+  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." > "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
+  osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+}
+if [ -f "$MARKER" ]; then emit_restart_alert; fi
+date +%s > "$MARKER"
+CHILD_PID=''
+STOPPING=0
+stop_wrapper() {
+  STOPPING=1
+  [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
+}
+trap stop_wrapper TERM INT HUP
+while [ "$STOPPING" = 0 ]; do
+  python3 "$REPO/src/remote-gateway-bridge.py" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  CHILD_RC=$?
+  set -e
+  CHILD_PID=''
+  [ "$STOPPING" = 0 ] || break
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
+  emit_restart_alert
+  sleep "$RESTART_DELAY" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  set -e
+  CHILD_PID=''
+done
