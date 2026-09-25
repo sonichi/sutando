@@ -9,7 +9,9 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   POST /speaking/on|off
   POST /presenter/on|off    accepted; presenting is the room's, not the relay's
   GET  /state               {topic, ts, speaking}
+  POST /spot/<words>        spotlight the passage with these words (`clear` clears)
   GET  /script              the talk script in the room's Doc, as steps (talk_script.py)
+  GET  /outline             slides, titles and pointable topics on the page (page_outline.py)
 
 It listens on 127.0.0.1 only: whoever reaches the port drives the stage as
 this agent, so it must never be exposed beyond the machine.
@@ -26,6 +28,13 @@ TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
 
 
+def visible_words(html: str) -> str:
+    """The page's words, lower-cased and single-spaced, to tell a speaker whether a spotlight will land."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>|<[^>]+>", " ", html)
+    import html as _html
+    return " ".join(_html.unescape(text).lower().split())
+
+
 def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     """What a request asks for, as ("highlight", topic|None), ("speaking", bool),
     ("state", None), or an HTTP status and body to answer directly."""
@@ -34,8 +43,11 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("state", None)
     if method == "GET" and path == "/script":
         return ("script", None)
+    if method == "GET" and path == "/outline":
+        return ("outline", None)
     if method != "POST":
-        return (405 if path.startswith(("/highlight/", "/slide/", "/speaking/", "/presenter/")) else 404,
+        return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/"))
+                else 404,
                 {"ok": False, "error": "not found"})
     if path.startswith("/highlight/"):
         topic = path[len("/highlight/"):].lower()
@@ -44,6 +56,14 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         if not TOPIC_RE.fullmatch(topic):
             return (400, {"ok": False, "error": f"not a topic key: {topic!r}"})
         return ("highlight", topic)
+    if path.startswith("/spot/"):
+        from urllib.parse import unquote
+        words = " ".join(unquote(path[len("/spot/"):]).split())
+        if words.lower() == "clear":
+            return ("spot", None)
+        if not words or len(words) > 200:
+            return (400, {"ok": False, "error": "a spotlight needs 1–200 characters of the page's words"})
+        return ("spot", words)
     if path.startswith("/slide/"):
         what = path[len("/slide/"):]
         if what in ("next", "prev"):
@@ -120,6 +140,13 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
                 if kind == "highlight":
                     state = await doc.set_stage(arg)
                     status, body = 200, {"ok": True, **state}
+                elif kind == "spot":
+                    spot = await doc.set_spot(arg)
+                    found = arg is None or " ".join(arg.lower().split()) in visible_words(doc.text)
+                    status, body = 200, {"ok": True, **spot, "found_on_page": found}
+                elif kind == "outline":
+                    from page_outline import outline
+                    status, body = 200, {"ok": True, **outline(doc.text)}
                 elif kind == "slide":
                     nav = await doc.navigate(*arg)
                     status, body = 200, {"ok": True, **nav}

@@ -31,7 +31,8 @@ async function relay(method: 'GET' | 'POST', path: string): Promise<Record<strin
 // Which slide tool to use is the model's most common mistake: slide_control moves a local tab.
 export const ROOM_SLIDE_RULE =
 	'When the deck being presented is open as an AG2 Space room page (room_present, or the room relay is up), ' +
-	'every slide request — "next", "go back", "go to slide N" — uses room_slide, and highlights use room_highlight. ' +
+	'every slide request — "next", "go back", "go to slide N" — uses room_slide; to find where something is, room_outline; ' +
+	'to point at it, room_highlight (topic key) or room_point (its words). ' +
 	'slide_control moves only a browser tab on this computer and does nothing in the room.';
 
 /** A user-directed move during a talk pauses it, or the next beat would move the deck away again. */
@@ -45,6 +46,7 @@ export const roomSlideTool: ToolDefinition = {
 	name: 'room_slide',
 	description:
 		'Move the slide deck shown in the AG2 Space room for EVERYONE watching: next, previous, or go to a slide number. ' +
+		'ALWAYS use this (never slide_control) for a deck you are presenting with room_present, or any deck in the room. ' +
 		'Use while presenting a deck that is open as the room\'s HTML page (the room relay is running). ' +
 		'For a deck open only in this computer\'s browser, use slide_control instead. Instant.',
 	parameters: z.object({
@@ -90,6 +92,32 @@ export const roomStageTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		return relay('GET', '/state');
+	},
+};
+
+export const roomOutlineTool: ToolDefinition = {
+	name: 'room_outline',
+	description:
+		'See what the room\'s HTML page contains before navigating: for a deck, every slide\'s number and title, and its ' +
+		'highlightable parts (topic keys with the words they label); for another page, its headings. Call it when asked to ' +
+		'go to or show a particular part, then use room_slide (by number), room_highlight (by topic) or room_point (by words). Instant.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		return relay('GET', '/outline');
+	},
+};
+
+export const roomPointTool: ToolDefinition = {
+	name: 'room_point',
+	description:
+		'Spotlight a passage on the room\'s page for everyone, by its words — any text on the slide showing now, even with no topic key ' +
+		'(e.g. "Liveness isn\'t health"). Use it to point at what a question is about. Pass "clear" to remove it. Instant.',
+	parameters: z.object({ words: z.string().min(1).max(200).describe('A few exact words from the page, or "clear"') }),
+	execution: 'inline',
+	async execute(args) {
+		const { words } = args as { words: string };
+		return relay('POST', `/spot/${encodeURIComponent(words)}`);
 	},
 };
 
@@ -178,11 +206,26 @@ export const roomPresentTool: ToolDefinition = {
 		if (action === 'start') injectContext?.(ROOM_SLIDE_RULE);
 		const line = await nextLine();
 		if (!line) return { ok: true, state: 'the talk is over' };
-		return { ok: true, say: line.say, line: line.n, of: talk.beats.length, instruction: 'Say ONLY this line, then stop.' };
+		return {
+			ok: true,
+			say: line.say,
+			line: line.n,
+			of: talk.beats.length,
+			instruction: 'Say ONLY this line, then stop.',
+			...(action === 'start' ? { rules: ROOM_SLIDE_RULE } : {}),
+		};
 	},
 };
 
-export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool, roomScriptTool, roomPresentTool];
+export const tools: ToolDefinition[] = [
+	roomSlideTool,
+	roomHighlightTool,
+	roomPointTool,
+	roomOutlineTool,
+	roomStageTool,
+	roomScriptTool,
+	roomPresentTool,
+];
 
 /** The slide rule, in the voice prompt of every session this skill is loaded into. */
 export function voiceSurface(): { promptRules: string[] } {

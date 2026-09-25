@@ -50,6 +50,9 @@ async def test_routes():
     assert route("POST", "/speaking/on") == ("speaking", True)
     assert route("GET", "/state?x=1") == ("state", None)
     assert route("GET", "/script") == ("script", None)
+    assert route("GET", "/outline") == ("outline", None)
+    assert route("POST", "/spot/Liveness%20isn%E2%80%99t%20health") == ("spot", "Liveness isn\u2019t health")
+    assert route("POST", "/spot/clear") == ("spot", None) and route("POST", "/spot/")[0] >= 400
     assert route("GET", "/highlight/x")[0] == 405
     assert route("POST", "/deck/other")[0] == 404
     assert route("POST", "/presenter/on")[0] == 200
@@ -92,6 +95,13 @@ async def test_a_round_trip_lands_on_the_stage_and_speaking_leaves_the_highlight
         first = body["seq"]
         status, body = await http(47811, "POST", "/slide/3")
         assert status == 200 and body["cmd"] == "goto" and body["n"] == 3 and body["seq"] > first, body
+        page._text.insert(0, "<section class=slide><h1>Loop</h1><p data-topic=trust>Trust &amp; safety</p></section>")
+        status, body = await http(47811, "POST", "/spot/trust%20%26%20safety")
+        assert status == 200 and body["found_on_page"] is True and page.stage["spot"]["text"] == "trust & safety", body
+        status, body = await http(47811, "POST", "/spot/not%20here")
+        assert body["found_on_page"] is False, body
+        status, body = await http(47811, "GET", "/outline")
+        assert body["kind"] == "deck" and body["slides"][0]["topics"][0]["topic"] == "trust", body
         status, body = await http(47811, "POST", "/highlight/%3Cx%3E")
         assert status == 400, body
     finally:

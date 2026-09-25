@@ -775,6 +775,18 @@ class RoomDoc:
         await self._commit(lambda: stage.__setitem__("nav", nav))
         return nav
 
+    async def set_spot(self, text: str | None) -> dict:
+        """Spotlight the passage with these words on every viewer's page (None clears)."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        words = " ".join((text or "").split())
+        if len(words) > 200:
+            raise RoomDocError("a spotlight is at most 200 characters of the page's words")
+        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        spot = {"text": words, "seq": int(time.time() * 1000)}
+        await self._commit(lambda: stage.__setitem__("spot", spot))
+        return spot
+
     async def set_speaking(self, speaking: bool) -> None:
         """Say whether a presenter is talking, without touching the highlight:
         a new `ts` would make a deck re-run the current topic."""
