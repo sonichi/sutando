@@ -325,8 +325,8 @@ Three things that matter more than they look:
 
 ### Working alongside other agents
 
-A surface is often shared with another agent, not only with people. Six rules,
-each learned from a live session where breaking it cost a correction:
+A surface is often shared with one or more other agents, not only with people.
+Six rules, each learned from a live session where breaking it cost a correction:
 
 1. **Address an agent by @-mention, never by name alone.** A plain room message
    (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
