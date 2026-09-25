@@ -106,10 +106,10 @@ nudge_and_wait() {
   return 1
 }
 
-# An idle frame over a dead or hung agent: injection reaches no one, so surface
-# it for a restart (the owner's lane) rather than arm a standby into a corpse.
+# An idle frame over a dead or hung agent: surface it once for a restart (the
+# owner's lane). The caller still arms afterwards -- see the alert branch.
 health_alert() {
-  echo "task-notifier-supervisor: pane idle-ready but the session beat is stale/absent for $NUDGE_TARGET; needs a restart, not a nudge or standby" >&2
+  echo "task-notifier-supervisor: pane idle-ready but the session beat is stale/absent for $NUDGE_TARGET; needs a restart (arming the standby meanwhile)" >&2
   command -v osascript >/dev/null 2>&1 \
     && osascript -e 'display notification "A Sutando session looks idle but its heartbeat is stale. It may need a restart." with title "Sutando"' >/dev/null 2>&1 || true
 }
@@ -126,6 +126,10 @@ NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}
 GRACE_PERIOD="${SUTANDO_NOTIFIER_GRACE_PERIOD:-45}"
 ROLE_POLL="${SUTANDO_NOTIFIER_ROLE_POLL:-5}"
 child_pid=""
+# One-shot latch for the idle-but-dead health alert: raised when it fires, so a
+# persistent stale/absent beat does not re-notify every grace period; lowered
+# again the moment the decision is anything but alert (the session recovered).
+alerted=0
 
 # yes / no / unknown -- unknown (ps snapshot unavailable) is deliberately
 # never read as "no": every caller below fails toward keeping whatever
@@ -239,13 +243,20 @@ while target_alive; do
     # alive; the unknown-verdict path above skips this and arms as before.
     case "$(decide_action)" in
       nudge)
+        alerted=0
         nudge_and_wait && continue   # restored -> back to standby, do not arm
         ;;                            # not restored -> fall through and arm
       alert)
-        health_alert
-        continue                      # dead/hung: skip arming, re-poll (restart is the owner's)
+        # Idle frame over a dead/hung agent. Surface it ONCE (a restart is the
+        # owner's lane), then still ARM: arming is the current behaviour, it
+        # keeps coverage for when the session recovers, and the notifier's own
+        # paste gate refuses to inject into an unhealthy pane anyway. Not
+        # arming here looped this branch, re-alerting every grace period.
+        [ "$alerted" = "1" ] || { health_alert; alerted=1; }
+        ;;                            # fall through to arm
+      *)
+        alerted=0                     # arm (or any other verdict): reset the latch
         ;;
-      # arm: fall through to the existing arm loop unchanged.
     esac
   fi
   unknown_since=""

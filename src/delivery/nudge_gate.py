@@ -24,9 +24,11 @@ Outcomes:
   re-arms the Monitor, then let the grace run until the next idle; only if no
   session-role watcher appears does the supervisor fall back to arming.
 - ``alert`` — idle-ready but NOT live (stale/absent beat). The frame looks idle
-  over a dead or hung agent: a nudge is not read, and neither is an injected
-  standby, so injection cannot fix it. Surface it for a restart (the owner's
-  lane) instead of pretending the standby covers a corpse.
+  over a dead or hung agent, which a restart (the owner's lane) fixes, not a
+  nudge. The supervisor surfaces this ONCE and then still arms the standby:
+  arming keeps coverage for when the session recovers, and the notifier's own
+  paste gate refuses to inject into an unhealthy pane regardless. ``alert`` is
+  thus ``arm`` plus a one-shot heads-up, not a decision to withhold coverage.
 - ``arm`` — everything else, unchanged from before: a dirty or busy pane, or any
   UNKNOWN signal. Unknowns fail toward keeping the existing coverage, never
   toward withholding it, the same principle the supervisor already follows for an
