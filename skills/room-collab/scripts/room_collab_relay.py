@@ -40,7 +40,7 @@ import asyncio
 import json
 import re
 
-from room_collab_protocol import DEFAULT_KIND, STATE_KEY_RE, RoomDocError, is_html_kind
+from room_collab_protocol import DEFAULT_KIND, DOC_PAGE_KIND_RE, STATE_KEY_RE, RoomDocError, is_html_kind
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
@@ -49,9 +49,23 @@ DB_NAME_MAX, DB_SET_MAX = 200, 2000
 PAGE_ID_RE = re.compile(r"[a-z0-9]{8}")
 
 
+def is_doc_surface(surface: str | None) -> bool:
+    """The Doc or one of its pages (`markdown-<id>`), which every Doc rule applies to."""
+    return surface == "doc" or (isinstance(surface, str) and DOC_PAGE_KIND_RE.fullmatch(surface) is not None)
+
+
 def surface_kind(surface: str) -> str | None:
-    """The document kind a relay surface opens: a named one, or an extra page's own `html-<id>`."""
-    return SURFACES.get(surface) or (surface if is_html_kind(surface) else None)
+    """The document kind a relay surface opens: a named one, or a page's own `html-<id>` / `markdown-<id>`."""
+    if surface in SURFACES:
+        return SURFACES[surface]
+    return surface if is_html_kind(surface) or is_doc_surface(surface) else None
+
+
+def page_surface(family: str, page: str | None) -> str:
+    """The surface a page of the held family is: the HTML page's or the Doc's (None: the main one)."""
+    if is_doc_surface(family):
+        return f"{DEFAULT_KIND}-{page}" if page else "doc"
+    return f"html-{page}" if page else "html"
 SWITCH_WAIT_S = 15
 ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
 
@@ -63,9 +77,10 @@ def visible_words(html: str) -> str:
     return " ".join(_html.unescape(text).lower().split())
 
 
-def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
+def route(method: str, path: str, family: str = "html") -> tuple[str, object] | tuple[int, dict]:
     """What a request asks for, as ("highlight", topic|None), ("speaking", bool),
-    ("state", None), or an HTTP status and body to answer directly."""
+    ("state", None), or an HTTP status and body to answer directly.
+    `family` is the held surface: /page/<id> means a page of the Doc while the Doc is held."""
     raw_query = path.split("?", 1)[1] if "?" in path else ""
     path = path.split("?", 1)[0].rstrip("/") or "/"
     if path == "/db" or path.startswith("/db/"):
@@ -131,15 +146,16 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     if path.startswith("/surface/"):
         what = path[len("/surface/"):].lower()
         if surface_kind(what) is None:
-            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, html-<id>, board, doc or db)"})
+            return (400, {"ok": False, "error": f"not a surface: {what!r} "
+                          "(html, html-<id>, board, doc, markdown-<id> or db)"})
         return ("surface", what)
     if path.startswith("/page/"):
         what = path[len("/page/"):].lower()
         if what == "main":
-            return ("surface", "html")
+            return ("surface", page_surface(family, None))
         if not PAGE_ID_RE.fullmatch(what):
             return (400, {"ok": False, "error": f"not a page id: {what!r} (8 of a-z0-9, or main)"})
-        return ("surface", f"html-{what}")
+        return ("surface", page_surface(family, what))
     if path in ("/presenter/on", "/presenter/off"):
         return (200, {"ok": True, "note": "presenting is controlled in the room"})
     return (404, {"ok": False, "error": "not found"})
@@ -231,7 +247,7 @@ def outline_of(surface: str, doc) -> dict:
     if surface == "board":
         from surface_outline import board_outline
         return board_outline(doc.live_elements)
-    if surface == "doc":
+    if is_doc_surface(surface):
         from surface_outline import doc_outline
         return doc_outline(doc.text)
     from page_outline import outline
@@ -244,7 +260,7 @@ def says(surface: str, doc, words: str) -> bool:
     if surface == "board":
         from surface_outline import board_words
         return want in board_words(doc.live_elements)
-    if surface == "doc":
+    if is_doc_surface(surface):
         return want in " ".join(doc.text.lower().split())
     return want in visible_words(doc.text)
 
@@ -352,7 +368,8 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
             while (await asyncio.wait_for(reader.readline(), 5)) not in (b"\r\n", b"\n", b""):
                 pass
             parts = line.split()
-            what = route(parts[0], parts[1]) if len(parts) >= 2 else (400, {"ok": False})
+            what = (route(parts[0], parts[1], holder["surface"]) if len(parts) >= 2
+                    else (400, {"ok": False}))
             if isinstance(what[0], int):
                 status, body = what
             elif what[0] == "script":
@@ -378,9 +395,12 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
             elif what[0] == "pages":
                 if open_kind is None:
                     raise RoomDocError("this relay was started without the room's other surfaces")
-                async with open_kind(holder["room"], "html") as main:
+                doc_family = is_doc_surface(holder["surface"])
+                async with open_kind(holder["room"], DEFAULT_KIND if doc_family else "html") as main:
                     listed = [{"id": None, "title": "Main"}] + [
-                        {"id": p["id"], "title": p["title"]} for p in main.pages]
+                        {"id": p["id"], "title": p["title"],
+                         **({"parent": p["parent"]} if p.get("parent") else {}),
+                         **({"icon": p["icon"]} if p.get("icon") else {})} for p in main.pages]
                 status, body = 200, {"ok": True, "pages": listed, "surface": holder["surface"]}
             elif what[0] == "rooms":
                 if list_rooms is None:
@@ -457,7 +477,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
 
     server = await asyncio.start_server(handle, host, port)
     log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
-        "/surface/html|html-<id>|board|doc|db, /page/<id>, /room/<id>, /db/<db>/row, /db/<db>/move; "
+        "/surface/html|html-<id>|board|doc|markdown-<id>|db, /page/<id>, /room/<id>, /db/<db>/row, /db/<db>/move; "
         "GET /state, /outline, /rooms, /pages, /db")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())

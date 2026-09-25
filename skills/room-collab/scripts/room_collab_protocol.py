@@ -108,7 +108,8 @@ def read_pages(index: object, base: str = HTML_KIND) -> list[dict]:
                     "parent": parent if isinstance(parent, str) and re.fullmatch(r"[a-z0-9]{8}", parent)
                     and parent != pid else None,
                     "icon": "".join(v["icon"].split())[:8] if isinstance(v.get("icon"), str) else ""})
-    top = {p["id"] for p in out if p["parent"] is None}
+    listed = {p["id"] for p in out}
+    top = {p["id"] for p in out if p["parent"] is None or p["parent"] not in listed}
     for p in out:
         if p["parent"] is not None and p["parent"] not in top:
             p["parent"] = None
