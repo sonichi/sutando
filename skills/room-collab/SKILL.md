@@ -418,6 +418,43 @@ Formulas: `+ - * / ^ &`, comparisons, ranges, and SUM, AVERAGE, MIN, MAX,
 COUNT, COUNTA, IF, AND, OR, NOT, ROUND, ABS, CONCAT, LEN, UPPER and LOWER.
 The web client computes the values; `read` returns what was typed.
 
+## Databases are a sixth surface
+
+`--kind db` holds every database in the room: typed properties, rows, and views
+(table, board, calendar, list, gallery) over the same rows. The model is shared
+with the web client — see `DATABASE.md`. Values are set by **property name**:
+options by name, persons by mxid (comma-separated), dates `YYYY-MM-DD` (`A..B`
+for a range), `Prop=` to clear. A value that does not fit is refused with the
+allowed options named, and nothing is written.
+
+```bash
+python3 $P --kind db dbs '!room:server'                                        # the databases, their views
+python3 $P --kind db create '!room:server' --template tasks --name Launch      # tasks|meetings|demo_day|wiki
+python3 $P --kind db read '!room:server' --db Launch --view Board [--json]     # a view's rows; a board by group
+python3 $P --kind db add '!room:server' --db Launch --set 'Name=Write the demo' \
+    --set 'Status=In progress' --set 'Assignee=@mark:server' --set 'Due=2026-09-25'
+python3 $P --kind db update '!room:server' --db Launch --row 'Write the demo' --set 'Priority=High'
+python3 $P --kind db move '!room:server' --db Launch --row 'Write the demo' --to Done   # a board move
+python3 $P --kind db import '!room:server' --db Launch rows.csv                # headers = property names
+```
+
+`--db` may be left out when the room has one database; `--row` is a row id or
+its title. A CSV's headers map to properties case-blind; `--map 'CSV header=Property'`
+names the rest (a unique header prefix is enough), `--header-row N` skips notes
+above the headers, and `--year` completes dates like `Sep 25`. Unmatched headers
+are reported, never created. A Google Sheet exported as CSV becomes a database:
+
+```bash
+python3 $P --kind db create '!room:server' --template demo_day --from-csv sheet.csv \
+    --header-row 2 --year 2026 --map 'Team Demo Date=Demo date' --map 'Persenter=Presenter' \
+    --map 'Use case brief=Use case' --map 'Time needed=Minutes' --map 'Killer Use Case Status=Killer use case'
+```
+
+By voice: `room_db_list`, `room_db_read`, `room_db_add`, `room_db_update` and
+`room_db_move` go through the relay's `/db` routes (the relay needs `--user-id`
+to sign writes). They work whichever surface the relay holds; `POST /surface/db`
+holds the databases open for faster calls.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:

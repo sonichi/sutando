@@ -58,6 +58,13 @@ Moving a card on a board writes the card's group value: select or status →
 that option; "No value" → removes it. A card cannot be moved between groups
 of a multi-select.
 
+## Agent-side input (not part of the stored contract)
+
+The CLI and the relay take values as typed text and turn them into what
+`normalize` accepts before it runs: option names match case-blind, persons and
+multi-selects split on commas, `A..B` is a date range, and CSV dates like
+`Sep 25` take `--year`. What is stored is exactly the table above.
+
 ## Built-in templates
 
 `tasks`, `meetings`, `demo_day` and `wiki`, with the properties and views
