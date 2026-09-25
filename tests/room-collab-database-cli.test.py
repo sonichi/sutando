@@ -148,7 +148,7 @@ def test_the_demo_day_sheet_becomes_a_database():
     assert out["rows_added"] == 4 and out["blank_rows_skipped"] == 1 and out["unmatched_headers"] == [], out
     v = json.loads(ok(["read", "!r:x", "--view", "By date", "--json"], page))
     got = [(r["values"]["Use case"], r["values"]["Demo date"], r["values"]["Killer use case"]) for r in v["rows"]]
-    assert got[0] == ("tbd", "", ""), "an empty date sorts first, as in the web client"
+    assert got[-1] == ("tbd", "", ""), "an empty date sorts last, as in the web client"
     assert got[1:3] == [("Cloud Sutando", "2026-09-25", ""), ("Room-collab, multi-agent", "2026-09-25", "Confirmed")], got
     rc, _, err = cli(["create", "!r:x", "--template", "demo_day", "--from-csv", fh.name, "--header-row", "2"]
                      + maps, page)
