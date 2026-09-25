@@ -109,6 +109,30 @@ async def test_a_template_never_overwrites_a_page_unless_told_to():
         room_collab.fetch_library = real
 
 
+async def test_the_stage_is_shared_state_beside_the_page():
+    doc = Doc()
+    page = RoomDoc(FakeWS(), doc, Awareness(doc), "html", kind=HTML_KIND)
+    first = await page.set_stage("step4")
+    assert page.stage["topic"] == "step4" and page.stage["ts"] == first["ts"]
+    assert str(doc.get("html", type=Text)) == "", "the stage never touches the page text"
+    await page.set_stage(None)
+    assert page.stage["topic"] == ""
+    for bad in ("<img>", "a b", "", "x" * 65):
+        try:
+            await page.set_stage(bad or "-")
+        except RoomDocError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} must be refused")
+    board = RoomDoc(FakeWS(), Doc(), Awareness(Doc()), "markdown", kind="board")
+    try:
+        await board.set_stage("x")
+    except RoomDocError:
+        pass
+    else:
+        raise AssertionError("only the HTML page has a stage")
+
+
 for name, fn in list(globals().items()):
     if name.startswith("test_"):
         check(name, fn)
@@ -118,4 +142,4 @@ if FAILS:
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-collab html surface: 5 passed")
+print("room-collab html surface: 6 passed")

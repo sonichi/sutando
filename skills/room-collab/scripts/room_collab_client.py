@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 import ssl
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable
 
@@ -59,7 +61,7 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
     explain,
     http_status,
     unanswered,
@@ -728,6 +730,32 @@ class RoomDoc:
         _, columns = self._require_kanban("read columns")
         rows = [v for k, v in self._items(columns) if is_column(v, k)]
         return sorted(rows, key=lambda c: (c["order"], c["id"]))
+
+    @property
+    def stage(self) -> dict:
+        """The HTML page's live stage: {topic, ts, speaking}."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        return dict(self._items(self._doc.get(HTML_STAGE_KEY, type=Map)))
+
+    async def set_stage(self, topic: str | None, *, speaking: bool | None = None) -> dict:
+        """Highlight `topic` on the page for everyone in the room (None clears it).
+        `ts` changes on every call, so repeating a topic re-triggers it."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        if topic is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", topic):
+            raise RoomDocError(f"not a topic key: {topic!r} (letters, digits, . _ -; up to 64)")
+        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        state = {"topic": topic or "", "ts": int(time.time() * 1000)}
+        if speaking is not None:
+            state["speaking"] = speaking
+
+        def mutate() -> None:
+            for k, v in state.items():
+                stage[k] = v
+
+        await self._commit(mutate)
+        return state
 
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.

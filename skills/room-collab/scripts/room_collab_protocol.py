@@ -12,6 +12,8 @@ import urllib.parse
 DEFAULT_TEXT_NAME = "markdown"
 DEFAULT_KIND = "markdown"
 HTML_KIND = "html"
+# The HTML page's live stage (a highlighted topic), beside its text; the web client reads it.
+HTML_STAGE_KEY = "stage"
 # The surfaces that are one shared text, and the root each text lives under.
 TEXT_ROOTS = {DEFAULT_KIND: DEFAULT_TEXT_NAME, HTML_KIND: "html"}
 

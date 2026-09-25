@@ -668,6 +668,13 @@ async def run(args: argparse.Namespace) -> int:
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
         if args.command == "templates":
             return await templates(doc, args, url)
+        if args.command == "highlight":
+            if args.kind != HTML_KIND:
+                raise RoomDocError(f"highlight is for the HTML page: pass --kind {HTML_KIND}.")
+            state = await doc.set_stage(None if args.topic == "clear" else args.topic)
+            await doc.settle(args.settle)
+            print(json.dumps({"ok": True, **state}))
+            return 0
         if args.command == "comment":
             if args.kind != DEFAULT_KIND:
                 raise RoomDocError(f"comments are pinned to the Doc; the {args.kind!r} page "
@@ -893,6 +900,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("old")
     s.add_argument("new")
+
+    s = sub.add_parser("highlight", help="highlight a topic on the HTML page for everyone "
+                                         "watching; `clear` removes it (needs --kind html)")
+    s.add_argument("room")
+    s.add_argument("topic", help="a data-topic key the page defines, or `clear`")
 
     s = sub.add_parser("templates", help="list the HTML page templates, or start the page from one "
                                          "(needs --kind html)")
