@@ -829,6 +829,38 @@ class RoomDoc:
         await self._commit(mutate)
         return len(writes)
 
+    def _require_db(self, what: str) -> dict:
+        from room_database import DB_KIND, MAPS
+        if self._kind != DB_KIND:
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: open the room's "
+                               f"databases with kind={DB_KIND!r}.")
+        return {m: self._doc.get(m, type=Map) for m in MAPS}
+
+    @property
+    def database(self) -> dict:
+        """The five maps (dbs, props, rows, cells, views) as plain dicts; see DATABASE.md."""
+        return {m: dict(self._items(y)) for m, y in self._require_db("read the databases").items()}
+
+    async def put_database(self, writes: dict) -> int:
+        """Apply {map: {key: value | None}} in one update; None removes the key. Returns how many."""
+        maps = self._require_db("write a database")
+        unknown = sorted(set(writes) - set(maps))
+        if unknown:
+            raise RoomDocError(f"not a database map: {', '.join(unknown)}. Nothing was written.")
+
+        def mutate() -> None:
+            for name, entries in writes.items():
+                ymap = maps[name]
+                for k, v in entries.items():
+                    if v is None:
+                        if k in ymap:
+                            del ymap[k]
+                    else:
+                        ymap[k] = v
+
+        await self._commit(mutate)
+        return sum(len(e) for e in writes.values())
+
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.
         Refuses a card the panel would drop, rather than writing it."""
