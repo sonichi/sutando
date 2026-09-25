@@ -757,6 +757,14 @@ class RoomDoc:
         await self._commit(mutate)
         return state
 
+    async def set_speaking(self, speaking: bool) -> None:
+        """Say whether a presenter is talking, without touching the highlight:
+        a new `ts` would make a deck re-run the current topic."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        await self._commit(lambda: stage.__setitem__("speaking", bool(speaking)))
+
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.
         Refuses a card the panel would drop, rather than writing it."""

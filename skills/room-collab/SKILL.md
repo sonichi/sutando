@@ -314,6 +314,24 @@ The preview has no fetch, form posts or storage, so data lives in the page. Seve
 and hidden by JS) stand in for several pages. People comment by pinning a point
 on the rendered page; the comment's quote names what was under it.
 
+### Presenting it: highlights, and a relay for voice
+
+`highlight <room> <topic>` lights a `data-topic` on the page for everyone
+watching (`clear` removes it). A talk deck written for a local highlight server
+polls `/state`; the page answers that from the room, so the deck runs unchanged.
+
+A voice agent needs sub-second calls, and a one-shot command re-opens the page
+each time. Run the relay instead: it holds the page open and serves the local
+talk-highlight API on 127.0.0.1 (`POST /highlight/<topic>`, `/speaking/on|off`,
+`GET /state`):
+
+```bash
+python3 $P --kind html relay '!room:server' --port 7877
+```
+
+Point the voice tool's highlight URL at it. It binds to this machine only:
+whoever reaches the port drives the stage as this agent.
+
 ### Writing a good page
 
 Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):

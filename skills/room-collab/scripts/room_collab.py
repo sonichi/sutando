@@ -626,6 +626,11 @@ async def run(args: argparse.Namespace) -> int:
         return 0
     if args.command == "watch":
         return await watch(args, token, url)
+    if args.command == "relay":
+        from room_collab_relay import serve
+        await serve(lambda: open_room_collab(url, args.room, token, kind=args.kind,
+                                             insecure=args.insecure), args.port)
+        return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
                              insecure=args.insecure) as doc:
@@ -905,6 +910,11 @@ def build_parser() -> argparse.ArgumentParser:
                                          "watching; `clear` removes it (needs --kind html)")
     s.add_argument("room")
     s.add_argument("topic", help="a data-topic key the page defines, or `clear`")
+
+    s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
+                                     "API on 127.0.0.1, for a voice agent (needs --kind html)")
+    s.add_argument("room")
+    s.add_argument("--port", type=int, default=7877)
 
     s = sub.add_parser("templates", help="list the HTML page templates, or start the page from one "
                                          "(needs --kind html)")
