@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from room_collab_protocol import DEFAULT_KIND, TEXT_ROOTS, RoomDocError  # noqa: E402
+from room_collab_protocol import DEFAULT_KIND, HTML_KIND, TEXT_ROOTS, RoomDocError  # noqa: E402
 from room_collab_watch import new_lines  # noqa: E402
 
 # The edge refuses urllib's default agent outright (Cloudflare 1010), so an
@@ -372,6 +372,53 @@ async def doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def fetch_library(base: str, name: str) -> bytes:
+    """One file of the template library the web client serves; the same files it lists."""
+    if not re.fullmatch(r"index\.json|[a-z0-9-]+\.html", name):
+        raise RoomDocError(f"not a library file: {name!r}")
+    try:
+        with urllib.request.urlopen(base.rstrip("/") + "/" + name, timeout=15) as r:
+            return r.read()
+    except (urllib.error.URLError, OSError) as exc:
+        raise RoomDocError(f"could not read the template library at {base}: {exc}") from exc
+
+
+async def templates(doc, args: argparse.Namespace, url: str) -> int:
+    """List the library, or start the page from one template (refusing to
+    overwrite someone's page unless --replace says to)."""
+    if args.kind != HTML_KIND:
+        raise RoomDocError(f"templates are for the HTML page: pass --kind {HTML_KIND}.")
+    base = args.library or _origin(url) + "/html-templates/"
+    index = json.loads(fetch_library(base, "index.json"))
+    items = [t for t in index.get("templates", []) if isinstance(t, dict)]
+    if not args.use:
+        if args.json:
+            print(json.dumps(index, ensure_ascii=False))
+            return 0
+        for t in items:
+            print(f"{t.get('id')}: {t.get('name')} — {t.get('description', '')}")
+        scope = index.get("scope") or {}
+        for s in scope.get("supported", []):
+            print(f"  supported: {s}")
+        for s in scope.get("not_supported", []):
+            print(f"  not supported: {s}")
+        return 0
+    chosen = next((t for t in items if t.get("id") == args.use), None)
+    if not chosen:
+        raise RoomDocError(f"no template {args.use!r}; run `templates` to list them.")
+    if doc.text.strip() and not args.replace:
+        raise RoomDocError("the page already has content; pass --replace to overwrite it "
+                           "for everyone in the room.")
+    body = fetch_library(base, str(chosen.get("file", ""))).decode("utf-8")
+    if doc.text:
+        await doc.replace(doc.text, body)
+    else:
+        await doc.append(body)
+    await doc.settle(args.settle)
+    print(json.dumps({"ok": True, "template": args.use, "chars": len(body)}))
+    return 0
+
+
 async def kanban(doc, args: argparse.Namespace) -> int:
     """The board of cards: read it, or write one card through the panel's
     own rules. Every write is a newer version signed with this agent's mxid."""
@@ -619,6 +666,8 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "templates":
+            return await templates(doc, args, url)
         if args.command == "comment":
             if args.kind != DEFAULT_KIND:
                 raise RoomDocError(f"comments are pinned to the Doc; the {args.kind!r} page "
@@ -844,6 +893,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("old")
     s.add_argument("new")
+
+    s = sub.add_parser("templates", help="list the HTML page templates, or start the page from one "
+                                         "(needs --kind html)")
+    s.add_argument("room")
+    s.add_argument("--use", metavar="ID", help="replace the page with this template")
+    s.add_argument("--replace", action="store_true",
+                   help="allow --use to overwrite a page that already has content")
+    s.add_argument("--library", help="the library's base URL (default: <service>/html-templates/)")
 
     s = sub.add_parser("comment", help="comment on a passage of the document, pinned to those words")
     s.add_argument("room")

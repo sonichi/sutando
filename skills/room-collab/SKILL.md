@@ -294,6 +294,26 @@ same rule as the panel — so a move you make is a newer version, and an older
 one you re-send writes nothing. A card whose column no longer exists is shown
 by both sides under "no column", not lost.
 
+## The HTML page is a fourth surface
+
+`--kind html` is one self-contained web page the room renders live beside its
+source: slides, UI mockups, landing pages, dashboards. It is text, so `read`,
+`append` and `replace` work as on the Doc, sent as deltas so a person typing
+alongside loses nothing.
+
+```bash
+python3 $P --kind html templates '!room:server'                   # the library, and what a page can do
+python3 $P --kind html templates '!room:server' --use slides      # start an empty page from one
+python3 $P --kind html templates '!room:server' --use slides --replace   # overwrite a page, for everyone
+python3 $P --kind html read '!room:server'
+```
+
+Stay inside the scope `templates` prints: HTML, CSS and inline JavaScript only.
+The preview has no network and no storage, so a `fetch`, a form post or an
+external script does nothing there. Several screens in one file (sections shown
+and hidden by JS) stand in for several pages. People comment by pinning a point
+on the rendered page; the comment's quote names what was under it.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:

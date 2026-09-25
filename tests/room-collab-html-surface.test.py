@@ -69,6 +69,46 @@ async def test_a_structured_kind_is_still_refused_as_text():
         raise AssertionError("a board must refuse a text write")
 
 
+async def test_the_library_is_read_only_by_bare_file_name():
+    import room_collab
+    for bad in ("../index.json", "x/y.html", "https://e/x.html", "a.js"):
+        try:
+            room_collab.fetch_library("http://127.0.0.1:9/", bad)
+        except RoomDocError as e:
+            assert "not a library file" in str(e), e
+        else:
+            raise AssertionError(f"{bad} must be refused before any request")
+
+
+async def test_a_template_never_overwrites_a_page_unless_told_to():
+    import argparse
+    import json as _json
+    import room_collab
+    doc = Doc()
+    page = RoomDoc(FakeWS(), doc, Awareness(doc), "html", kind=HTML_KIND)
+    await page.append("<p>someone's work</p>")
+    files = {"index.json": _json.dumps({"v": 1, "templates": [
+        {"id": "blank", "name": "Blank", "file": "blank.html"}]}).encode(),
+             "blank.html": b"<p>blank</p>"}
+    real = room_collab.fetch_library
+    room_collab.fetch_library = lambda base, name: files[name]
+    try:
+        args = argparse.Namespace(kind=HTML_KIND, library="http://lib/", use="blank",
+                                  replace=False, json=False, settle=0)
+        try:
+            await room_collab.templates(page, args, "https://svc")
+        except RoomDocError as e:
+            assert "--replace" in str(e)
+        else:
+            raise AssertionError("must refuse to overwrite")
+        assert page.text == "<p>someone's work</p>"
+        args.replace = True
+        assert await room_collab.templates(page, args, "https://svc") == 0
+        assert page.text == "<p>blank</p>", page.text
+    finally:
+        room_collab.fetch_library = real
+
+
 for name, fn in list(globals().items()):
     if name.startswith("test_"):
         check(name, fn)
@@ -78,4 +118,4 @@ if FAILS:
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-collab html surface: 3 passed")
+print("room-collab html surface: 5 passed")
