@@ -26,6 +26,7 @@ exit 1
 EOF
 chmod +x "$HANDLER"
 
+POLL_ITERS=0
 run_sweep() {
   local outfile="$TMP/sweep.out" pid i
   : > "$outfile"
@@ -38,6 +39,7 @@ run_sweep() {
   set +m
   # A failed handler run takes a beat: probe, queue, spawn the real run, HANDLER_DONE.
   for i in $(seq 1 60); do grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && break; sleep 0.25; done
+  POLL_ITERS=$i
   kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   grep 'TASK_FILE:' "$outfile" 2>/dev/null | head -1
@@ -48,9 +50,9 @@ echo "  watcher emitted after handler failure: ${line:-<nothing>}"
 [ "$line" = "TASK_FILE: $PAYLOAD" ]
 rc=$?
 check $rc "a failed handler's fallback emission still names the resolved payload path"
-# Both were already captured (sweep.out/.err) and never shown -- a FAIL had
-# nothing beyond the one grepped line to diagnose from (#4750).
+# Distinguishes never-emitted (POLL_ITERS=60) from a wrong path caught early.
 if [ "$rc" != "0" ]; then
+  echo "  poll iterations before kill: $POLL_ITERS/60"
   echo "  watcher stdout:"; sed 's/^/    /' "$TMP/sweep.out" 2>/dev/null
   echo "  watcher stderr:"; sed 's/^/    /' "$TMP/sweep.err" 2>/dev/null
 fi
