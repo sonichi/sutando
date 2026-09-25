@@ -1215,8 +1215,8 @@ twilio_creds_present() {
   done
   return 0
 }
-# One settle window for the bind wait below and the verify pass (default 10s).
-VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+# Default the settle window here so the bind wait below and the verify pass share it.
+: "${VERIFY_SETTLE_S:=10}"
 # Pids holding a LISTEN socket on :3100, one per line. LISTEN only: a stale
 # client connection or a foreign listener also answers a bare `lsof -i :3100`.
 cs_listen_pids() { lsof -ti :3100 -sTCP:LISTEN 2>/dev/null || true; }
@@ -1390,7 +1390,7 @@ if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
 fi
 # A single probe races a service still binding, so retry briefly. The deadline is
 # GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
-# VERIFY_SETTLE_S is assigned before the phone block, which shares the window.
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
 verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
