@@ -12,8 +12,10 @@ import urllib.parse
 DEFAULT_TEXT_NAME = "markdown"
 DEFAULT_KIND = "markdown"
 HTML_KIND = "html"
-# The HTML page's live stage (a highlighted topic), beside its text; the web client reads it.
+# A surface's live stage (moves, a spotlight; a highlighted topic on the page), beside its content.
 HTML_STAGE_KEY = "stage"
+# The surfaces with a stage: the HTML page, the board ("board") and the Doc.
+STAGE_KINDS = (HTML_KIND, "board", DEFAULT_KIND)
 # The surfaces that are one shared text, and the root each text lives under.
 TEXT_ROOTS = {DEFAULT_KIND: DEFAULT_TEXT_NAME, HTML_KIND: "html"}
 

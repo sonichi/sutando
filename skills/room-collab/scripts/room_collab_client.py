@@ -61,7 +61,7 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, STAGE_KINDS, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
     explain,
     http_status,
     unanswered,
@@ -731,12 +731,16 @@ class RoomDoc:
         rows = [v for k, v in self._items(columns) if is_column(v, k)]
         return sorted(rows, key=lambda c: (c["order"], c["id"]))
 
+    def _require_stage(self, what: str) -> Any:
+        if self._kind not in STAGE_KINDS:
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: only the HTML page, "
+                               "the board and the Doc have a stage")
+        return self._doc.get(HTML_STAGE_KEY, type=Map)
+
     @property
     def stage(self) -> dict:
-        """The HTML page's live stage: {topic, ts, speaking}."""
-        if self._kind != HTML_KIND:
-            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
-        return dict(self._items(self._doc.get(HTML_STAGE_KEY, type=Map)))
+        """The surface's live stage: {topic, ts, speaking} on the page; nav and spot on any."""
+        return dict(self._items(self._require_stage("read the stage")))
 
     async def set_stage(self, topic: str | None, *, speaking: bool | None = None) -> dict:
         """Highlight `topic` on the page for everyone in the room (None clears it).
@@ -758,15 +762,14 @@ class RoomDoc:
         return state
 
     async def navigate(self, cmd: str, n: int | None = None) -> dict:
-        """Move every viewer's deck: `next`, `prev`, or `goto` slide `n` (1-based).
-        A move carries a rising `seq`; a page opened later never replays it."""
-        if self._kind != HTML_KIND:
-            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        """Move every viewer: `next`, `prev`, or `goto` part `n` (1-based) — the page's
+        slides, the board's frames, the Doc's headings. A move carries a rising `seq`;
+        a surface opened later never replays it."""
+        stage = self._require_stage("move the stage")
         if cmd not in ("next", "prev", "goto"):
             raise RoomDocError(f"not a move: {cmd!r} (next, prev or goto)")
         if cmd == "goto" and not (isinstance(n, int) and 1 <= n <= 999):
             raise RoomDocError(f"goto needs a slide number 1–999, not {n!r}")
-        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
         prev = stage.get("nav")
         last = prev.get("seq", 0) if isinstance(prev, dict) else 0
         nav = {"cmd": cmd, "seq": max(int(time.time() * 1000), int(last) + 1)}
@@ -776,23 +779,22 @@ class RoomDoc:
         return nav
 
     async def set_spot(self, text: str | None) -> dict:
-        """Spotlight the passage with these words on every viewer's page (None clears)."""
-        if self._kind != HTML_KIND:
-            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        """Point every viewer at the passage with these words (None clears): the page
+        spotlights it, the board selects and zooms to it, the Doc scrolls to and flashes it."""
+        stage = self._require_stage("point")
         words = " ".join((text or "").split())
         if len(words) > 200:
             raise RoomDocError("a spotlight is at most 200 characters of the page's words")
-        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
-        spot = {"text": words, "seq": int(time.time() * 1000)}
+        prev = stage.get("spot")
+        last = prev.get("seq", 0) if isinstance(prev, dict) else 0
+        spot = {"text": words, "seq": max(int(time.time() * 1000), int(last) + 1)}
         await self._commit(lambda: stage.__setitem__("spot", spot))
         return spot
 
     async def set_speaking(self, speaking: bool) -> None:
         """Say whether a presenter is talking, without touching the highlight:
         a new `ts` would make a deck re-run the current topic."""
-        if self._kind != HTML_KIND:
-            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
-        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        stage = self._require_stage("set speaking")
         await self._commit(lambda: stage.__setitem__("speaking", bool(speaking)))
 
     def _require_sheet(self, what: str) -> tuple:

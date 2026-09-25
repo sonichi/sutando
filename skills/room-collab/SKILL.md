@@ -344,7 +344,8 @@ the owner moves to before acting; a room picked with `room_use` holds until then
 Older hosts skip the following silently.
 
 The skill's own voice tools use the relay: `room_slide` (next / previous / go to),
-`room_highlight`, `room_stage`, and `room_script`. The last one loads a **talk
+`room_highlight`, `room_point`, `room_outline`, `room_stage`, `room_surface` and
+`room_script`. The last one loads a **talk
 script** from the room's Doc. Under a heading "Talk script", each paragraph is a
 step, and bracketed cues fire where they stand:
 
@@ -356,6 +357,25 @@ The cues are `[next]`, `[prev]`, `[slide 5]`, `[highlight: topic]`, `[clear]` an
 `[pause 2]`; other brackets stay part of the words. To check one:
 `python3 $P script '!room:server'`. Keep the script in the Doc so people can
 review the words and cues before the talk.
+
+### The same moves on the whiteboard and the Doc
+
+The board and the Doc keep a `stage` map too, with the page's `nav` and `spot`
+shapes, so one set of verbs drives all three. On the **board** a slide is a
+frame, numbered in the board's own Present order (rows top to bottom, each row
+left to right): a move changes the slide of anyone presenting, and pans everyone
+else to that frame; `spot` selects and zooms to the shape or frame whose words
+match. On the **Doc** a slide is a `#` heading outside code fences: a move
+scrolls to it, and `spot` scrolls to and flashes the passage. Nothing is edited,
+and as on the page, a surface opened later does not replay earlier moves. Topic
+highlights (`/highlight`) stay page-only.
+
+The relay holds one surface at a time: `POST /surface/board` (or `doc`, `html`)
+switches, `GET /surface` names it, and `/slide`, `/spot`, `/outline`, `/state`
+then act on it. `GET /outline` lists the board's frames (number, name, texts) or
+the Doc's headings (number, level, title), so a "go to 3" lands where the
+viewers see 3. The voice tool `room_surface` makes the switch. From the command
+line: `python3 $P --kind board slide '!room:server' 2`.
 
 ### Writing a good page
 

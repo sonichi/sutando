@@ -156,7 +156,7 @@ async def test_a_switch_drops_the_old_room_and_every_call_after_lands_on_the_new
         status, body = await http(47812, "GET", "/state")
         assert body["room"] == "!a:x" and opened == ["!a:x"], (body, opened)
         status, body = await http(47812, "POST", "/room/%21b%3Ax")
-        assert status == 200 and body == {"ok": True, "room": "!b:x", "connected": True,
+        assert status == 200 and body == {"ok": True, "room": "!b:x", "surface": "html", "connected": True,
                                           "has_page": False, "chars": 0}, body
         assert opened == ["!a:x", "!b:x"] and exited == ["!a:x"], (opened, exited)
         status, body = await http(47812, "POST", "/highlight/step1")
