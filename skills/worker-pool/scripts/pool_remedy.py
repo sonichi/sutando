@@ -13,6 +13,8 @@ import argparse
 import importlib.util
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +37,7 @@ sys.path.insert(0, str(_HERE))
 sup = _sibling("pool_supervise")
 sw = _sibling("spawn_worker")
 pd = _sibling("pool_delivery")
+wc = _sibling("pool_wedge_cards")
 ps, wi = sup.ps, sup.wi
 
 RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
@@ -144,22 +147,89 @@ def ensure_supervisors(workspace, repo, observations: dict, *, runner=None) -> d
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
+INPUT_WATCH_SUFFIX = "-input"
+WATCHING = "watching"
+
+
+seat_label = wc.seat_label
+
+
+def input_watch_command(workspace, repo, worker_id, socket, seat) -> list:
+    """The tmux argv for this seat's input watcher. `--socket=` is spelled joined so
+    the core launchers' `--socket <sock>` liveness match never mistakes it for theirs."""
+    name = wi.tmux_session_name(worker_id)
+    out = Path(workspace) / "state" / f"core-supervisor.{name}.json"
+    tmux = shutil.which("tmux") or "tmux"
+    watch = shlex.join([sys.executable, str(Path(repo) / "src" / "core-input-watch.py"),
+                        f"--socket={socket}", f"--session={name}", f"--out={out}",
+                        f"--seat={seat}"])
+    alive = f"{shlex.quote(tmux)} -S {shlex.quote(str(socket))} has-session -t {shlex.quote('=' + name)}"
+    # The watcher ends with its seat; the next tick starts one for a new session.
+    loop = (f"{watch} & w=$!; while {alive} 2>/dev/null && kill -0 $w 2>/dev/null; "
+            f"do sleep 30; done; kill $w 2>/dev/null")
+    return [tmux, "-S", str(socket), "new-session", "-d", "-s", name + INPUT_WATCH_SUFFIX,
+            "bash", "-c", loop]
+
+
+def ensure_input_watch(workspace, repo, worker_id, *, runner=None) -> dict:
+    """One core-input-watch per live worker seat, idempotent by its tmux session,
+    so a gate on the worker's pane reaches the owner as a card naming the seat."""
+    run = runner or subprocess.run
+    socket, name = sup._open_tmux(workspace, worker_id)
+    if not socket:
+        return {"worker_id": worker_id, "outcome": NOT_RUNNING}
+
+    def has(session):
+        try:
+            return run(["tmux", "-S", str(socket), "has-session", "-t", f"={session}"],
+                       capture_output=True, text=True, timeout=15).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    try:
+        if has(name + INPUT_WATCH_SUFFIX):
+            return {"worker_id": worker_id, "outcome": WATCHING}
+        if has(name) is not True:
+            return {"worker_id": worker_id, "outcome": NOT_RUNNING}
+        cmd = input_watch_command(workspace, repo, worker_id, socket,
+                                  seat_label(workspace, worker_id))
+        r = run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"worker_id": worker_id, "outcome": SUPERVISOR_FAILED, "why": str(e)}
+    if r.returncode != 0:
+        return {"worker_id": worker_id, "outcome": SUPERVISOR_FAILED,
+                "why": (r.stderr or r.stdout or "").strip()[-300:]}
+    return {"worker_id": worker_id, "outcome": WATCHING, "started": True}
+
+
+def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) -> dict:
+    return {w: ensure_input_watch(workspace, repo, w, runner=runner)
+            for w, o in observations.items() if o.get("session_alive") is True}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
-    holds the inbox. `escalate` is returned untouched, because asking the owner
-    is the core's, not a timer's."""
+    holds the inbox. A wedge card is raised and never acts on the session: only a
+    dead session is ever respawned. `escalate` is returned untouched, because
+    asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
+    cards = {}
     for worker_id, decision in decisions.items():
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN):
+            cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
+                                             runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
+    sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
     return {"recoveries": done,
             "rearms": rearms,
+            "cards": cards,
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
@@ -181,10 +251,15 @@ def main(argv=None) -> int:
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    acted = ({"recoveries": {}, "rearms": {}, "escalations": [], "dry_run": True} if a.dry_run
-             else apply(a.workspace, a.repo, tick["decisions"]))
+    acted = ({"recoveries": {}, "rearms": {}, "cards": {}, "escalations": [], "dry_run": True}
+             if a.dry_run else apply(a.workspace, a.repo, tick["decisions"]))
     if not a.dry_run:
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
+        acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
+        acted["escapes"] = wc.drive_escapes(a.workspace)
+        clear = {w for w, o in tick["observations"].items()
+                 if o.get("session_alive") is True and w not in tick.get("wedged", [])}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear)
     print(json.dumps({"decisions": tick["decisions"], **acted}, indent=2, sort_keys=True))
     failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
     return 1 if failed else 0

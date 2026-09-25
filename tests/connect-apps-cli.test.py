@@ -47,7 +47,22 @@ class FakeCloud(connectors.Cloud):
         self.enabled = enabled
         self.users = list(user) if isinstance(user, list) else [user]
         self.paths = []
+        self.posts = []
         self.error = None
+
+    def post(self, path, body=None):
+        if not self.signed_in():
+            raise connectors.Setup("not_signed_in", "not signed in")
+        self.posts.append((path, body))
+        if path.endswith("/default"):
+            wanted = path.split("/")[-2]
+            for c in self.connections:
+                if c.get("id") == wanted:
+                    for o in self.connections:
+                        if o.get("toolkit") == c.get("toolkit"):
+                            o["isDefault"] = o is c
+                    return {"ok": True}
+        raise cloud_auth.CloudError(404, "not_found", path)
 
     def get(self, path):
         if not self.signed_in():
@@ -1165,8 +1180,10 @@ class TestSwitch(Base):
         code, out = run(self.ws, ["status", "linear"], cloud)
         self.assertEqual(code, connectors.EXIT_OK)
         self.assertEqual(out["connections"], [
-            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com"},
-            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None}])
+            {"id": NEW_ID, "toolkit": "linear", "name": "Linear", "status": "active", "accountLabel": "new@example.com",
+             "isDefault": None},
+            {"id": OLD_ID, "toolkit": "gmail", "name": "Gmail", "status": "expired", "accountLabel": None,
+             "isDefault": None}])
         self.assertEqual(cloud.paths, ["/api/connectors"])
 
     def test_active_connections_keeps_ids_of_active_rows(self):
@@ -1606,6 +1623,161 @@ class TestReadCache(Base):
         connectors.ConnectCache(self.ws, now=lambda: NOW).put_connections(self.rows("linear"))
         self.assertEqual(hook.connected_set(self.ws, NOW + 1), {"linear"})
         self.assertIsNone(hook.connected_set(self.ws, NOW + connectors.CACHE_TTL_S))
+
+
+
+class SetDefaultTests(unittest.TestCase):
+    """set-default: the agent changes which account an app uses (agent-universe #279)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.rows = [
+            {"id": "c1", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@personal.com", "isDefault": True},
+            {"id": "c2", "toolkit": "gmail", "name": "Gmail", "status": "active",
+             "accountLabel": "me@work.com", "isDefault": False},
+            {"id": "c3", "toolkit": "gmail", "name": "Gmail", "status": "expired",
+             "accountLabel": "old@work.com", "isDefault": False},
+            {"id": "c4", "toolkit": "slack", "name": "Slack", "status": "active",
+             "accountLabel": None, "isDefault": True},
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_label_or_part_of_it_or_an_id_picks_the_account(self):
+        for sel in ("me@work.com", "ME@WORK.COM", "work", "c2"):
+            cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+            code, out = run(self.ws, ["set-default", "gmail", sel], cloud=cloud)
+            self.assertEqual(code, 0, sel)
+            self.assertEqual(out["account"]["id"], "c2")
+            self.assertEqual(cloud.posts, [("/api/connectors/c2/default", None)], sel)
+
+    def test_an_expired_account_cannot_become_the_default(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "gmail", "old@work.com"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "no_match")
+        self.assertEqual([c["id"] for c in out["candidates"]], ["c1", "c2"])
+        self.assertEqual(cloud.posts, [])
+
+    def test_a_name_that_fits_several_accounts_asks_instead_of_guessing(self):
+        rows = [dict(r) for r in self.rows]
+        rows[0]["accountLabel"] = "me@work.com"
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "ambiguous")
+        self.assertEqual(cloud.posts, [])
+
+    def test_an_app_with_nothing_connected_is_none(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        code, out = run(self.ws, ["set-default", "linear", "anything"], cloud=cloud)
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "none")
+
+    def test_a_cloud_without_defaults_is_a_setup_answer(self):
+        rows = [dict(r, isDefault=None) for r in self.rows]
+        cloud = FakeCloud(self.ws, connections=rows)
+        code, out = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "unsupported")
+        self.assertEqual(cloud.posts, [])
+
+    def test_an_account_without_an_id_is_refused_not_posted(self):
+        rows = [dict(r) for r in self.rows]
+        rows[1]["id"] = None
+        cloud = FakeCloud(self.ws, connections=rows)
+        for sel in ("me@work.com", "work"):
+            code, out = run(self.ws, ["set-default", "gmail", sel], cloud=cloud)
+            self.assertEqual(code, 1, sel)
+            self.assertEqual(out["reason"], "no_id", sel)
+            self.assertEqual([c["id"] for c in out["candidates"]], ["c1", None])
+        self.assertEqual(cloud.posts, [], "nothing is posted to /api/connectors/None/default")
+        rows[1]["id"] = "  "
+        self.assertEqual(connectors.pick_account(rows, "gmail", "work")[1], "no_id")
+        # An id-less row that is not the one meant does not get in the way.
+        code, out = run(self.ws, ["set-default", "gmail", "personal"], cloud=cloud)
+        self.assertEqual((code, out["account"]["id"]), (0, "c1"))
+
+    def test_the_read_cache_shows_the_new_default_afterwards(self):
+        cloud = FakeCloud(self.ws, connections=[dict(r) for r in self.rows])
+        # A fresh cache entry still names the old default: what `status` would serve before the write.
+        connectors.ConnectCache(self.ws).put_connections([dict(r) for r in self.rows])
+        code, _ = run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual(code, 0)
+        cached = connectors.ConnectCache(self.ws).connections()
+        self.assertEqual({r["id"]: r["isDefault"] for r in cached if r["toolkit"] == "gmail"},
+                         {"c1": False, "c2": True, "c3": False})
+        self.assertEqual(cloud.paths.count("/api/connectors"), 2, "one live read to pick, one to refresh")
+        code, out = run(self.ws, ["status", "gmail"], cloud=cloud)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["id"]: c["isDefault"] for c in out["connections"] if c["toolkit"] == "gmail"},
+                         {"c1": False, "c2": True, "c3": False})
+        self.assertEqual(cloud.paths.count("/api/connectors"), 2, "status was served from the refreshed cache")
+
+    def test_a_refused_or_unsupported_set_default_leaves_the_cache_alone(self):
+        cache = connectors.ConnectCache(self.ws)
+        cache.put_connections([dict(r) for r in self.rows])
+        cloud = FakeCloud(self.ws, connections=[dict(r, isDefault=None) for r in self.rows])
+        run(self.ws, ["set-default", "gmail", "nobody"], cloud=cloud)
+        run(self.ws, ["set-default", "gmail", "work"], cloud=cloud)
+        self.assertEqual([r["isDefault"] for r in cache.connections()], [True, False, False, True])
+
+
+class CloudPostTests(unittest.TestCase):
+    """Cloud.post: one authenticated POST with get's error mapping (set-default is its only caller)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cloud(self, answer, token="sutk_test"):
+        def request(base, tok, method, path, body=None):
+            self.calls.append((base, tok, method, path, body))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return connectors.Cloud(self.ws, read_auth=lambda _ws: ("https://sutando.ag2.space", token), request=request)
+
+    def test_posts_with_the_session_and_an_empty_body_by_default(self):
+        cloud = self.cloud({"ok": True})
+        self.assertEqual(cloud.post("/api/connectors/c2/default"), {"ok": True})
+        self.assertEqual(cloud.post("/api/x", {"a": 1}), {"ok": True})
+        self.assertEqual(self.calls, [("https://sutando.ag2.space", "sutk_test", "POST", "/api/connectors/c2/default", {}),
+                                      ("https://sutando.ag2.space", "sutk_test", "POST", "/api/x", {"a": 1})])
+        self.assertEqual(self.cloud(["not", "a", "dict"]).post("/api/x"), {})
+
+    def test_signed_out_is_a_setup_answer_before_any_request(self):
+        cloud = self.cloud({"ok": True}, token=None)
+        with self.assertRaises(connectors.Setup) as ctx:
+            cloud.post("/api/x")
+        self.assertEqual(ctx.exception.code, "not_signed_in")
+        self.assertEqual(self.calls, [])
+
+    def test_a_401_drops_the_session_and_other_cloud_errors_pass_through(self):
+        cloud = self.cloud(cloud_auth.CloudError(401, "unauthorized", "expired"))
+        with self.assertRaises(cloud_auth.CloudError):
+            cloud.post("/api/x")
+        self.assertIsNone(cloud.token, "the token is re-read on the next call")
+        cloud = self.cloud(cloud_auth.CloudError(404, "not_found", "/api/x"))
+        with self.assertRaises(cloud_auth.CloudError) as ctx:
+            cloud.post("/api/x")
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(cloud.token, "sutk_test")
+
+    def test_a_transport_error_becomes_a_network_cloud_error(self):
+        for exc in (OSError("reset"), ValueError("bad json")):
+            with self.subTest(exc):
+                with self.assertRaises(cloud_auth.CloudError) as ctx:
+                    self.cloud(exc).post("/api/x")
+                self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "network"))
 
 
 if __name__ == "__main__":
