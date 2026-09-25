@@ -194,17 +194,29 @@ export const roomSurfaceTool: ToolDefinition = {
 	description:
 		'Choose which of the room\'s surfaces room_slide, room_point, room_outline and room_stage act on: "html" (the HTML page, the default), ' +
 		'"board" (the whiteboard) or "doc" (the Doc). Call it when the user wants to present or point at the whiteboard or the Doc, ' +
-		'then room_outline to see its parts. Without a surface, says which one is selected. Takes ~1–2 s to switch.',
+		'then room_outline to see its parts. A room can have several HTML pages: surface "pages" lists them (id and title), and ' +
+		'surface "html" with a page id presents that page (omit page for the main one). ' +
+		'Without a surface, says which one is selected. Takes ~1–2 s to switch.',
 	parameters: z.object({
-		surface: z.enum(['html', 'board', 'doc']).optional().describe('The surface to act on; omit to ask which one is selected'),
+		surface: z
+			.enum(['html', 'board', 'doc', 'pages'])
+			.optional()
+			.describe('The surface to act on, or "pages" to list the HTML pages; omit to ask which one is selected'),
+		page: z
+			.string()
+			.regex(/^[a-z0-9]{8}$/)
+			.optional()
+			.describe('With surface "html": the id of one of the room\'s extra HTML pages, from surface "pages"'),
 	}),
 	execution: 'inline',
 	timeout: 20_000,
 	async execute(args) {
-		const { surface } = args as { surface?: 'html' | 'board' | 'doc' };
+		const { surface, page } = args as { surface?: 'html' | 'board' | 'doc' | 'pages'; page?: string };
 		if (!surface) return relay('GET', '/surface');
+		if (surface === 'pages') return relay('GET', '/pages', 17_000);
 		const note = pauseForManualMove();
-		const res = await relay('POST', `/surface/${surface}`, 17_000);
+		const target = surface === 'html' && page ? `html-${page}` : surface;
+		const res = await relay('POST', `/surface/${target}`, 17_000);
 		return note && !res.error ? { ...res, note } : res;
 	},
 };

@@ -14,6 +14,9 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   GET  /outline             the page's slides, titles and topics (page_outline.py); the
                             board's frames or the Doc's headings (surface_outline.py)
   POST /surface/html|board|doc  hold that surface instead (html at start); GET /surface names it
+  POST /surface/html-<id>   hold one of the room's extra HTML pages (also POST /page/<id>;
+                            /page/main is the main page)
+  GET  /pages               the room's HTML pages: main first, then each extra page's id and title
   POST /room/<room id>      hold that room instead (url-encoded `!abc:server`), same surface
   GET  /rooms               the agent's joined rooms, {id, name}, to resolve a spoken name
 
@@ -29,11 +32,17 @@ import asyncio
 import json
 import re
 
-from room_collab_protocol import DEFAULT_KIND, HTML_KIND, RoomDocError
+from room_collab_protocol import DEFAULT_KIND, RoomDocError, is_html_kind
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
-SURFACES = {"html": HTML_KIND, "board": "board", "doc": DEFAULT_KIND}
+SURFACES = {"html": "html", "board": "board", "doc": DEFAULT_KIND}
+PAGE_ID_RE = re.compile(r"[a-z0-9]{8}")
+
+
+def surface_kind(surface: str) -> str | None:
+    """The document kind a relay surface opens: a named one, or an extra page's own `html-<id>`."""
+    return SURFACES.get(surface) or (surface if is_html_kind(surface) else None)
 SWITCH_WAIT_S = 15
 ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
 
@@ -59,9 +68,11 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("surface", None)
     if method == "GET" and path == "/rooms":
         return ("rooms", None)
+    if method == "GET" and path == "/pages":
+        return ("pages", None)
     if method != "POST":
         return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/",
-                                        "/surface/", "/room/"))
+                                        "/surface/", "/room/", "/page/"))
                 else 404,
                 {"ok": False, "error": "not found"})
     if path.startswith("/highlight/"):
@@ -96,9 +107,16 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("speaking", path.endswith("/on"))
     if path.startswith("/surface/"):
         what = path[len("/surface/"):].lower()
-        if what not in SURFACES:
-            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, board or doc)"})
+        if surface_kind(what) is None:
+            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, html-<id>, board or doc)"})
         return ("surface", what)
+    if path.startswith("/page/"):
+        what = path[len("/page/"):].lower()
+        if what == "main":
+            return ("surface", "html")
+        if not PAGE_ID_RE.fullmatch(what):
+            return (400, {"ok": False, "error": f"not a page id: {what!r} (8 of a-z0-9, or main)"})
+        return ("surface", f"html-{what}")
     if path in ("/presenter/on", "/presenter/off"):
         return (200, {"ok": True, "note": "presenting is controlled in the room"})
     return (404, {"ok": False, "error": "not found"})
@@ -157,10 +175,10 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
             if surface == "html":
                 opener = lambda: open_doc(held_room)  # noqa: E731
             else:
-                opener = lambda: open_kind(held_room, SURFACES[surface])  # noqa: E731
+                opener = lambda: open_kind(held_room, surface_kind(surface))  # noqa: E731
             try:
                 async with opener() as doc:
-                    if surface == "html" and doc.kind != HTML_KIND:
+                    if surface == "html" and not is_html_kind(doc.kind):
                         raise RoomDocError("the relay drives the HTML page: open it with --kind html")
                     # A switch asked for while this one opened: go straight to the new target.
                     if target() == held:
@@ -226,7 +244,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
             return {"ok": False, "room": holder["room"], "error": "another switch overtook this one"}
         doc, surface = holder["doc"], holder["surface"]
         body = {"ok": True, "room": room_id, "surface": surface, "connected": True}
-        if surface == "html":
+        if is_html_kind(surface):
             body.update(has_page=bool(doc.text.strip()), chars=len(doc.text))
         return body
 
@@ -249,6 +267,13 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 status, body = 200, await change_surface(what[1])
             elif what[0] == "room":
                 status, body = 200, await switch_room(what[1])
+            elif what[0] == "pages":
+                if open_kind is None:
+                    raise RoomDocError("this relay was started without the room's other surfaces")
+                async with open_kind(holder["room"], "html") as main:
+                    listed = [{"id": None, "title": "Main"}] + [
+                        {"id": p["id"], "title": p["title"]} for p in main.pages]
+                status, body = 200, {"ok": True, "pages": listed, "surface": holder["surface"]}
             elif what[0] == "rooms":
                 if list_rooms is None:
                     raise RoomDocError("this relay was started without a room list")
@@ -264,10 +289,10 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                     raise RoomDocError("the relay is switching; try again")
                 kind, arg = what
                 parts = None
-                if kind == "slide" and arg[0] == "goto" and surface != "html":
+                if kind == "slide" and arg[0] == "goto" and not is_html_kind(surface):
                     o = outline_of(surface, doc)
                     parts = len(o.get("slides") or o.get("headings") or [])
-                if kind == "highlight" and surface != "html":
+                if kind == "highlight" and not is_html_kind(surface):
                     status, body = 409, {"ok": False, "error": f"topic highlights are on the HTML page; "
                                          f"the relay holds the {surface} — point at words with /spot"}
                 elif kind == "highlight":
@@ -310,6 +335,6 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
 
     server = await asyncio.start_server(handle, host, port)
     log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
-        "/surface/html|board|doc, /room/<id>; GET /state, /outline, /rooms")
+        "/surface/html|html-<id>|board|doc, /page/<id>, /room/<id>; GET /state, /outline, /rooms, /pages")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())
