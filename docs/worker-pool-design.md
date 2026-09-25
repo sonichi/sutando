@@ -267,9 +267,60 @@ watcher beat that is stale or absent AND an inbox no session-role watcher holds
 the same three-tick sustain and 90 s line issue one `rearm_watcher`, which
 ensures the inbox's hosting-mode supervisor, whose standby arms once nobody
 serves the inbox; still lost at 3 minutes escalates to the owner like a dead
-session. A stale beat whose inbox is held is a watcher that beats nothing (one
-launched before beat injection), never a lost one; a holder check that could
-not be told is not evidence either way.
+session. A stale beat whose inbox is held is never a lost watcher: it is a
+watcher launched before beat injection, which beats nothing, and re-arming into
+a live process is the double-arm the ladder exists to prevent. A session-role
+watcher stamps its sentinel and starts its beat before its startup sweep, so
+inside the sweep it reads as live and events queue rather than drop; its only
+held-and-beatless window is the readiness round-trip, a few seconds the
+three-tick sustain absorbs. A watcher on the non-session order sweeps before it
+subscribes and is deaf for as long as a stale-sentinel backlog stalls that sweep
+(#4588); it is not a session-role holder, so its stale beat counts as a lost
+watcher and the rung acts on it after the sustain, which is the right outcome
+for a watcher that cannot hear. A holder check that could not be told is not
+evidence either way.
+
+**A live session that will not progress is the third rung.** A seat's session can
+answer alive while its pane holds a limit menu, a permission dialog, an error it
+parked on, or a turn whose frame never changes. Each tick reads that pane with the
+core's readers (`pane_gate`, `cli_wedge`) and what the worker owes: the tasks
+`task_dispatch owned-by` says were handed to it, less those with a ready result,
+live or archived (the contract `check-pending-tasks.sh` uses; sentinels are never
+renamed or flagged done on a live pool, so their mere presence is not work). Only a
+worker that owes work is wedged; one at its prompt with work queued is the watcher
+rung's. "Frozen" compares the raw frame across ticks, so a static custom pane that
+owes work would read as stuck; a running Claude turn's timer keeps it changing.
+
+**A wedged live session is never restarted** (owner decision, 2026-09-24): a fresh
+session meets the same network error, rate limit, API error or retry, and loses the
+turn in flight. With the same sustain and stale line, once per episode:
+
+- a gate or a limit escalates, as a gate always has;
+- abnormal text raises a card that quotes the banner line and names the cause. On a
+  seat routed through the credential proxy, a retry, API or network cause offers the
+  proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
+  what `src/restart.sh` runs); the click reaches the core as a task. The worker's
+  session is never the target;
+- a frozen turn raises a card offering "Send Escape". Nothing is typed unless the
+  owner presses it; the next tick then re-reads the pane and types one Escape only
+  if it still shows the frame the card was raised for, and refuses otherwise.
+
+A card decision repeats on each tick until the card is actually created, so one
+unreadable capture delays it by a tick rather than suppressing it. The clocks are
+tick-bound: with the 300 s timer the three-sighting sustain, not the 90 s line,
+decides, so a card lands about ten minutes after first sighting, and a pressed
+Escape is typed on the tick after the press. The 90 s line binds only for a tick
+of 45 s or less.
+
+Only a dead session is respawned (the death rung below). Every live seat also runs
+its own `core-input-watch.py`, ensured by the same tick, so a gate reaches the owner
+as a card naming the seat within seconds rather than at the ladder's pace.
+
+**A dead worker that still owes work recovers at the first confirming tick.** A
+gone session is not something a host sleep explains, so for such a worker the
+resume sample after a reboot counts as first detection and the next tick recovers
+it; without a resume, the tick after first detection does. A worker that owes
+nothing keeps the full sustain.
 
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
@@ -313,6 +364,7 @@ remedy or to the core for diagnosis.
 |---|---|---|
 | process death | beat expired, session gone, not owner-paused, sustained | a pre-authorised restart |
 | task stalled | unfinished work whose progress has not advanced | diagnosis only |
+| wedged | session alive, work owed, pane on a gate, limit, abnormal text or a frozen turn, sustained | a card only: escalate, name the cause (proxy restart when proxied), or offer Escape; never a restart |
 
 **Sub-agent activity counts as progress**, or the detector escalates the busiest
 workers. Owner-paused outranks every signal. Detection and the pre-authorised remedy

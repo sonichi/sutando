@@ -115,6 +115,25 @@ CLI arg  >  env override  >  manifest.json config[key]  >  another config file (
 
 Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
 
+## Supervised workers (`supervised_worker`)
+
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+
+```json
+"supervised_worker": {
+  "name": "room-collab-presence",
+  "script": "scripts/presence_daemon.py",
+  "interpreter": { "config": "ROOM_COLLAB_PYTHON", "needs": "pycrdt + websockets" }
+}
+```
+
+- `name` — the supervisor's worker name; a plain name, not a path (it reaches a state dir and a log line).
+- `script` — relative to the skill directory, and it must resolve **inside** it. A manifest is attacker-adjacent (`skills/trusted-capabilities` installs third-party skills), so traversal is refused rather than trusted.
+- `interpreter.config` — the config key naming the interpreter, read **env first, then this manifest's `config` block**. It is required and never guessed: these loops may import packages the core's own python does not have, and started under the wrong one the worker crash-loops under the supervisor, which reads as a broken daemon rather than a missing setting. Unset is a skipped worker with a reason on stderr.
+- `interpreter.needs` — optional; quoted back in that reason so the operator knows what the interpreter must provide.
+
+**Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).
