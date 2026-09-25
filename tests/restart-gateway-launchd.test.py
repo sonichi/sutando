@@ -100,5 +100,75 @@ class BehaviourTest(unittest.TestCase):
         self.assertNotIn("bootout", calls)
 
 
+class StopOnlyMarkerTest(unittest.TestCase):
+    """--stop-only must clear the wrapper's started marker, or the next startup
+    reads as "previous process exited" and raises a false restart alert."""
+
+    def _run_stop_only(self, job_loaded: bool, ws: Path) -> None:
+        start = SRC.index("# Gateway bridge: same launchd handling")
+        end = SRC.index("_PROXY_LABEL=")
+        block = SRC[start:end]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            shim = d / "launchctl"
+            shim.write_text("#!/bin/bash\n" + ("exit 0\n" if job_loaded else 'if [ "$1" = print ]; then exit 113; fi\nexit 0\n'))
+            shim.chmod(0o755)
+            (d / "pkill").write_text("#!/bin/bash\nexit 0\n")
+            (d / "pkill").chmod(0o755)
+            script = d / "block.sh"
+            script.write_text(f'#!/bin/bash\nset -u\n_WS="{ws}"\nREPO="{ws}"\n' + block)
+            subprocess.run(["bash", str(script), "--stop-only"], env={"PATH": f"{d}:/usr/bin:/bin", "HOME": str(d)},
+                           capture_output=True, text=True, timeout=30)
+
+    def test_stop_only_removes_the_started_marker(self):
+        with tempfile.TemporaryDirectory() as ws:
+            ws = Path(ws)
+            marker = ws / "state" / "channel-bridge-supervisor" / "gateway.started"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("1")
+            self._run_stop_only(job_loaded=True, ws=ws)
+            self.assertFalse(marker.exists(), "--stop-only left gateway.started behind (false alert on next startup)")
+
+    def test_marker_path_matches_the_wrapper(self):
+        wrapper = (REPO / "src" / "launchd" / "gateway-bridge-wrapper.sh").read_text()
+        self.assertIn('MARKER="$STATE_DIR/gateway.started"', wrapper)
+        self.assertIn('STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"', wrapper)
+        self.assertIn("state/channel-bridge-supervisor/gateway.started", SRC)
+
+
+class DrainSkipTest(unittest.TestCase):
+    """The stop drain must not wait on a gateway that launchd relaunches at once;
+    it still waits for one that was pkilled (no job), up to the cap."""
+
+    def _run_drain(self, job_loaded: bool) -> float:
+        start = SRC.index("STOP_PATTERNS=(")
+        # the drain loop ends at the first "done" after the loop head
+        loop_head = SRC.index("for _ in $(seq 1 30); do", start)
+        end = SRC.index("\ndone\n", loop_head) + len("\ndone\n")
+        block = SRC[start:end]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "launchctl").write_text("#!/bin/bash\n" + ("exit 0\n" if job_loaded else "exit 113\n"))
+            (d / "launchctl").chmod(0o755)
+            # only the gateway ever reads as alive
+            (d / "pgrep").write_text('#!/bin/bash\ncase "$*" in *remote-gateway-bridge*) exit 0 ;; *) exit 1 ;; esac\n')
+            (d / "pgrep").chmod(0o755)
+            script = d / "drain.sh"
+            script.write_text('#!/bin/bash\nset -u\nREPO="/nonexistent"\n_GW_SERVICE="gui/1/com.sutando.gateway-bridge"\n' + block)
+            import time
+            t0 = time.monotonic()
+            subprocess.run(["bash", str(script)], env={"PATH": f"{d}:/usr/bin:/bin", "HOME": str(d)},
+                           capture_output=True, text=True, timeout=30)
+            return time.monotonic() - t0
+
+    def test_launchd_owned_gateway_is_skipped_by_the_drain(self):
+        elapsed = self._run_drain(job_loaded=True)
+        self.assertLess(elapsed, 1.5, f"drain waited {elapsed:.1f}s on a launchd-owned gateway (should skip it)")
+
+    def test_pkilled_gateway_is_still_drained_to_the_cap(self):
+        elapsed = self._run_drain(job_loaded=False)
+        self.assertGreater(elapsed, 2.0, f"drain gave up after {elapsed:.1f}s on a pkilled gateway (should wait ~3s)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
