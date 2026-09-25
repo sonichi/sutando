@@ -18,6 +18,7 @@ All subprocess calls are mocked — no real osascript runs here.
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -229,11 +230,40 @@ class TestRemindersGate(unittest.TestCase):
         seen = {}
 
         def fake_run(cmd, **kwargs):
-            seen["cmd"] = cmd
+            seen["cmd"], seen["env"] = cmd, kwargs.get("env") or {}
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="No reminders.\n", stderr="")
         with _env_without_optin(), patch.object(self.mod.subprocess, "run", side_effect=fake_run):
             self.assertEqual(self.mod.get_reminders(), [])
-        self.assertIn("--owner-asked", seen["cmd"])
+        self._assert_host_opt_in_passed(seen)
+
+    def _assert_host_opt_in_passed(self, seen):
+        """The verified host opt-in travels as the env consent, never as --owner-asked:
+        nobody asked in a conversation here, and the flag is what a bound task's tier refuses."""
+        self.assertNotIn("--owner-asked", seen["cmd"])
+        self.assertEqual(seen["env"].get("SUTANDO_ALLOW_NATIVE_PIM"), "1")
+
+    def test_without_the_macos_tools_skill_the_briefing_degrades_to_not_read(self):
+        """Core without skills/macos-tools: no crash, calendar and reminders say why."""
+        with patch.dict(sys.modules, {"native_pim_consent": None}):
+            mod = _load()
+        self.assertIsNone(mod.consent)
+        mod.CALENDAR_CACHE_FILE = Path("/nonexistent/calendar-today.json")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mod.STATE_DIR = Path(tmp.name)
+        runs = []
+        with patch.dict(os.environ, OPT_IN), \
+             patch.object(mod.subprocess, "run", side_effect=lambda *a, **k: runs.append(a)):
+            self.assertIsNone(mod.get_calendar_events())
+            self.assertIsNone(mod.get_reminders())
+        self.assertEqual(runs, [], "no osascript and no reminders.py without the policy module")
+        self.assertIn("macos-tools skill", mod.CALENDAR_UNREAD_NOTE)
+        self.assertIn("macos-tools skill", mod.REMINDERS_UNREAD_NOTE)
+        text = mod.synthesize(weather=None, events=None, reminders=None,
+                              discord_msgs=[], pending_qs=[], health_issues=[])
+        self.assertIn("macos-tools skill", text)
+        with _env_without_optin():
+            self.assertFalse(mod._native_pim_opted_in())
 
     def test_denial_detection_is_the_shared_policy(self):
         """Either spelling of the macOS refusal is a denial, via native_pim_consent.is_denied."""
@@ -255,14 +285,14 @@ class TestRemindersGate(unittest.TestCase):
         seen = {}
 
         def fake_run(cmd, **kwargs):
-            seen["cmd"] = cmd
+            seen["cmd"], seen["env"] = cmd, kwargs.get("env") or {}
             return subprocess.CompletedProcess(args=cmd, returncode=0,
                                                stdout="  [Work] today task (due x)\n", stderr="")
 
         with patch.dict(os.environ, OPT_IN), \
              patch.object(self.mod.subprocess, "run", side_effect=fake_run):
             items = self.mod.get_reminders()
-        self.assertIn("--owner-asked", seen["cmd"])
+        self._assert_host_opt_in_passed(seen)
         self.assertEqual(items, ["[Work] today task (due x)"])
 
 

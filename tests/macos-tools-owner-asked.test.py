@@ -20,6 +20,7 @@ lands in a per-test temp dir, never the real workspace.
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -61,7 +62,8 @@ class _Base:  # mixin: the per-script classes below are the TestCases
         self.err = io.StringIO()
         self.out = io.StringIO()
         self._tmp = tempfile.TemporaryDirectory()
-        self.state = Path(self._tmp.name)
+        self.state = Path(self._tmp.name) / "state"
+        self.state.mkdir()
         self._state_patch = patch.object(self.mod.consent, "state_dir", return_value=self.state)
         self._state_patch.start()
 
@@ -93,6 +95,18 @@ class _Base:  # mixin: the per-script classes below are the TestCases
         self.assertIn("mcp__claude_ai_Google_Calendar__", msg)
         self.assertIn("ask the owner", msg)
         self.assertIn("never re-prompt", msg)
+
+    def test_flag_is_refused_on_a_team_task_before_any_subprocess(self):
+        ws = self.state.parent
+        (ws / "state" / "bindings").mkdir(parents=True, exist_ok=True)
+        (ws / "tasks").mkdir(exist_ok=True)
+        (ws / "state" / "bindings" / "active-execution.json").write_text(json.dumps({"task_id": "t1"}))
+        (ws / "tasks" / "t1.txt").write_text("source: discord\naccess_tier: team\ntask: x\n")
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            code = self._run(self.argv_ok, lambda cmd: _done(cmd, stdout=self.ok_stdout))
+        self.assertEqual(code, self.mod.consent.EXIT_NO_CONSENT)
+        self.assertEqual(self.calls, [], "no osascript on another person's task")
+        self.assertIn("not the owner's", self.err.getvalue())
 
     def test_flag_runs_the_applescript_path(self):
         with _no_consent_env():
@@ -246,7 +260,8 @@ class TestConsentHelper(unittest.TestCase):
     def setUp(self):
         self.c = _load("native_pim_consent")
         self._tmp = tempfile.TemporaryDirectory()
-        self.state = Path(self._tmp.name)
+        self.state = Path(self._tmp.name) / "state"
+        self.state.mkdir()
         self._state_patch = patch.object(self.c, "state_dir", return_value=self.state)
         self._state_patch.start()
 
@@ -337,15 +352,145 @@ class TestConsentHelper(unittest.TestCase):
         self.assertIn("native_pim_consent.py grant", msg)
         self.assertIn("--owner-asked", msg)
 
-    def test_state_dir_falls_back_to_the_config_dir_walk(self):
+    def test_state_dir_is_the_repo_resolver_with_no_private_fallback(self):
         self._state_patch.stop()
         try:
-            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/nonexistent/ws/.claude-sutando"}), \
-                 patch.dict(sys.modules, {"workspace_default": None}):
-                self.assertEqual(self.c.state_dir(), Path("/nonexistent/ws/state"))
-                self.assertEqual(self.c._config_dir_workspace(), Path("/nonexistent/ws"))
-            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/nonexistent/plain"}):
-                self.assertTrue(str(self.c._config_dir_workspace()).endswith("sutando-workspace"))
+            ws = tempfile.TemporaryDirectory()
+            self.addCleanup(ws.cleanup)
+            with patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": ws.name}):
+                self.assertEqual(self.c.state_dir().resolve(), Path(ws.name).resolve() / "state")
+            with patch.dict(sys.modules, {"workspace_default": None}):
+                self.assertRaises(ImportError, self.c.state_dir)
+            self.assertFalse(hasattr(self.c, "_config_dir_workspace"))
+            self.assertNotIn("sutando-workspace", Path(self.c.__file__).read_text())
+        finally:
+            self._state_patch.start()
+
+    # ── The bound task's tier: consent counts only on the owner's own task ──
+    def _bind(self, tier, task_id="task-7"):
+        ws = self.state.parent
+        (ws / "state" / "bindings").mkdir(parents=True, exist_ok=True)
+        (ws / "tasks").mkdir(exist_ok=True)
+        (ws / "state" / "bindings" / "active-execution.json").write_text(
+            json.dumps({"task_id": task_id}))
+        body = f"source: discord\nuser_id: 1\naccess_tier: {tier}\ntask: read my calendar\n" \
+            if tier else "source: discord\ntask: read my calendar\n"
+        (ws / "tasks" / f"{task_id}.txt").write_text(body)
+
+    def _require(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                return self.c.require_consent("Calendar", argv), err.getvalue()
+            except SystemExit as e:
+                return e.code, err.getvalue()
+
+    def test_team_task_refuses_every_form_of_consent_inside_the_agent_session(self):
+        self._bind("team")
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertEqual(self.c.bound_task_tier(), "team")
+            self.assertTrue(self.c.not_owner_task())
+            code, err = self._require(["x.py", "list", "--owner-asked"])
+            self.assertEqual(code, self.c.EXIT_NO_CONSENT)
+            self.assertIn("not the owner's", err)
+            self.assertIn("composio_find", err)
+            self.assertEqual(self._require(["x.py", "list"])[0], self.c.EXIT_NO_CONSENT,
+                             "no consent at all is still refused")
+        with patch.dict(os.environ, {"CLAUDECODE": "1", "SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+            self.assertEqual(self._require(["x.py", "list"])[0], self.c.EXIT_NO_CONSENT,
+                             "the env consent does not count on a team task")
+        self.c.grant()
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertEqual(self._require(["x.py", "list"])[0], self.c.EXIT_NO_CONSENT,
+                             "the persisted marker does not count on a team task")
+
+    def test_guest_and_unreadable_tiers_are_refused_like_team(self):
+        for tier in ("guest", "other", "not-a-tier"):
+            self._bind(tier)
+            with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+                self.assertEqual(self._require(["x.py", "--owner-asked"])[0], self.c.EXIT_NO_CONSENT, tier)
+
+    def test_owner_task_and_no_binding_pass(self):
+        for tier in ("owner", None):
+            self._bind(tier)
+            with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+                self.assertEqual(self._require(["x.py", "--owner-asked"])[0], ["x.py"], tier)
+        ws = self.state.parent
+        (ws / "state" / "bindings" / "active-execution.json").write_text(json.dumps({"task_id": "gone"}))
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertIsNone(self.c.bound_task_tier())
+            self.assertEqual(self._require(["x.py", "--owner-asked"])[0], ["x.py"], "dangling binding")
+        (ws / "state" / "bindings" / "active-execution.json").write_text("{not json")
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertEqual(self._require(["x.py", "--owner-asked"])[0], ["x.py"], "unreadable binding")
+        (ws / "state" / "bindings" / "active-execution.json").write_text(json.dumps({"task_id": "../x"}))
+        with _no_consent_env(), patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertIsNone(self.c.bound_task_tier(), "path-shaped task id is ignored")
+
+    def test_outside_the_agent_session_the_binding_is_not_ours(self):
+        """A cron (the morning briefing) is not the core's bound task: the tier does not apply."""
+        self._bind("team")
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "SUTANDO_ALLOW_NATIVE_PIM")}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(self.c.in_agent_session())
+            self.assertFalse(self.c.not_owner_task())
+            self.assertEqual(self._require(["x.py", "--owner-asked"])[0], ["x.py"])
+
+    # ── check / report-error: what the voice tool runs, through the same policy ──
+    def test_check_is_denial_then_host_opt_in_and_never_the_flag(self):
+        with _no_consent_env():
+            v = self.c.check("Contacts")
+            self.assertFalse(v["allowed"])
+            self.assertEqual(v["reason"], "no-consent")
+            self.assertIn("native_pim_consent.py grant", v["message"])
+            self.assertIn("SUTANDO_ALLOW_NATIVE_PIM=1", v["message"])
+            self.assertNotIn("--owner-asked", v["message"], "the inline tool has no flag to pass")
+        with patch.dict(os.environ, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+            self.assertEqual(self.c.check("Contacts"), {"allowed": True, "reason": None, "message": None})
+        with patch.dict(os.environ, {"SUTANDO_ALLOW_NATIVE_PIM": "10"}):
+            self.assertFalse(self.c.check("Contacts")["allowed"])
+        self.c.grant()
+        with _no_consent_env():
+            self.assertTrue(self.c.check("Contacts")["allowed"])
+        self.c.record_denial("Contacts")
+        with patch.dict(os.environ, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+            v = self.c.check("Contacts")
+            self.assertEqual(v["reason"], "denied")
+            self.assertIn("Privacy & Security", v["message"])
+            self.assertTrue(self.c.check("Reminders")["allowed"], "denials are per app")
+
+    def test_report_error_records_only_a_macos_denial(self):
+        self.assertEqual(self.c.report_error("Contacts", "boom (-600)"), {"denied": False, "message": None})
+        self.assertFalse(self.c.denied_earlier("Contacts"))
+        v = self.c.report_error("Contacts", DENIED)
+        self.assertTrue(v["denied"])
+        self.assertIn("not asking again", v["message"])
+        self.assertTrue(self.c.denied_earlier("Contacts"))
+
+    def test_cli_check_and_report_error_print_json_for_a_given_workspace(self):
+        ws = tempfile.TemporaryDirectory()
+        self.addCleanup(ws.cleanup)
+        self._state_patch.stop()
+        try:
+            out = io.StringIO()
+            with _no_consent_env(), contextlib.redirect_stdout(out):
+                self.assertEqual(self.c.main(["check", "Contacts", "--workspace", ws.name]), 0)
+            self.assertEqual(json.loads(out.getvalue())["reason"], "no-consent")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.c.main(["report-error", "Contacts", "--workspace", ws.name,
+                                              "--error", DENIED]), 0)
+            self.assertTrue(json.loads(out.getvalue())["denied"])
+            self.assertTrue((Path(ws.name) / "state" / "contacts-automation-denied").exists())
+            out = io.StringIO()
+            with patch.dict(os.environ, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}), contextlib.redirect_stdout(out):
+                self.assertEqual(self.c.main(["--workspace", ws.name, "check", "Contacts"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["reason"], "denied")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self.c.main(["check", "Safari"]), 1)
+                self.assertEqual(self.c.main(["report-error"]), 1)
+            self.assertIn("Usage", err.getvalue())
         finally:
             self._state_patch.start()
 

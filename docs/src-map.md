@@ -117,7 +117,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
 - **`migration_safety_helpers.sh`** — shellcheck shell=bash PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
-- **`native-pim-consent.ts`** — Native PIM consent — the TS twin of skills/macos-tools/scripts/native_pim_consent.py.
+- **`native-pim-consent.ts`** — Native PIM consent — the voice-process client of skills/macos-tools/scripts/native_pim_consent.py.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.

@@ -30,7 +30,10 @@ from util_paths import personal_path  # noqa: E402
 
 _MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
 sys.path.insert(0, str(_MACOS_TOOLS_SCRIPTS))
-import native_pim_consent as consent  # noqa: E402  (the one denial/opt-in policy)
+try:
+    import native_pim_consent as consent  # noqa: E402  (the one denial/opt-in policy)
+except ImportError:  # the skill is optional: without it the local apps are simply not read
+    consent = None
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -48,6 +51,10 @@ NO_CALENDAR_SOURCE_NOTE = (
     "Connect Google Calendar via Settings → Integrations, or set "
     "MORNING_BRIEFING_CALENDAR_SOURCE=macos to use the local Calendar app."
 )
+NO_MACOS_TOOLS_NOTE = (
+    "I couldn't read your calendar: the local Calendar app needs the macos-tools skill, "
+    "which is not installed. Connect Google Calendar via Settings → Integrations."
+)
 CALENDAR_DENIED_NOTE = (
     "I couldn't read your calendar: macOS denied Calendar access "
     "(System Settings → Privacy & Security → Automation); I won't ask again."
@@ -58,6 +65,7 @@ NO_REMINDERS_SOURCE_NOTE = (
     "Reminders not read: the local Reminders app is opt-in "
     "(set MORNING_BRIEFING_CALENDAR_SOURCE=macos to include it)."
 )
+NO_REMINDERS_SKILL_NOTE = "Reminders not read: the local Reminders app needs the macos-tools skill."
 
 # Weather codes → one-word description
 WEATHER_CODES = {
@@ -270,7 +278,7 @@ def _native_pim_opted_in() -> bool:
         return True
     if (config_get_env_first("SUTANDO_ALLOW_NATIVE_PIM", "") or "").strip() == "1":
         return True
-    return consent.consent_marker(STATE_DIR).exists()
+    return consent is not None and consent.consent_marker(STATE_DIR).exists()
 
 
 def _calendar_denied_marker() -> Path:
@@ -370,6 +378,11 @@ def _read_local_calendar() -> list[dict] | None:
     """One AppleScript read of Calendar.app — never launches the app, never retries.
     A stored denial (-1743) is final: recorded once, later runs skip the read."""
     global CALENDAR_UNREAD_NOTE
+    if consent is None:
+        CALENDAR_UNREAD_NOTE = NO_MACOS_TOOLS_NOTE
+        print("  calendar: local read needs the macos-tools skill (native_pim_consent); not installed",
+              file=sys.stderr)
+        return None
     marker = _calendar_denied_marker()
     if marker.exists():
         CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
@@ -442,12 +455,17 @@ def get_reminders() -> "list[str] | None":
               "(MORNING_BRIEFING_CALENDAR_SOURCE=macos); not read", file=sys.stderr)
         return None
     script_path = _MACOS_TOOLS_SCRIPTS / "reminders.py"
-    if not script_path.exists():
+    if consent is None or not script_path.exists():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SKILL_NOTE
+        print("  reminders: local read needs the macos-tools skill; not installed", file=sys.stderr)
         return None
     try:
+        # The host opt-in was verified above; it is passed as the env consent,
+        # never as --owner-asked (nobody asked in a conversation here).
         r = subprocess.run(
-            [sys.executable, str(script_path), "list", "--due-today", "--owner-asked"],
-            capture_output=True, text=True, timeout=10
+            [sys.executable, str(script_path), "list", "--due-today"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, consent.ENV: "1"},
         )
         if r.returncode != 0:
             return None

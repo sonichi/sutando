@@ -93,6 +93,18 @@ DENIED = [
     "shortcuts run MyShortcut --input-path x.txt",
     "osascript ~/scripts/dump-calendar.scpt",
     "osascript /tmp/contacts-export.applescript",
+    # command position is what counts: wrappers, substitutions, subshells, later segments
+    "bash -c 'open -a Calendar'",
+    "sh -c \"osascript -e 'tell application \\\"Contacts\\\" to get every person'\"",
+    "grep -l x *.txt | xargs open -a Reminders",
+    "echo $(osascript -e 'tell application \"Calendar\" to launch')",
+    "sudo open -a Contacts",
+    "(open -a Calendar)",
+    "{ open -a Calendar; }",
+    "grep foo bar; open -a Calendar",
+    "osascript -l JavaScript -e 'var a = 1; Application(\"Calendar\").calendars()'",
+    "osascript <<'EOF'\ntell application \"Calendar\"\nget every calendar\nend tell\nEOF",
+    "/usr/bin/osascript -e 'tell application \"Reminders\" to get every list'",
 ]
 for cmd in DENIED:
     r = bash(cmd)
@@ -139,6 +151,13 @@ ALLOWED = [
     "shortcuts list",
     "osascript -e 'tell application id \"com.apple.Safari\" to activate'",
     "python3 skills/macos-tools/scripts/native_pim_consent.py status",
+    # Read-only commands that quote an app command are reads, not launches.
+    'grep -rn "open -gja Calendar" src/',
+    "grep -n osascript f | grep 'application \"Calendar\"'",
+    'git log -S "open -a Contacts" --oneline',
+    "cat hooks/native-pim-guard.py",
+    "rg 'tell application \"Reminders\"' skills/",
+    "echo 'open -a Calendar' > notes.txt",
 ]
 for cmd in ALLOWED:
     r = bash(cmd)
@@ -188,6 +207,49 @@ for cmd in ["python3 skills/macos-tools/scripts/native_pim_consent.py grant",
     r = bash(cmd, ws=ws_marker)
     check(f"grant is denied to the agent: {cmd[:60]}",
           decision(r) == "deny" and "own terminal" in reason_of(r), r.stdout[:120])
+
+# …and no other spelling of "write the consent record" gets past either: the marker
+# path, its denial-marker siblings, and any Python that drives the policy module.
+MARKER = WS / "state" / "native-pim-consent"
+for cmd in [f"touch {MARKER}",
+            f"echo owner > {MARKER}",
+            "printf owner >> state/native-pim-consent",
+            f"cd {WS}/state && touch native-pim-consent",
+            f"echo owner | tee {MARKER}",
+            f"cp /dev/null {MARKER}",
+            f"mkdir -p {WS}/state && date > {WS}/state/native-pim-consent",
+            f"python3 -c \"open('{MARKER}', 'w').close()\"",
+            "python3 -c 'import native_pim_consent as c; c.grant()'",
+            "python3 -c 'import sys; sys.path.insert(0, \"skills/macos-tools/scripts\"); import native_pim_consent; native_pim_consent.grant()'",
+            "python3 - <<'EOF'\nimport native_pim_consent\nnative_pim_consent.grant()\nEOF",
+            "python3 -m native_pim_consent grant",
+            "python3 skills/macos-tools/scripts/native_pim_consent.py check Calendar",
+            f"rm {WS}/state/calendar-automation-denied",
+            "rm -f state/contacts-automation-denied state/reminders-automation-denied",
+            f"cat /dev/null > {WS}/state/reminders-automation-denied",
+            "find . -name native-pim-consent -delete",
+            f"sed -i '' d {MARKER}",
+            f"ls; touch {MARKER}"]:
+    r = bash(cmd, ws=ws_marker)
+    check(f"consent record write is denied: {cmd[:60]!r}",
+          decision(r) == "deny" and "own terminal" in reason_of(r), r.stdout[:120])
+check("no marker was written by the probes themselves", not MARKER.exists())
+
+# Reading the record, or the sources that mention it, is not writing it.
+for cmd in [f"cat {MARKER}",
+            f"ls -la {WS}/state/",
+            f"test -f {MARKER} && echo present",
+            "grep -rn native-pim-consent src/ hooks/",
+            "git grep -n native_pim_consent",
+            "cat src/native-pim-consent.ts",
+            "grep -rn automation-denied src/morning-briefing.py",
+            "python3 skills/macos-tools/scripts/native_pim_consent.py revoke",
+            "python3 tests/native-pim-guard.test.py",
+            "npx tsx --test tests/call-contact-consent.test.ts",
+            "cat state/calendar-automation-denied"]:
+    r = bash(cmd, ws=ws_marker)
+    check(f"consent record read is allowed: {cmd[:60]}",
+          r.returncode == 0 and decision(r) is None and not r.stdout.strip(), r.stdout[:120])
 
 # ── Consent counts only on the owner's own task (state/bindings → tasks/<id>.txt) ──
 def _bind(ws, tier, task_id="task-42"):
@@ -239,27 +301,28 @@ check("unreadable binding: self-attested prefix still lifts", r.returncode == 0 
 r = bash("SUTANDO_ALLOW_NATIVE_PIM=1 open -a Calendar", ws=ws_dangling)
 check("binding with a path-shaped task id is ignored", r.returncode == 0 and not r.stdout.strip(), r.stdout[:120])
 
-# ── Unit: decide() and the workspace fallback, in-process ────────────────────
+# ── Unit: decide() in-process; the policy is the consent module's, not a copy ──
 import importlib.util  # noqa: E402
 spec = importlib.util.spec_from_file_location("native_pim_guard", HOOK)
 guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
-check("decide: unrelated command allowed", guard.decide("ls -la", WS) is None)
-check("decide: grant denied before anything else", guard.decide("python3 native_pim_consent.py grant", WS) == guard.REASON_GRANT)
+STATE = WS / "state"
+check("decide: unrelated command allowed", guard.decide("ls -la", STATE) is None)
+check("decide: grant denied before anything else", guard.decide("python3 native_pim_consent.py grant", STATE) == guard.REASON_GRANT)
+check("decide: marker write denied before anything else", guard.decide("touch state/native-pim-consent", STATE) == guard.REASON_MARKER)
 os.environ.pop("SUTANDO_ALLOW_NATIVE_PIM", None)
-check("decide: app command without consent denied", guard.decide("open -a Reminders", WS) == guard.REASON)
-saved = dict(os.environ)
-try:
-    os.environ["CLAUDE_CONFIG_DIR"] = "/nonexistent/ws/.claude-sutando"
-    sys.modules["workspace_default"] = None
-    check("workspace fallback: config-dir walk", guard._workspace() == Path("/nonexistent/ws"))
-    os.environ["CLAUDE_CONFIG_DIR"] = "/nonexistent/plain"
-    check("workspace fallback: no .claude-sutando ancestor → home default",
-          str(guard._workspace()).endswith("sutando-workspace"))
-finally:
-    sys.modules.pop("workspace_default", None)
-    os.environ.clear()
-    os.environ.update(saved)
+check("decide: app command without consent denied", guard.decide("open -a Reminders", STATE) == guard.REASON)
+check("decide: unresolvable workspace = no consent evidence → still denied", guard.decide("open -a Reminders", None) == guard.REASON)
+check("decide: unresolvable workspace leaves unrelated commands alone", guard.decide("ls", None) is None)
+check("no private workspace fallback in the hook", not hasattr(guard, "_workspace") and "sutando-workspace" not in Path(HOOK).read_text())
+check("marker names and the bound tier come from native_pim_consent",
+      guard.consent.__name__ == "native_pim_consent" and not hasattr(guard, "bound_task_tier")
+      and guard.MARKER_FILE.search("state/" + guard.consent.CONSENT_MARKER) is not None
+      and guard.MARKER_FILE.search("src/native-pim-consent.ts") is None)
+check("tier of the bound team task is read through the consent module",
+      guard.consent.bound_task_tier(ws_team / "state") == "team")
+check("segments: env prefix skipped, wrapper and read-only words recognised",
+      [w for w, _ in guard.segments("X=1 osascript -e 'a'; grep b | xargs open")] == ["osascript", "grep", "xargs"])
 
 # ── Bad input: fail-OPEN (exit 0, no deny) — never wedge the core ─────────────
 r = run("this is not json")

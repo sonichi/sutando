@@ -6,17 +6,25 @@ Driving those apps (``osascript``/JXA ``tell application "Calendar"``, ``open -a
 Calendar``, a script file or ``shortcuts run`` that can do the same) raises a
 macOS Automation permission prompt on the owner's screen. Calendar work goes
 through the Station connector; the local apps are only for an owner who asked.
+Only the command at command position counts (start, or after ``;`` ``&&`` ``|``
+``(`` ``$(`` and the like): ``grep "open -a Calendar" src/`` is a read and passes;
+a wrapper such as ``bash -c``, ``xargs`` or ``sudo`` is scanned whole.
 
 Consent, any of: the command's env prefix ``SUTANDO_ALLOW_NATIVE_PIM=1`` (at
 command position), that variable in the hook's own environment, or the persisted
 host opt-in ``<workspace>/state/native-pim-consent`` written by the owner with
-``native_pim_consent.py grant`` — a command this hook denies to the agent, so the
-owner runs it in their own terminal. The consent counts only on the owner's own
-task: when ``state/bindings/active-execution.json`` names the running task and
-its file resolves to a non-owner tier, the hatch is ignored. Without a binding
-the consent is self-attested (the model wrote the string), so this hook guards
-against acting on the agent's own initiative and is not an authorisation
-boundary. Fail-OPEN on any error, like gmail-write-guard.py.
+``native_pim_consent.py grant``. The agent never writes that consent: ``grant``,
+any command that names ``state/native-pim-consent`` or a ``*-automation-denied``
+marker outside a read-only command, and any Python that imports
+``native_pim_consent`` are denied, so the owner runs ``grant`` in their own
+terminal. The consent counts only on the owner's own task: when
+``state/bindings/active-execution.json`` names the running task and its file
+resolves to a non-owner tier, the hatch is ignored. Without a binding the consent
+is self-attested (the model wrote the string), so this hook guards against acting
+on the agent's own initiative and is not an authorisation boundary. The policy
+itself (marker names, host opt-in, bound tier) is ``native_pim_consent.py``;
+this hook only parses the command. Fail-OPEN on any error, like
+gmail-write-guard.py.
 """
 import json
 import os
@@ -24,14 +32,21 @@ import re
 import sys
 from pathlib import Path
 
+_REPO = Path(__file__).resolve().parents[1]
+for _p in (_REPO / "src", _REPO / "skills" / "macos-tools" / "scripts"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+import native_pim_consent as consent  # noqa: E402  (the one consent policy)
+
 APPS = r"(?:Calendar|iCal|Reminders|Contacts|Address\s?Book)"
 BUNDLES = r"com\.apple\.(?:iCal|reminders|AddressBook)"
 
-# AppleScript/JXA targets by name or bundle id: `tell application "Calendar"`,
-# `application id "com.apple.iCal"`, `Application("Contacts")`, `using terms from …`.
+# AppleScript/JXA targets by name or bundle id (`tell application "Calendar"`, `application id
+# "com.apple.iCal"`, `Application("Contacts")`); a quote may carry a shell escape (`sh -c "…\"Calendar\"…"`).
+Q = r"""\\?["']"""
 SCRIPT_TARGET = re.compile(
-    r"""(?:\bapp(?:lication)?\s*["']\s*%s\s*["']|\bapplication\s+id\s*["']%s["']"""
-    r"""|\bApplication\s*\(\s*["'](?:%s|%s)["']\s*\))""" % (APPS, BUNDLES, APPS, BUNDLES),
+    r"""(?:\bapp(?:lication)?\s*%s\s*%s\s*%s|\bapplication\s+id\s*%s%s%s"""
+    r"""|\bApplication\s*\(\s*%s(?:%s|%s)%s\s*\))""" % (Q, APPS, Q, Q, BUNDLES, Q, Q, APPS, BUNDLES, Q),
     re.IGNORECASE,
 )
 # `open -a Calendar`, `open -gja Reminders`, `open -b com.apple.iCal`,
@@ -46,12 +61,38 @@ SCRIPT_FILE = re.compile(r"""\bosascript\b[^;&|\n]*?\s(["']?)([^\s"';&|]+\.(?:sc
                          re.IGNORECASE)
 SHORTCUTS_RUN = re.compile(r"\bshortcuts\s+run\b")
 GRANT_COMMAND = re.compile(r"native_pim_consent(?:\.py)?\s+grant\b")
+CONSENT_MODULE = re.compile(r"\bnative_pim_consent\b")
+# The CLI reads the state (`status`) or narrows it (`revoke`): the only module uses allowed.
+CONSENT_READ_CLI = re.compile(r"^(?:\S*python[0-9.]*\s+)?\S*native_pim_consent\.py\s+(?:status|revoke)\s*$")
+# The marker files by name; the TS/JS/doc sources that mention them are not the markers.
+MARKER_FILE = re.compile(
+    r"\b(?:%s|(?:%s)%s)\b(?!\.(?:ts|js|mjs|md|py))" % (
+        re.escape(consent.CONSENT_MARKER),
+        "|".join(a.lower() for a in consent.APPS),
+        re.escape(consent.DENIAL_MARKER_SUFFIX)),
+    re.IGNORECASE,
+)
 # The token must sit at command position (start, after ; & | ( or an env-prefix
 # chain), so `echo SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count.
 ESCAPE_HATCH = re.compile(
     r"(?:^|[;&|(`\n])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*SUTANDO_ALLOW_NATIVE_PIM=1(?:\s|$)"
 )
 SCRIPT_FILE_READ_LIMIT = 65536
+
+# Not `(` alone: JXA `Application("Calendar")` must stay in one piece; `$(` and
+# backticks do split, and a leading `(`/`{` is stripped from the segment.
+SEGMENT_SPLIT = re.compile(r"(?:\|\||&&|[;|&\n`]|\$\()")
+ENV_PREFIX = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
+# Commands that only read: an app name or a marker path inside them is text, not an action.
+READ_ONLY = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "git", "cat", "head", "tail", "less", "more",
+    "wc", "ls", "stat", "file", "diff", "echo", "printf", "test", "[", "which", "type",
+})
+# Wrappers hand their arguments to another command: scan the whole segment.
+WRAPPERS = frozenset({
+    "sudo", "env", "command", "nohup", "time", "nice", "xargs", "caffeinate", "bash", "sh",
+    "zsh", "eval", "exec", "builtin", "script", "timeout", "gtimeout", "watch",
+})
 
 ORDER = (
     "Order: (1) the Station connector first: composio_find {\"apps\": [\"google calendar\"]} then "
@@ -79,11 +120,30 @@ REASON_GRANT = (
     "their own terminal, never by the agent. Tell the owner the command if they want the local "
     "Calendar/Reminders/Contacts apps used on this host. [native-pim-guard]"
 )
+REASON_MARKER = (
+    "Blocked: state/native-pim-consent and the *-automation-denied markers are the owner's consent "
+    "record, and native_pim_consent is the policy behind it; the agent never writes, deletes or "
+    "drives them. Read the state with `python3 skills/macos-tools/scripts/native_pim_consent.py "
+    "status`; the owner grants with `… grant` in their own terminal, never the agent. "
+    "[native-pim-guard]"
+)
 
 
-def _script_file_targets(command: str) -> bool:
+def segments(command: str):
+    """(command word, segment text) per shell segment; env-prefix assignments skipped."""
+    out = []
+    for raw in SEGMENT_SPLIT.split(command):
+        seg = ENV_PREFIX.sub("", raw.strip().lstrip("({ \t"), count=1)
+        if not seg:
+            continue
+        word = os.path.basename(seg.split(None, 1)[0].strip("\"'"))
+        out.append((word.lower(), seg))
+    return out
+
+
+def _script_file_targets(segment: str) -> bool:
     """An osascript script file: the name or its first 64 KB names one of the apps."""
-    for _q, path in SCRIPT_FILE.findall(command):
+    for _q, path in SCRIPT_FILE.findall(segment):
         if re.search(r"(?:%s|%s)" % (APPS, BUNDLES), os.path.basename(path), re.IGNORECASE):
             return True
         try:
@@ -96,74 +156,84 @@ def _script_file_targets(command: str) -> bool:
     return False
 
 
+def _segment_targets(word: str, seg: str, rest: str) -> bool:
+    if word in READ_ONLY:
+        return False
+    if word == "open":
+        return bool(OPEN_APP.search(seg))
+    if word == "shortcuts":
+        return bool(SHORTCUTS_RUN.search(seg))
+    # A runner's script may continue past a `;` or a heredoc line; a wrapper's
+    # argument is itself a command: both are scanned from here to the end.
+    if word in ("osascript", "automator"):
+        return bool(SCRIPT_TARGET.search(rest)) or _script_file_targets(rest)
+    if word in WRAPPERS:
+        if OPEN_APP.search(rest) or SHORTCUTS_RUN.search(rest):
+            return True
+        if SCRIPT_RUNNER.search(rest) and SCRIPT_TARGET.search(rest):
+            return True
+        return _script_file_targets(rest)
+    return False
+
+
 def targets_native_pim(command: str) -> bool:
-    """True when the Bash command scripts or launches one of the apps."""
-    if OPEN_APP.search(command) or SHORTCUTS_RUN.search(command):
-        return True
-    if SCRIPT_RUNNER.search(command) and SCRIPT_TARGET.search(command):
-        return True
-    return _script_file_targets(command)
+    """True when a command at command position scripts or launches one of the apps."""
+    segs = segments(command)
+    for i, (word, seg) in enumerate(segs):
+        rest = "\n".join(s for _w, s in segs[i:])
+        if _segment_targets(word, seg, rest):
+            return True
+    return False
 
 
-def _workspace() -> Path:
-    """The repo resolver when importable (same answer as native_pim_consent.py), else the config-dir walk."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    try:
-        from workspace_default import resolve_workspace
-        return Path(resolve_workspace())
-    except Exception:
-        pass
-    p = os.path.normpath(os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
-    while True:
-        if os.path.basename(p) == ".claude-sutando":
-            return Path(os.path.dirname(p))
-        parent = os.path.dirname(p)
-        if parent == p:
-            return Path(os.path.expanduser("~/sutando-workspace"))
-        p = parent
+def _redirects_to_marker(seg: str) -> bool:
+    return any(MARKER_FILE.search(t) for t in re.findall(r">{1,2}\s*[\"']?([^\s\"']+)", seg))
 
 
-def consent_marker_present(ws: Path) -> bool:
-    return (ws / "state" / "native-pim-consent").exists()
-
-
-def bound_task_tier(ws: Path):
-    """Tier of the task bound to this session, or None when nothing is bound or readable."""
-    try:
-        with open(ws / "state" / "bindings" / "active-execution.json") as f:
-            task_id = str(json.load(f).get("task_id") or "")
-    except (OSError, ValueError):
-        return None
-    if not task_id or "/" in task_id or task_id.startswith("."):
-        return None
-    task_file = ws / "tasks" / f"{task_id}.txt"
-    if not task_file.exists():
-        return None
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    try:
-        from policy.egress.result import resolve_access_tier
-    except Exception:
-        return None
-    return resolve_access_tier(task_file)
-
-
-def consent_given(command: str, ws: Path) -> bool:
-    return bool(ESCAPE_HATCH.search(command)) or \
-        os.environ.get("SUTANDO_ALLOW_NATIVE_PIM", "").strip() == "1" or \
-        consent_marker_present(ws)
-
-
-def decide(command: str, ws: Path):
-    """The deny reason for this command, or None to allow."""
+def touches_consent(command: str):
+    """REASON_GRANT for the owner's grant command, REASON_MARKER for any other write to or
+    use of the consent record / policy module, else None. Read-only commands pass."""
     if GRANT_COMMAND.search(command):
         return REASON_GRANT
+    for word, seg in segments(command):
+        if word in READ_ONLY:
+            if _redirects_to_marker(seg):
+                return REASON_MARKER
+            continue
+        if MARKER_FILE.search(seg):
+            return REASON_MARKER
+        if CONSENT_MODULE.search(seg) and not CONSENT_READ_CLI.match(seg):
+            return REASON_MARKER
+    return None
+
+
+def _state():
+    """``<workspace>/state`` via the consent module's resolver, or None when it cannot resolve."""
+    try:
+        return consent.state_dir()
+    except Exception:
+        return None
+
+
+def consent_given(command: str, state) -> bool:
+    if ESCAPE_HATCH.search(command) or consent.env_allows():
+        return True
+    return state is not None and consent.host_opted_in(state)
+
+
+def decide(command: str, state):
+    """The deny reason for this command, or None to allow."""
+    reason = touches_consent(command)
+    if reason:
+        return reason
     if not targets_native_pim(command):
         return None
-    if not consent_given(command, ws):
+    if not consent_given(command, state):
         return REASON
-    tier = bound_task_tier(ws)
-    if tier is not None and tier != "owner":
-        return REASON_NOT_OWNER_TASK
+    if state is not None:
+        tier = consent.bound_task_tier(state)
+        if tier is not None and tier != "owner":
+            return REASON_NOT_OWNER_TASK
     return None
 
 
@@ -172,7 +242,7 @@ def main() -> None:
     if str(data.get("tool_name") or "") != "Bash":
         sys.exit(0)
     command = str((data.get("tool_input") or {}).get("command") or "")
-    reason = decide(command, _workspace())
+    reason = decide(command, _state())
     if reason:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",

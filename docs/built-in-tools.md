@@ -20,9 +20,11 @@ permission prompt on the owner's screen (the `native-pim-guard` hook denies it).
 asked for the local app in this conversation: run the `skills/macos-tools` script with `--owner-asked`
 (raw commands need the `SUTANDO_ALLOW_NATIVE_PIM=1` prefix). The owner can allow the local apps for
 the host once with `python3 skills/macos-tools/scripts/native_pim_consent.py grant` in their own
-terminal (`revoke` / `status` too) — tell them the command, never run it yourself. That flag and
+terminal (`revoke` / `status` too) — tell them the command, never run it yourself, and never write
+`state/native-pim-consent` (or delete a `*-automation-denied` marker) any other way: the hook denies
+`touch`, redirects, `python3 -c "…grant()"` and every other spelling. That flag and
 prefix are strings you write: they keep you from acting on your own initiative, they do not prove
-who asked, and on a non-owner task the hook ignores them (`hooks/README.md`). Once the owner denied
+who asked, and on a non-owner task the hook and the scripts both refuse them (`hooks/README.md`). Once the owner denied
 the permission (`-1743`, stored in `state/<app>-automation-denied`), never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
 ```bash
@@ -95,7 +97,9 @@ The voice/phone `call_contact` inline tool ("call Mary", "find Bob's number") is
 Contacts path: it runs in the voice process, which has no Station client, so it searches the local
 Contacts app only behind the host opt-in (`SUTANDO_ALLOW_NATIVE_PIM=1` in the server env, or the
 `native_pim_consent.py grant` marker); otherwise it answers with what the owner must do once, and a
-stored macOS denial makes it answer "denied" without opening the app.
+stored macOS denial makes it answer "denied" without opening the app. It asks `native_pim_consent.py
+check` / `report-error` for that verdict (one policy, no TypeScript copy); if that check cannot run,
+the app is not opened.
 
 **Google Contacts — writable in practice, but NOT via a contract Google supports.** The entry above
 is macOS Contacts and is lookup-only. It is not the only contacts path: on 2026-09-04 an agent that

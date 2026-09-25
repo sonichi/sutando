@@ -12,7 +12,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { isMacOS, macOSOnlyError } from './platform.js';
 import { requirePython } from './python-binary.js';
-import { checkNativePimConsent, denialMessage, isDenialError, recordNativePimDenial } from './native-pim-consent.js';
+import { checkNativePimConsent, reportNativePimError } from './native-pim-consent.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -227,10 +227,10 @@ end tell`;
 				} catch (err) {
 					const stderr = (err as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
 					const text = `${stderr} ${err instanceof Error ? err.message : String(err)}`;
-					if (isDenialError(text)) {
-						recordNativePimDenial('Contacts', deps.workspace);
+					const verdict = reportNativePimError('Contacts', text, { env: deps.env, workspace: deps.workspace });
+					if (verdict.denied) {
 						console.log(`${ts()} [CallContact] macOS denied Contacts automation; recorded, not retrying`);
-						return { status: 'denied', contactsSearched: false, instruction: denialMessage('Contacts') };
+						return { status: 'denied', contactsSearched: false, instruction: verdict.message };
 					}
 					throw err;
 				}

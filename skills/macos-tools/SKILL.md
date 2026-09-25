@@ -24,7 +24,12 @@ python3 "$SKILL_DIR/scripts/native_pim_consent.py" status    # marker, env var, 
 python3 "$SKILL_DIR/scripts/native_pim_consent.py" revoke
 ```
 `--owner-asked` and `SUTANDO_ALLOW_NATIVE_PIM=1` are strings you write: they stop you acting on your
-own initiative, they do not prove who asked (see `hooks/README.md`, native-pim-guard).
+own initiative, they do not prove who asked (see `hooks/README.md`, native-pim-guard). Where the
+session says whose task is running (`state/bindings/active-execution.json`), the scripts refuse every
+form of consent on a non-owner task (exit 2, "not the owner's"). The consent record itself —
+`state/native-pim-consent` and the `*-automation-denied` markers — is the owner's: never write, copy,
+delete or `touch` it, and never import `native_pim_consent` to call `grant()`; the hook denies all of
+those, and `status` is how you read the state.
 
 ## When to Use
 

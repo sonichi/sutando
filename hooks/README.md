@@ -198,10 +198,15 @@ Station connector first (`composio_find {"apps": ["google calendar"]}` →
 `composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
 present, then ask the owner; and never re-prompt once the owner denied the
 permission. Driving those apps raises a macOS Automation prompt on the owner's
-screen (user report, 2026-09-24). Unrelated `osascript`/`open` commands and every
-non-Bash tool pass through. Known gaps: a script file that names the app only
-indirectly, and read-only commands that quote an app command (`grep "open -a
-Calendar"`) are denied like the real thing — re-run with the prefix.
+screen (user report, 2026-09-24). Only a command at **command position** counts
+(the start, or after `;`, `&&`, `||`, `|`, `$(`, a backtick, `(`/`{`, an env-prefix
+chain): `grep -rn "open -gja Calendar" src/`, `git log -S "open -a Contacts"` and
+`grep osascript f | grep 'application "Calendar"'` are reads and pass, while a
+wrapper (`bash -c`, `sh -c`, `xargs`, `sudo`, `env`, `eval`, …) is scanned whole and
+an `osascript` heredoc or `;`-joined script is scanned to the end of the command.
+Unrelated `osascript`/`open` commands and every non-Bash tool pass through. Known
+gap: a script file that names the app only indirectly, or a split string such as
+`"Cont"&"acts"` — a best-effort regex.
 
 Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
 position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
@@ -209,8 +214,18 @@ SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count), that variable in 
 hook's own environment, or the owner's persisted host opt-in
 `<workspace>/state/native-pim-consent`, written by `python3
 skills/macos-tools/scripts/native_pim_consent.py grant` in the **owner's own
-terminal** — the hook denies the agent running `grant` itself. Fail-OPEN on hook
-errors.
+terminal**. The agent never writes that record: the hook denies `grant`, any command
+outside a read-only one (`cat`, `ls`, `grep`, `git`, `test`, …) that names
+`native-pim-consent` or a `*-automation-denied` marker — `touch`, `echo … >`, `tee`,
+`cp`, `rm`, `python3 -c "open(…)"`, `sed -i` — and any Python that imports or runs
+`native_pim_consent` other than the CLI's `status`/`revoke`. A redirect onto the
+marker is denied even from a read-only command. Fail-OPEN on hook errors.
+
+**One policy.** The marker names, the host opt-in and the bound task's tier are
+`native_pim_consent.py`'s (`skills/macos-tools/scripts/`), which this hook imports;
+the hook only parses the command line. The scripts, the morning briefing and the
+voice `call_contact` tool (through `native_pim_consent.py check` / `report-error`)
+read the same module, so there is no second copy to drift.
 
 **What this consent is, honestly.** The prefix and the env var are strings the
 model writes, so on their own they guard against the agent acting on its own
@@ -223,6 +238,10 @@ of consent is ignored and the command is denied with a reason saying so. Without
 binding — a chat session, a cron, a binding the core did not write — the consent is
 self-attested and a task's injected text saying "the owner asked" is not
 distinguishable from the owner asking. Do not rely on this hook as access control.
+The scripts apply the same tier inside an agent session (`CLAUDECODE=1`): on a
+non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
+so the script gate does not accept what the hook would deny. A cron such as the
+morning briefing is not the core's bound task and is not tier-checked.
 
 **Codex cores.** This is a Claude-runtime `PreToolUse` hook. On a Codex core only
 the script gate (`native_pim_consent.py`, exit 2 without consent) and the inline
