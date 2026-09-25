@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from room_collab_protocol import DEFAULT_KIND, HTML_KIND, TEXT_ROOTS, RoomDocError  # noqa: E402
+from room_collab_protocol import DEFAULT_KIND, HTML_KIND, STAGE_KINDS, TEXT_ROOTS, RoomDocError  # noqa: E402
 from room_collab_watch import new_lines  # noqa: E402
 
 # The edge refuses urllib's default agent outright (Cloudflare 1010), so an
@@ -637,7 +637,9 @@ async def run(args: argparse.Namespace) -> int:
         await serve(lambda: open_room_collab(url, args.room, token, kind=args.kind,
                                              insecure=args.insecure), args.port,
                     open_text=lambda: open_room_collab(url, args.room, token,
-                                                       insecure=args.insecure))
+                                                       insecure=args.insecure),
+                    open_kind=lambda kind: open_room_collab(url, args.room, token, kind=kind,
+                                                            insecure=args.insecure))
         return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -647,6 +649,15 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.kind == KANBAN_KIND:
             return await kanban(doc, args)
+
+        if args.command == "slide":
+            if args.kind not in STAGE_KINDS:
+                raise RoomDocError(f"slide moves the page, the board or the Doc, not the {args.kind!r}.")
+            move = args.move.lower()
+            nav = await (doc.navigate("goto", int(move)) if move.isdigit() else doc.navigate(move))
+            await doc.settle(args.settle)
+            print(json.dumps({"ok": True, **nav}))
+            return 0
 
         if args.kind == BOARD_KIND:
             # Presence is its own channel and belongs to no surface, so
@@ -681,14 +692,6 @@ async def run(args: argparse.Namespace) -> int:
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
         if args.command == "templates":
             return await templates(doc, args, url)
-        if args.command == "slide":
-            if args.kind != HTML_KIND:
-                raise RoomDocError(f"slide is for the HTML page: pass --kind {HTML_KIND}.")
-            move = args.move.lower()
-            nav = await (doc.navigate("goto", int(move)) if move.isdigit() else doc.navigate(move))
-            await doc.settle(args.settle)
-            print(json.dumps({"ok": True, **nav}))
-            return 0
         if args.command == "highlight":
             if args.kind != HTML_KIND:
                 raise RoomDocError(f"highlight is for the HTML page: pass --kind {HTML_KIND}.")
@@ -927,8 +930,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("topic", help="a data-topic key the page defines, or `clear`")
 
-    s = sub.add_parser("slide", help="move every viewer's deck: next, prev, or a slide number "
-                                     "(needs --kind html)")
+    s = sub.add_parser("slide", help="move every viewer: next, prev, or a number — the page's slides "
+                                     "(--kind html), the board's frames (--kind board), the Doc's headings")
     s.add_argument("room")
     s.add_argument("move", help="next | prev | <slide number>")
 
@@ -937,7 +940,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
-                                     "API on 127.0.0.1, for a voice agent (needs --kind html)")
+                                     "API on 127.0.0.1, for a voice agent (needs --kind html); "
+                                     "POST /surface/board|doc moves it to the board or the Doc")
     s.add_argument("room")
     s.add_argument("--port", type=int, default=7877)
 

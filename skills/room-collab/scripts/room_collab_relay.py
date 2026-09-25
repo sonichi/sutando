@@ -1,4 +1,4 @@
-"""A local HTTP relay onto an HTML page's shared stage.
+"""A local HTTP relay onto a room surface's shared stage: the HTML page, the board or the Doc.
 
 A voice agent's tool must answer within a turn; opening the room per call costs
 seconds on a large page. The relay holds one connection and speaks the local
@@ -11,7 +11,12 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   GET  /state               {topic, ts, speaking}
   POST /spot/<words>        spotlight the passage with these words (`clear` clears)
   GET  /script              the talk script in the room's Doc, as steps (talk_script.py)
-  GET  /outline             slides, titles and pointable topics on the page (page_outline.py)
+  GET  /outline             the page's slides, titles and topics (page_outline.py); the
+                            board's frames or the Doc's headings (surface_outline.py)
+  POST /surface/html|board|doc  hold that surface instead (html at start); GET /surface names it
+
+On the board a slide is a frame (in Present order) and on the Doc a heading;
+topic highlights exist only on the page.
 
 It listens on 127.0.0.1 only: whoever reaches the port drives the stage as
 this agent, so it must never be exposed beyond the machine.
@@ -22,10 +27,12 @@ import asyncio
 import json
 import re
 
-from room_collab_protocol import HTML_KIND, RoomDocError
+from room_collab_protocol import DEFAULT_KIND, HTML_KIND, RoomDocError
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
+SURFACES = {"html": HTML_KIND, "board": "board", "doc": DEFAULT_KIND}
+SWITCH_WAIT_S = 15
 
 
 def visible_words(html: str) -> str:
@@ -45,8 +52,11 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("script", None)
     if method == "GET" and path == "/outline":
         return ("outline", None)
+    if method == "GET" and path == "/surface":
+        return ("surface", None)
     if method != "POST":
-        return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/"))
+        return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/",
+                                        "/surface/"))
                 else 404,
                 {"ok": False, "error": "not found"})
     if path.startswith("/highlight/"):
@@ -73,6 +83,11 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return (400, {"ok": False, "error": f"not a move: {what!r} (next, prev or a slide number)"})
     if path in ("/speaking/on", "/speaking/off"):
         return ("speaking", path.endswith("/on"))
+    if path.startswith("/surface/"):
+        what = path[len("/surface/"):].lower()
+        if what not in SURFACES:
+            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, board or doc)"})
+        return ("surface", what)
     if path in ("/presenter/on", "/presenter/off"):
         return (200, {"ok": True, "note": "presenting is controlled in the room"})
     return (404, {"ok": False, "error": "not found"})
@@ -88,33 +103,90 @@ async def read_script(open_text) -> dict:
     return {"ok": True, "steps": parse(section)}
 
 
-async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open_text=None) -> None:
+def outline_of(surface: str, doc) -> dict:
+    if surface == "board":
+        from surface_outline import board_outline
+        return board_outline(doc.live_elements)
+    if surface == "doc":
+        from surface_outline import doc_outline
+        return doc_outline(doc.text)
+    from page_outline import outline
+    return outline(doc.text)
+
+
+def says(surface: str, doc, words: str) -> bool:
+    """Whether a spotlight on these words will land on the surface."""
+    want = " ".join(words.lower().split())
+    if surface == "board":
+        from surface_outline import board_words
+        return want in board_words(doc.live_elements)
+    if surface == "doc":
+        return want in " ".join(doc.text.lower().split())
+    return want in visible_words(doc.text)
+
+
+async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open_text=None,
+                open_kind=None) -> None:
     """Hold the page open (reconnecting when it drops) and answer HTTP on `port`.
-    `open_text` opens the room's Doc, for GET /script."""
-    holder: dict = {"doc": None}
+    `open_text` opens the room's Doc, for GET /script; `open_kind(kind)` opens another
+    of the room's surfaces, for POST /surface."""
+    holder: dict = {"doc": None, "surface": "html"}
     ready = asyncio.Event()
+    switch = asyncio.Event()
 
     async def keep_connected() -> None:
         attempt = 0
         while True:
+            switch.clear()
+            surface = holder["surface"]
+            opener = open_doc if surface == "html" else (lambda: open_kind(SURFACES[surface]))
             try:
-                async with open_doc() as doc:
-                    if doc.kind != HTML_KIND:
+                async with opener() as doc:
+                    if surface == "html" and doc.kind != HTML_KIND:
                         raise RoomDocError("the relay drives the HTML page: open it with --kind html")
                     holder["doc"], attempt = doc, 0
-                    ready.set()
-                    log(f"relay: connected; {len(doc.text)} chars on the page")
-                    await doc.closed()
+                    # A switch asked for while this one opened: go straight to the new surface.
+                    if holder["surface"] == surface:
+                        ready.set()
+                    size = f"{len(doc.live_elements)} elements" if surface == "board" else f"{len(doc.text)} chars"
+                    log(f"relay: connected to the {surface}; {size}")
+                    closed = asyncio.ensure_future(doc.closed())
+                    switched = asyncio.ensure_future(switch.wait())
+                    await asyncio.wait({closed, switched}, return_when=asyncio.FIRST_COMPLETED)
+                    closed.cancel()
+                    switched.cancel()
             except RoomDocError as exc:
                 log(f"relay: {exc}")
                 if "--kind html" in str(exc):
                     raise
             holder["doc"] = None
             ready.clear()
+            if switch.is_set():
+                continue
             delay = RECONNECT_S[min(attempt, len(RECONNECT_S) - 1)]
             attempt += 1
             log(f"relay: reconnecting in {delay}s")
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(switch.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def change_surface(to: str | None) -> dict:
+        if to is not None and to != holder["surface"]:
+            if to != "html" and open_kind is None:
+                raise RoomDocError("this relay was started without the room's other surfaces")
+            holder["surface"] = to
+            ready.clear()
+            switch.set()
+        try:
+            await asyncio.wait_for(ready.wait(), SWITCH_WAIT_S if to else 0.01)
+        except asyncio.TimeoutError:
+            if to:
+                raise RoomDocError(f"could not open the room's {to} yet") from None
+            return {"ok": True, "surface": holder["surface"], "connected": False}
+        o = outline_of(holder["surface"], holder["doc"])
+        return {"ok": True, "surface": holder["surface"], "connected": True,
+                "parts": len(o.get("slides") or o.get("headings") or [])}
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         status, body = 500, {"ok": False}
@@ -130,23 +202,34 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
                 if open_text is None:
                     raise RoomDocError("this relay was started without the room's Doc")
                 status, body = 200, await read_script(open_text)
+            elif what[0] == "surface":
+                status, body = 200, await change_surface(what[1])
             else:
                 try:
                     await asyncio.wait_for(ready.wait(), 5)
                 except asyncio.TimeoutError:
                     raise RoomDocError("not connected to the room yet") from None
-                doc = holder["doc"]
+                doc, surface = holder["doc"], holder["surface"]
                 kind, arg = what
-                if kind == "highlight":
+                parts = None
+                if kind == "slide" and arg[0] == "goto" and surface != "html":
+                    o = outline_of(surface, doc)
+                    parts = len(o.get("slides") or o.get("headings") or [])
+                if kind == "highlight" and surface != "html":
+                    status, body = 409, {"ok": False, "error": f"topic highlights are on the HTML page; "
+                                         f"the relay holds the {surface} — point at words with /spot"}
+                elif kind == "highlight":
                     state = await doc.set_stage(arg)
                     status, body = 200, {"ok": True, **state}
                 elif kind == "spot":
                     spot = await doc.set_spot(arg)
-                    found = arg is None or " ".join(arg.lower().split()) in visible_words(doc.text)
+                    found = arg is None or says(surface, doc, arg)
                     status, body = 200, {"ok": True, **spot, "found_on_page": found}
                 elif kind == "outline":
-                    from page_outline import outline
-                    status, body = 200, {"ok": True, **outline(doc.text)}
+                    status, body = 200, {"ok": True, **outline_of(surface, doc)}
+                elif kind == "slide" and parts is not None and arg[1] > parts:
+                    noun = "frames" if surface == "board" else "headings"
+                    status, body = 400, {"ok": False, "error": f"the {surface} has {parts} {noun}"}
                 elif kind == "slide":
                     nav = await doc.navigate(*arg)
                     status, body = 200, {"ok": True, **nav}
@@ -158,6 +241,8 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
                     status, body = 200, {"topic": stage.get("topic") or None,
                                          "ts": stage.get("ts", 0),
                                          "speaking": bool(stage.get("speaking"))}
+                    if surface != "html":
+                        body["surface"] = surface
         except (RoomDocError, asyncio.TimeoutError, ConnectionError) as exc:
             status, body = 503, {"ok": False, "error": str(exc) or type(exc).__name__}
         payload = json.dumps(body).encode()
@@ -170,6 +255,7 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
             writer.close()
 
     server = await asyncio.start_server(handle, host, port)
-    log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /speaking/on|off; GET /state")
+    log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
+        "/surface/html|board|doc; GET /state, /outline")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())
