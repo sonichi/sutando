@@ -123,17 +123,16 @@ Otherwise:
 
    The block is only **absent from the preview** — the archived task file body remains intact (see step 5), so re-queueing via `mv tasks/archive/<id>.txt tasks/` preserves sandboxing for non-owner tiers.
 
-3. Resolve a **readable channel label** for each orphan, then group.
-
-   `channel_id` alone is unreadable in a report — `!JzcRmAhNYbiWhIWNCL:ag2.space`
-   tells the owner nothing about which conversation stalled. The task file already
-   carries the name the bridge saw:
-
-   ```python
-   name = header.get("room_name") or header.get("channel_name")   # bridges write one of these
-   cid  = header.get("channel_id") or header.get("chat_id") or ""
-   label = f"{name} ({cid})" if name else (cid or "DM")
-   ```
+3. Take each orphan's **channel label from the classifier's `label` field** (step 2's JSON row) — never
+   recompute it from the raw header. `classify.py` builds `label` from `room_name` / `channel_name` /
+   `channel_id` / `chat_id` and runs it through `neutralize()` alongside `preview` before either leaves
+   the row (see step 2's schema line above), which is what turns a `[`/`]` in an attacker-controlled
+   room or channel name into `(`/`)` before it can read as a `[file:]`/`[send:]`/`[attach:]` action.
+   Re-deriving `label` here from `header.get("room_name") or header.get("channel_name")` — as this
+   prose used to instruct — rebuilds the exact untrusted string outside `neutralize()`'s reach: the
+   marker-injection path #4399 closed in `preview` was still open in `label` on this prose-driven path,
+   because a human or agent following the doc by hand (rather than reading classify.py's own JSON)
+   never passed the raw name through the gate (#4399, qingyun-wu 2026-09-24).
 
    Use `label` everywhere the report shows a channel. Keep the id: it is what
    `contextNotFrom` and re-queue commands key on, so dropping it trades one
@@ -254,6 +253,7 @@ Step 2 runs `scripts/classify.py` (read-only, stdlib + `src/local_task_protocol.
 
 ## Iteration log
 
+- v0.1.11 — 2026-09-24 — #4399 follow-up (qingyun-wu). v0.1.10 closed the marker-injection path in `preview` by moving its computation into `classify.py:neutralize()`, but step 3's prose still told the reader to rebuild `label` by hand from `header.get("room_name") or header.get("channel_name")` — the same untrusted fields, outside the neutralizer, on the path a human or agent takes when following this doc directly instead of consuming `classify.py`'s JSON row. Step 3 now says to take `label` from the classifier's row (already neutralized, same as `preview`) and never re-derive it from the raw header. No code change: `classify.py:channel_label()` already ran every `label` through `neutralize()` (confirmed at its call site) — only this prose had drifted from what the script does.
 - v0.1.0 — 2026-05-23 — initial draft. Per Chi 2026-05-23 Discord exchange about #1049 redesign ("simply ask the agent to check when starting"). Designed to be invoked from `/startup` step 1 (PR #1072). Standalone-callable for manual recovery. Replaces the attempts-counter approach (#1049 + #1066's followup) with a startup-time classification using existing side-effect markers (#1048's `.sending` files + result-file presence). No bumper, no in-band writes, no self-trigger loop.
 - v0.1.1 — 2026-05-23 — qingyun-sutando review pass. **(1)** Fixed `<id>` ambiguity — `<id>` is the value of the `id:` header (already includes `task-` prefix); paths are `results/<id>.txt` NOT `results/task-<id>.txt` (the prior wording double-prefixed and would have misclassified every completed-but-unarchived task as ORPHAN → spurious recovery notes). **(2)** Age now derives from immutable header `timestamp:` / `task-<epoch-ms>` id, NOT file mtime (mtime resets on rsync / `git checkout` / `touch` / workspace sync, making old orphans look FRESH → re-fire). **(3)** Clarified `.sending` contract via new step 2b: `<id>.txt` (no suffix) = DONE, `<id>.txt.sending` = bridge mid-delivery (treat as DONE; bridge owns its own crash recovery via #1046/#1048's startup sweep). **(4)** Named the <5min residual hole explicitly under its own section, with prioritized coverage list (voice / phone / Telegram + generic API). **(5)** Noted "promote to scripts/orphan-check.py" trigger.
 - v0.1.2 — 2026-05-26 — tier-aware orphan recovery. Step 2.1 now parses `access_tier:` (default `owner` for legacy task files lacking the field). Step 3 rewritten as a decision table branching on `source` + `access_tier`: voice/phone → silent archive; team/other → `[no-send]` archive; owner discord/telegram/slack/chat → defer to new step 3b (consolidated proactive DM aggregating all owner-tier orphans this pass into ONE `proactive-orphan-recovery-<ts>.txt` instead of N per-channel sentinels). New step 3c bomb-guard collapses any future >5-deliveries-to-one-channel into a single summary post (no-op today; defense for future branch additions). Triggered by 2026-05-26 noise-bomb post-mortem (`feedback_orphan_check_tier_classify_before_sentinel`): v0.1.1 sentinel-blasted 22 stale tasks across #ep013 (13), #talk (4), voice channels (4), and DM (1) — wrong default for high-volume team-tier orphans whose threads had moved on, and wrong shape (N per-channel posts) for owner-tier ones. Sibling work on cross-fleet bridges (qingyun-sutando MacBook branch) adds defensive bot-user_id tier-filter so peer bots' stale tasks don't tier as `owner` via allowFrom inheritance — that's the upstream cause of the same skill running on a sibling fleet seeing 21/22 of one fleet's orphans as `owner` rather than `team`.
