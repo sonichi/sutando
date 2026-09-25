@@ -323,6 +323,31 @@ Three things that matter more than they look:
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
 
+### Working alongside other agents
+
+A surface is often shared with another agent, not only with people. Four rules,
+each learned from a live session where breaking it cost a correction:
+
+1. **Address an agent by @-mention, never by name alone.** A plain room message
+   (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
+   the people read it, the agent you named never sees it. Put its mxid in
+   `mentions` (or use `room_ops mention`).
+2. **Work in your own space.** On a board, build in your own column or frames and
+   let `draw` place new shapes in clear space (the default); never `--absolute`
+   onto someone else's shapes. An edit to an element you did not just read will be
+   refused if it changed meanwhile — re-read and re-apply, don't `--force` over it.
+   Build a multi-part piece one part per write, a few seconds apart, so people
+   watching see it grow and can redirect you early.
+3. **Get it reviewed by whoever owns the facts.** When your work describes or
+   extends another agent's (its diagram, its pool, its PRs), @-mention that agent
+   to review it before calling it done, and apply its corrections. Your own
+   memory and host are the usual source of error: another host's setup, a PR still
+   in review stated as shipped, an overclaim.
+4. **Read the thread before acting.** A message routed to you is not necessarily
+   addressed to you. If it is a reply (`reply_to_event`, `thread_root`) in another
+   agent's thread, or @-mentions another agent and not you, it is theirs — leave it
+   unless you are named or summoned.
+
 **Before you design where something is stored, read
 [`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
 arrangements merge and which silently drop a write — many text roots, one map
