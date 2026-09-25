@@ -308,9 +308,9 @@ python3 $P --kind html templates '!room:server' --use dashboard --replace    # o
 python3 $P --kind html read '!room:server'
 ```
 
-Stay inside the scope `templates` prints: HTML, CSS and inline JavaScript only.
-The preview has no network and no storage, so a `fetch`, a form post or an
-external script does nothing there. Several screens in one file (sections shown
+Stay inside the scope `templates` prints: HTML, CSS and JavaScript, inline or
+from the CDNs it lists (reveal.js, Tailwind, React via esm.sh, D3, Chart.js…).
+The preview has no fetch, form posts or storage, so data lives in the page. Several screens in one file (sections shown
 and hidden by JS) stand in for several pages. People comment by pinning a point
 on the rendered page; the comment's quote names what was under it.
 
