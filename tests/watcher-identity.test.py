@@ -875,5 +875,47 @@ class TestInboxHoldersCli(unittest.TestCase):
         self.assertEqual(self._run(["inbox-holders", "--inbox="])[0], 64)
 
 
+class TestSentinelNamesPidCli(unittest.TestCase):
+    """`sentinel-names-pid <pid> --ready <state>`: the one predicate a shell
+    caller can ask before writing a sentinel it might not own."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.state = Path(self._t.name) / "state"
+        self.state.mkdir()
+        self.addCleanup(self._t.cleanup)
+
+    def _run(self, args):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = wid.main(args)
+        return rc, buf.getvalue().strip(), err.getvalue()
+
+    def test_a_sentinel_holding_the_pid_answers_yes(self):
+        (self.state / "watch-tasks-stream.pid").write_text("4242\n")
+        self.assertEqual(self._run(["sentinel-names-pid", "4242", "--ready", str(self.state)])[:2], (0, "yes"))
+
+    def test_any_sentinel_counts_not_just_the_canonical_one(self):
+        (self.state / "watch-tasks-stream-agent+w1.pid").write_text("4242\n")
+        self.assertEqual(self._run(["sentinel-names-pid", "4242", "--ready", str(self.state)])[:2], (0, "yes"))
+
+    def test_another_pid_answers_no(self):
+        (self.state / "watch-tasks-stream.pid").write_text("4242\n")
+        self.assertEqual(self._run(["sentinel-names-pid", "99", "--ready", str(self.state)])[:2], (0, "no"))
+
+    def test_no_sentinel_at_all_answers_no(self):
+        self.assertEqual(self._run(["sentinel-names-pid", "4242", "--ready", str(self.state)])[:2], (0, "no"))
+
+    def test_usage_errors_are_64(self):
+        for args in (["sentinel-names-pid"],
+                     ["sentinel-names-pid", "4242"],
+                     ["sentinel-names-pid", "not-a-pid", "--ready", str(self.state)],
+                     ["sentinel-names-pid", "4242", "--ready"],
+                     ["sentinel-names-pid", "4242", "--nope", str(self.state)]):
+            rc, out, err = self._run(args)
+            self.assertEqual(rc, 64, args)
+            self.assertIn("usage:", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

@@ -116,6 +116,72 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 
+# The duplicate check below is a scan, so two starters at the same instant could
+# each see the other and both exit (zero announcers) or both run. A per-inbox
+# lock dir, held from the scan through the sentinel stamp, serializes them: the
+# second waits and then sees the first's sentinel. mkdir is the atomic primitive
+# (no flock binary on macOS; an flock'd fd would be inherited by fswatch).
+START_LOCK_TIMEOUT_S="${SUTANDO_WATCHER_START_LOCK_TIMEOUT_S:-30}"
+START_LOCK="$WORKSPACE_DIR/state/watch-tasks-stream.start-$(printf '%s' "$TASKS_DIR_ABS" | cksum | cut -d' ' -f1).lock"
+release_start_lock() {
+  [ -n "${START_LOCK:-}" ] || return 0
+  [ "$(cat "$START_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$START_LOCK"
+  START_LOCK=""
+}
+mkdir -p "$WORKSPACE_DIR/state" 2>/dev/null || true
+__lock_deadline=$(( $(date +%s) + START_LOCK_TIMEOUT_S ))
+while ! mkdir "$START_LOCK" 2>/dev/null; do
+  __lpid="$(cat "$START_LOCK/pid" 2>/dev/null)"
+  # A lock with no pid file is a winner that died between mkdir and its pid
+  # write; older than a few seconds it is nobody's, so it is reclaimed like a dead pid.
+  __ldead=""
+  if [ -z "$__lpid" ]; then
+    __lmt="$(stat -c %Y -- "$START_LOCK" 2>/dev/null || true)"
+    case "$__lmt" in ''|*[!0-9]*) __lmt="$(stat -f %m -- "$START_LOCK" 2>/dev/null || true)" ;; esac
+    case "$__lmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __lmt )) -gt 5 ] && __ldead=1 ;; esac
+  fi
+  case "$__lpid" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$__lpid" 2>/dev/null || __ldead=1 ;;
+  esac
+  if [ -n "$__ldead" ]; then
+    # Rename, never rm in place: two starters over one dead lock would both
+    # rm, and the second rm takes the first's fresh lock with it.
+    if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
+      # mv moves whatever is at the path: if another taker already replaced
+      # the dead lock with its live one, give that one back untouched. A third
+      # starter creating the lock inside that window nests the returned dir
+      # under its own (today's double run at worst; nothing is deleted).
+      __mpid="$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)"
+      # A pid-less lock is identified by the MOVED dir's age, never by its empty
+      # pid: a brand-new lock whose winner has not written its pid yet looks the same.
+      __mold=""
+      if [ -z "$__lpid" ] && [ -z "$__mpid" ]; then
+        __mmt="$(stat -c %Y -- "$START_LOCK.dead.$$" 2>/dev/null || true)"
+        case "$__mmt" in ''|*[!0-9]*) __mmt="$(stat -f %m -- "$START_LOCK.dead.$$" 2>/dev/null || true)" ;; esac
+        case "$__mmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __mmt )) -gt 5 ] && __mold=1 ;; esac
+      fi
+      if { [ -n "$__lpid" ] && [ "$__mpid" = "$__lpid" ]; } || [ -n "$__mold" ]; then
+        echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid ${__lpid:-<none>}; taking it over" >&2
+        rm -rf "$START_LOCK.dead.$$"
+      elif ! mv "$START_LOCK.dead.$$" "$START_LOCK" 2>/dev/null; then
+        rm -rf "$START_LOCK.dead.$$"
+      fi
+    fi
+    continue
+  fi
+  if [ "$(date +%s)" -ge "$__lock_deadline" ]; then
+    # Refusing would leave the inbox with no announcer; the scan below still runs.
+    echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS held by pid ${__lpid:-unknown} for ${START_LOCK_TIMEOUT_S}s; starting without it" >&2
+    START_LOCK=""; break
+  fi
+  sleep 0.1
+done
+[ -n "$START_LOCK" ] && echo "$$" > "$START_LOCK/pid"
+# Every exit before the sentinel stamp must give the lock back; the main cleanup
+# trap armed later replaces this one and releases it too.
+trap release_start_lock EXIT
+
 # One announcer per inbox, enforced here rather than by every launcher: a start
 # over a holder exits 0 as covered and says so on stdout, and only
 # --force-restart replaces the holder, whatever its kind. The one exception is a
@@ -137,6 +203,29 @@ case "$__holders" in
       if [ -z "$FORCE_RESTART" ]; then
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "standby" ]; then
           continue   # the designed handoff: the standby leaves once this watcher is ready
+        fi
+        # An unready live holder is stamped by nobody else; only THIS SEAT's own
+        # sentinel may be written, so the inbox must be this identity's own.
+        if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
+           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
+                \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$(basename "$TASKS_DIR_ABS")" = "tasks" \) ] \
+           && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
+           && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
+          __hprev="$(cat "$__hsent" 2>/dev/null)"
+          # Never overwrite a LIVE pid: that file is another watcher's readiness,
+          # and taking it is the clobber this whole change exists to undo.
+          if [ -n "$__hprev" ] && kill -0 "$__hprev" 2>/dev/null; then
+            echo "watch-tasks-stream: not re-stamping $__hsent: it names live pid $__hprev" >&2
+          else
+            mkdir -p "$(dirname "$__hsent")" 2>/dev/null || true
+            # Temp + rename, so no reader sees the empty file a truncating write leaves.
+            if __htmp="$(mktemp "$__hsent.XXXXXX" 2>/dev/null)" \
+               && echo "$__hpid" > "$__htmp" && mv -f "$__htmp" "$__hsent"; then
+              echo "watch-tasks-stream: re-stamped $__hsent for live holder pid $__hpid (it named '${__hprev:-<nothing>}' before)" >&2
+            else
+              rm -f "${__htmp:-}" 2>/dev/null || true
+            fi
+          fi
         fi
         # stdout, in the TASK_FILE shape: a Monitor-hosted caller sees stdout as
         # its event stream and would never read the stderr line.
@@ -250,6 +339,15 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
     exit 1
   }
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+  # fswatch names this directory by its physical path; handle_event compares to it.
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
+    mkdir -p "$HANDLER_CONFIG_DIR"
+    HANDLER_CONFIG_DIR="$(canonical_tasks_dir "$HANDLER_CONFIG_DIR")" || {
+      echo "watch-tasks-stream: could not canonicalize the task-event-handler config dir" >&2
+      exit 1
+    }
+    HANDLER_CONFIG_PATH="$HANDLER_CONFIG_DIR/${HANDLER_CONFIG_PATH##*/}"
+  fi
 fi
 
 # absent: no config on disk (the core takes every task). ready: parsed. broken: a
@@ -273,7 +371,11 @@ task_file_identity() {
   sum="$(cksum < "$1" 2>/dev/null | awk 'NR==1 {print $1 "-" $2}')"
   printf '%s' "${inode}:${sum}"
 }
-HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+# A held set replays at once on a task or config event; on any other watched
+# event it replays at most this often. No timer exists.
+HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-30}"
+# A sentinel older than this is not racing its payload's write (see dispatch_task).
+RESOLVE_RACE_WINDOW_S="${SUTANDO_RESOLVE_RACE_WINDOW_S:-10}"
 # One read per routing decision: the bytes are copied once into a private
 # snapshot and parsed from there; no cache, no compare, nothing to go stale.
 read_handler_config_now() {
@@ -309,8 +411,7 @@ redispatch_held_tasks() {
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
   done <<< "$held"
 }
-# An elapsed deadline, checked after every event: a busy stream never resets it
-# the way it resets the read timeout.
+# An elapsed deadline, checked after every event; a busy stream never resets it.
 retry_held_tasks_if_due() {
   [ -n "$HELD_NAMES" ] || return 0
   [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
@@ -654,10 +755,24 @@ dispatch_task() {
   # resolve is retried briefly rather than treated as permanent. Same bounded
   # shape as acquire_task_claim's lock race, applied to filesystem visibility
   # instead of lock contention.
+  # Only a fresh sentinel can be racing its payload, and only the resolver's
+  # typed "no payload" verdict (rc 4) is about the entry rather than the run.
+  local max_attempts=3 mtime now age=0
+  # GNU first: on GNU, `stat -f` answers a different question and succeeds, so
+  # the result is validated as numeric rather than trusted by exit status.
+  mtime="$(stat -c %Y -- "$task_path" 2>/dev/null || true)"
+  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m -- "$task_path" 2>/dev/null || true)" ;; esac
+  now="$(date +%s)"
+  case "$mtime" in ''|*[!0-9]*) ;; *) age=$((now - mtime)) ;; esac
   attempt=0
   until resolved="$(resolve_inbox_entry "$task_path")"; do
+    rc=$?
     attempt=$((attempt + 1))
-    if [ "$attempt" -ge 3 ]; then
+    if [ "$rc" -eq 4 ] && [ "$age" -gt "$RESOLVE_RACE_WINDOW_S" ]; then
+      echo "watch-tasks-stream: $task_path names no payload and is ${age}s old, past the ${RESOLVE_RACE_WINDOW_S}s race window; not dispatching (1 attempt)" >&2
+      return 0
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
       echo "watch-tasks-stream: resolve_inbox_entry did not resolve $task_path after $attempt attempts; not dispatching" >&2
       return 0
     fi
@@ -838,6 +953,7 @@ cleanup() {
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
   trap '' TERM HUP INT
+  release_start_lock
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
@@ -995,6 +1111,8 @@ fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The sentinel is what a waiting starter's scan will see: the lock's job is done.
+release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
 # handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
 # INJECTED, never located: a core helper may run a path it is handed but must not
@@ -1024,28 +1142,9 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# -t bounds the read so a stretch with no fswatch event still gets a periodic,
-# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
-# event shape the platform's fswatch monitor backend turns out to use.
-while true; do
-  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path <&3
-  read_rc=$?
-  if [ "$read_rc" -ne 0 ]; then
-    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
-    # exit code alone can't distinguish them -- ask whether fswatch is still
-    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
-    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      if [ -n "$HANDLER_CONFIG_PATH" ]; then
-        reload_current_handler
-        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
-        redispatch_held_tasks
-      fi
-      continue
-    fi
-    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
-    # to the script's normal exit path rather than spinning on a dead FIFO.
-    break
-  fi
+# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
+# readiness replay above, since a second open of the FIFO would race it for bytes.
+while IFS= read -r path <&3; do
   handle_event "$path"
   retry_held_tasks_if_due
 done

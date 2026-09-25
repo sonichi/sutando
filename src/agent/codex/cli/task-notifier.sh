@@ -106,7 +106,7 @@ pane_state() {
   # A blank capture is NO information, which is not the same as a pane we read and
   # could not account for; fail here so callers see "" and keep the two apart.
   [ -n "${pane//[[:space:]]/}" ] || return 1
-  printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime codex 2>/dev/null
+  printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" --probe 2>/dev/null
 }
 
 core_pane_is_idle_ready() {

@@ -76,6 +76,9 @@ record_delivery() {
 
 export SUTANDO_TEST_MODE=1
 export SUTANDO_WORKSPACE="$TMPWS"
+# This suite is about the queue and guest gates; the watcher-coverage gate (a
+# temp inbox nobody watches would block every case) has its own suite.
+export SUTANDO_STOP_HOOK_WATCHER_GATE=0
 
 LIVE_WS="$(env -u SUTANDO_TEST_MODE -u SUTANDO_WORKSPACE \
              bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"

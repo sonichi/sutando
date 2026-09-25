@@ -70,6 +70,8 @@ AUTHORS_KEY = "authors"
 SYNC_TIMEOUT_S = 20.0
 # Marks a transaction as ours, so the reconcile observer can ignore its own writes.
 LOCAL_ORIGIN = "room-collab-client"
+# pycrdt stamps an awareness change this process made with this origin.
+LOCAL_AWARENESS_ORIGIN = "local"
 
 
 class RoomDoc:
@@ -273,7 +275,7 @@ class RoomDoc:
         def on_change(kind: str, changes: tuple) -> None:
             # Only our OWN state, changed locally. Re-sending a peer's update
             # makes this socket a holder of that peer's id, so it never expires.
-            if kind != "update" or changes[1] != "local":
+            if kind != "update" or changes[1] != LOCAL_AWARENESS_ORIGIN:
                 return
             mine = self._awareness.client_id
             if mine not in [i for group in changes[0].values() for i in group]:
@@ -502,6 +504,71 @@ class RoomDoc:
                              if isinstance(v, dict)}
         return snap
 
+    def _observe_changes(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Subscribe `fn` to every change in this surface — any remote document
+        edit, and any awareness change that carries new peer state — and return
+        an unsubscribe.
+
+        One switch over the document kinds, shared by `events` and
+        `on_activity`: two copies drift the moment a fourth kind lands and only
+        one of them is taught about it.
+
+        Awareness is filtered to remote `change` events. `Awareness.start()`
+        re-sends this client's own state every `outdated_timeout/2` to stop the
+        server expiring it, and each of those emits a local `update`: counting
+        them made an idle timer read a silent surface as busy forever, so the
+        30-minute drop could never fire. A remote renewal is an `update` too and
+        carries no new state, so only `change` is activity.
+        """
+        subs = []
+
+        def on_doc(event: Any) -> None:
+            origin = getattr(getattr(event, "transaction", None), "origin", None)
+            if origin != LOCAL_ORIGIN:
+                fn()
+
+        if self._kind == DEFAULT_KIND:
+            subs.append((self._text, self._text.observe(on_doc)))
+        elif self._kind == BOARD_KIND:
+            m = self._doc.get(ELEMENTS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        elif self._kind == KANBAN_KIND:
+            m = self._doc.get(CARDS_KEY, type=Map)
+            subs.append((m, m.observe(on_doc)))
+        def on_awareness(kind: str, changes: tuple) -> None:
+            if kind == "change" and (len(changes) < 2 or changes[1] != LOCAL_AWARENESS_ORIGIN):
+                fn()
+
+        aw_sub = self._awareness.observe(on_awareness)
+
+        def stop() -> None:
+            for obj, sub in subs:
+                obj.unobserve(sub)
+            self._awareness.unobserve(aw_sub)
+
+        return stop
+
+    async def closed(self) -> "RoomDocError":
+        """Resolve when this surface's session ends, with the reason.
+
+        A holder that only sleeps never learns the socket died: `_read_loop`
+        sets the end, it does not raise into the caller.
+        """
+        ended = await asyncio.shield(self._ended)
+        err = RoomDocError(f"the surface session has ended: {close_reason(ended)}")
+        err.code = close_code(ended)
+        return err
+
+    def on_activity(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Call `callback()` whenever ANYTHING changes in this surface, not only
+        what concerns a handle.
+
+        `events` answers "what here is addressed to me"; an idle timer on
+        presence needs the other question — someone else's keystroke is exactly
+        the moment an agent's presence is worth showing, so it must count.
+        """
+        return self._observe_changes(callback)
+
     async def events(self, handles: list[str], settle: float = 1.0,
                      since: dict | None = None) -> AsyncIterator[dict]:
         """What happened that concerns `handles`, as it happens: a text or board
@@ -524,21 +591,7 @@ class RoomDoc:
         def poke(*_: Any) -> None:
             queue.put_nowait(None)
 
-        def on_doc(event: Any) -> None:
-            origin = getattr(getattr(event, "transaction", None), "origin", None)
-            if origin != LOCAL_ORIGIN:
-                poke()
-
-        subs = []
-        if self._kind == DEFAULT_KIND:
-            subs.append((self._text, self._text.observe(on_doc)))
-        elif self._kind == BOARD_KIND:
-            m = self._doc.get(ELEMENTS_KEY, type=Map)
-            subs.append((m, m.observe(on_doc)))
-        elif self._kind == KANBAN_KIND:
-            m = self._doc.get(CARDS_KEY, type=Map)
-            subs.append((m, m.observe(on_doc)))
-        aw_sub = self._awareness.observe(lambda *_: poke())
+        stop_observing = self._observe_changes(poke)
         ended = asyncio.ensure_future(asyncio.shield(self._ended))
         last = since if since is not None else self.snapshot()
         # A carried snapshot is compared at once: the gap may hold a mention.
@@ -574,9 +627,7 @@ class RoomDoc:
                 for ev in out:
                     yield ev
         finally:
-            for obj, sub in subs:
-                obj.unobserve(sub)
-            self._awareness.unobserve(aw_sub)
+            stop_observing()
             if not ended.done():
                 ended.cancel()
 

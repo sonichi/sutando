@@ -50,8 +50,8 @@ class OutboxParkedProbe(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         (self.ws / "results").mkdir()
 
-    def _items(self):
-        d = self.ws / "results" / ".outbox" / ".items"
+    def _items(self, root_name=".outbox"):
+        d = self.ws / "results" / root_name / ".items"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -73,8 +73,8 @@ class OutboxParkedProbe(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _write(self, item_id, status):
-        self._items().joinpath(f"{item_id}.json").write_text(
+    def _write(self, item_id, status, root_name=".outbox"):
+        self._items(root_name).joinpath(f"{item_id}.json").write_text(
             json.dumps({"item_id": item_id, "status": status}), encoding="utf-8")
 
     def test_no_outbox_root_says_its_zero_is_untestable(self):
@@ -203,6 +203,25 @@ class OutboxParkedProbe(unittest.TestCase):
             r = self.hc.check_outbox_parked(self.ws)
         self.assertEqual(r["status"], "warn")
         self.assertIn("unjudged", r["detail"])
+
+    def test_a_parked_item_in_a_non_default_root_names_THAT_root_not_dot_outbox(self):
+        # Regression: the recovery hint used to hardcode `.outbox` for every root.
+        self._write("proactive-telegram-bridge-restarted-1.txt#1", "PARKED",
+                    root_name=".outbox-discord-proactive")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn(".outbox-discord-proactive", r["detail"])
+        self.assertIn("proactive-telegram-bridge-restarted-1.txt#1", r["detail"])
+
+    def test_parked_items_across_two_roots_are_both_counted_with_their_own_root(self):
+        self._write("task-a", "PARKED", root_name=".outbox")
+        self._write("task-b", "PARKED", root_name=".outbox-discord-proactive")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("2 repl", r["detail"])
+        self.assertIn("task-a", r["detail"])
+        self.assertIn("task-b", r["detail"])
+        self.assertIn(".outbox-discord-proactive", r["detail"])
 
     def test_the_probe_is_registered(self):
         src = (REPO / "src" / "health-check.py").read_text(encoding="utf-8")

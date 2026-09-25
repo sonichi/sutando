@@ -125,10 +125,10 @@ class Observing(Base):
         pb.touch(pb.beat_path(self.ws, "worker", wid))
         obs = sup.observe(self.ws, __import__("time").time(),
                           runner=Tmux(live={wi.tmux_session_name(wid)}))
-        # No watcher beat was written and the tmux stub answers no holder scan,
-        # so the watcher reads absent and its holder stays unknown.
+        # No watcher beat, no holder scan answer, an empty inbox, an unreadable pane.
         self.assertEqual(obs[wid], ps.Observation(beat=pb.LIVE, session_alive=True, paused=False,
-                                                  watcher_beat=pb.ABSENT, watcher_held=None))
+                                                  watcher_beat=pb.ABSENT, watcher_held=None,
+                                                  work_outstanding=False))
 
     def test_the_owners_marker_is_what_pauses_a_worker(self):
         wid = make_worker(self.ws)
@@ -428,7 +428,7 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised", "routing"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing", "wedged"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
