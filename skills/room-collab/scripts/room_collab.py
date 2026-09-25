@@ -41,7 +41,7 @@ SUMMON_CONTEXT_MAX = 400
 MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
 # The surface as the summon's prose names it; the marker carries `kind` verbatim.
 SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board",
-                  "html": "HTML page"}
+                  "html": "HTML page", "sheet": "sheet"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
@@ -54,7 +54,7 @@ IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 
 
 def resolve_identity(explicit: str | None) -> str:
-    """The mxid a kanban write is signed with (`by`). The panel tie-breaks on
+    """The mxid a kanban or sheet write is signed with (`by`). The panel tie-breaks on
     it, so it must be the same string on every write from this agent."""
     who = explicit or next((os.environ[v] for v in IDENTITY_VARS if os.environ.get(v)), None)
     if not who:
@@ -419,6 +419,47 @@ async def templates(doc, args: argparse.Namespace, url: str) -> int:
     return 0
 
 
+async def sheet(doc, args: argparse.Namespace) -> int:
+    """The room's sheet: read its inputs, set one cell, or import a CSV block."""
+    from room_sheet import grid, plan_writes, read_csv, starter_axes, to_csv
+
+    rows, cols, cells = doc.sheet
+    if not rows or not cols:
+        # A room that has never had a sheet gets the same blank grid the web client makes.
+        start_rows, start_cols = starter_axes()
+        await doc.put_sheet(start_rows if not rows else {}, start_cols if not cols else {}, {})
+        rows, cols, cells = doc.sheet
+    if args.command == "peers":
+        print(render("peers", peers=doc.peers, as_json=args.json))
+        return 0
+    if args.command == "read":
+        block = grid(rows, cols, cells)
+        if args.json:
+            from room_sheet import col_name
+            print(json.dumps({f"{col_name(c)}{r + 1}": v for r, line in enumerate(block)
+                              for c, v in enumerate(line) if v}, ensure_ascii=False, indent=2))
+        else:
+            print(to_csv(block) or "(the sheet is empty)", end="")
+        return 0
+    try:
+        if args.command == "set":
+            new_rows, new_cols, writes = plan_writes(rows, cols, args.cell, [[args.value]],
+                                                     resolve_identity(args.user_id))
+        elif args.command == "import":
+            with open(args.file, encoding="utf-8-sig") as fh:
+                block = read_csv(fh.read())
+            new_rows, new_cols, writes = plan_writes(rows, cols, args.at, block,
+                                                     resolve_identity(args.user_id))
+        else:
+            raise RoomDocError(f"{args.command!r} is not a sheet command; use read, set, import or peers.")
+    except ValueError as exc:
+        raise RoomDocError(str(exc)) from None
+    n = await doc.put_sheet(new_rows, new_cols, writes)
+    await doc.settle(args.settle)
+    print(json.dumps({"ok": True, "cells": n, "rows_added": len(new_rows), "cols_added": len(new_cols)}))
+    return 0
+
+
 async def kanban(doc, args: argparse.Namespace) -> int:
     """The board of cards: read it, or write one card through the panel's
     own rules. Every write is a newer version signed with this agent's mxid."""
@@ -647,6 +688,8 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.kind == KANBAN_KIND:
             return await kanban(doc, args)
+        if args.kind == "sheet":
+            return await sheet(doc, args)
 
         if args.kind == BOARD_KIND:
             # Presence is its own channel and belongs to no surface, so
@@ -878,7 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's surfaces (markdown, html, board, kanban); "
+                   help="which of the room's surfaces (markdown, html, board, kanban, sheet); "
                         "default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
@@ -926,6 +969,16 @@ def build_parser() -> argparse.ArgumentParser:
                                          "watching; `clear` removes it (needs --kind html)")
     s.add_argument("room")
     s.add_argument("topic", help="a data-topic key the page defines, or `clear`")
+
+    s = sub.add_parser("set", help="set one sheet cell to a value or =formula (needs --kind sheet)")
+    s.add_argument("room")
+    s.add_argument("cell", help="an address like B4")
+    s.add_argument("value", help='the input as typed, e.g. 42, "Q3", or =SUM(B1:B9)')
+
+    s = sub.add_parser("import", help="write a CSV file into the sheet from --at (needs --kind sheet)")
+    s.add_argument("room")
+    s.add_argument("file")
+    s.add_argument("--at", default="A1", help="the top-left cell (default A1)")
 
     s = sub.add_parser("slide", help="move every viewer's deck: next, prev, or a slide number "
                                      "(needs --kind html)")

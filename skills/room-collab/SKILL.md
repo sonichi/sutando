@@ -370,6 +370,23 @@ Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
   narrow. Exercise the controls, read the console, and fix what you see. People
   review the page by pinning comments on it; answer each one in its thread.
 
+## The sheet is a fifth surface
+
+`--kind sheet` is a shared grid with formulas. Rows and columns have stable ids,
+so an address like `B4` is resolved when you write, and your edit lands where B4
+is now, even after someone inserts a row.
+
+```bash
+python3 $P --kind sheet read '!room:server'                       # inputs as CSV (formulas as typed)
+python3 $P --kind sheet read '!room:server' --json                # {"B4": "=SUM(B1:B3)", ...}
+python3 $P --kind sheet set '!room:server' B4 '=SUM(B1:B3)'       # one cell: a value or =formula
+python3 $P --kind sheet import '!room:server' data.csv --at A1    # a block; the grid grows to fit
+```
+
+Formulas: `+ - * / ^ &`, comparisons, ranges, and SUM, AVERAGE, MIN, MAX,
+COUNT, COUNTA, IF, AND, OR, NOT, ROUND, ABS, CONCAT, LEN, UPPER and LOWER.
+The web client computes the values; `read` returns what was typed.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:

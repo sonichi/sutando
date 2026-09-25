@@ -795,6 +795,38 @@ class RoomDoc:
         stage = self._doc.get(HTML_STAGE_KEY, type=Map)
         await self._commit(lambda: stage.__setitem__("speaking", bool(speaking)))
 
+    def _require_sheet(self, what: str) -> tuple:
+        from room_sheet import CELLS_KEY as SC, COLS_KEY as SK, ROWS_KEY as SR, SHEET_KIND
+        if self._kind != SHEET_KIND:
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: open the sheet "
+                               f"with kind={SHEET_KIND!r}.")
+        return (self._doc.get(SR, type=Map), self._doc.get(SK, type=Map), self._doc.get(SC, type=Map))
+
+    @property
+    def sheet(self) -> tuple[dict, dict, dict]:
+        """(rows, cols, cells) as plain dicts: axis id → {order}, `<row>|<col>` → {v, updated, by}."""
+        rows, cols, cells = self._require_sheet("read the sheet")
+        return tuple(dict(self._items(m)) for m in (rows, cols, cells))
+
+    async def put_sheet(self, new_rows: dict, new_cols: dict, writes: dict) -> int:
+        """Add axis entries and write cells in one update; a None value removes a cell."""
+        rows, cols, cells = self._require_sheet("write the sheet")
+
+        def mutate() -> None:
+            for k, v in new_rows.items():
+                rows[k] = v
+            for k, v in new_cols.items():
+                cols[k] = v
+            for k, v in writes.items():
+                if v is None:
+                    if k in cells:
+                        del cells[k]
+                else:
+                    cells[k] = v
+
+        await self._commit(mutate)
+        return len(writes)
+
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.
         Refuses a card the panel would drop, rather than writing it."""
