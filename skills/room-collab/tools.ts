@@ -493,6 +493,39 @@ export const roomDbMoveTool: ToolDefinition = {
 	},
 };
 
+export const roomDbRowTool: ToolDefinition = {
+	name: 'room_db_row',
+	description:
+		'Open one row of a room database as a page: read its properties and its page body (markdown notes, like a ' +
+		'meeting\'s minutes or a task\'s details), or write that body for everyone. Omit body to read; pass body to ' +
+		'replace the page, or with append true to add to its end (e.g. "add to the standup notes: ship Friday"). ' +
+		'The row is named by its title or id. Takes ~1–3 s.',
+	parameters: z.object({
+		database: DATABASE_ARG,
+		row: z.string().min(1).max(200).describe('The row\'s title or id (from room_db_read)'),
+		body: z
+			.string()
+			.max(16_000)
+			.optional()
+			.describe('Markdown for the row page; omit to read the row. An empty string clears the page'),
+		append: z.boolean().optional().describe('Add body to the end of the page instead of replacing it'),
+	}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute(args) {
+		const { database, row, body, append } = args as {
+			database?: string;
+			row: string;
+			body?: string;
+			append?: boolean;
+		};
+		const path = `${dbPath(database)}/row/${encodeURIComponent(row)}`;
+		if (body === undefined) return relay('GET', path, DB_TIMEOUT_MS);
+		const q = `text=${encodeURIComponent(body)}${append ? '&append=1' : ''}`;
+		return relay('POST', `${path}/body?${q}`, DB_TIMEOUT_MS);
+	},
+};
+
 export const tools: ToolDefinition[] = [
 	roomUseTool,
 	roomSlideTool,
@@ -509,6 +542,7 @@ export const tools: ToolDefinition[] = [
 	roomDbAddTool,
 	roomDbUpdateTool,
 	roomDbMoveTool,
+	roomDbRowTool,
 ];
 
 /** The slide rule, in the voice prompt of every session this skill is loaded into. */

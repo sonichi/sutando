@@ -968,6 +968,9 @@ class RoomDoc:
         if unknown:
             raise RoomDocError(f"not a database map: {', '.join(unknown)}. Nothing was written.")
 
+        from room_database import BODIES
+        bodies = self._doc.get(BODIES, type=Map)
+
         def mutate() -> None:
             for name, entries in writes.items():
                 ymap = maps[name]
@@ -977,9 +980,60 @@ class RoomDoc:
                             del ymap[k]
                     else:
                         ymap[k] = v
+                    # A row's page body lives and dies with the row, as in the web client.
+                    if name == "rows" and v is None and k in bodies:
+                        del bodies[k]
+                    elif name == "rows" and v is not None and k not in bodies:
+                        bodies[k] = Text()
 
         await self._commit(mutate)
         return sum(len(e) for e in writes.values())
+
+    def row_body(self, db: str, row: str) -> str | None:
+        """A row page's markdown body; None when the row has none yet (see DATABASE.md)."""
+        from room_database import BODIES, key
+        self._require_db("read a row page")
+        t = self._doc.get(BODIES, type=Map).get(key(db, row))
+        return str(t) if isinstance(t, Text) else None
+
+    async def put_row_body(self, db: str, row: str, text: str, *, append: bool = False) -> int:
+        """Set (or append to) a row page's body; only the changed middle is rewritten,
+        so people typing elsewhere in it keep their place. Returns the body's length."""
+        from room_database import BODIES, BODY_MAX, DbRefusal, key
+        maps = self._require_db("write a row page")
+        k = key(db, row)
+        if k not in maps["rows"]:
+            raise DbRefusal(f"no row {row!r} in database {db!r}. Nothing was written.")
+        bodies = self._doc.get(BODIES, type=Map)
+        current = self.row_body(db, row) or ""
+        new = current + text if append else text
+        if len(new) > BODY_MAX:
+            raise DbRefusal(f"a row page holds at most {BODY_MAX} characters. Nothing was written.")
+        if new == current and k in bodies:
+            return len(new)
+        p = 0
+        while p < min(len(current), len(new)) and current[p] == new[p]:
+            p += 1
+        q = 0
+        while q < min(len(current), len(new)) - p and current[-1 - q] == new[-1 - q]:
+            q += 1
+        # pycrdt indexes Text by UTF-8 bytes.
+        start = len(current[:p].encode("utf-8"))
+        width = len(current[p:len(current) - q].encode("utf-8"))
+        middle = new[p:len(new) - q]
+
+        def mutate() -> None:
+            t = bodies.get(k)
+            if not isinstance(t, Text):
+                bodies[k] = Text()
+                t = bodies[k]
+            if width:
+                del t[start:start + width]
+            if middle:
+                t.insert(start, middle)
+
+        await self._commit(mutate)
+        return len(new)
 
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.

@@ -510,7 +510,14 @@ python3 $P --kind db add '!room:server' --db Launch --set 'Name=Write the demo' 
 python3 $P --kind db update '!room:server' --db Launch --row 'Write the demo' --set 'Priority=High'
 python3 $P --kind db move '!room:server' --db Launch --row 'Write the demo' --to Done   # a board move
 python3 $P --kind db import '!room:server' --db Launch rows.csv                # headers = property names
+python3 $P row-read '!room:server' Launch 'Write the demo' [--json]           # a row as a page: properties + body
+python3 $P row-body '!room:server' Launch 'Write the demo' --text '# Plan'     # set the page body (markdown)
+python3 $P row-body '!room:server' - 'Write the demo' --file notes.md --append # `-` = the only database
 ```
+
+Every row is also a page: `row-read` and `row-body` read and write its markdown
+body (they imply `--kind db`). Setting a body rewrites only the part that changed,
+so people typing elsewhere in it keep their place.
 
 `--db` may be left out when the room has one database; `--row` is a row id or
 its title. A CSV's headers map to properties case-blind; `--map 'CSV header=Property'`
@@ -524,8 +531,8 @@ python3 $P --kind db create '!room:server' --template demo_day --from-csv sheet.
     --map 'Use case brief=Use case' --map 'Time needed=Minutes' --map 'Killer Use Case Status=Killer use case'
 ```
 
-By voice: `room_db_list`, `room_db_read`, `room_db_add`, `room_db_update` and
-`room_db_move` go through the relay's `/db` routes (the relay needs `--user-id`
+By voice: `room_db_list`, `room_db_read`, `room_db_add`, `room_db_update`,
+`room_db_move` and `room_db_row` (read a row's page, or write its body) go through the relay's `/db` routes (the relay needs `--user-id`
 to sign writes). They work whichever surface the relay holds; `POST /surface/db`
 holds the databases open for faster calls.
 

@@ -20,6 +20,9 @@ from room_collab_protocol import RoomDocError
 
 DB_KIND = "db"
 MAPS = ("dbs", "props", "rows", "cells", "views")
+# `<db>|<row>` → Y.Text, the row page's markdown body; kept out of MAPS, whose values are plain dicts.
+BODIES = "bodies"
+BODY_MAX = 200_000
 GAP = 1024
 PROP_TYPES = ("title", "text", "number", "checkbox", "url", "email", "select", "multi_select",
               "status", "date", "person", "files", "relation", "created_time", "created_by",
@@ -611,6 +614,23 @@ def group_target(d: dict, prop: dict, to: str):
 
 
 # ---- what a reader sees -------------------------------------------------------
+
+def row_json(d: dict, row: dict, body: str | None, name: str = "") -> dict:
+    """One row as its page shows it: every property's display value by name, then the body."""
+    tp = title_prop(d)
+    return {"db": d["id"], "name": name, "row": row["id"],
+            "title": display_value(value_of(d, row, tp), tp) if tp else "",
+            "values": {p["name"]: display_value(value_of(d, row, p), p) for p in d["props"]},
+            "body": body or ""}
+
+
+def render_row(r: dict) -> str:
+    """row_json as text: the title, one line per non-empty property, then the body."""
+    lines = [f"# {r['title'] or r['row']}", f"({r['name'] or r['db']} · row {r['row']})", ""]
+    lines += [f"{k}: {v}" for k, v in r["values"].items() if v]
+    lines += ["", "---", r["body"].rstrip("\n") if r["body"].strip() else "(the page is empty)"]
+    return "\n".join(lines)
+
 
 def view_json(d: dict, view: dict, name: str = "") -> dict:
     """A view's rows with display values keyed by property name; a board's rows also in its groups."""
