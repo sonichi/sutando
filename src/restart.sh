@@ -83,6 +83,9 @@ if launchctl print "$_GW_SERVICE" >/dev/null 2>&1; then
     if [ "${1:-}" = "--stop-only" ]; then
         echo "  Stopping launchd-supervised gateway bridge..."
         launchctl bootout "$_GW_SERVICE" 2>/dev/null || true
+        # A deliberate stop is not a restart: clear the wrapper's started marker so
+        # the next startup does not read as "previous process exited" and alert.
+        rm -f "${_WS:-$REPO/workspace}/state/channel-bridge-supervisor/gateway.started" 2>/dev/null || true
     else
         echo "  Restarting launchd-supervised gateway bridge..."
         launchctl kickstart -k "$_GW_SERVICE" 2>/dev/null || true
@@ -143,9 +146,13 @@ STOP_PATTERNS=(
     "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
+# Under launchd a restart kickstarts the gateway bridge at once, so waiting for
+# it to vanish would always run this drain to its cap; skip it in that case.
+_GW_LAUNCHD=0; launchctl print "$_GW_SERVICE" >/dev/null 2>&1 && _GW_LAUNCHD=1
 for _ in $(seq 1 30); do
     still=0
     for pat in "${STOP_PATTERNS[@]}"; do
+        [ "$pat" = "remote-gateway-bridge" ] && [ "$_GW_LAUNCHD" = 1 ] && continue
         if pgrep -f "$pat" >/dev/null 2>&1; then still=1; break; fi
     done
     [ $still -eq 0 ] && break

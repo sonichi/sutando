@@ -77,9 +77,8 @@ class BehaviourTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
             return log.read_text() if log.exists() else ""
 
-    # The slice runs up to the proxy block, so it also contains the unrelated
-    # pkills that follow the gateway block (relay-bridge, ngrok, ...); only the
-    # gateway's own pkill is under test here.
+    # The slice also holds the unrelated pkills after the gateway block (relay,
+    # ngrok, ...), so only the gateway's own pkill is asserted on.
     GW_PKILL = "pkill -f remote-gateway-bridge"
 
     def test_job_loaded_restart_kickstarts_and_does_not_pkill(self):
