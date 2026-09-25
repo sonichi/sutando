@@ -49,7 +49,7 @@ class EnsureTaskEventHandler(Base):
         self.assertIsNone(pr.ensure_task_event_handler(self.ws))
         self.assertFalse(cfg_path(self.ws).exists())
 
-    def test_no_live_workers_is_a_noop(self):
+    def test_only_retired_workers_is_a_noop(self):
         make_worker(self.ws)
         roster = json.loads(pr.roster_path(self.ws).read_text())
         for w in roster["workers"].values():
@@ -58,6 +58,29 @@ class EnsureTaskEventHandler(Base):
         cfg_path(self.ws).unlink()
         self.assertIsNone(pr.ensure_task_event_handler(self.ws))
         self.assertFalse(cfg_path(self.ws).exists())
+
+    def _set_state(self, state):
+        roster = json.loads(pr.roster_path(self.ws).read_text())
+        for w in roster["workers"].values():
+            w["state"] = state
+        pr.roster_path(self.ws).write_text(json.dumps(roster))
+
+    def test_a_recovering_worker_still_gets_a_declaration(self):
+        """The router routes without asking liveness, so a recovering worker
+        keeps receiving deliveries; without the declaration the watcher sends
+        its bound tasks to the core instead."""
+        make_worker(self.ws)
+        self._set_state("recovering")
+        cfg_path(self.ws).unlink()
+        self.assertIsNotNone(pr.ensure_task_event_handler(self.ws))
+        self.assertTrue(cfg_path(self.ws).exists())
+
+    def test_an_abandoned_worker_still_gets_a_declaration(self):
+        make_worker(self.ws)
+        self._set_state("abandoned")
+        cfg_path(self.ws).unlink()
+        self.assertIsNotNone(pr.ensure_task_event_handler(self.ws))
+        self.assertTrue(cfg_path(self.ws).exists())
 
     def test_an_existing_pool_that_predates_the_file_is_backfilled(self):
         """register_worker() already wrote it once (this skill's normal path);
@@ -111,6 +134,18 @@ class TickBackfillsOnItsOwnSweep(Base):
         sup.tick(self.ws, 1000.0, worker_ids=[wid])
 
         self.assertTrue(cfg_path(self.ws).exists())
+
+    def test_a_sweep_backfills_when_the_only_worker_is_recovering(self):
+        wid = make_worker(self.ws)
+        roster = json.loads(pr.roster_path(self.ws).read_text())
+        roster["workers"][wid]["state"] = "recovering"
+        pr.roster_path(self.ws).write_text(json.dumps(roster))
+        cfg_path(self.ws).unlink()
+
+        sup.tick(self.ws, 1000.0, worker_ids=None)
+
+        self.assertTrue(cfg_path(self.ws).exists(),
+                         "a recovering worker's bound tasks would fall through to the core")
 
 
 if __name__ == "__main__":
