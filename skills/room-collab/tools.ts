@@ -11,6 +11,12 @@ const START_HINT =
 	'The room relay is not running. Ask the core to start it: ' +
 	"python3 skills/room-collab/scripts/room_collab.py --kind html relay '<room id>'";
 
+// One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
+const talk: { beats: Beat[]; pos: number; active: boolean } = { beats: [], pos: 0, active: false };
+
+// The session's context channel, from setup(), to restate the slide rule when a talk starts.
+let injectContext: ((text: string) => void) | null = null;
+
 async function relay(method: 'GET' | 'POST', path: string): Promise<Record<string, unknown>> {
 	let res: Response;
 	try {
@@ -20,6 +26,19 @@ async function relay(method: 'GET' | 'POST', path: string): Promise<Record<strin
 	}
 	const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
 	return res.ok ? body : { error: String(body.error ?? `relay answered ${res.status}`) };
+}
+
+// Which slide tool to use is the model's most common mistake: slide_control moves a local tab.
+export const ROOM_SLIDE_RULE =
+	'When the deck being presented is open as an AG2 Space room page (room_present, or the room relay is up), ' +
+	'every slide request — "next", "go back", "go to slide N" — uses room_slide, and highlights use room_highlight. ' +
+	'slide_control moves only a browser tab on this computer and does nothing in the room.';
+
+/** A user-directed move during a talk pauses it, or the next beat would move the deck away again. */
+function pauseForManualMove(): string | undefined {
+	if (!talk.active) return undefined;
+	talk.active = false;
+	return 'The talk is paused so this move sticks. Call room_present resume to continue from where you were.';
 }
 
 export const roomSlideTool: ToolDefinition = {
@@ -37,7 +56,9 @@ export const roomSlideTool: ToolDefinition = {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
 		if (action === 'goto' && !slideNumber) return { error: 'goto needs slideNumber' };
 		const move = action === 'goto' ? String(slideNumber) : action === 'next' ? 'next' : 'prev';
-		return relay('POST', `/slide/${move}`);
+		const note = pauseForManualMove();
+		const res = await relay('POST', `/slide/${move}`);
+		return note && !res.error ? { ...res, note } : res;
 	},
 };
 
@@ -54,7 +75,9 @@ export const roomHighlightTool: ToolDefinition = {
 	async execute(args) {
 		const { topic } = args as { topic: string };
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(topic)) return { error: `not a topic key: ${topic}` };
-		return relay('POST', `/highlight/${encodeURIComponent(topic.toLowerCase())}`);
+		const note = pauseForManualMove();
+		const res = await relay('POST', `/highlight/${encodeURIComponent(topic.toLowerCase())}`);
+		return note && !res.error ? { ...res, note } : res;
 	},
 };
 
@@ -93,8 +116,6 @@ export const roomScriptTool: ToolDefinition = {
 	},
 };
 
-// One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
-const talk: { beats: Beat[]; pos: number; active: boolean } = { beats: [], pos: 0, active: false };
 
 /** Take a beat's actions (in order, waiting out pauses), then hand back its line. */
 async function runBeat(beat: Beat): Promise<string | null> {
@@ -154,6 +175,7 @@ export const roomPresentTool: ToolDefinition = {
 			talk.pos -= 1; // re-deliver the beat that was interrupted
 		}
 		talk.active = true;
+		if (action === 'start') injectContext?.(ROOM_SLIDE_RULE);
 		const line = await nextLine();
 		if (!line) return { ok: true, state: 'the talk is over' };
 		return { ok: true, say: line.say, line: line.n, of: talk.beats.length, instruction: 'Say ONLY this line, then stop.' };
@@ -162,8 +184,18 @@ export const roomPresentTool: ToolDefinition = {
 
 export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool, roomScriptTool, roomPresentTool];
 
+/** The slide rule, in the voice prompt of every session this skill is loaded into. */
+export function voiceSurface(): { promptRules: string[] } {
+	return { promptRules: [ROOM_SLIDE_RULE] };
+}
+
 /** Pace the talk on turn ends: after the model finishes a line, take the next beat. */
-export function setup(ctx: { session: unknown; injectText: (session: unknown, text: string) => void }): void {
+export function setup(ctx: {
+	session: unknown;
+	injectText: (session: unknown, text: string) => void;
+	injectContext?: (text: string) => void;
+}): void {
+	if (typeof ctx?.injectContext === 'function') injectContext = ctx.injectContext;
 	const sess = ctx?.session as { eventBus?: { subscribe?: (ev: string, fn: () => void) => void } } | undefined;
 	if (!sess?.eventBus?.subscribe || typeof ctx.injectText !== 'function') {
 		console.warn('[room-collab] no turn events on this session; room_present runs one line per call');
