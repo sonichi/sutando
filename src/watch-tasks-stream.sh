@@ -1067,6 +1067,9 @@ handle_event() {
       # that signaled a background --handler-runner subprocess's completion,
       # which no longer exists now that the handler runs synchronously.
       reload_current_handler
+      # Diagnostic instrument only (not a shipped fix): lets a margin-sweep
+      # probe measure real config-write -> reload latency on this runner.
+      [ -n "${SUTANDO_TEST_RELOAD_PROBE:-}" ] && echo "RELOAD_PROBE $(date +%s.%N) state=$HANDLER_STATE" >&2
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
       redispatch_held_tasks
       ;;
