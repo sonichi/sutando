@@ -107,16 +107,28 @@ test_absent_helper_no_caller_refuses() {
 }
 
 # Delegation, both launchers: a behavioral test of one cannot see a second copy
-# of the policy in the other.
+# of the policy in the other. The claude launcher's own resolve+source call
+# lives in session-launch.sh (the launcher-cleanup split moved it there,
+# shared with the worker launch script) — start-cli.sh delegates to it rather
+# than calling the resolver itself, so it's checked for the delegation link,
+# not the resolver call.
 test_both_launchers_delegate() {
   local rc=0 f
-  for f in src/agent/claude/cli/start-cli.sh src/startup.sh; do
+  if ! grep -qF 'source "$REPO/src/agent/claude/cli/session-launch.sh"' "$REAL_REPO/src/agent/claude/cli/start-cli.sh" \
+     && ! grep -qF '. "$REPO/src/agent/claude/cli/session-launch.sh"' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh does not source session-launch.sh"; rc=1
+  fi
+  for f in src/agent/claude/cli/session-launch.sh src/startup.sh; do
     if ! grep -qF 'source "$REPO/src/claude_config_dir.sh"' "$REAL_REPO/$f"; then
       echo "  FAIL: $f does not source the shared resolver"; rc=1
     fi
     if ! grep -qF 'resolve_claude_config_dir "$REPO"' "$REAL_REPO/$f"; then
       echo "  FAIL: $f does not call resolve_claude_config_dir"; rc=1
     fi
+  done
+  # No second copy anywhere in the delegation chain, including the launcher
+  # that now only delegates.
+  for f in src/agent/claude/cli/start-cli.sh src/agent/claude/cli/session-launch.sh src/startup.sh; do
     # Invocation form only — a prose mention of the subcommand is not a copy.
     if grep -qF 'sutando-config.sh" claude-sutando-config-dir' "$REAL_REPO/$f"; then
       echo "  FAIL: $f still calls the M0 subcommand directly — second copy of the policy"; rc=1

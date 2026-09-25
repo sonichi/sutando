@@ -111,8 +111,7 @@ class RePickTests(FakeTmuxHarness):
     def test_a_restart_between_the_paste_and_the_enter_resumes_at_the_enter(self):
         # The composer already holds exactly our prompt and nothing was ever pressed.
         self.write_task("task-mid.txt")
-        prompt = (f"Sutando task ready: task-mid.txt. Read {self.tasks_dir}/task-mid.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-mid.txt.")
+        prompt = self.expected_prompt("task-mid.txt")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
         t = self._finish_on("task-mid.txt", lambda log: "ENTER" in log)
         result = self.run_event("task-mid.txt")
@@ -153,8 +152,7 @@ class RePickTests(FakeTmuxHarness):
         # composer cannot say whose line it is, so neither pick presses Enter.
         self.write_task("task-a b.txt")
         self.write_task("task-ab.txt")
-        prompt = (f"Sutando task ready: task-a b.txt. Read {self.tasks_dir}/task-a b.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-a b.txt.")
+        prompt = self.expected_prompt("task-a b.txt")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
         result = self.run_event("task-ab.txt", timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -200,8 +198,7 @@ class RePickTests(FakeTmuxHarness):
     def test_a_marker_beside_a_staged_prompt_means_resume_not_await(self):
         # The crash landed after the marker and before the Enter.
         self.write_task("task-mk.txt")
-        prompt = (f"Sutando task ready: task-mk.txt. Read {self.tasks_dir}/task-mk.txt, follow CLAUDE.md, "
-                  f"complete the task, and write the result to {self.results_dir}/task-mk.txt.")
+        prompt = self.expected_prompt("task-mk.txt")
         self.inflight_dir.mkdir(parents=True, exist_ok=True)
         (self.inflight_dir / "task-mk.txt").write_text("4242\n")
         self.pane_file.write_text(f"❯ {prompt}\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
@@ -292,6 +289,47 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 return True
             time.sleep(0.1)
         return False
+
+    def tearDown(self):
+        """Every test in this class starts the real main loop, whose standby
+        watcher calls setsid() and so survives a killpg of the notifier."""
+        left = self._kill_strays()
+        super().tearDown()
+        self.assertEqual(left, [], "a fixture watcher or fswatch outlived the test")
+
+    def _strays(self):
+        """Pids still naming this fixture. `pgrep -f` matches the full argv;
+        macOS `ps -o command=` truncates it to the terminal width and would
+        silently report none."""
+        out = subprocess.run(["pgrep", "-f", Path(self.root).name],
+                             capture_output=True, text=True).stdout
+        me = os.getpid()
+        return [int(x) for x in out.split() if x.isdigit() and int(x) != me]
+
+    def _kill_strays(self, grace=5.0):
+        """Reap anything still naming this fixture, by process group."""
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            pids = self._strays()
+            if not pids:
+                return []
+            for pid in pids:
+                for killer in (os.killpg, os.kill):
+                    try:
+                        killer(pid, signal.SIGTERM)
+                        break
+                    except (ProcessLookupError, PermissionError):
+                        continue
+            time.sleep(0.3)
+        for pid in self._strays():
+            for killer in (os.killpg, os.kill):
+                try:
+                    killer(pid, signal.SIGKILL)
+                    break
+                except (ProcessLookupError, PermissionError):
+                    continue
+        time.sleep(0.3)
+        return self._strays()
 
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:
@@ -394,53 +432,63 @@ class MainLoopWiringTest(FakeTmuxHarness):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        # A real file, not PIPE: nothing here ever read proc.stderr, so a FAIL
+        # had none of the notifier's own log_notifier lines to diagnose from (#4703).
+        errf_path = self.root / "notifier.stderr"
+        errf = open(errf_path, "w")
         proc = subprocess.Popen(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env({"SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=errf,
             text=True,
             start_new_session=True,
         )
+        def with_stderr(msg):
+            return msg + "\nnotifier stderr:\n" + errf_path.read_text(errors="replace")
+
         try:
-            self.assertTrue(
-                self._wait_for_fswatch_attach(),
-                "fswatch never attached to the watched tasks dir",
-            )
-            self.write_task("task-p.txt")
-            # Let the (failing) first wake pass, then clear the draft -- no
-            # new task file is EVER written from here on.
-            time.sleep(1.5)
-            self.assertNotIn("TYPE", self.sendkeys_log_text(),
-                              "a busy composer must not have been typed over")
-            self.pane_file.write_text(IDLE_FOOTER + "\n")
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if "TYPE Sutando task ready: task-p.txt" in self.sendkeys_log_text():
-                    break
-                time.sleep(0.2)
-            else:
-                self.fail("the periodic self-poll never retried the queued task:\n"
-                          + self.sendkeys_log_text())
-            self.write_result("task-p.txt")
-            deadline = time.time() + 10
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.2)
-        finally:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                self.assertTrue(
+                    self._wait_for_fswatch_attach(),
+                    with_stderr("fswatch never attached to the watched tasks dir"),
+                )
+                self.write_task("task-p.txt")
+                # Let the (failing) first wake pass, then clear the draft -- no
+                # new task file is EVER written from here on.
+                time.sleep(1.5)
+                self.assertNotIn("TYPE", self.sendkeys_log_text(),
+                                  with_stderr("a busy composer must not have been typed over"))
+                self.pane_file.write_text(IDLE_FOOTER + "\n")
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if "TYPE Sutando task ready: task-p.txt" in self.sendkeys_log_text():
+                        break
+                    time.sleep(0.2)
+                else:
+                    self.fail(with_stderr("the periodic self-poll never retried the queued task:\n"
+                                           + self.sendkeys_log_text()))
+                self.write_result("task-p.txt")
+                deadline = time.time() + 10
+                while time.time() < deadline and proc.poll() is None:
+                    time.sleep(0.2)
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=5)
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=5)
+        finally:
+            errf.close()
 
     def test_claimed_task_is_never_selected_by_an_unrelated_wake(self):
         # next_pending_task must skip a task claimed must-handle, whichever
@@ -550,91 +598,8 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
-    def test_required_task_still_unclaimed_is_skipped_on_a_fresh_probe(self):
-        # The pre-claim race: no CLAIMS_DIR entry yet, but a fresh probe must
-        # still skip it -- direct against next_pending_task, per the note below.
-        handler = self.bin / "fake-handler.sh"
-        handler.write_text('''#!/bin/bash
-for a in "$@"; do
-  case "$a" in --task-file) next=file; continue ;; esac
-  if [ "${next:-}" = file ]; then file="$a"; next=""; fi
-done
-case "$file" in
-  */task-protected.txt) exit 4 ;;
-  *) exit 3 ;;
-esac
-''')
-        handler.chmod(0o755)
-        self.write_task("task-protected.txt")
-        time.sleep(0.05)
-        self.write_task("task-unrelated2.txt")
-        # next_pending_task is a local function, not a CLI subcommand -- run
-        # the script's own definitions (above its `--event` gate) as a file.
-        functions_only = []
-        for line in NOTIFIER.read_text().splitlines():
-            if line.startswith('if [ "${1:-}" = "--event" ]'):
-                break
-            functions_only.append(line)
-        probe_script = NOTIFIER.parent / ".probe-test-next-pending.sh"
-        probe_script.write_text("\n".join(functions_only) + "\nnext_pending_task\n")
-        probe_script.chmod(0o755)
-        self.addCleanup(probe_script.unlink, missing_ok=True)
-        env = self._env({"SUTANDO_TASK_EVENT_HANDLER": str(handler),
-                          "SUTANDO_WORKSPACE_DIR": str(self.tasks_dir.parent)})
-        result = subprocess.run(["/bin/bash", str(probe_script)],
-                                 env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout.strip(), "task-unrelated2.txt",
-            "a required task with no claim file YET must still be skipped, on the "
-            f"strength of a fresh probe alone; got {result.stdout!r}, stderr={result.stderr!r}")
-
-
-    def test_separate_task_inbox_still_probes_the_canonical_workspace(self):
-        # A separate task inbox is a supported layout; probed against the inbox's
-        # parent instead of the canonical workspace, the handler says "optional".
-        canonical = self.root / "workspace"
-        inbox = self.root / "deliveries" / "tasks"
-        inbox.mkdir(parents=True)
-        seen = self.root / "handler-saw.txt"
-        handler = self.bin / "fake-handler-ws.sh"
-        handler.write_text(f'''#!/bin/bash
-ws=""; file=""
-while [ $# -gt 0 ]; do
-  case "$1" in --workspace) ws="$2"; shift ;; --task-file) file="$2"; shift ;; esac
-  shift
-done
-printf '%s\\n' "$ws" >> "{seen}"
-case "$file" in
-  */task-protected.txt) [ "$ws" = "{canonical}" ] && exit 4; exit 3 ;;
-  *) exit 3 ;;
-esac
-''')
-        handler.chmod(0o755)
-        (inbox / "task-protected.txt").write_text("task: say OK\n")
-        time.sleep(0.05)
-        (inbox / "task-unrelated3.txt").write_text("task: say OK\n")
-        functions_only = []
-        for line in NOTIFIER.read_text().splitlines():
-            if line.startswith('if [ "${1:-}" = "--event" ]'):
-                break
-            functions_only.append(line)
-        probe_script = NOTIFIER.parent / ".probe-test-separate-inbox.sh"
-        probe_script.write_text("\n".join(functions_only) + "\nnext_pending_task\n")
-        probe_script.chmod(0o755)
-        self.addCleanup(probe_script.unlink, missing_ok=True)
-        env = self._env({"SUTANDO_TASK_EVENT_HANDLER": str(handler),
-                          "SUTANDO_WORKSPACE_DIR": str(canonical),
-                          "SUTANDO_TASKS_DIR": str(inbox)})
-        result = subprocess.run(["/bin/bash", str(probe_script)],
-                                 env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(canonical), seen.read_text(),
-                      "the probe must name the canonical workspace, not the inbox's parent")
-        self.assertNotIn(str(inbox.parent) + "\n", seen.read_text())
-        self.assertEqual(result.stdout.strip(), "task-unrelated3.txt",
-                         f"protected task leaked to the core; got {result.stdout!r}")
-
+    # Two tests removed here: both ran next_pending_task()/
+    # probe_optional_task_handler() directly, deleted by the single-decider redesign.
 
 
 if __name__ == "__main__":

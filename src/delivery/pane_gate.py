@@ -11,7 +11,7 @@ captures, how often it polls, what it logs).
     deliver(line, session, "codex", ...)     -> Outcome mapped from tmux-send-line.sh's exit code
 
 Runtime specifics are DATA on a RuntimeAdapter — prompt glyph, idle footer, gate
-signatures, input-affordance hint, busy marker, placeholder — never branches in the
+signatures, input-affordance hint, placeholder — never branches in the
 policy. A gate signature counts only while a current input affordance is on screen
 and no empty composer sits under it: a finished turn's prose may say "Select" or
 "Press Enter to continue", and above the runtime's own empty prompt it is history.
@@ -45,7 +45,10 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, live_banner_lines, matched_abnormal  # noqa: E402
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
+                       frame_abnormal, frame_working)
+from quota_availability import provider_allows_now  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -91,7 +94,6 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
-BUSY = re.compile(r"esc to interrupt", re.I)
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,6 @@ class RuntimeAdapter:
     idle_ready: "re.Pattern[str]"
     gate_signatures: Tuple[Tuple[str, "re.Pattern[str]"], ...]
     await_hint: "re.Pattern[str]" = AWAIT_HINT
-    busy: "re.Pattern[str]" = BUSY
 
 
 CLAUDE = RuntimeAdapter(
@@ -305,19 +306,6 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     return None
 
 
-def banner_abnormal_names(tail: str) -> List[str]:
-    """cli_wedge's whole-line banner families -- the only reader of a live
-    "Retrying in Ns" line. The retry family outranks everything; the parked
-    family waits for the gate signatures, since its quota-limit line also
-    matches the Fable-consent dialog, which is a named gate first."""
-    names: List[str] = []
-    for family, name, _line in live_banner_lines(tail):
-        tag = f"{family}:{name}" if family == "retry" else name
-        if tag not in names:
-            names.append(tag)
-    return names
-
-
 # A working turn queues typed input (the Claude notifier delivers like the Monitor
 # tool); a dialog, a parked banner or an unreadable pane does not.
 def accepts_input(verdict: Verdict) -> bool:
@@ -327,25 +315,39 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
-    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle."""
+def _limit_is_stale(abn, workspace, socket, session, probe=False) -> bool:
+    """A quota-only banner beside a FRESH proxy record that says accepted, on a seat
+    whose own traffic is ROUTED through that proxy, is a line from before the reset:
+    scrollback, not a hold. Anything else keeps the hold -- another abnormal family,
+    an unrouted or unobserved seat, or a record absent, stale or rejected. A retry
+    never reaches here: classify_pane returns on it before any gate."""
+    if abn.kind != "provider-limit":
+        return False
+    if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
+        return False
+    try:
+        ws = workspace if workspace is not None else resolve_workspace()
+        return provider_allows_now(ws, socket, session, probe=probe)
+    except Exception:  # noqa: BLE001 -- an unreadable record is not permission
+        return False
+
+
+def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
+                  socket=None, session=None, probe=False) -> Verdict:
+    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle.
+    `workspace` locates the proxy's quota record (None: the configured one); `socket`
+    and `session` name the seat whose routing that record must vouch for."""
     if capture is None:
         return Verdict("unknown", "no capture")
     if not capture.strip():
         return Verdict("unknown", "empty pane")
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
-    # A retry is abnormal even mid-turn: the interrupt affordance stays up while
-    # the CLI retries, and a line typed then queues into a turn that is not served.
-    retrying = [t for t in banner_abnormal_names(tail) if t.startswith("retry:")]
-    if retrying:
-        return Verdict("abnormal", ",".join(retrying))
-    if adapter.busy.search(tail):
-        return Verdict("busy", "working")
-    abnormal = matched_abnormal([tail])
-    if abnormal:
-        return Verdict("abnormal", ",".join(abnormal))
-    joined = "\n".join(lines)
+    # cli_wedge ranks abnormal text above motion. A retry keeps that rank against
+    # a dialog too; a parked line may be the dialog's own text, so the gate reads first.
+    abn = frame_abnormal(tail)
+    if abn and abn.retrying:
+        return Verdict("abnormal", ",".join(abn.names))
     # FULL capture, not the TAIL_LINES tail: a wrapped draft past that window
     # loses its own glyph line to truncation and the footer reads as empty.
     line = prompt_line(capture, adapter)
@@ -354,9 +356,10 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
-    banner = banner_abnormal_names(tail)
-    if banner:
-        return Verdict("abnormal", ",".join(banner))
+    if abn and not _limit_is_stale(abn, workspace, socket, session, probe):
+        return Verdict("abnormal", ",".join(abn.names))
+    if frame_working(tail):
+        return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
     if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
@@ -365,7 +368,8 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
 
 
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
-            runner: Callable = subprocess.run, env: Optional[dict] = None) -> Verdict:
+            runner: Callable = subprocess.run, env: Optional[dict] = None, workspace=None,
+            probe=False) -> Verdict:
     """Capture the core window through cli_wedge's one capture path, then classify it."""
     target = core_target(socket_path, session, tmux_bin, runner, env)
     if target is None:
@@ -373,7 +377,7 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
     # Both runtimes need attributes: Codex draws a dim placeholder, Claude a
     # grey ghost suggestion, and prompt_line() strips either before deciding pending.
     text = capture_pane(socket_path, target, tmux_bin, runner, env, escapes=True)
-    return classify_pane(text, adapter)
+    return classify_pane(text, adapter, workspace, socket_path, session, probe)
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
@@ -420,10 +424,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--width", type=int, default=0)
         if name == "classify":
             p.add_argument("--json", action="store_true")
+        if name in ("classify", "safe"):
+            p.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+            p.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+            p.add_argument("--session", default=None, help="the seat the record must vouch for")
+            p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+    hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+    hp.add_argument("--session", default=None, help="the seat the record must vouch for")
+    hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -440,7 +453,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         print(json.dumps(v.as_dict()) if a.json else v.state)
         return 0
     if a.cmd == "pending":
@@ -455,7 +470,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "healthy":
         # The notifier's pre-typing question, answered by the same verdict every
         # caller gets: exit 0 when typed input reaches the composer, else refuse.
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         if not accepts_input(v):
             print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
             return EXIT_UNSAFE
@@ -471,7 +488,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(text)
         return 0
     if a.cmd == "safe":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         if state_is_unsafe(v.state):
             print(f"pane_gate: {v.state} — not safe to type into", file=sys.stderr)
             return EXIT_UNSAFE

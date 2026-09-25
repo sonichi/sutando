@@ -22,6 +22,8 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 from delivery import pane_gate as pg  # noqa: E402
+import cli_wedge as wedge  # noqa: E402
+import quota_availability as qa  # noqa: E402
 
 FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 CODEX_DIM_IDLE = "\x1b[1m›\x1b[0m \x1b[2mImprove documentation in @filename\x1b[0m\n"
@@ -403,6 +405,59 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
+    """The gate asks cli_wedge one question -- frame_abnormal -- and ranks nothing
+    itself. A gate that composed the detectors and ordered them by hand once put
+    the interrupt affordance above a retry, against the rule the window classifier
+    already held (abnormal text outranks motion). Pinned by substitution: whatever
+    cli_wedge answers is the verdict, and without its answer no banner is seen."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    PARKED = "API Error: 529 Overloaded"
+    INTERRUPT = "✻ Thinking… (12s · esc to interrupt)"
+
+    def test_cli_wedges_answer_is_the_verdict_even_over_an_idle_footer(self):
+        stub = wedge.FrameAbnormal("abnormal", ("stubbed-family",), False)
+        with mock.patch.object(pg, "frame_abnormal", return_value=stub):
+            v = pg.classify_pane(CLAUDE_IDLE, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "stubbed-family"))
+
+    def test_without_cli_wedges_answer_the_gate_sees_no_banner_at_all(self):
+        with mock.patch.object(pg, "frame_abnormal", return_value=None):
+            for text in (self.RETRY, self.PARKED):
+                with self.subTest(text=text):
+                    self.assertEqual(state(f"{text}\n{CLAUDE_IDLE}", "claude"), "idle-ready")
+
+    def test_a_parked_line_beside_the_affordance_is_abnormal_as_the_window_rule_says(self):
+        # cli_wedge: moving + abnormal is a warning; the affordance is motion, not health.
+        v = pg.classify_pane(f"{self.INTERRUPT}\n{self.PARKED}\n{CLAUDE_IDLE}", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason, pg.accepts_input(v)), ("abnormal", "api-error", False))
+
+    def test_a_named_dialog_still_outranks_a_parked_line_that_is_its_own_text(self):
+        dialog = ("  You've reached your Fable limit\n  ❯ Switch to Opus 5 and continue\n"
+                  "    Continue with Fable 5.1\n  Esc to cancel\n")
+        self.assertIsNotNone(wedge.frame_abnormal(dialog))   # control: the line IS parked text
+        self.assertEqual(pg.classify_pane(dialog, pg.CLAUDE).reason, "fable-limit")
+
+    def test_a_retry_outranks_a_named_dialog(self):
+        dialog = f"{self.RETRY}\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n"
+        v = pg.classify_pane(dialog, pg.CLAUDE)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("retry:retrying", v.reason)
+
+
+class ANamedLoginGateOutranksCliWedgesNewCoarserLabel(unittest.TestCase):
+    """cli_wedge now recognises the login dialog's title as abnormal/needs-login
+    (a narrower fix, this repo). The gate must still report the SPECIFIC named
+    kind -- HITL's kind-string contract depends on "login", not "needs-login"."""
+
+    def test_the_named_gate_wins(self):
+        dialog = ("Select login method\n  \u276f 1. Log in with browser\n"
+                  "    2. Paste code manually\n  Esc to cancel\n")
+        v = pg.classify_pane(dialog, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "login"))
+
+
 class ARetryIsAbnormalEvenInsideARunningTurn(unittest.TestCase):
     """Owner's rule: retry means abnormal. The interrupt affordance stays on screen
     while the CLI retries, so "esc to interrupt" cannot vouch for a served turn --
@@ -448,7 +503,7 @@ class AbnormalIsBothOfCliWedgesFamilies(unittest.TestCase):
 
     def test_control_the_same_retry_banner_was_invisible_to_the_parked_patterns(self):
         # Proves the fixture reaches the family only the banner grammar reads.
-        self.assertEqual(pg.matched_abnormal([self.RETRY]), [])
+        self.assertEqual(wedge.matched_abnormal([self.RETRY]), [])
 
     def test_a_parked_api_error_banner_is_abnormal(self):
         v = pg.classify_pane(f"{self.PARKED}\n{CLAUDE_IDLE}", pg.CLAUDE)
@@ -875,6 +930,237 @@ class CliInProcess(unittest.TestCase):
         self.assertTrue(err.startswith("pending: "), err)
         self.assertIn("half typed", err)
 
+
+
+class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
+    """A weekly-limit row that has scrolled into the transcript reads as a live
+    limit for as long as it stays in the tail window, so the hold outlives the
+    reset. The provider's own record, written by the credential proxy on every
+    request, outranks that screenshot -- and ONLY when it is fresh, says allowed,
+    and the banner is the sole abnormality. Everything else still holds."""
+
+    BANNER = "  ⎿  You've hit your weekly limit · resets Sep 27 at 2am (America/Los_Angeles)"
+    GHOST = "❯ \x1b[2mcheck the watcher's still running\x1b[0m"
+    # The seat measured on 2026-09-24: banner 7 non-blank rows from the bottom, then
+    # an idle footer under an empty composer holding a dimmed CLI suggestion.
+    PANE = (
+        "⏺ Re-armed. Holding.\n"
+        "✻ Worked for 10s · done 4:26 AM\n"
+        "⏺ Monitor event: \"worker task watcher on its own delivery inbox\"\n"
+        f"{BANNER}\n"
+        "✻ Crunched for 1s · done 4:56 AM\n"
+        "                    0% until auto-compact\n"
+        "──────────────────────────── sutando-worker ─\n"
+        f"{GHOST}\n"
+        "─────────────────────────────────────────────\n"
+        f"  {FOOTER} · 1 feedback draft\n"
+    )
+    MENU = (
+        "⏺ Writing the result file.\n"
+        f"{BANNER}\n"
+        "✻ Churned for 49s · done 4:37 AM\n"
+        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+        "   What do you want to do?\n"
+        "   ❯ 1. Stop and wait for limit to reset\n"
+        "     2. Wait here, then continue automatically at Sep 27 at 2am\n"
+        "     3. Switch to usage credits\n"
+        "   Enter to confirm · Esc to cancel\n"
+    )
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.ws = Path(self._t.name) / "ws"
+        (self.ws / "state").mkdir(parents=True)
+        self.record = self.ws / "state" / "quota-state.json"
+        self.socket, self.session = "/tmp/gate-test.sock", "sutando-worker-test"
+        self._seat(qa.SeatEnv(True, "http://localhost:7846"))
+        # The seat's model is known and the record names the same one, so the
+        # model check is satisfied unless a test says otherwise.
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "claude-fable-5-1"}))
+
+    def _seat(self, env):
+        """What the seat's process environment reads as, through the one probe."""
+        if getattr(self, "_seat_patch", None):
+            self._seat_patch.stop()
+        self._seat_patch = mock.patch.object(qa, "seat_env_base_url", return_value=env)
+        self._seat_patch.start()
+        self.addCleanup(self._seat_patch.stop)
+
+    def _write(self, allowed=True, age_s=30):
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - age_s, tz=timezone.utc)
+        status = "allowed" if allowed else "rejected"
+        self.record.write_text(json.dumps({
+            "available": allowed,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-fable-5-1"},
+            "headers": {
+                "anthropic-ratelimit-unified-status": "allowed",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-7d-status": status,
+            },
+        }))
+
+    def _verdict(self, pane):
+        return pg.classify_pane(pane, pg.CLAUDE, self.ws, self.socket, self.session)
+
+    def test_the_fixture_itself_reads_as_a_quota_only_limit(self):
+        # Control: without a record the banner holds, and for exactly the family named.
+        v = self._verdict(self.PANE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_fresh_allowed_record_makes_the_banner_scrollback(self):
+        self._write(allowed=True, age_s=30)
+        v = self._verdict(self.PANE)
+        self.assertEqual(v.state, "idle-ready", v)
+        self.assertTrue(pg.accepts_input(v))
+
+    def test_a_stale_record_does_not_vouch(self):
+        self._write(allowed=True, age_s=3600)
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_record_that_says_rejected_keeps_the_hold(self):
+        self._write(allowed=False, age_s=30)
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_rejected_window_under_an_allowed_overall_status_keeps_the_hold(self):
+        # bassil's regression record at the gate: overall allowed, flag true, 7d rejected.
+        # bfd4a51e held on it; the head that adopted the skill's reader released. Never again.
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - 30, tz=timezone.utc)
+        self.record.write_text(json.dumps({
+            "available": True,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-fable-5-1"},
+            "headers": {"anthropic-ratelimit-unified-status": "allowed",
+                        "anthropic-ratelimit-unified-5h-status": "allowed",
+                        "anthropic-ratelimit-unified-7d-status": "rejected"},
+        }))
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_record_refreshed_on_another_model_keeps_the_hold(self):
+        # A haiku probe on a seat whose own model is limited writes exactly this.
+        # (The seat's settings outrank the fixture's model-switch record.)
+        from datetime import datetime, timezone
+        when = datetime.fromtimestamp(__import__("time").time() - 30, tz=timezone.utc)
+        cfg = self.ws / "cfg"; cfg.mkdir()
+        (cfg / "settings.json").write_text(json.dumps({"model": "claude-fable-5-1[1m]"}))
+        self._seat(qa.SeatEnv(True, "http://localhost:7846", str(cfg)))
+        self.record.write_text(json.dumps({
+            "available": True,
+            "last_checked": when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "last_request": {"model": "claude-haiku-4-5-20251001"},
+            "headers": {"anthropic-ratelimit-unified-status": "allowed",
+                        "anthropic-ratelimit-unified-7d-status": "allowed"},
+        }))
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_an_unreadable_record_keeps_the_hold(self):
+        self.record.write_text("{not json")
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_a_workspace_that_does_not_exist_keeps_the_hold(self):
+        self._write(allowed=True, age_s=30)
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, Path(self._t.name) / "nowhere", self.socket, self.session)
+        self.assertEqual(v.reason, "quota-limit")
+
+    def test_the_record_never_vouches_for_an_unrouted_seat(self):
+        # Routed seats speak as one account through the proxy; an unrouted seat keeps
+        # its own credential, so the record is about somebody else. Both shapes hold.
+        self._write(allowed=True, age_s=30)
+        for env in (qa.SeatEnv(True, None), qa.SeatEnv(True, "https://api.anthropic.com")):
+            self._seat(env)
+            self.assertEqual(self._verdict(self.PANE).reason, "quota-limit", env)
+
+    def test_an_unobserved_seat_holds(self):
+        self._write(allowed=True, age_s=30)
+        self._seat(qa.SeatEnv(False, None))
+        self.assertEqual(self._verdict(self.PANE).reason, "quota-limit")
+
+    def test_no_seat_named_means_no_release(self):
+        self._write(allowed=True, age_s=30)
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, self.ws, self.socket, None)
+        self.assertEqual(v.reason, "quota-limit")
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, self.ws)
+        self.assertEqual(v.reason, "quota-limit")
+
+    def test_the_record_never_overrides_a_second_abnormal_family(self):
+        self._write(allowed=True, age_s=30)
+        pane = self.PANE.replace("✻ Crunched for 1s · done 4:56 AM\n",
+                                 "✻ Crunched for 1s · done 4:56 AM\nSession expired\n")
+        v = self._verdict(pane)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("needs-login", v.reason)
+        self.assertIn("quota-limit", v.reason)
+
+    def test_the_record_never_overrides_a_retry(self):
+        self._write(allowed=True, age_s=30)
+        pane = self.PANE.replace("✻ Crunched for 1s · done 4:56 AM\n",
+                                 "  ⎿  Connection error. Retrying in 2 seconds…\n")
+        v = self._verdict(pane)
+        self.assertEqual(v.state, "abnormal")
+        self.assertIn("retry:retrying", v.reason)
+
+    def test_the_record_never_overrides_a_live_limit_dialog(self):
+        # The menu IS the limit, live and waiting on a key; the gate reads it first.
+        self._write(allowed=True, age_s=30)
+        v = self._verdict(self.MENU)
+        self.assertEqual(v.state, "busy", v)
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_plain_capture_still_passes_healthy_as_pending(self):
+        # The notifier hands `healthy` a colour-stripped capture, where the dimmed
+        # suggestion reads as typed text: pending, and pending accepts input.
+        self._write(allowed=True, age_s=30)
+        plain = pg._SGR.sub("", self.PANE)
+        v = self._verdict(plain)
+        self.assertEqual(v.state, "pending", v)
+        self.assertTrue(pg.accepts_input(v))
+
+    def _healthy(self, stdin, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = pg.main(["healthy", "--runtime", "claude", *extra])
+        return code, out.getvalue().strip(), err.getvalue().strip()
+
+    def test_healthy_cli_honours_workspace_end_to_end(self):
+        seat = ("--workspace", str(self.ws), "--socket", self.socket, "--session", self.session)
+        code, out, err = self._healthy(self.PANE, *seat)
+        self.assertEqual(code, pg.EXIT_UNSAFE, (out, err))
+        self.assertIn("quota-limit", err)
+        self._write(allowed=True, age_s=30)
+        code, out, err = self._healthy(self.PANE, *seat)
+        self.assertEqual((code, out), (0, "idle-ready"), err)
+        # Without the seat named, the same record releases nothing.
+        code, out, err = self._healthy(self.PANE, "--workspace", str(self.ws))
+        self.assertEqual(code, pg.EXIT_UNSAFE, (out, err))
+
+    def test_healthy_cli_without_workspace_resolves_the_configured_one(self):
+        # No --workspace: the configured workspace is consulted, and its record
+        # (whatever it holds) must never turn a live dialog into a pass.
+        seat = ("--socket", self.socket, "--session", self.session)
+        with mock.patch.object(pg, "resolve_workspace", return_value=self.ws):
+            self._write(allowed=True, age_s=30)
+            self.assertEqual(self._healthy(self.PANE, *seat)[:2], (0, "idle-ready"))
+            self.assertEqual(self._healthy(self.MENU, *seat)[0], pg.EXIT_UNSAFE)
+
+    def test_probe_is_off_unless_the_caller_asks(self):
+        # The probe spends a request; only a caller that says --probe may cause one.
+        with mock.patch.object(pg, "provider_allows_now", return_value=False) as allows:
+            self._verdict(self.PANE)
+            self._healthy(self.PANE, "--workspace", str(self.ws), "--socket", self.socket, "--session", self.session)
+            self._healthy(self.PANE, "--workspace", str(self.ws), "--socket", self.socket, "--session", self.session, "--probe")
+        probes = [c.kwargs.get("probe") for c in allows.call_args_list]
+        self.assertEqual(probes, [False, False, True])
+        self.assertEqual(allows.call_args_list[-1].args[1:3], (self.socket, self.session))
+
+    def test_a_resolver_that_raises_keeps_the_hold(self):
+        with mock.patch.object(pg, "resolve_workspace", side_effect=RuntimeError("no config")):
+            v = pg.classify_pane(self.PANE, pg.CLAUDE, None, self.socket, self.session)
+        self.assertEqual(v.reason, "quota-limit")
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,7 @@ SUTANDO_REQUEST
 python3 "$C" note '<wait id>' "YouTube is connected. On it." [--status connected]   # a private-card line
 python3 "$C" claim '<room id>'                 # before answering in a room that may have a wait
 python3 "$C" verify-account '<wait id>'        # a resume: is the wait's AG2 Cloud account the one in use now?
+python3 "$C" set-default gmail work@x.io      # the account the agent uses for gmail unless told otherwise
 python3 "$C" rearm                             # restart dead waiters (startup + proactive loop run it)
 ```
 
@@ -147,12 +148,20 @@ line (Step 2) repeats the verdict as `room_kind=dm|room|unknown`; `unknown` mean
 
 ## Where the answer may go
 
-- **Something the owner asked you to do or find where they asked** (post to Slack, create a Linear
-  issue, search YouTube, summarize a public page): reply in the room they asked in, like any reply.
-- **Private content** (mail, calendar events, files and docs, messages, contacts): only in the
-  owner's DM. From a shared room, find your DM with the owner with `room.list` and confirm it with
-  `room.inspect` as above; the answer goes there, and the shared room gets only "I sent it to you in
-  our DM." No confirmed DM: text only, no data ("I can only share your calendar in our DM.").
+Reply where you were asked. The precheck line (Step 2) says it as `reply_to=room|dm`.
+
+- **Anything you did, found or wrote on the web or in a public app** (post to Slack, create a Linear
+  issue, search YouTube, summarize a public page, web research, listings, shopping, summaries, code):
+  reply in the room they asked in, like any reply, when that room is the audience: the room asked
+  for it, or the owner asked for it to be posted there. An apartment search asked by a shared room
+  is answered in that room; one the owner asked for themselves goes to the owner's DM, with nothing
+  in the room unless the room was waiting for it (CLAUDE.md "Where replies go").
+- **The DM exception is a closed list: data read from the owner's connected accounts or device**
+  (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
+  health or financial records): only in the owner's DM. From a shared room, find your DM with the
+  owner with `room.list` and confirm it with `room.inspect` as above; the answer goes there, and the
+  shared room gets exactly one line: "I sent it to you in our DM." Never move silently. No confirmed
+  DM: text only, no data ("I can only share your calendar in our DM.").
 
 Connecting itself (the card, "isn't connected yet", "once that's done", timeouts, account notes) is
 never posted in a shared room: it goes on the private card (step 3b).
@@ -160,7 +169,7 @@ never posted in a shared room: it goes on the private card (step 3b).
 ## Step 2: find the apps
 
 When you first touched the task file, the connect-apps precheck hook may have added a line to your
-context: `connect-apps precheck: needs_connect=<slugs>; connected=<slugs>; room_kind=…; run: …`.
+context: `connect-apps precheck: needs_connect=<slugs>; connected=<slugs>; room_kind=…; reply_to=…; run: …`.
 It is read from the task's words and a 30-second cache of the owner's connections, so:
 
 - `needs_connect=` names every app the request needs (and `connected=` the rest): skip
@@ -229,6 +238,25 @@ message, no "I sent you a card in our DM", no outro.
    folded in by `card` itself: the old card points at the new one, so no `status` or `note` first.
 3. Go to step 4 (`mode: private`, `message: null`).
 
+## Step 3b2: several accounts on one app, and which one is the default
+
+The owner can keep any number of accounts on one app (two Gmails, three Slacks). `status` lists
+every connection with `accountLabel` and `isDefault`; the default is the one every call uses
+unless the ask names another (then pass `account` to composio_exec, as in Rules).
+
+- "Make my work Gmail the default", "switch the default Gmail to bassil@ag2.ai", "use
+  mapletyres@gmail.com from now on": run `set-default <slug> <account>` (label, part of it, or
+  id). Exit 0: say "<App> now uses <label> by default." Exit 1 with `reason: ambiguous`: name the
+  `candidates` and ask which. Exit 1 with `no_match` or `none`: that account is not connected,
+  so offer to add it (next bullet). Exit 1 with `no_id`: the account is there but the cloud gave
+  it no id, so you cannot change it; say "Pick the default in Settings → Integrations → <App>."
+  Exit 2 `unsupported`: the cloud has no defaults yet; say so. Exit 2 `cloud_error` (a 404, or
+  409 `not_active`: the account went away between the read and the write): run `status <slug>`
+  and tell the owner which accounts are still connected, then ask again.
+- "Add my other Gmail", "connect a second Slack": no card and no switch. Tell them: "Settings →
+  Integrations → <App> → Add account", then ask which one should be the default once it is
+  there. A switch card (Step 3c) replaces the current account; adding keeps both.
+
 ## Step 3c: switch an app to another account
 
 For a request to sign an app that is already connected in with a different account. Step 0 applies:
@@ -270,10 +298,30 @@ The resume task of a switch wait says "signed in with the new account" and is ha
 now signed in with the new account."). The label is personal: in a shared room it goes on the private
 card with `note`, never in the room.
 
+## Two accounts of one app
+
+The owner may keep two accounts of one app connected (a personal and a work Gmail). `composio_find`
+lists them under the app's `accounts` (`id`, `label`, `is_default`) only when there are two or more;
+`python3 "$C" status` shows `isDefault` on each connection.
+
+- **The ask names one** ("check my work Gmail", "put it on my personal calendar", "from
+  me@work.com"): pass `account` to `composio_exec` with the label or a unique part of it
+  (`"account": "work"`). Never pick by guessing which one they meant.
+- **The ask names none:** pass no `account`; the call uses their default account.
+- **`account_ambiguous` / `account_not_found`:** the error's `accounts` lists the candidates. Ask in
+  the owner's DM which one, naming the labels ("Your work Gmail (me@work.com) or the personal one
+  (me@gmail.com)?"). Labels are personal: never in a room with other people.
+- **"Use my work account by default":** the owner asked, so change it: `set-default <slug>
+  <account>` (Step 3b2). You change the default only when the owner asks for that, never on your
+  own and never to make one call easier: a call that means the other account passes `account`.
+- **"Add my other Gmail":** no card, no switch. Say "Settings → Integrations → <App> → Add account",
+  then ask which one should be the default once it is there.
+
 ## Which apps am I connected to? Disconnect <app>
 
 - **"Which apps am I connected to?"** Run `python3 "$C" status`. List the apps whose `connections`
-  status is `active`, each with its `accountLabel` when there is one, and end with "Manage them in
+  status is `active`, each with its `accountLabel` when there is one (an app with two accounts: both,
+  the `isDefault` one marked "default"), and end with "Manage them in
   Settings → Integrations." Account labels are personal: answer only where private content may go
   (the owner's confirmed DM, see "Where the answer may go"); from a shared room, send it to the DM and
   say only "I sent it to you in our DM."
@@ -382,9 +430,16 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - The place to see, switch or disconnect the owner's connected apps is **Settings → Integrations**.
   Never name a "Superpower Station page" or a dashboard for that. Marketplace is only for browsing and
   connecting new apps.
-- Never disconnect an app, and never switch one without the owner's card tap.
+- Never disconnect an app, and never switch one without the owner's card tap. Change which of two
+  accounts is the default only when the owner asks for that (`set-default`, Step 3b2); never on your
+  own, and never to make one call easier (a call that means the other account passes `account`).
 - One card per request, listing every app it needs.
-- Private content (mail, calendar, files, messages, contacts) only in a room confirmed as the owner's DM.
+- Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
+  history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
+  confirmed as the owner's DM; that list is closed. Web research, listings, shopping, summaries and
+  code go where they were asked when that room is the audience; what the owner asked for themselves
+  goes to the DM. A moved answer the room was waiting for leaves one line in the room: "I sent it to
+  you in our DM."
 - In a room with other people, never mention connecting, sign-in, accounts or cards: all of it goes
   on the private card (`--private`, `note`).
 - Never restart the engine, and never ask for a restart except the one step 1 case.

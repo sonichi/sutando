@@ -76,6 +76,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/pane_gate.py",
+            # pane_gate consults the proxy's quota record through this authority.
+            "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
@@ -89,6 +91,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime-api/instance_key.py",
             "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
+            "src/tasks-dir-resolve.sh",
+            "src/watcher_identity.py",
             "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
@@ -225,6 +229,8 @@ exit 0
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
+            str(self.root / "src/tasks-dir-resolve.sh"),
+            str(self.root / "src/watcher_identity.py"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
@@ -326,22 +332,14 @@ exit 0
             if slave >= 0:
                 os.close(slave)
 
-    def _install_pool_skill(self):
-        script = self.root / "skills" / "pool" / "scripts" / "route_handler.py"
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("#!/bin/sh\nexit 0\n")
-        script.chmod(0o755)
-        link = self.root / "skills" / "pool" / "task-event-handler"
-        link.symlink_to("scripts/route_handler.py")
-        return link
-
-    def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
-        p = self._install_pool_skill()
-        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+    def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
+        # Since #4503 the launcher resolves nothing; only a genuine pin forwards.
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh",
+                                    env_extra={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"-e SUTANDO_TASK_EVENT_HANDLER={p}", self.log.read_text())
+        self.assertIn("-e SUTANDO_TASK_EVENT_HANDLER=/opt/handler", self.log.read_text())
 
-    def test_no_pool_skill_sets_no_handler(self):
+    def test_no_pin_sets_no_handler(self):
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
@@ -647,12 +645,18 @@ exit 23
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(100):
+            # Each notifier lifetime now spawns a role-verdict check, so a
+            # restart is a property to wait for, not a one-second deadline.
+            for _ in range(1000):
                 observed = _read_count(count)
                 if observed >= 2:
                     break
@@ -693,6 +697,10 @@ sleep 60
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
@@ -1071,7 +1079,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(2)\n",
+            needle + "    import time as _slow_history\n    _slow_history.sleep(4)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1110,7 +1118,8 @@ exit 0
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertLess(elapsed, 1.0, f"unassigned delivery took {elapsed:.2f}s")
+        # Well under the injected 4s scan, well over a loaded runner's own overhead.
+        self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
         calls = self.log.read_text()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
@@ -1248,7 +1257,9 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+    def test_managed_notifier_waits_for_idle_then_submits_in_watcher_announced_order(self):
+        # Priority now lives in the watcher's sweep (closes #3017); this stub
+        # emits in that real order (urgent before low), matching a real sweep.
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
         results = workspace / "results"
@@ -1266,7 +1277,7 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
             "#!/bin/bash\n"
-            "printf 'TASK_FILE: task-low.txt\\nTASK_FILE: task-owner.txt\\n'\n"
+            "printf 'TASK_FILE: task-owner.txt\\nTASK_FILE: task-low.txt\\n'\n"
         )
         watcher.chmod(0o755)
         early = Path(self.tmp.name) / "submitted-while-busy"

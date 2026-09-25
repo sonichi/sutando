@@ -1,0 +1,22 @@
+{
+  "name": "room-collab",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Read and write a room's collaborative surfaces, and stay resident in one after a summon. Config-only: contributes no inline tools. ROOM_COLLAB_PYTHON is the interpreter the presence daemon runs under \u2014 the skill needs pycrdt + websockets, which the core's own python is not required to have, so sparrowd refuses to supervise the daemon until this names a real interpreter rather than guessing sys.executable.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "ROOM_COLLAB_PYTHON": ""
+  },
+  "supervised_worker": {
+    "name": "room-collab-presence",
+    "script": "scripts/presence_daemon.py",
+    "interpreter": {
+      "config": "ROOM_COLLAB_PYTHON",
+      "needs": "pycrdt + websockets"
+    }
+  }
+}

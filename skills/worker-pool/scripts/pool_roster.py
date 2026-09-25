@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import task_event_handler_config_path  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
@@ -281,39 +282,33 @@ def _publish(workspace, roster: dict) -> None:
 class HandlerPublishError(RosterError):
     """The handler could not be published, so no pool may be registered.
 
-    The launcher reads zero publishers as the ordinary no-pool case, so a pool
-    that exists without one is indistinguishable from no pool at all -- and
-    worker-bound tasks would fall through to the unrestricted core.
+    core's watcher reads a missing/unusable config as the ordinary no-pool
+    case, so a pool that exists without one is indistinguishable from no pool
+    at all -- and worker-bound tasks would fall through to the unrestricted
+    core.
     """
 
 
-def publish_task_event_handler():
-    """Publish this skill's handler where the launcher's neutral lookup finds it.
+def publish_task_event_handler(workspace):
+    """Declare this skill's router as core's task-event handler.
 
-    Created when a pool first exists rather than shipped in the repo: an install
-    that never made a worker publishes nothing, the lookup finds none, and the
-    watcher behaves exactly as it did before this skill existed.
+    Written to <workspace>/state/task-event-handler.json, which core's
+    watcher also fswatches -- so a worker registration takes effect on the
+    watcher's very next event, no restart. An install that never registers a
+    worker never writes this, and the watcher behaves exactly as it did
+    before this skill existed. `_write_atomic`'s tmp name is PID-suffixed, so
+    two concurrent registrations (the caller already serializes via `_locked`,
+    but this function is also exercised directly, unlocked, elsewhere) never
+    collide on the same tmp path the way a shared name would.
     """
-    link = Path(__file__).resolve().parents[1] / "task-event-handler"
-    if link.is_symlink() or link.exists():
-        return link
+    handler = Path(__file__).resolve().parent / "pool_route_handler.py"
+    cfg = task_event_handler_config_path(Path(workspace) / "state")
     try:
-        link.symlink_to(Path("scripts") / "pool_route_handler.py")
+        _write_atomic(cfg, {"handler": str(handler)})
     except OSError as e:
         raise HandlerPublishError(
-            f"cannot publish the task-event handler at {link}: {e}") from e
-    return link
-
-
-def ensure_task_event_handler_published(workspace):
-    """Republish this skill's handler if a pool already has a worker but the
-    file is missing -- self-heals a checkout from before the file stopped
-    being tracked in git. A no-op with no pool: the handler stays unshipped.
-    """
-    roster = load_roster(workspace)
-    if roster and roster.get("workers"):
-        return publish_task_event_handler()
-    return None
+            f"cannot publish the task-event handler at {cfg}: {e}") from e
+    return cfg
 
 
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
@@ -328,7 +323,7 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
     with _locked(workspace):
         # Before any durable write: a registration that survived a failed publish
         # would leave a real pool the launcher cannot distinguish from no pool.
-        publish_task_event_handler()
+        publish_task_event_handler(workspace)
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
         if runtime:
@@ -361,6 +356,45 @@ def bind_room(workspace, room: str, target: str) -> dict:
         bindings[room] = wid
         save_bindings(workspace, bindings)
         return compile_roster(workspace, workers, bindings)
+
+
+def rename_worker(workspace, target: str, label: str) -> "tuple[str, str, dict | None]":
+    """Change one worker's display label — the one production writer for a
+    rename. Returns (worker id, old label, roster), roster None on a no-op.
+
+    The label lives only in the roster; the advertisement is derived from it
+    and republished by the compile, and the id-derived session name is untouched.
+    A new name another worker already answers to is refused, so `resolve_label`
+    never becomes ambiguous.
+    """
+    new = (label or "").strip()
+    if not new:
+        raise RosterError("a label cannot be empty")
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to rename")
+        workers = dict(raw.get("workers") or {})
+        if target in workers:
+            wid = target
+        else:
+            hits = [w for w, row in workers.items() if (row or {}).get("label") == target]
+            if len(hits) > 1:
+                raise RosterError(f"{target!r} is the label of {len(hits)} workers; "
+                                  "name one by id")
+            if not hits:
+                raise RosterError(f"{target!r} is not a worker id or label")
+            wid = hits[0]
+        old = (workers[wid] or {}).get("label") or wid
+        if new == old:
+            return wid, old, None
+        if new == CORE:
+            raise RosterError(f"{CORE!r} names the core; a worker cannot take it")
+        for other, row in workers.items():
+            if other != wid and new in (other, (row or {}).get("label")):
+                raise RosterError(f"{new!r} already names worker {other}")
+        workers[wid] = {**(workers[wid] or {}), "label": new}
+        return wid, old, compile_roster(workspace, workers, load_bindings(workspace))
 
 
 def unbind_room(workspace, room: str) -> dict:

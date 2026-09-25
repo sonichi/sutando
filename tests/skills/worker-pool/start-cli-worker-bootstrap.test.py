@@ -7,9 +7,15 @@ the host — the core's own included, which is why a worker running it never
 starts the watcher it exists for. It also stamps the core's session-starts.log,
 which health-check reads as the current core launch.
 
+Core and worker are now two separate scripts (launcher-cleanup): the core's
+own src/agent/claude/cli/start-cli.sh carries no worker concept at all, and a
+worker's own skills/worker-pool/scripts/launch-worker-session.sh carries none
+of the core's ceremony — both source the same shared
+src/agent/claude/cli/session-launch.sh for the mechanics they need in common.
+
 Both polarities against the real launcher on a private tmux socket and a copied
-repo: unset, every core row and marker is what it was; set, the worker writes
-none of them and boots its own mode.
+repo: the core's own launcher run leaves every core row and marker what it
+was; the worker's own launcher run writes none of them and boots its own mode.
 
 Run: python3 tests/start-cli-worker-bootstrap.test.py
 """
@@ -33,9 +39,15 @@ PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
 CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nenv > "$HOME/claude.env"\nsleep 120\n'
 
 
-def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = PGREP_STUB) -> dict:
+def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = PGREP_STUB,
+          launcher: str = "src/agent/claude/cli/start-cli.sh") -> dict:
     """One launcher run against a COPIED repo whose sutando-config.sh names a
     scratch workspace — the real one must never be a test's write target.
+
+    `launcher` selects which script this run actually execs — the canonical
+    core's start-cli.sh (default) or the worker's own
+    skills/worker-pool/scripts/launch-worker-session.sh. Both source the same
+    copied src/agent/claude/cli/session-launch.sh.
 
     `server_env` starts the tmux server FIRST, from a process carrying that env:
     what a core launch does, since it exports its marker before it touches tmux.
@@ -56,6 +68,11 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
         root = td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+        (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
+        shutil.copy2(
+            REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+            root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
+        )
         ws = td / "ws"
         (ws / "state").mkdir(parents=True)
         (root / "scripts" / "sutando-config.sh").write_text(
@@ -89,7 +106,7 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
             if server_env:
                 subprocess.run([TMUX, "-S", str(sock), "new-session", "-d", "-s", "seed", "sleep 120"],
                                env={**env, **server_env}, capture_output=True, check=True)
-            run = subprocess.run(["/bin/bash", str(root / "src" / "agent" / "claude" / "cli" / "start-cli.sh")],
+            run = subprocess.run(["/bin/bash", str(root / launcher)],
                                  env=env, capture_output=True, text=True, timeout=90)
             assert run.returncode == 0, (
                 f"launcher exited {run.returncode}\nstdout: {run.stdout}\nstderr: {run.stderr}")
@@ -147,7 +164,8 @@ class TestWorkerWritesNoCoreRows(unittest.TestCase):
         self.got = _boot({"SUTANDO_INSTANCE_ID": wid,
                           "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
                           "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
-                          "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
+                          "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+                         launcher="skills/worker-pool/scripts/launch-worker-session.sh")
 
     def test_the_worker_boots_its_own_mode(self):
         self.assertIn("--worker", self.got["argv"],
@@ -175,7 +193,8 @@ class TestWorkerOnAServerBornFromACoreLaunch(unittest.TestCase):
                           "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
                           "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
                           "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
-                         server_env={"SUTANDO_CORE_SESSION": "1"})
+                         server_env={"SUTANDO_CORE_SESSION": "1"},
+                         launcher="skills/worker-pool/scripts/launch-worker-session.sh")
 
     def test_control_the_server_carries_the_core_marker(self):
         self.assertIn("SUTANDO_CORE_SESSION=1", self.got["global_env"])

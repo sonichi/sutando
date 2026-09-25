@@ -31,6 +31,9 @@ PYBIN="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo p
 TMPWS="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooktest-wp.XXXXXX")"
 export SUTANDO_TEST_MODE=1
 export SUTANDO_WORKSPACE="$TMPWS"
+# This suite is about the queue gates; the watcher-coverage gate (a temp inbox
+# nobody watches would block every case) has its own suite.
+export SUTANDO_STOP_HOOK_WATCHER_GATE=0
 
 _real() { (cd "$1" 2>/dev/null && pwd -P) || echo "$1"; }
 WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"

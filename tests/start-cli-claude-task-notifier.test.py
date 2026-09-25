@@ -31,6 +31,11 @@ class Harness:
         root = self.td / "repo"
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
+        # Only the worker's own launcher, not the whole skill: this harness
+        # tests the launch mechanics, not worker-pool's own behavior.
+        (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
+        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
+                    root / "skills/worker-pool/scripts/launch-worker-session.sh")
         self.root = root
         ws = self.td / "ws"
         (ws / "state").mkdir(parents=True)
@@ -60,6 +65,11 @@ class Harness:
 
     def launch(self, *args, extra_env=None):
         run = subprocess.run(["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh"), *args],
+                             env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=90)
+        return run
+
+    def launch_worker(self, *args, extra_env=None):
+        run = subprocess.run(["/bin/bash", str(self.root / "skills/worker-pool/scripts/launch-worker-session.sh"), *args],
                              env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=90)
         return run
 
@@ -316,9 +326,10 @@ class WatcherIdentityTests(unittest.TestCase):
             h.close()
 
 
-class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
-    """The launcher defaults the watcher's task-event handler from the optional
-    worker-pool skill, so a restart never arms a watcher that routes nothing."""
+class LauncherForwardsOnlyAGenuinePin(unittest.TestCase):
+    """Since #4503, the launcher resolves nothing: the watcher declares/reads
+    its own handler via a config file it fswatches. The launcher's only job
+    left is to forward a pin the operator already set, verbatim."""
 
     def setUp(self):
         self.h = Harness()
@@ -326,67 +337,51 @@ class PoolRouteHandlerReachesTheWatcher(unittest.TestCase):
     def tearDown(self):
         self.h.close()
 
-    def _install_skill(self, name="pool"):
-        script = self.h.root / "skills" / name / "scripts" / "route_handler.py"
-        script.parent.mkdir(parents=True)
-        script.write_text("#!/bin/sh\nexit 0\n")
-        script.chmod(0o755)
-        link = self.h.root / "skills" / name / "task-event-handler"
-        link.symlink_to("scripts/route_handler.py")
-        return link
-
-    def test_without_the_skill_no_handler_is_set(self):
+    def test_no_pin_no_handler_reaches_the_watcher(self):
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
 
-    def test_with_the_skill_the_handler_reaches_the_watcher(self):
-        p = self._install_skill()
-        run = self.h.launch()
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertIn(f"SUTANDO_TASK_EVENT_HANDLER={p}", env)
-
-    def test_an_explicit_handler_wins_over_the_skill_default(self):
-        self._install_skill()
+    def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
         run = self.h.launch(extra_env={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         _, _, env = self.h.watcher()
         self.assertIn("SUTANDO_TASK_EVENT_HANDLER=/opt/handler", env)
 
-    def test_two_publishing_skills_are_ambiguous_and_set_nothing(self):
-        self._install_skill("pool-a")
-        self._install_skill("pool-b")
-        run = self.h.launch()
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("2 skills publish one", run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
-
-    def test_a_non_executable_skill_file_sets_nothing(self):
-        p = self._install_skill()
-        os.chmod(p.parent / "scripts" / "route_handler.py", 0o644)
-        run = self.h.launch()
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", env)
-
 
 class WorkerLaunchStartsNoNotifier(unittest.TestCase):
-    def test_worker_instance_gets_no_watcher_session(self):
+    """A worker no longer even CAN reach start-cli.sh's notifier/monitor
+    machinery: it has its own launcher (skills/worker-pool/scripts/
+    launch-worker-session.sh), which contains no ensure_task_notifier or
+    ensure_core_monitor call at all -- not a guard that happens to return
+    early, an absent call site. Real launcher, real tmux, same rigor as the
+    core-side tests above."""
+
+    def test_worker_launch_creates_no_watcher_session(self):
         h = Harness()
         try:
             wid = "c" * 32
-            run = h.launch(extra_env={"SUTANDO_INSTANCE_ID": wid,
-                                      "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
-                                      "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
-                                      "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
+            run = h.launch_worker(extra_env={"SUTANDO_INSTANCE_ID": wid,
+                                             "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
+                                             "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
+                                             "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             sessions = h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
+            self.assertIn("sutando-worker-" + wid, sessions, sessions)
             self.assertFalse(any(s.endswith("-watcher") for s in sessions), sessions)
         finally:
             h.close()
+
+    def test_the_worker_launcher_has_no_notifier_or_monitor_call_site(self):
+        """Source-tied guard, same shape as the core-side tests: if a future
+        edit reintroduces a notifier/monitor call into the worker's own
+        launcher, this fails even if the live-tmux test above somehow didn't
+        exercise the new path."""
+        worker_launcher = (REPO / "skills/worker-pool/scripts/launch-worker-session.sh").read_text()
+        for forbidden in ("ensure_task_notifier", "ensure_core_monitor"):
+            self.assertNotIn(forbidden, worker_launcher,
+                             f"the worker launcher calls {forbidden}, which is core-only")
 
 
 if __name__ == "__main__":

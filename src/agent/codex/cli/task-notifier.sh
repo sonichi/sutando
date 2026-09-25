@@ -10,19 +10,17 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
-TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
+# The workspace is named, not inferred, when the inbox is not <workspace>/tasks
+# (a worker's <workspace>/deliveries/<id>); its parent is right only for the core.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
-DELIVERIES_DIR="$(dirname "$TASKS_DIR")/deliveries"
-# Same per-instance receipt the watcher writes; resolved by its owner so the
-# two cannot disagree about which instance a declined task belongs to.
+DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
+# Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
+CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
-NOTIFIER_PY="$(require_python "$REPO" "resolve the fallback receipt dir")" || exit 1
-TASK_HANDLER_FALLBACKS_DIR="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" handler-fallbacks-dir "$(dirname "$TASKS_DIR")/state")" || {
-  echo "task-notifier: could not resolve the fallback receipt dir" >&2
-  exit 1
-}
+NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -42,29 +40,9 @@ DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
-
-probe_optional_task_handler() {
-  local filename="$1" rc
-  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] || return 3
-  [ -x "$SUTANDO_TASK_EVENT_HANDLER" ] || return 3
-  "$SUTANDO_TASK_EVENT_HANDLER" \
-    --runtime codex \
-    --workspace "$(dirname "$TASKS_DIR")" \
-    --task-file "$TASKS_DIR/$filename" \
-    --results-dir "$RESULTS_DIR" \
-    --repo "$REPO" \
-    --probe >/dev/null
-  rc=$?
-  if [ "$rc" -eq 4 ]; then
-    # Required Team handlers are watcher-owned and must never reach the live core.
-    return 0
-  fi
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
-    echo "task-notifier: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    return 3
-  fi
-  return "$rc"
-}
+# FIFO of announced-but-unresolved filenames, as marker files (oldest mtime =
+# head) -- not a bash array, since bash 3.2's `set -u` errors on an empty one.
+queue_dir=""
 
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
@@ -80,6 +58,7 @@ cleanup_notifier() {
   clear_workstream_context
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
+    rm -rf "$event_dir/queue" 2>/dev/null || true
     rmdir "$event_dir" 2>/dev/null || true
   fi
 }
@@ -112,13 +91,11 @@ prepare_workstream_context() {
   fi
 }
 
-# Completion detection is src/delivery/task_dispatch.py's contract (with the
-# watcher's handler_result_exists); only the receipt cleanup is this notifier's.
+# Completion detection is src/delivery/task_dispatch.py's contract, shared
+# with the watcher's own handler_result_exists.
 has_result() {
   local filename="$1"
-  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
-  rm -f "$TASK_HANDLER_FALLBACKS_DIR/$filename"
-  return 0
+  "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename"
 }
 
 # What the pane text MEANS (idle footer, gate signatures, working marker, the
@@ -129,7 +106,7 @@ pane_state() {
   # A blank capture is NO information, which is not the same as a pane we read and
   # could not account for; fail here so callers see "" and keep the two apart.
   [ -n "${pane//[[:space:]]/}" ] || return 1
-  printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime codex 2>/dev/null
+  printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" --probe 2>/dev/null
 }
 
 core_pane_is_idle_ready() {
@@ -171,26 +148,6 @@ wait_for_core_idle() {
     fi
     sleep "$POLL_INTERVAL"
   done
-}
-
-next_pending_task() {
-  local candidate
-  # Priority order, completion and live claims come from task_dispatch; the
-  # optional-handler probe needs --runtime, so that hold stays here.
-  while IFS= read -r candidate; do
-    if [ ! -f "$TASK_HANDLER_FALLBACKS_DIR/$candidate" ] \
-        && probe_optional_task_handler "$candidate"; then
-      # The watcher has not published its claim yet. Leave the file durable;
-      # its provider receipt or explicit fallback event will wake us.
-      continue
-    fi
-    printf '%s\n' "$candidate"
-    return 0
-  done < <(
-    "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
-      --claims-dir "$TASK_HANDLER_CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR"
-  )
-  return 1
 }
 
 # This script previously had no logging at all, which made a lost submit
@@ -305,6 +262,14 @@ deliver_prompt() {
   done
 }
 
+# What the prompt tells the session to read: the payload a resolver-backed
+# announcement named, else the inbox entry itself (the core's tasks/ case).
+task_payload() {
+  local p=""
+  [ -n "${PAYLOAD_DIR:-}" ] && p="$(cat "$PAYLOAD_DIR/$1" 2>/dev/null)"
+  printf '%s' "${p:-$TASKS_DIR/$1}"
+}
+
 submit_task() {
   local filename="$1" wait_for_result="${2:-0}" prompt started
   case "$filename" in
@@ -314,7 +279,7 @@ submit_task() {
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi
@@ -370,19 +335,117 @@ fi
 
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
+queue_dir="$event_dir/queue"
+PAYLOAD_DIR="$event_dir/payload"
+mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 "$NOTIFIER_PY" -c \
-  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
-# Watcher output is a wake signal, not queue order. While the core is busy, keep
-# every task durable on disk rather than typing into Codex's non-durable input.
-attempt_highest_pending() {
+# A narrower net than the watcher's own routing, for a worker claim that
+# outlives its handler declaration (the pool de-registers mid-flight).
+# The core's question: on a delivery inbox the sentinel IS this instance's assignment.
+filename_is_worker_held() {
+  local filename="$1" rc=0
+  "$NOTIFIER_PY" "$DISPATCH_PY" worker-holds "$DELIVERIES_DIR" "$filename" || rc=$?
+  [ "$rc" -ne 1 ]
+}
+
+# Same narrower net, for a watcher-owned claim (CLAIMS_DIR); staleness
+# stays the watcher's own call (acquire_task_claim), never re-derived here.
+filename_is_claimed() {
+  [ -e "$CLAIMS_DIR/$1" ]
+}
+
+# The watcher is the sole decider of ROUTING: enqueue exactly the filename
+# it announced. No re-pick, no handler probe here -- the tier read below is
+# not a routing decision (the watcher already decided this task is this
+# instance's); it only orders what the notifier was handed, by the one
+# shared priority policy (task_priority.py), read once and stored on the
+# marker so it is never re-scanned.
+# Checked once, here, not on every retry: a held/claimed filename never
+# occupies the queue at all, so it can never head-of-line-block a later
+# announced task behind it -- the next restart's sweep re-announces it if
+# the hold ever clears, matching this design's no-durable-log recovery.
+enqueue_announced_task() {
+  local announced="$1" entry filename payload tier rc=0 resolved=()
+  # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
+  # payload path a resolver-backed watcher announces, which must sit in the workspace's
+  # task store. A refusal (rc 1) types nothing quietly; any other failure is a broken
+  # reader and is logged, never a silent drop.
+  [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] || resolved=(--resolved "$WORKSPACE_DIR/tasks")
+  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${resolved[@]+"${resolved[@]}"} 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
+    return 0
+  fi
+  filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
+  has_result "$filename" && return 0
+  [ -e "$queue_dir/$filename" ] && return 0
+  if [ "${SUTANDO_INBOX_KIND:-}" != "deliveries" ] && filename_is_worker_held "$filename"; then
+    log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
+    return 0
+  fi
+  if filename_is_claimed "$filename"; then
+    log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
+    return 0
+  fi
+  printf '%s' "$payload" > "$PAYLOAD_DIR/$filename"
+  # `|| tier=""`: under set -e, a bare `tier="$(...)"` on a failing
+  # subprocess exits the whole notifier before the case below ever runs.
+  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$payload" 2>/dev/null)" || tier=""
+  case "$tier" in
+    urgent|normal|low) ;;
+    *)
+      if [ -z "${_TIER_READ_WARNED:-}" ]; then
+        log_notifier "priority-tier read failed for $filename; defaulting to normal (further failures this run are not logged again)"
+        _TIER_READ_WARNED=1
+      fi
+      tier=normal
+      ;;
+  esac
+  printf '%s' "$tier" > "$queue_dir/$filename"
+}
+
+# Highest tier first, oldest marker within a tier (mtime order == announce
+# order: each marker is created once and never touched again). Scans the
+# announce-ordered list once per tier rather than sorting, since every
+# marker's tier is fixed at enqueue and the tier set is exactly three values.
+queue_head() {
+  local ordered tier f
+  ordered="$(ls -1tr "$queue_dir" 2>/dev/null)"
+  [ -n "$ordered" ] || return 0
+  for tier in urgent normal low; do
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ "$(cat "$queue_dir/$f" 2>/dev/null)" = "$tier" ]; then
+        printf '%s\n' "$f"
+        return 0
+      fi
+    done <<< "$ordered"
+  done
+}
+
+# Retry the SAME head task on every wake, never re-pick; a busy core keeps
+# it queued rather than typing into Codex's non-durable input.
+process_announced_queue() {
   local filename
-  next_pending_task >/dev/null || return 0
-  wait_for_core_idle || exit 1
-  filename="$(next_pending_task)" || return 0
-  submit_task "$filename" 1
+  while :; do
+    filename="$(queue_head)"
+    [ -n "$filename" ] || return 0
+    if has_result "$filename"; then
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    wait_for_core_idle || exit 1
+    submit_task "$filename" 1
+    if has_result "$filename"; then
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    return 0
+  done
 }
 
 # `read || rc=$?`, NOT `read; rc=$?` -- under `set -e` the bare form dies before
@@ -392,14 +455,17 @@ while :; do
   IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
   if [ "$rrc" -eq 0 ]; then
     case "$event" in
-      "TASK_FILE: "*) attempt_highest_pending ;;
+      "TASK_FILE: "*)
+        enqueue_announced_task "${event#TASK_FILE: }"
+        process_announced_queue
+        ;;
     esac
     continue
   fi
   # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike, so
   # the code cannot tell them apart -- ask whether the watcher is still alive.
   if kill -0 "$watcher_pid" 2>/dev/null; then
-    attempt_highest_pending   # a refused task has no other trigger; retry it
+    process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
   break   # the watcher died -- genuine EOF, stop the notifier

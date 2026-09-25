@@ -160,6 +160,9 @@ KNOWN_HEADER_KEYS = (
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
+    # dm|room verdict a trusted writer stamps (room-bound voice tasks put it
+    # above task:); header status defangs a forged body copy that would claim DM.
+    "channel_kind",
     # Which instance took delivery. Same namespace as the addressee in the body, so a
     # non-addressed core can tell; header status defangs a forged body copy.
     "receiving_instance",
@@ -617,6 +620,61 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
     if live.is_file():
         yield live
     yield from _iter_archived_result_candidates(results_dir, task_id)
+
+
+def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]]:
+    """Every EXISTING result file for each id in `task_ids`, keyed by id, from ONE listing of
+    each layout `iter_result_candidates` walks (live, `archive/` flat and epoch-suffixed,
+    `archive/<YYYY-MM>/`, retention `archive-<day>/`). A malformed id gets no entry.
+
+    Same files as walking `iter_result_candidates` per id, without the per-id glob over the
+    flat archive: the cost is the listings plus the ids, never their product. Order within an
+    id is not the lookup precedence; use it for "does any candidate satisfy", not "which one".
+    """
+    wanted = {t for t in task_ids if valid_archive_lookup_id(t)}
+    out: dict[str, list[Path]] = {t: [] for t in wanted}
+    if not wanted:
+        return out
+
+    def take(directory: Path, epoch_forms: bool) -> None:
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            return
+        with entries:
+            for e in entries:
+                name = e.name
+                if not name.endswith(".txt"):
+                    continue
+                stem = name[:-4]
+                if stem in wanted:
+                    if e.is_file():
+                        out[stem].append(directory / name)
+                    continue
+                if epoch_forms:
+                    cut = stem.rfind("-")
+                    if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():
+                        out[stem[:cut]].append(directory / name)
+
+    base = Path(results_dir)
+    take(base, False)
+    archive = base / "archive"
+    take(archive, True)
+    try:
+        with os.scandir(archive) as entries:
+            months = [e.name for e in entries if _MONTH_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        take(archive / month, True)
+    try:
+        with os.scandir(base) as entries:
+            days = [e.name for e in entries if _RETENTION_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        take(base / day, True)
+    return out
 
 
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:

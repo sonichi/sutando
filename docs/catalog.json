@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-15"
+   "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -236,7 +236,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-09-22"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -248,7 +248,7 @@
    ],
    "status": "canonical",
    "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-   "last_verified": "2026-08-04"
+   "last_verified": "2026-09-18"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
    "title": "Claude Code Hook Contract — v1",
@@ -299,7 +299,7 @@
    ],
    "status": "active",
    "canonical_for": "generated source-module inventory",
-   "last_verified": "2026-07-23"
+   "last_verified": "2026-09-18"
   },
   "docs/state-sync-allowlist.md": {
    "title": "State sync allowlist design",
@@ -483,6 +483,16 @@
    "status": "draft",
    "canonical_for": "the record behind the v1 worker-pool design: rejected alternatives, the failure model inherited from the #3860 draft, and the owner decisions it encodes",
    "last_verified": "2026-09-08"
+  },
+  "docs/task-watcher-hosting-modes.md": {
+   "title": "Task watcher hosting modes — session watcher, standby, supervisor",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
+   "last_verified": "2026-09-22"
   }
  }
 }

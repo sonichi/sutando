@@ -3,8 +3,13 @@ name: Windows runtime
 on:
   pull_request:
     branches: [main, staging-interaction-planes, support-windows-11]
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, staging-interaction-planes]
+  schedule:
+    # Off-peak daily; the job-level `if` below is what actually gates execution.
+    - cron: '37 8 * * *'
+  workflow_dispatch: {}
 
 env:
   SUTANDO_TELEMETRY: "0"
@@ -14,6 +19,11 @@ jobs:
     name: PowerShell + Windows runtime
     runs-on: windows-latest
     timeout-minutes: 20
+    # Not a required check (see main's ruleset); skip on ordinary push/PR to save CI minutes.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'windows-ci'))
 
     steps:
       - name: Checkout
