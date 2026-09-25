@@ -50,11 +50,13 @@ echo "  watcher emitted after handler failure: ${line:-<nothing>}"
 [ "$line" = "TASK_FILE: $PAYLOAD" ]
 rc=$?
 check $rc "a failed handler's fallback emission still names the resolved payload path"
+# 2>/dev/null on sed would make a missing file print as silently empty.
+dump_file() { [ -f "$1" ] && sed 's/^/    /' "$1" || echo "    <file missing: $1>"; }
 # Distinguishes never-emitted (POLL_ITERS=60) from a wrong path caught early.
 if [ "$rc" != "0" ]; then
   echo "  poll iterations before kill: $POLL_ITERS/60"
-  echo "  watcher stdout:"; sed 's/^/    /' "$TMP/sweep.out" 2>/dev/null
-  echo "  watcher stderr:"; sed 's/^/    /' "$TMP/sweep.err" 2>/dev/null
+  echo "  watcher stdout:"; dump_file "$TMP/sweep.out"
+  echo "  watcher stderr:"; dump_file "$TMP/sweep.err"
 fi
 
 echo
