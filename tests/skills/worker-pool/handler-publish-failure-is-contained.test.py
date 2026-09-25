@@ -74,6 +74,8 @@ class ABatchSurvivesOnePublishFailure(unittest.TestCase):
         for label in ("alpha", "beta"):
             out = sw.spawn(self.ws, REPO, cwd=str(REPO), socket=SOCK, label=label,
                            runner=self.t, require_sentinel=False)
+            # Recovery acts only on a rostered worker; spawn() alone does not roster it.
+            pr.register_worker(self.ws, out["worker_id"], label, runtime=out.get("runtime"))
             self.ids.append(out["worker_id"])
         self.t.live.clear()                       # both workers died
         self.before = len(self.t.launches())
