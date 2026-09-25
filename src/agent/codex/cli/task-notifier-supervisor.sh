@@ -72,9 +72,21 @@ beat_path_for_session() {
   fi
 }
 
+# Only a notifier that implements the one-shot --nudge entrypoint can be nudged.
+# The shared supervisor's $NOTIFIER defaults to the Codex notifier, which has no
+# --nudge handler -- passing it would fall through to that notifier's long-lived
+# event loop and never return, wedging nudge_and_wait. A grep for the exact
+# entrypoint, never a probe run (a run has the same fall-through hazard).
+notifier_supports_nudge() {
+  [ -r "$NOTIFIER" ] && grep -q '"--nudge"' "$NOTIFIER" 2>/dev/null
+}
+
 # nudge / alert / arm, from the pane verdict and the beat freshness. An
-# unresolvable beat path is passed as health=unknown, which decides "arm".
+# unresolvable beat path is passed as health=unknown, which decides "arm". A
+# notifier without --nudge can only ever arm, so short-circuit there: this also
+# avoids classifying a non-Claude pane with the Claude profile pane_state uses.
 decide_action() {
+  notifier_supports_nudge || { echo arm; return; }
   local ps beat
   ps="$(pane_state)"
   beat="$(beat_path_for_session)"

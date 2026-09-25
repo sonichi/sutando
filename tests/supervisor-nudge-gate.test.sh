@@ -90,23 +90,30 @@ check "idle-ready + unresolvable health -> arm" "arm" "$(decision "$IDLE_STATE" 
 HOST="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"
 if [ -n "$HOST" ]; then
   : > "$WORK/state/cores/$HOST.alive"
-  (
-    # Scrub any ambient SUTANDO_* from a live session running this test, so the
-    # core-beat branch and the test's own pane/workspace are what decide_action
-    # sees -- not a leaked worker id, pane, or inbox.
-    unset SUTANDO_INSTANCE_ID SUTANDO_TMUX_PANE SUTANDO_TASKS_DIR \
-          SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER
-    export SUTANDO_SUPERVISOR_SOURCE_ONLY=1
-    export SUTANDO_TMUX_SOCKET="$SOCK" SUTANDO_TMUX_SESSION="idle" SUTANDO_TMUX_WINDOW="0"
-    export SUTANDO_WORKSPACE_DIR="$WORK" SUTANDO_NOTIFIER_PY="$PY"
-    # shellcheck source=/dev/null
-    source "$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
-    printf 'ps=%s beat=%s action=%s\n' "$(pane_state)" "$(beat_path_for_session)" "$(decide_action)"
-  ) > "$WORK/act.txt" 2>/dev/null
+  # The Claude notifier implements --nudge; a stub without it must never be nudged.
+  CLAUDE_NOTIFIER="$REPO/src/agent/claude/cli/task-notifier.sh"
+  NONUDGE="$WORK/nonudge-notifier.sh"; printf '#!/bin/bash\n[ "${1:-}" = "--event" ] && exit 0\nwhile :; do sleep 1; done\n' > "$NONUDGE"; chmod +x "$NONUDGE"
+  run_decide() { # notifier-script
+    (
+      unset SUTANDO_INSTANCE_ID SUTANDO_TMUX_PANE SUTANDO_TASKS_DIR \
+            SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER
+      export SUTANDO_SUPERVISOR_SOURCE_ONLY=1
+      export SUTANDO_TMUX_SOCKET="$SOCK" SUTANDO_TMUX_SESSION="idle" SUTANDO_TMUX_WINDOW="0"
+      export SUTANDO_WORKSPACE_DIR="$WORK" SUTANDO_NOTIFIER_PY="$PY" SUTANDO_NOTIFIER_SCRIPT="$1"
+      # shellcheck source=/dev/null
+      source "$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
+      printf 'ps=%s beat=%s action=%s\n' "$(pane_state)" "$(beat_path_for_session)" "$(decide_action)"
+    ) 2>/dev/null
+  }
+  run_decide "$CLAUDE_NOTIFIER" > "$WORK/act.txt"
   ACT="$(sed -n 's/.*action=//p' "$WORK/act.txt")"
-  check "decide_action (core, idle-ready pane, fresh core beat) -> nudge" "nudge" "$ACT"
+  check "decide_action (Claude notifier, idle-ready pane, fresh core beat) -> nudge" "nudge" "$ACT"
   BEATSEEN="$(sed -n 's/.*beat=\([^ ]*\).*/\1/p' "$WORK/act.txt")"
   check "beat_path_for_session resolves the core beat" "$WORK/state/cores/$HOST.alive" "$BEATSEEN"
+  # A notifier without --nudge (the Codex default) can only ever arm, even on an
+  # idle-ready pane with a live beat -- nudging it would wedge on its event loop.
+  NNACT="$(run_decide "$NONUDGE" | sed -n 's/.*action=//p')"
+  check "decide_action (no-nudge notifier, idle-ready + fresh) -> arm" "arm" "$NNACT"
 else
   echo "ok   decide_action core-beat case skipped (no host-label)"
 fi
