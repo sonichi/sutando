@@ -217,9 +217,11 @@ while IFS= read -r event; do
         tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || continue 2
       done
       filename="$(next_pending_task)" || continue
-      # A deferred delivery (core busy) leaves the task pending for the
-      # next event, not a reason to kill the persistent watcher.
-      submit_task "$filename" || true
+      # deliver_prompt runs its OWN idle check; a busy gap here must retry
+      # in place too, like the outer gate above, not drop silently.
+      while ! submit_task "$filename"; do
+        tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || continue 2
+      done
       ;;
   esac
 done < "$event_dir/events"

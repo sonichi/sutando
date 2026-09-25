@@ -64,6 +64,8 @@ class FakeTmuxHarness(unittest.TestCase):
         self.sendkeys_log.write_text("")
         self.swallow_flag = self.root / "swallow-next-paste.flag"
         self.pane_width = None  # None = no wrap; a subclass/test may set a column count
+        self.capture_count_file = self.root / "capture-pane.count"  # 1 line/call, after read
+        self.capture_count_file.write_text("")
         self._write_fake_tmux()
 
     def _write_fake_tmux(self):
@@ -92,6 +94,9 @@ case "$cmd" in
     done
     hist=""
     [ -f "{self.pane_file}" ] && hist="$(cat "{self.pane_file}")"
+    # Recorded AFTER hist is read, so a test can time a mutation to land
+    # no earlier than the NEXT call, never this one.
+    echo call >> "{self.capture_count_file}"
     composer="$(cat "{self.composer_file}" 2>/dev/null)"
     if [ "$PANE_WIDTH" -gt 0 ] && [ -n "$composer" ]; then
       composer="$(printf '%s' "$composer" | fold -w "$PANE_WIDTH")"
@@ -478,6 +483,73 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 self.fail("notifier never dispatched the pending task once idle, with no "
                           "second task-file event:\n" + self.sendkeys_log_text())
             self.write_result("task-busy-recover.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_busy_between_the_outer_and_inner_idle_checks_still_retries(self):
+        # deliver_prompt's own idle check is independent of the outer one --
+        # a busy gap between them must still retry, not silently drop.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.write_task("task-race.txt")
+            # Wait for the outer check's one capture-pane call, then flip busy
+            # for the next one (deliver_prompt's inner check) -- deterministic.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if self.capture_count_file.read_text().count("call") >= 1:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("the outer idle check never ran")
+            self.pane_file.write_text(BUSY_MARKER + "\n")
+            # Outlive one full CORE_READY_TIMEOUT (5s in this harness) cycle
+            # for the INNER check while the pane stays busy throughout.
+            time.sleep(6)
+            self.assertIsNone(proc.poll(),
+                               "the persistent watcher must survive an idle-wait timeout, not exit")
+            self.assertEqual(self.sendkeys_log_text(), "",
+                              "must not dispatch after the inner idle-wait timed out")
+            # Pane recovers -- WITHOUT any second task-file event.
+            self.pane_file.write_text(IDLE_MARKER + "\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-race.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("a delivery deferred by the busy-between-checks race was never "
+                          "retried once the pane went idle again, with no second "
+                          "task-file event:\n" + self.sendkeys_log_text())
+            self.assertEqual(
+                self.sendkeys_log_text().count("TYPE Sutando task ready: task-race.txt"), 1,
+                "exactly one eventual dispatch, not a repeat from an earlier failed attempt")
+            self.write_result("task-race.txt")
             deadline = time.time() + 10
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(0.2)
