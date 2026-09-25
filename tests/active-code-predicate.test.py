@@ -731,11 +731,42 @@ class FunctionScopedInvocations(unittest.TestCase):
         """kewei-red-ag2space round 36 follow-up: an outer one-liner and a
         nested one-liner inside it can share an identical (start, end)
         span; reachability keyed on span alone credited the never-called
-        nested one just because the span happened to match the outer's."""
+        nested one just because the span happened to match the outer's.
+        `outer` runs BEFORE the added `inner` call (qingyun-wu round 37
+        follow-up: the original fixture called `inner` before `outer` ever
+        ran -- real Bash reports `command not found` there, confirmed by
+        direct execution -- so it could only pass by accident of the
+        installation-timing bug this file now fixes)."""
         text = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\n"
         self.assertFalse(program_invokes(text, NAME))
-        called = text.replace("}\nouter\n", "}\n  inner\n}\nouter\n")
+        called = text.replace("}\nouter\n", "}\nouter\n  inner\n")
         self.assertTrue(program_invokes(called, NAME))
+
+    def test_a_call_before_the_enclosing_function_ever_runs_invokes_nothing(self):
+        """qingyun-wu round 37: a name defined ONLY inside a nested
+        function is not installed until that function actually runs --
+        calling it first is a real `command not found` (confirmed by
+        direct execution), not a hit resolved from its bare textual
+        anchor."""
+        text = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\ninner\nouter\n"
+        self.assertFalse(program_invokes(text, NAME))
+
+    def test_calling_after_the_enclosing_function_has_run_invokes_it(self):
+        """Positive control for the above: swapping the call order so
+        `outer` runs first installs `inner` before it is called."""
+        text = f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\nouter\ninner\n"
+        self.assertTrue(program_invokes(text, NAME))
+
+    def test_a_runtime_installed_nested_definition_overrides_a_textually_later_decoy(self):
+        """qingyun-wu round 37: a top-level decoy that is textually LATER
+        than a nested definition can still lose to it, because `outer`
+        running installs the nested one AFTER the decoy's own definition
+        statement already executed -- source order alone picked the
+        decoy; execution order (confirmed by direct execution) picks the
+        nested one."""
+        text = (f"outer() {{\n  inner() {{ bash scripts/{NAME}; }}\n}}\n"
+                f"inner() {{ printf DECOY; }}\nouter\ninner\n")
+        self.assertTrue(program_invokes(text, NAME))
 
     def test_content_after_a_nested_close_belongs_to_the_enclosing_body(self):
         """kewei-red-ag2space round 36 follow-up: `}; helper` puts the

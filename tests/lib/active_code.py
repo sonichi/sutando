@@ -100,7 +100,9 @@ def _command_tokens(seg: str) -> list[str]:
     # `!` is peeled first (below); the opener check looks PAST it too,
     # or `! { helper; }` -- which really runs helper -- goes unrecognized.
     after_bang = stripped[1:].lstrip() if leading_bang else stripped
-    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t")
+    # A redirect glued straight onto `{` (`{>/dev/null cmd; }`) still opens
+    # a command group in Bash -- `<`/`>` are metacharacters, not word chars.
+    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t<>")
     import shlex
     try:
         toks = shlex.split(seg)
@@ -116,6 +118,15 @@ def _command_tokens(seg: str) -> list[str]:
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif toks[0] == "{" and leading_brace and len(toks) > 1:
+            toks = toks[1:]; changed = True
+        elif (leading_brace and toks[0][:1] == "{" and len(toks[0]) > 1
+              and toks[0][1] in "<>"):
+            # shlex has no redirect grammar, so `{>/dev/null` glues into one
+            # token; split the reserved-word `{` back off and re-peel.
+            toks = [toks[0][1:]] + toks[1:]; changed = True
+        elif toks[0][:1] in "<>" and len(toks) > 1:
+            # A redirection may precede the command it applies to
+            # (`>/dev/null false`); it is never the command itself.
             toks = toks[1:]; changed = True
         elif toks[0] == "timeout" and len(toks) > 1:
             toks = toks[1:]; changed = True
@@ -341,6 +352,9 @@ _FUNC_START_KEYWORD_SPLIT_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*
 _BRACE_LINE_RE = re.compile(r"^\s*\{\s*(.*)$")
 _CLOSE_ONLY_RE = re.compile(r"^\s*\}\s*$")
 _CMD_SEP = frozenset(";&|")
+# `{`/`}` glued onto a redirect (`{>/dev/null`) is still a token boundary;
+# kept apart from _CMD_SEP since a redirect never re-arms command-start.
+_TOKEN_BOUNDARY_EXTRA = frozenset("<>")
 
 
 def _line_continues(line: str) -> bool:
@@ -426,7 +440,8 @@ def _brace_delta(line: str) -> int:
     at_cmd_start = True  # the start of a physical (or joined logical) line is itself command-start
 
     def boundary(pos: int) -> bool:
-        return pos < 0 or pos >= n or masked[pos].isspace() or masked[pos] in _CMD_SEP
+        return (pos < 0 or pos >= n or masked[pos].isspace()
+                or masked[pos] in _CMD_SEP or masked[pos] in _TOKEN_BOUNDARY_EXTRA)
 
     while i < n:
         ch = masked[i]
@@ -629,6 +644,12 @@ def _strip_unreachable_function_bodies(text: str) -> str:
         for k in range(start, end + 1):
             excluded[k] = True
     top_level_idx = [idx for idx in range(len(lines)) if not excluded[idx]]
+    # Every line but a pure signature can call -- `installed_before` needs
+    # a call to an enclosing function wherever it actually happens.
+    sig_only: set = set()
+    for _, _, sig_lines, _, _ in funcs:
+        sig_only.update(sig_lines)
+    callable_idx = [idx for idx in range(len(lines)) if idx not in sig_only]
 
     by_name: dict[str, list[tuple[int, int, int]]] = {}
     for name, anchor, _, start, end in funcs:
@@ -670,6 +691,57 @@ def _strip_unreachable_function_bodies(text: str) -> str:
                 out.append(idx)
         return out
 
+    def enclosing_span(span: "tuple[int, int, int]") -> "tuple[str, int, int, int] | None":
+        """(name, anchor, start, end) of the tightest OTHER function whose
+        body contains `span`'s anchor, or None when `span` is top-level."""
+        best = None
+        for name2, anchor2, _, start2, end2 in funcs:
+            cand = (anchor2, start2, end2)
+            if cand == span or not (start2 <= span[0] <= end2):
+                continue
+            if best is None or (end2 - start2) < (best[3] - best[2]):
+                best = (name2, anchor2, start2, end2)
+        return best
+
+    _calls_cache: dict[str, list[int]] = {}
+
+    def calls_to(name: str) -> list[int]:
+        """Every line (any depth -- top-level or inside a body) that calls
+        `name`, memoized: `installed_before` re-asks this for the same
+        enclosing name at multiple candidate `ref`s."""
+        if name not in _calls_cache:
+            _calls_cache[name] = called_on(name, callable_idx)
+        return _calls_cache[name]
+
+    def installed_before(span: "tuple[int, int, int]", ref: int,
+                          seen: frozenset = frozenset()) -> "int | None":
+        """The line at which `span`'s definition is INSTALLED as seen from
+        `ref`, or None if it never is by then -- round 36 follow-up,
+        qingyun-wu: a nested definition takes effect only once its
+        ENCLOSING function actually runs, not at its own textual anchor
+        (kewei-red-ag2space: calling a nested-only name before the
+        enclosing call ever executes must resolve to nothing, and a
+        top-level redefinition that is merely TEXTUALLY later than the
+        nested one must still lose to a nested one installed by a LATER
+        runtime call). Top-level: its own anchor. Nested: the LATEST call
+        to its direct enclosing function that lands before `ref`, with
+        that enclosing definition itself required to be installed by the
+        call's own line (recursive, depth-general)."""
+        if span in seen:
+            return None
+        encl = enclosing_span(span)
+        if encl is None:
+            anchor = span[0]
+            return anchor if anchor < ref else None
+        encl_name, encl_anchor, encl_start, encl_end = encl
+        encl_span = (encl_anchor, encl_start, encl_end)
+        best_call = None
+        for call_line in calls_to(encl_name):
+            if call_line < ref and installed_before(encl_span, call_line, seen | {span}) is not None:
+                if best_call is None or call_line > best_call:
+                    best_call = call_line
+        return best_call
+
     def resolve(name: str, at_line: int, own_line: int = None,
                 body_bounds: "tuple[int, int] | None" = None
                 ) -> "tuple[int, int, int] | None":
@@ -690,13 +762,24 @@ def _strip_unreachable_function_bodies(text: str) -> str:
         follow-up, qingyun-sutando/kewei-red-ag2space: calling a name
         before its own later definition, both inside the same body, must
         resolve to nothing -- a real `command not found` -- not to
-        whatever the propagated at_line happened to make current)."""
-        best = None
+        whatever the propagated at_line happened to make current).
+
+        A candidate reached from OUTSIDE its own body (the `at_line`
+        branch) that is itself nested is resolved by INSTALLATION time
+        (`installed_before`), never by its bare anchor -- see that
+        function's docstring."""
+        best, best_eff = None, None
         for anchor, start, end in by_name.get(name, ()):
-            ref = (own_line if body_bounds and body_bounds[0] <= anchor <= body_bounds[1]
-                   else at_line)
-            if anchor < ref:
-                best = (anchor, start, end)
+            span = (anchor, start, end)
+            same_body = body_bounds and body_bounds[0] <= anchor <= body_bounds[1]
+            if same_body:
+                eff = anchor if anchor < own_line else None
+            elif enclosing_span(span) is None:
+                eff = anchor if anchor < at_line else None
+            else:
+                eff = installed_before(span, at_line)
+            if eff is not None and (best_eff is None or eff > best_eff):
+                best, best_eff = span, eff
         return best
 
     # `at_line` is the call site that reached each queued function; `span`
