@@ -49,6 +49,7 @@ async def test_routes():
     assert route("POST", "/highlight/<x>")[0] == 400
     assert route("POST", "/speaking/on") == ("speaking", True)
     assert route("GET", "/state?x=1") == ("state", None)
+    assert route("GET", "/script") == ("script", None)
     assert route("GET", "/highlight/x")[0] == 405
     assert route("POST", "/deck/other")[0] == 404
     assert route("POST", "/presenter/on")[0] == 200

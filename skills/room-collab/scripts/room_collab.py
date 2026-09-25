@@ -626,10 +626,18 @@ async def run(args: argparse.Namespace) -> int:
         return 0
     if args.command == "watch":
         return await watch(args, token, url)
+    if args.command == "script":
+        from room_collab_relay import read_script
+        print(json.dumps(await read_script(lambda: open_room_collab(url, args.room, token,
+                                                                    insecure=args.insecure)),
+                         ensure_ascii=False, indent=2))
+        return 0
     if args.command == "relay":
         from room_collab_relay import serve
         await serve(lambda: open_room_collab(url, args.room, token, kind=args.kind,
-                                             insecure=args.insecure), args.port)
+                                             insecure=args.insecure), args.port,
+                    open_text=lambda: open_room_collab(url, args.room, token,
+                                                       insecure=args.insecure))
         return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -923,6 +931,10 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(needs --kind html)")
     s.add_argument("room")
     s.add_argument("move", help="next | prev | <slide number>")
+
+    s = sub.add_parser("script", help="print the talk script in the room's Doc as steps of "
+                                      "words and cues (JSON)")
+    s.add_argument("room")
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html)")

@@ -9,6 +9,7 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   POST /speaking/on|off
   POST /presenter/on|off    accepted; presenting is the room's, not the relay's
   GET  /state               {topic, ts, speaking}
+  GET  /script              the talk script in the room's Doc, as steps (talk_script.py)
 
 It listens on 127.0.0.1 only: whoever reaches the port drives the stage as
 this agent, so it must never be exposed beyond the machine.
@@ -31,6 +32,8 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     path = path.split("?", 1)[0].rstrip("/") or "/"
     if method == "GET" and path == "/state":
         return ("state", None)
+    if method == "GET" and path == "/script":
+        return ("script", None)
     if method != "POST":
         return (405 if path.startswith(("/highlight/", "/slide/", "/speaking/", "/presenter/")) else 404,
                 {"ok": False, "error": "not found"})
@@ -55,8 +58,19 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     return (404, {"ok": False, "error": "not found"})
 
 
-async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print) -> None:
-    """Hold the page open (reconnecting when it drops) and answer HTTP on `port`."""
+async def read_script(open_text) -> dict:
+    """The room Doc's talk script, parsed; opened per call since it is read once per talk."""
+    from talk_script import extract, parse
+    async with open_text() as doc:
+        section = extract(doc.text)
+    if section is None:
+        raise RoomDocError('the room\'s Doc has no "Talk script" heading')
+    return {"ok": True, "steps": parse(section)}
+
+
+async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open_text=None) -> None:
+    """Hold the page open (reconnecting when it drops) and answer HTTP on `port`.
+    `open_text` opens the room's Doc, for GET /script."""
     holder: dict = {"doc": None}
     ready = asyncio.Event()
 
@@ -92,6 +106,10 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print) -> N
             what = route(parts[0], parts[1]) if len(parts) >= 2 else (400, {"ok": False})
             if isinstance(what[0], int):
                 status, body = what
+            elif what[0] == "script":
+                if open_text is None:
+                    raise RoomDocError("this relay was started without the room's Doc")
+                status, body = 200, await read_script(open_text)
             else:
                 try:
                     await asyncio.wait_for(ready.wait(), 5)

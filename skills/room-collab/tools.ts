@@ -69,4 +69,27 @@ export const roomStageTool: ToolDefinition = {
 	},
 };
 
-export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool];
+export const roomScriptTool: ToolDefinition = {
+	name: 'room_script',
+	description:
+		'Load the talk script from the room\'s Doc (its "Talk script" section) when the user asks you to present or give the talk. ' +
+		'Returns steps; each step is a list of items in order: {say} is what you speak (natural, close to the words), ' +
+		'and a cue is an action you take at exactly that point — {cue:"slide", move:"next"|"prev"|N} → room_slide, ' +
+		'{cue:"highlight", topic} → room_highlight (topic "clear" clears), {cue:"pause", seconds} → a short silent pause. ' +
+		'Never read a cue aloud. Go step by step; if someone interrupts, answer, then resume from the step you were on. Takes ~1–2 s.',
+	parameters: z.object({}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute() {
+		let res: Response;
+		try {
+			res = await fetch(`${relayUrl()}/script`, { signal: AbortSignal.timeout(12_000) });
+		} catch {
+			return { error: START_HINT };
+		}
+		const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+		return res.ok ? body : { error: String(body.error ?? `relay answered ${res.status}`) };
+	},
+};
+
+export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool, roomScriptTool];

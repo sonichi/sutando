@@ -332,6 +332,20 @@ python3 $P --kind html relay '!room:server' --port 7877
 Point the voice tool's highlight URL at it. It binds to this machine only:
 whoever reaches the port drives the stage as this agent.
 
+The skill's own voice tools use the relay: `room_slide` (next / previous / go to),
+`room_highlight`, `room_stage`, and `room_script`. The last one loads a **talk
+script** from the room's Doc. Under a heading "Talk script", each paragraph is a
+step, and bracketed cues fire where they stand:
+
+```text
+…and that closes the loop. [next] Here is what we learned. [highlight: trust]
+```
+
+The cues are `[next]`, `[prev]`, `[slide 5]`, `[highlight: topic]`, `[clear]` and
+`[pause 2]`; other brackets stay part of the words. To check one:
+`python3 $P script '!room:server'`. Keep the script in the Doc so people can
+review the words and cues before the talk.
+
 ### Writing a good page
 
 Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
