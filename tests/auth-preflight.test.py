@@ -138,6 +138,23 @@ class TestDecision(unittest.TestCase):
             self.assertFalse(r["ssh"])
             self.assertTrue(r["remedy"].startswith("needs GUI /login"))
 
+    def test_default_keychain_check_reaches_the_real_resolver_for_a_scoped_only_install(self):
+        """john-the-dev's #4196 review: keychain_has_credentials is pragma:
+        no-cover, and every other test injects a stub keychain_check, so a
+        mutation dropping config_dir at that one line (reverting to the
+        exact bug this PR fixes) still passed every suite. Exercise
+        check_auth_state's DEFAULT keychain_check against a config dir
+        whose ONLY existing item is the scoped one."""
+        import keychain_service
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            _mkconfig(td, oauth=True)
+            scoped = keychain_service.scoped_keychain_service(td)
+            with patch("keychain_service.keychain_service_exists",
+                       side_effect=lambda service: service == scoped):
+                r = check_auth_state(td, env={})
+            self.assertEqual(r["verdict"], "ok")
+
 
 class TestCli(unittest.TestCase):
     def test_exit_2_and_json_on_fresh_dir(self):

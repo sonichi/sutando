@@ -44,15 +44,9 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
 def keychain_has_credentials(config_dir: str = "") -> bool:  # pragma: no cover - external I/O (security CLI)
-    """True when the macOS Keychain holds a Claude Code credentials item for
-    this config dir — the scoped per-install item, or the vanilla shared one.
-
-    Existence check only — the secret value is never requested. Found the hard
-    way (2026-09-11): checking only the vanilla name made a genuinely
-    authenticated, scoped-keychain install (the common case, per
-    credential-proxy.ts's own scopedKeychainService) read as logged-out on
-    every restart, permanently aborting startup on a healthy host.
-    """
+    """True when the Keychain holds a credentials item for this config dir —
+    the scoped per-install item, or the vanilla shared one. Existence only;
+    the secret value is never requested."""
     return bool(resolved_credential_service(config_dir))
 
 

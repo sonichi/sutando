@@ -4,27 +4,14 @@
 Mirrors credential-proxy.ts's `scopedKeychainService`: a per-CLAUDE_CONFIG_DIR
 Keychain item name (`Claude Code-credentials-<sha256(config_dir)[:8]>`), with a
 fallback to the vanilla shared item (`Claude Code-credentials`) for installs
-that predate per-config-dir scoping.
+that predate per-config-dir scoping. Centralized so health-check.py's
+quota-account-identity probe and auth_preflight.py's boot-auth probe never
+drift from each other (CLAUDE.md "Shared adapter policy is core").
 
-Centralized because more than one adapter needs this exact resolution
-(src/health-check.py's quota-account-identity probe, src/auth_preflight.py's
-boot-auth probe) — a copy that drifts between them is the defect (see
-CLAUDE.md "Shared adapter policy is core"). Found via a real, install-breaking
-instance of that drift: auth_preflight.py checked only the vanilla name,
-so a scoped-keychain install (the common case) always read as logged-out
-even while genuinely authenticated, and `bash src/restart.sh` permanently
-aborted startup on a healthy host (2026-09-11).
-
-Property worth stating rather than assuming (review, #4196, 2026-09-11): the
-scoped name is a pure function of the config_dir STRING, not of the machine —
-two different hosts with the same CLAUDE_CONFIG_DIR path produce the identical
-service name (confirmed live: two independent hosts both produced
-`Claude Code-credentials-b0888206` from the same path string). Harmless while
-each machine's Keychain stays local, as it does today; it would become a
-genuine collision (two different secrets, one name) only if some future
-mechanism merged keychain items across machines. Neither observed nor
-implemented anywhere in this codebase as of this fix — noted so it is a known
-property if that ever changes, not a surprise.
+The scoped name is a pure function of the config_dir STRING, not the machine:
+two hosts sharing a CLAUDE_CONFIG_DIR path produce the identical service name.
+Harmless while each machine's Keychain stays local; would only collide if a
+future mechanism merged Keychain items across machines.
 """
 from __future__ import annotations
 
