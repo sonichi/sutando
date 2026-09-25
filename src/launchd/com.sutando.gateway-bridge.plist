@@ -15,7 +15,9 @@
 
   Design:
     - RunAtLoad=true so it starts at login/boot.
-    - KeepAlive { Crashed: true, SuccessfulExit: false } → restart on crash,
+    - KeepAlive { Crashed: true, SuccessfulExit: false } → restart on crash; the
+      wrapper itself supervises the bridge, so a clean bridge exit is relaunched
+      by the wrapper, not by launchd (only a no-token idle exit stays down);
       OOM, or kill (any non-zero/signal exit), but NOT on a clean exit. The
       wrapper exits 0 when no token is configured, so a de-configured install
       stops cleanly instead of crash-looping.

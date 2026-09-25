@@ -7,7 +7,8 @@
 #   exit-1 child  -> restarted
 #   exit-75 child -> NOT restarted, wrapper ends (the bridge's own stand-down)
 #   deliberate window -> restart happens but no alert / no proactive result file
-#   no token      -> wrapper waits idle; it does NOT exit 0 into an idle job
+#   no token      -> wrapper exits 0 at once (no child); startup-runtime's idle-job
+#                    kickstart owns that case, and a live idle PID would read as running
 #
 # Run: bash tests/gateway-bridge-wrapper-self-heal.test.sh
 set -uo pipefail
@@ -48,7 +49,7 @@ EOS
   restarts=$(grep -c "automatically restarting" "$d/o.log")
   alerts=$(ls "$d/ws/results"/proactive-gateway-bridge-restarted-* 2>/dev/null | wc -l | tr -d ' ')
   alive=$(cat "$d/alive.txt")
-  idle=$(grep -c "waiting idle" "$d/o.log")
+  idle=$(grep -c "nothing to run; exiting cleanly" "$d/o.log")
   echo "$restarts $alerts $alive $idle"
   rm -rf "$d"
 }
@@ -63,7 +64,7 @@ echo "exit-0  child -> $r0 restart(s), $a0 alert file(s)   (want >0 restarts: th
 echo "exit-1  child -> $r1 restart(s)                       (want >0)"
 echo "exit-75 child -> $r75 restart(s), wrapper alive=$alive75 (want 0 and 0: stand-down)"
 echo "deliberate    -> $rd restart(s), $ad alert file(s)    (want >0 restarts, 0 alerts)"
-echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, alive=1: waits idle, no exit 0)"
+echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, alive=0: exits 0 at once, no child)"
 
 [ "$r0" -gt 0 ] || { echo "FAIL: a clean exit-0 bridge was NOT relaunched (the outage would recur)"; fail=1; }
 [ "$a0" -gt 0 ] || { echo "FAIL: a non-deliberate restart raised no alert"; fail=1; }
@@ -73,8 +74,8 @@ echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, 
 [ "$rd" -gt 0 ] || { echo "FAIL: deliberate window suppressed the RESTART, not just the alert"; fail=1; }
 [ "$ad" -eq 0 ] || { echo "FAIL: a restart inside the deliberate window still alerted"; fail=1; }
 [ "$rn" -eq 0 ] || { echo "FAIL: launched the bridge with no token"; fail=1; }
-[ "$aliven" -eq 1 ] || { echo "FAIL: no-token wrapper exited (an idle launchd job again) instead of waiting"; fail=1; }
-[ "$idlen" -gt 0 ] || { echo "FAIL: no-token path did not log 'waiting idle'"; fail=1; }
+[ "$aliven" -eq 0 ] || { echo "FAIL: no-token wrapper stayed alive (an idle PID would read as a running bridge)"; fail=1; }
+[ "$idlen" -gt 0 ] || { echo "FAIL: no-token path did not log 'nothing to run; exiting cleanly'"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "PASS"
 exit $fail

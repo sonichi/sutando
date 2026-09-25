@@ -89,6 +89,18 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._ws_heartbeat = orig
         rgb._release_singleton()
 
+    def test_main_stands_down_with_exit_75_when_deferred(self):
+        # A supervising wrapper (gateway-bridge-wrapper.sh) relaunches any child
+        # that exits, except rc 75: so a deferral must exit 75, not return 0.
+        orig = rgb._acquire_singleton
+        rgb._acquire_singleton = lambda: False
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                rgb.main()
+        finally:
+            rgb._acquire_singleton = orig
+        self.assertEqual(ctx.exception.code, 75)
+
     def test_deferred_when_live_holder(self):
         lf = self._lockfile()
         lf.parent.mkdir(parents=True, exist_ok=True)

@@ -4821,7 +4821,9 @@ def main() -> None:
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
-        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
+        # A live bridge already polls this workspace: stand down. 75 tells a
+        # supervising wrapper not to relaunch; a plain exit would loop it.
+        sys.exit(75)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()

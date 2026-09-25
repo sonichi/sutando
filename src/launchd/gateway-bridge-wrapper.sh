@@ -6,7 +6,7 @@
 # REMOTE_TASK_TOKEN (legacy AG2_REMOTE_TOKEN), which lives in the ag2space
 # channel .env — NOT in the environment launchd hands the job. launchd doesn't
 # source shell profiles or .env files, so we resolve + load the channel .env
-# here, map the legacy token names to the ones the bridge reads, then exec the
+# here, map the legacy token names to the ones the bridge reads, then supervise the
 # bridge. Mirrors the credential-proxy-wrapper.sh pattern.
 #
 # Called by com.sutando.gateway-bridge.plist as the ProgramArguments entry so
@@ -61,10 +61,10 @@ export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
 if [ -z "$REMOTE_TASK_TOKEN" ]; then
-    # Wait idle rather than exit 0: a clean exit leaves the launchd job idle
-    # (KeepAlive is crash-only) and nothing brings it back when the token appears.
-    echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — waiting idle" >&2
-    while :; do sleep 300; done
+    # Exit 0 into an idle job on purpose: startup-runtime's "loaded but idle"
+    # branch kickstarts it once a token exists, and an idle PID would read as running.
+    echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
+    exit 0
 fi
 
 # Evict an already-running gateway bridge that belongs to THIS checkout: it has no
@@ -84,7 +84,10 @@ fi
 # by this wrapper, so the launchd job never sits idle after a clean exit. An exit
 # inside the deliberate-restart window is expected and raises no alert; rc 75 is
 # the bridge's own stand-down and ends the wrapper for good.
-WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || echo "$REPO/workspace")"
+if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
+    echo "[gateway-bridge-wrapper] workspace unresolvable via scripts/sutando-config.sh — nothing to run; exiting cleanly." >&2
+    exit 0
+fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
 MARKER="$STATE_DIR/gateway.started"
@@ -119,6 +122,8 @@ stop_wrapper() {
 }
 trap stop_wrapper TERM INT HUP
 while [ "$STOPPING" = 0 ]; do
+  # A rotated token must reach the next child, not only the first.
+  [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
   python3 "$REPO/src/remote-gateway-bridge.py" &
   CHILD_PID=$!
   set +e
