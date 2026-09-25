@@ -303,8 +303,8 @@ alongside loses nothing.
 
 ```bash
 python3 $P --kind html templates '!room:server'                   # the library, and what a page can do
-python3 $P --kind html templates '!room:server' --use slides      # start an empty page from one
-python3 $P --kind html templates '!room:server' --use slides --replace   # overwrite a page, for everyone
+python3 $P --kind html templates '!room:server' --use slides-swiss-modern   # start an empty page from one
+python3 $P --kind html templates '!room:server' --use dashboard --replace    # overwrite a page, for everyone
 python3 $P --kind html read '!room:server'
 ```
 
