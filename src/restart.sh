@@ -5,6 +5,21 @@
 #   --stop-only    Stop without restarting
 #   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
 
+# Reject anything unrecognized — the default action below is destructive, and
+# a silent fallthrough (an unknown flag ends up running it anyway) is a trap.
+case "${1:-}" in
+  ""|--stop-only|--rebuild-app) ;;
+  --help|-h)
+    sed -n '2,6p' "$0"
+    exit 0
+    ;;
+  *)
+    echo "restart.sh: unrecognized argument: $1" >&2
+    sed -n '2,6p' "$0" >&2
+    exit 2
+    ;;
+esac
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REBUILD_APP=0
 [ "${1:-}" = "--rebuild-app" ] && REBUILD_APP=1
