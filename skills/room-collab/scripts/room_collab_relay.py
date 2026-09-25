@@ -285,7 +285,7 @@ SEARCH_PAGES_MAX = 30
 
 
 async def search_room(open_kind, query: str, limit: int) -> dict:
-    """Every Doc page, HTML page, database row and sheet cell, read once and ranked; a surface that
+    """Every Doc page, HTML page, database row and sheet row, read once and ranked; a surface that
     cannot be opened is listed under `failed`, never silently skipped."""
     from room_search import db_records, doc_record, html_record, search, sheet_records
     failed: list[dict] = []

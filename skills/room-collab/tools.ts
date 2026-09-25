@@ -201,7 +201,7 @@ export const roomSearchTool: ToolDefinition = {
 	name: 'room_search',
 	description:
 		'Find where something is in the room: searches every Doc page, HTML page, database row (title, values and page body) and sheet ' +
-		'cell for words that must all appear. Each hit has its surface, title, a snippet and `go`, the relay steps that open it: ' +
+		'row for words that must all appear. Each hit has its surface, title, a snippet and `go`, the relay steps that open it: ' +
 		'call room_surface with that surface (and page id), or room_db_row for a database row. Use it when asked "where did we write…" ' +
 		'or to go to something by what it says rather than by page. Takes a few seconds on a large room.',
 	parameters: z.object({

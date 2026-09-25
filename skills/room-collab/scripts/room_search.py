@@ -1,7 +1,7 @@
 """Search across a room's collaborative surfaces — pure: records in, ranked hits out.
 
 A record is one searchable unit: a Doc page, an HTML page, a database row or a
-sheet cell. Each carries `go`, the relay path(s) that open it, so a voice agent
+sheet row. Each carries `go`, the relay path(s) that open it, so a voice agent
 can go where a hit is. Readers (the relay, the CLI) build records from the
 documents they opened; nothing here opens a socket.
 """
@@ -76,19 +76,15 @@ def db_records(maps: dict, bodies: dict[str, str]) -> list[dict]:
 
 
 def sheet_records(rows: dict, cols: dict, cells: dict) -> list[dict]:
-    """One record per filled cell, named by its address (B12)."""
-    from room_sheet import col_name, ordered
-    r_at = {r: i for i, r in enumerate(ordered(rows))}
-    c_at = {c: i for i, c in enumerate(ordered(cols))}
+    """One record per filled row, so a query can match across its cells; the first filled cell is its title."""
+    from room_sheet import grid
     out = []
-    for k, v in cells.items():
-        r, _, c = k.partition("|")
-        value = (v or {}).get("v") if isinstance(v, dict) else None
-        if r not in r_at or c not in c_at or not isinstance(value, str) or not value.strip():
-            continue
-        out.append({"surface": "sheet", "kind": "sheet", "page": None, "title": "",
-                    "cell": f"{col_name(c_at[c])}{r_at[r] + 1}", "headings": [], "text": value, "go": []})
-    return sorted(out, key=lambda x: (len(x["cell"]), x["cell"]))
+    for i, row in enumerate(grid(rows, cols, cells)):
+        filled = [v for v in row if isinstance(v, str) and v.strip()]
+        if filled:
+            out.append({"surface": "sheet", "kind": "sheet", "page": None, "title": filled[0],
+                        "sheet_row": i + 1, "headings": [], "text": " · ".join(filled), "go": []})
+    return out
 
 
 def snippet(text: str, ws: list[str], phrase: str) -> str:
@@ -140,7 +136,9 @@ def render(hits: list[dict], failed: list[dict]) -> str:
     for h in hits:
         where = {"doc": "Doc", "html": "HTML page", "db": f"database {h.get('db_name', '')}",
                  "sheet": "sheet"}.get(h["surface"], h["surface"])
-        name = h.get("title") or h.get("cell") or "(untitled)"
+        name = h.get("title") or "(untitled)"
+        if h["surface"] == "sheet":
+            name = f"row {h['sheet_row']}: {name}"
         lines.append(f"{where:<24} {name}\n    {h['snippet']}")
     lines += [f"could not search {f['kind']}: {f['error']}" for f in failed]
     return "\n".join(lines) if lines else "no matches"

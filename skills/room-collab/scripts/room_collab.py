@@ -1334,7 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
                                       "words and cues (JSON)")
     s.add_argument("room")
 
-    s = sub.add_parser("search", help="search every Doc page, HTML page, database row and sheet cell "
+    s = sub.add_parser("search", help="search every Doc page, HTML page, database row and sheet row "
                                       "in the room; each hit says how to open it")
     s.add_argument("room")
     s.add_argument("query", help="words that must all appear (case does not matter)")

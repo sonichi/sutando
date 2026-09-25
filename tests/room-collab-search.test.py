@@ -78,12 +78,14 @@ def test_database_rows_match_on_title_values_and_page_body():
     assert search(recs, "@a:x") == [], "who made a row is not its content"
 
 
-def test_sheet_cells_are_named_by_address():
-    rows = {"r0": {"order": 1}, "r1": {"order": 2}}
+def test_a_sheet_row_matches_across_its_cells():
+    rows = {"r0": {"order": 1}, "r1": {"order": 2}, "r2": {"order": 3}}
     cols = {"c0": {"order": 1}, "c1": {"order": 2}}
-    cells = {"r1|c1": {"v": "Room-collab demo"}, "r0|c0": {"v": "Title"}, "zz|c0": {"v": "demo orphan"}}
-    hits = search(sheet_records(rows, cols, cells), "demo")
-    assert [h["cell"] for h in hits] == ["B2"], hits
+    cells = {"r1|c0": {"v": "Bassil"}, "r1|c1": {"v": "Room-collab demo"}, "r0|c0": {"v": "Presenter"},
+             "zz|c0": {"v": "demo orphan"}}
+    hits = search(sheet_records(rows, cols, cells), "bassil demo")
+    assert [(h["sheet_row"], h["title"]) for h in hits] == [(2, "Bassil")], hits
+    assert "Room-collab demo" in hits[0]["snippet"]
 
 
 def test_results_are_capped_and_snippets_are_short():

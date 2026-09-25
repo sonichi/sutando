@@ -563,7 +563,7 @@ python3 skills/room-collab/scripts/room_collab.py search '!room:ag2.space' "laun
 ```
 
 One query over every Doc page, HTML page, database row (title, values and page body) and sheet
-cell. Every word must appear; case does not matter; a title or heading counts more than body text.
+row. Every word must appear; case does not matter; a title or heading counts more than body text.
 An HTML page matches only on what a viewer sees — never its scripts or styles. Each hit carries
 `go`, the relay steps that open it (`/surface/doc` then `/page/<id>`, or `/db/<db>/row/<row>`).
 A surface that cannot be opened is listed under `failed`, so "no matches" never hides a
