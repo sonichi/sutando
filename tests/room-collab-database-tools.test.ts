@@ -51,6 +51,17 @@ describe('room-collab database tools', () => {
 		assert.equal(hits.at(-1), 'POST /db/-/move?row=Shared%20browser&to=Tried%20by%20others');
 	});
 
+	it('room_db_row reads a row page, or sets or appends its body', async () => {
+		await tools.roomDbRowTool.execute({ database: 'Standups', row: 'Monday standup' }, {} as never);
+		assert.equal(hits.at(-1), 'GET /db/Standups/row/Monday%20standup');
+		await tools.roomDbRowTool.execute({ row: 'Monday', body: '# Notes\n- a&b=c' }, {} as never);
+		assert.equal(hits.at(-1), 'POST /db/-/row/Monday/body?text=%23%20Notes%0A-%20a%26b%3Dc');
+		await tools.roomDbRowTool.execute({ row: 'Monday', body: '- ship', append: true }, {} as never);
+		assert.equal(hits.at(-1), 'POST /db/-/row/Monday/body?text=-%20ship&append=1');
+		await tools.roomDbRowTool.execute({ row: 'Monday', body: '' }, {} as never);
+		assert.equal(hits.at(-1), 'POST /db/-/row/Monday/body?text=', 'an empty body clears the page');
+	});
+
 	it('a refusal comes back as the relay worded it', async () => {
 		const res = await tools.roomDbAddTool.execute({ set: ['Killer use case=Maybe'] }, {} as never);
 		assert.deepEqual(res, { error: 'Killer use case: not an option' });
@@ -58,7 +69,8 @@ describe('room-collab database tools', () => {
 
 	it('the tools are contributed and the existing ones are kept', () => {
 		const names = tools.tools.map((t) => t.name);
-		for (const n of ['room_db_list', 'room_db_read', 'room_db_add', 'room_db_update', 'room_db_move', 'room_surface'])
+		for (const n of ['room_db_list', 'room_db_read', 'room_db_add', 'room_db_update', 'room_db_move', 'room_db_row', 'room_surface'])
 			assert.ok(names.includes(n), n);
+		assert.equal(new Set(names).size, names.length, 'tool names are unique');
 	});
 });
