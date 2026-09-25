@@ -858,6 +858,15 @@ async def run(args: argparse.Namespace) -> int:
                                                                     insecure=args.insecure)),
                          ensure_ascii=False, indent=2))
         return 0
+    if args.command == "search":
+        from room_collab_relay import search_room
+        from room_search import render
+        body = await search_room(lambda kind: open_room_collab(url, args.room, token, kind=kind,
+                                                               insecure=args.insecure),
+                                 args.query, args.limit)
+        print(json.dumps(body, ensure_ascii=False, indent=2) if args.json
+              else render(body["hits"], body["failed"]))
+        return 0
     if args.command == "relay":
         from room_collab_relay import serve
         await serve(lambda room: open_room_collab(url, room, token, kind=args.kind,
@@ -1324,6 +1333,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("script", help="print the talk script in the room's Doc as steps of "
                                       "words and cues (JSON)")
     s.add_argument("room")
+
+    s = sub.add_parser("search", help="search every Doc page, HTML page, database row and sheet cell "
+                                      "in the room; each hit says how to open it")
+    s.add_argument("room")
+    s.add_argument("query", help="words that must all appear (case does not matter)")
+    s.add_argument("--limit", type=int, default=10, help="most hits to show (default 10, at most 50)")
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html); "

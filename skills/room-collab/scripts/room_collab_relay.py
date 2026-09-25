@@ -103,6 +103,17 @@ def route(method: str, path: str, family: str = "html") -> tuple[str, object] | 
         return ("script", None)
     if method == "GET" and path == "/outline":
         return ("outline", None)
+    if method == "GET" and path == "/search":
+        from urllib.parse import parse_qs
+        q = parse_qs(raw_query)
+        query = (q.get("q") or [""])[0].strip()
+        if not query:
+            return (400, {"ok": False, "error": "search needs ?q=<words>"})
+        try:
+            limit = int((q.get("limit") or ["10"])[0])
+        except ValueError:
+            return (400, {"ok": False, "error": "limit is a number"})
+        return ("search", {"q": query[:200], "limit": limit})
     if method == "GET" and path == "/surface":
         return ("surface", None)
     if method == "GET" and path == "/rooms":
@@ -268,6 +279,52 @@ async def read_script(open_text) -> dict:
     if section is None:
         raise RoomDocError('the room\'s Doc has no "Talk script" heading')
     return {"ok": True, "steps": parse(section)}
+
+
+SEARCH_PAGES_MAX = 30
+
+
+async def search_room(open_kind, query: str, limit: int) -> dict:
+    """Every Doc page, HTML page, database row and sheet cell, read once and ranked; a surface that
+    cannot be opened is listed under `failed`, never silently skipped."""
+    from room_search import db_records, doc_record, html_record, search, sheet_records
+    failed: list[dict] = []
+
+    async def read(kind: str, take):
+        try:
+            async with open_kind(kind) as doc:
+                return take(doc)
+        except Exception as e:  # noqa: BLE001 — one surface failing must not hide the rest
+            failed.append({"kind": kind, "error": str(e)[:200]})
+            return None
+
+    async def family(main_kind: str, make) -> list[dict]:
+        main = await read(main_kind, lambda d: (d.text, d.pages))
+        if main is None:
+            return []
+        text, pages = main
+        pages = pages[:SEARCH_PAGES_MAX]
+        texts = await asyncio.gather(*(read(f"{main_kind}-{p['id']}", lambda d: d.text) for p in pages))
+        return [make(None, "Main", text)] + [make(p["id"], p["title"], t)
+                                               for p, t in zip(pages, texts) if t is not None]
+
+    def rows(doc) -> list[dict]:
+        from room_database import key, list_dbs, read_db
+        maps = doc.database
+        bodies = {}
+        for db in list_dbs(maps):
+            for row in read_db(maps, db["id"])["rows"]:
+                body = doc.row_body(db["id"], row["id"])
+                if body:
+                    bodies[key(db["id"], row["id"])] = body
+        return db_records(maps, bodies)
+
+    docs, htmls, dbs, sheet = await asyncio.gather(
+        family(DEFAULT_KIND, doc_record), family("html", html_record),
+        read("db", rows), read("sheet", lambda d: sheet_records(*d.sheet)))
+    records = docs + htmls + (dbs or []) + (sheet or [])
+    return {"ok": True, "query": query, "hits": search(records, query, limit),
+            "searched": len(records), "failed": failed}
 
 
 def outline_of(surface: str, doc) -> dict:
@@ -449,6 +506,13 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                          **({"parent": p["parent"]} if p.get("parent") else {}),
                          **({"icon": p["icon"]} if p.get("icon") else {})} for p in main.pages]
                 status, body = 200, {"ok": True, "pages": listed, "surface": holder["surface"]}
+            elif what[0] == "search":
+                if open_kind is None:
+                    raise RoomDocError("this relay was started without the room's other surfaces")
+                current = holder["room"]
+                status, body = 200, await search_room(lambda kind: open_kind(current, kind),
+                                                      what[1]["q"], what[1]["limit"])
+                body["room"] = current
             elif what[0] == "rooms":
                 if list_rooms is None:
                     raise RoomDocError("this relay was started without a room list")
@@ -525,6 +589,6 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
     server = await asyncio.start_server(handle, host, port, limit=LINE_LIMIT)
     log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
         "/surface/html|html-<id>|board|doc|markdown-<id>|db, /page/<id>, /room/<id>, /db/<db>/row, /db/<db>/move, "
-        "/db/<db>/row/<row>/body; GET /state, /outline, /rooms, /pages, /db, /db/<db>/row/<row>")
+        "/db/<db>/row/<row>/body; GET /state, /outline, /rooms, /pages, /search?q=, /db, /db/<db>/row/<row>")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())
