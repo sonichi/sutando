@@ -48,7 +48,8 @@ written; empty (null, "" or []) removes the cell.
 `layout` is one of `table`, `board` (grouped by `groupBy`: a select, status or
 person property), `calendar` (by `dateProp`), `list` or `gallery`.
 
-- `sort` is `[{prop, dir: asc|desc}]`, applied in order, then by row order.
+- `sort` is `[{prop, dir: asc|desc}]`, applied in order, then by row order. An empty
+  value sorts last in either direction.
 - `filter` is `[{prop, op, value?}]`, all of which must hold. `op` is one of
   `is`, `is_not`, `contains`, `empty`, `not_empty`, `gt`, `lt`, `checked` or
   `unchecked`.

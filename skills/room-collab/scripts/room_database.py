@@ -297,6 +297,11 @@ def query(d: dict, view: dict) -> list[dict]:
             p = by_id.get(s.get("prop"))
             if p:
                 va, vb = value_of(d, a, p), value_of(d, b, p)
+                # Empty sorts last in either direction, as in the web client.
+                if va is None or vb is None:
+                    if (va is None) != (vb is None):
+                        return 1 if va is None else -1
+                    continue
                 c = ((va > vb) - (va < vb) if _is_number(va) and _is_number(vb)
                      else _cmp_text(display_value(va, p), display_value(vb, p)))
                 if c:

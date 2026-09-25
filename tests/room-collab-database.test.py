@@ -156,6 +156,18 @@ def test_views_filter_sort_group():
     assert [value_of(d, r, P["name"]) for r in desc] == ["Shared browser", "Room-collab", "Cloud Sutando"]
 
 
+def test_empty_sorts_last_in_either_direction():
+    maps, db = fresh("demo_day")
+    add(maps, db, {"name": "Undated"})
+    add(maps, db, {"name": "Late", "date": "2026-10-02"})
+    add(maps, db, {"name": "Early", "date": "2026-09-25"})
+    d = read_db(maps, db)
+    P = {p["id"]: p for p in d["props"]}
+    for direction, expect in (("asc", ["Early", "Late", "Undated"]), ("desc", ["Late", "Early", "Undated"])):
+        view = {**d["views"][0], "sort": [{"prop": "date", "dir": direction}]}
+        assert [value_of(d, r, P["name"]) for r in query(d, view)] == expect, direction
+
+
 def test_numbers_sort_as_numbers_and_compare_with_gt():
     maps, db = fresh("demo_day")
     for n in (10, 9, 100):
