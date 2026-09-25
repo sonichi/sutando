@@ -7,6 +7,7 @@ before the page is connected as though a write had happened.
 
 Run: python3 tests/room-collab-relay.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import inspect
 import json
@@ -23,9 +24,9 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-collab relay: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_collab_client import RoomDoc  # noqa: E402
-from room_collab_protocol import HTML_KIND  # noqa: E402
-from room_collab_relay import route, serve  # noqa: E402
+from room_collab_client import RoomDoc
+from room_collab_protocol import HTML_KIND
+from room_collab_relay import route, serve
 
 FAILS = []
 

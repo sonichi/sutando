@@ -7,6 +7,7 @@ CSV (the demo-day sheet's shape: a notes row above the headers) becomes rows.
 
 Run: python3 tests/room-collab-database-cli.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import contextlib
 import io
@@ -24,10 +25,10 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-collab database cli: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-import room_collab  # noqa: E402
-import room_collab_client  # noqa: E402
-from room_collab_client import RoomDoc  # noqa: E402
-from room_collab_protocol import RoomDocError  # noqa: E402
+import room_collab
+import room_collab_client
+from room_collab_client import RoomDoc
+from room_collab_protocol import RoomDocError
 
 FAILS = []
 BY = "@sutando-x:ag2.space"

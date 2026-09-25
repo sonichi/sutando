@@ -6,6 +6,7 @@ matches only on what a viewer sees, and each hit says how to open it.
 
 Run: python3 tests/room-collab-search.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import json
 import sys
@@ -15,9 +16,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
-from room_collab_protocol import RoomDocError  # noqa: E402
-from room_database import add_row_plan, create_plan, read_db  # noqa: E402
-from room_search import (LIMIT_MAX, db_records, doc_record, html_record, search,  # noqa: E402
+from room_collab_protocol import RoomDocError
+from room_database import add_row_plan, create_plan, read_db
+from room_search import (LIMIT_MAX, db_records, doc_record, html_record, search,
                          sheet_records, snippet, visible_text)
 
 FAILS = []

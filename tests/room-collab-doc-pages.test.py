@@ -8,6 +8,7 @@ page, and the relay's /page/<id> opening an HTML page while the Doc is held.
 
 Run: python3 tests/room-collab-doc-pages.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import contextlib
 import io
@@ -26,12 +27,12 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-collab doc pages: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-import room_collab  # noqa: E402
-from room_collab_client import RoomDoc  # noqa: E402
-from room_collab_protocol import (DEFAULT_KIND, HTML_KIND, RoomDocError, doc_page_kind,  # noqa: E402
+import room_collab
+from room_collab_client import RoomDoc
+from room_collab_protocol import (DEFAULT_KIND, HTML_KIND, RoomDocError, doc_page_kind,
                                   doc_socket_url, has_stage, is_html_kind, is_markdown_kind,
                                   main_kind, new_page_id, read_pages, text_root)
-from room_collab_relay import route, serve, surface_kind  # noqa: E402
+from room_collab_relay import route, serve, surface_kind
 
 FAILS = []
 PASSED = []

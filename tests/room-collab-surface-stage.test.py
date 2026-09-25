@@ -8,6 +8,7 @@ before a switch.
 
 Run: python3 tests/room-collab-surface-stage.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import json
 import sys
@@ -23,11 +24,11 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-collab surface stage: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_collab_board import complete_element  # noqa: E402
-from room_collab_client import RoomDoc  # noqa: E402
-from room_collab_protocol import DEFAULT_KIND, HTML_KIND, RoomDocError  # noqa: E402
-from room_collab_relay import route, serve  # noqa: E402
-from surface_outline import board_outline, doc_headings, slide_frames  # noqa: E402
+from room_collab_board import complete_element
+from room_collab_client import RoomDoc
+from room_collab_protocol import DEFAULT_KIND, HTML_KIND, RoomDocError
+from room_collab_relay import route, serve
+from surface_outline import board_outline, doc_headings, slide_frames
 
 FAILS = []
 PASSED = []

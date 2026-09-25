@@ -8,6 +8,7 @@ refuse on the databases surface rather than failing obscurely.
 
 Run: python3 tests/room-collab-database-relay.test.py  (exit 0 pass / 1 fail)
 """
+# ruff: noqa: E402 — imports follow the sys.path insert below
 import asyncio
 import json
 import sys
@@ -23,10 +24,10 @@ except ImportError as exc:  # pragma: no cover
     print(f"room-collab database relay: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
 
-from room_collab_client import RoomDoc  # noqa: E402
-from room_collab_protocol import HTML_KIND  # noqa: E402
-from room_collab_relay import route, serve  # noqa: E402
-from room_database import MAPS, create_plan  # noqa: E402
+from room_collab_client import RoomDoc
+from room_collab_protocol import HTML_KIND
+from room_collab_relay import route, serve
+from room_database import MAPS, create_plan
 
 FAILS = []
 ME = "@air.agent:x"
