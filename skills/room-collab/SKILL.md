@@ -399,6 +399,26 @@ relay holds one page at a time too: `POST /page/<id>` (or `/surface/html-<id>`;
 on an extra page anchors to `<id>/pt:…` or `<id>/sl:…`; a main-page comment keeps
 the bare `pt:…` / `sl:…` id.
 
+### Doc pages
+
+The Doc has pages the same way: `--kind markdown` is the main Doc, and each
+extra page is `--kind markdown-<id>`, a text document every Doc command
+(`read`, `append`, `replace`, `comment`, `slide`) works on. The list lives in
+the main Doc's `pages` map, with a title, an order, an optional icon and an
+optional parent (one level of nesting); the web client shows it beside the Doc.
+
+```bash
+python3 $P pages --kind markdown '!room:server'                     # the main Doc, then each page
+python3 $P page-add --kind markdown '!room:server' 'Notes'          # prints the --kind to write it with
+python3 $P page-add --kind markdown --parent ab12cd34 '!room:server' 'Details'   # nested under a page
+python3 $P --kind markdown-ab12cd34 append '!room:server' '## Next steps'
+```
+
+A comment on a Doc page records its page and shows on that page only. In the
+relay, `POST /surface/doc` then `POST /page/<id>` opens a Doc page (`/page/main`
+goes back to the Doc) and `GET /pages` lists the Doc's pages while the Doc is
+held; `room_surface` takes `surface: "doc"` with `page`.
+
 ### Pages that remember: the artifact runtime
 
 A page's own scripts get `window.artifact`: `artifact.state.get / set / keys / on` for
