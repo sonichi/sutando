@@ -99,6 +99,58 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_table(run=None):
+    """{pid: (ppid, command basename)} from one `ps` snapshot; None when unobserved."""
+    try:
+        r = (run or subprocess.run)(["ps", "-Ao", "pid=,ppid=,comm="],
+                                    capture_output=True, text=True, timeout=5)
+    except Exception:                                        # noqa: BLE001
+        return None
+    if getattr(r, "returncode", None) != 0:
+        return None
+    table = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2].strip()))
+    return table
+
+
+def session_root(table: dict, start: int):
+    """The process that runs this session: the nearest ancestor of `start` that
+    is not a shell. None when the chain reaches init, so nothing scopes it."""
+    pid, seen = start, set()
+    while pid > 1 and pid in table and pid not in seen:
+        seen.add(pid)
+        ppid, comm = table[pid]
+        if comm.lstrip("-") not in wid.WATCHER_SHELLS:
+            return pid
+        pid = ppid
+    return None
+
+
+def descends_from(table: dict, pid: int, root: int) -> bool:
+    seen = set()
+    while pid > 1 and pid in table and pid not in seen:
+        if pid == root:
+            return True
+        seen.add(pid)
+        pid = table[pid][0]
+    return pid == root
+
+
+def _in_this_session(pid: int, run=None):
+    """Does this watcher descend from the session running this gate? A watcher
+    left by an ended session still holds the inbox but announces to no one."""
+    table = _process_table(run)
+    if table is None:
+        raise Unobserved("the process table could not be read")
+    root = session_root(table, os.getppid())
+    if root is None:
+        return True
+    return descends_from(table, pid, root)
+
+
 def sentinel_for(state_dir, instance: str) -> Path:
     """Resolved by the watcher's own owner, so the two cannot disagree about
     which file this instance stamps."""
@@ -108,7 +160,8 @@ def sentinel_for(state_dir, instance: str) -> Path:
 
 def decide(*, instance: str, inbox: str, workspace: str,
            alive=_pid_alive, resolve=sentinel_for,
-           watcher_target=_watcher_target) -> tuple[str, str]:
+           watcher_target=_watcher_target,
+           in_session=_in_this_session) -> tuple[str, str]:
     """(decision, why). Pure over its seams: no process is started here and
     liveness arrives as a callable, so both polarities are testable."""
     if not instance:
@@ -150,6 +203,14 @@ def decide(*, instance: str, inbox: str, workspace: str,
     if not _same_path(target, inbox):
         return "start", (f"sentinel {sentinel} names pid {pid}, a watcher of "
                          f"{target} — not this worker's inbox {inbox}")
+    try:
+        mine = in_session(int(pid))
+    except Unobserved as e:
+        return "unknown", (f"pid {pid} watches {inbox}, and whether this session "
+                           f"started it could not be observed ({e})")
+    if not mine:
+        return "start", (f"pid {pid} watches {inbox} but was not started by this "
+                         f"session, so nothing here reads what it announces")
     return "skip", f"this instance's watcher is live (pid {pid}) on {inbox}"
 
 
