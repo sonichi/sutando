@@ -4000,7 +4000,7 @@ def _assigned_worker(task_id: str) -> str:
     recorder in an optional local skill this standalone PyPI package cannot
     import or name (docs/architecture-boundaries.md, "Optional adapter
     capabilities") — the same arrangement _worker_of() has with the done-flag
-    writer. tests/gateway-result-worker-attribution.test.py builds its
+    writer. the gateway-result attribution suite builds its
     fixtures through that recorder's own path function, so a drift fails a
     test instead of silently losing attribution.
 

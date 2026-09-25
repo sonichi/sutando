@@ -9,7 +9,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 
 
 def _load(ws: Path):

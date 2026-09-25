@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
 
 

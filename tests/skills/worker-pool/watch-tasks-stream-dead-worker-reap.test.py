@@ -22,7 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 FAILURES: list[str] = []
 FAILURE_TEXT = "could not safely process"
 

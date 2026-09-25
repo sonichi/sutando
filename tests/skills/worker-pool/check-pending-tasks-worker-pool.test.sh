@@ -24,7 +24,7 @@
 # Run: bash tests/check-pending-tasks-worker-pool.test.sh
 set -u
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK="$REPO/src/check-pending-tasks.sh"
 PYBIN="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || echo python3)"
 

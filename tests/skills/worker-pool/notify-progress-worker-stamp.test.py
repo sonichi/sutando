@@ -13,7 +13,7 @@ import sys
 import unittest
 from unittest import mock
 
-_SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "task-progress" / "scripts"
+_SCRIPTS = pathlib.Path(__file__).resolve().parents[3] / "skills" / "task-progress" / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 import notify  # noqa: E402
 

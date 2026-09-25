@@ -9,7 +9,7 @@
 # core, so there is no core/worker invariance case left to test here — the
 # core's launcher simply never computes these two vars at all now.
 set -uo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 WORKERCLI="$REPO/skills/worker-pool/scripts/launch-worker-session.sh"

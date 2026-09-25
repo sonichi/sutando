@@ -37,7 +37,7 @@ def scratch():
     finally:
         shutil.rmtree(path, ignore_errors=True)
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 
 # The launcher polls `pgrep -ax claude`, then `ps -o args=` for `--name $SESSION`:
 # the stub reports the launched stub's own pid, and the real ps shows its argv.
