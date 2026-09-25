@@ -73,6 +73,9 @@ def active_text(text: str) -> str:
 import re
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# An optional fd digit plus `<`/`>` -- matches a redirect operator's own
+# leading text, glued to its target (`2>/dev/null`) or not (`2>`, `>`).
+_REDIR_TOKEN_RE = re.compile(r"^[0-9]*[<>]")
 
 
 def _command_tokens(seg: str) -> list[str]:
@@ -120,14 +123,17 @@ def _command_tokens(seg: str) -> list[str]:
         elif toks[0] == "{" and leading_brace and len(toks) > 1:
             toks = toks[1:]; changed = True
         elif (leading_brace and toks[0][:1] == "{" and len(toks[0]) > 1
-              and toks[0][1] in "<>"):
-            # shlex has no redirect grammar, so `{>/dev/null` glues into one
-            # token; split the reserved-word `{` back off and re-peel.
+              and _REDIR_TOKEN_RE.match(toks[0][1:])):
+            # shlex has no redirect grammar, so `{>/dev/null` (or `{2>`)
+            # glues into one token; split the reserved-word `{` back off.
             toks = [toks[0][1:]] + toks[1:]; changed = True
-        elif toks[0][:1] in "<>" and len(toks) > 1:
-            # A redirection may precede the command it applies to
-            # (`>/dev/null false`); it is never the command itself.
-            toks = toks[1:]; changed = True
+        elif _REDIR_TOKEN_RE.match(toks[0]) and len(toks) > 1:
+            # A leading redirect (`>/dev/null false`, `2> /dev/null false`)
+            # and its target -- glued or the next word -- are never the command.
+            m = _REDIR_TOKEN_RE.match(toks[0])
+            rest = toks[1:]
+            toks = rest if m.end() < len(toks[0]) else rest[1:]
+            changed = True
         elif toks[0] == "timeout" and len(toks) > 1:
             toks = toks[1:]; changed = True
             while toks and (toks[0].startswith("-") or toks[0].isdigit()):

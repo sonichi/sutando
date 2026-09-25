@@ -77,6 +77,27 @@ class CommandPosition(unittest.TestCase):
     def test_unquoted_blanks_quoted_runs_only(self):
         self.assertEqual(unquoted("a 'bc' d"), "a      d")
 
+    def test_a_command_group_redirect_glued_to_the_brace_is_peeled(self):
+        """`{>/dev/null cmd; }`: `<`/`>` are metacharacters, so `{` is its
+        own token in real Bash even glued to a redirect (confirmed by
+        direct execution)."""
+        self.assertTrue(invokes(f"{{>/dev/null bash scripts/{NAME}; }}", NAME))
+
+    def test_a_command_group_redirect_with_a_separate_target_is_peeled(self):
+        """qingyun-wu round 38: `{> /dev/null cmd; }` -- the operator is
+        glued to `{` but its target is a separate word (confirmed by
+        direct execution: `{> /dev/null false; }` exits 1)."""
+        self.assertTrue(invokes(f"{{> /dev/null bash scripts/{NAME}; }}", NAME))
+
+    def test_a_leading_fd_redirect_glued_to_its_target_is_peeled(self):
+        """`2>/dev/null cmd` -- a leading fd-numbered redirect, target
+        glued to the operator (confirmed by direct execution)."""
+        self.assertTrue(invokes(f"2>/dev/null bash scripts/{NAME}", NAME))
+
+    def test_a_leading_fd_redirect_with_a_separate_target_is_peeled(self):
+        """`2> /dev/null cmd` -- same, target a separate word."""
+        self.assertTrue(invokes(f"2> /dev/null bash scripts/{NAME}", NAME))
+
 
 class PythonArgsPosition(unittest.TestCase):
     def test_a_quoted_real_invocation_is_named(self):
