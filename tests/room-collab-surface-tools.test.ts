@@ -36,6 +36,16 @@ describe('room-collab surface tools', () => {
 		assert.ok(tools.tools.includes(tools.roomSurfaceTool), 'the tool is contributed');
 	});
 
+	it('room_surface lists the HTML pages and presents one by id', async () => {
+		await tools.roomSurfaceTool.execute({ surface: 'pages' }, {} as never);
+		await tools.roomSurfaceTool.execute({ surface: 'html', page: 'ab12cd34' }, {} as never);
+		await tools.roomSurfaceTool.execute({ surface: 'html' }, {} as never);
+		assert.deepEqual(hits.slice(-3), ['GET /pages', 'POST /surface/html-ab12cd34', 'POST /surface/html']);
+		const schema = tools.roomSurfaceTool.parameters;
+		assert.equal(schema.safeParse({ surface: 'html', page: '../x' }).success, false);
+		assert.equal(schema.safeParse({ surface: 'html', page: 'ab12cd34' }).success, true);
+	});
+
 	it('the moving and pointing tools say they work on the board and the Doc', () => {
 		for (const t of [tools.roomSlideTool, tools.roomPointTool, tools.roomOutlineTool]) {
 			assert.match(t.description, /whiteboard/, t.name);

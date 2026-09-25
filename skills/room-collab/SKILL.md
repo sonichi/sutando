@@ -377,6 +377,28 @@ the Doc's headings (number, level, title), so a "go to 3" lands where the
 viewers see 3. The voice tool `room_surface` makes the switch. From the command
 line: `python3 $P --kind board slide '!room:server' 2`.
 
+### Many pages in one room
+
+`--kind html` is the room's **main** page. A room can hold more: each extra page
+is its own document, `--kind html-<id>` (8 characters of `a-z0-9`), and every
+HTML command — `read`, `append`, `replace`, `templates`, `highlight`, `slide`,
+`state`, `relay` — works on it exactly as on the main page. The list of pages
+lives in the main page (its `pages` map), and the web client's page switcher
+reads the same list.
+
+```bash
+python3 $P pages '!room:server'                      # main first, then each page's --kind and title
+python3 $P page-add '!room:server' 'Q3 numbers'      # lists a new page; prints the --kind to write it with
+python3 $P --kind html-ab12cd34 templates '!room:server' --use dashboard
+```
+
+A page removed in the web client leaves the list only; its document is kept. The
+relay holds one page at a time too: `POST /page/<id>` (or `/surface/html-<id>`;
+`/page/main` goes back), `GET /pages` lists them, and the voice tool
+`room_surface` takes `surface: "pages"` to list and `page` to pick one. A comment
+on an extra page anchors to `<id>/pt:…` or `<id>/sl:…`; a main-page comment keeps
+the bare `pt:…` / `sl:…` id.
+
 ### Pages that remember: the artifact runtime
 
 A page's own scripts get `window.artifact`: `artifact.state.get / set / keys / on` for

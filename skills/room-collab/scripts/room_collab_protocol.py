@@ -7,6 +7,8 @@ importable without pycrdt or websockets is what lets CI exercise them.
 """
 from __future__ import annotations
 
+import re
+import secrets
 import urllib.parse
 
 DEFAULT_TEXT_NAME = "markdown"
@@ -22,6 +24,67 @@ STATE_VALUE_MAX = 4096
 STAGE_KINDS = (HTML_KIND, "board", DEFAULT_KIND)
 # The surfaces that are one shared text, and the root each text lives under.
 TEXT_ROOTS = {DEFAULT_KIND: DEFAULT_TEXT_NAME, HTML_KIND: "html"}
+
+# A room's extra HTML pages: each is its own document of kind `html-<id>` with the
+# main page's roots; the main page's Y.Map `pages` lists them (`<id>` -> entry).
+HTML_PAGE_KIND_RE = re.compile(r"html-([a-z0-9]{8})")
+HTML_PAGES_KEY = "pages"
+PAGE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+PAGE_TITLE_MAX = 80
+
+
+def is_html_kind(kind: str | None) -> bool:
+    """The main HTML page or one of the room's extra pages — the one test every
+    HTML-only command and root lookup goes through."""
+    return kind == HTML_KIND or (isinstance(kind, str) and HTML_PAGE_KIND_RE.fullmatch(kind) is not None)
+
+
+def text_root(kind: str | None) -> str | None:
+    """The Y.Text a text kind lives under, or None for a kind that is not text."""
+    return TEXT_ROOTS[HTML_KIND] if is_html_kind(kind) else TEXT_ROOTS.get(kind or "")
+
+
+def has_stage(kind: str | None) -> bool:
+    return is_html_kind(kind) or kind in STAGE_KINDS
+
+
+def html_page_kind(page_id: str | None) -> str:
+    """The document kind of a page: `html` for the main page (None), else `html-<id>`."""
+    if page_id is None:
+        return HTML_KIND
+    kind = f"html-{page_id}"
+    if not HTML_PAGE_KIND_RE.fullmatch(kind):
+        raise RoomDocError(f"not a page id: {page_id!r} (8 characters of a-z0-9)")
+    return kind
+
+
+def new_page_id() -> str:
+    return "".join(secrets.choice(PAGE_ID_ALPHABET) for _ in range(8))
+
+
+def clean_title(title: str) -> str:
+    return " ".join(str(title).split())[:PAGE_TITLE_MAX]
+
+
+def read_pages(index: object) -> list[dict]:
+    """The listed pages in order (as the web client orders them); malformed entries are skipped."""
+    if not isinstance(index, dict):
+        return []
+    num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0  # noqa: E731
+    out = []
+    for pid, v in index.items():
+        if not isinstance(pid, str) or not re.fullmatch(r"[a-z0-9]{8}", pid) or not isinstance(v, dict):
+            continue
+        title = clean_title(v.get("title")) if isinstance(v.get("title"), str) else ""
+        out.append({"id": pid, "kind": f"html-{pid}", "title": title or "Untitled page",
+                    "order": num(v.get("order")), "created": num(v.get("created")),
+                    "by": v.get("by") if isinstance(v.get("by"), str) else ""})
+    return sorted(out, key=lambda p: (p["order"], p["created"], p["id"]))
+
+
+def new_page_entry(title: str, by: str, pages: list[dict], now_ms: int) -> dict:
+    order = max((p["order"] for p in pages), default=0) + 1
+    return {"title": clean_title(title) or "Untitled page", "order": order, "created": now_ms, "by": by}
 
 # The service accepts the socket and THEN closes with one of these, because a
 # close before accept cannot carry a code the client can read.
