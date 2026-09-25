@@ -432,12 +432,16 @@ class MainLoopWiringTest(FakeTmuxHarness):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        # A real file, not PIPE: nothing here ever read proc.stderr, so a FAIL
+        # had none of the notifier's own log_notifier lines to diagnose from (#4703).
+        errf_path = self.root / "notifier.stderr"
+        errf = open(errf_path, "w")
         proc = subprocess.Popen(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env({"SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=errf,
             text=True,
             start_new_session=True,
         )
@@ -460,7 +464,8 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 time.sleep(0.2)
             else:
                 self.fail("the periodic self-poll never retried the queued task:\n"
-                          + self.sendkeys_log_text())
+                          + self.sendkeys_log_text()
+                          + "\nnotifier stderr:\n" + errf_path.read_text(errors="replace"))
             self.write_result("task-p.txt")
             deadline = time.time() + 10
             while time.time() < deadline and proc.poll() is None:
@@ -479,6 +484,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 except ProcessLookupError:
                     pass
                 proc.wait(timeout=5)
+            errf.close()
 
     def test_claimed_task_is_never_selected_by_an_unrelated_wake(self):
         # next_pending_task must skip a task claimed must-handle, whichever
