@@ -757,6 +757,24 @@ class RoomDoc:
         await self._commit(mutate)
         return state
 
+    async def navigate(self, cmd: str, n: int | None = None) -> dict:
+        """Move every viewer's deck: `next`, `prev`, or `goto` slide `n` (1-based).
+        A move carries a rising `seq`; a page opened later never replays it."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        if cmd not in ("next", "prev", "goto"):
+            raise RoomDocError(f"not a move: {cmd!r} (next, prev or goto)")
+        if cmd == "goto" and not (isinstance(n, int) and 1 <= n <= 999):
+            raise RoomDocError(f"goto needs a slide number 1–999, not {n!r}")
+        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        prev = stage.get("nav")
+        last = prev.get("seq", 0) if isinstance(prev, dict) else 0
+        nav = {"cmd": cmd, "seq": max(int(time.time() * 1000), int(last) + 1)}
+        if cmd == "goto":
+            nav["n"] = n
+        await self._commit(lambda: stage.__setitem__("nav", nav))
+        return nav
+
     async def set_speaking(self, speaking: bool) -> None:
         """Say whether a presenter is talking, without touching the highlight:
         a new `ts` would make a deck re-run the current topic."""

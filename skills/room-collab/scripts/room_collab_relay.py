@@ -5,6 +5,7 @@ seconds on a large page. The relay holds one connection and speaks the local
 talk-highlight API, so an existing voice tool drives the room's page unchanged:
 
   POST /highlight/<topic>   (topic `clear` clears)
+  POST /slide/next|prev|<n> move every viewer's deck
   POST /speaking/on|off
   POST /presenter/on|off    accepted; presenting is the room's, not the relay's
   GET  /state               {topic, ts, speaking}
@@ -31,7 +32,7 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     if method == "GET" and path == "/state":
         return ("state", None)
     if method != "POST":
-        return (405 if path.startswith(("/highlight/", "/speaking/", "/presenter/")) else 404,
+        return (405 if path.startswith(("/highlight/", "/slide/", "/speaking/", "/presenter/")) else 404,
                 {"ok": False, "error": "not found"})
     if path.startswith("/highlight/"):
         topic = path[len("/highlight/"):].lower()
@@ -40,6 +41,13 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         if not TOPIC_RE.fullmatch(topic):
             return (400, {"ok": False, "error": f"not a topic key: {topic!r}"})
         return ("highlight", topic)
+    if path.startswith("/slide/"):
+        what = path[len("/slide/"):]
+        if what in ("next", "prev"):
+            return ("slide", (what, None))
+        if what.isdigit() and 1 <= int(what) <= 999:
+            return ("slide", ("goto", int(what)))
+        return (400, {"ok": False, "error": f"not a move: {what!r} (next, prev or a slide number)"})
     if path in ("/speaking/on", "/speaking/off"):
         return ("speaking", path.endswith("/on"))
     if path in ("/presenter/on", "/presenter/off"):
@@ -94,6 +102,9 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print) -> N
                 if kind == "highlight":
                     state = await doc.set_stage(arg)
                     status, body = 200, {"ok": True, **state}
+                elif kind == "slide":
+                    nav = await doc.navigate(*arg)
+                    status, body = 200, {"ok": True, **nav}
                 elif kind == "speaking":
                     await doc.set_speaking(bool(arg))
                     status, body = 200, {"ok": True, "speaking": bool(arg)}

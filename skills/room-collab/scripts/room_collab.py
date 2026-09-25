@@ -673,6 +673,14 @@ async def run(args: argparse.Namespace) -> int:
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
         if args.command == "templates":
             return await templates(doc, args, url)
+        if args.command == "slide":
+            if args.kind != HTML_KIND:
+                raise RoomDocError(f"slide is for the HTML page: pass --kind {HTML_KIND}.")
+            move = args.move.lower()
+            nav = await (doc.navigate("goto", int(move)) if move.isdigit() else doc.navigate(move))
+            await doc.settle(args.settle)
+            print(json.dumps({"ok": True, **nav}))
+            return 0
         if args.command == "highlight":
             if args.kind != HTML_KIND:
                 raise RoomDocError(f"highlight is for the HTML page: pass --kind {HTML_KIND}.")
@@ -910,6 +918,11 @@ def build_parser() -> argparse.ArgumentParser:
                                          "watching; `clear` removes it (needs --kind html)")
     s.add_argument("room")
     s.add_argument("topic", help="a data-topic key the page defines, or `clear`")
+
+    s = sub.add_parser("slide", help="move every viewer's deck: next, prev, or a slide number "
+                                     "(needs --kind html)")
+    s.add_argument("room")
+    s.add_argument("move", help="next | prev | <slide number>")
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html)")

@@ -52,6 +52,9 @@ async def test_routes():
     assert route("GET", "/highlight/x")[0] == 405
     assert route("POST", "/deck/other")[0] == 404
     assert route("POST", "/presenter/on")[0] == 200
+    assert route("POST", "/slide/next") == ("slide", ("next", None))
+    assert route("POST", "/slide/12") == ("slide", ("goto", 12))
+    assert route("POST", "/slide/0")[0] == 400 and route("POST", "/slide/up")[0] == 400
 
 
 async def http(port, method, path):
@@ -84,6 +87,10 @@ async def test_a_round_trip_lands_on_the_stage_and_speaking_leaves_the_highlight
         assert page.stage["ts"] == ts, "speaking must not re-stamp the highlight"
         status, body = await http(47811, "GET", "/state")
         assert body == {"topic": "step4", "ts": ts, "speaking": True}, body
+        status, body = await http(47811, "POST", "/slide/next")
+        first = body["seq"]
+        status, body = await http(47811, "POST", "/slide/3")
+        assert status == 200 and body["cmd"] == "goto" and body["n"] == 3 and body["seq"] > first, body
         status, body = await http(47811, "POST", "/highlight/%3Cx%3E")
         assert status == 400, body
     finally:
