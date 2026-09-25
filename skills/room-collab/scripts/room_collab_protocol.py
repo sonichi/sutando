@@ -29,6 +29,9 @@ TEXT_ROOTS = {DEFAULT_KIND: DEFAULT_TEXT_NAME, HTML_KIND: "html"}
 # main page's roots; the main page's Y.Map `pages` lists them (`<id>` -> entry).
 HTML_PAGE_KIND_RE = re.compile(r"html-([a-z0-9]{8})")
 HTML_PAGES_KEY = "pages"
+# The Doc's pages work the same way: `markdown-<id>`, listed in the main Doc's `pages` map.
+DOC_PAGE_KIND_RE = re.compile(r"markdown-([a-z0-9]{8})")
+PAGES_KEY = HTML_PAGES_KEY
 PAGE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 PAGE_TITLE_MAX = 80
 
@@ -39,23 +42,44 @@ def is_html_kind(kind: str | None) -> bool:
     return kind == HTML_KIND or (isinstance(kind, str) and HTML_PAGE_KIND_RE.fullmatch(kind) is not None)
 
 
+def is_markdown_kind(kind: str | None) -> bool:
+    """The main Doc or one of its extra pages — the test everywhere `markdown` is special."""
+    return kind == DEFAULT_KIND or (isinstance(kind, str) and DOC_PAGE_KIND_RE.fullmatch(kind) is not None)
+
+
+def main_kind(kind: str | None) -> str | None:
+    """The main document of a kind's page family (`html` or `markdown`), or None for a kind without pages."""
+    return HTML_KIND if is_html_kind(kind) else DEFAULT_KIND if is_markdown_kind(kind) else None
+
+
 def text_root(kind: str | None) -> str | None:
     """The Y.Text a text kind lives under, or None for a kind that is not text."""
-    return TEXT_ROOTS[HTML_KIND] if is_html_kind(kind) else TEXT_ROOTS.get(kind or "")
+    family = main_kind(kind)
+    return TEXT_ROOTS[family] if family else TEXT_ROOTS.get(kind or "")
 
 
 def has_stage(kind: str | None) -> bool:
-    return is_html_kind(kind) or kind in STAGE_KINDS
+    return main_kind(kind) is not None or kind in STAGE_KINDS
+
+
+def page_kind(base: str, page_id: str | None) -> str:
+    """The document kind of a page of `base` (`html` or `markdown`): the base for None, else `<base>-<id>`."""
+    if page_id is None:
+        return base
+    kind = f"{base}-{page_id}"
+    if main_kind(kind) != base:
+        raise RoomDocError(f"not a page id: {page_id!r} (8 characters of a-z0-9)")
+    return kind
 
 
 def html_page_kind(page_id: str | None) -> str:
     """The document kind of a page: `html` for the main page (None), else `html-<id>`."""
-    if page_id is None:
-        return HTML_KIND
-    kind = f"html-{page_id}"
-    if not HTML_PAGE_KIND_RE.fullmatch(kind):
-        raise RoomDocError(f"not a page id: {page_id!r} (8 characters of a-z0-9)")
-    return kind
+    return page_kind(HTML_KIND, page_id)
+
+
+def doc_page_kind(page_id: str | None) -> str:
+    """The document kind of a Doc page: `markdown` for the main Doc (None), else `markdown-<id>`."""
+    return page_kind(DEFAULT_KIND, page_id)
 
 
 def new_page_id() -> str:
@@ -66,8 +90,9 @@ def clean_title(title: str) -> str:
     return " ".join(str(title).split())[:PAGE_TITLE_MAX]
 
 
-def read_pages(index: object) -> list[dict]:
-    """The listed pages in order (as the web client orders them); malformed entries are skipped."""
+def read_pages(index: object, base: str = HTML_KIND) -> list[dict]:
+    """The listed pages in order (as the web client orders them); malformed entries are skipped.
+    A parent that is gone or itself nested leaves its child at the top level, as on the web."""
     if not isinstance(index, dict):
         return []
     num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0  # noqa: E731
@@ -76,15 +101,29 @@ def read_pages(index: object) -> list[dict]:
         if not isinstance(pid, str) or not re.fullmatch(r"[a-z0-9]{8}", pid) or not isinstance(v, dict):
             continue
         title = clean_title(v.get("title")) if isinstance(v.get("title"), str) else ""
-        out.append({"id": pid, "kind": f"html-{pid}", "title": title or "Untitled page",
+        parent = v.get("parent")
+        out.append({"id": pid, "kind": f"{base}-{pid}", "title": title or "Untitled page",
                     "order": num(v.get("order")), "created": num(v.get("created")),
-                    "by": v.get("by") if isinstance(v.get("by"), str) else ""})
+                    "by": v.get("by") if isinstance(v.get("by"), str) else "",
+                    "parent": parent if isinstance(parent, str) and re.fullmatch(r"[a-z0-9]{8}", parent)
+                    and parent != pid else None,
+                    "icon": "".join(v["icon"].split())[:8] if isinstance(v.get("icon"), str) else ""})
+    listed = {p["id"] for p in out}
+    top = {p["id"] for p in out if p["parent"] is None or p["parent"] not in listed}
+    for p in out:
+        if p["parent"] is not None and p["parent"] not in top:
+            p["parent"] = None
     return sorted(out, key=lambda p: (p["order"], p["created"], p["id"]))
 
 
-def new_page_entry(title: str, by: str, pages: list[dict], now_ms: int) -> dict:
+def new_page_entry(title: str, by: str, pages: list[dict], now_ms: int, parent: str | None = None) -> dict:
     order = max((p["order"] for p in pages), default=0) + 1
-    return {"title": clean_title(title) or "Untitled page", "order": order, "created": now_ms, "by": by}
+    entry = {"title": clean_title(title) or "Untitled page", "order": order, "created": now_ms, "by": by}
+    if parent is not None:
+        if not any(p["id"] == parent and p["parent"] is None for p in pages):
+            raise RoomDocError(f"no top-level page {parent!r} to nest under (one level only)")
+        entry["parent"] = parent
+    return entry
 
 # The service accepts the socket and THEN closes with one of these, because a
 # close before accept cannot carry a code the client can read.

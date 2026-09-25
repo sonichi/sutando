@@ -122,7 +122,7 @@ class RoomDoc:
                          self._kind, "structured data")
             raise RoomDocError(
                 f"cannot {what} on the {self._kind!r} document: it holds {where}, "
-                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents (and html-<id> pages) are text — "
+                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents (and their html-<id> and markdown-<id> pages) are text — "
                 "open one of those, or use the API for this kind.")
         return self._text
 
@@ -802,20 +802,20 @@ class RoomDoc:
 
     @property
     def pages(self) -> list[dict]:
-        """The room's extra HTML pages, in order, as the main page's `pages` map lists them."""
-        if self._kind != HTML_KIND:
-            raise RoomDocError(f"the page list lives in the main HTML page (--kind {HTML_KIND}), "
-                               f"not the {self._kind!r} document")
-        return read_pages(dict(self._items(self._doc.get(HTML_PAGES_KEY, type=Map))))
+        """The extra pages of the main HTML page or the main Doc, in order, as its `pages` map lists them."""
+        if self._kind not in (HTML_KIND, DEFAULT_KIND):
+            raise RoomDocError(f"the page list lives in the main HTML page (--kind {HTML_KIND}) or the "
+                               f"main Doc (--kind {DEFAULT_KIND}), not the {self._kind!r} document")
+        return read_pages(dict(self._items(self._doc.get(HTML_PAGES_KEY, type=Map))), self._kind)
 
-    async def add_page(self, title: str, by: str) -> dict:
-        """List a new page; it is written by opening its kind (`html-<id>`), as any page is."""
+    async def add_page(self, title: str, by: str, parent: str | None = None) -> dict:
+        """List a new page (under `parent`, one level); it is written by opening its kind, as any page is."""
         pages = self.pages
         pid = new_page_id()
-        entry = new_page_entry(title, by, pages, int(time.time() * 1000))
+        entry = new_page_entry(title, by, pages, int(time.time() * 1000), parent)
         index = self._doc.get(HTML_PAGES_KEY, type=Map)
         await self._commit(lambda: index.__setitem__(pid, entry))
-        return {"id": pid, "kind": f"html-{pid}", **entry}
+        return {"id": pid, "kind": f"{self._kind}-{pid}", **entry}
 
     def _require_versions(self, what: str) -> tuple:
         from html_versions import VERSION_TEXTS_KEY, VERSIONS_KEY

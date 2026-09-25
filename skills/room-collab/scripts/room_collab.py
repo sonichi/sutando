@@ -25,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from room_collab_protocol import (DEFAULT_KIND, HTML_KIND, RoomDocError, has_stage, is_html_kind,  # noqa: E402
-                                  text_root)
+                                  is_markdown_kind, main_kind, text_root)
 from room_collab_watch import new_lines  # noqa: E402
 
 # The edge refuses urllib's default agent outright (Cloudflare 1010), so an
@@ -709,24 +709,33 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
             await asyncio.sleep(wait)
 
 
+def page_family(args: argparse.Namespace) -> str:
+    """The main document whose pages `pages`/`page-add` act on: the HTML page unless told the Doc."""
+    family = main_kind(getattr(args, "page_kind", None) or HTML_KIND)
+    if family is None:
+        raise RoomDocError("pages belong to the HTML page (--kind html) or the Doc (--kind markdown)")
+    return family
+
+
 async def pages(doc, args: argparse.Namespace) -> int:
-    """List the room's HTML pages (main first), or list a new one and print the kind to write it with."""
+    """List the pages of the HTML page or the Doc (main first), or list a new one and print the kind to write it with."""
     if args.command == "page-add":
         if not " ".join(args.title.split()):
             raise RoomDocError("a page needs a title")
-        entry = await doc.add_page(args.title, args.user_id or args.name or "agent")
+        entry = await doc.add_page(args.title, args.user_id or args.name or "agent",
+                                   getattr(args, "parent", None))
         await doc.settle(args.settle)
         if args.json:
             print(json.dumps({"ok": True, **entry}, ensure_ascii=False))
         else:
             print(f"added {entry['title']!r}: write it with --kind {entry['kind']}")
         return 0
-    listed = [{"id": None, "kind": HTML_KIND, "title": "Main"}] + doc.pages
+    listed = [{"id": None, "kind": doc.kind, "title": "Main"}] + doc.pages
     if args.json:
         print(json.dumps(listed, ensure_ascii=False, indent=2))
     else:
         for p in listed:
-            print(f"{p['kind']:<14} {p['title']}")
+            print(f"{p['kind']:<18} {'  ' if p.get('parent') else ''}{p.get('icon') or ''}{p['title']}")
     return 0
 
 
@@ -863,8 +872,8 @@ async def run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in ("pages", "page-add"):
-        # The page list lives in the main page, whichever page --kind names.
-        async with open_room_collab(url, args.room, token, kind=HTML_KIND,
+        # The page list lives in the main document, whichever page --kind names.
+        async with open_room_collab(url, args.room, token, kind=page_family(args),
                                     insecure=args.insecure) as doc:
             return await pages(doc, args)
 
@@ -954,12 +963,13 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": True, **state}))
             return 0
         if args.command == "comment":
-            if args.kind != DEFAULT_KIND:
+            if not is_markdown_kind(args.kind):
                 raise RoomDocError(f"comments are pinned to the Doc; the {args.kind!r} page "
                                    "has no comment layer yet. Say it in the room instead.")
             at, nth = locate_quote(doc.text, args.quote, args.nth)
+            page = args.kind.split("-", 1)[1] if args.kind != DEFAULT_KIND else None
             body, extra = comment_content(doc.anchor(at, at + len(args.quote)), args.quote, nth,
-                                          args.text, args.mention)
+                                          args.text, args.mention, page=page)
             if args.dry_run:
                 print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
                                  ensure_ascii=False, indent=2))
@@ -1028,7 +1038,7 @@ def locate_quote(text: str, quote: str, nth: int | None = None) -> tuple[int, in
 
 
 def comment_content(anchor: dict, quote: str, nth: int, message: str,
-                    mentions: list[str] | None = None) -> tuple[str, dict]:
+                    mentions: list[str] | None = None, page: str | None = None) -> tuple[str, dict]:
     """The room message a comment is: a body any client can read, and the
     anchor the collab client hangs it on. The quote leads the body so a plain
     timeline shows what is being talked about."""
@@ -1038,7 +1048,10 @@ def comment_content(anchor: dict, quote: str, nth: int, message: str,
     # A full mxid in the body is what the gateway turns into a real mention.
     lead = " ".join(m for m in (mentions or []) if m)
     body = f"> {quote}\n\n{lead + ' ' + text if lead else text}"
-    return body, {COMMENT_KEY: {"anchor": {**anchor, "quote": quote, "nth": nth}, "v": 1}}
+    marker = {"anchor": {**anchor, "quote": quote, "nth": nth}, "v": 1}
+    if page is not None:
+        marker["page"] = page  # the Doc page it is on; the web client shows it on that page only
+    return body, {COMMENT_KEY: marker}
 
 
 def reply_content(message: str, mentions: list[str] | None = None) -> str:
@@ -1064,6 +1077,8 @@ def summon_content(room: str, invitee: str, kind: str,
     if not MXID_RE.match(who):
         raise RoomDocError(f"a summon needs the mxid of whoever is called, like "
                            f"@name:server — got {invitee!r}")
+    # A page's summon calls to its surface: the client opens surfaces, not pages.
+    kind = main_kind(kind) or kind
     where = SUMMON_SURFACE.get(kind)
     if where is None:
         raise RoomDocError(f"{kind!r} is not a surface to summon anyone to; "
@@ -1169,8 +1184,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's surfaces (markdown, html, html-<id> for an extra "
-                        "HTML page, board, kanban, sheet, db); default markdown")
+                   help="which of the room's surfaces (markdown, markdown-<id> for a Doc page, html, "
+                        "html-<id> for an extra HTML page, board, kanban, sheet, db); default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1194,10 +1209,16 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
     s = sub.add_parser("pages", help="list the room's HTML pages — the main page and each extra "
-                                     "one, with the --kind that opens it")
+                                     "one, with the --kind that opens it (pages --kind markdown: the Doc's)")
+    s.add_argument("--kind", dest="page_kind", default=HTML_KIND,
+                   help="html (default) for the HTML pages, markdown for the Doc's pages")
     s.add_argument("room")
     s = sub.add_parser("page-add", help="add an HTML page to the room's page list; prints the "
-                                        "--kind (html-<id>) to write it with")
+                                        "--kind (html-<id>) to write it with (--kind markdown: a Doc page)")
+    s.add_argument("--kind", dest="page_kind", default=HTML_KIND,
+                   help="html (default) for an HTML page, markdown for a Doc page")
+    s.add_argument("--parent", default=None,
+                   help="the id of a top-level page to nest the new one under (one level)")
     s.add_argument("room")
     s.add_argument("title")
 
