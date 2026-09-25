@@ -5,16 +5,17 @@ exact after rotation, and the summary left at done.
 
 One owner: the agent-activity skill's CLI and the activity bus both write through here, so the
 lock, the rotation, the index and the summary cannot drift between them. Row shape is the contract
-the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done"}.
+the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done",
+"queue": {"depth","position"}?} — `queue` rides only on the queued row, from task_queue.position().
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
 from pathlib import Path
 
+from file_lock import locked_file
 from workspace_default import resolve_workspace
 
 KINDS = ("processing", "thinking", "working", "notice", "done")
@@ -174,7 +175,8 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
            audience: str | None = None, projection: str | None = None,
-           pid: str | None = None, ts: float | None = None, replay: bool = False) -> dict:
+           pid: str | None = None, ts: float | None = None, replay: bool = False,
+           queue: dict | None = None) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
@@ -192,12 +194,13 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         rec["task"] = task
     if done:
         rec["done"] = True
+    if queue:
+        rec["queue"] = queue
     path = log_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     # One lock for the append AND the rotation; the log is opened only under it, so no writer holds
     # an inode that a concurrent rotation replaces.
-    with open(path.with_suffix(".lock"), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with locked_file(path.with_suffix(".lock"), create_mode=0o600):
         task_id = task.get("id") if isinstance(task, dict) and isinstance(task.get("id"), str) else None
         acked = bool(pid and task_id and (_pid_acked(workspace, task_id, pid)
                                           or (done and _pid_in_log(summaries_path(workspace), pid))))

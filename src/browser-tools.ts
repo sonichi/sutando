@@ -1,16 +1,22 @@
 /**
  * Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
  * Split from inline-tools.ts for readability.
+ *
+ * macOS-only: every tool here drives Google Chrome through AppleScript. On
+ * Windows the tools degrade to a `macOSOnly` error so Gemini knows to fall
+ * back to telling the user instead of silently no-op'ing.
  */
 
 import { execSync, execFileSync } from 'node:child_process';
 import { resolveCredential } from './credential-resolver.js';
-import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
+import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
 import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
 import { withScheme } from './url-scheme.js';
@@ -31,6 +37,22 @@ export function injectText(session: any, text: string) {
 	} catch (err) {
 		console.error(`${ts()} [InjectText] Error:`, err);
 	}
+}
+
+/** Send context through `transport.sendContent` with `turnComplete: false`. The pinned Gemini
+ *  transport ignores that flag and sends realtime text, so a spoken reply is still possible. */
+export function injectSilentContext(session: any, text: string): boolean {
+	try {
+		const transport = session?.transport;
+		if (typeof transport?.sendContent === 'function') {
+			transport.sendContent([{ role: 'user', text }], false);
+			return true;
+		}
+		console.warn(`${ts()} [InjectSilent] transport has no sendContent — context dropped`);
+	} catch (err) {
+		console.error(`${ts()} [InjectSilent] Error:`, err);
+	}
+	return false;
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
@@ -63,6 +85,7 @@ export const scrollTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { direction, amount, target: _rawTarget } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		if (!isMacOS()) return macOSOnlyError('scroll');
 		// "window"/"page"/"main" etc. mean the MAIN page, not a CSS selector. The model
 		// habitually passes target:"window" (2026-06-09 live test): the selector branch
 		// matched nothing, its <500px-wide fallback skipped GitHub's full-width scroller,
@@ -193,6 +216,7 @@ export const switchTabTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { keyword } = args as { keyword: string };
+		if (!isMacOS()) return macOSOnlyError('switch_tab');
 		// Resolve aliases to URL patterns
 		const alias = TAB_ALIASES[keyword.toLowerCase()];
 		const searchTerms = alias ? [keyword, alias] : [keyword];
@@ -276,6 +300,7 @@ export const closeTabTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('close_tab');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to close active tab'`, { timeout: 5_000 });
 			console.log(`${ts()} [CloseTab] closed active tab`);
@@ -310,6 +335,7 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url: rawUrl } = args as { url: string };
+		if (!isMacOS()) return macOSOnlyError('open_url');
 		// Normalize spoken-URL artifacts before handing to osascript. The LLM
 		// sometimes passes a URL with surrounding whitespace from voice
 		// transcription, or with embedded spaces that AppleScript / Chrome
@@ -391,13 +417,10 @@ async function describeScreenshot(imagePath: string, previousDescs: string[] = [
 	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
-		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
-		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
+		// Windows paths reach PowerShell through the environment, so only the sips argv is sanitized.
+		const safePath = isWindows() ? imagePath : imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
 		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
-		try {
-			execFileSync('sips', ['-Z', '800', '-s', 'format', 'jpeg', safePath, '--out', resized], { timeout: 2_000, stdio: 'ignore' });
-		} catch { /* use original if resize fails */ }
-		const actualPath = existsSync(resized) ? resized : imagePath;
+		const actualPath = resizeImage(safePath, resized, 800, 2_000) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
 		const imageData = readFileSync(actualPath).toString('base64');
 		// Issue #189: when continuing a narration, the vision model should build
@@ -489,6 +512,7 @@ export const clickTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
+		if (!isMacOS()) return macOSOnlyError('click');
 		try {
 			if (shortcut) {
 				// Parse shortcut like "cmd+shift+5"
@@ -560,6 +584,7 @@ export const pointAtTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { query } = args as { query: string };
+		if (!isMacOS()) return macOSOnlyError('point_at');
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
 		const apiKey = resolveCredential('gemini-voice').key;
@@ -585,16 +610,10 @@ export const pointAtTool: ToolDefinition = {
 			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
-			// Downscale; sips -Z preserves aspect, so 0–1 normalized coords map
-			// straight onto the display with no extra transform (open item #2).
-			// Per-invocation temp path + success flag so a failed sips can never
-			// feed a stale screenshot from a previous call into the model.
-			const small = `/tmp/pointer-shot-${process.pid}-${Date.now()}.jpg`;
-			let resized = false;
-			try {
-				execFileSync('sips', ['-s', 'format', 'jpeg', '-Z', '1568', cap.path, '--out', small], { timeout: 4_000, stdio: 'ignore' });
-				resized = existsSync(small);
-			} catch { /* fall back to the full-size capture below */ }
+			// Aspect-preserving downscale keeps 0–1 normalized coords valid on the display.
+			// Per-invocation temp path so a failed resize can never feed a stale frame.
+			const small = join(tmpdir(), `pointer-shot-${process.pid}-${Date.now()}.jpg`);
+			const resized = resizeImage(cap.path, small, 1568);
 			const imgPath = resized ? small : cap.path;
 			const imageData = readFileSync(imgPath).toString('base64');
 			if (resized) { try { unlinkSync(small); } catch { /* best-effort cleanup */ } }
@@ -691,4 +710,3 @@ export {
 	onCallEnd,
 	startRecordingNarration,
 } from './recording-tools.js';
-

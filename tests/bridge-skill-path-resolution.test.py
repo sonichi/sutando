@@ -28,6 +28,7 @@ Run: python3 tests/bridge-skill-path-resolution.test.py   (exit 0 pass / 1 fail)
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 import subprocess
 import sys
@@ -109,9 +110,17 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 mod.TASKS_DIR = TASKS_DIR
 
 
+_TS_SEQ = itertools.count(1)
+
+
 def write_task(text: str, user_id: str = "U_OWNER", tier_map: dict | None = None) -> Path | None:
-    """Call _write_task with access control mocked; return the written file path."""
-    event = {"user": user_id, "channel": "CFAKE", "channel_type": "im", "ts": "1000.001"}
+    """Call _write_task with access control mocked; return the written file path.
+
+    ts is unique per call: the ingress replay-dedup (already_admitted) drops a
+    second admission of the same provider ts as a replay.
+    """
+    event = {"user": user_id, "channel": "CFAKE", "channel_type": "im",
+             "ts": f"1000.{next(_TS_SEQ):03d}"}
     effective_tier_map = tier_map if tier_map is not None else {user_id: "owner"}
     with patch.object(mod, "load_allowed", lambda: {user_id}), \
          patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \

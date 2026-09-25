@@ -93,12 +93,18 @@ from workspace_default import resolve_workspace  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
+# Entrypoint-owned path setup: ``import ag2_sparrow`` resolves uninstalled (5b).
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package (gateway-shim parity)
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
 from slack_owner import resolve_proactive_owner_id  # noqa: E402
 from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
 from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
+import slack_result_delivery as _srd  # noqa: E402  (reply leg binds the shared outbox; needs _PKG_ROOT above)
 
 try:
     from slack_bolt import App
@@ -598,7 +604,8 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
         _pop_pending_reply(task_id)
         raise
 
-# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# Per-task NUDGE timer, NOT task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (which
+# abandons a task at its deadline; this keeps waiting, hence still 10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
 # loops on the API error), no result file is ever written and the Slack user
 # gets silence. After this many seconds we post a one-time "still working /
@@ -1147,8 +1154,21 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
             )),
         )
 
+    # The id derives from the provider event (channel+ts is Slack's message
+    # identity), so a redelivered event maps to the same file — never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _ev_channel, _ev_ts = event.get("channel"), event.get("ts")
+    if _ev_channel and _ev_ts:
+        task_id = provider_task_id(f"sl{event.get('team') or '0'}",
+                                   f"{_ev_channel}-{_ev_ts}")
+        # Every month partition: an event archived before a rollover is still admitted.
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return None
+    else:  # pragma: no cover — eventless call shape (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
     priority = default_priority_for_source("slack", access_tier)
 
@@ -1421,7 +1441,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> bool:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown", receipt_out: list | None = None) -> bool:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1471,6 +1491,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # outbound obs event must consult these rather than assume success.
     delivered_ok = True
     sent_files = 0
+    # Provider material for the outbox receipt (reply leg only): the last
+    # chat_postMessage response, and the exception that broke the chunk loop.
+    _last_resp = None
+    _chunk_exc: Exception | None = None
+    _parts_visible = 0  # chunks, files and notices the user can already see
 
     # Post the text body in <=4000-char chunks (Slack's per-message limit is
     # 40k chars but readability suffers above ~4k). Use the shared fence-aware
@@ -1489,9 +1514,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
-                app.client.chat_postMessage(**kwargs)
+                _last_resp = app.client.chat_postMessage(**kwargs)
+                _parts_visible += 1
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
+                _chunk_exc = e
                 all_chunks_sent = False
                 break
         if not all_chunks_sent:
@@ -1516,6 +1543,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
         if _is_path_sendable(fpath):
             if _send_file(channel, thread_ts, fpath):
                 sent_files += 1
+                _parts_visible += 1
                 print(f"  Sent file: {fpath}", flush=True)
             else:
                 delivered_ok = False
@@ -1527,6 +1555,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file access denied: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
+                _parts_visible += 1
             except Exception as e:
                 # The deny notice can be the ONLY user-visible output: a body of
                 # just `[file: /blocked]` posts no text chunk, so if this refusal
@@ -1541,6 +1570,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file not found: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
+                _parts_visible += 1
             except Exception as e:
                 # Same reasoning as the deny branch above.
                 print(f"[Slack] not-found notice chat_postMessage failed: {e}", flush=True)
@@ -1577,6 +1607,11 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
         except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
             pass
 
+    if receipt_out is not None:
+        # Three-state outcome for the outbox (reply leg): classification is
+        # shared policy in slack_result_delivery, not re-derived here.
+        receipt_out.append(_srd.receipt_for_send(delivered_ok, _last_resp, _chunk_exc,
+                                                 parts_visible=_parts_visible))
     return delivered_ok
 
 
@@ -1664,6 +1699,23 @@ def result_watcher():
                 if not target:
                     continue
 
+                # Outbox pre-checks (crash window): DELIVERED means the send
+                # landed but the archive never ran — finish it, never re-send.
+                if _srd.is_delivered(RESULTS_DIR, task_id):
+                    print(f"  Skipped (already delivered per outbox): {task_id}", flush=True)
+                    _pop_pending_reply(task_id)
+                    archive_file(result_file, "results", task_id)
+                    archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
+                    continue
+                if _srd.is_parked(RESULTS_DIR, task_id):
+                    # terminal disposition already durable in the outbox:
+                    # archive the pair so it cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _pop_pending_reply(task_id)
+                    archive_file(result_file, "results", task_id)
+                    archive_file(find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt", "tasks", task_id)
+                    continue
+
                 # Skip-marker check via unified parser (#873). Equivalent to
                 # the prior startswith trio but routed through one source of
                 # truth so future skip markers added in result_markers.py
@@ -1682,17 +1734,25 @@ def result_watcher():
                     # (no_send / deduped), not silent voids. One line per result.
                     _record_skip_audit(task_id, _skip_action.value)
                 else:
+                    _send_tok = _srd.claim_for_send(RESULTS_DIR, task_id)
+                    if _send_tok is None:
+                        # another incarnation holds the claim right now
+                        continue
+                    _rcpt: list = []
                     try:
-                        delivered = _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+                        delivered = _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"), receipt_out=_rcpt)
                     except Exception as e:
+                        # Escaped raises are local (provider errors are caught
+                        # inside _send_reply): re-ready for retry, park at cap.
+                        _srd.failed(RESULTS_DIR, _send_tok)
                         print(f"[Slack] reply error: {e}", flush=True)
-                        # Keep both the durable route and result file so the
-                        # next poll (or restarted bridge) can retry delivery.
                         continue  # pragma: no cover - watcher loop retry; helper state is unit-tested
-                    if not delivered:
-                        # Slack refuses without raising, so the except never sees it;
-                        # archiving here would destroy an undelivered reply.
-                        print(f"[Slack] reply refused, keeping {task_id} for retry", flush=True)
+                    receipt = _rcpt[0] if _rcpt else _srd.receipt_for_send(delivered)
+                    disposition = _srd.settle(RESULTS_DIR, _send_tok, receipt, str(target["channel"]))
+                    if disposition != "delivered":
+                        # retry: re-readied; parked: the pre-check above
+                        # archives the pair on the next pass.
+                        print(f"[Slack] reply {disposition} ({receipt.detail}), keeping {task_id}", flush=True)
                         continue
                     print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
 

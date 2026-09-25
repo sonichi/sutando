@@ -14,7 +14,6 @@ A task legitimately runs RUNNING → WAITING → RUNNING many times; each is its
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -26,6 +25,8 @@ from typing import Callable
 
 from activity_rows import append as append_row
 from activity_rows import task_from_file
+from file_lock import locked_file
+from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
 PHASES = ("RECEIVED", "QUEUED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED")
@@ -86,6 +87,7 @@ class LifecycleTransition:
     text: str | None = None
     worker: str | None = None
     into: str | None = None
+    queue: dict | None = None  # {depth, position} at QUEUED, from the pending list
 
     def key(self, state: TaskActivityState) -> str:
         gen = self.generation if self.generation is not None else state.generation
@@ -119,12 +121,21 @@ def _task_dict(state: TaskActivityState) -> dict:
 
 
 def _row(state: TaskActivityState, kind: str, line: str, ts: float, done: bool = False,
-         audience: str | None = None, projection: str = "RUNTIME_DETAIL") -> dict:
+         audience: str | None = None, projection: str = "RUNTIME_DETAIL", queue: dict | None = None) -> dict:
     # The pid rides in the snapshot's pending list, so a replay projects the same identity again
     # and the row writer applies it once.
     state.emitted += 1
-    return {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done, "pid": f"{state.task_id}:{state.generation}:{state.emitted}",
-            "audience": audience or state.visibility.get("telemetry", TELEMETRY_AUDIENCE), "projection": projection}
+    row = {"kind": kind, "line": line, "ts": ts, "room": state.room, "task": _task_dict(state), "done": done, "pid": f"{state.task_id}:{state.generation}:{state.emitted}",
+           "audience": audience or state.visibility.get("telemetry", TELEMETRY_AUDIENCE), "projection": projection}
+    if queue:
+        row["queue"] = queue
+    return row
+
+
+def queued_line(queue: dict | None) -> str:
+    """The queued row's text: "queued · N ahead" once at least one task is ahead of this one."""
+    pos = int((queue or {}).get("position") or 0)
+    return f"queued · {pos - 1} ahead" if pos > 1 else "queued"
 
 
 def shared_projection(state: TaskActivityState) -> dict:
@@ -167,8 +178,8 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
             # QUEUED and RUNNING are emitted by independent processes and can land out of order: an
             # earlier-stamped QUEUED is history — row written, phase kept, a replay of it a no-op.
             state.applied += ["queued", key]
-            rows.append(_row(state, "notice", "queued", now, audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
-                             projection="TASK_STATUS"))
+            rows.append(_row(state, "notice", queued_line(item.queue), now, audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE),
+                             projection="TASK_STATUS", queue=item.queue))
             return state, rows
         if frm != state.phase or state.phase in TERMINAL or item.to_phase not in TRANSITIONS.get(state.phase, frozenset()):
             # Not a valid move from where the task is: a stale or replayed transition. Telemetry only.
@@ -190,12 +201,15 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
         if item.reason:
             state.summary = item.reason
         kind, line = _PHASE_ROW[item.to_phase]
-        if item.to_phase == "COMPLETED" and state.into:
+        if item.to_phase == "QUEUED":
+            line = queued_line(item.queue)
+        elif item.to_phase == "COMPLETED" and state.into:
             line = "consolidated"
         elif item.reason and item.to_phase in TERMINAL:
             line = f"{line}: {item.reason}" if item.to_phase != "COMPLETED" else item.reason
         rows.append(_row(state, kind, line, now, done=item.to_phase in TERMINAL,
-                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS",
+                         queue=item.queue if item.to_phase == "QUEUED" else None))
         return state, rows
     # a runtime observation
     last = state.sessions.get(item.activity_session_id, 0)
@@ -243,6 +257,13 @@ def cancel_target(task_text: str | None) -> str | None:
 def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
                          worker: str | None = None, ws: Path | None = None, ts: float | None = None) -> LifecycleTransition:
     task, room = task_from_file(task_file)
+    queue = None
+    if to_phase == "QUEUED":
+        # The file just landed: its place in the pending list is what the queued row shows.
+        try:
+            queue = queue_position(ws or Path(task_file).resolve().parent.parent, task["id"])
+        except Exception:  # noqa: BLE001 - a queue that cannot be counted is a plain "queued"
+            queue = None
     into = None
     if into_task:
         for d in ("tasks", os.path.join("tasks", "archive")):
@@ -251,7 +272,8 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
                 into = task_from_file(p)[0].get("event")
                 break
     return LifecycleTransition(task["id"], to_phase, reason=reason, message_event_id=task.get("event"),
-                               room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts)
+                               room=room, sender=task.get("from"), text=task.get("text"), worker=worker, into=into, ts=ts,
+                               queue=queue)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,7 +324,8 @@ class ActivityStore:
 
     def _default_project(self, row: dict) -> None:
         append_row(row["line"], kind=row["kind"], room=row["room"], task=row["task"], done=row["done"],
-                   workspace=self.ws, audience=row.get("audience"), projection=row.get("projection"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1)
+                   workspace=self.ws, audience=row.get("audience"), projection=row.get("projection"), pid=row.get("pid"), ts=row.get("ts"), replay=int(row.get("attempts", 0)) > 1,
+                   queue=row.get("queue"))
 
     def path(self, task_id: str) -> Path:
         return self.dir / f"{task_id}.json"
@@ -327,8 +350,7 @@ class ActivityStore:
         that fails leaves its rows pending in the snapshot; the next apply on that task drains them
         first, so a row is projected exactly once, later, never lost and never twice."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.dir / f".{item.task_id}.lock", "w") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX)
+        with locked_file(self.dir / f".{item.task_id}.lock", create_mode=0o600):
             state = self.load(item.task_id)
             self._drain(state)
             state, rows = reduce(state, item)

@@ -17,8 +17,10 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
+2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `persistent: true`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
 
@@ -41,21 +43,26 @@ caps this file and refuses date stamps in it).
    (`python3 src/discord-read.py <channel> --serving <channel>` when serving a task, `--operator` otherwise),
    pending questions, relay, build log. Trust the record over recall; maintain `current-track.md`.
 1. **Tasks.** Process every file in `$WORKSPACE/tasks/`; `access_tier: team|other` → the sandboxed path.
-   Group a thread with `[deduped: task-<latest>]`, then
-   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>"`
+   Group a thread with `[deduped: task-<latest>]`, staged under its FINAL name and gated into
+   place — `results/` is claimed by a poller in under a second, and the checker reads the source
+   id from the BASENAME, so a generic temp name makes it pass everything:
+   `S="$WORKSPACE/state/dedup-staging/<file>"` then
+   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$S" && mv -f "$S" "$WORKSPACE/results/<file>"`
    (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
    Marker semantics belong to `src/result_markers.py`; never re-implement them.
-   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"` (1 = a task got no result).
+   When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
+   `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
+   archive their own claims.
+   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   (1 = a task got no result, so idle does not run).
+1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
+   any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
 2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
    when voice is connected, plus a macOS notification.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
-3.4. **Zero-result rule.** Before reporting any empty result or telling the owner how the system behaves:
-   `python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence>"`
-   (1 already parked → read and extend · 0 untriaged · 2 cannot answer, not a green light). Name what a
-   non-zero would look like, run the positive control, suspect scope then shape, never verify in zsh.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
    (0 no candidate · 1 do not file, candidates named · 2 cannot answer).
@@ -91,19 +98,28 @@ caps this file and refuses date stamps in it).
 7. **Build log write.** Append with `O_APPEND` and a random marker; assert `count(MARK) == 1` by reading
    the file back. Never read-modify-replace. Then decide whether a `relay/relay-<ts>.md` note is owed
    (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
-7.5. **Memory index.** Before adding a row to `MEMORY.md`:
-   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>"` (0 safe · 1 refuse,
-   casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+7.5. **Memory index**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
+   (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
 8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
    placed by importance (only the top 5 render anywhere), and assert with the reader:
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
    position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
    Then pivot; never block.
-9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
-   owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
-   is UNKNOWN, not dead; never hand-roll a process check.
+9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
+   "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
+   if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
+   duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
+   change nothing and say so. A re-arm that prints `WATCHER_HELD:` on stdout did not start: it names
+   the holder (pid, role, whether its output is read) and the `--force-restart` command; report that
+   line and do not re-arm again. `--force-restart` replaces a holder; use it only on the owner's word.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
+   untagged watcher is invisible to the verdict above and to the supervisor.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.

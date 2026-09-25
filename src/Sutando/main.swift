@@ -371,6 +371,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollMuteState()
         }
 
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
+
         // Watcher health: every 5 min, verify the task watcher is running.
         // Bumped from 30s → 300s on 2026-05-14 (Chi greenlit) — with Claude
         // Code's `Monitor` tool now driving `watch-tasks-stream.sh` as the
@@ -380,18 +386,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // human-interactive territory (worst-case lag = ~5 min stale before
         // auto-restart) while cutting 12× the wake-ups.
         //
-        // Original design context (Chi 2026-04-18): "can the app remind the
-        // CLI about watcher" — auto-restart instead of remind, no UX
-        // change beyond cadence.
+        // Recovery shells out to the launcher dispatcher rather than typing a
+        // keystroke into the pane — see checkWatcher() below.
         Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
             self?.checkWatcher()
         }
-
-        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
-        // capture server Darwin-notifies com.sutando.recording.on/.off on
-        // every state change (⌃R, watcher-started sessions, watchdog
-        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
-        registerRecordingStateObservers()
 
         // Contextual chips: every 120s, refresh contextual-chips.json from
         // cheap mechanical sources (open PRs, top pending question, recent
@@ -567,62 +566,147 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
     }
 
+    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
+    /// fail-opened on any argv merely mentioning the substring (review #4269,
+    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
+    /// boundary check (`watcherLineMatches`) to keep correct, not two.
+    func watcherProcessSeen() -> Bool? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        // pid,command (not bare command): excluding OUR OWN pid needs it, since
+        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
+        ps.arguments = ["-axo", "pid,command"]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        // Drain BEFORE waiting: this listing exceeds the 64 KiB pipe buffer, so
+        // waiting first deadlocks ps on write against a main thread that never reads.
+        let out = psPipe.fileHandleForReading.readDataToEndOfFile()
+        ps.waitUntilExit()
+        // A failed ps must read as unknown -- an empty listing from a
+        // non-zero exit is not a clean "no match" (the sysmond-unreachable
+        // case this whole probe exists to not misread as "dead", #4269).
+        if ps.terminationStatus != 0 {
+            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            return nil
+        }
+        let listing = String(data: out, encoding: .utf8) ?? ""
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let myInbox = canonicalInbox(ProcessInfo.processInfo.environment["SUTANDO_TASKS_DIR"] ?? workspace + "/tasks")
+        // A tagged line answers by its inbox: this core's own is alive, another
+        // instance's is foreign. A bare two-token line has no operand, so it is a
+        // pre-upgrade watcher of this core, not a worker's: alive, never a relaunch.
+        var sawUndecidable = false
+        var sawForeignWatcher = false
+        for line in listing.split(separator: "\n") {
+            switch watcherLineMatches(line, excluding: selfPID) {
+            case .some(true): return true
+            case .none:
+                guard let tagged = sessionWatcherInboxTag(line) else {
+                    sawUndecidable = true
+                    continue
+                }
+                if tagged == myInbox { return true }
+                sawForeignWatcher = true
+            case .some(false): continue
+            }
+        }
+        if sawUndecidable { return nil }
+        if sawForeignWatcher {
+            logToFile("checkWatcher: session watcher(s) seen for other inboxes only, none for \(myInbox) -- not this core's")
+        }
+        return false
+    }
+
+    /// True when `s` contains the watcher script's name at a path/whitespace
+    /// boundary on both sides.
+    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
+        let marker = "watch-tasks-stream.sh"
+        var searchRange = s.startIndex..<s.endIndex
+        while let r = s.range(of: marker, range: searchRange) {
+            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
+            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
+            if before && after { return true }
+            searchRange = r.upperBound..<s.endIndex
+        }
+        return false
+    }
+
+    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
+    /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    /// A bare-`true` here says a watcher with no operand runs; which inbox a
+    /// tagged (multi-token) line serves is `watcherProcessSeen`'s question.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
+        let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
+        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return false }
+        guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
+        guard !parts[1].hasPrefix("-") else { return false }
+        // A match here is definite only at exactly 2 tokens -- more tokens could
+        // be a real pathname continuing past a space, so that's undecidable.
+        if matchesWatcherScriptAtBoundary(parts[1]) {
+            return parts.count == 2 ? true : nil
+        }
+        if parts.count == 2 { return false }
+        // A spaced script path is indistinguishable from a script plus arguments.
+        return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
+    /// The `--inbox` of a line tagged `--role session`, canonicalized, or nil when
+    /// either tag is absent. The value runs to the next `--flag` or the end of the
+    /// line, so a directory with a space in its path survives the flattened argv.
+    private func sessionWatcherInboxTag(_ line: Substring) -> String? {
+        let text = String(line)
+        guard let role = flagValue("role", in: text), role == "session" else { return nil }
+        guard let inbox = flagValue("inbox", in: text), !inbox.isEmpty else { return nil }
+        return canonicalInbox(inbox)
+    }
+
+    /// `--name value` or `--name=value` out of a flattened argv; nil when absent.
+    private func flagValue(_ name: String, in text: String) -> String? {
+        let pattern = "--" + name + "(?:=|\\s+)(.+?)(?=\\s+--[a-z]|\\s*$)"
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let r = Range(m.range(at: 1), in: text) else { return nil }
+        return text[r].trimmingCharacters(in: .whitespaces)
+    }
+
+    /// One spelling per inbox: symlinks resolved, trailing and doubled slashes gone,
+    /// so the same directory written two ways never reads as two inboxes.
+    private func canonicalInbox(_ path: String) -> String {
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
+    }
+
+    /// Both halves are Claude-only. Dispatching against a live non-Claude
+    /// session isn't a no-op like the old keystroke — the launcher's healing
+    /// path would spawn a second core window.
     func checkWatcher() {
-        // pgrep -f watch-tasks
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        proc.arguments = ["-f", "watch-tasks"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return }
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return  // watcher alive
-        }
-
-        // Read CLI's REAL status BEFORE alerting. If Claude Code is currently
-        // working (has an active Bash/tool child process under its pane),
-        // skip the alert — the CLI will handle the restart in the normal
-        // proactive-loop Step 9 without us spamming its stdin with
-        // 'watcher' keystrokes. Only alert when the CLI is genuinely idle
-        // (waiting on user input). Chi's ask: "does the app read the real
-        // state first? and remind about the watcher only when idle?"
-        if cliIsWorking() {
-            logToFile("watcher dead; CLI is working — skipping alert")
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not repairing a session whose runtime is unknown")
             return
         }
+        if rt != "claude" { return }
 
-        // One sender for lines typed into the core pane: scripts/tmux-send-line.sh
-        // owns has-session, the current-prompt read and the queued-word skip.
-        // (Removed 120s inner throttle 2026-05-14: now strictly dead code under
-        // the 300s outer Timer cadence — two consecutive ticks are always 300s
-        // apart, so the throttle never gated. Flood-protection is now solely
-        // the shared sender's queued-word skip + the Timer interval.)
-
-        // If the core CLI is running inside the `sutando-core` tmux session
-        // (launch via src/agent/start-cli.sh), send the word `watcher` to
-        // its pane as if Chi typed it. The CLI parses that as a restart
-        // prompt and starts the watcher via its own run_in_background Bash
-        // — so the watcher's stdout routes through the task-notification
-        // pipe correctly. Any externally-started watcher (nohup etc.)
-        // has stdout → /dev/null and is useless.
-        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
-        if rc == 6 {
-            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
+        switch watcherProcessSeen() {
+        case .some(true): return  // watcher alive
+        case .none:
+            logToFile("checkWatcher: ps could not answer — not alerting on an unknown")
             return
-        }
-        if rc == 0 {
-            notify("Sutando", "Task watcher down — sent 'watcher' to sutando-core tmux")
-            logToFile("watcher dead; tmux send-keys to sutando-core")
-            return
+        case .some(false): break
         }
 
-        // Fallback: Claude Code isn't in the expected tmux session.
-        // Notify so Chi can restart manually.
-        notify("Sutando", "Task watcher is down — prompt the CLI to restart it (or start CLI via src/agent/start-cli.sh)")
-        logToFile("watcher dead; notification fired (tmux session not found)")
+        // Pinned to the runtime `rt` just confirmed, so the dispatcher's own
+        // config-drift check can't force a --restart on top of this.
+        logToFile("checkWatcher: watcher dead — repairing via start-cli.sh")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh",
+                      args: ["--runtime", "claude"],
+                      okMessage: "Task watcher was down — repaired via the core launcher.",
+                      failVerb: "Task watcher repair")
     }
 
     /// Per-host label for `hosts/<host>/` paths. Lockstep with `_host_label()`
@@ -781,109 +865,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return String(data: outData, encoding: .utf8)
     }
 
-    /// True if Claude Code in the sutando-core tmux pane has any running
-    /// child process — indicating an active Bash/Tool call. False if only
-    /// the claude process itself is running (idle, waiting on stdin) or
-    /// if the tmux session can't be found.
-    func cliIsWorking() -> Bool {
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        // Get the pane's PID (the interactive shell wrapping claude).
-        // -S sutandoTmuxSocket so we find the same tmux server startup.sh
-        // created (different TMPDIR between shell and sandboxed .app).
-        let list = Process()
-        list.executableURL = URL(fileURLWithPath: tmuxPath)
-        list.arguments = ["-S", sutandoTmuxSocket, "list-panes", "-t", "sutando-core", "-F", "#{pane_pid}"]
-        let pipe = Pipe()
-        list.standardOutput = pipe
-        list.standardError = FileHandle.nullDevice
-        do { try list.run() } catch { return false }
-        list.waitUntilExit()
-        if list.terminationStatus != 0 { return false }
-        let panePid = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if panePid.isEmpty { return false }
-
-        // pgrep descendants of the pane PID. Claude Code itself is a child
-        // of the shell; its tool invocations are grandchildren. We want
-        // any non-claude descendant — a running bash/tool/subprocess.
-        // tmux launches the pane command directly — no intermediate shell.
-        // So `pane_pid` in a startup.sh-wrapped setup IS the claude process,
-        // and its DIRECT children are tool-call subprocesses + long-lived
-        // plugin helpers (sourcekit-lsp, caffeinate, bun, npm exec, etc.).
-        // The age filter distinguishes: a child with etime < 60s is a
-        // fresh tool call; older ones are background services that don't
-        // indicate active work.
-        let list2 = Process()
-        list2.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        list2.arguments = ["-P", panePid]
-        let listPipe = Pipe()
-        list2.standardOutput = listPipe
-        list2.standardError = FileHandle.nullDevice
-        do { try list2.run() } catch { return false }
-        list2.waitUntilExit()
-        let children = String(data: listPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .split(separator: "\n").map(String.init) ?? []
-        for childPid in children where !childPid.isEmpty {
-            if processAgeSeconds(pid: childPid) < 60 {
-                return true  // fresh child under pane_pid → active tool call
-            }
-        }
-        return false
-    }
-
-    /// Parse `ps -o etime= -p <pid>` → seconds. Returns Int.max on any
-    /// parse failure so old processes stay "old" and don't false-trigger
-    /// the cliIsWorking heuristic.
-    func processAgeSeconds(pid: String) -> Int {
-        let ps = Process()
-        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-o", "etime=", "-p", pid]
-        let pipe = Pipe()
-        ps.standardOutput = pipe
-        ps.standardError = FileHandle.nullDevice
-        do { try ps.run() } catch { return Int.max }
-        ps.waitUntilExit()
-        if ps.terminationStatus != 0 { return Int.max }
-        // etime format: [DD-]HH:MM:SS | [HH:]MM:SS | MM:SS
-        var raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.isEmpty { return Int.max }
-        var days = 0
-        var rest = raw
-        if let dashIdx = rest.firstIndex(of: "-") {
-            days = Int(rest[..<dashIdx]) ?? 0
-            rest = String(rest[rest.index(after: dashIdx)...])
-        }
-        let parts = rest.split(separator: ":").compactMap { Int($0) }
-        switch parts.count {
-        case 2: return days * 86400 + parts[0] * 60 + parts[1]
-        case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
-        default: return Int.max
-        }
-    }
-
-    /// Type one line into a core pane through the shared sender
-    /// (`scripts/tmux-send-line.sh`), which owns the session check, the
-    /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
-    /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
-    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
-        if let w = skipIfQueued { args += ["--skip-if-queued", w] }
-        proc.arguments = args
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return 4 }
-        proc.waitUntilExit()
-        return proc.terminationStatus
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
     }
 
     /// Return the avatar image, badged per composite mode:
@@ -1744,6 +1729,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // via voice-processing IO unit fails to initialize the output node on
         // this hardware (-10875). Re-enable once that's resolved.
         httpToggle(endpoint: "toggle")
+        openWebUI()
     }
 
     @objc func toggleMute() {
@@ -2363,7 +2349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns true if the loop-pause sentinel exists AND its expiry is in
     /// the future. Used by Timers (contextual-chips, health-check) to skip
     /// their body during a pause window — keeps the menu-bar quiet during
-    /// a meeting/dinner break without disabling task watcher restarts.
+    /// a meeting/dinner break without disabling task watcher recovery.
     func pauseSentinelActive() -> Bool {
         let path = workspace + "/state/loop-paused-until.sentinel"
         guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),

@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Delivery-side half of the worker pool: read one recipient's own folder.
+
+Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
+worker — receives work as *sentinels* in `deliveries/<recipient>/`:
+
+    tasks/<task-id>.txt                      the payload; immutable, never copied
+    deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
+    deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
+
+Creating the sentinel assigns (the router's job, not this module's). Renaming it
+records that the ASSIGNED recipient accepted the work — a worker never selects
+its own, so nothing is claimed here. The rename is atomic and exclusive, so a
+losing racer sees OSError and walks away. Nothing here writes a sentinel, reads another recipient's folder, or
+selects work that was not delivered.
+
+This module is intentionally free of any watcher, session or transport concern:
+it is the logic a reader needs, so the same rules hold whether events arrive by
+fswatch, by poll, or not at all.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# helpers live in the core; repo root is parents[3] from this directory
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+
+from workspace_default import resolve_workspace  # noqa: E402
+
+from delivery.readiness import read_ready_result  # noqa: E402
+from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
+                         RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
+                         require_recipient, workers_root)
+
+# `.txt` because the watcher that wakes a worker emits for no other extension.
+PENDING_SUFFIX = ".txt"
+ACCEPTED_SUFFIX = ".accepted"
+# Sentinels written before the rename. Recognised so work already accepted under
+# the old name is never re-delivered; nothing writes this suffix.
+LEGACY_ACCEPTED_SUFFIX = ".claimed"
+# Not a sentinel: the regex below never matches it, so listings skip it.
+LOCK_NAME = ".lock"
+
+# One suffix, substituted never appended: an accepted sentinel must not still
+# read as pending, or a reader re-takes its own in-flight work.
+
+# `~`: the bridge encodes a channel instance into the id (task-<inst>~<id>).
+_SENTINEL = re.compile(
+    r"^(?P<id>task-[A-Za-z0-9_~-]+?)(?:\.txt|(?P<accepted>\.accepted|\.claimed))$")
+
+# RECIPIENT, the record layout and the record predicate are imported above:
+# the gateway bridge reads what this module writes, so both bind one contract.
+
+
+class NotDelivered(Exception):
+    """The sentinel named is absent, malformed, or not this recipient's."""
+
+
+def parse_sentinel(name: str) -> tuple[str, bool] | None:
+    """(task_id, accepted) for a sentinel filename, or None if it is not one."""
+    m = _SENTINEL.match(name)
+    if not m:
+        return None
+    return m.group("id"), m.group("accepted") is not None
+
+
+def _root(workspace) -> Path:
+    """`None` resolves through the one sanctioned helper — a second resolution
+    path is how a reader and a writer end up in different trees."""
+    return Path(workspace) if workspace is not None else resolve_workspace()
+
+
+def deliveries_dir(workspace, recipient: str) -> Path:
+    return _root(workspace) / "deliveries" / require_recipient(recipient)
+
+
+def payload_path(workspace: Path, task_id: str) -> Path:
+    return _root(workspace) / "tasks" / f"{task_id}{PENDING_SUFFIX}"
+
+
+def archived_payload(workspace: Path, task_id: str) -> Path:
+    return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
+
+
+def results_dir(workspace) -> Path:
+    """Where every recipient's answers go. Named here so a caller that only
+    composes the path (a spawner, a launcher) does not re-spell the layout."""
+    return _root(workspace) / "results"
+
+
+def result_path(workspace: Path, task_id: str) -> Path:
+    return _root(workspace) / "results" / f"{task_id}.txt"
+
+
+def done_flag(workspace: Path, recipient: str, task_id: str) -> Path:
+    return record_path(workers_root(_root(workspace) / "state"), recipient,
+                       task_id, DONE_STAGE)
+
+
+def pending_flag(workspace: Path, recipient: str, task_id: str) -> Path:
+    """The first stage of the same record: owned, result not yet published."""
+    return record_path(workers_root(_root(workspace) / "state"), recipient,
+                       task_id, PENDING_STAGE)
+
+
+def is_done_flag(path) -> bool:
+    """Completion evidence is a REGULAR file and nothing else: a directory or a
+    symlink at the name is malformed state, and reading either as a finish
+    invents a claimant.
+    """
+    return read_record_state(path) is RecordState.PRESENT
+
+
+def _publish_record(dst: Path) -> None:
+    # The recipient's folder and its `done/` must be this recipient's OWN: through
+    # an alias the record would land under another recipient's name.
+    require_own_dir(dst.parent.parent)
+    require_own_dir(dst.parent)
+    # Temp file + rename inside the same directory, so a concurrent reader sees
+    # the name either absent or complete, never half-written.
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        os.unlink(tmp)
+        raise
+
+
+def mark_done(workspace, recipient: str, task_id: str, *, published: bool) -> Path:
+    """Record `recipient`'s hold on `task_id`. The ONLY writer of either stage.
+
+    `published=False` lays `.pending` BEFORE the result, so a result the drain
+    can see always has attribution beside it; `published=True` promotes it to
+    `.flag` after, and that is the only stage `residue` retires on. A promoted
+    record is never demoted, so a late `pending` cannot reopen retired work.
+    """
+    require_recipient(recipient)
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    done = done_flag(workspace, recipient, task_id)
+    pend = pending_flag(workspace, recipient, task_id)
+    if not published:
+        if is_done_flag(done):
+            return done
+        _publish_record(pend)
+        return pend
+    _publish_record(done)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
+    return done
+
+
+def clear_pending(workspace, recipient: str, task_id: str) -> Path:
+    """Withdraw a `.pending` hold this worker will not finish: the task went back to
+    the live core, or its handler never ran. Retires this recipient's sentinel with
+    it. Never touches `.flag` -- a finish is never undone -- and is idempotent, so a
+    fallback that fires twice is harmless.
+    """
+    require_recipient(recipient)
+    if not _SENTINEL.match(task_id + PENDING_SUFFIX):
+        raise ValueError(f"not a task id: {task_id!r}")
+    pend = pending_flag(workspace, recipient, task_id)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
+    # The live core owns the payload now; a sentinel left here reads `completed`
+    # once it publishes, and `sweep` retires only on a flag.
+    if not is_done_flag(done_flag(workspace, recipient, task_id)):
+        # Decide under the lock accept/release rename under; the flag check above is
+        # not synchronized with mark_done, and a flag landing late only retires a finish.
+        with arbitration(workspace, recipient):
+            sentinel = find(workspace, recipient, task_id)
+            if sentinel is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(sentinel)
+    return pend
+
+
+def writer_path() -> Path:
+    """The executable a spawner injects as SUTANDO_POOL_DELIVERY_SCRIPT: this file,
+    absolute. The core never locates it (docs/architecture-boundaries.md); the
+    skill hands it over, and the launcher forwards it into the worker session.
+    """
+    return Path(__file__).resolve()
+
+
+def pending(workspace: Path, recipient: str) -> list[Path]:
+    """Pending sentinels in this recipient's folder, oldest first.
+
+    Ordering is by the sentinel's own mtime, so a reader drains in delivery
+    order without reading any payload.
+    """
+    d = deliveries_dir(workspace, recipient)
+    if not d.is_dir():
+        return []
+    out = []
+    for p in d.iterdir():
+        got = parse_sentinel(p.name)
+        if got and not got[1]:
+            out.append(p)
+    return sorted(out, key=lambda q: (q.stat().st_mtime, q.name))
+
+
+def accepted(workspace: Path, recipient: str) -> list[Path]:
+    d = deliveries_dir(workspace, recipient)
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir()
+                  if (got := parse_sentinel(p.name)) and got[1])
+
+
+def regular_file_state(path) -> str:
+    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, a
+    symlink or a FIFO at the name) or "unknown" (any other OSError: EACCES, EIO).
+    Only the first three are verdicts about the path; "unknown" is about this call.
+    O_NONBLOCK: a FIFO at the name would otherwise block the open with no writer."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as e:
+        return "non-regular" if e.errno == errno.ELOOP else "unknown"
+    try:
+        return "regular" if stat.S_ISREG(os.fstat(fd).st_mode) else "non-regular"
+    finally:
+        os.close(fd)
+
+
+def is_regular_file(path) -> bool:
+    """A REGULAR file at that exact name, never followed. `exists()` accepts a
+    directory or a symlink, and authorising delivery on one lets a planted link
+    decide which body the caller reads. Fail-closed: an unopenable path is False.
+    """
+    return regular_file_state(path) == "regular"
+
+
+def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
+    """The sentinel for `task_id` under either name, or None."""
+    d = deliveries_dir(workspace, recipient)
+    for name in (task_id + PENDING_SUFFIX, task_id + ACCEPTED_SUFFIX,
+                 task_id + LEGACY_ACCEPTED_SUFFIX):
+        p = d / name
+        if is_regular_file(p):
+            return p
+    return None
+
+
+def parse_entry(entry, workspace=None) -> tuple[Path, str, str, bool]:
+    """The (workspace, recipient, task_id, accepted) a delivery entry path names.
+
+    Inverse of `deliveries_dir` plus the sentinel grammar, and the only reader in
+    that direction: a second inverse drifts the first time the layout moves.
+
+    Raises NotDelivered unless the path is shaped the way this module writes one
+    AND a sentinel for that task is present — a name on its own is not delivered.
+    """
+    p = Path(entry)
+    got = parse_sentinel(p.name)
+    if got is None:
+        raise NotDelivered(f"not a delivery sentinel: {entry!r}")
+    task_id, was_accepted = got
+    folder = p.parent
+    recipient = folder.name
+    if not RECIPIENT.match(recipient):
+        raise NotDelivered(f"not a recipient id: {recipient!r}")
+    ws = Path(workspace) if workspace is not None else folder.parent.parent
+    # Against the forward builder rather than a literal layout, so the two
+    # directions cannot disagree about where a recipient's deliveries live.
+    if deliveries_dir(ws, recipient).resolve() != folder.resolve():
+        raise NotDelivered(f"not inside this workspace's deliveries: {entry!r}")
+    if find(ws, recipient, task_id) is None:
+        raise NotDelivered(f"no delivery for {task_id} under {folder}")
+    return ws, recipient, task_id, was_accepted
+
+
+@contextlib.contextmanager
+def arbitration(workspace, recipient: str):
+    """One lock per folder around publish, accept and release, so a check of
+    both names and the rename that follows it cannot interleave."""
+    d = deliveries_dir(workspace, recipient)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / LOCK_NAME, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def accept(sentinel: Path) -> Path:
+    """Take up work already assigned here. Atomic and exclusive; a loser gets
+    OSError.
+
+    Nothing is selected: the folder decided the recipient. This only excludes a
+    second incarnation of the SAME recipient — never a sibling, which cannot see
+    this folder.
+    """
+    got = parse_sentinel(sentinel.name)
+    if got is None or got[1]:
+        raise NotDelivered(f"not a pending sentinel: {sentinel.name}")
+    dst = sentinel.with_name(got[0] + ACCEPTED_SUFFIX)
+    with arbitration(sentinel.parent.parent.parent, sentinel.parent.name):
+        # A stray pending name beside the accepted one: rename would silently
+        # replace work in flight. (A racing loser's source is gone: OSError.)
+        if dst.exists() and sentinel.exists():
+            raise NotDelivered(f"already accepted: {dst.name}")
+        os.rename(sentinel, dst)
+    return dst
+
+
+def release(sentinel: Path) -> Path:
+    """Hand an accepted delivery back to the SAME recipient for its next run."""
+    got = parse_sentinel(sentinel.name)
+    if got is None or not got[1]:
+        raise NotDelivered(f"not an accepted sentinel: {sentinel.name}")
+    dst = sentinel.with_name(got[0] + PENDING_SUFFIX)
+    with arbitration(sentinel.parent.parent.parent, sentinel.parent.name):
+        os.rename(sentinel, dst)
+    return dst
+
+
+def residue(workspace: Path, recipient: str, task_id: str) -> str:
+    """What a crash left behind, read without a journal.
+
+    One name per state, each mapped by `sweep` to exactly one action.
+    """
+    ws = Path(workspace)
+    # The shared readiness contract, not existence: an empty or whitespace-only
+    # file is a placeholder still being written, and must not suppress recovery.
+    has_result = read_ready_result(result_path(ws, task_id)) is not None
+    # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
+    # verdict is what `sweep` deletes on, so a planted link would retire real work.
+    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
+    sentinel = find(ws, recipient, task_id)
+    payload = payload_path(ws, task_id).is_file()
+
+    # The flag is terminal on its own: the bridge drains the result file on
+    # delivery, so after a drain the flag is the only durable evidence left.
+    if has_flag:
+        return "finished"
+    if has_result:
+        return "completed"
+    if sentinel is None:
+        if payload and not archived_payload(ws, task_id).is_file():
+            return "undelivered"
+        return "clean"
+    if not payload:
+        return "stale-sentinel"
+    return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
+
+
+def prune_spent(workspace: Path, recipient: str) -> dict:
+    """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
+    re-offer. A sentinel is spent when its payload is gone (`stale-sentinel`),
+    or the work is finished AND nothing could hand it back — the flag alone is
+    not enough, because the core re-queues a payload whose sentinel is gone and
+    whose result it cannot find. Safe beside a live watcher, which `sweep` is not.
+    """
+    ws = Path(workspace)
+    seen = set()
+    actions = {"retired": [], "stale": [], "kept": []}
+    for p in accepted(ws, recipient) + pending(ws, recipient):
+        task_id = parse_sentinel(p.name)[0]
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        state = residue(ws, recipient, task_id)
+        if state == "stale-sentinel":
+            p.unlink()
+            actions["stale"].append(task_id)
+        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
+            p.unlink()
+            actions["retired"].append(task_id)
+        else:
+            actions["kept"].append(task_id)
+    return actions
+
+
+def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
+    """True when removing the sentinel cannot put the task back in the core's
+    queue: either the payload is gone, or a result the core can find remains."""
+    if not payload_path(ws, task_id).is_file():
+        return True
+    if read_ready_result(result_path(ws, task_id)) is not None:
+        return True
+    return archived_payload(ws, task_id).is_file()
+
+
+def sweep(workspace: Path, recipient: str) -> dict:
+    """Boot reconciliation. An event that fired while nobody listened is gone,
+    so a reader that only streams never learns about it."""
+    ws = Path(workspace)
+    seen = set()
+    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": []}
+    for p in accepted(ws, recipient) + pending(ws, recipient):
+        task_id = parse_sentinel(p.name)[0]
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        state = residue(ws, recipient, task_id)
+        if state == "pending":
+            actions["ready"].append(task_id)
+        elif state == "died-mid-work":
+            release(p)
+            actions["released"].append(task_id)
+        elif state == "completed":
+            actions["completed"].append(task_id)
+        elif state == "finished":
+            # Both result and flag exist, so the delivery is spent. Leaving the
+            # sentinel would hand finished work back as ready on the next boot.
+            p.unlink()
+            actions["retired"].append(task_id)
+        elif state == "stale-sentinel":
+            p.unlink()
+            actions["stale"].append(task_id)
+        else:
+            raise AssertionError(f"unmapped residue state {state!r} for {task_id}")
+    return actions
+
+
+def read_payload(workspace: Path, task_id: str) -> str | None:
+    """The task text from `tasks/`, which a sentinel only points at.
+
+    The bridges write header-format text, never JSON; a reader that wants
+    fields parses it with local_task_protocol, not here.
+    """
+    p = payload_path(Path(workspace), task_id)
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _emit(task_id: str) -> None:
+    # A dead consumer must end the reader rather than let events pile up unseen.
+    try:
+        print(f"DELIVERY: {task_id}", flush=True)
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
+    ap.add_argument("--workspace", required=True)
+    ap.add_argument("--recipient", default="core")
+    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
+                                       "payload", "mark-done", "writer-path"))
+    ap.add_argument("--task-id")
+    ap.add_argument("--sentinel")
+    ap.add_argument("--stage", choices=("pending", "done", "abandon"),
+                    help="for `mark-done`: pending = before the result, done = after, "
+                         "abandon = withdraw a pending hold (never a finish)")
+    ap.add_argument("--interval", type=float, default=1.0)
+    a = ap.parse_args(argv)
+    ws = Path(a.workspace)
+
+    if a.command == "payload":
+        # A sentinel names its payload and holds none; the mapping lives here
+        # so a caller never re-spells tasks/.
+        if not a.sentinel:
+            ap.error("--sentinel is required for payload")
+        parsed = parse_sentinel(a.sentinel)
+        if parsed is None:
+            ap.error(f"not a delivery sentinel: {a.sentinel}")
+        print(payload_path(ws, parsed[0]))
+    if a.command == "writer-path":
+        print(writer_path())
+        return 0
+    if a.command == "mark-done":
+        if not a.task_id or not a.stage:
+            ap.error("--task-id and --stage are required for mark-done")
+        if a.stage == "abandon":
+            print(clear_pending(ws, a.recipient, a.task_id))
+            return 0
+        print(mark_done(ws, a.recipient, a.task_id, published=a.stage == "done"))
+        return 0
+    if a.command == "residue":
+        if not a.task_id:
+            ap.error("--task-id is required for residue")
+        print(residue(ws, a.recipient, a.task_id))
+        return 0
+    if a.command == "pending":
+        for p in pending(ws, a.recipient):
+            print(parse_sentinel(p.name)[0])
+        return 0
+    if a.command == "sweep":
+        print(json.dumps(sweep(ws, a.recipient), indent=2))
+        return 0
+
+    # A release puts the name back as pending, and pending-at-boot is exactly
+    # what a streaming reader never hears about: announce both.
+    boot = sweep(ws, a.recipient)
+    for task_id in boot["ready"] + boot["released"]:
+        _emit(task_id)
+    announced = {parse_sentinel(p.name)[0] for p in pending(ws, a.recipient)}
+    while True:
+        time.sleep(a.interval)
+        now = {parse_sentinel(p.name)[0] for p in pending(ws, a.recipient)}
+        for task_id in sorted(now - announced):
+            _emit(task_id)
+        announced = now
+
+
+if __name__ == "__main__":
+    sys.exit(main())

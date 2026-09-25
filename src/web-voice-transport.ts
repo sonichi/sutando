@@ -600,9 +600,13 @@ export class VoiceTransport {
 
   private ws: WebSocket | null = null;
   private audioCtx: AudioContext | null = null;
+  /** Playback runs on its own context at the stream rate: a buffer/context
+   *  rate mismatch makes the browser linearly interpolate each chunk. */
+  private playbackCtx: AudioContext | null = null;
   private micStream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
   private analyserNode: AnalyserNode | null = null;
+  private rateMismatchLogged = false;
   /** `cancelled` distinguishes flushPlayback stops from natural completions —
    *  stop() fires `onended` too, and cancellation is not completion (D7.1). */
   private activeSources: Array<{ src: AudioBufferSourceNode; cancelled: boolean }> = [];
@@ -817,12 +821,22 @@ export class VoiceTransport {
 
     this.status('connecting', 'Connecting…');
 
-    // Create the AudioContext up front (ideally on a user gesture) so playback
-    // and capture share one clock and it isn't born suspended.
+    // Create the AudioContext up front (ideally on a user gesture) so it isn't
+    // born suspended. Capture uses this one; playback has its own (playbackCtx).
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
       this.audioCtx = new AudioContext();
     }
     this.adoptCtx(this.audioCtx);
+    if (!this.playbackCtx || this.playbackCtx.state === 'closed') {
+      try {
+        this.playbackCtx = this.createPlaybackContext();
+      } catch {
+        this.playbackCtx = null; // playChunk retries lazily
+      }
+    }
+    if (this.playbackCtx?.state === 'suspended') {
+      void this.playbackCtx.resume().catch(() => {});
+    }
     if (this.audioCtx.state === 'suspended') {
       try {
         await this.audioCtx.resume();
@@ -1052,6 +1066,14 @@ export class VoiceTransport {
       }
     }
     this.audioCtx = null;
+    if (this.playbackCtx && this.playbackCtx.state !== 'closed') {
+      try {
+        this.playbackCtx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.playbackCtx = null;
     this.analyserNode = null; // recreated against the next ctx in playChunk
   }
 
@@ -1553,7 +1575,7 @@ export class VoiceTransport {
       });
       this.micStream = null;
     }
-    // Don't close audioCtx here — playback may still be draining.
+    // Don't close audioCtx here — connect() and recovery reuse it.
   }
 
   // ─── WS message routing ─────────────────────────────────────
@@ -1582,8 +1604,10 @@ export class VoiceTransport {
     if (msg?.type === 'agent.state') {
       this.handleAgentState(msg as AgentStateV1);
     } else if (msg?.type === 'session.config' && msg.audioFormat) {
+      const prevOutputRate = this.outputRate;
       this.inputRate = msg.audioFormat.inputSampleRate ?? this.inputRate;
       this.outputRate = msg.audioFormat.outputSampleRate ?? this.outputRate;
+      if (this.outputRate !== prevOutputRate) this.retirePlaybackCtx();
       this.ev.onSessionConfig?.(this.inputRate, this.outputRate);
     } else if (msg?.type === 'transcript') {
       this.ev.onTranscript?.(msg.role, msg.text, msg.partial !== false);
@@ -1609,15 +1633,21 @@ export class VoiceTransport {
     // Deafened: drop the agent's audio (like a call deafen — you don't hear
     // what was said while deafened).
     if (this.deafened) return;
-    if (!this.audioCtx || this.audioCtx.state === 'closed') {
+    if (!this.playbackCtx || this.playbackCtx.state === 'closed') {
       try {
-        this.audioCtx = new AudioContext();
+        this.playbackCtx = this.createPlaybackContext();
       } catch {
         return;
       }
-      this.adoptCtx(this.audioCtx);
     }
-    const ctx = this.audioCtx;
+    const ctx = this.playbackCtx;
+    if (ctx.sampleRate !== this.outputRate && !this.rateMismatchLogged) {
+      this.rateMismatchLogged = true;
+      this.debug(
+        `playback AudioContext rate ${ctx.sampleRate} differs from stream rate ${this.outputRate}; the browser will interpolate each chunk`,
+        'warn',
+      );
+    }
     if (ctx.state === 'suspended') ctx.resume();
 
     const f32 = int16ToFloat32(arrayBuf);
@@ -1700,6 +1730,36 @@ export class VoiceTransport {
     this.ev.onDebug?.(msg, kind);
   }
 
+  /** Playback context at the stream's rate; falls back to the device rate
+   *  where the constructor rejects it (NotSupportedError). */
+  private createPlaybackContext(): AudioContext {
+    try {
+      return new AudioContext({ sampleRate: this.outputRate });
+    } catch (e) {
+      this.debug(
+        `playback AudioContext at ${this.outputRate} Hz rejected (${(e as Error)?.name ?? e}); using device rate`,
+        'warn',
+      );
+      return new AudioContext();
+    }
+  }
+
+  /** A renegotiated output rate needs a context at that rate; playChunk
+   *  recreates it lazily (and re-hands the analyser to the surface). */
+  private retirePlaybackCtx(): void {
+    if (!this.playbackCtx) return;
+    this.flushPlayback();
+    if (this.playbackCtx.state !== 'closed') {
+      try {
+        this.playbackCtx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.playbackCtx = null;
+    this.analyserNode = null;
+  }
+
   private stopStats(): void {
     if (this.statsTimer) {
       clearInterval(this.statsTimer);
@@ -1736,6 +1796,7 @@ export class VoiceTransport {
     this.speechAboveFloorMs = 0;
     this.ctxSuspendCount = 0;
     this.ctxLastTransition = null;
+    this.rateMismatchLogged = false;
     for (const slot of this.episodeRing) {
       slot.id = 0;
       slot.sent = false;
@@ -1859,7 +1920,7 @@ export class VoiceTransport {
       scheduledDepth: this.activeSources.length,
       lastEndedAt: this.lastEndedAt,
       ctxState: this.audioCtx?.state ?? null,
-      ctxTimeMs: this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : null,
+      ctxTimeMs: this.playbackCtx ? Math.round(this.playbackCtx.currentTime * 1000) : null,
       ctxSuspendCount: this.ctxSuspendCount,
       captureState: this.captureState,
       capStalled: this.capStalled,
@@ -1897,7 +1958,7 @@ export class VoiceTransport {
    *       failed/skipped frame's interval folds into the next delta):
    *       [capCallbacks, bytesSent, sendSkipped, sendFailed, chunksRecv,
    *        chunksScheduled, chunksEnded, chunksCancelled]
-   *   x   [ctxTimeMs|-1, scheduledDepth, lastEndedAgoMs|-1]
+   *   x   [playback ctxTimeMs|-1, scheduledDepth, lastEndedAgoMs|-1]
    *   cs  ctx state initial ('r'unning | 's'uspended | 'c'losed)
    *   cap capture state initial ('o'bserving | 'r'ecovering | 'd'egraded)
    *   sc  ctxSuspendCount
@@ -1932,7 +1993,7 @@ export class VoiceTransport {
         this.chunksCancelled - this.hbPrev.chunksCancelled,
       ],
       x: [
-        this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : -1,
+        this.playbackCtx ? Math.round(this.playbackCtx.currentTime * 1000) : -1,
         this.activeSources.length,
         this.lastEndedAt != null ? Math.max(0, now - this.lastEndedAt) : -1,
       ],
@@ -2139,7 +2200,7 @@ export class VoiceTransport {
   }
 
   private async tryReacquire(gen: number, capGen: number): Promise<boolean> {
-    // Tear down the dead capture first (keep the ctx — playback drains on it).
+    // Tear down the dead capture first (keep the ctx — the reacquire rewires on it).
     this.stopMic();
     let stream: MediaStream;
     try {

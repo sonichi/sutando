@@ -25,6 +25,7 @@ Each entry has:
 - `artifact` (optional string) — the filename STEM of the dated output this job produces, e.g. `"fleet-growth"` for `fleet-growth-2026-08-18.mp4`. Read by `health-check.py`'s `daily-cron-punctuality` probe. Without it the probe infers a stem from the last hyphenated token of the job name, so `talk-events-nightly` looks for `nightly-<date>.*`, never observes the real artifact, and reports the job UNCHECKED forever. Declare it whenever the name does not already equal the stem.
 - `conditional` (optional bool) — set `true` when the job runs on schedule but produces output only if there is new input (a nightly render with no new beats). The punctuality probe then treats "no artifact today" as evidence of nothing rather than a miss; lateness is still measured from the artifacts that do exist.
   On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
+- `owner` (optional string) — which session's `CronCreate` registration this entry belongs to: absent means the core (today's only behavior, unchanged). A worker-pool worker's bare id (the same id `pool_roster.py`/`worker_identity.py` use, e.g. `"d1fc9b10050b490d894947f96627447f"`) pins the entry to that worker instead — that worker's own `/startup` registers it (see `skills/startup/SKILL.md`'s worker section), and step 3 below must skip it here so the two registrations never double-fire the same job. Set this by hand when moving a job that a pinned room's cron output belongs to from the core onto its worker, per `src/cron_ownership.py` (the one shared filter both registration passes call — see `docs/architecture-boundaries.md` "Shared adapter policy").
 
 ### Durable Codex schedules
 
@@ -45,7 +46,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
 1.5. **Start the streaming task watcher NOW, before registering any cron jobs.** This step used to run last (as step 5, after every `CronCreate` round-trip below) — moved here so an incoming task isn't queued unprocessed for the entire registration loop. Measured impact (startup-latency post-mortem, 2026-08-24, RC9 onboarding): with N session crons the old ordering left the watcher unarmed for ~76 seconds on a fresh boot (one `CronCreate` round-trip per entry, 9 entries measured), during which a brand-new user's first onboarding ping sat unprocessed — the single biggest contributor to "Sutando took a while to respond" reports on first boot.
 
-   Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **Gate on running watcher TREES, not on the sentinel** — if one is already running, skip the Monitor call; the existing one continues. Reuse the shared enumerator rather than restating its rules here (the copies drift, and step 5 used to be one of the copies that did):
+   Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (an instance whose inbox isn't `<workspace>/tasks/` substitutes `$SUTANDO_TASKS_DIR` for the resolved path instead: that variable, when set, is what the watcher and its supervisor both resolve to, so the tag must carry it, not the workspace default; every reader compares inboxes by their real path, so a trailing slash or a `/private` prefix does not split one inbox into two), `persistent: true`, `description: 'Streaming task watcher'`. `--role session --inbox <value>` is what makes this an in-session watcher CODE can tell apart from an external one for the SAME inbox (#4477) — the watcher itself, on seeing `--role session`, proves readiness, stamps its sentinel, then waits up to 15 s for any external standby on this exact inbox to leave before its sweep (it kills nothing: #4585), and `task-notifier-supervisor.sh` (if one is running externally) polls the same inbox-scoped, sentinel-gated signal and stands the standby down; neither needs an instruction here to tear the other down, so there is no teardown step in this skill. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **The watcher checks its own inbox at startup** (`watcher_identity.py inbox-holders`): if a session watcher already covers it, the new one exits 0 naming the holder, so the Monitor call is safe to make whenever the per-inbox verdict says no session watcher is ready; never start it untagged, and use `--force-restart` only on the owner's word. The host-wide enumerator below stays for the STOP decision (which pids are ownerless), never for the start:
 
    ```bash
    python3 -c "
@@ -102,7 +103,16 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      authoritative for this routed core. This is a registration
      override only; never rewrite `crons.json`, because that configured value is the restoration
      target after quota resets. Codex keeps using its own quota telemetry and durable scheduler.
-3. For each job in the config:
+3. **Filter to entries the core owns before iterating.** This step always runs as the core, never a worker (workers never call `/schedule-crons`; see `skills/startup/SKILL.md`'s worker section). Skip any entry whose `owner` names a worker — it belongs to that worker's own registration, and registering it here too double-fires it (this closed a real incident: a room's `event-mining-hourly` posted from both the core and its pinned worker until the entry was marked `owner`-pinned). Absent `owner` is unaffected — that is still every entry today.
+   ```bash
+   python3 -c "
+   import json, sys
+   sys.path.insert(0, 'src')
+   from cron_ownership import entries_for_owner, CORE
+   cfg = json.load(open('$CF'))
+   print(json.dumps(entries_for_owner(cfg, CORE)))"
+   ```
+   Iterate the filtered list below, not the raw file.
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).

@@ -5,6 +5,7 @@ retry-whole on a rejected send, dedupe keys stable per (requirement, revision).
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -164,6 +165,17 @@ class ProjectorTests(unittest.TestCase):
             S._KIND_CATEGORY.clear()
             S._KIND_CATEGORY.update(original)
         self.assertEqual(category_of("choice"), CATEGORY_DECISION, "restored")
+
+
+class FallbackWhereTests(unittest.TestCase):
+    def test_the_plain_text_says_which_machine_when_the_host_is_known(self):
+        import hitl.schema as SCHEMA
+        from hitl.projector import fallback_body
+        with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
+            self.assertIn("(on Chis-MacBook-Pro · Qingyun's Air)", fallback_body(make_req()))
+        with mock.patch.object(SCHEMA, "device_host", return_value=""):
+            self.assertIn("(on Qingyun's Air)", fallback_body(make_req()))
+            self.assertNotIn("(on ", fallback_body(make_req(device=None)))
 
 
 if __name__ == "__main__":

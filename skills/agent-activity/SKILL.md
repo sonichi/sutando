@@ -20,9 +20,18 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
 | `task.event` | event id of the user message (`source_message_id`); the client mounts the per-message card under it |
 | `task.into` | on a consolidated `done`: event id of the message whose reply answered this one too |
+| `queue` | on the `queued` row only: `{depth, position}` — how many tasks are pending and this one's 1-based place in the order the core takes them (`src/task_queue.py`) |
 
 A `notice` row reading `queued` is written by the task watcher when the file lands, before any turn
-has it (`activity.py queued --task-file …`; only for files that name a room and a message).
+has it (the activity bus's QUEUED transition; `activity.py queued --task-file …` is the same row by
+hand, only for files that name a room and a message). With at least one task ahead the line reads
+`queued · N ahead` and carries `queue`.
+
+`python3 $S/activity.py queue --task-file <workspace>/tasks/task-….txt` prints that task's
+`{"depth": N, "position": K}` now. When more than one task is pending, the first line to the task's
+own conversation names the position ("Got it, right after the one I'm on." for one ahead, "Got it,
+N in line before this one." for more); nothing else narrates the queue. When `tasks/` cannot be read
+it prints nothing, says why on stderr and exits 1: the position is unknown then, not zero.
 
 A task's rows are **live** until its `done` row; a task-less row is live 15 minutes. The drawer
 shows only live rows and hides itself when none is live. Rows are flat: the client marks the first
@@ -67,7 +76,7 @@ skill hook. The hook never depends on the agent remembering anything:
   "closed, no message sent from here", never "replied"; a `[deduped: task-X]` pointer closes it as
   "consolidated" with `task.into` = X's message event id (the reply lives under that message).
 - **Bounded, one writer at a time.** Every append and the rotation that follows it run under one
-  `flock` on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
+  cross-platform advisory lock on `agent-activity.jsonl.lock`, so no row is lost or duplicated when hooks from several
   sessions write at once. The live log keeps the newest 400 rows (older rows move to
   `agent-activity.archive.<YYYY-MM-DD>.jsonl` by the row's own UTC day), and the session bindings
   file drops a task once its done row exists, so the per-tool-call reads stay small.
@@ -75,6 +84,9 @@ skill hook. The hook never depends on the agent remembering anything:
   `agent-activity.summaries.jsonl` — `{ts, started, rows, days, line, room, task}` — so the client can
   fold the card of an old message from it after the rows have rotated out, and expand it from the
   `days` archive files. Served like the log, at `/media/state/agent-activity.summaries.jsonl`.
+- **A sibling feed: private Connect cards.** `connect-apps` writes `state/connect-cards.json` (served at
+  `/media/state/connect-cards.json`); the client draws each card inside this activity card under the
+  message in its `event`, so a Connect card asked from a shared room is only visible to the owner.
 - **Fail closed.** A session with no bound open task writes nothing; a task another session claimed
   is never written to, so narration cannot cross rooms. The writer's own calls never become rows.
 - The hook exits 0 on every path; it must not block the tool it observed.

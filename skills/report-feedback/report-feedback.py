@@ -21,7 +21,7 @@ import json
 import os
 import platform
 import re
-import subprocess
+import subprocess  # noqa: F401 — tests patch report_feedback.subprocess.run (the Keychain read in cloud_auth)
 import sys
 import time
 import urllib.error
@@ -30,21 +30,23 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+# Cloud session lookup lives in src/cloud_auth.py; the names stay importable
+# here because tests and the redirect guard read them off this module.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+import cloud_auth  # noqa: E402
+from file_lock import locked_file  # noqa: E402
+
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
-TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+TRUSTED_API_HOSTS = cloud_auth.TRUSTED_API_HOSTS
 
 # Test seam. Empty in production: a redirect that downgrades to plaintext must
 # never replay the bearer token, so http is allowed only where a test opts in.
 INSECURE_REDIRECT_HOSTS: frozenset[str] = frozenset()
 
-DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
-# sutando.ag2.ai 307s to .space and clients drop Authorization across the
-# cross-origin redirect, so a bearer sent there reads back as a bogus 401.
-RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
-# What the desktop host overwrites the Keychain token with on sign-out (its
-# vault CLI has no delete verb); must read as "not signed in".
-SIGNED_OUT_SENTINEL = "__signed_out__"
+DEFAULT_CLOUD_ORIGIN = cloud_auth.DEFAULT_CLOUD_ORIGIN
+RETIRED_CLOUD_ORIGINS = cloud_auth.RETIRED_CLOUD_ORIGINS
+SIGNED_OUT_SENTINEL = cloud_auth.SIGNED_OUT_SENTINEL
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
 # autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
@@ -123,121 +125,24 @@ def resolve_workspace() -> Path:
         return Path(__file__).resolve().parents[2] / "workspace"
 
 
-def _normalize_base(base: str) -> str:
-    """A retired production origin IS the current one — never send a bearer to
-    it (the 307 to the new host drops Authorization → a misleading 401)."""
-    base = (base or "").strip().rstrip("/")
-    if base in RETIRED_CLOUD_ORIGINS or not base:
-        return DEFAULT_CLOUD_ORIGIN
-    return base
-
-
-def _fnv1a64(s: str) -> int:
-    """FNV-1a 64-bit, byte-for-byte the desktop host's (cloud_session.rs)."""
-    h = 0xCBF29CE484222325
-    for b in s.encode():
-        h ^= b
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-
-def origin_vault_key(origin: str) -> str:
-    """Origin-scoped Keychain key, matching cloud_session.rs origin_key_suffix."""
-    slug = "".join(c.upper() if (c.isascii() and c.isalnum()) else "_" for c in origin)
-    return f"AG2_CLOUD_TOKEN_{slug}_{_fnv1a64(origin):016X}"
-
-
-def resolve_cloud_origin() -> str:
-    env = os.environ.get("AG2_CLOUD_ORIGIN", "").strip().rstrip("/")
-    return env or DEFAULT_CLOUD_ORIGIN
+# Wrappers, not aliases: each hands its sibling down as the injected reader, so
+# patching _keychain_get / read_keychain_auth here still steers the chain.
+_normalize_base = cloud_auth.normalize_base
+_fnv1a64 = cloud_auth.fnv1a64
+origin_vault_key = cloud_auth.origin_vault_key
+resolve_cloud_origin = cloud_auth.resolve_cloud_origin
 
 
 def _keychain_get(key: str):
-    """Read one Keychain secret the way the engine vault does; None if absent."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-a", "sutando", "-s", key, "-w"],
-            capture_output=True,
-            timeout=10,
-        )
-        if r.returncode != 0:
-            return None
-        return r.stdout.decode().strip() or None
-    except Exception:
-        return None
+    return cloud_auth.keychain_get(key)
 
 
 def read_keychain_auth():
-    """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
-
-    The desktop host stores the sutk_ ONLY in the Keychain, under a key bound
-    to the cloud origin it was minted against (no cross-origin fallback except
-    the host's own retired-production carry-over, mirrored here).
-    """
-    origin = resolve_cloud_origin()
-    candidates = [origin]
-    if origin == DEFAULT_CLOUD_ORIGIN:
-        candidates.extend(RETIRED_CLOUD_ORIGINS)
-    for o in candidates:
-        tok = _keychain_get(origin_vault_key(o))
-        if tok and tok != SIGNED_OUT_SENTINEL:
-            return origin, tok
-    # Pre-origin-scoping installs stored a bare, unscoped key.
-    tok = _keychain_get("AG2_CLOUD_TOKEN")
-    if tok and tok != SIGNED_OUT_SENTINEL:
-        return origin, tok
-    return None, None
+    return cloud_auth.read_keychain_auth(get=_keychain_get)
 
 
 def read_cloud_auth(ws: Path):
-    """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
-
-    Matches the desktop's readCloudAuth (electron/ipc.cjs). Post-M1 the record
-    lives at ``<workspace>/state/auth/cloud-auth.json``; the pre-M1 root
-    ``<workspace>/cloud-auth.json`` is probed as a 30-day reader fallback. Both
-    packaged-app workspace equivalents are also probed so the skill finds the
-    token even when running from a different checkout. The Tauri desktop writes
-    no auth file at all — its session lives in the Keychain, probed next.
-    Falls back to the metering env the supervisor injects for signed-in runs.
-    """
-    seen: set[str] = set()
-    _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
-    for p in (
-        ws / "state" / "auth" / "cloud-auth.json",  # M1 canonical (state/auth/cloud-auth.json)
-        ws / "cloud-auth.json",  # pre-M1 root fallback (30-day reader window per workspace contract)
-        _app_ws / "state" / "auth" / "cloud-auth.json",  # packaged-app M1 canonical
-        _app_ws / "cloud-auth.json",  # packaged-app pre-M1 fallback
-        Path.home() / "Library" / "Application Support" / "@stando" / "ui" / "cloud-auth.json",  # legacy
-    ):
-        rp = str(p)
-        if rp in seen:
-            continue
-        seen.add(rp)
-        try:
-            if p.exists():
-                d = json.loads(p.read_text())
-                if d.get("token"):  # signed in == has token (matches desktop)
-                    return _normalize_base(d.get("apiBase") or ""), d["token"]
-        except Exception:
-            continue
-
-    base, tok = read_keychain_auth()
-    if tok:
-        return base, tok
-
-    hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
-    if hdrs:
-        try:
-            auth = json.loads(hdrs).get("Authorization", "")
-            tok = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth
-            base = os.environ.get("SUTANDO_METERING_ENDPOINT", "").replace("/api/usage/v2", "")
-            if tok:
-                return _normalize_base(base), tok
-        except Exception:
-            pass
-    return None, None
+    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
 
 
 def why_no_logs(ws: Path) -> str:
@@ -424,15 +329,45 @@ def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> 
     return manager.create(req).id
 
 
-def apply_clicks(ws: Path, prefs: dict, device: str) -> dict:
+def apply_clicks(ws: Path, prefs: dict, device: str, *, release_automatic: bool = True) -> dict:
     """Register parked drafts that have no card yet, then run every choice the owner clicked.
     A decision that cannot complete (signed out, API down) stays in progress for the next run;
     one whose post landed but whose card did not resolve finishes from its receipt, without posting."""
     out = {"registered": [], "applied": [], "kept": [], "cancelled": [], "held": []}
     manager = hitl_manager(ws)
     for rec in list_drafts(ws):
+        if rec["payload"].get("recovery"):
+            if not release_automatic and requirement_for_draft(manager, rec["id"]) is None:
+                continue
+            if not prefs["autoReport"]:
+                archive_recovery(ws, rec, "disabled")
+                continue
+            if not recovery_ready(rec):
+                continue
+            recovery = rec["payload"]["recovery"]
+            if not recovery.get("released"):
+                ok, reason = check_auto_gate(ws, rec["payload"]["title"])
+                if not ok:
+                    out["kept"].append(rec["id"])
+                    continue
+                recovery["released"] = time.time()
+                recovery["release_reason"] = ("recovery_failed" if recovery["state"] == "failed"
+                                               else "no_recovery_within_one_hour")
+                save_draft(ws, rec)
+                record_auto_report(ws, rec["payload"]["title"])
+            if not (prefs["askFirst"] or rec["payload"].get("ask") or
+                    requirement_for_draft(manager, rec["id"]) is not None):
+                rc = decide(ws, prefs, rec["id"], "file", owner_approved=False)
+                if rc == 0:
+                    out["applied"].append(rec["id"])
+                else:
+                    out["kept"].append(rec["id"])
+                continue
         if requirement_for_draft(manager, rec["id"]) is None:
             out["registered"].append(register_ask(ws, rec["id"], rec["payload"]["title"], device))
+    for rec in list_drafts(ws, state="posting"):
+        if rec["payload"].get("recovery") and requirement_for_draft(manager, rec["id"]) is None:
+            register_held(ws, manager, rec["id"], rec["payload"]["title"], device)
     for req in manager.active():
         if req.runtime != HITL_RUNTIME or req.status != "in_progress" or not req.chosen_action:
             continue
@@ -489,6 +424,58 @@ def pending_clicks(ws: Path) -> int:
                    if r.runtime == HITL_RUNTIME and r.status == "in_progress" and r.chosen_action)
     except Exception:  # noqa: BLE001 — no store, no engine: nothing to apply
         return 0
+
+
+def save_draft(ws: Path, rec: dict) -> None:
+    path = _draft_path(ws, rec["id"])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def recovery_ready(rec: dict, now: float | None = None) -> bool:
+    recovery = rec["payload"]["recovery"]
+    now = time.time() if now is None else now
+    return (recovery["state"] == "failed" or
+            (recovery["state"] == "not_started" and now >= recovery["deadline"]))
+
+
+def hold_report(ws: Path, payload: dict) -> str:
+    for rec in list_drafts(ws):
+        if rec["payload"].get("recovery") and _auto_key(rec["payload"]["title"]) == _auto_key(payload["title"]):
+            return rec["id"]
+    payload = dict(payload)
+    payload["recovery"] = {"state": "not_started", "deadline": time.time() + 3600}
+    return write_draft(ws, payload)
+
+
+def archive_recovery(ws: Path, rec: dict, state: str) -> None:
+    rec["payload"]["recovery"]["state"] = state
+    save_draft(ws, rec)
+    os.replace(_draft_path(ws, rec["id"]), _draft_path(ws, rec["id"]).with_suffix(".suppressed"))
+    manager = hitl_manager(ws)
+    req = requirement_for_draft(manager, rec["id"])
+    if req is not None:
+        manager.cancel(req.id)
+
+
+def update_recovery(ws: Path, incident: str, outcome: str) -> None:
+    if outcome not in ("started", "succeeded", "failed"):
+        raise ValueError("recovery outcome must be started | succeeded | failed")
+    rec = load_draft(ws, incident)
+    if not rec or not rec["payload"].get("recovery"):
+        raise ValueError("unknown or already submitted incident")
+    recovery = rec["payload"]["recovery"]
+    if outcome == "succeeded":
+        archive_recovery(ws, rec, "succeeded")
+        return
+    if recovery.get("released"):
+        raise ValueError("incident already released; only verified success can suppress an unsent report")
+    if outcome == "started" and recovery["state"] == "failed":
+        raise ValueError("a final failed outcome cannot be reset")
+    recovery["state"] = "recovering" if outcome == "started" else "failed"
+    recovery["updated"] = time.time()
+    save_draft(ws, rec)
 
 
 def _auto_state_path(ws: Path) -> Path:
@@ -598,7 +585,7 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
         return post_feedback(nxt, payload, token, _hops + 1)
 
 
-def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
+def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved: bool = True) -> int:
     """The owner answered the card: file (with logs per prefs), file without logs, or skip.
     Returns the exit code; every failure keeps the draft parked."""
     if choice not in ("file", "file_no_logs", "skip"):
@@ -622,13 +609,18 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
         drop_draft(ws, draft_id)
         print(f"SKIPPED: draft {draft_id} dropped at the owner's request.")
         return 0
+    if rec["payload"].get("recovery") and not recovery_ready(rec):
+        print(f"HELD: incident {draft_id} is awaiting recovery.")
+        return 3
     base, token = read_cloud_auth(ws)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
-                 "auto": bool(d.get("auto")), "owner_approved": True, "idempotency_key": draft_id}
+                 "auto": bool(d.get("auto")), "owner_approved": owner_approved, "idempotency_key": draft_id}
+    if d.get("recovery"):
+        ctx["recovery"] = d["recovery"]
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -660,7 +652,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str) -> int:
     return 0
 
 
-def main() -> None:
+def _main() -> None:
     ap = argparse.ArgumentParser()
     # Optional at parse time: --drafts and --decide carry no title; filing and asking enforce it below.
     ap.add_argument("--title", default="")
@@ -681,6 +673,8 @@ def main() -> None:
     ap.add_argument("--decide", nargs=2, metavar=("DRAFT_ID", "CHOICE"),
                     help="Apply a choice to a parked draft by hand: file | file_no_logs | skip.")
     ap.add_argument("--drafts", action="store_true", help="List parked drafts as JSON and exit.")
+    ap.add_argument("--recovery", nargs=2, metavar=("INCIDENT_ID", "OUTCOME"),
+                    help="Record existing recovery: started | succeeded | failed. Never starts a repair.")
     a = ap.parse_args()
 
     ws = resolve_workspace()
@@ -689,6 +683,14 @@ def main() -> None:
     device = platform.node().split(".")[0]
     if a.drafts:
         print(json.dumps(list_drafts(ws), indent=2))
+        return
+    if a.recovery:
+        try:
+            update_recovery(ws, a.recovery[0], a.recovery[1])
+        except ValueError as exc:
+            ap.error(str(exc))
+        print("RECOVERY: " + " ".join(a.recovery))
+        apply_clicks(ws, prefs, device)
         return
     if a.apply:
         out = apply_clicks(ws, prefs, device)
@@ -721,6 +723,14 @@ def main() -> None:
             print(f"SKIPPED: {reason}.")
             sys.exit(3)
 
+    if a.auto:
+        incident = hold_report(ws, {"kind": a.kind, "severity": a.severity,
+            "title": a.title.strip(), "body": a.body.strip() or a.title.strip(),
+            "auto": True, "no_logs": bool(a.no_logs), "ask": bool(a.ask)})
+        print(f"HELD: incident {incident}; awaiting existing recovery or one hour without recovery. "
+              f"Record its outcome with --recovery {incident} started|succeeded|failed.")
+        return
+
     if a.ask or (a.auto and prefs["askFirst"]):
         draft = {"kind": a.kind, "severity": a.severity, "title": a.title.strip(),
                  "body": a.body.strip() or a.title.strip(), "auto": bool(a.auto), "no_logs": bool(a.no_logs)}
@@ -738,7 +748,7 @@ def main() -> None:
 
     base, token = read_cloud_auth(ws)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — ask the user to sign in (Settings → Sutando Cloud), then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)
 
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version()}
@@ -780,6 +790,11 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}")
         sys.exit(1)
+
+
+def main() -> None:
+    with locked_file(resolve_workspace() / "state" / "feedback-reports.lock", create_mode=0o600):
+        _main()
 
 
 if __name__ == "__main__":

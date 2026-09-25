@@ -63,6 +63,13 @@ class Writer(unittest.TestCase):
     def rows(self):
         return [json.loads(l) for l in card.log_path(self.ws).read_text().splitlines()]
 
+    def test_a_queue_rides_on_the_row_only_when_given(self):
+        rec = card.append("queued · 1 ahead", kind="notice", room="!r:s", task={"id": "task-q"}, workspace=self.ws,
+                          queue={"depth": 2, "position": 2})
+        self.assertEqual(rec["queue"], {"depth": 2, "position": 2})
+        self.assertNotIn("queue", card.append("x", kind="notice", room=None, workspace=self.ws))
+        self.assertNotIn("queue", card.append("x", kind="notice", room=None, workspace=self.ws, queue={}))
+
     def test_append_writes_one_row_with_kind_task_and_room(self):
         card.append("picked up", kind="processing", room="!r:s",
                     task={"id": "task-1", "from": "@q:s", "text": "hi"}, workspace=self.ws)
@@ -94,7 +101,7 @@ class Writer(unittest.TestCase):
         # Rotation used to replace the inode while another writer held it, losing that writer's row.
         # Eight processes x 30 rows, live window 25: every row lands exactly once, done rows included.
         import multiprocessing as mp
-        with mp.get_context("fork").Pool(8) as pool:
+        with mp.get_context("spawn" if os.name == "nt" else "fork").Pool(8) as pool:
             pool.starmap(_append_many, [(str(self.ws), f"w{i}", 30, 25) for i in range(8)])
             pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         live = card.log_path(self.ws).read_text().splitlines()
@@ -152,6 +159,37 @@ class WriterCli(unittest.TestCase):
         rc, rec = self.run_main("append", "CI green")
         self.assertEqual((rec["kind"], "task" in rec), ("notice", False))
         self.assertEqual(len(card.log_path(self.ws).read_text().splitlines()), 3)
+
+    def test_queue_prints_this_tasks_depth_and_position_from_its_own_workspace(self):
+        (self.ws / "tasks").mkdir()
+        for i, name in enumerate(("task-a", "task-b")):
+            p = self.ws / "tasks" / f"{name}.txt"
+            p.write_text(f"id: {name}\nchannel_id: !r:s\ntask: hi\n")
+            os.utime(p, (1_700_000_000 + i, 1_700_000_000 + i))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = card.main(["queue", "--task-file", str(self.ws / "tasks" / "task-b.txt")])
+        self.assertEqual((rc, json.loads(out.getvalue())), (0, {"depth": 2, "position": 2}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            card.main(["queue", "--task-file", str(self.ws / "tasks" / "task-gone.txt"), "--workspace", str(self.ws)])
+        self.assertEqual(json.loads(out.getvalue()), {"depth": 2, "position": 0})
+
+    def test_queue_on_an_unreadable_tasks_dir_prints_no_count_and_exits_1(self):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("chmod cannot make tasks/ unreadable here: not POSIX, or root")
+        (self.ws / "tasks").mkdir()
+        p = self.ws / "tasks" / "task-a.txt"
+        p.write_text("id: task-a\nchannel_id: !r:s\ntask: hi\n")
+        (self.ws / "tasks").chmod(0o100)  # the file opens by path; the listing is denied
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = card.main(["queue", "--task-file", str(p)])
+        finally:
+            (self.ws / "tasks").chmod(0o700)
+        self.assertEqual((rc, out.getvalue()), (1, ""), "no {depth: 0}: the position is unknown")
+        self.assertIn("activity: queue not counted, tasks/ could not be read", err.getvalue())
 
     def test_done_without_a_task_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -549,7 +587,7 @@ class Hook(unittest.TestCase):
         import multiprocessing as mp
         self.log(*[{"ts": i, "room": "!r:s", "task": {"id": f"task-c{i:06d}", "text": "x"}, "line": "a"} for i in range(8)])
         ws = str(self.ws)
-        with mp.get_context("fork").Pool(8) as pool:
+        with mp.get_context("spawn" if os.name == "nt" else "fork").Pool(8) as pool:
             pool.starmap(_bind_in_process, [(ws, f"task-c{i:06d}", f"S{i}") for i in range(8)])
             pool.close(); pool.join()  # workers exit on their own: a terminate() under coverage deadlocks them
         binds = hook.load_json(self.p["bind"], {})

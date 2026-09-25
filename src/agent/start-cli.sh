@@ -3,7 +3,15 @@
 # src/agent/<runtime>/cli/; every caller uses this dispatcher.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# Pure bash, no external dirname: this dispatcher is the boot chain's own
+# first line (startup.sh execs straight into it), run before anything has
+# confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../.." && pwd)"
+unset _self_dir
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
@@ -28,10 +36,26 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
-runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
-  echo "start-cli: failed to resolve core runtime" >&2
-  exit 1
-}
+# `--runtime <name>` names the runtime for THIS launch (leading arg only). A
+# caller that recorded one must not get the core's config substituted for it.
+requested_runtime=""
+if [ "${1:-}" = "--runtime" ]; then
+  requested_runtime="${2:-}"
+  if [ -z "$requested_runtime" ]; then
+    echo "start-cli: --runtime needs a value" >&2
+    exit 2
+  fi
+  shift 2
+fi
+
+if [ -n "$requested_runtime" ]; then
+  runtime="$requested_runtime"
+else
+  runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
+    echo "start-cli: failed to resolve core runtime" >&2
+    exit 1
+  }
+fi
 
 case "$runtime" in
   claude|codex)
