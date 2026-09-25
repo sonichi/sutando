@@ -314,6 +314,30 @@ The preview has no fetch, form posts or storage, so data lives in the page. Seve
 and hidden by JS) stand in for several pages. People comment by pinning a point
 on the rendered page; the comment's quote names what was under it.
 
+### Writing a good page
+
+Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
+
+- **Choose HTML only when the page earns it**: options side by side, a diagram
+  or timeline, data or a chart, something to try (a slider, a flow), or a page
+  people will share. For a few paragraphs, use the Doc.
+- **Start from a template** (`templates`) that matches the form, and keep its
+  scope: data lives in the page, since it has no fetch and no storage.
+- **Readable in five seconds**: a heading and a one-line framing before any
+  detail. Lay it out for real: a comparison gets columns, a sequence gets drawn.
+  Headings and paragraphs alone should have been the Doc.
+- **Real content, never filler**: no placeholder statistics and no controls that
+  do nothing. Check any number the page states.
+- **Tasteful and specific**: 60–75 characters per line, and colour only where it
+  carries meaning. Avoid generic AI looks such as purple gradients on white or
+  card grids for their own sake. If the design would suit a neighbouring topic
+  just as well, it is too generic.
+- **Works for everyone**: readable at phone width, semantic elements, controls
+  that work from the keyboard, visible focus.
+- **Check it before you announce it**: render it, then look at it wide and
+  narrow. Exercise the controls, read the console, and fix what you see. People
+  review the page by pinning comments on it; answer each one in its thread.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:
