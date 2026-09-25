@@ -133,6 +133,23 @@ async def test_the_stage_is_shared_state_beside_the_page():
         raise AssertionError("only the HTML page has a stage")
 
 
+async def test_the_page_state_is_shared_and_bounded_like_the_web_client():
+    doc = Doc()
+    page = RoomDoc(FakeWS(), doc, Awareness(doc), "html", kind=HTML_KIND)
+    await page.set_app_state("votes", {"u1": "Room-collab"})
+    assert page.app_state == {"votes": {"u1": "Room-collab"}}
+    assert str(doc.get("html", type=Text)) == "", "state never touches the page text"
+    for key, value in (("../x", 1), ("big", "x" * 5000)):
+        try:
+            await page.set_app_state(key, value)
+        except RoomDocError:
+            pass
+        else:
+            raise AssertionError(f"{key} must be refused")
+    await page.set_app_state("votes", None)
+    assert page.app_state == {}
+
+
 for name, fn in list(globals().items()):
     if name.startswith("test_"):
         check(name, fn)
@@ -142,4 +159,4 @@ if FAILS:
     for f in FAILS:
         print("  -", f)
     sys.exit(1)
-print("room-collab html surface: 6 passed")
+print("room-collab html surface: 7 passed")

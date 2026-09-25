@@ -695,6 +695,23 @@ async def run(args: argparse.Namespace) -> int:
         if args.kind == "sheet":
             return await sheet(doc, args)
 
+        if args.command == "state":
+            if args.kind != HTML_KIND:
+                raise RoomDocError(f"state is for the HTML page: pass --kind {HTML_KIND}.")
+            if args.key is None:
+                print(json.dumps(doc.app_state, ensure_ascii=False, indent=2))
+                return 0
+            if args.value is None:
+                print(json.dumps(doc.app_state.get(args.key), ensure_ascii=False))
+                return 0
+            try:
+                value = json.loads(args.value)
+            except json.JSONDecodeError as exc:
+                raise RoomDocError(f"value must be JSON (quote strings): {exc}") from None
+            await doc.set_app_state(args.key, value)
+            await doc.settle(args.settle)
+            print(json.dumps({"ok": True, "key": args.key, "deleted": value is None}))
+            return 0
         if args.command == "slide":
             if args.kind not in STAGE_KINDS:
                 raise RoomDocError(f"slide moves the page, the board or the Doc, not the {args.kind!r}.")
@@ -1009,6 +1026,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("file")
     s.add_argument("--at", default="A1", help="the top-left cell (default A1)")
+
+    s = sub.add_parser("state", help="read or write the HTML page's shared state, the one its scripts "
+                                     "see as artifact.state (needs --kind html)")
+    s.add_argument("room")
+    s.add_argument("key", nargs="?", help="omit to list every key")
+    s.add_argument("value", nargs="?", help="JSON to store; `null` deletes the key; omit to read")
 
     s = sub.add_parser("slide", help="move every viewer: next, prev, or a number — the page's slides "
                                      "(--kind html), the board's frames (--kind board), the Doc's headings")

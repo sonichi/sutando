@@ -61,7 +61,8 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, STAGE_KINDS, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, HTML_STATE_KEY, STAGE_KINDS, STATE_KEY_RE,
+    STATE_VALUE_MAX, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
     explain,
     http_status,
     unanswered,
@@ -790,6 +791,33 @@ class RoomDoc:
         spot = {"text": words, "seq": max(int(time.time() * 1000), int(last) + 1)}
         await self._commit(lambda: stage.__setitem__("spot", spot))
         return spot
+
+    @property
+    def app_state(self) -> dict:
+        """The page's shared state, as its scripts see it through `artifact.state`."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
+        return dict(self._items(self._doc.get(HTML_STATE_KEY, type=Map)))
+
+    async def set_app_state(self, key: str, value) -> None:
+        """Set (or, with None, delete) one key of the page's shared state, under the web client's bounds."""
+        import json as _json
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
+        if not re.fullmatch(STATE_KEY_RE, key):
+            raise RoomDocError(f"not a state key: {key!r} (letters, digits, . _ -; up to 64)")
+        if value is not None and len(_json.dumps(value).encode()) > STATE_VALUE_MAX:
+            raise RoomDocError(f"the value for {key!r} is over {STATE_VALUE_MAX} bytes of JSON")
+        state = self._doc.get(HTML_STATE_KEY, type=Map)
+
+        def mutate() -> None:
+            if value is None:
+                if key in state:
+                    del state[key]
+            else:
+                state[key] = value
+
+        await self._commit(mutate)
 
     async def set_speaking(self, speaking: bool) -> None:
         """Say whether a presenter is talking, without touching the highlight:

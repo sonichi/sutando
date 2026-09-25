@@ -14,6 +14,10 @@ DEFAULT_KIND = "markdown"
 HTML_KIND = "html"
 # A surface's live stage (moves, a spotlight; a highlighted topic on the page), beside its content.
 HTML_STAGE_KEY = "stage"
+# The page's own shared state (window.artifact.state in the page); keys and bounds as the web client checks.
+HTML_STATE_KEY = "state"
+STATE_KEY_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+STATE_VALUE_MAX = 4096
 # The surfaces with a stage: the HTML page, the board ("board") and the Doc.
 STAGE_KINDS = (HTML_KIND, "board", DEFAULT_KIND)
 # The surfaces that are one shared text, and the root each text lives under.

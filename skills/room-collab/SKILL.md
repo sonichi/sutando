@@ -377,6 +377,24 @@ the Doc's headings (number, level, title), so a "go to 3" lands where the
 viewers see 3. The voice tool `room_surface` makes the switch. From the command
 line: `python3 $P --kind board slide '!room:server' 2`.
 
+### Pages that remember: the artifact runtime
+
+A page's own scripts get `window.artifact`: `artifact.state.get / set / keys / on` for
+shared state (saved in the room; a late joiner gets all of it), `artifact.emit / on`
+for one-shot events (only viewers online at that moment see one), and `artifact.me`
+(a stable per-viewer id and name). The host checks every request: keys are
+`[A-Za-z0-9._-]` up to 64 characters, values are JSON up to 4 KB, there are at most 500
+keys, and events are limited to 20 per second. The page never gets network or storage.
+An agent reads and writes the same state:
+
+```bash
+python3 $P --kind html state '!room:server'                  # every key
+python3 $P --kind html state '!room:server' votes            # one key
+python3 $P --kind html state '!room:server' votes '{}'       # set (JSON); `null` deletes
+```
+
+The Library's **Live poll** is a worked example.
+
 ### Writing a good page
 
 Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
