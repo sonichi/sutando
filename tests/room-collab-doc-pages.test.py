@@ -213,6 +213,9 @@ async def test_the_relay_switches_to_a_doc_page_and_lists_the_docs_pages():
         status, body = await http(port, "POST", "/spot/some%20words")
         assert body["found_on_page"] is True and page.stage["spot"]["text"] == "some words", body
         assert "spot" not in main.stage, "a spot on the page never reaches the main Doc"
+        status, body = await http(port, "POST", "/page/zz99zz99")
+        assert status == 404 and body["pages"] == [entry["id"]], body
+        assert body["surface"] == entry["kind"], "an unlisted page leaves the held page in place"
         status, body = await http(port, "POST", "/page/main")
         assert body["surface"] == "doc", body
         assert opens[-1] == DEFAULT_KIND and entry["kind"] in opens, opens

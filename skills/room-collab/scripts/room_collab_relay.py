@@ -70,6 +70,15 @@ def page_surface(family: str, page: str | None) -> str:
     if is_doc_surface(family):
         return f"{DEFAULT_KIND}-{page}" if page else "doc"
     return f"html-{page}" if page else "html"
+def page_of_surface(surface: str) -> tuple[str, str] | None:
+    """(main kind, page id) for an extra HTML or Doc page's surface; None for any other surface."""
+    for main_kind in ("html", DEFAULT_KIND):
+        prefix = f"{main_kind}-"
+        if surface.startswith(prefix) and PAGE_ID_RE.fullmatch(surface[len(prefix):]):
+            return main_kind, surface[len(prefix):]
+    return None
+
+
 SWITCH_WAIT_S = 15
 ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
 
@@ -368,6 +377,19 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
         return {"ok": True, "surface": holder["surface"], "connected": True,
                 "parts": len(o.get("slides") or o.get("headings") or o.get("databases") or [])}
 
+    async def unlisted_page(surface: str) -> dict | None:
+        """A refusal when `surface` is a page missing from its family's index; a typo must not open a blank page."""
+        found = page_of_surface(surface) if surface else None
+        if found is None or open_kind is None:
+            return None
+        main_kind, page_id = found
+        async with open_kind(holder["room"], main_kind) as main:
+            ids = [p["id"] for p in main.pages]
+        if page_id in ids:
+            return None
+        return {"ok": False, "error": f"no page {page_id!r} in this room; GET /pages lists them",
+                "pages": ids, "surface": holder["surface"]}
+
     async def switch_room(room_id: str) -> dict:
         retarget(room_id=room_id)
         try:
@@ -400,7 +422,11 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 current = holder["room"]
                 status, body = 200, await read_script(lambda: open_text(current))
             elif what[0] == "surface":
-                status, body = 200, await change_surface(what[1])
+                missing = await unlisted_page(what[1])
+                if missing is not None:
+                    status, body = 404, missing
+                else:
+                    status, body = 200, await change_surface(what[1])
             elif what[0] == "room":
                 status, body = 200, await switch_room(what[1])
             elif what[0] == "db":
