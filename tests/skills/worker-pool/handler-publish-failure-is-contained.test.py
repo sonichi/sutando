@@ -28,6 +28,9 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 
 import pool_remedy as rem  # noqa: E402
+import spawn_worker as sw  # noqa: E402
+
+LAUNCHER_NAME = Path(sw.LAUNCHER).name
 
 sup, sw = rem.sup, rem.sw
 pr = sup.pr
@@ -48,7 +51,7 @@ class FakeTmux:
             return cp(argv, 0, "claude\n", "")
         if len(argv) > 2 and argv[2] == "watcher-sentinel":
             return cp(argv, 0, "sentinel-" + (kw.get("env") or {})["SUTANDO_INSTANCE_ID"], "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith(LAUNCHER_NAME):
             self.live.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return cp(argv, 0, "Started detached.", "")
         if len(argv) > 3 and argv[3] == "has-session":
@@ -58,7 +61,7 @@ class FakeTmux:
         return cp(argv, 0, "", "")
 
     def launches(self):
-        return [a for a in self.calls if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+        return [a for a in self.calls if a[0] == "bash" and a[1].endswith(LAUNCHER_NAME)]
 
 
 class ABatchSurvivesOnePublishFailure(unittest.TestCase):

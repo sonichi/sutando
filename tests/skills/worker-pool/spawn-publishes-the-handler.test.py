@@ -28,6 +28,8 @@ sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 import pool_roster as pr  # noqa: E402
 import spawn_worker as sw  # noqa: E402
 
+LAUNCHER_NAME = Path(sw.LAUNCHER).name
+
 
 class FakeTmux:
     """Records argv+env, answers has-session from a known set, and creates the
@@ -44,7 +46,7 @@ class FakeTmux:
         self.envs.append(dict(kw.get("env") or {}))
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return cp(argv, 0, self.runtime + "\n", "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith(LAUNCHER_NAME):
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
             return cp(argv, 0, "Started detached.", "")
         sub = argv[3] if len(argv) > 3 else ""
@@ -105,7 +107,7 @@ class SpawnDeclaresTheRouter(unittest.TestCase):
         inner = t.__call__
 
         def watching(argv, **kw):
-            if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+            if argv[0] == "bash" and argv[1].endswith(LAUNCHER_NAME):
                 seen["declared_at_launch"] = _cfg(self.ws).exists()
             return inner(argv, **kw)
 
