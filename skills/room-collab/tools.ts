@@ -3,7 +3,15 @@
 
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { anchorPaths, cuePath, lineInstruction, toBeats, type Beat, type ScriptItem } from './present.js';
+import {
+	anchorPaths,
+	cuePath,
+	describeAnchor,
+	lineInstruction,
+	toBeats,
+	type Beat,
+	type ScriptItem,
+} from './present.js';
 
 // Read at call time: manifest config lands in process.env after imports are hoisted.
 const relayUrl = () => (process.env.ROOM_COLLAB_RELAY_URL || 'http://127.0.0.1:7877').replace(/\/$/, '');
@@ -14,12 +22,26 @@ const START_HINT =
 // One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
 // `synced` is false once anything but the talk may have moved the deck (start, resume,
 // goto, a manual move); the next beat then re-applies its position before speaking.
-const talk: { beats: Beat[]; pos: number; active: boolean; synced: boolean } = {
+const talk: { beats: Beat[]; pos: number; active: boolean; synced: boolean; titles: Record<number, string> } = {
 	beats: [],
 	pos: 0,
 	active: false,
 	synced: false,
+	titles: {},
 };
+
+/** Where the talk is, for the model: the line it is on and what the deck shows. */
+function talkPosition(): Record<string, unknown> | null {
+	if (!talk.beats.length) return null;
+	const at = Math.max(0, talk.pos - 1);
+	return {
+		state: talk.active ? 'presenting' : talk.pos >= talk.beats.length ? 'finished' : 'paused',
+		line: at + 1,
+		of: talk.beats.length,
+		step: talk.beats[at].step + 1,
+		showing: describeAnchor(talk.beats[at].anchor, talk.titles),
+	};
+}
 
 // The session's context channel, from setup(), to restate the slide rule when a talk starts.
 let injectContext: ((text: string) => void) | null = null;
@@ -94,12 +116,15 @@ export const roomHighlightTool: ToolDefinition = {
 export const roomStageTool: ToolDefinition = {
 	name: 'room_stage',
 	description:
-		'Read what the room\'s HTML page is showing to everyone: the highlighted topic and whether a presenter is speaking. ' +
+		'Read what the room\'s HTML page is showing to everyone: the highlighted topic, whether a presenter is speaking, and — during a ' +
+		'talk — which script line you are on and which slide the deck shows. Check it before answering a question about "this slide". ' +
 		'Also tells you whether the room relay is running (an error means it is not). Instant.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
-		return relay('GET', '/state');
+		const stage = await relay('GET', '/state');
+		const position = talkPosition();
+		return position ? { ...stage, talk: position } : stage;
 	},
 };
 
@@ -169,12 +194,12 @@ async function runBeat(beat: Beat, before: Beat | null): Promise<string | null> 
 }
 
 /** Run beats until one has a line to say (a beat of only actions just runs). */
-async function nextLine(): Promise<{ say: string; n: number } | null> {
+async function nextLine(): Promise<{ say: string; n: number; showing?: string } | null> {
 	while (talk.pos < talk.beats.length) {
 		const before = talk.pos > 0 ? talk.beats[talk.pos - 1] : null;
 		const beat = talk.beats[talk.pos++];
 		const say = await runBeat(beat, before);
-		if (say) return { say, n: talk.pos };
+		if (say) return { say, n: talk.pos, showing: describeAnchor(beat.anchor, talk.titles) };
 	}
 	talk.active = false;
 	return null;
@@ -206,9 +231,11 @@ export const roomPresentTool: ToolDefinition = {
 			if (script.error) return script;
 			const outline = await relay('GET', '/outline');
 			const topicSlide: Record<string, number> = {};
-			((outline.slides as { n: number; topics: { topic: string }[] }[]) ?? []).forEach((s) =>
-				s.topics.forEach((tp) => (topicSlide[tp.topic] ??= s.n)),
-			);
+			talk.titles = {};
+			((outline.slides as { n: number; title: string | null; topics: { topic: string }[] }[]) ?? []).forEach((s) => {
+				if (s.title) talk.titles[s.n] = s.title;
+				s.topics.forEach((tp) => (topicSlide[tp.topic] ??= s.n));
+			});
 			talk.beats = toBeats((script.steps as ScriptItem[][]) ?? [], topicSlide);
 			talk.pos = 0;
 			await relay('POST', '/highlight/clear'); // a talk starts from a clean stage
@@ -231,6 +258,7 @@ export const roomPresentTool: ToolDefinition = {
 			say: line.say,
 			line: line.n,
 			of: talk.beats.length,
+			showing: line.showing,
 			instruction: 'Say ONLY this line, then stop.',
 			...(action === 'start' ? { rules: ROOM_SLIDE_RULE } : {}),
 		};
@@ -272,7 +300,7 @@ export function setup(ctx: {
 			const line = await nextLine();
 			if (!line) return;
 			try {
-				ctx.injectText(ctx.session, lineInstruction(line.say, line.n, talk.beats.length));
+				ctx.injectText(ctx.session, lineInstruction(line.say, line.n, talk.beats.length, line.showing));
 			} catch (err) {
 				console.warn(`[room-collab] present inject failed: ${err instanceof Error ? err.message : err}`);
 			}

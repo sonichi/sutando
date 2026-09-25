@@ -70,6 +70,14 @@ export function cuePath(cue: Beat['cues'][number]): string | null {
 }
 
 /** What the model is told for one beat: speak exactly this, nothing about the control. */
-export const lineInstruction = (say: string, n: number, total: number) =>
+export const lineInstruction = (say: string, n: number, total: number, showing?: string) =>
 	`[SILENT CONTROL — never spoken aloud; do not read, repeat or mention it. You are presenting (line ${n} of ${total}); ` +
-	`the slide is already set. Say ONLY this line, naturally, then stop and wait: "${say.replace(/"/g, "'")}"]`;
+	`the deck is already set${showing ? ` and now shows ${showing.replace(/"/g, "'")}` : ''}. ` +
+	`Say ONLY this line, naturally, then stop and wait: "${say.replace(/"/g, "'")}"]`;
+
+/** How a beat's position reads to the model: "slide 18 — What agents need…". */
+export function describeAnchor(anchor: Anchor | null, titles: Record<number, string>): string | undefined {
+	const n = anchor === null ? 1 : anchor.slide;
+	if (n === undefined) return undefined;
+	return titles[n] ? `slide ${n} — ${titles[n].replace(/[.。]+$/, "")}` : `slide ${n}`;
+}
