@@ -17,6 +17,8 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   POST /surface/html-<id>   hold one of the room's extra HTML pages (also POST /page/<id>;
                             /page/main is the main page)
   GET  /pages               the room's HTML pages: main first, then each extra page's id and title
+  GET  /appstate            the held page's shared state (what its scripts see as artifact.state)
+  POST /appstate/<key>/<json>  set one key of it (url-encoded JSON; `null` deletes)
   POST /room/<room id>      hold that room instead (url-encoded `!abc:server`), same surface
   GET  /rooms               the agent's joined rooms, {id, name}, to resolve a spoken name
   GET  /db                  the room's databases (room_database.py)
@@ -38,7 +40,7 @@ import asyncio
 import json
 import re
 
-from room_collab_protocol import DEFAULT_KIND, RoomDocError, is_html_kind
+from room_collab_protocol import DEFAULT_KIND, STATE_KEY_RE, RoomDocError, is_html_kind
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
@@ -80,6 +82,8 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("rooms", None)
     if method == "GET" and path == "/pages":
         return ("pages", None)
+    if method == "GET" and path == "/appstate":
+        return ("appstate", None)
     if method != "POST":
         return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/",
                                         "/surface/", "/room/", "/page/"))
@@ -98,6 +102,15 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         if len(room) > 255 or not ROOM_ID_RE.fullmatch(room):
             return (400, {"ok": False, "error": f"not a room id: {room[:80]!r} (like !abc:server)"})
         return ("room", room)
+    if path.startswith("/appstate/"):
+        from urllib.parse import unquote
+        key, _, raw = path[len("/appstate/"):].partition("/")
+        if not re.fullmatch(STATE_KEY_RE, key) or not raw:
+            return (400, {"ok": False, "error": "use /appstate/<key>/<url-encoded JSON>; `null` deletes"})
+        try:
+            return ("appstate_set", (key, json.loads(unquote(raw))))
+        except ValueError:
+            return (400, {"ok": False, "error": "the value must be JSON (quote strings)"})
     if path.startswith("/spot/"):
         from urllib.parse import unquote
         words = " ".join(unquote(path[len("/spot/"):]).split())
@@ -402,6 +415,14 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                     status, body = 200, {"ok": True, **spot, "found_on_page": found}
                 elif kind == "outline":
                     status, body = 200, {"ok": True, **outline_of(surface, doc)}
+                elif kind in ("appstate", "appstate_set") and not is_html_kind(surface):
+                    status, body = 409, {"ok": False, "error": "page state is on an HTML page; "
+                                         "switch with /surface/html or /page/<id>"}
+                elif kind == "appstate":
+                    status, body = 200, {"ok": True, "state": doc.app_state, "surface": surface}
+                elif kind == "appstate_set":
+                    await doc.set_app_state(*arg)
+                    status, body = 200, {"ok": True, "key": arg[0], "deleted": arg[1] is None}
                 elif kind == "slide" and parts is not None and arg[1] > parts:
                     noun = "frames" if surface == "board" else "headings"
                     status, body = 400, {"ok": False, "error": f"the {surface} has {parts} {noun}"}

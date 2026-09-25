@@ -51,6 +51,10 @@ async def test_routes():
     assert route("POST", "/speaking/on") == ("speaking", True)
     assert route("GET", "/state?x=1") == ("state", None)
     assert route("GET", "/script") == ("script", None)
+    assert route("GET", "/appstate") == ("appstate", None)
+    assert route("POST", "/appstate/votes/%7B%22u1%22%3A%22a%22%7D") == ("appstate_set", ("votes", {"u1": "a"}))
+    assert route("POST", "/appstate/votes/null") == ("appstate_set", ("votes", None))
+    assert route("POST", "/appstate/..%2Fx/1")[0] == 400 and route("POST", "/appstate/votes/%7Bbad")[0] == 400
     assert route("GET", "/outline") == ("outline", None)
     assert route("POST", "/spot/Liveness%20isn%E2%80%99t%20health") == ("spot", "Liveness isn\u2019t health")
     assert route("POST", "/spot/clear") == ("spot", None) and route("POST", "/spot/")[0] >= 400

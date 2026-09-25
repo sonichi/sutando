@@ -161,6 +161,28 @@ export const roomStageTool: ToolDefinition = {
 	},
 };
 
+export const roomPageStateTool: ToolDefinition = {
+	name: 'room_page_state',
+	description:
+		'Read or change the shared state of the HTML page the room relay holds — what the page\'s own scripts keep (poll votes, ' +
+		'retro notes, quiz progress, checklist ticks). Without key: returns all of it. With key and value: sets it (value is JSON; ' +
+		'null deletes). Use it for "how many votes so far?", "reset the poll", "tick the first item". Instant.',
+	parameters: z.object({
+		key: z.string().max(64).optional().describe('A state key, e.g. "votes"'),
+		value: z.unknown().optional().describe('JSON value to store; null deletes the key'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { key, value } = args as { key?: string; value?: unknown };
+		if (key === undefined) return relay('GET', '/appstate');
+		if (value === undefined) {
+			const all = await relay('GET', '/appstate');
+			return all.error ? all : { key, value: (all.state as Record<string, unknown> | undefined)?.[key] ?? null };
+		}
+		return relay('POST', `/appstate/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`);
+	},
+};
+
 export const roomOutlineTool: ToolDefinition = {
 	name: 'room_outline',
 	description:
@@ -477,6 +499,7 @@ export const tools: ToolDefinition[] = [
 	roomHighlightTool,
 	roomPointTool,
 	roomOutlineTool,
+	roomPageStateTool,
 	roomStageTool,
 	roomSurfaceTool,
 	roomScriptTool,
