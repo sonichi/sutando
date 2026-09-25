@@ -24,7 +24,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from room_collab_protocol import DEFAULT_KIND, HTML_KIND, STAGE_KINDS, TEXT_ROOTS, RoomDocError  # noqa: E402
+from room_collab_protocol import (DEFAULT_KIND, HTML_KIND, RoomDocError, has_stage, is_html_kind,  # noqa: E402
+                                  text_root)
 from room_collab_watch import new_lines  # noqa: E402
 
 # The edge refuses urllib's default agent outright (Cloudflare 1010), so an
@@ -360,7 +361,7 @@ async def doctor(args: argparse.Namespace) -> int:
         async with open_room_collab(url, args.room, token, kind=args.kind,
                                  insecure=args.insecure) as doc:
             say("connect", True, f"{url} accepted the socket")
-            if args.kind in TEXT_ROOTS:
+            if text_root(args.kind):
                 say("read", True, f"{len(doc.text)} chars in the document")
             else:
                 say("read", True, f"{len(doc.elements)} elements")
@@ -386,7 +387,7 @@ def fetch_library(base: str, name: str) -> bytes:
 async def templates(doc, args: argparse.Namespace, url: str) -> int:
     """List the library, or start the page from one template (refusing to
     overwrite someone's page unless --replace says to)."""
-    if args.kind != HTML_KIND:
+    if not is_html_kind(args.kind):
         raise RoomDocError(f"templates are for the HTML page: pass --kind {HTML_KIND}.")
     base = args.library or _origin(url) + "/html-templates/"
     index = json.loads(fetch_library(base, "index.json"))
@@ -592,6 +593,27 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
             await asyncio.sleep(wait)
 
 
+async def pages(doc, args: argparse.Namespace) -> int:
+    """List the room's HTML pages (main first), or list a new one and print the kind to write it with."""
+    if args.command == "page-add":
+        if not " ".join(args.title.split()):
+            raise RoomDocError("a page needs a title")
+        entry = await doc.add_page(args.title, args.user_id or args.name or "agent")
+        await doc.settle(args.settle)
+        if args.json:
+            print(json.dumps({"ok": True, **entry}, ensure_ascii=False))
+        else:
+            print(f"added {entry['title']!r}: write it with --kind {entry['kind']}")
+        return 0
+    listed = [{"id": None, "kind": HTML_KIND, "title": "Main"}] + doc.pages
+    if args.json:
+        print(json.dumps(listed, ensure_ascii=False, indent=2))
+    else:
+        for p in listed:
+            print(f"{p['kind']:<14} {p['title']}")
+    return 0
+
+
 async def run(args: argparse.Namespace) -> int:
     if args.command == "stay":
         # A record, not a connection: the daemon holds the socket and outlives
@@ -685,6 +707,12 @@ async def run(args: argparse.Namespace) -> int:
                     list_rooms=joined_rooms)
         return 0
 
+    if args.command in ("pages", "page-add"):
+        # The page list lives in the main page, whichever page --kind names.
+        async with open_room_collab(url, args.room, token, kind=HTML_KIND,
+                                    insecure=args.insecure) as doc:
+            return await pages(doc, args)
+
     async with open_room_collab(url, args.room, token, kind=args.kind,
                              insecure=args.insecure) as doc:
         if args.name:
@@ -696,7 +724,7 @@ async def run(args: argparse.Namespace) -> int:
             return await sheet(doc, args)
 
         if args.command == "state":
-            if args.kind != HTML_KIND:
+            if not is_html_kind(args.kind):
                 raise RoomDocError(f"state is for the HTML page: pass --kind {HTML_KIND}.")
             if args.key is None:
                 print(json.dumps(doc.app_state, ensure_ascii=False, indent=2))
@@ -713,7 +741,7 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": True, "key": args.key, "deleted": value is None}))
             return 0
         if args.command == "slide":
-            if args.kind not in STAGE_KINDS:
+            if not has_stage(args.kind):
                 raise RoomDocError(f"slide moves the page, the board or the Doc, not the {args.kind!r}.")
             move = args.move.lower()
             nav = await (doc.navigate("goto", int(move)) if move.isdigit() else doc.navigate(move))
@@ -755,7 +783,7 @@ async def run(args: argparse.Namespace) -> int:
         if args.command == "templates":
             return await templates(doc, args, url)
         if args.command == "highlight":
-            if args.kind != HTML_KIND:
+            if not is_html_kind(args.kind):
                 raise RoomDocError(f"highlight is for the HTML page: pass --kind {HTML_KIND}.")
             state = await doc.set_stage(None if args.topic == "clear" else args.topic)
             await doc.settle(args.settle)
@@ -968,8 +996,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's surfaces (markdown, html, board, kanban, sheet); "
-                        "default markdown")
+                   help="which of the room's surfaces (markdown, html, html-<id> for an extra "
+                        "HTML page, board, kanban, sheet); default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -987,6 +1015,14 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--delta", action="store_true",
                            help="only the lines new since this agent last read the surface")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("pages", help="list the room's HTML pages — the main page and each extra "
+                                     "one, with the --kind that opens it")
+    s.add_argument("room")
+    s = sub.add_parser("page-add", help="add an HTML page to the room's page list; prints the "
+                                        "--kind (html-<id>) to write it with")
+    s.add_argument("room")
+    s.add_argument("title")
 
     s = sub.add_parser("stay",
                        help="register this agent as resident in a surface; the presence daemon "

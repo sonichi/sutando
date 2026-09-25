@@ -61,8 +61,9 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_STAGE_KEY, HTML_STATE_KEY, STAGE_KINDS, STATE_KEY_RE,
-    STATE_VALUE_MAX, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_PAGES_KEY, HTML_STAGE_KEY, HTML_STATE_KEY, STATE_KEY_RE,
+    STATE_VALUE_MAX, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url, has_stage, is_html_kind,
+    new_page_entry, new_page_id, read_pages, text_root,
     explain,
     http_status,
     unanswered,
@@ -89,7 +90,7 @@ class RoomDoc:
         self._text_name = text_name
         # Only the text kinds have a text by default; a composer holds one per
         # post, which `open_post` selects. Naming another kind accepts unseen writes.
-        self._text = doc.get(text_name, type=Text) if kind in TEXT_ROOTS else None
+        self._text = doc.get(text_name, type=Text) if text_root(kind) else None
         self._post_id: str | None = None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
@@ -121,7 +122,7 @@ class RoomDoc:
                          self._kind, "structured data")
             raise RoomDocError(
                 f"cannot {what} on the {self._kind!r} document: it holds {where}, "
-                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents are text — "
+                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents (and html-<id> pages) are text — "
                 "open one of those, or use the API for this kind.")
         return self._text
 
@@ -498,7 +499,7 @@ class RoomDoc:
         """What this document looks like right now, for whichever kind it is,
         plus who is present — the unit `events()` diffs."""
         snap: dict = {"peers": list(self.peers)}
-        if self._kind in TEXT_ROOTS:
+        if text_root(self._kind):
             snap["text"] = self.text
         elif self._kind == BOARD_KIND:
             snap["elements"] = self.elements
@@ -530,7 +531,7 @@ class RoomDoc:
             if origin != LOCAL_ORIGIN:
                 fn()
 
-        if self._kind in TEXT_ROOTS:
+        if text_root(self._kind):
             subs.append((self._text, self._text.observe(on_doc)))
         elif self._kind == BOARD_KIND:
             m = self._doc.get(ELEMENTS_KEY, type=Map)
@@ -733,7 +734,7 @@ class RoomDoc:
         return sorted(rows, key=lambda c: (c["order"], c["id"]))
 
     def _require_stage(self, what: str) -> Any:
-        if self._kind not in STAGE_KINDS:
+        if not has_stage(self._kind):
             raise RoomDocError(f"cannot {what} on the {self._kind!r} document: only the HTML page, "
                                "the board and the Doc have a stage")
         return self._doc.get(HTML_STAGE_KEY, type=Map)
@@ -746,7 +747,7 @@ class RoomDoc:
     async def set_stage(self, topic: str | None, *, speaking: bool | None = None) -> dict:
         """Highlight `topic` on the page for everyone in the room (None clears it).
         `ts` changes on every call, so repeating a topic re-triggers it."""
-        if self._kind != HTML_KIND:
+        if not is_html_kind(self._kind):
             raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
         if topic is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", topic):
             raise RoomDocError(f"not a topic key: {topic!r} (letters, digits, . _ -; up to 64)")
@@ -795,14 +796,31 @@ class RoomDoc:
     @property
     def app_state(self) -> dict:
         """The page's shared state, as its scripts see it through `artifact.state`."""
-        if self._kind != HTML_KIND:
+        if not is_html_kind(self._kind):
             raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
         return dict(self._items(self._doc.get(HTML_STATE_KEY, type=Map)))
+
+    @property
+    def pages(self) -> list[dict]:
+        """The room's extra HTML pages, in order, as the main page's `pages` map lists them."""
+        if self._kind != HTML_KIND:
+            raise RoomDocError(f"the page list lives in the main HTML page (--kind {HTML_KIND}), "
+                               f"not the {self._kind!r} document")
+        return read_pages(dict(self._items(self._doc.get(HTML_PAGES_KEY, type=Map))))
+
+    async def add_page(self, title: str, by: str) -> dict:
+        """List a new page; it is written by opening its kind (`html-<id>`), as any page is."""
+        pages = self.pages
+        pid = new_page_id()
+        entry = new_page_entry(title, by, pages, int(time.time() * 1000))
+        index = self._doc.get(HTML_PAGES_KEY, type=Map)
+        await self._commit(lambda: index.__setitem__(pid, entry))
+        return {"id": pid, "kind": f"html-{pid}", **entry}
 
     async def set_app_state(self, key: str, value) -> None:
         """Set (or, with None, delete) one key of the page's shared state, under the web client's bounds."""
         import json as _json
-        if self._kind != HTML_KIND:
+        if not is_html_kind(self._kind):
             raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
         if not re.fullmatch(STATE_KEY_RE, key):
             raise RoomDocError(f"not a state key: {key!r} (letters, digits, . _ -; up to 64)")
@@ -936,7 +954,7 @@ async def open_room_collab(api_root: str, room_id: str, token: str, *,
     """Open one of a room's surfaces. `kind` selects which — the default
     markdown document, the HTML page, or a structured surface such as the board
     or the kanban. A text kind's root comes from TEXT_ROOTS unless named."""
-    text_name = text_name or TEXT_ROOTS.get(kind, DEFAULT_TEXT_NAME)
+    text_name = text_name or text_root(kind) or DEFAULT_TEXT_NAME
     url = doc_socket_url(api_root, room_id, kind=kind)
     sslctx = None
     if url.startswith("wss://"):
