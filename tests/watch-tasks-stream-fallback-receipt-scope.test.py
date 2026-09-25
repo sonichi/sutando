@@ -55,13 +55,18 @@ def run(watcher_instance, receipt_owner, want_state=False):
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     if watcher_instance: env["SUTANDO_INSTANCE_ID"] = watcher_instance
     else: env.pop("SUTANDO_INSTANCE_ID", None)
-    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
-                         env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    # stderr is kept: a probe that fails with nothing to read cannot be diagnosed.
+    errf = open(tmp / "watcher.err", "w+")
+    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
+                         env=env, stdout=subprocess.PIPE, stderr=errf,
                          text=True, start_new_session=True)
     out, t0, seen_state = [], time.time(), set()
+    # The sentinel lands only after fswatch is confirmed up, so a loaded runner
+    # can take longer than a probe that stops at TASK_FILE; give it a real budget.
+    budget = 30 if want_state else 8
     try:
         os.set_blocking(p.stdout.fileno(), False)
-        while time.time() - t0 < 8:
+        while time.time() - t0 < budget:
             time.sleep(0.3)
             try:
                 c = p.stdout.read()
@@ -69,20 +74,35 @@ def run(watcher_instance, receipt_owner, want_state=False):
             except Exception: pass
             # Sample WHILE the watcher lives: its cleanup trap unlinks the
             # sentinel on exit, so a post-hoc listing is always empty.
-            seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            if want_state and not seen_state:
+                seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+                if seen_state:
+                    print(f"  sentinel landed {time.time() - t0:.1f}s after launch")
+            else:
+                seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            # The sweep announces before the sentinel is stamped (the stamp
+            # waits for fswatch to be confirmed up), so keep sampling for it.
+            if want_state and not seen_state: continue
             if log.exists() and "handle" in log.read_text(): break
             if any("TASK_FILE" in c for c in out): break
     finally:
         try: os.killpg(os.getpgid(p.pid), 15)
         except Exception: pass
         p.wait(timeout=5)
+        errf.seek(0); LAST_STDERR[0] = errf.read(); errf.close()
     _res = "".join(out).strip().splitlines(), (log.read_text().split() if log.exists() else [])
     return (sorted(seen_state), _res) if want_state else _res
+
+LAST_STDERR = [""]
 
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
+        if LAST_STDERR[0].strip():
+            print("  watcher stderr:")
+            for line in LAST_STDERR[0].strip().splitlines()[-20:]:
+                print("    " + line)
 
 
 # Single probe now: no queue between probe and run to guard against a stale

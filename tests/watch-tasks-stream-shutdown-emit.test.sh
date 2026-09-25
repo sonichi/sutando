@@ -184,7 +184,7 @@ run_shutdown_sweep() {  # $1 = 1 to set SUTANDO_INBOX_RESOLVER, 0 to leave it un
     SUTANDO_INBOX_RESOLVER="$resolver_env" SUTANDO_WORKSPACE_DIR="$RWS" \
       SUTANDO_RESULTS_DIR="$RWS/results" SUTANDO_INSTANCE="w-test-$1" \
       SUTANDO_TASK_EVENT_HANDLER="$RHANDLER" TMPDIR="$RTMP" \
-      bash "$WATCHER" "$RINBOX" > "$outfile" 2>"$RTMP/sweep-$1.err" &
+      bash "$WATCHER" "$RINBOX" --role standby --inbox "$RINBOX" > "$outfile" 2>"$RTMP/sweep-$1.err" &
     pid=$!
     set +m
     # Wait for the handler to be RUNNING, not merely probed: TERM landing

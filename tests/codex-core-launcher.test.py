@@ -76,6 +76,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/pane_gate.py",
+            # pane_gate consults the proxy's quota record through this authority.
+            "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
@@ -89,6 +91,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime-api/instance_key.py",
             "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
+            "src/tasks-dir-resolve.sh",
+            "src/watcher_identity.py",
             "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
@@ -225,6 +229,8 @@ exit 0
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
+            str(self.root / "src/tasks-dir-resolve.sh"),
+            str(self.root / "src/watcher_identity.py"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
@@ -639,12 +645,18 @@ exit 23
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(100):
+            # Each notifier lifetime now spawns a role-verdict check, so a
+            # restart is a property to wait for, not a one-second deadline.
+            for _ in range(1000):
                 observed = _read_count(count)
                 if observed >= 2:
                     break
@@ -685,6 +697,10 @@ sleep 60
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,

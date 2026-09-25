@@ -40,6 +40,7 @@ into the core, where the descriptions can be checked against a caller.
 
 - `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher; refuses before any side effect, rolls back on a launcher failure.
 - `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
+- `rename_worker.py` — rename a worker after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new name>" [--workspace W]`. Rewrites the roster label (the only store of it) and republishes the advertisement; the id and its tmux session name stay.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write.
 - `worker_identity.py` — worker / session / incarnation records.
@@ -62,6 +63,13 @@ and zero or more **workers**, each with its own tmux session, watcher and inbox
 (`deliveries/<worker id>/`). There is deliberately no back channel between them —
 what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
 the owner can see, and a reply is an ordinary result.
+
+**A worker's queue is its own inbox and nothing else.** `tasks/` holds every
+instance's payloads, the core's and every other worker's in flight; a task is yours
+only while its sentinel sits in `deliveries/<your id>/`. Never list `tasks/` to find
+work, and never answer a task file you found there: the result would be posted as a
+reply in a room bound to someone else. The watcher's `QUEUE: n pending after this`
+counts your inbox, and that count is the only queue you have.
 
 ```
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who

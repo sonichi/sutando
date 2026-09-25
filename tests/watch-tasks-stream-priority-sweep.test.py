@@ -71,7 +71,7 @@ class Harness:
         env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
         env.pop("SUTANDO_INSTANCE_ID", None)
         self.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
 
@@ -143,7 +143,7 @@ def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlo
         env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
         env.pop("SUTANDO_INSTANCE_ID", None)
         h.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh", str(h.ws / "tasks")],
+            ["bash", "src/watch-tasks-stream.sh", str(h.ws / "tasks"), "--role", "standby", "--inbox", str(h.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
 

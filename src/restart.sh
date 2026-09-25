@@ -82,7 +82,8 @@ pkill -f "remote-gateway-bridge" 2>/dev/null
 # restart, and kept stamping tasks from 39-day-old code. Kill both names.
 pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
-pkill -f "watch-tasks" 2>/dev/null
+# No watcher kill here: a pattern kill hits every pool worker's watcher on the host.
+# The core's watcher dies with its session; a new one refuses to double an inbox.
 pkill -f "conversation-server" 2>/dev/null
 pkill -f "ngrok" 2>/dev/null
 # Credential proxy: handle the launchd-supervised job explicitly. pkill alone
@@ -124,7 +125,7 @@ fi
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
 for _ in $(seq 1 30); do

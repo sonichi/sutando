@@ -48,6 +48,27 @@ Use `append` to reply, not `replace`: your text lands where nobody else is
 typing, and the merge keeps everyone's characters. `replace` is for editing a
 sentence you own.
 
+**To be seen in a surface, register — do not hold it open yourself.** Every
+subcommand except `watch` opens the document, does one thing and closes, so
+presence published by a `read` is gone before anyone looks. A summon asks you
+to *be* there, and your session is the wrong thing to hang that on: it ends,
+compacts or restarts, and your presence ends with it.
+
+```bash
+python3 $P stay '!room:server'            # after reading a summon
+python3 $P --kind board stay '!room:server'
+python3 $P stay '!room:server' --leave    # when you are done there
+```
+
+`stay` writes a record and exits; it holds nothing and needs no token. The
+presence daemon — supervised, outliving any session — reconciles toward that
+record, reconnects when a socket dies, and drops a surface after 30 minutes
+with no activity on it. Identity and presence name are resolved the same way
+every other subcommand resolves them, so the flagless form is correct.
+
+`watch` still exists and still holds a connection, for watching a surface in
+the foreground and acting on each event. Use it for that, not for being seen.
+
 **Global flags go BEFORE the subcommand.** `--url`, `--kind`, `--name`,
 `--json` belong to the program, not the command: `room_collab.py --kind board
 read <room>` works, `room_collab.py read <room> --kind board` is refused as
@@ -55,9 +76,29 @@ read <room>` works, `room_collab.py read <room> --kind board` is refused as
 
 ## Requirements
 
+`websockets` and `pycrdt`. Two install routes; which one you need is
+decided by the python, not by preference.
+
+**In a virtualenv, or on any python whose pip may install into it:**
+
 ```bash
 pip install -r skills/room-collab/requirements.txt
 ```
+
+**On a managed python — Homebrew or a Debian/Ubuntu system python —**
+that command refuses with `error: externally-managed-environment`
+(PEP 668). Install into a venv and invoke the skill with THAT
+interpreter; the skill's own `python3` is not it:
+
+```bash
+python3 -m venv ~/.venvs/room-collab
+~/.venvs/room-collab/bin/pip install -r skills/room-collab/requirements.txt
+~/.venvs/room-collab/bin/python3 skills/room-collab/scripts/room_collab.py read <room>
+```
+
+Do not reach for `pip --break-system-packages` to make the first
+command work: it writes into the python other services on the host
+share.
 
 ## Credential
 
@@ -96,8 +137,35 @@ python3 $P append '!room:server' 'text to add'        # add at the end
 python3 $P replace '!room:server' 'old text' 'new'    # refuses if absent, never writes blindly
 python3 $P comment '!room:server' 'the exact words' 'is this final?'   # a comment pinned to them
 python3 $P reply  '!room:server' '$eventid' 'yes, final'              # answer in a comment's thread
-python3 $P --name mars read '!room:server'            # publish presence while connected
+python3 $P summon '!room:server' '@qingyun:server' --context 'the passage'  # call someone IN
+python3 $P --name mars --user-id '@mars:x' watch '!room:server'   # BE PRESENT: held open, so others see you
 ```
+
+### `summon` — telling someone you need them
+
+Writing `@someone` into the document is just characters: no event, no mention,
+no notification. `summon` posts the room message the web client's own @-picker
+posts — the same `space.ag2.collab.doc.summon` marker — so their timeline
+renders the summon card, with a Join button that opens the surface.
+
+```bash
+python3 $P summon '!room:server' '@qingyun:server' --context 'the design doc is ready for you'
+python3 $P --kind board summon '!room:server' '@mars:server'      # into the whiteboard
+python3 $P summon '!room:server' '@qingyun:server' --dry-run      # see the message, post nothing
+```
+
+**One summon is one interruption.** `m.mentions` is what makes the mention real,
+which is also what turns it into a task for whoever is called — so this is how
+you say "I finished, come and look", not how you decorate a sentence with a name.
+
+`--context` is the passage quoted under the card. You state it; this command does
+not check it against the document. It is folded to one line and capped at 400
+characters. `--kind` picks the surface (`markdown` default, `board`, `kanban`);
+the invitee must be a full mxid, because a bare name renders as prose and calls
+nobody.
+
+The card shows the surface, who was called and that passage; it opens the
+surface, not the line — the marker carries no anchor.
 
 Add `--insecure` only for a local rig with a self-signed certificate.
 
@@ -254,6 +322,82 @@ Three things that matter more than they look:
 3. **Send deltas, not the document.** `append`/`insert`/`replace` put only the change
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
+
+### Working alongside other agents
+
+A surface is often shared with one or more other agents, not only with people.
+Six rules, each learned from a live session where breaking it cost a correction.
+With only one agent on the surface, rules 2 and 3 still apply (the owner of the
+facts is then a person); the rest start mattering the moment a second agent
+joins.
+
+1. **Address an agent by @-mention, never by name alone.** A plain room message
+   (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
+   the people read it, the agent you named never sees it. Put its mxid in
+   `mentions` (or use `room_ops mention`); a display name typed as plain text
+   reaches it only if a bridge happens to match it.
+2. **Work in your own space.** On a board, build in your own column or frames
+   and let `draw` place new shapes in clear space (the default); never
+   `--absolute` onto someone else's shapes. An edit to an element you did not
+   just read will be refused if it changed meanwhile — re-read and re-apply,
+   don't `--force` over it. Build a multi-part piece one part per write, a few
+   seconds apart, so people watching see it grow and can redirect you early.
+3. **Get it reviewed by whoever owns the facts.** When your work describes or
+   extends another agent's (its diagram, its pool, its PRs), @-mention that
+   agent to review it before calling it done, and apply its corrections. Your
+   own memory and host are the usual source of error: another host's setup, a PR
+   still in review stated as shipped, an overclaim.
+4. **Read the thread before acting.** A message routed to you is not necessarily
+   addressed to you. If it is a reply (`reply_to_event`, `thread_root`) in
+   another agent's thread, or @-mentions another agent and not you, it is theirs
+   — leave it unless you are named or summoned.
+5. **When a message is addressed to nobody, one agent asks once.** If it could
+   be yours or another agent's, post one mentioned line — "mine or yours?" —
+   rather than both leaving it. Rule 4 without this pair loses the request.
+6. **Hand work to an agent in a mentioned message, not in a task result.** A
+   result answers the person who asked and carries no mention, so the agent you
+   meant never receives it. Send the handoff separately, with that agent in
+   `mentions`.
+
+### Working alongside people
+
+A surface can be shared with one or more people. The skill already covers the
+mechanics (presence, sending deltas, who-wrote-what, commenting, summon); these
+are the rules for using them. Each one was learned in a live session.
+
+1. **Answer where you were asked, in the room's language.** Under their line in
+   the doc, threaded in the room — then one short line in the room pointing to
+   it. Detail goes in the surface, not the timeline.
+2. **A person's words and shapes are theirs.** Check who wrote a passage
+   (`--with-authors`) before touching it. Never rewrite a person's text; ask in
+   a comment pinned beside it, and edit only when they ask you to.
+3. **Work in visible steps.** Hold presence so they see you, and build one part
+   at a time so a person watching can redirect you early.
+4. **With several people, act within each asker's authority for you.** Your
+   owner's ask is an instruction. A collaborator's is an instruction within what
+   their tier allows. Anyone else's is input to discuss, not act on. When two
+   asks conflict, don't pick one quietly: name the conflict, mention both
+   people, and let your owner decide. If your owner is one of the two, their ask
+   stands, and you say so.
+5. **People don't @-mention you.** In a surface you were summoned to, a person's
+   message that addresses nobody may be for you. Ask once (rule 5 for agents,
+   above) rather than ignoring it or acting on a guess.
+6. **What's private to one person stays off shared surfaces.** Their mail,
+   calendar, files and anything they told you privately don't go onto a board,
+   doc or room other people can read, even when they asked for it in that room.
+   Answer them privately and say one line in the room.
+7. **Keep what is decided apart from what is discussion.** Put the final text in
+   its own labelled part and notes below it, so a reader knows what ships.
+
+**Before you design where something is stored, read
+[`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
+arrangements merge and which silently drop a write — many text roots, one map
+key per row, an order derived from `(created, id)` rather than stored. The
+failure it describes does not look like a failure: a row that was written is
+simply not in the list, with no error and no gap, and nobody notices an absence
+they were never shown. Two of us each lost an evening to a premise we had
+stated as a structural constraint without measuring it; the discriminator was
+ten lines both times.
 
 ## Who wrote what
 

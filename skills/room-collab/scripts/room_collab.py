@@ -32,6 +32,15 @@ from room_collab_watch import new_lines  # noqa: E402
 USER_AGENT = "room-collab-skill/1 (+https://ag2.space)"
 # The web client's collabKey('doc', 'comment'): a room message carrying it is a comment.
 COMMENT_KEY = "space.ag2.collab.doc.comment"
+# collabKey('doc', 'summon'): an agent's summon must be the SAME event the
+# client's @-picker writes, or its timeline has no card to render.
+SUMMON_KEY = "space.ag2.collab.doc.summon"
+SUMMON_CONTEXT_MAX = 400
+# An mxid with a server part. The client's own reader refuses anything else, so
+# a summon naming "qingyun" would post a message that renders as plain prose.
+MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
+# The surface as the summon's prose names it; the marker carries `kind` verbatim.
+SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
@@ -326,8 +335,6 @@ def render(command: str, *, text: str = "", peers: list | None = None,
 async def doctor(args: argparse.Namespace) -> int:
     """Every step a first connection needs, reported one line each and stopped
     at the first failure — so the failing STEP is the answer, not a symptom."""
-    from room_collab_client import open_room_collab
-
     def say(step: str, ok: bool, detail: str) -> None:
         print(f"  {'ok  ' if ok else 'FAIL'}  {step:<8} {detail}")
 
@@ -339,6 +346,9 @@ async def doctor(args: argparse.Namespace) -> int:
     except ImportError as exc:
         say("deps", False, f"{exc}; pip install -r skills/room-collab/requirements.txt")
         return 2
+    # Imported after the deps check: this module exits at import when the deps
+    # are absent, which would pre-empt the step the check exists to report.
+    from room_collab_client import open_room_collab
     rows = credential_report(args.token, args.url)
     for step, ok, detail in rows:
         say(step, ok, detail)
@@ -437,6 +447,21 @@ async def kanban(doc, args: argparse.Namespace) -> int:
 
 
 
+def presence_name(name: "str | None", user_id: "str | None") -> "str | None":
+    """The name to publish presence under: the given one, else the mxid's localpart.
+
+    A peer with no name is not rendered — the web client skips it and the
+    service's summary counts it without naming it — so publishing nameless is
+    indistinguishable from not joining. An mxid already carries a usable name.
+    """
+    if name and name.strip():
+        return name.strip()
+    if isinstance(user_id, str) and user_id.startswith("@") and ":" in user_id:
+        local = user_id[1:].split(":", 1)[0].strip()
+        return local or None
+    return None
+
+
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
@@ -454,8 +479,9 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
         try:
             async with open_room_collab(url, args.room, token, kind=args.kind,
                                      insecure=args.insecure) as doc:
-                if args.name:
-                    await doc.set_presence(args.name, user_id=args.user_id)
+                announce = presence_name(args.name, args.user_id)
+                if announce:
+                    await doc.set_presence(announce, user_id=args.user_id)
                 if since is not None:
                     print("RECONNECTED\tcatching up on what landed meanwhile", flush=True)
                 async for ev in doc.events(handles, settle=args.settle, since=since):
@@ -478,15 +504,61 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.command == "stay":
+        # A record, not a connection: the daemon holds the socket and outlives
+        # the task that read the summon. No token, nothing kept open.
+        import presence_store
+        import presence_daemon
+        ws = _workspace(args.workspace)
+        path = presence_daemon.desired_path(ws)
+        if args.leave:
+            entries = presence_store.mutate_desired(
+                path, lambda es: presence_store.without(es, args.room, args.kind))
+            verb = "left"
+        else:
+            # Resolved, not raw: no flags would register identity=None and
+            # name=None, and no name means a held socket nobody can see.
+            who = resolve_identity(args.user_id)
+            entry = {"room": args.room, "kind": args.kind,
+                     "identity": who, "name": presence_name(args.name, who),
+                     "summoned_at": time.time()}
+            entries = presence_store.mutate_desired(
+                path, lambda es: presence_store.upsert(es, entry))
+            verb = "staying in"
+        if args.json:
+            print(json.dumps({"ok": True, "action": verb, "entries": entries},
+                             ensure_ascii=False))
+        else:
+            print(f"{verb} {args.room} ({args.kind}); {len(entries)} surface(s) registered")
+        return 0
+
+    # Dispatched before the imports below: doctor reports missing deps as its
+    # own first step, and importing the client here would exit before it runs.
+    if args.command == "doctor":
+        return await doctor(args)
+
     # Imported here, not at module scope: the rules above are pure, and a test
     # of them must not need pycrdt installed.
     from room_collab_client import open_room_collab
 
-    from room_collab_board import BOARD_KIND, place_clear
+    from room_collab_board import BOARD_KIND, place_clear, stale_writes
     from room_kanban import KANBAN_KIND
+    if args.command == "summon":
+        # No document connection: a summon is a room message, and its context is
+        # what the caller states rather than a passage this command verifies.
+        body, extra = summon_content(args.room, args.invitee, args.kind, args.context)
+        if args.dry_run:
+            print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
+                             ensure_ascii=False, indent=2))
+            return 0
+        receipt = post_summon(args.room, body, extra)
+        if args.json:
+            print(json.dumps(receipt, ensure_ascii=False))
+        else:
+            print(f"summoned {args.invitee} to the {args.kind} surface: "
+                  f"{receipt.get('event_id') or receipt.get('state') or 'posted'}")
+        return 0
 
-    if args.command == "doctor":
-        return await doctor(args)
     if args.command == "reply":
         # No document at all: a reply is a room message in the comment's thread.
         body = reply_content(args.text, args.mention)
@@ -524,6 +596,13 @@ async def run(args: argparse.Namespace) -> int:
             written = None
             if args.command == "draw":
                 elements = parse_elements(args.elements)
+                current = {e.get("id"): e for e in doc.elements}
+                stale = [] if args.force else stale_writes(elements, current.get)
+                if stale:
+                    listed = ", ".join(f"{i} (sent v{int(v)}, board has v{int(b)})" for i, v, b in stale)
+                    raise RoomDocError(
+                        f"not written: changed since you read it — {listed}. "
+                        "Read the board again and re-apply, or pass --force to overwrite.")
                 # Unless the coordinates are final, a drawing that would land
                 # on someone else's is moved below it.
                 if not args.absolute:
@@ -641,6 +720,40 @@ def reply_content(message: str, mentions: list[str] | None = None) -> str:
     return lead + " " + text if lead else text
 
 
+def summon_content(room: str, invitee: str, kind: str,
+                   context: str | None = None) -> tuple[str, dict]:
+    """The room message a summon is: prose any client shows, and the marker the
+    collab client renders as the summon card.
+
+    v3 — `invitee` and `context` in the marker, so a reader draws the card
+    without parsing the prose. v1/v2 carried neither and the client falls back
+    to `m.mentions`; the full mxid in the body is what makes that mention real.
+    """
+    who = invitee.strip()
+    if not MXID_RE.match(who):
+        raise RoomDocError(f"a summon needs the mxid of whoever is called, like "
+                           f"@name:server — got {invitee!r}")
+    where = SUMMON_SURFACE.get(kind)
+    if where is None:
+        raise RoomDocError(f"{kind!r} is not a surface to summon anyone to; "
+                           f"use one of {', '.join(sorted(SUMMON_SURFACE))}")
+    quoted = " ".join((context or "").split())[:SUMMON_CONTEXT_MAX]
+    body = f"{who} — you're needed in this room's {where}."
+    if quoted:
+        body += f"\n\n> {quoted}"
+    marker = {"room_id": room, "kind": kind, "invitee": who, "v": 3}
+    if quoted:
+        marker["context"] = quoted
+    return body, {SUMMON_KEY: marker, "m.mentions": {"user_ids": [who]}}
+
+
+def post_summon(room: str, body: str, extra: dict, *, runner=subprocess.run,
+                script: Path | None = None) -> dict:
+    """Post the summon through room-ops `say`; the reply is its receipt."""
+    return _post(room, body, ["--extra-content", json.dumps(extra, ensure_ascii=False)],
+                 "summon", runner=runner, script=script)
+
+
 def post_reply(room: str, root: str, body: str, *, runner=subprocess.run,
                script: Path | None = None) -> dict:
     """Post a reply in the comment's thread through room-ops `say --thread-root`."""
@@ -710,6 +823,13 @@ def build_parser() -> argparse.ArgumentParser:
                            help="only the lines new since this agent last read the surface")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
+    s = sub.add_parser("stay",
+                       help="register this agent as resident in a surface; the presence daemon "
+                            "holds the connection and outlives this process")
+    s.add_argument("room")
+    s.add_argument("--leave", action="store_true",
+                   help="deregister instead: the daemon drops the connection on its next pass")
+
     s = sub.add_parser("watch", help="hold the surface open; print each event that concerns --for")
     s.add_argument("room")
     s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
@@ -747,11 +867,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="print the room message the reply would be and post nothing")
 
+    s = sub.add_parser("summon",
+                       help="call someone into a surface — the card the client renders "
+                            "(no document connection needed)")
+    s.add_argument("room")
+    s.add_argument("invitee", metavar="MXID",
+                   help="who is called, by mxid — a person or another agent")
+    s.add_argument("--context", default=None,
+                   help="the passage they are called about, quoted under the card; "
+                        "stated by you, not checked against the document")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="print the room message the summon would be and post nothing")
+
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")
     s.add_argument("elements", help="JSON array of Excalidraw-shaped elements")
     s.add_argument("--absolute", action="store_true",
                    help="write the coordinates as given, even onto existing drawings")
+    s.add_argument("--force", action="store_true",
+                   help="write even over elements someone changed since you read them")
 
     s = sub.add_parser("erase", help="mark a board element or kanban card deleted")
     s.add_argument("room")

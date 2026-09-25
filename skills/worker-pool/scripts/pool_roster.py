@@ -379,6 +379,45 @@ def bind_room(workspace, room: str, target: str) -> dict:
         return compile_roster(workspace, workers, bindings)
 
 
+def rename_worker(workspace, target: str, label: str) -> "tuple[str, str, dict | None]":
+    """Change one worker's display label — the one production writer for a
+    rename. Returns (worker id, old label, roster), roster None on a no-op.
+
+    The label lives only in the roster; the advertisement is derived from it
+    and republished by the compile, and the id-derived session name is untouched.
+    A new name another worker already answers to is refused, so `resolve_label`
+    never becomes ambiguous.
+    """
+    new = (label or "").strip()
+    if not new:
+        raise RosterError("a label cannot be empty")
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to rename")
+        workers = dict(raw.get("workers") or {})
+        if target in workers:
+            wid = target
+        else:
+            hits = [w for w, row in workers.items() if (row or {}).get("label") == target]
+            if len(hits) > 1:
+                raise RosterError(f"{target!r} is the label of {len(hits)} workers; "
+                                  "name one by id")
+            if not hits:
+                raise RosterError(f"{target!r} is not a worker id or label")
+            wid = hits[0]
+        old = (workers[wid] or {}).get("label") or wid
+        if new == old:
+            return wid, old, None
+        if new == CORE:
+            raise RosterError(f"{CORE!r} names the core; a worker cannot take it")
+        for other, row in workers.items():
+            if other != wid and new in (other, (row or {}).get("label")):
+                raise RosterError(f"{new!r} already names worker {other}")
+        workers[wid] = {**(workers[wid] or {}), "label": new}
+        return wid, old, compile_roster(workspace, workers, load_bindings(workspace))
+
+
 def unbind_room(workspace, room: str) -> dict:
     """Drop a room's binding; its tasks go to the core again. Absent is not an
     error: an unpin of an unbound room is the state the owner asked for."""

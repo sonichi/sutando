@@ -19,6 +19,7 @@ from room_collab_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, is_newer, live_elements,
     sort_elements,
+    stale_writes,
 )
 
 FAILS = []
@@ -178,6 +179,17 @@ def test_describe_invalid_names_the_reason():
     assert "finite" in describe_invalid(el(width=float("nan")))
     assert "id" in describe_invalid({})
     assert describe_invalid(el()) == "valid", "a control: a good element says so"
+
+
+def test_stale_writes_names_elements_the_board_moved_past():
+    stored = {"a": {"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 5}}
+    mk = lambda v: {"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": v}  # noqa: E731
+    assert stale_writes([mk(6)], stored.get) == [], "read v5, send v6: an ordinary edit"
+    assert stale_writes([mk(5)], stored.get) == [("a", 5, 5)], "a tie would be settled by a random nonce"
+    assert stale_writes([mk(3)], stored.get) == [("a", 3, 5)], "an older write would be dropped silently"
+    assert stale_writes([{"id": "a"}], stored.get) == [], "no version: 'on top of whatever is there'"
+    assert stale_writes([mk(1) | {"id": "new"}], stored.get) == [], "a new element has nothing to be stale against"
+    assert stale_writes([mk(True)], stored.get) == [], "a bool is not a version"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

@@ -50,14 +50,14 @@ class Base(unittest.TestCase):
         return util_paths.watcher_sentinel_path(self.ws / "state", instance=instance)
 
     def ask(self, *, instance=WORKER, alive=lambda pid: True,
-            watcher_target=None):
+            watcher_target=None, in_session=lambda pid: True):
         """`watcher_target` defaults to "this pid watches MY inbox", which is
         what every pre-ownership test meant by a live watcher."""
         if watcher_target is None:
             watcher_target = lambda pid: self.inbox          # noqa: E731
         return wb.decide(instance=instance, inbox=self.inbox,
                          workspace=str(self.ws), alive=alive,
-                         watcher_target=watcher_target)
+                         watcher_target=watcher_target, in_session=in_session)
 
 
 class TestInstanceScoped(Base):
@@ -164,6 +164,141 @@ class TestMain(Base):
         with contextlib.redirect_stdout(buf):
             rc = wb.main(list(args))
         return rc, buf.getvalue().splitlines()
+
+    def _pd(self):
+        """pool_delivery, reached exactly as the bootstrap reaches it."""
+        import pool_delivery
+        return pool_delivery
+
+    def _inbox_dir(self):
+        d = Path(self.ws) / "deliveries" / WORKER
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_the_boot_decision_prunes_spent_sentinels_and_keeps_owed_ones(self):
+        """A delivered task's sentinel outlived its payload and its result; every
+        Stop hook and startup sweep re-walked all of them (#4614)."""
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        for i in range(3):                       # spent: payload gone
+            (d / f"task-spent{i}.txt").touch()
+        (tasks / "task-owed.txt").write_text("id: task-owed\nsource: test\ntask: x\n")
+        (d / "task-owed.txt").touch()           # owed: payload present, no result
+        rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
+                                "--workspace", str(self.ws))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[0], "start")
+        sweep = [l for l in out if l.startswith("sweep=")]
+        self.assertEqual(len(sweep), 1, out)
+        self.assertIn("stale=3", sweep[0])
+        self.assertIn("kept=1", sweep[0])
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
+
+    def test_the_prune_never_releases_an_accepted_delivery(self):
+        """On `skip` this worker's own watcher is live, so an accepted sentinel is
+        work the session is answering; the boot sweep would re-offer it as pending."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        (tasks / "task-live.txt").write_text("id: task-live\nsource: test\ntask: x\n")
+        (d / f"task-live{pd.ACCEPTED_SUFFIX}").touch()
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("kept=1", out)
+        self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
+                         "an in-flight delivery was renamed back to pending")
+
+    def test_every_way_a_finished_sentinel_can_be_spent(self):
+        """`_nothing_can_re_queue` has three ways to say yes, and each is a real
+        shape: the payload is gone, a ready result is still on disk, or the
+        payload is archived. All three retire; none of them can re-queue."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        results = Path(self.ws) / "results"; results.mkdir(exist_ok=True)
+        for tid in ("task-gone", "task-result", "task-arch"):
+            (d / f"{tid}.txt").touch()
+            pd.mark_done(self.ws, WORKER, tid, published=True)
+        # task-gone: no payload at all (the common case, the drain took it).
+        # task-result: payload present AND a ready result beside it.
+        (tasks / "task-result.txt").write_text("id: task-result\nsource: test\ntask: x\n")
+        pd.result_path(Path(self.ws), "task-result").write_text("done\n")
+        # task-arch: payload present, no live result, but the payload is archived.
+        (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
+        arch = pd.archived_payload(Path(self.ws), "task-arch")
+        arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
+        # Each one alone, so a shared fixture cannot mask a branch that never runs.
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
+        self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("retired=3", out)
+        self.assertEqual(list(d.iterdir()), [])
+
+    def test_a_sentinel_named_by_both_stages_is_judged_once(self):
+        """The same task can sit in the folder as `.accepted` and `.txt`; the
+        walk must judge it once, not retire it twice."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        (d / f"task-two{pd.ACCEPTED_SUFFIX}").touch()
+        (d / "task-two.txt").touch()
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("stale=1", out)
+        self.assertNotIn("stale=2", out)
+        self.assertEqual(len(list(d.iterdir())), 1, "the second name was judged again")
+
+    def test_a_finished_sentinel_whose_payload_could_be_re_queued_is_kept(self):
+        """`residue` calls a done flag alone `finished`, but with the payload still
+        in tasks/ and no findable result, removing the sentinel re-queues it."""
+        pd = self._pd()
+        d = self._inbox_dir()
+        tasks = Path(self.ws) / "tasks"; tasks.mkdir(exist_ok=True)
+        for tid in ("task-fin", "task-done"):
+            (tasks / f"{tid}.txt").write_text(f"id: {tid}\nsource: test\ntask: x\n")
+            (d / f"{tid}.txt").touch()
+            pd.mark_done(self.ws, WORKER, tid, published=True)
+        # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
+        arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
+        arch.write_text("archived")
+        out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("retired=1", out)
+        self.assertIn("kept=1", out)
+        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+
+    def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
+        """A prune that raises must leave the decision, its exit code and its first
+        line untouched; only the sweep= line says what happened."""
+        import contextlib
+        import io
+        for decision, why in (("start", "no sentinel"), ("skip", "live")):
+            with patch.object(wb, "decide", return_value=(decision, why)), \
+                 patch.object(wb, "prune_spent_sentinels", wraps=wb.prune_spent_sentinels) as spy:
+                with patch.dict(sys.modules, {"pool_delivery": None}):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = wb.main(["--instance", WORKER, "--inbox", self.inbox,
+                                      "--workspace", str(self.ws)])
+                    out = buf.getvalue().splitlines()
+            self.assertEqual(rc, 0, decision)
+            self.assertEqual(out[0], decision)
+            self.assertEqual(spy.call_count, 1, f"the prune must run on {decision}")
+            sweep = [l for l in out if l.startswith("sweep=")]
+            self.assertEqual(len(sweep), 1, out)
+            self.assertTrue(sweep[0].startswith("sweep=skipped ("), sweep[0])
+
+    def test_no_sweep_runs_on_an_unknown_decision(self):
+        """`unknown` means the state could not be read; touching the inbox there
+        would act on a picture the gate itself refused to trust."""
+        import contextlib
+        import io
+        with patch.object(wb, "decide", return_value=("unknown", "ps did not run")), \
+             patch.object(wb, "prune_spent_sentinels") as spy:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wb.main(["--instance", WORKER, "--inbox", self.inbox,
+                              "--workspace", str(self.ws)])
+        self.assertEqual(rc, 2)
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual([l for l in buf.getvalue().splitlines() if l.startswith("sweep=")], [])
 
     def test_a_worker_with_no_watcher_is_told_to_start(self):
         rc, out = self.run_main("--instance", WORKER, "--inbox", self.inbox,
@@ -321,6 +456,93 @@ class TestOwnershipIsScopedToTheInbox(Base):
         self.assertIsNone(wb._watcher_target(os.getpid()))
 
 
+class TestOwnershipIsScopedToThisSession(Base):
+    """A watcher on this inbox left by an ENDED session still holds the inbox,
+    but its stdout reaches no one: reading it as coverage strands every task."""
+
+    def test_a_watcher_this_session_did_not_start_means_start(self):
+        self.sentinel(WORKER).write_text("4242\n")
+        d, why = self.ask(in_session=lambda pid: False)
+        self.assertEqual(d, "start", why)
+        self.assertIn("not started by this session", why)
+
+    def test_an_unobservable_ancestry_is_unknown_not_skip(self):
+        def blind(pid):
+            raise wb.Unobserved("ps failed")
+        self.sentinel(WORKER).write_text("4242\n")
+        d, why = self.ask(in_session=blind)
+        self.assertEqual(d, "unknown", why)
+
+    def test_the_session_is_the_nearest_ancestor_that_is_not_a_shell(self):
+        table = {50: (40, "python3"), 40: (30, "zsh"), 30: (20, "claude"),
+                 20: (1, "tmux"), 60: (30, "zsh"), 61: (60, "bash"),
+                 70: (1, "bash")}
+        self.assertEqual(wb.session_root(table, 40), 30)
+        self.assertTrue(wb.descends_from(table, 61, 30))
+        self.assertFalse(wb.descends_from(table, 70, 30))
+
+    def test_a_chain_of_shells_up_to_init_scopes_nothing(self):
+        self.assertIsNone(wb.session_root({40: (1, "-zsh")}, 40))
+
+    def test_a_ps_that_raises_leaves_the_session_unobserved(self):
+        def ps(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 5))
+        self.assertIsNone(wb._process_table(run=ps))
+        with self.assertRaises(wb.Unobserved):
+            wb._in_this_session(4242, run=ps)
+
+    def test_a_ps_that_exits_non_zero_leaves_the_session_unobserved(self):
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "ps: denied")
+        self.assertIsNone(wb._process_table(run=ps))
+        with self.assertRaises(wb.Unobserved):
+            wb._in_this_session(4242, run=ps)
+
+    def test_a_snapshot_with_no_session_root_cannot_disown_the_watcher(self):
+        """Every ancestor of this gate is a shell up to init: nothing scopes
+        the session, so the watcher keeps the pre-ancestry answer."""
+        me = os.getppid()
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 0, f"{me} 1 -zsh\n4242 1 bash\n", "")
+        self.assertTrue(wb._in_this_session(4242, run=ps))
+
+    def test_a_snapshot_decides_descent_from_the_session_root(self):
+        me = os.getppid()
+        def ps(argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 0, f"{me} 30 zsh\n30 20 claude\n20 1 tmux\n4242 30 bash\n4343 1 bash\n", "")
+        self.assertTrue(wb._in_this_session(4242, run=ps))
+        self.assertFalse(wb._in_this_session(4343, run=ps))
+
+    def test_a_detached_watcher_on_this_inbox_is_not_this_sessions(self):
+        """The real shape: a watcher reparented away from this session."""
+        script = self.ws / "watch-tasks-stream.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n")
+        out = subprocess.run(
+            ["bash", "-c", f'nohup bash "{script}" "{self.inbox}" >/dev/null 2>&1 & echo $!'],
+            capture_output=True, text=True, check=True).stdout.strip()
+        pid = int(out)
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        import watcher_identity
+        for _ in range(50):
+            if watcher_identity.proc_argv_vector(pid) is not None:
+                break
+            time.sleep(0.02)
+        else:
+            self.skipTest("no authoritative argv read on this platform")
+        table = wb._process_table()
+        if wb.session_root(table, os.getppid()) is None:
+            self.skipTest("this test process has no non-shell ancestor to scope to")
+        if table.get(pid, (0,))[0] != 1:
+            self.skipTest("a subreaper adopted the detached process")
+        self.sentinel(WORKER).write_text(f"{pid}\n")
+        d, why = wb.decide(instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+                           alive=lambda p: True)
+        self.assertEqual(d, "start", why)
+        self.assertIn("not started by this session", why)
+
+
 class TestTheShippedStartupNamesTheInbox(Base):
     """F1: the ownership check reads the watched inbox from argv, so the
     instruction that starts a worker's watcher has to put it there."""
@@ -346,6 +568,34 @@ class TestTheShippedStartupNamesTheInbox(Base):
         self.assertEqual(wb._target_from_argv(
             argv, 4242, argv_vector=lambda pid: shlex.split(argv)), self.inbox)
 
+    def test_a_tagged_watcher_is_read_by_its_tag_not_by_the_roles_value(self):
+        """`--role session --inbox X X` is the shape /startup --worker starts and
+        the shape a hand re-arm uses. Reading the first dash-less token made the
+        inbox "session", so this gate said start over a live watcher (#4698)."""
+        for argv in (f"bash src/watch-tasks-stream.sh --role session --inbox {self.inbox} {self.inbox}",
+                     f"bash src/watch-tasks-stream.sh {self.inbox} --role session --inbox {self.inbox}",
+                     f"bash src/watch-tasks-stream.sh --role=session --inbox={self.inbox} {self.inbox}"):
+            self.assertEqual(wb._target_from_argv(
+                argv, 4242, argv_vector=lambda pid, a=argv: shlex.split(a)), self.inbox, argv)
+
+    def test_the_tag_wins_over_a_positional_that_disagrees(self):
+        """Only the tag is a reliable cross-process identity: an inbox that came
+        from $SUTANDO_TASKS_DIR leaves no positional at all."""
+        argv = f"bash src/watch-tasks-stream.sh /somewhere/else --role session --inbox {self.inbox}"
+        self.assertEqual(wb._target_from_argv(
+            argv, 4242, argv_vector=lambda pid: shlex.split(argv)), self.inbox)
+
+    def test_a_tagged_live_watcher_makes_the_gate_skip_not_start(self):
+        """The end-to-end shape of #4698: the gate must not start a duplicate."""
+        argv = f"bash src/watch-tasks-stream.sh --role session --inbox {self.inbox} {self.inbox}"
+        self.sentinel(WORKER).write_text("4242\n")
+        decision, why = wb.decide(
+            instance=WORKER, inbox=self.inbox, workspace=str(self.ws),
+            alive=lambda pid: True, in_session=lambda pid: True,
+            watcher_target=lambda pid: wb._target_from_argv(
+                argv, pid, argv_vector=lambda _p: shlex.split(argv)))
+        self.assertEqual(decision, "skip", why)
+
     def test_an_argv_without_an_inbox_is_still_unknown(self):
         self.assertEqual(wb._target_from_argv("bash src/watch-tasks-stream.sh"), "")
 
@@ -368,7 +618,7 @@ class TestTheShippedStartupNamesTheInbox(Base):
         vec = ["bash", "src/watch-tasks-stream.sh", spaced]
         decision, _ = wb.decide(
             instance=WORKER, inbox=spaced, workspace=str(self.ws),
-            alive=lambda pid: True,
+            alive=lambda pid: True, in_session=lambda pid: True,
             watcher_target=lambda pid: wb._target_from_argv(
                 f"bash src/watch-tasks-stream.sh {spaced}", pid, argv_vector=lambda p: vec))
         self.assertEqual(decision, "skip")

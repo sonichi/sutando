@@ -17,7 +17,8 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
+2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `persistent: true`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
    Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
@@ -106,10 +107,19 @@ caps this file and refuses date stamps in it).
    `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
    position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
    Then pivot; never block.
-9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
-   owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
-   is UNKNOWN, not dead; never hand-roll a process check.
+9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
+   "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
+   if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
+   duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
+   change nothing and say so. A re-arm that prints `WATCHER_HELD:` on stdout did not start: it names
+   the holder (pid, role, whether its output is read) and the `--force-restart` command; report that
+   line and do not re-arm again. `--force-restart` replaces a holder; use it only on the owner's word.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
+   untagged watcher is invisible to the verdict above and to the supervisor.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.

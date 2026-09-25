@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""The loader's voice-room wiring: gateway readers, the owner cache, and the
-claim gate that holds an unverified room's result before any claim.
+"""The loader's voice-room wiring: gateway readers, the owner cache, the
+claim gate that holds an unverified room's result before any claim, and the
+post-claim room gate that re-judges the body the claim actually delivers.
 
 Loads src/remote-gateway-bridge.py in-process (the exec'd namespace gives the
 loader its `_req`, `_reenroll_identity` and `_proactive_route`) with a fake
@@ -14,8 +15,10 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SRC = Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py"
 AGENT = "@agent:example.org"
@@ -42,25 +45,34 @@ def _load(env: dict, name: str):
                 os.environ[k] = v
 
 
+DM_ROOM = "!dm:example.org"
+
+
 class FakeGateway:
     def __init__(self):
         self.calls = []
         self.rosters = {OK_ROOM: [AGENT, OWNER]}
         self.owner = OWNER
+        self.posts = []
 
     def req(self, method, path, payload=None, timeout=None):
         self.calls.append((method, path, payload))
         if path == "/v1/agents":
-            return {"agents": [{"id": AGENT, "owner": self.owner, "owner_dm_room": "!dm:example.org"}]}
+            return {"agents": [{"id": AGENT, "owner": self.owner, "owner_dm_room": DM_ROOM}]}
         if path == "/v1/room" and (payload or {}).get("op") == "members":
             room = payload["room_id"]
             if room in self.rosters:
                 return {"members": [{"user_id": u} for u in self.rosters[room]]}
             return {"error": "members read failed (HTTP 403)"}
+        if path == "/v1/room" and (payload or {}).get("op") == "message":
+            self.posts.append((payload["room_id"], payload["body"]))
+            return {"ok": True, "event_id": "$evt"}
         return {"ok": True}
 
 
-class LoaderVoiceRoomTests(unittest.TestCase):
+class _LoaderFixture(unittest.TestCase):
+    """One fresh loader module per test, its gateway faked in `_req`."""
+
     def setUp(self):
         self.ws = tempfile.mkdtemp(prefix="voice-room-loader-ws-")
         self.cfg = tempfile.mkdtemp(prefix="voice-room-loader-cfg-")
@@ -87,6 +99,8 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         p.write_text(body, encoding="utf-8")
         return p
 
+
+class LoaderVoiceRoomTests(_LoaderFixture):
     def test_verifier_is_wired_to_the_workspace_check_dir(self):
         self.assertEqual(self.mod.VOICE_ROOM_VERIFIER.check_dir.resolve(),
                          (Path(self.ws) / "state" / self.mod.CHECK_DIR_NAME).resolve())
@@ -166,7 +180,8 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         self.assertEqual(self.mod._voice_result_room(room_file), OK_ROOM)
         self.assertIsNone(self.mod._voice_result_room(dm_file))
         self.assertIsNone(self.mod._voice_result_room(skip_file), "a skip-marked file addresses no room")
-        self.assertIsNone(self.mod._voice_result_room(Path(self.ws) / "results" / "absent.txt"))
+        self.assertEqual(self.mod._voice_result_room(Path(self.ws) / "results" / "absent.txt"), "",
+                         "a file that cannot be read names no room it could be trusted with")
 
     def test_claim_gate_holds_an_unverified_room_and_logs_once(self):
         forged = self._result("proactive-result-task-4-4.to-ag2space.txt", f"[channel: {FORGED_ROOM}]\nforged")
@@ -198,6 +213,42 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         bad.write_bytes(b"[channel: " + b"\xff\xfe" + b"]\nbody")
         self.assertFalse(self.mod._ag2space_proactive_claim_gate(bad), "fail closed, never an exception")
         self.assertIn(bad.name, self.mod._VOICE_ROOM_HELD)
+        self.assertFalse(any(c[1] == "/v1/room" for c in self.gw.calls), "no room to ask about")
+
+    def test_unreadable_tagged_file_is_held_like_an_undecodable_one(self):
+        """An I/O failure on the read is no statement that the result has no
+        room: the gate holds the file, exactly as it holds an undecodable one."""
+        locked = self._result("proactive-result-task-12-12.to-ag2space.txt", f"[channel: {OK_ROOM}]\nbody")
+        real_read = Path.read_text
+
+        def denied(path, *a, **k):
+            if path.name == locked.name:
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real_read(path, *a, **k)
+        with mock.patch.object(Path, "read_text", denied):
+            self.assertEqual(self.mod._voice_result_room(locked), "")
+            self.assertFalse(self.mod._ag2space_proactive_claim_gate(locked), "fail closed: never claimed unread")
+            self.assertFalse(self.mod._ag2space_proactive_claim_gate(locked))
+        self.assertIn(locked.name, self.mod._VOICE_ROOM_HELD)
+        held = [line for line in self.logs if f"voice-room: holding {locked.name}" in line]
+        self.assertEqual(len(held), 1, self.logs)
+        self.assertIn("could not be read", held[0])
+        self.assertFalse(any(c[1] == "/v1/room" for c in self.gw.calls), "nothing was asked of the gateway")
+        self.assertTrue(self.mod._ag2space_proactive_claim_gate(locked), "released once the file reads again")
+        self.assertNotIn(locked.name, self.mod._VOICE_ROOM_HELD)
+
+    def test_room_gate_judges_only_the_tagged_voice_shape(self):
+        self.assertIs(self.mod.PROACTIVE_ROOM_GATE, self.mod._ag2space_proactive_room_gate)
+        gate = self.mod._ag2space_proactive_room_gate
+        results = Path(self.ws) / "results"
+        self.assertTrue(gate(results / "proactive-result-task-13-13.txt", FORGED_ROOM), "untagged: any bridge's")
+        self.assertTrue(gate(results / "proactive-13.txt", FORGED_ROOM), "not a voice result")
+        self.assertTrue(gate(results / "proactive-result-task-13-13.to-discord.txt", FORGED_ROOM), "another bridge's tag")
+        self.assertFalse(any(c[1] == "/v1/room" for c in self.gw.calls), "none of those is asked about")
+        self.assertFalse(gate(results / "proactive-result-task-14-14.to-ag2space.txt", FORGED_ROOM))
+        self.assertIn("proactive-result-task-14-14.to-ag2space.txt", self.mod._VOICE_ROOM_HELD)
+        self.assertTrue(gate(results / "proactive-result-task-14-14.to-ag2space.txt", OK_ROOM))
+        self.assertNotIn("proactive-result-task-14-14.to-ag2space.txt", self.mod._VOICE_ROOM_HELD)
 
     def test_held_file_is_released_once_the_room_verifies(self):
         late = self._result("proactive-result-task-8-8.to-ag2space.txt", "[channel: !late:example.org]\nlate")
@@ -207,6 +258,126 @@ class LoaderVoiceRoomTests(unittest.TestCase):
         self.mod.VOICE_ROOM_VERIFIER._cache.clear()
         self.assertTrue(self.mod._ag2space_proactive_claim_gate(late))
         self.assertNotIn(late.name, self.mod._VOICE_ROOM_HELD)
+
+
+class DrainRoomGateTests(_LoaderFixture):
+    """The production drain (`_post_proactive`, with the loader's own gates
+    injected) judged on the body it CLAIMS, not only on the one it peeked."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod._ROUTING.update(owner_dm=DM_ROOM, loaded=True, next=time.time() + 3600)
+        self.mod._GATE_FAILED_LOGGED.clear()
+
+    def tearDown(self):
+        self.mod._ROUTING.update(owner_dm="", loaded=False, next=0.0)
+        super().tearDown()
+
+    def _names(self):
+        return sorted(p.name for p in (Path(self.ws) / "results").iterdir() if p.is_file())
+
+    def _completing_rename(self, target: Path, body: str, on_claim=None, handback_fails=False):
+        """A Path.rename that finishes writing `target` just before it is claimed:
+        the writer's last bytes landing between the drain's peek and its claim."""
+        real_rename, real_write = Path.rename, Path.write_text
+
+        def rename(path, dest):
+            if path.name == target.name:
+                real_write(path, body)
+                if on_claim:
+                    on_claim()
+            elif handback_fails and Path(dest).name == target.name:
+                raise PermissionError(1, "Operation not permitted", str(dest))
+            return real_rename(path, dest)
+        return mock.patch.object(Path, "rename", rename)
+
+    def test_partial_peek_complete_claim_forged_room_is_never_delivered(self):
+        partial = self._result("proactive-result-task-20-20.to-ag2space.txt", "[channel: !forged:ex")
+        full = f"[channel: {FORGED_ROOM}]\nforged room body"
+        with self._completing_rename(partial, full):
+            self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [], "the forged room never gets the completed body")
+        self.assertEqual(self._names(), [partial.name], "handed back under its own name, not claimed or eaten")
+        self.assertEqual(partial.read_text(), full)
+        self.assertIn(partial.name, self.mod._VOICE_ROOM_HELD)
+        self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [])
+        self.assertEqual(self._names(), [partial.name], "held by the claim gate from the next pass on")
+        held = [line for line in self.logs if f"voice-room: holding {partial.name}" in line]
+        self.assertEqual(len(held), 1, self.logs)
+
+    def test_without_the_post_claim_gate_the_forged_body_would_have_gone_out(self):
+        """Negative control: the same race with only the pre-claim gate delivers
+        the forged body — what the post-claim gate exists to stop."""
+        partial = self._result("proactive-result-task-21-21.to-ag2space.txt", "[channel: !forged:ex")
+        self.mod.PROACTIVE_ROOM_GATE = None
+        with self._completing_rename(partial, f"[channel: {FORGED_ROOM}]\nforged room body"):
+            self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [(FORGED_ROOM, "forged room body")])
+
+    def test_refused_claim_whose_hand_back_fails_stays_claimed_never_delivered(self):
+        partial = self._result("proactive-result-task-26-26.to-ag2space.txt", "[channel: !forged:ex")
+        with self._completing_rename(partial, f"[channel: {FORGED_ROOM}]\nforged room body", handback_fails=True):
+            self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [])
+        self.assertEqual(self._names(), [f"proactive-result-task-26-26.to-ag2space.sending.{os.getpid()}"],
+                         "left under its claim for orphan recovery, not delivered and not eaten")
+
+    def test_verified_room_is_delivered_and_a_stale_failure_mark_is_dropped(self):
+        ok = self._result("proactive-result-task-22-22.to-ag2space.txt", f"[channel: {OK_ROOM}]\nverified room body")
+        self.mod._GATE_FAILED_LOGGED.add(ok.name)
+        self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [(OK_ROOM, "verified room body")])
+        self.assertNotIn(ok.name, self._names(), "claimed and archived")
+        self.assertNotIn(ok.name, self.mod._GATE_FAILED_LOGGED)
+        self.assertEqual(sum(1 for c in self.gw.calls if c[1] == "/v1/room" and (c[2] or {}).get("op") == "members"), 1,
+                         "pre- and post-claim verdicts share one cached gateway read")
+
+    def test_gate_raising_before_the_claim_holds_a_room_bound_result(self):
+        tagged = self._result("proactive-result-task-23-23.to-ag2space.txt", f"[channel: {OK_ROOM}]\nroom body")
+
+        def broken(room):
+            raise RuntimeError("verifier down")
+        self.mod.VOICE_ROOM_VERIFIER.verified = broken
+        self.mod._post_proactive()
+        self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [])
+        self.assertEqual(self._names(), [tagged.name], "not claimed: no .sending, nothing archived")
+        failed = [line for line in self.logs if f"proactive {tagged.name} held: room gate failed" in line]
+        self.assertEqual(len(failed), 1, self.logs)
+        self.assertIn("verifier down", failed[0])
+
+    def test_gate_raising_after_the_claim_hands_the_result_back(self):
+        tagged = self._result("proactive-result-task-24-24.to-ag2space.txt", f"[channel: {OK_ROOM}]\nroom body")
+        real_verified = self.mod.VOICE_ROOM_VERIFIER.verified
+        broken = [False]
+
+        def flaky(room):
+            if broken[0]:
+                raise RuntimeError("verifier down")
+            return real_verified(room)
+        self.mod.VOICE_ROOM_VERIFIER.verified = flaky
+
+        def break_now():
+            broken[0] = True
+        with self._completing_rename(tagged, tagged.read_text(), on_claim=break_now):
+            self.mod._post_proactive()
+        self.assertEqual(self.gw.posts, [])
+        self.assertEqual(self._names(), [tagged.name], "handed back, never delivered")
+        self.assertEqual(sum(1 for line in self.logs if "room gate failed" in line), 1)
+
+    def test_plain_owner_nudges_still_deliver_through_a_raising_gate(self):
+        nudge = self._result("proactive-1700000000.txt", "plain owner nudge")
+        untagged = self._result("proactive-result-task-25-25.txt", "voice result for the owner")
+
+        def broken(path):
+            raise RuntimeError("gate down")
+        self.mod.PROACTIVE_CLAIM_GATE = broken
+        self.mod._post_proactive()
+        self.assertEqual(sorted(self.gw.posts), [(DM_ROOM, "plain owner nudge"), (DM_ROOM, "voice result for the owner")])
+        self.assertNotIn(nudge.name, self._names())
+        self.assertNotIn(untagged.name, self._names())
+        self.assertFalse(any("room gate failed" in line for line in self.logs), "nothing room-bound was held")
 
 
 if __name__ == "__main__":

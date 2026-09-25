@@ -580,6 +580,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ps.standardOutput = psPipe
         ps.standardError = FileHandle.nullDevice
         do { try ps.run() } catch { return nil }
+        // Drain BEFORE waiting: this listing exceeds the 64 KiB pipe buffer, so
+        // waiting first deadlocks ps on write against a main thread that never reads.
+        let out = psPipe.fileHandleForReading.readDataToEndOfFile()
         ps.waitUntilExit()
         // A failed ps must read as unknown -- an empty listing from a
         // non-zero exit is not a clean "no match" (the sysmond-unreachable
@@ -588,19 +591,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
             return nil
         }
-        let listing = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let listing = String(data: out, encoding: .utf8) ?? ""
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        // A definite match short-circuits alive; an undecidable line must not
-        // be overridden by a later definite-false one, or an ambiguous argv reads as dead.
+        let myInbox = canonicalInbox(ProcessInfo.processInfo.environment["SUTANDO_TASKS_DIR"] ?? workspace + "/tasks")
+        // A tagged line answers by its inbox: this core's own is alive, another
+        // instance's is foreign. A bare two-token line has no operand, so it is a
+        // pre-upgrade watcher of this core, not a worker's: alive, never a relaunch.
         var sawUndecidable = false
+        var sawForeignWatcher = false
         for line in listing.split(separator: "\n") {
             switch watcherLineMatches(line, excluding: selfPID) {
             case .some(true): return true
-            case .none: sawUndecidable = true
+            case .none:
+                guard let tagged = sessionWatcherInboxTag(line) else {
+                    sawUndecidable = true
+                    continue
+                }
+                if tagged == myInbox { return true }
+                sawForeignWatcher = true
             case .some(false): continue
             }
         }
-        return sawUndecidable ? nil : false
+        if sawUndecidable { return nil }
+        if sawForeignWatcher {
+            logToFile("checkWatcher: session watcher(s) seen for other inboxes only, none for \(myInbox) -- not this core's")
+        }
+        return false
     }
 
     /// True when `s` contains the watcher script's name at a path/whitespace
@@ -619,6 +635,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
     /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    /// A bare-`true` here says a watcher with no operand runs; which inbox a
+    /// tagged (multi-token) line serves is `watcherProcessSeen`'s question.
     private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
         let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -637,6 +655,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if parts.count == 2 { return false }
         // A spaced script path is indistinguishable from a script plus arguments.
         return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
+    /// The `--inbox` of a line tagged `--role session`, canonicalized, or nil when
+    /// either tag is absent. The value runs to the next `--flag` or the end of the
+    /// line, so a directory with a space in its path survives the flattened argv.
+    private func sessionWatcherInboxTag(_ line: Substring) -> String? {
+        let text = String(line)
+        guard let role = flagValue("role", in: text), role == "session" else { return nil }
+        guard let inbox = flagValue("inbox", in: text), !inbox.isEmpty else { return nil }
+        return canonicalInbox(inbox)
+    }
+
+    /// `--name value` or `--name=value` out of a flattened argv; nil when absent.
+    private func flagValue(_ name: String, in text: String) -> String? {
+        let pattern = "--" + name + "(?:=|\\s+)(.+?)(?=\\s+--[a-z]|\\s*$)"
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let r = Range(m.range(at: 1), in: text) else { return nil }
+        return text[r].trimmingCharacters(in: .whitespaces)
+    }
+
+    /// One spelling per inbox: symlinks resolved, trailing and doubled slashes gone,
+    /// so the same directory written two ways never reads as two inboxes.
+    private func canonicalInbox(_ path: String) -> String {
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
     }
 
     /// Both halves are Claude-only. Dispatching against a live non-Claude

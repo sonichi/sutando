@@ -74,7 +74,7 @@ class Harness:
                   "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND"):
             env.pop(k, None)
         self.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks")],
+            ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
 

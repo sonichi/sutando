@@ -1349,6 +1349,9 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -2682,6 +2685,35 @@ def _maybe_push_agent_profile(record) -> bool:
     return True
 
 
+# The primary app checks every 30 minutes; the fallback checks every five.
+_HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
+def _reported_core_status() -> tuple[str | None, str | None]:
+    """Overlay independent diagnostics without exporting their private details."""
+    status, step = _read_core_status()
+    if status in ("error", "offline"):
+        return status, step
+    try:
+        report = json.loads((_STATE / "agent-health.json").read_text())
+    except FileNotFoundError:
+        return status, step
+    except Exception:
+        return "unknown", "Health check unavailable"
+    try:
+        ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
+        if (report.get("version") != 1 or type(ts) not in (int, float)
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or type(total) is not int or total <= 0
+                or type(failures) is not int or not 0 <= failures <= total):
+            return "unknown", "Health check unavailable"
+        if failures:
+            return "error", f"Health check: {failures} failing check(s)"
+    except Exception:
+        return "unknown", "Health check unavailable"
+    return status, step
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2692,7 +2724,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
-    _status, _step = _read_core_status()
+    _status, _step = _reported_core_status()
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3499,6 +3531,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3658,7 +3704,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3681,8 +3729,11 @@ def _post_proactive() -> None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3716,6 +3767,20 @@ def _post_proactive() -> None:
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -4484,6 +4549,17 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
             continue
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is not None:
+            try:
+                headers = local_task_protocol.parse_task_headers(
+                    task.read_text(encoding="utf-8", errors="replace")).headers
+            except OSError:
+                continue
+            # Cron completions belong to the local scheduler, not a gateway lease.
+            # Leave their delivery and retirement to the local consumers.
+            if headers.get("source") == "cron":
+                continue
         try:
             age = now - rfile.stat().st_mtime
         except OSError:
@@ -4509,7 +4585,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
-        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
             if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue

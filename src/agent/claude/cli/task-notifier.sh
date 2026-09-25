@@ -44,6 +44,13 @@ SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
 # A queued task with nothing left to re-trigger it (composer busy, staging
 # failed) would otherwise wait forever for an unrelated wake. See the main loop.
 RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
+# Consecutive composer-not-empty refusals before the owner is told; only they can clear it.
+COMPOSER_BLOCK_ESCALATE_AFTER="${SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER:-4}"
+# Per instance: pool workers share this workspace but each types into its own pane. Owner: util_paths.
+# Empty when unresolvable; note_composer_block then alerts from memory instead of counting.
+COMPOSER_BLOCK_FILE="$("$NOTIFIER_PY" "$REPO/src/util_paths.py" composer-block-path "$WORKSPACE_DIR/state" 2>/dev/null)" || COMPOSER_BLOCK_FILE=""
+# "incarnation filename" already alerted by this process when the record cannot be written.
+COMPOSER_BLOCK_ALERTED=""
 watcher_pid=""
 event_dir=""
 # FIFO of announced-but-unresolved filenames, as marker files (oldest mtime =
@@ -57,8 +64,38 @@ stop_watcher() {
   watcher_pid=""
 }
 
+# The supervisor stops this notifier with TERM once a session watcher is ready;
+# say which ending this is, so the log answers "how often was the standby needed".
+# The standby watcher yields to a session watcher it sees before that watcher
+# has stamped, so "ready" is re-polled briefly before an ending is called a loss.
+# $2 = how many times to ask. On a SIGNAL the answer is asked once: the
+# supervisor sends TERM precisely because role-present already said yes, and a
+# handler that polls for seconds delays cleanup_notifier past its killer's patience.
+standby_end_log() {
+  local i v="" tries="${2:-10}"
+  for i in $(seq 1 "$tries"); do
+    # rc 2 is "the process table could not be read", and under `set -e` a bare
+    # assignment from it would end the notifier instead of logging its ending.
+    v="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || v="unknown"
+    [ "$v" = "yes" ] && break
+    sleep 0.5
+  done
+  if [ "$v" = "yes" ]; then
+    log_notifier "standby stood down for $TASKS_DIR ($1): a session-role watcher is ready"
+  else
+    log_notifier "standby ended for $TASKS_DIR ($1) with no session-role watcher ready"
+  fi
+}
+trap 'exit 0' HUP INT TERM
+
 cleanup_notifier() {
+  # The watcher goes FIRST: the ending is logged from here, and a probe that ran
+  # before the watcher was stopped would delay its kill past a caller's patience.
   stop_watcher
+  # Only the hand-off waits (the standby yields before the session watcher has
+  # stamped); asking once elsewhere keeps this notifier's own exit prompt.
+  [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1
+    standby_end_log "${STANDBY_END_WHY:-notifier exiting}" "${STANDBY_END_TRIES:-1}"; }
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
     rm -rf "$event_dir/queue" 2>/dev/null || true
@@ -66,13 +103,77 @@ cleanup_notifier() {
   fi
 }
 trap cleanup_notifier EXIT
-trap 'exit 0' HUP INT TERM
-
 log_notifier() {
   local msg="task-notifier: $*" dir
   dir="$WORKSPACE_DIR/logs"
   [ -d "$dir" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$dir/claude-task-notifier.log" 2>/dev/null
   printf '%s\n' "$msg" >&2
+}
+
+write_composer_block() {
+  local tmp
+  [ -n "$COMPOSER_BLOCK_FILE" ] || return 1
+  # mv onto a directory moves INTO it and reports success.
+  [ ! -d "$COMPOSER_BLOCK_FILE" ] || return 1
+  mkdir -p "$(dirname "$COMPOSER_BLOCK_FILE")" 2>/dev/null || true
+  tmp="$(mktemp "$COMPOSER_BLOCK_FILE.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s\n' "$1" >"$tmp" 2>/dev/null && mv -f "$tmp" "$COMPOSER_BLOCK_FILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+clear_composer_block() {
+  [ -n "$COMPOSER_BLOCK_FILE" ] || return 0
+  rm -f "$COMPOSER_BLOCK_FILE" 2>/dev/null \
+    || log_notifier "could not clear composer-block record $COMPOSER_BLOCK_FILE; continuing"
+}
+
+alert_composer_block() {
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  command -v osascript >/dev/null 2>&1 || return 0
+  # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
+  (
+    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" &
+    op=$!
+    (
+      trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
+      sleep 2 & s=$!
+      wait "$s" || true
+      kill -TERM "$op" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$op" 2>/dev/null || true
+    ) &
+    wd=$!
+    wait "$op" 2>/dev/null || true
+    kill -TERM "$wd" 2>/dev/null || true
+    wait "$wd" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+}
+
+# Record "n incarnation filename [alerted]", keyed so the count spans --event runs and retries.
+# Persist before alerting; at-least-once: a lost "alerted" write may repeat the alert.
+note_composer_block() {
+  local filename="$1" incarnation="$2" n=0 alerted="" rec_n rec_inc rec_file rec_alerted
+  if [ -n "$COMPOSER_BLOCK_FILE" ] \
+     && read -r rec_n rec_inc rec_file rec_alerted 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
+     && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
+    case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
+    [ "$rec_alerted" = alerted ] && alerted=alerted
+  fi
+  n=$((n + 1))
+  if write_composer_block "$n $incarnation $filename${alerted:+ $alerted}"; then
+    [ -z "$alerted" ] && [ "$n" -ge "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
+    alert_composer_block "$filename" "$n"
+    write_composer_block "$n $incarnation $filename alerted" \
+      || log_notifier "could not record the composer-block alert for $filename; it may repeat"
+    return 0
+  fi
+  log_notifier "could not persist composer-block count for $filename (${COMPOSER_BLOCK_FILE:-path unresolved}); alerting now"
+  [ "$COMPOSER_BLOCK_ALERTED" = "$incarnation $filename" ] && return 0
+  COMPOSER_BLOCK_ALERTED="$incarnation $filename"
+  alert_composer_block "$filename" "$n"
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -103,7 +204,7 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # cli_wedge) or a dialog holds; a running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude >/dev/null 2>&1
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" --probe >/dev/null 2>&1
 }
 
 pane_text_composer_is_empty() {
@@ -268,8 +369,10 @@ deliver_prompt() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+      note_composer_block "$filename" "$incarnation"
       return 1
     fi
+    clear_composer_block
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
@@ -348,9 +451,20 @@ press_enter_and_confirm() {
   done
 }
 
+# What the prompt tells the session to read: the payload a resolver-backed
+# announcement named, else the inbox entry itself (the core's tasks/ case).
+task_payload() {
+  local p=""
+  [ -n "${PAYLOAD_DIR:-}" ] && p="$(cat "$PAYLOAD_DIR/$1" 2>/dev/null)"
+  printf '%s' "${p:-$TASKS_DIR/$1}"
+}
+
+# The notifier only ever delivers as the STANDBY (a session watcher stands it
+# down), so the prompt says so and names the re-arm: the session reading it is
+# looking at exactly the problem the Stop hook would otherwise block on later.
 task_prompt() {
-  printf 'Sutando task ready: %s. Read %s/%s, follow CLAUDE.md, complete the task, and write the result to %s/%s.' \
-    "$1" "$TASKS_DIR" "$1" "$RESULTS_DIR" "$1"
+  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
+    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
 # Whitespace is not identity in a wrapped composer: when another pending task's
@@ -375,6 +489,7 @@ submit_task() {
     log_notifier "no session $SESSION — dropping $filename"
     return 0
   fi
+  log_notifier "delivering $filename as the standby: no session-role watcher holds $TASKS_DIR"
   # A capture can fail (the pane is gone); the liveness wait below is what decides that.
   raw="$(capture_raw)" || raw=""
   incarnation="$(core_incarnation)"
@@ -425,17 +540,22 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
+# A new notifier starts a new episode; a record left by the previous one is not its history.
+clear_composer_block
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-claude-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"
-mkdir -p "$queue_dir"
+PAYLOAD_DIR="$event_dir/payload"
+mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 "$NOTIFIER_PY" -c \
-  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
+log_notifier "standby armed for $TASKS_DIR (standby watcher pid $watcher_pid)"
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
+# The core's question: on a delivery inbox the sentinel IS this instance's assignment.
 filename_is_worker_held() {
   local filename="$1" rc=0
   "$NOTIFIER_PY" "$DISPATCH_PY" worker-holds "$DELIVERIES_DIR" "$filename" || rc=$?
@@ -459,11 +579,21 @@ filename_is_claimed() {
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local filename="$1" tier
-  case "$filename" in ""|*/*|*..*) return 0 ;; esac
+  local announced="$1" entry filename payload tier rc=0 resolved=()
+  # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
+  # payload path a resolver-backed watcher announces, which must sit in the workspace's
+  # task store. A refusal (rc 1) types nothing quietly; any other failure is a broken
+  # reader and is logged, never a silent drop.
+  [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] || resolved=(--resolved "$WORKSPACE_DIR/tasks")
+  entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${resolved[@]+"${resolved[@]}"} 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
+    return 0
+  fi
+  filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   has_result "$filename" && return 0
   [ -e "$queue_dir/$filename" ] && return 0
-  if filename_is_worker_held "$filename"; then
+  if [ "${SUTANDO_INBOX_KIND:-}" != "deliveries" ] && filename_is_worker_held "$filename"; then
     log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
     return 0
   fi
@@ -471,9 +601,10 @@ enqueue_announced_task() {
     log_notifier "$filename has a live task-event-handler claim; not queuing, not typing into the core"
     return 0
   fi
+  printf '%s' "$payload" > "$PAYLOAD_DIR/$filename"
   # `|| tier=""`: under set -e, a bare `tier="$(...)"` on a failing
   # subprocess exits the whole notifier before the case below ever runs.
-  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$TASKS_DIR/$filename" 2>/dev/null)" || tier=""
+  tier="$("$NOTIFIER_PY" "$DISPATCH_PY" priority-tier "$payload" 2>/dev/null)" || tier=""
   case "$tier" in
     urgent|normal|low) ;;
     *)
@@ -513,7 +644,7 @@ process_announced_queue() {
     filename="$(queue_head)"
     [ -n "$filename" ] || return 0
     if has_result "$filename"; then
-      rm -f "$queue_dir/$filename"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
     if ! wait_for_core_healthy; then
@@ -523,7 +654,7 @@ process_announced_queue() {
     fi
     submit_task "$filename"
     if has_result "$filename"; then
-      rm -f "$queue_dir/$filename"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
     return 0
@@ -550,5 +681,6 @@ while :; do
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
+  STANDBY_END_WHY="standby watcher exited"; STANDBY_END_TRIES=10
   break   # the watcher died -- genuine EOF, stop the notifier
 done < "$event_dir/events"
