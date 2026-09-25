@@ -3,6 +3,7 @@
 
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { cuePath, lineInstruction, toBeats, type Beat, type ScriptItem } from './present.js';
 
 // Read at call time: manifest config lands in process.env after imports are hoisted.
 const relayUrl = () => (process.env.ROOM_COLLAB_RELAY_URL || 'http://127.0.0.1:7877').replace(/\/$/, '');
@@ -92,4 +93,94 @@ export const roomScriptTool: ToolDefinition = {
 	},
 };
 
-export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool, roomScriptTool];
+// One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
+const talk: { beats: Beat[]; pos: number; active: boolean } = { beats: [], pos: 0, active: false };
+
+/** Take a beat's actions (in order, waiting out pauses), then hand back its line. */
+async function runBeat(beat: Beat): Promise<string | null> {
+	for (const cue of beat.cues) {
+		if (cue.cue === 'pause') await new Promise((r) => setTimeout(r, Math.min(cue.seconds, 10) * 1000));
+		const path = cuePath(cue);
+		if (path) await relay('POST', path);
+	}
+	return beat.say || null;
+}
+
+/** Run beats until one has a line to say (a beat of only actions just runs). */
+async function nextLine(): Promise<{ say: string; n: number } | null> {
+	while (talk.pos < talk.beats.length) {
+		const beat = talk.beats[talk.pos++];
+		const say = await runBeat(beat);
+		if (say) return { say, n: talk.pos };
+	}
+	talk.active = false;
+	return null;
+}
+
+export const roomPresentTool: ToolDefinition = {
+	name: 'room_present',
+	description:
+		'Give the talk in the room\'s "Talk script", for everyone watching the room\'s deck. ' +
+		'"start" loads the script and runs the first beat (it moves the slides and highlights ITSELF), then returns the first line: say it. ' +
+		'After each line you say, the next beat arrives by itself as a silent control message: say only its line. Never narrate the script ahead. ' +
+		'If someone interrupts or asks a question: call "pause", answer them, then call "resume" to continue from the same place. ' +
+		'"goto" jumps to a script step (1-based); "stop" ends the talk. Use this, not room_script, whenever the user asks you to present.',
+	parameters: z.object({
+		action: z.enum(['start', 'pause', 'resume', 'goto', 'stop']),
+		step: z.number().int().min(1).optional().describe('For goto: the 1-based script step'),
+	}),
+	execution: 'inline',
+	timeout: 20_000,
+	async execute(args) {
+		const { action, step } = args as { action: 'start' | 'pause' | 'resume' | 'goto' | 'stop'; step?: number };
+		if (action === 'pause' || action === 'stop') {
+			talk.active = false;
+			if (action === 'stop') talk.pos = talk.beats.length;
+			return { ok: true, state: action === 'pause' ? 'paused — call resume to continue' : 'stopped' };
+		}
+		if (action === 'start' || talk.beats.length === 0) {
+			const script = await relay('GET', '/script');
+			if (script.error) return script;
+			talk.beats = toBeats((script.steps as ScriptItem[][]) ?? []);
+			talk.pos = 0;
+			await relay('POST', '/highlight/clear'); // a talk starts from a clean stage
+			if (!talk.beats.length) return { error: 'the Talk script is empty' };
+		}
+		if (action === 'goto') {
+			const at = talk.beats.findIndex((b) => b.step === (step ?? 1) - 1);
+			if (at < 0) return { error: `no script step ${step}` };
+			talk.pos = at;
+		} else if (action === 'resume' && talk.pos > 0) {
+			talk.pos -= 1; // re-deliver the beat that was interrupted
+		}
+		talk.active = true;
+		const line = await nextLine();
+		if (!line) return { ok: true, state: 'the talk is over' };
+		return { ok: true, say: line.say, line: line.n, of: talk.beats.length, instruction: 'Say ONLY this line, then stop.' };
+	},
+};
+
+export const tools: ToolDefinition[] = [roomSlideTool, roomHighlightTool, roomStageTool, roomScriptTool, roomPresentTool];
+
+/** Pace the talk on turn ends: after the model finishes a line, take the next beat. */
+export function setup(ctx: { session: unknown; injectText: (session: unknown, text: string) => void }): void {
+	const sess = ctx?.session as { eventBus?: { subscribe?: (ev: string, fn: () => void) => void } } | undefined;
+	if (!sess?.eventBus?.subscribe || typeof ctx.injectText !== 'function') {
+		console.warn('[room-collab] no turn events on this session; room_present runs one line per call');
+		return;
+	}
+	sess.eventBus.subscribe('turn.end', () => {
+		if (!talk.active) return;
+		// Deferred past the turn's finalization, or the cue merges into the ended turn.
+		setTimeout(async () => {
+			if (!talk.active) return;
+			const line = await nextLine();
+			if (!line) return;
+			try {
+				ctx.injectText(ctx.session, lineInstruction(line.say, line.n, talk.beats.length));
+			} catch (err) {
+				console.warn(`[room-collab] present inject failed: ${err instanceof Error ? err.message : err}`);
+			}
+		}, 750);
+	});
+}
