@@ -875,12 +875,12 @@ async def run(args: argparse.Namespace) -> int:
         return 0
     if args.command == "search":
         from room_collab_relay import search_room
-        from room_search import render
+        from room_search import render as render_hits
         body = await search_room(lambda kind: open_room_collab(url, args.room, token, kind=kind,
                                                                insecure=args.insecure),
                                  args.query, args.limit)
         print(json.dumps(body, ensure_ascii=False, indent=2) if args.json
-              else render(body["hits"], body["failed"]))
+              else render_hits(body["hits"], body["failed"]))
         return 0
     if args.command == "relay":
         from room_collab_relay import serve
