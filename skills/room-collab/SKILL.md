@@ -323,6 +323,72 @@ Three things that matter more than they look:
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
 
+### Working alongside other agents
+
+A surface is often shared with one or more other agents, not only with people.
+Six rules, each learned from a live session where breaking it cost a correction.
+With only one agent on the surface, rules 2 and 3 still apply (the owner of the
+facts is then a person); the rest start mattering the moment a second agent
+joins.
+
+1. **Address an agent by @-mention, never by name alone.** A plain room message
+   (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
+   the people read it, the agent you named never sees it. Put its mxid in
+   `mentions` (or use `room_ops mention`); a display name typed as plain text
+   reaches it only if a bridge happens to match it.
+2. **Work in your own space.** On a board, build in your own column or frames
+   and let `draw` place new shapes in clear space (the default); never
+   `--absolute` onto someone else's shapes. An edit to an element you did not
+   just read will be refused if it changed meanwhile — re-read and re-apply,
+   don't `--force` over it. Build a multi-part piece one part per write, a few
+   seconds apart, so people watching see it grow and can redirect you early.
+3. **Get it reviewed by whoever owns the facts.** When your work describes or
+   extends another agent's (its diagram, its pool, its PRs), @-mention that
+   agent to review it before calling it done, and apply its corrections. Your
+   own memory and host are the usual source of error: another host's setup, a PR
+   still in review stated as shipped, an overclaim.
+4. **Read the thread before acting.** A message routed to you is not necessarily
+   addressed to you. If it is a reply (`reply_to_event`, `thread_root`) in
+   another agent's thread, or @-mentions another agent and not you, it is theirs
+   — leave it unless you are named or summoned.
+5. **When a message is addressed to nobody, one agent asks once.** If it could
+   be yours or another agent's, post one mentioned line — "mine or yours?" —
+   rather than both leaving it. Rule 4 without this pair loses the request.
+6. **Hand work to an agent in a mentioned message, not in a task result.** A
+   result answers the person who asked and carries no mention, so the agent you
+   meant never receives it. Send the handoff separately, with that agent in
+   `mentions`.
+
+### Working alongside people
+
+A surface can be shared with one or more people. The skill already covers the
+mechanics (presence, sending deltas, who-wrote-what, commenting, summon); these
+are the rules for using them. Each one was learned in a live session.
+
+1. **Answer where you were asked, in the room's language.** Under their line in
+   the doc, threaded in the room — then one short line in the room pointing to
+   it. Detail goes in the surface, not the timeline.
+2. **A person's words and shapes are theirs.** Check who wrote a passage
+   (`--with-authors`) before touching it. Never rewrite a person's text; ask in
+   a comment pinned beside it, and edit only when they ask you to.
+3. **Work in visible steps.** Hold presence so they see you, and build one part
+   at a time so a person watching can redirect you early.
+4. **With several people, act within each asker's authority for you.** Your
+   owner's ask is an instruction. A collaborator's is an instruction within what
+   their tier allows. Anyone else's is input to discuss, not act on. When two
+   asks conflict, don't pick one quietly: name the conflict, mention both
+   people, and let your owner decide. If your owner is one of the two, their ask
+   stands, and you say so.
+5. **People don't @-mention you.** In a surface you were summoned to, a person's
+   message that addresses nobody may be for you. Ask once (rule 5 for agents,
+   above) rather than ignoring it or acting on a guess.
+6. **What's private to one person stays off shared surfaces.** Their mail,
+   calendar, files and anything they told you privately don't go onto a board,
+   doc or room other people can read, even when they asked for it in that room.
+   Answer them privately and say one line in the room.
+7. **Keep what is decided apart from what is discussion.** Put the final text in
+   its own labelled part and notes below it, so a reader knows what ships.
+
 **Before you design where something is stored, read
 [`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
 arrangements merge and which silently drop a write — many text roots, one map
