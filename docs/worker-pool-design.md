@@ -34,9 +34,15 @@ core created), **router** (turns a declared target into a delivery), **Task Brid
 (the single admission gate), **process supervisor** (`launchd` on macOS), **pool**
 (core + router + workers). "Lead" and "follower" are retired.
 
-A worker runs on whatever agent runtime the install uses — Claude Code today, whose
-unit of execution is a *session*. That is the runtime's concept, not Sutando's: a
-worker is not a session, has many over its life, and exists with none running.
+A worker selects a supported CLI runtime at creation. Claude Code and Codex run in
+separate tmux sessions with the same delivery and result protocol. A worker is
+not a runtime session: it keeps its id and inbox across runs.
+
+Claude accepts a chosen session ID and can resume that conversation. Codex
+assigns its own ID, so Codex workers record `session_id: null` until that ID can
+be captured reliably. A dead Codex worker starts a fresh conversation under
+the same worker ID and inbox; `--resume` refuses rather than claim continuity it
+cannot prove. Pending deliveries remain assigned to that worker.
 
 **A worker has an id and a label.** The id is the worker's identity, opaque, never
 changed or reused; every path, filename, roster key and header names it. The label

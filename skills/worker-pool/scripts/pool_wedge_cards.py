@@ -58,6 +58,15 @@ def seat_label(workspace, worker_id) -> str:
     return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id[:8]})"
 
 
+def worker_runtime(workspace, worker_id) -> str | None:
+    """Use the roster's runtime, the same source used by the wedge observer."""
+    row = sup.supervised_workers(workspace).get(worker_id)
+    if not isinstance(row, dict):
+        return None
+    runtime = row.get("runtime") or "claude"  # legacy roster rows predate this field
+    return runtime if runtime in sup.pane_gate.ADAPTERS else None
+
+
 def capture(socket, session, runner=subprocess.run) -> str | None:
     try:
         done = runner(["tmux", "-S", str(socket), "capture-pane", "-p", "-J", "-t", f"={session}:0"],
@@ -100,12 +109,17 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     socket, session = sup._open_tmux(workspace, worker_id)
     if not socket:
         return {"worker_id": worker_id, "outcome": "no-recorded-session"}
+    runtime = worker_runtime(workspace, worker_id)
+    if runtime is None:
+        return {"worker_id": worker_id, "outcome": "indeterminate",
+                "probe": "worker runtime unavailable"}
     text = capture(socket, session, runner)
     if text is None:
         return {"worker_id": worker_id, "outcome": "indeterminate", "probe": "pane unread"}
     seat = seat_label(workspace, worker_id)
     frame = cw.raw_state_id(text)
-    pane = sup.classify_pane_text(text, workspace=workspace, socket=socket, session=session)
+    pane = sup.classify_pane_text(text, runtime, workspace=workspace,
+                                  socket=socket, session=session)
     subject = {"source": SOURCE, "worker_id": worker_id, "session": session, "wedge": which,
                "frame": frame}
     device = {"id": session, "name": seat, "socket": str(socket)}
@@ -113,7 +127,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         req = HumanRequirement(
-            kind="confirmation", runtime="claude", device=device, subject=subject,
+            kind="confirmation", runtime=runtime, device=device, subject=subject,
             title=f"{seat} · its turn looks frozen",
             message=(f"{seat} (tmux session {session}) owes work and its screen has not changed "
                      "across supervision ticks. Send Escape interrupts the turn; it is typed only "
@@ -126,7 +140,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         if abn is None:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         lines = cause_lines(text)
-        via_proxy = routed(socket, session) is True and (
+        via_proxy = runtime == "claude" and routed(socket, session) is True and (
             abn.retrying or any(n in _PROXY_CAUSES for n in abn.names))
         cause = ", ".join(abn.names)
         body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
@@ -140,7 +154,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]
                    if via_proxy else []) + [_jump(session)]
         req = HumanRequirement(
-            kind="choice" if via_proxy else "core-blocked", runtime="claude", device=device,
+            kind="choice" if via_proxy else "core-blocked", runtime=runtime, device=device,
             subject=subject, title=f"{seat} · {abn.kind}: {cause}", message="\n".join(body),
             guard=f"{SOURCE}:{session}:cause:{cause}", actions=actions,
             turn_on_action=via_proxy)
@@ -170,8 +184,10 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
             continue
         socket, session = (r.device or {}).get("socket"), subj.get("session")
         text = capture(socket, session, runner) if socket and session else None
-        still = (text is not None and cw.raw_state_id(text) == subj.get("frame")
-                 and sup.classify_pane_text(text, workspace=workspace, socket=socket,
+        runtime = worker_runtime(workspace, subj.get("worker_id"))
+        still = (runtime is not None and runtime == r.runtime
+                 and text is not None and cw.raw_state_id(text) == subj.get("frame")
+                 and sup.classify_pane_text(text, runtime, workspace=workspace, socket=socket,
                                             session=session) == ps.PANE_WORKING)
         if not still:
             _note(manager, r.id, refused=REFUSED_NOTE)

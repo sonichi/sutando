@@ -362,9 +362,12 @@ class WorkerLaunchStartsNoNotifier(unittest.TestCase):
         h = Harness()
         try:
             wid = "c" * 32
+            delivery_writer = h.td / "pool_delivery.py"
+            delivery_writer.write_text("# Test-only writer path for the worker launcher.\n")
             run = h.launch_worker(extra_env={"SUTANDO_INSTANCE_ID": wid,
                                              "SUTANDO_TMUX_SESSION": "sutando-worker-" + wid,
                                              "SUTANDO_TASKS_DIR": "/tmp/never-read-worker-inbox",
+                                             "SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_writer),
                                              "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"})
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             sessions = h.tm("list-sessions", "-F", "#{session_name}").stdout.split()

@@ -830,7 +830,7 @@ async def run(args: argparse.Namespace) -> int:
     # of them must not need pycrdt installed.
     from room_collab_client import open_room_collab
 
-    from room_collab_board import BOARD_KIND, place_clear
+    from room_collab_board import BOARD_KIND, place_clear, stale_writes
     from room_kanban import KANBAN_KIND
     if args.command == "summon":
         # No document connection: a summon is a room message, and its context is
@@ -955,6 +955,13 @@ async def run(args: argparse.Namespace) -> int:
             written = None
             if args.command == "draw":
                 elements = parse_elements(args.elements)
+                current = {e.get("id"): e for e in doc.elements}
+                stale = [] if args.force else stale_writes(elements, current.get)
+                if stale:
+                    listed = ", ".join(f"{i} (sent v{int(v)}, board has v{int(b)})" for i, v, b in stale)
+                    raise RoomDocError(
+                        f"not written: changed since you read it — {listed}. "
+                        "Read the board again and re-apply, or pass --force to overwrite.")
                 # Unless the coordinates are final, a drawing that would land
                 # on someone else's is moved below it.
                 if not args.absolute:
@@ -1414,6 +1421,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("elements", help="JSON array of Excalidraw-shaped elements")
     s.add_argument("--absolute", action="store_true",
                    help="write the coordinates as given, even onto existing drawings")
+    s.add_argument("--force", action="store_true",
+                   help="write even over elements someone changed since you read them")
 
     s = sub.add_parser("erase", help="mark a board element or kanban card deleted")
     s.add_argument("room")

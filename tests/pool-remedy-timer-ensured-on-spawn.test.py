@@ -10,6 +10,7 @@ nothing would ever recover — measured on a peer host: three dead workers,
 import importlib.util
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,8 @@ def _load(name):
 
 sys.path.insert(0, str(SCRIPTS))
 sw = _load("spawn_worker")
+# Exercise macOS timer behavior on every CI host with a fake launchctl and temp LaunchAgents.
+sys.platform = "darwin"
 
 fails = 0
 
@@ -48,21 +51,23 @@ class Launchctl:
     what `launchctl print` answers, so a test can present an installed-but-
     unloaded job as well as a healthy one."""
 
-    def __init__(self, loaded=False, bootstrap_rc=0):
-        self.loaded, self.bootstrap_rc, self.argv = loaded, bootstrap_rc, []
+    def __init__(self, loaded=(), bootstrap_rc=0):
+        self.loaded, self.bootstrap_rc, self.argv = set(loaded), bootstrap_rc, []
 
     def __call__(self, argv, **kw):
         self.argv.append(list(argv))
         sub = argv[1] if len(argv) > 1 else ""
         rc = 0
         if sub == "print":
-            rc = 0 if self.loaded else 1
+            rc = 0 if argv[2] in self.loaded else 1
         elif sub == "bootstrap":
             rc = self.bootstrap_rc
             if rc == 0:
-                self.loaded = True
+                with open(argv[3], "rb") as fh:
+                    label = plistlib.load(fh)["Label"]
+                self.loaded.add(f"gui/{os.getuid()}/{label}")
         elif sub == "bootout":
-            self.loaded = False
+            self.loaded.discard(argv[2])
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
 
     def ran(self, sub):
@@ -83,10 +88,12 @@ def case(name, *, loaded, bootstrap_rc=0, platform="darwin"):
     tmp = tempfile.mkdtemp()
     la = Path(tmp) / "LaunchAgents"
     la.mkdir()
+    loaded_labels = set()
     if loaded:  # an already-installed host has the plist on disk too
-        lc0 = Launchctl(loaded=False)
+        lc0 = Launchctl()
         sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc0, sleep=lambda *_: None)
-    lc = Launchctl(loaded=loaded, bootstrap_rc=bootstrap_rc)
+        loaded_labels = lc0.loaded
+    lc = Launchctl(loaded=loaded_labels, bootstrap_rc=bootstrap_rc)
     real = sys.platform
     try:
         sys.platform = platform
@@ -102,7 +109,7 @@ if out.get("ensured") is True:
     ok("a host with no timer installs it")
 else:
     fail(f"no timer was installed on a fresh host: {out}")
-if (la / "com.sutando.pool-remedy.plist").exists():
+if sw.prt.plist_path(la.parent, la).exists():
     ok("the plist is on disk")
 else:
     fail("no plist written")
@@ -113,7 +120,7 @@ else:
 
 # --- already installed: do NOT re-install ------------------------------------
 # pool_remedy calls spawn() from INSIDE this job; re-installing would bootout it.
-out, lc, _ = case("installed", loaded=True)
+out, lc, la = case("installed", loaded=True)
 if out.get("ensured") is False and out.get("why") == "already installed":
     ok("an installed+loaded timer is left alone")
 else:
@@ -122,6 +129,113 @@ if not lc.ran("bootout"):
     ok("the running job was not booted out")
 else:
     fail(f"booted out the job it may be running inside: {lc.argv}")
+
+# --- two loaded jobs for one workspace require explicit cleanup -------------
+job = sw.prt.render(la.parent, REPO)
+job["Label"] = sw.prt.LABEL
+legacy_path = sw.prt.legacy_plist_path(la)
+with open(legacy_path, "wb") as fh:
+    plistlib.dump(job, fh)
+lc(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(legacy_path)])
+lc.argv.clear()
+out = sw.ensure_remedy_timer(la.parent, REPO, runner=lc, launch_agents=la)
+if out.get("conflict") is True and not lc.ran("bootout"):
+    ok("automatic ensure reports duplicate legacy and workspace timers")
+else:
+    fail(f"duplicate sweepers were silently accepted: {out}, {lc.argv}")
+
+# --- different workspaces keep independent timers ---------------------------
+tmp = Path(tempfile.mkdtemp())
+la = tmp / "LaunchAgents"
+la.mkdir()
+old_ws, new_ws = tmp / "old-workspace", tmp / "new-workspace"
+lc = Launchctl()
+sw.prt.install(old_ws, str(REPO), launch_agents=la, runner=lc, sleep=lambda *_: None)
+lc.argv.clear()
+real = sys.platform
+try:
+    sys.platform = "darwin"
+    out = sw.ensure_remedy_timer(new_ws, str(REPO),
+                                 runner=lc, launch_agents=la)
+finally:
+    sys.platform = real
+if out.get("ensured") is True and not lc.ran("bootout") and lc.ran("bootstrap"):
+    ok("a second workspace gets its own timer without booting out the first")
+else:
+    fail(f"second workspace displaced the first timer: {out}, {lc.argv}")
+if (sw.prt.status(old_ws, launch_agents=la, runner=lc).get("loaded")
+        and sw.prt.status(new_ws, launch_agents=la, runner=lc).get("workspace")
+        == str(new_ws.resolve())):
+    ok("both workspace timers remain loaded with their own targets")
+else:
+    fail("one workspace timer lost its target")
+
+# --- a dev checkout cannot take over a timer for the same workspace ----------
+lc.argv.clear()
+out = sw.ensure_remedy_timer(old_ws, tmp / "different-checkout",
+                             runner=lc, launch_agents=la)
+if out.get("conflict") is True and not lc.ran("bootout") and not lc.ran("bootstrap"):
+    ok("automatic ensure refuses a different repo for the same workspace")
+else:
+    fail(f"a different repo rebound an existing timer: {out}, {lc.argv}")
+
+# --- the executable path matters even when --repo still names this checkout --
+path = sw.prt.plist_path(old_ws, la)
+with open(path, "rb") as fh:
+    job = plistlib.load(fh)
+job["ProgramArguments"][1] = "/scratch/checkout/pool_remedy.py"
+with open(path, "wb") as fh:
+    plistlib.dump(job, fh)
+lc.argv.clear()
+out = sw.ensure_remedy_timer(old_ws, REPO, runner=lc, launch_agents=la)
+if out.get("conflict") is True and not lc.ran("bootout") and not lc.ran("bootstrap"):
+    ok("automatic ensure refuses a timer running code from another checkout")
+else:
+    fail(f"a foreign executable was silently accepted or replaced: {out}, {lc.argv}")
+
+# --- the legacy singleton in a live app workspace must not be seized --------
+legacy_ws = tmp / "legacy-workspace"
+legacy = sw.prt.render(legacy_ws, tmp / "dev-checkout")
+legacy["Label"] = sw.prt.LABEL
+legacy_path = sw.prt.legacy_plist_path(la)
+with open(legacy_path, "wb") as fh:
+    plistlib.dump(legacy, fh)
+lc(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(legacy_path)])
+lc.argv.clear()
+out = sw.ensure_remedy_timer(legacy_ws, REPO, runner=lc, launch_agents=la)
+if out.get("conflict") is True and not lc.ran("bootout") and not lc.ran("bootstrap"):
+    ok("automatic ensure refuses to seize a same-workspace legacy timer from another repo")
+else:
+    fail(f"a live legacy timer was displaced: {out}, {lc.argv}")
+
+# --- a matching legacy job may be executing this very spawn ------------------
+# An automatic install used to bootout the loaded singleton during its sweep.
+matching_ws = tmp / "matching-legacy-workspace"
+matching = sw.prt.render(matching_ws, REPO)
+matching["Label"] = sw.prt.LABEL
+with open(legacy_path, "wb") as fh:
+    plistlib.dump(matching, fh)
+lc.loaded = {sw.prt.legacy_service_target()}
+lc.argv.clear()
+out = sw.ensure_remedy_timer(matching_ws, REPO, runner=lc, launch_agents=la)
+if (out.get("why") == "already installed" and out.get("legacy_retained") is True
+        and not lc.ran("bootout") and not lc.ran("bootstrap")
+        and legacy_path.exists() and not sw.prt.plist_path(matching_ws, la).exists()):
+    ok("auto-ensure leaves a loaded matching legacy job running through its sweep")
+else:
+    fail(f"auto-ensure displaced its own loaded legacy job: {out}, {lc.argv}")
+
+# An unloaded legacy plist cannot provide recovery, and leaving it alongside
+# a new job would allow two sweepers after login. Require explicit migration.
+lc.loaded.clear()
+lc.argv.clear()
+out = sw.ensure_remedy_timer(matching_ws, REPO, runner=lc, launch_agents=la)
+if (out.get("conflict") is True and "explicit install" in out.get("why", "")
+        and not lc.ran("bootout") and not lc.ran("bootstrap")
+        and legacy_path.exists() and not sw.prt.plist_path(matching_ws, la).exists()):
+    ok("an unloaded matching legacy plist requires explicit migration")
+else:
+    fail(f"auto-ensure migrated an unloaded legacy plist: {out}, {lc.argv}")
 
 # --- a failing install must not raise ----------------------------------------
 out, _, _ = case("broken", loaded=False, bootstrap_rc=1)

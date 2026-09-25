@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
+    ap.add_argument("command", choices=("sweep", "pending", "watch", "prune-spent", "residue",
                                        "payload", "mark-done", "writer-path"))
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel")
@@ -500,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.command == "sweep":
         print(json.dumps(sweep(ws, a.recipient), indent=2))
+        return 0
+    if a.command == "prune-spent":
+        print(json.dumps(prune_spent(ws, a.recipient), indent=2))
         return 0
 
     # A release puts the name back as pending, and pending-at-boot is exactly
