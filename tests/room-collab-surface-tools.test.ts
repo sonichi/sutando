@@ -36,6 +36,12 @@ describe('room-collab surface tools', () => {
 		assert.ok(tools.tools.includes(tools.roomSurfaceTool), 'the tool is contributed');
 	});
 
+	it('room_surface opens one of the Doc\'s pages by id', async () => {
+		await tools.roomSurfaceTool.execute({ surface: 'doc', page: 'ab12cd34' }, {} as never);
+		await tools.roomSurfaceTool.execute({ surface: 'board', page: 'ab12cd34' }, {} as never);
+		assert.deepEqual(hits.slice(-2), ['POST /surface/markdown-ab12cd34', 'POST /surface/board']);
+	});
+
 	it('room_surface lists the HTML pages and presents one by id', async () => {
 		await tools.roomSurfaceTool.execute({ surface: 'pages' }, {} as never);
 		await tools.roomSurfaceTool.execute({ surface: 'html', page: 'ab12cd34' }, {} as never);

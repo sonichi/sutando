@@ -218,6 +218,7 @@ export const roomSurfaceTool: ToolDefinition = {
 		'"board" (the whiteboard) or "doc" (the Doc). Call it when the user wants to present or point at the whiteboard or the Doc, ' +
 		'then room_outline to see its parts. A room can have several HTML pages: surface "pages" lists them (id and title), and ' +
 		'surface "html" with a page id presents that page (omit page for the main one). ' +
+		'The Doc has pages too: while the Doc is selected, surface "pages" lists the Doc\'s pages, and surface "doc" with a page id opens that one. ' +
 		'Without a surface, says which one is selected. Takes ~1–2 s to switch.',
 	parameters: z.object({
 		surface: z
@@ -228,7 +229,7 @@ export const roomSurfaceTool: ToolDefinition = {
 			.string()
 			.regex(/^[a-z0-9]{8}$/)
 			.optional()
-			.describe('With surface "html": the id of one of the room\'s extra HTML pages, from surface "pages"'),
+			.describe('With surface "html": the id of one of the room\'s extra HTML pages, from surface "pages"; with surface "doc", one of the Doc\'s pages'),
 	}),
 	execution: 'inline',
 	timeout: 20_000,
@@ -237,7 +238,8 @@ export const roomSurfaceTool: ToolDefinition = {
 		if (!surface) return relay('GET', '/surface');
 		if (surface === 'pages') return relay('GET', '/pages', 17_000);
 		const note = pauseForManualMove();
-		const target = surface === 'html' && page ? `html-${page}` : surface;
+		const pageKind = surface === 'doc' ? 'markdown' : surface === 'html' ? 'html' : null;
+		const target = pageKind && page ? `${pageKind}-${page}` : surface;
 		const res = await relay('POST', `/surface/${target}`, 17_000);
 		return note && !res.error ? { ...res, note } : res;
 	},
