@@ -62,6 +62,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
+from channel_env_resolve import resolve_channel_env  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
@@ -6693,17 +6694,9 @@ def _gateway_configured() -> bool:
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        if gw_env.exists():
-            return any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                # errors="replace" is load-bearing, not cosmetic: without it a
-                # single non-UTF-8 byte raises, the except below swallows it, and a
-                # CONFIGURED gateway reads as unconfigured — which now also silences
-                # the gateway-down warn. Fail-open on a decode error is exactly the
-                # class this PR closes. (Caught in review by Sutando-Pro.)
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
+        # Which file defines the token is content, not filename, and the same
+        # owner answers it for startup and for runtime-health.
+        return resolve_channel_env(claude_home_path("channels"), "ag2space") is not None
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
@@ -6746,7 +6739,7 @@ def check_gateway_bridge() -> "dict | None":
     local core (and results back up).
 
     Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
-    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    AG2_REMOTE_TOKEN in env or under channels/ag2space/) — a Sutando-only user
     without the mobile gateway never sees this check. Otherwise: ``warn`` when
     configured-but-not-running (with the delivery impact spelled out) or on a
     duplicate-process pileup, ``ok`` when a single instance is running.
