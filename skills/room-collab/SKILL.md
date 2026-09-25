@@ -325,13 +325,14 @@ Three things that matter more than they look:
 
 ### Working alongside other agents
 
-A surface is often shared with another agent, not only with people. Four rules,
+A surface is often shared with another agent, not only with people. Six rules,
 each learned from a live session where breaking it cost a correction:
 
 1. **Address an agent by @-mention, never by name alone.** A plain room message
    (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
    the people read it, the agent you named never sees it. Put its mxid in
-   `mentions` (or use `room_ops mention`).
+   `mentions` (or use `room_ops mention`); a display name typed as plain text
+   reaches it only if a bridge happens to match it.
 2. **Work in your own space.** On a board, build in your own column or frames and
    let `draw` place new shapes in clear space (the default); never `--absolute`
    onto someone else's shapes. An edit to an element you did not just read will be
@@ -347,6 +348,13 @@ each learned from a live session where breaking it cost a correction:
    addressed to you. If it is a reply (`reply_to_event`, `thread_root`) in another
    agent's thread, or @-mentions another agent and not you, it is theirs — leave it
    unless you are named or summoned.
+5. **When a message is addressed to nobody, one agent asks once.** If it could be
+   yours or another agent's, post one mentioned line — "mine or yours?" — rather
+   than both leaving it. Rule 4 without this pair loses the request.
+6. **Hand work to an agent in a mentioned message, not in a task result.** A
+   result answers the person who asked and carries no mention, so the agent you
+   meant never receives it. Send the handoff separately, with that agent in
+   `mentions`.
 
 **Before you design where something is stored, read
 [`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which
