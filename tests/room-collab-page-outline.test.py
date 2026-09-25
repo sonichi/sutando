@@ -23,4 +23,16 @@ assert [s["title"] for s in reveal["slides"]] == ["One", "Two"], reveal
 assert reveal["slides"][1]["topics"] == [{"topic": "k", "text": "key"}], reveal
 page = outline("<h1>Report</h1><p>x</p><h2>Findings</h2>")
 assert page == {"kind": "page", "headings": ["Report", "Findings"]}, page
+# Element anchors: the ids the web client pins comments to, data-id before data-topic.
+from page_outline import anchors  # noqa: E402
+found = anchors('<section class="slide" data-topic="intro"><h1>Hi</h1><div data-id="cta" data-topic="x">Buy '
+                '<b>now</b></div><p data-id="bad value">z</p><img data-id="logo"></section>'
+                '<p data-topic="k">tail</p><script>var s=\'<p data-id="q">\'</script><p data-id="%s">long</p>' % ("x" * 65))
+assert [(a["anchor"], a["slide"], a["text"]) for a in found] == [
+    ("el:data-topic=intro", 1, "Hi Buy now z"), ("el:data-id=cta", 1, "Buy now"),
+    ("el:data-id=logo", 1, ""), ("el:data-topic=k", None, "tail")], found
+import room_collab  # noqa: E402
+assert "el:data-id=cta" in room_collab.render_anchors('<div data-id="cta">Buy</div>', False)
+assert "no data-id" in room_collab.render_anchors("<p>x</p>", False)
+assert room_collab.build_parser().parse_args(["--kind", "html", "anchors", "!r:x"]).command == "anchors"
 print("room-collab page outline: ok")

@@ -396,8 +396,39 @@ A page removed in the web client leaves the list only; its document is kept. The
 relay holds one page at a time too: `POST /page/<id>` (or `/surface/html-<id>`;
 `/page/main` goes back), `GET /pages` lists them, and the voice tool
 `room_surface` takes `surface: "pages"` to list and `page` to pick one. A comment
-on an extra page anchors to `<id>/pt:…` or `<id>/sl:…`; a main-page comment keeps
-the bare `pt:…` / `sl:…` id.
+on an extra page anchors to `<id>/pt:…`, `<id>/sl:…` or `<id>/el:…`; a main-page
+comment keeps the bare id.
+
+### Comments pinned to elements
+
+A comment placed inside an element with `data-id`, `data-topic` or `id` (in that
+preference, nearest ancestor) pins to it as `el:<attr>=<value>` (values up to 64
+characters of `A-Za-z0-9._:-`), so it follows the element when the page is
+rearranged; its pin sits at the element's top-right, and if the element is removed
+the comment shows "Element no longer on the page". Elsewhere the comment keeps a
+`pt:`/`sl:` coordinate. Give the parts people will discuss a stable `data-id`, and
+keep it when rewriting the page. To see what a page offers:
+
+```bash
+python3 $P --kind html anchors '!room:server'      # el:data-id=… / el:data-topic=… with slide and words
+```
+
+### Versions of a page
+
+Every HTML page (main or `html-<id>`) keeps named snapshots in its own document —
+the web client's **Versions** button reads the same list:
+
+```bash
+python3 $P --kind html versions '!room:server'                          # id, when, size, who, name
+python3 $P --kind html version-save '!room:server' --name "Before review"
+python3 $P --kind html version-restore '!room:server' "Before review"    # by id or name
+```
+
+A restore replaces the whole page for everyone in one change, after saving the
+current page as an automatic "Before restore …" version. A page over 2 MB (a deck
+with embedded media) cannot be versioned; a page keeps at most 50 versions, the
+oldest automatic ones pruned first, and a 51st named one is refused. Save a version
+before rewriting a page someone else wrote.
 
 ### Pages that remember: the artifact runtime
 

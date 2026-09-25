@@ -706,6 +706,44 @@ async def pages(doc, args: argparse.Namespace) -> int:
     return 0
 
 
+def render_anchors(html: str, as_json: bool) -> str:
+    """The page's named elements, as the anchor ids its comments pin to."""
+    from page_outline import anchors
+    found = anchors(html)
+    if as_json:
+        return json.dumps(found, ensure_ascii=False, indent=2)
+    if not found:
+        return "no data-id or data-topic elements on this page"
+    return "\n".join(f"{a['anchor']:<40} {('slide ' + str(a['slide'])) if a['slide'] else '':<9}"
+                     f"<{a['tag']}> {a['text']}".rstrip() for a in found)
+
+
+async def versions(doc, args: argparse.Namespace) -> int:
+    """List an HTML page's versions, save one, or restore one."""
+    from html_versions import format_size
+    if not is_html_kind(args.kind):
+        raise RoomDocError(f"versions are for an HTML page: pass --kind {HTML_KIND} (or html-<id>).")
+    by = args.user_id or args.name or "agent"
+    if args.command == "version-save":
+        out = await doc.save_version(args.version_name, by)
+    elif args.command == "version-restore":
+        out = await doc.restore_version(args.version, by)
+    else:
+        listed = doc.versions
+        if args.json:
+            print(json.dumps(listed, ensure_ascii=False, indent=2))
+        for v in [] if args.json else listed:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(v["created"] / 1000))
+            auto = " (automatic)" if v["auto"] else ""
+            print(f"{v['id']}  {when}  {format_size(v['size']):>9}  {v['by'] or '?'}  {v['name']}{auto}")
+        if not listed and not args.json:
+            print("no versions yet")
+        return 0
+    await doc.settle(args.settle)
+    print(json.dumps({"ok": True, **out}, ensure_ascii=False))
+    return 0
+
+
 async def run(args: argparse.Namespace) -> int:
     if args.command == "stay":
         # A record, not a connection: the daemon holds the socket and outlives
@@ -834,6 +872,13 @@ async def run(args: argparse.Namespace) -> int:
             await doc.set_app_state(args.key, value)
             await doc.settle(args.settle)
             print(json.dumps({"ok": True, "key": args.key, "deleted": value is None}))
+            return 0
+        if args.command in ("versions", "version-save", "version-restore"):
+            return await versions(doc, args)
+        if args.command == "anchors":
+            if not is_html_kind(args.kind):
+                raise RoomDocError(f"anchors are for an HTML page: pass --kind {HTML_KIND} (or html-<id>).")
+            print(render_anchors(doc.text, args.json))
             return 0
         if args.command == "slide":
             if not has_stage(args.kind):
@@ -1131,6 +1176,19 @@ def build_parser() -> argparse.ArgumentParser:
                                         "--kind (html-<id>) to write it with")
     s.add_argument("room")
     s.add_argument("title")
+
+    s = sub.add_parser("anchors", help="list the HTML page's data-id / data-topic elements, as the "
+                                       "el:<attr>=<value> ids comments pin to")
+    s.add_argument("room")
+    s = sub.add_parser("versions", help="list an HTML page's saved versions (--kind html or html-<id>)")
+    s.add_argument("room")
+    s = sub.add_parser("version-save", help="save the HTML page as it is now as a named version")
+    s.add_argument("room")
+    s.add_argument("--name", dest="version_name", required=True, help="the version's name")
+    s = sub.add_parser("version-restore", help="put a saved version back for everyone (the current "
+                                               "page is saved first as an automatic version)")
+    s.add_argument("room")
+    s.add_argument("version", help="the version's id or name")
 
     s = sub.add_parser("stay",
                        help="register this agent as resident in a surface; the presence daemon "
