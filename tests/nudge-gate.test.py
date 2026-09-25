@@ -14,6 +14,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -115,6 +116,16 @@ class CliBeatPathTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             beat = Path(d) / "nope.alive"
             rc, out = self._run(["--pane-state", "busy", "--beat-path", str(beat)])
+            self.assertEqual((rc, out), (0, "arm"))
+
+    def test_stat_error_other_than_missing_is_unknown_and_arms(self):
+        # An OSError other than FileNotFoundError must fall through to
+        # "unknown" (arms), never be swallowed as absent.
+        with tempfile.TemporaryDirectory() as d:
+            beat = Path(d) / "core.alive"
+            beat.write_text("{}")
+            with patch("os.stat", side_effect=PermissionError("denied")):
+                rc, out = self._run(["--pane-state", "idle-ready", "--beat-path", str(beat)])
             self.assertEqual((rc, out), (0, "arm"))
 
 
