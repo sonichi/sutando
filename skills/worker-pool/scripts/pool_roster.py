@@ -359,7 +359,8 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
 def bind_room(workspace, room: str, target: str) -> dict:
     """Bind one room to one worker, named by id or by a unique label — the one
     production writer for a pin, and it publishes: the compile it ends in writes
-    the advertisement too. Same locked read-merge-write as `register_worker`; an
+    the advertisement too, and the pin (re)publishes the task-event handler
+    config, which only `register_worker` wrote before. Same locked read-merge-write as `register_worker`; an
     unknown or ambiguous name is refused BEFORE the declaration is saved, so
     bindings.json never names a target the roster would reject on its next
     compile."""
@@ -371,6 +372,7 @@ def bind_room(workspace, room: str, target: str) -> dict:
         wid = resolve_label(raw, target)
         if wid != CORE and wid not in workers:
             raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        publish_task_event_handler(workspace)
         bindings = dict(load_bindings(workspace))
         bindings[room] = wid
         save_bindings(workspace, bindings)
