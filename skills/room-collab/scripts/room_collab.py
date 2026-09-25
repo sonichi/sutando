@@ -460,6 +460,94 @@ async def sheet(doc, args: argparse.Namespace) -> int:
     return 0
 
 
+def _merged(maps: dict, writes: dict) -> dict:
+    out = {m: dict(entries) for m, entries in maps.items()}
+    for m, entries in writes.items():
+        for k, v in entries.items():
+            if v is None:
+                out.setdefault(m, {}).pop(k, None)
+            else:
+                out.setdefault(m, {})[k] = v
+    return out
+
+
+def _csv_plan(d: dict, args: argparse.Namespace, by: str) -> tuple:
+    from room_database import csv_records, import_plan
+    with open(args.csv_file, encoding="utf-8-sig") as fh:
+        records, report = csv_records(d, fh.read(), header_row=args.header_row,
+                                      mapping=args.map, year=args.year)
+    ids, writes = import_plan(d, records, by)
+    return ids, writes, report
+
+
+async def database(doc, args: argparse.Namespace) -> int:
+    """The room's databases: list, create from a template, read a view, add, update,
+    move on a board, import a CSV. Values are set by property name and checked first."""
+    from room_database import (add_row_plan, assignments, cell_writes, create_plan, group_target,
+                               list_dbs, move_plan, read_db, render_view, resolve_db, resolve_prop,
+                               resolve_row, resolve_view, view_json)
+
+    if args.command == "peers":
+        print(render("peers", peers=doc.peers, as_json=args.json))
+        return 0
+    maps = doc.database
+    names = {x["id"]: x["name"] for x in list_dbs(maps)}
+    if args.command == "dbs":
+        dbs = [{**x, "rows": len(read_db(maps, x["id"])["rows"]),
+                "views": [v["name"] for v in read_db(maps, x["id"])["views"]]} for x in list_dbs(maps)]
+        if args.json:
+            print(json.dumps(dbs, ensure_ascii=False, indent=2))
+        elif not dbs:
+            print("(no databases in this room — create one with `create --template tasks`)")
+        for x in [] if args.json else dbs:
+            print(f"{x['id']}  {x['name']}  ({x.get('template') or 'custom'}, {x['rows']} rows; "
+                  f"views: {', '.join(x['views'])})")
+        return 0
+    if args.command == "read":
+        d = resolve_db(maps, args.db)
+        v = view_json(d, resolve_view(d, args.view), names.get(d["id"], ""))
+        print(json.dumps(v, ensure_ascii=False, indent=2) if args.json else render_view(v))
+        return 0
+
+    by = resolve_identity(args.user_id)
+    out: dict = {"ok": True}
+    if args.command == "create":
+        db, writes = create_plan(maps, args.template, by, args.db_name)
+        out["db"] = db
+        if args.csv_file:
+            ids, rows, report = _csv_plan(read_db(_merged(maps, writes), db), args, by)
+            writes = {m: {**writes.get(m, {}), **rows.get(m, {})} for m in set(writes) | set(rows)}
+            out.update(rows_added=len(ids), **report)
+    elif args.command in ("add", "update", "move", "import"):
+        d = resolve_db(maps, args.db)
+        out["db"] = d["id"]
+        if args.command == "add":
+            row, writes = add_row_plan(d, by, assignments(d, args.set or []))
+            out["row"] = row
+        elif args.command == "update":
+            if not args.set:
+                raise RoomDocError("update needs at least one --set 'Property=Value'")
+            row = resolve_row(d, args.row)["id"]
+            writes, out["row"] = {"cells": cell_writes(d, row, assignments(d, args.set), by)}, row
+        elif args.command == "move":
+            view = resolve_view(d, args.view, layout="board")
+            prop = resolve_prop(d, view.get("groupBy") or "")
+            row = resolve_row(d, args.row)["id"]
+            writes = move_plan(d, row, prop, group_target(d, prop, args.to), by)
+            out.update(row=row, view=view["name"], to=args.to)
+        else:
+            args.csv_file = args.file
+            ids, writes, report = _csv_plan(d, args, by)
+            out.update(rows_added=len(ids), **report)
+    else:
+        raise RoomDocError(f"{args.command!r} is not a database command; use dbs, create, read, add, "
+                           "update, move, import or peers.")
+    out["written"] = await doc.put_database(writes)
+    await doc.settle(args.settle)
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
 async def kanban(doc, args: argparse.Namespace) -> int:
     """The board of cards: read it, or write one card through the panel's
     own rules. Every write is a newer version signed with this agent's mxid."""
@@ -497,6 +585,10 @@ async def kanban(doc, args: argparse.Namespace) -> int:
     now = int(time.time() * 1000)
     by = resolve_identity(args.user_id)
     stored = {k: v for k, v in doc.cards}
+    if args.command == "add" and not args.text:
+        raise RoomDocError("add needs the card's text: add <room> <text>")
+    if args.command == "move" and not (args.card_id and args.column):
+        raise RoomDocError("move needs a card and a column: move <room> <card_id> <column>")
     if args.command == "add":
         if not doc.columns:
             # The panel seeds these on first open; the same ids and order here
@@ -682,7 +774,8 @@ async def run(args: argparse.Namespace) -> int:
                                                             insecure=args.insecure),
                     open_kind=lambda room, kind: open_room_collab(url, room, token, kind=kind,
                                                                   insecure=args.insecure),
-                    list_rooms=joined_rooms)
+                    list_rooms=joined_rooms,
+                    identity=lambda: resolve_identity(args.user_id))
         return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -694,6 +787,8 @@ async def run(args: argparse.Namespace) -> int:
             return await kanban(doc, args)
         if args.kind == "sheet":
             return await sheet(doc, args)
+        if args.kind == "db":
+            return await database(doc, args)
 
         if args.command == "state":
             if args.kind != HTML_KIND:
@@ -960,6 +1055,15 @@ def _post(room: str, body: str, flags: list[str], what: str, *, runner, script) 
     return receipt
 
 
+def _csv_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--header-row", dest="header_row", type=int, default=1,
+                   help="the CSV row holding the headers, 1-based (default 1)")
+    s.add_argument("--map", action="append", default=[], metavar="'CSV HEADER=Property'",
+                   help="map a CSV column to a property (repeatable); a unique header prefix is "
+                        "enough. Headers equal to a property name map themselves; others are reported")
+    s.add_argument("--year", type=int, help="the year for dates like 'Sep 25' that have none")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="room_collab", description=__doc__)
     p.add_argument("--url", help="service origin (else $AG2_ROOM_COLLAB_URL, $AG2_API_ROOT, or the relay's)")
@@ -968,7 +1072,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's surfaces (markdown, html, board, kanban, sheet); "
+                   help="which of the room's surfaces (markdown, html, board, kanban, sheet, db); "
                         "default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
@@ -986,6 +1090,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "read":
             s.add_argument("--delta", action="store_true",
                            help="only the lines new since this agent last read the surface")
+            s.add_argument("--db", help="the database, by name or id (--kind db; default: the only one)")
+            s.add_argument("--view", help="the view, by name or id (--kind db; default: the first)")
+            s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                           help="machine-readable output")
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
 
     s = sub.add_parser("stay",
@@ -1022,10 +1130,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("cell", help="an address like B4")
     s.add_argument("value", help='the input as typed, e.g. 42, "Q3", or =SUM(B1:B9)')
 
-    s = sub.add_parser("import", help="write a CSV file into the sheet from --at (needs --kind sheet)")
+    s = sub.add_parser("import", help="write a CSV file into the sheet from --at (--kind sheet), "
+                                      "or into a database as rows (--kind db --db X)")
     s.add_argument("room")
     s.add_argument("file")
     s.add_argument("--at", default="A1", help="the top-left cell (default A1)")
+    s.add_argument("--db", help="the database, by name or id (--kind db)")
+    _csv_options(s)
+
+    s = sub.add_parser("dbs", help="list the room's databases (needs --kind db)")
+    s.add_argument("room")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="machine-readable output")
+
+    s = sub.add_parser("create", help="create a database from a template (needs --kind db)")
+    s.add_argument("room")
+    s.add_argument("--template", required=True, choices=("tasks", "meetings", "demo_day", "wiki"))
+    s.add_argument("--name", dest="db_name", help="the database's name (default: the template's)")
+    s.add_argument("--from-csv", dest="csv_file", metavar="FILE", help="also import this CSV's rows")
+    _csv_options(s)
+
+    s = sub.add_parser("update", help="set values on a database row (needs --kind db)")
+    s.add_argument("room")
+    s.add_argument("--db", help="the database, by name or id (default: the only one)")
+    s.add_argument("--row", required=True, help="the row's id, or its title")
+    s.add_argument("--set", action="append", metavar="PROP=VALUE",
+                   help="a value by property name (repeatable); empty clears it")
 
     s = sub.add_parser("state", help="read or write the HTML page's shared state, the one its scripts "
                                      "see as artifact.state (needs --kind html)")
@@ -1044,7 +1173,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html); "
-                                     "POST /surface/board|doc moves it to the board or the Doc")
+                                     "POST /surface/board|doc|db moves it to the board, the Doc or "
+                                     "the databases; /db reads and writes the room's databases")
     s.add_argument("room", help="the room to hold first; POST /room/<id> switches it")
     s.add_argument("--port", type=int, default=7877)
 
@@ -1098,17 +1228,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("room")
     s.add_argument("element_id")
 
-    s = sub.add_parser("add", help="add a kanban card (needs --kind kanban)")
+    s = sub.add_parser("add", help="add a kanban card (--kind kanban), or a database row (--kind db)")
     s.add_argument("room")
-    s.add_argument("text")
+    s.add_argument("text", nargs="?", help="the card's text (kanban)")
+    s.add_argument("--db", help="the database, by name or id (--kind db; default: the only one)")
+    s.add_argument("--set", action="append", metavar="PROP=VALUE",
+                   help="a row value by property name (repeatable): options by name, persons by "
+                        "mxid (comma-separated), dates YYYY-MM-DD (--kind db)")
     s.add_argument("--column", help="column id; default todo")
     s.add_argument("--assign", metavar="MXID", help="who it is for")
     s.add_argument("--id", help="card id; default generated")
 
-    s = sub.add_parser("move", help="move a kanban card to a column (needs --kind kanban)")
+    s = sub.add_parser("move", help="move a kanban card to a column (--kind kanban), or a database "
+                                    "row to a board group (--kind db)")
     s.add_argument("room")
-    s.add_argument("card_id")
-    s.add_argument("column")
+    s.add_argument("card_id", nargs="?")
+    s.add_argument("column", nargs="?")
+    s.add_argument("--db", help="the database, by name or id (--kind db)")
+    s.add_argument("--row", help="the row's id, or its title (--kind db)")
+    s.add_argument("--to", help="the group's name, e.g. Done, or 'none' (--kind db)")
+    s.add_argument("--view", help="the board view (default: the first board)")
 
     s = sub.add_parser("assign", help="assign a kanban card (needs --kind kanban)")
     s.add_argument("room")

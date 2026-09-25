@@ -13,12 +13,18 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   GET  /script              the talk script in the room's Doc, as steps (talk_script.py)
   GET  /outline             the page's slides, titles and topics (page_outline.py); the
                             board's frames or the Doc's headings (surface_outline.py)
-  POST /surface/html|board|doc  hold that surface instead (html at start); GET /surface names it
+  POST /surface/html|board|doc|db  hold that surface instead (html at start); GET /surface names it
   POST /room/<room id>      hold that room instead (url-encoded `!abc:server`), same surface
   GET  /rooms               the agent's joined rooms, {id, name}, to resolve a spoken name
+  GET  /db                  the room's databases (room_database.py)
+  GET  /db/<db>[/view/<view>]  a view's rows with display values; db and view by name or id
+  POST /db/<db>/row?set=Prop%3DValue&set=...  add a row, values by property name
+  POST /db/<db>/row/<row>?set=...             set values on a row (by id or title)
+  POST /db/<db>/move?row=<row>&to=<group>     move a row on the board view (&view=<name>)
 
 On the board a slide is a frame (in Present order) and on the Doc a heading;
-topic highlights exist only on the page.
+topic highlights exist only on the page. The /db routes use the held database surface,
+or open the room's databases for the one call when another surface is held.
 
 It listens on 127.0.0.1 only: whoever reaches the port drives the stage as
 this agent, so it must never be exposed beyond the machine.
@@ -33,7 +39,8 @@ from room_collab_protocol import DEFAULT_KIND, HTML_KIND, RoomDocError
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECONNECT_S = (1, 2, 5, 10, 30)
-SURFACES = {"html": HTML_KIND, "board": "board", "doc": DEFAULT_KIND}
+SURFACES = {"html": HTML_KIND, "board": "board", "doc": DEFAULT_KIND, "db": "db"}
+DB_NAME_MAX, DB_SET_MAX = 200, 2000
 SWITCH_WAIT_S = 15
 ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
 
@@ -48,7 +55,10 @@ def visible_words(html: str) -> str:
 def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     """What a request asks for, as ("highlight", topic|None), ("speaking", bool),
     ("state", None), or an HTTP status and body to answer directly."""
+    raw_query = path.split("?", 1)[1] if "?" in path else ""
     path = path.split("?", 1)[0].rstrip("/") or "/"
+    if path == "/db" or path.startswith("/db/"):
+        return db_route(method, path, raw_query)
     if method == "GET" and path == "/state":
         return ("state", None)
     if method == "GET" and path == "/script":
@@ -97,11 +107,80 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
     if path.startswith("/surface/"):
         what = path[len("/surface/"):].lower()
         if what not in SURFACES:
-            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, board or doc)"})
+            return (400, {"ok": False, "error": f"not a surface: {what!r} (html, board, doc or db)"})
         return ("surface", what)
     if path in ("/presenter/on", "/presenter/off"):
         return (200, {"ok": True, "note": "presenting is controlled in the room"})
     return (404, {"ok": False, "error": "not found"})
+
+
+def db_route(method: str, path: str, raw_query: str) -> tuple:
+    """/db requests → ("db", {op, db, view, row, set, to}) or a status and body."""
+    from urllib.parse import parse_qs, unquote
+    segs = [unquote(x) for x in path.strip("/").split("/")][1:]
+    q = parse_qs(raw_query, keep_blank_values=True)
+    if any(len(x) > DB_NAME_MAX for x in segs) or any(len(x) > DB_SET_MAX for v in q.values() for x in v):
+        return (400, {"ok": False, "error": "a name or value is too long"})
+    reads = {0: "list", 1: "view"}
+    if method == "GET":
+        if len(segs) in reads or (len(segs) == 3 and segs[1] == "view"):
+            return ("db", {"op": reads.get(len(segs), "view"), "db": segs[0] if segs else None,
+                           "view": segs[2] if len(segs) == 3 else None})
+        return (405 if len(segs) >= 2 and segs[1] in ("row", "move") else 404, {"ok": False, "error": "not found"})
+    if method != "POST":
+        return (405, {"ok": False, "error": "not found"})
+    sets = q.get("set", [])
+    if any("=" not in x for x in sets):
+        return (400, {"ok": False, "error": "each set is Property=Value (url-encode the = as %3D)"})
+    if len(segs) == 2 and segs[1] == "row":
+        return ("db", {"op": "add", "db": segs[0], "set": sets})
+    if len(segs) == 3 and segs[1] == "row":
+        if not sets:
+            return (400, {"ok": False, "error": "an update needs at least one set=Property=Value"})
+        return ("db", {"op": "update", "db": segs[0], "row": segs[2], "set": sets})
+    if len(segs) == 2 and segs[1] == "move":
+        row, to = (q.get("row") or [""])[0], (q.get("to") or [""])[0]
+        if not row or not to:
+            return (400, {"ok": False, "error": "a move needs row=<row id or title> and to=<group>"})
+        return ("db", {"op": "move", "db": segs[0], "row": row, "to": to,
+                       "view": (q.get("view") or [None])[0]})
+    return (405 if len(segs) <= 1 else 404, {"ok": False, "error": "not found"})
+
+
+async def db_request(doc, req: dict, identity=None) -> tuple[int, dict]:
+    """One /db request against an open database surface; a refusal is a 400 and writes nothing."""
+    from room_database import (DbRefusal, add_row_plan, assignments, cell_writes, group_target, list_dbs,
+                               move_plan, read_db, resolve_db, resolve_prop, resolve_row, resolve_view,
+                               view_json)
+    maps = doc.database
+    names = {x["id"]: x["name"] for x in list_dbs(maps)}
+    try:
+        if req["op"] == "list":
+            return 200, {"ok": True, "databases": [
+                {**x, "rows": len(read_db(maps, x["id"])["rows"]),
+                 "views": [v["name"] for v in read_db(maps, x["id"])["views"]]} for x in list_dbs(maps)]}
+        d = resolve_db(maps, req["db"])
+        if req["op"] == "view":
+            return 200, {"ok": True, **view_json(d, resolve_view(d, req.get("view")), names[d["id"]])}
+        if identity is None:
+            raise RoomDocError("this relay was started without an identity to sign writes (--user-id)")
+        by = identity()
+        body: dict = {"ok": True, "db": d["id"], "name": names[d["id"]]}
+        if req["op"] == "add":
+            row, writes = add_row_plan(d, by, assignments(d, req["set"]))
+        elif req["op"] == "update":
+            row = resolve_row(d, req["row"])["id"]
+            writes = {"cells": cell_writes(d, row, assignments(d, req["set"]), by)}
+        else:
+            view = resolve_view(d, req.get("view"), layout="board")
+            prop = resolve_prop(d, view.get("groupBy") or "")
+            row = resolve_row(d, req["row"])["id"]
+            writes = move_plan(d, row, prop, group_target(d, prop, req["to"]), by)
+            body.update(view=view["name"], to=req["to"])
+        body.update(row=row, written=await doc.put_database(writes))
+        return 200, body
+    except DbRefusal as exc:
+        return 400, {"ok": False, "error": str(exc)}
 
 
 async def read_script(open_text) -> dict:
@@ -115,6 +194,9 @@ async def read_script(open_text) -> dict:
 
 
 def outline_of(surface: str, doc) -> dict:
+    if surface == "db":
+        from room_database import list_dbs
+        return {"kind": "db", "databases": [{"id": x["id"], "name": x["name"]} for x in list_dbs(doc.database)]}
     if surface == "board":
         from surface_outline import board_outline
         return board_outline(doc.live_elements)
@@ -137,10 +219,11 @@ def says(surface: str, doc, words: str) -> bool:
 
 
 async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=print,
-                open_text=None, open_kind=None, list_rooms=None) -> None:
+                open_text=None, open_kind=None, list_rooms=None, identity=None) -> None:
     """Hold one surface of one room open (reconnecting when it drops) and answer HTTP on `port`.
     `open_doc(room)` opens a room's page, `open_kind(room, kind)` another of its surfaces,
-    `open_text(room)` its Doc for GET /script; `list_rooms()` (blocking) lists joined rooms."""
+    `open_text(room)` its Doc for GET /script; `list_rooms()` (blocking) lists joined rooms;
+    `identity()` is the mxid a /db write is signed with."""
     holder: dict = {"doc": None, "room": room, "surface": "html", "error": None}
     ready = asyncio.Event()
     switch = asyncio.Event()
@@ -167,6 +250,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                         holder["doc"], holder["error"], attempt = doc, None, 0
                         ready.set()
                         size = (f"{len(doc.live_elements)} elements" if surface == "board"
+                                else f"{len(doc.database['dbs'])} databases" if surface == "db"
                                 else f"{len(doc.text)} chars")
                         log(f"relay: connected to the {surface} of {held_room}; {size}")
                         closed = asyncio.ensure_future(doc.closed())
@@ -213,7 +297,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
             return {"ok": True, "surface": holder["surface"], "connected": False}
         o = outline_of(holder["surface"], holder["doc"])
         return {"ok": True, "surface": holder["surface"], "connected": True,
-                "parts": len(o.get("slides") or o.get("headings") or [])}
+                "parts": len(o.get("slides") or o.get("headings") or o.get("databases") or [])}
 
     async def switch_room(room_id: str) -> dict:
         retarget(room_id=room_id)
@@ -249,6 +333,17 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 status, body = 200, await change_surface(what[1])
             elif what[0] == "room":
                 status, body = 200, await switch_room(what[1])
+            elif what[0] == "db":
+                if holder["surface"] == "db" and holder["doc"] is not None:
+                    status, body = await db_request(holder["doc"], what[1], identity)
+                elif open_kind is None:
+                    raise RoomDocError("this relay was started without the room's other surfaces")
+                else:
+                    async with open_kind(holder["room"], SURFACES["db"]) as doc:
+                        status, body = await db_request(doc, what[1], identity)
+                        if what[1]["op"] not in ("list", "view") and status == 200:
+                            await doc.settle(0.3)  # a refusal from the server surfaces before close
+                body["room"] = holder["room"]
             elif what[0] == "rooms":
                 if list_rooms is None:
                     raise RoomDocError("this relay was started without a room list")
@@ -267,7 +362,10 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 if kind == "slide" and arg[0] == "goto" and surface != "html":
                     o = outline_of(surface, doc)
                     parts = len(o.get("slides") or o.get("headings") or [])
-                if kind == "highlight" and surface != "html":
+                if surface == "db" and kind in ("slide", "spot", "speaking"):
+                    status, body = 409, {"ok": False, "error": "the databases have no stage to move or point "
+                                         "at; switch with /surface/html, board or doc"}
+                elif kind == "highlight" and surface != "html":
                     status, body = 409, {"ok": False, "error": f"topic highlights are on the HTML page; "
                                          f"the relay holds the {surface} — point at words with /spot"}
                 elif kind == "highlight":
@@ -288,6 +386,9 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
                 elif kind == "speaking":
                     await doc.set_speaking(bool(arg))
                     status, body = 200, {"ok": True, "speaking": bool(arg)}
+                elif surface == "db":
+                    status, body = 200, {"topic": None, "ts": 0, "speaking": False,
+                                         "room": holder["room"], "surface": surface}
                 else:
                     stage = doc.stage
                     status, body = 200, {"topic": stage.get("topic") or None,
@@ -310,6 +411,7 @@ async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=
 
     server = await asyncio.start_server(handle, host, port)
     log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /slide/<move>, /spot/<words>, "
-        "/surface/html|board|doc, /room/<id>; GET /state, /outline, /rooms")
+        "/surface/html|board|doc|db, /room/<id>, /db/<db>/row, /db/<db>/move; "
+        "GET /state, /outline, /rooms, /db")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())
