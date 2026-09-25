@@ -85,7 +85,11 @@ if launchctl print "$_GW_SERVICE" >/dev/null 2>&1; then
         launchctl bootout "$_GW_SERVICE" 2>/dev/null || true
         # A deliberate stop is not a restart: clear the wrapper's started marker so
         # the next startup does not read as "previous process exited" and alert.
-        [ -n "${_WS:-}" ] && rm -f "$_WS/state/channel-bridge-supervisor/gateway.started" 2>/dev/null || true
+        if [ -n "${_WS:-}" ]; then
+            rm -f "$_WS/state/channel-bridge-supervisor/gateway.started" 2>/dev/null || true
+        else
+            echo "  ⚠ workspace unresolved; gateway.started marker not cleared (next startup may alert)" >&2
+        fi
     else
         echo "  Restarting launchd-supervised gateway bridge..."
         launchctl kickstart -k "$_GW_SERVICE" 2>/dev/null || true

@@ -15,12 +15,13 @@
 
   Design:
     - RunAtLoad=true so it starts at login/boot.
-    - KeepAlive { Crashed: true, SuccessfulExit: false } → restart on crash; the
-      wrapper itself supervises the bridge, so a clean bridge exit is relaunched
-      by the wrapper, not by launchd (only a no-token idle exit stays down);
-      OOM, or kill (any non-zero/signal exit), but NOT on a clean exit. The
-      wrapper exits 0 when no token is configured, so a de-configured install
-      stops cleanly instead of crash-looping.
+    - KeepAlive { Crashed: true, SuccessfulExit: false } → launchd restarts the
+      wrapper on crash, OOM, or kill (any non-zero/signal exit), but NOT on a
+      clean exit. The wrapper supervises the bridge itself, so a bridge that
+      exits (pkill, crash, clean stop) is relaunched by the wrapper. The wrapper
+      exits 0 only when no token is configured, so a de-configured install stops
+      cleanly instead of crash-looping; startup.sh kickstarts that idle job once
+      a token exists.
     - ThrottleInterval=10: ≤ one restart per 10s, so a genuine crash-loop
       (e.g. a persistently-502ing gateway) doesn't burn CPU.
     - Wrapper (gateway-bridge-wrapper.sh) loads the ag2space channel .env for

@@ -77,5 +77,37 @@ echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, 
 [ "$aliven" -eq 0 ] || { echo "FAIL: no-token wrapper stayed alive (an idle PID would read as a running bridge)"; fail=1; }
 [ "$idlen" -gt 0 ] || { echo "FAIL: no-token path did not log 'nothing to run; exiting cleanly'"; fail=1; }
 
+# Token rotation on a LEGACY install (.env carries only AG2_REMOTE_TOKEN): the
+# child must see the rotated value on relaunch, and a removed token must stop the
+# loop cleanly rather than relaunch with the stale export.
+rotation_case() {
+  local d; d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
+  cat > "$d/scripts/sutando-config.sh" <<EOS
+#!/bin/bash
+case "\${1:-}" in workspace) echo "$d/ws" ;; claude-home-path) echo "$d/relay.env" ;; *) echo "$d/none.env" ;; esac
+EOS
+  chmod +x "$d/scripts/sutando-config.sh"
+  echo "AG2_REMOTE_TOKEN=first" > "$d/relay.env"
+  # each child records the token it was launched with, then exits 0 (relaunch path)
+  printf 'import os,sys\nopen("%s/seen.log","a").write(os.environ.get("REMOTE_TASK_TOKEN","<unset>")+"\\n")\nsys.exit(0)\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/python3" "$d/shims/osascript"
+  ( cd "$d"; env -u REMOTE_TASK_TOKEN -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+      bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
+    sleep 1.5; echo "AG2_REMOTE_TOKEN=second" > "$d/relay.env"
+    sleep 2.5; : > "$d/relay.env"          # token removed
+    sleep 3
+    if kill -0 $p 2>/dev/null; then echo 1 > alive.txt; else echo 0 > alive.txt; fi
+    kill -TERM $p 2>/dev/null; wait $p 2>/dev/null )
+  echo "$(grep -c '^first$' "$d/seen.log") $(grep -c '^second$' "$d/seen.log") $(grep -c 'token removed' "$d/o.log") $(cat "$d/alive.txt")"
+  rm -rf "$d"
+}
+read -r seen_first seen_second removed_lines alive_after <<<"$(rotation_case)"
+echo "legacy rotation -> first=$seen_first second=$seen_second removed-stop=$removed_lines alive=$alive_after (want first>0, second>0, removed-stop>0, alive=0)"
+[ "$seen_first" -gt 0 ] || { echo "FAIL: first child never saw the legacy AG2_REMOTE_TOKEN mapping"; fail=1; }
+[ "$seen_second" -gt 0 ] || { echo "FAIL: a rotated token in .env never reached a relaunched child (stale export won)"; fail=1; }
+[ "$removed_lines" -gt 0 ] && [ "$alive_after" -eq 0 ] || { echo "FAIL: a removed token did not stop the loop cleanly"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "PASS"
 exit $fail

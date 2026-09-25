@@ -32,6 +32,11 @@ fi
 # Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
 # $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
 # config helper falls back to ~/.claude otherwise.
+# What the process environment (the plist, or a caller) provided, kept apart from
+# what the .env provides, so a re-read can drop a removed .env token without
+# dropping an environment-provided one.
+_ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
+_ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
 if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
 fi
@@ -85,7 +90,8 @@ fi
 # inside the deliberate-restart window is expected and raises no alert; rc 75 is
 # the bridge's own stand-down and ends the wrapper for good.
 if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
-    echo "[gateway-bridge-wrapper] workspace unresolvable via scripts/sutando-config.sh — nothing to run; exiting cleanly." >&2
+    echo "[gateway-bridge-wrapper] FATAL: workspace unresolvable via scripts/sutando-config.sh (check sutando.config.local.json) — not starting the bridge" >&2
+    osascript -e 'display notification "Gateway bridge cannot resolve the workspace; it is not running." with title "Sutando"' >/dev/null 2>&1 || true
     exit 0
 fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
@@ -122,8 +128,19 @@ stop_wrapper() {
 }
 trap stop_wrapper TERM INT HUP
 while [ "$STOPPING" = 0 ]; do
-  # A rotated token must reach the next child, not only the first.
+  # A rotated or removed .env token must reach the next child: reset to the
+  # environment-provided values, re-read the .env, redo the legacy mapping.
+  REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
+  REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
   [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  if [ -z "$REMOTE_TASK_TOKEN" ]; then
+    echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
+    rm -f "$MARKER"
+    exit 0
+  fi
   python3 "$REPO/src/remote-gateway-bridge.py" &
   CHILD_PID=$!
   set +e
