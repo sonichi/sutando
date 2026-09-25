@@ -7,6 +7,13 @@
 
 # Reject anything unrecognized — the default action below is destructive, and
 # a silent fallthrough (an unknown flag ends up running it anyway) is a trap.
+# A second argument is unrecognized too: only $1 is ever consulted below, so
+# `--rebuild-app --stop-only` would silently run a full restart, not a stop.
+if [ "$#" -gt 1 ]; then
+  echo "restart.sh: unrecognized argument: $2" >&2
+  sed -n '2,6p' "$0" >&2
+  exit 2
+fi
 case "${1:-}" in
   ""|--stop-only|--rebuild-app) ;;
   --help|-h)
