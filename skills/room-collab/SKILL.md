@@ -415,6 +415,9 @@ Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
   just as well, it is too generic.
 - **Works for everyone**: readable at phone width, semantic elements, controls
   that work from the keyboard, visible focus.
+- **No `<form>` submits**: the sandbox never fires `submit`, so a form does nothing.
+  Use buttons and an Enter-key handler, and keep shared data in `artifact.state`.
+- **Give discussable parts a `data-id`**, so comments and agents can point at them.
 - **Check it before you announce it**: render it, then look at it wide and
   narrow. Exercise the controls, read the console, and fix what you see. People
   review the page by pinning comments on it; answer each one in its thread.
