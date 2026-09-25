@@ -103,19 +103,26 @@ class RuntimeAdapter:
     idle_ready: "re.Pattern[str]"
     gate_signatures: Tuple[Tuple[str, "re.Pattern[str]"], ...]
     await_hint: "re.Pattern[str]" = AWAIT_HINT
+    alternate_glyphs: Tuple[str, ...] = ()
+    idle_requires_prompt: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph="❯", idle_ready=CLAUDE_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
 )
-# Codex prints the same footer when launched with Sutando's flags; a selected
-# picker row is its own glyph followed by a number, and is itself the affordance.
-CODEX_PICKER_ROW = re.compile(r"›\s*\d+\.")
+# Codex's composer glyph varies by CLI version; its model row is the idle footer.
+CODEX_IDLE = re.compile(
+    rf"{CLAUDE_IDLE.pattern}|^[ \t]*(?:gpt-[\w.-]+|codex[\w.-]*|o[1-9][\w.-]*)\b[^\n]*[·•]",
+    re.I | re.M,
+)
+CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
-    name="codex", glyph="›", idle_ready=CLAUDE_IDLE,
+    name="codex", glyph="›", idle_ready=CODEX_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
+    alternate_glyphs=("»",),
+    idle_requires_prompt=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -143,6 +150,12 @@ class Outcome:
     message: str
 
 
+def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
+    plain = _SGR.sub("", raw).lstrip(" \t")
+    return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
+                 if plain.startswith(glyph)), None)
+
+
 def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Optional[PromptLine]:
     """The LAST line starting with the runtime's glyph (scrollback holds old ones):
     its input is what follows the glyph and one optional space/nbsp, with any
@@ -152,10 +165,10 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
     lines_ = capture.splitlines()
     last_i, found = -1, None
     for i, raw in enumerate(lines_):
-        plain = _SGR.sub("", raw).lstrip(" \t")
-        if not plain.startswith(adapter.glyph):
+        glyph = _prompt_glyph(raw, adapter)
+        if glyph is None:
             continue
-        rest_raw = raw[raw.find(adapter.glyph) + len(adapter.glyph):]
+        rest_raw = raw[raw.find(glyph) + len(glyph):]
         rest_ghostless, n = _GHOST.subn("", rest_raw)
         rest = _SGR.sub("", rest_ghostless)
         placeholder = n > 0
@@ -170,7 +183,7 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
         if not prev_full:
             break
         plain = _SGR.sub("", nxt)
-        if plain.lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(nxt, adapter) is not None:
             break
         raw_parts.append(nxt)
         prev_full = len(plain) >= width
@@ -198,7 +211,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
     lines_ = capture.splitlines()
     last_i = -1
     for i, raw in enumerate(lines_):
-        if _SGR.sub("", raw).lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(raw, adapter) is not None:
             last_i = i
     if last_i < 0:
         return ""
@@ -211,7 +224,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
             if not prev_full:
                 break
             plain = _SGR.sub("", lines_[j])
-            if plain.lstrip(" \t").startswith(adapter.glyph):
+            if _prompt_glyph(lines_[j], adapter) is not None:
                 break
             end = j
             prev_full = len(plain) >= width
@@ -245,7 +258,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(lines[i], adapter) is not None:
             start = i
             break
     if start is None:
@@ -267,7 +280,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     _pop_borders()
     if not block or (len(block) == 1 and COMPOSER_PLACEHOLDER.match(block[0])):
         return ""
-    block[0] = block[0].lstrip().lstrip(adapter.glyph).lstrip()
+    block[0] = prompt_line(block[0], adapter).text
     return "".join(block)
 
 
@@ -362,7 +375,9 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
-    if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
+    if ((adapter.idle_ready.search(tail) and
+         (not adapter.idle_requires_prompt or line is not None))
+            or (line is not None and line.placeholder)):
         return Verdict("idle-ready", "idle footer or empty composer", "" if line else None)
     return Verdict("unknown", "no idle affordance")
 

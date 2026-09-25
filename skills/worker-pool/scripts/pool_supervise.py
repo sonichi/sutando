@@ -66,11 +66,17 @@ def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None
     The socket is read from the recorded incarnation, never assumed: a wrong
     socket answers "no server running" for a host whose real socket is fine.
     """
-    open_runs = [r for r in wi.incarnations(workspace, worker_id)
-                 if isinstance(r, dict) and r.get("ended_at") is None]
-    if not open_runs:
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    if open_runs:
+        run = open_runs[-1]
+    elif runs and runs[-1].get("end_reason") == "crashed":
+        # A failed recovery closes its attempted run. The last crashed run
+        # still names the socket to probe, so escalation must keep its evidence.
+        run = runs[-1]
+    else:
         return None
-    tmux = open_runs[-1].get("tmux") or {}
+    tmux = run.get("tmux") or {}
     socket = tmux.get("socket")
     name = tmux.get("session_name") or wi.tmux_session_name(worker_id)
     if not socket:

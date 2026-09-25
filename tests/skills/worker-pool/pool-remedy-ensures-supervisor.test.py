@@ -55,6 +55,8 @@ class EnsureSupervisor(unittest.TestCase):
         # The last incarnation records the socket the worker ran on.
         (self.ws / "state" / "workers" / WID / "incarnations.json").write_text(
             json.dumps({"incarnations": [{"tmux": {"socket": "/tmp/sock-test"}}]}))
+        (self.ws / "state" / "roster.json").write_text(
+            json.dumps({"workers": {WID: {"runtime": "claude", "state": "live"}}}))
 
     def tearDown(self):
         self.td.cleanup()
@@ -101,6 +103,10 @@ class EnsureSupervisors(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td) / "ws"
             (ws / "state" / "workers").mkdir(parents=True)
+            (ws / "state" / "roster.json").write_text(json.dumps({"workers": {
+                worker_id: {"runtime": "claude", "state": "live"}
+                for worker_id in ("a" * 32, "b" * 32, "c" * 32)
+            }}))
             obs = {"a" * 32: {"beat": "live", "session_alive": True, "paused": False},
                    "b" * 32: {"beat": "stale", "session_alive": False, "paused": False},
                    "c" * 32: {"beat": "absent", "session_alive": None, "paused": False}}

@@ -100,6 +100,14 @@ class TheSessionProbe(Base):
         self.assertIsNone(sup.probe_session(self.ws, wid, runner=t))
         self.assertEqual(t.calls, [], "probed tmux for a worker that has no open run")
 
+    def test_a_crashed_last_run_remains_probeable_after_failed_recovery(self):
+        wid = make_worker(self.ws)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        t = Tmux()
+        self.assertIs(sup.probe_session(self.ws, wid, runner=t), False)
+        self.assertEqual(t.calls[-1][:3], ["tmux", "-S", SOCK])
+
     def test_an_open_run_with_no_recorded_socket_is_unknown(self):
         wid = make_worker(self.ws, socket="")
         self.assertIsNone(sup.probe_session(self.ws, wid, runner=Tmux()))
@@ -225,6 +233,17 @@ class TheLadderSurvivesBetweenTicks(Base):
         self.assertEqual(seen, [ps.NOTHING, ps.NOTHING, ps.NOTHING, ps.RECOVER],
                          "each tick is a separate process in production: the ladder "
                          "only advances if the state really persisted between them")
+
+    def test_failed_recovery_with_no_open_run_still_escalates(self):
+        wid = make_worker(self.ws)
+        for now in (1000.0, 1030.0, 1060.0, 1095.0):
+            out = sup.tick(self.ws, now, runner=Tmux())
+        self.assertEqual(out["decisions"][wid], ps.RECOVER)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        out = sup.tick(self.ws, 1210.0, runner=Tmux())
+        self.assertEqual(out["observations"][wid]["session_alive"], False)
+        self.assertEqual(out["decisions"][wid], ps.ESCALATE)
 
     def test_no_persist_decides_without_advancing_the_ladder(self):
         wid = make_worker(self.ws)

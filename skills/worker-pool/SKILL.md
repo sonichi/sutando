@@ -56,6 +56,21 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
+## Codex CLI workers
+
+`python3 skills/worker-pool/scripts/create_worker.py --runtime codex --folder
+<dir> --label <name>` creates a Codex worker with its own tmux session and
+notifier. The core watcher needs the pool route handler before `--room` can
+bind a room. An unbound worker can receive tasks addressed to its ID.
+
+Codex assigns new conversation IDs itself. Until its assigned ID is captured,
+the worker's `runtime_session_id` is `null`, `--resume` refuses, and recovery
+starts a fresh Codex conversation with the same worker ID and inbox. The
+notifier resolves delivery sentinels to payloads in shared `tasks/`, writes
+results to shared `results/`, and records the worker's done flag.
+If the worker dies mid-turn, recovery re-delivers the task in that fresh
+conversation without memory of any partial work from the previous turn.
+
 ## Talking to the other instances (core ↔ worker)
 
 You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)

@@ -74,7 +74,29 @@ pkill -f "screen-capture-server" 2>/dev/null
 pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "slack-bridge" 2>/dev/null
-pkill -f "remote-gateway-bridge" 2>/dev/null
+# Gateway bridge: same launchd handling as the credential proxy below. Its job's
+# KeepAlive is crash-only, so a bare pkill (exit 0) leaves it down until startup.sh
+# happens to run: bootout for --stop-only, kickstart -k for a restart, pkill only
+# for a legacy bare launch (no job loaded).
+_GW_SERVICE="gui/$(id -u)/com.sutando.gateway-bridge"
+if launchctl print "$_GW_SERVICE" >/dev/null 2>&1; then
+    if [ "${1:-}" = "--stop-only" ]; then
+        echo "  Stopping launchd-supervised gateway bridge..."
+        launchctl bootout "$_GW_SERVICE" 2>/dev/null || true
+        # A deliberate stop is not a restart: clear the wrapper's started marker so
+        # the next startup does not read as "previous process exited" and alert.
+        if [ -n "${_WS:-}" ]; then
+            rm -f "$_WS/state/channel-bridge-supervisor/gateway.started" 2>/dev/null || true
+        else
+            echo "  ⚠ workspace unresolved; gateway.started marker not cleared (next startup may alert)" >&2
+        fi
+    else
+        echo "  Restarting launchd-supervised gateway bridge..."
+        launchctl kickstart -k "$_GW_SERVICE" 2>/dev/null || true
+    fi
+else
+    pkill -f "remote-gateway-bridge" 2>/dev/null
+fi
 # The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
 # IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
 # `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
@@ -128,9 +150,13 @@ STOP_PATTERNS=(
     "remote-gateway-bridge" "remote-relay-bridge" "observability/boot"
     "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
+# Under launchd a restart kickstarts the gateway bridge at once, so waiting for
+# it to vanish would always run this drain to its cap; skip it in that case.
+_GW_LAUNCHD=0; launchctl print "$_GW_SERVICE" >/dev/null 2>&1 && _GW_LAUNCHD=1
 for _ in $(seq 1 30); do
     still=0
     for pat in "${STOP_PATTERNS[@]}"; do
+        [ "$pat" = "remote-gateway-bridge" ] && [ "$_GW_LAUNCHD" = 1 ] && continue
         if pgrep -f "$pat" >/dev/null 2>&1; then still=1; break; fi
     done
     [ $still -eq 0 ] && break

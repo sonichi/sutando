@@ -54,6 +54,9 @@ PANES = {
     "frozen": f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n",
 }
 MOVED = f"✻ Thinking… (47s · esc to interrupt)\n❯ \n{FOOTER}\n"
+CODEX_FROZEN = "◦ Working (2m • esc to interrupt)\n› \n"
+CODEX_PICKER = "◦ Working (2m • esc to interrupt)\n› 4. gpt-5.5 (current)\nPress enter to confirm or esc to go back\n"
+CODEX_ABNORMAL = "API Error: 500 internal server error\n› \n"
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 
@@ -88,13 +91,19 @@ def never_spawn(*a, **k):
     raise AssertionError("spawn must never run for a wedge")
 
 
-def pool():
+def pool(runtime="claude"):
     ws = Path(tempfile.mkdtemp(prefix="pool-wedge-cards-"))
     (ws / "state").mkdir()
+    row = {"state": "live", "label": "comm"}
+    if runtime != "claude":
+        row["runtime"] = runtime
     (ws / "state" / "roster.json").write_text(json.dumps(
-        {"workers": {WID: {"state": "live", "label": "comm"}}}))
-    wi.record_session(ws, WID, "s1", runtime="claude", relation=wi.RELATION_NEW)
-    wi.start_incarnation(ws, WID, "s1", tmux_socket=SOCK, tmux_session=NAME)
+        {"workers": {WID: row}}))
+    if runtime == "codex":
+        wi.create_worker(ws, runtime="codex", worker_id=WID, tmux_socket=SOCK)
+    else:
+        wi.record_session(ws, WID, "s1", runtime="claude", relation=wi.RELATION_NEW)
+        wi.start_incarnation(ws, WID, "s1", tmux_socket=SOCK, tmux_session=NAME)
     return ws
 
 
@@ -212,6 +221,70 @@ class CauseCard(unittest.TestCase):
     def test_a_cleared_seat_closes_its_pending_card(self):
         _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
+
+
+class CodexCards(unittest.TestCase):
+    def setUp(self):
+        self.ws = pool("codex")
+
+    def test_frozen_codex_turn_has_codex_runtime_and_escape_checks_it_again(self):
+        out, t, req = card(self.ws, FROZEN, CODEX_FROZEN)
+        self.assertEqual(out["outcome"], "carded")
+        self.assertEqual(req.runtime, "codex")
+        self.assertEqual(t.acted(), [])
+        press(self.ws, req, "send_escape")
+        recheck = Tmux(CODEX_FROZEN)
+        self.assertEqual(wc.drive_escapes(self.ws, runner=recheck, manager=manager(self.ws)),
+                         {req.id: "sent"})
+        self.assertEqual(recheck.acted(),
+                         [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
+
+    def test_codex_picker_over_a_working_marker_clears_frozen_card(self):
+        # Codex's selected › row is a gate even when the old working marker remains.
+        # The Claude adapter would misread this same pane as a working turn.
+        out, t, req = card(self.ws, FROZEN, CODEX_PICKER)
+        self.assertEqual(out, {"worker_id": WID, "outcome": "cleared", "pane": ps.PANE_GATE})
+        self.assertIsNone(req)
+        self.assertEqual(t.acted(), [])
+
+    def test_codex_api_error_never_offers_the_claude_proxy_restart(self):
+        def proxy_probe(*_args):
+            raise AssertionError("Codex must not inspect the Anthropic proxy")
+
+        t = Tmux(CODEX_ABNORMAL)
+        out = wc.raise_card(self.ws, WID, CAUSE, runner=t, routed=proxy_probe,
+                            manager=manager(self.ws))
+        req = manager(self.ws).get(out["hitl_id"])
+        self.assertEqual(req.runtime, "codex")
+        self.assertEqual([a.id for a in req.actions], ["open_terminal"])
+        self.assertIsNone(req.subject["remedy"])
+        self.assertFalse(req.turn_on_action)
+
+    def test_escape_refuses_if_the_workers_runtime_changed(self):
+        _, _, req = card(self.ws, FROZEN, CODEX_FROZEN)
+        press(self.ws, req, "send_escape")
+        roster = self.ws / "state" / "roster.json"
+        data = json.loads(roster.read_text())
+        data["workers"][WID]["runtime"] = "claude"
+        roster.write_text(json.dumps(data))
+        recheck = Tmux(CODEX_FROZEN)
+        self.assertEqual(wc.drive_escapes(self.ws, runner=recheck, manager=manager(self.ws)),
+                         {req.id: "refused"})
+        self.assertEqual(recheck.acted(), [])
+
+    def test_missing_roster_row_never_guesses_the_runtime_or_opens_a_card(self):
+        roster = self.ws / "state" / "roster.json"
+        data = json.loads(roster.read_text())
+        del data["workers"][WID]
+        roster.write_text(json.dumps(data))
+        t = Tmux(CODEX_FROZEN)
+
+        out = wc.raise_card(self.ws, WID, FROZEN, runner=t, manager=manager(self.ws))
+
+        self.assertEqual(out, {"worker_id": WID, "outcome": "indeterminate",
+                               "probe": "worker runtime unavailable"})
+        self.assertEqual(t.calls, [])
+        self.assertEqual(manager(self.ws).active(), [])
 
 
 class CardEdges(unittest.TestCase):
