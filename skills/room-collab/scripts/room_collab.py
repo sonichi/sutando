@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from room_collab_protocol import DEFAULT_KIND, RoomDocError  # noqa: E402
+from room_collab_protocol import DEFAULT_KIND, TEXT_ROOTS, RoomDocError  # noqa: E402
 from room_collab_watch import new_lines  # noqa: E402
 
 # The edge refuses urllib's default agent outright (Cloudflare 1010), so an
@@ -40,7 +40,8 @@ SUMMON_CONTEXT_MAX = 400
 # a summon naming "qingyun" would post a message that renders as plain prose.
 MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
 # The surface as the summon's prose names it; the marker carries `kind` verbatim.
-SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board"}
+SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board",
+                  "html": "HTML page"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
@@ -359,7 +360,7 @@ async def doctor(args: argparse.Namespace) -> int:
         async with open_room_collab(url, args.room, token, kind=args.kind,
                                  insecure=args.insecure) as doc:
             say("connect", True, f"{url} accepted the socket")
-            if args.kind == DEFAULT_KIND:
+            if args.kind in TEXT_ROOTS:
                 say("read", True, f"{len(doc.text)} chars in the document")
             else:
                 say("read", True, f"{len(doc.elements)} elements")
@@ -619,6 +620,9 @@ async def run(args: argparse.Namespace) -> int:
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
         if args.command == "comment":
+            if args.kind != DEFAULT_KIND:
+                raise RoomDocError(f"comments are pinned to the Doc; the {args.kind!r} page "
+                                   "has no comment layer yet. Say it in the room instead.")
             at, nth = locate_quote(doc.text, args.quote, args.nth)
             body, extra = comment_content(doc.anchor(at, at + len(args.quote)), args.quote, nth,
                                           args.text, args.mention)
@@ -797,7 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-id", dest="user_id", default=None,
                    help="this agent's mxid, so the roster can show its avatar")
     p.add_argument("--kind", default="markdown",
-                   help="which of the room's surfaces (markdown, board, kanban); default markdown")
+                   help="which of the room's surfaces (markdown, html, board, kanban); "
+                        "default markdown")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")

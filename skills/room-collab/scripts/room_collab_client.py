@@ -59,7 +59,7 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url,
     explain,
     http_status,
     unanswered,
@@ -84,9 +84,9 @@ class RoomDoc:
         self._awareness = awareness
         self._kind = kind
         self._text_name = text_name
-        # Only markdown has a text by default; a composer holds one per post,
-        # which `open_post` selects. Naming another kind accepts unseen writes.
-        self._text = doc.get(text_name, type=Text) if kind == DEFAULT_KIND else None
+        # Only the text kinds have a text by default; a composer holds one per
+        # post, which `open_post` selects. Naming another kind accepts unseen writes.
+        self._text = doc.get(text_name, type=Text) if kind in TEXT_ROOTS else None
         self._post_id: str | None = None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
@@ -118,8 +118,8 @@ class RoomDoc:
                          self._kind, "structured data")
             raise RoomDocError(
                 f"cannot {what} on the {self._kind!r} document: it holds {where}, "
-                f"not text. Only the {DEFAULT_KIND!r} document is a text — open "
-                "that, or use the API for this kind.")
+                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents are text — "
+                "open one of those, or use the API for this kind.")
         return self._text
 
     @property
@@ -495,7 +495,7 @@ class RoomDoc:
         """What this document looks like right now, for whichever kind it is,
         plus who is present — the unit `events()` diffs."""
         snap: dict = {"peers": list(self.peers)}
-        if self._kind == DEFAULT_KIND:
+        if self._kind in TEXT_ROOTS:
             snap["text"] = self.text
         elif self._kind == BOARD_KIND:
             snap["elements"] = self.elements
@@ -527,7 +527,7 @@ class RoomDoc:
             if origin != LOCAL_ORIGIN:
                 fn()
 
-        if self._kind == DEFAULT_KIND:
+        if self._kind in TEXT_ROOTS:
             subs.append((self._text, self._text.observe(on_doc)))
         elif self._kind == BOARD_KIND:
             m = self._doc.get(ELEMENTS_KEY, type=Map)
@@ -803,10 +803,12 @@ class RoomDoc:
 @asynccontextmanager
 async def open_room_collab(api_root: str, room_id: str, token: str, *,
                         kind: str = DEFAULT_KIND,
-                        text_name: str = DEFAULT_TEXT_NAME,
+                        text_name: str | None = None,
                         insecure: bool = False) -> AsyncIterator[RoomDoc]:
     """Open one of a room's surfaces. `kind` selects which — the default
-    markdown document, or another surface such as the board or the kanban."""
+    markdown document, the HTML page, or a structured surface such as the board
+    or the kanban. A text kind's root comes from TEXT_ROOTS unless named."""
+    text_name = text_name or TEXT_ROOTS.get(kind, DEFAULT_TEXT_NAME)
     url = doc_socket_url(api_root, room_id, kind=kind)
     sslctx = None
     if url.startswith("wss://"):

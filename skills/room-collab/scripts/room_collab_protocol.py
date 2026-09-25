@@ -11,6 +11,9 @@ import urllib.parse
 
 DEFAULT_TEXT_NAME = "markdown"
 DEFAULT_KIND = "markdown"
+HTML_KIND = "html"
+# The surfaces that are one shared text, and the root each text lives under.
+TEXT_ROOTS = {DEFAULT_KIND: DEFAULT_TEXT_NAME, HTML_KIND: "html"}
 
 # The service accepts the socket and THEN closes with one of these, because a
 # close before accept cannot carry a code the client can read.
