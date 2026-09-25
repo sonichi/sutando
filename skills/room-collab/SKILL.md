@@ -538,6 +538,9 @@ python3 $P row-body '!room:server' - 'Write the demo' --file notes.md --append #
 Every row is also a page: `row-read` and `row-body` read and write its markdown
 body (they imply `--kind db`). Setting a body rewrites only the part that changed,
 so people typing elsewhere in it keep their place.
+`row-delete <room> <db> <row> --yes` removes a row with its values and its page,
+for everyone; without `--yes` it shows the row and stops. Confirm with the owner
+before deleting a row someone else wrote.
 
 `--db` may be left out when the room has one database; `--row` is a row id or
 its title. A CSV's headers map to properties case-blind; `--map 'CSV header=Property'`

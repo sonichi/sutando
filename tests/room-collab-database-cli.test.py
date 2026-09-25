@@ -234,6 +234,25 @@ def test_deleting_a_row_deletes_its_body_and_old_rows_get_one():
     assert page.row_body(db, "old") == "late notes"
 
 
+def test_row_delete_asks_first_then_removes_the_row_its_cells_and_its_page():
+    page = room()
+    db = json.loads(ok(["create", "!r:x", "--template", "tasks"], page))["db"]
+    gone = json.loads(ok(["add", "!r:x", "--set", "Name=Old task", "--set", "Priority=High"], page))["row"]
+    kept = json.loads(ok(["add", "!r:x", "--set", "Name=Keep me"], page))["row"]
+    ok(["row-body", "!r:x", "-", gone, "--text", "notes"], page)
+    sent = page._ws.sent
+    rc, _, err = cli(["row-delete", "!r:x", "-", "old task"], page)
+    assert rc == 2 and "--yes" in err and "Old task" in err, err
+    assert page._ws.sent == sent and page.row_body(db, gone) == "notes", "nothing reached the room"
+    out = json.loads(ok(["row-delete", "!r:x", "-", "old task", "--yes"], page))
+    assert out == {"ok": True, "db": db, "row": gone, "deleted": True, "title": "Old task"}, out
+    maps = page.database
+    assert f"{db}|{gone}" not in maps["rows"] and f"{db}|{kept}" in maps["rows"]
+    assert not [k for k in maps["cells"] if k.startswith(f"{db}|{gone}|")], maps["cells"]
+    assert [k for k in maps["cells"] if k.startswith(f"{db}|{kept}|")], "the other row keeps its values"
+    assert page.row_body(db, gone) is None and page.row_body(db, kept) == ""
+
+
 def test_kanban_add_and_move_still_need_their_arguments():
     parser = room_collab.build_parser()
     args = parser.parse_args(["--kind", "kanban", "add", "!r:x", "ship it"])

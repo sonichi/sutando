@@ -534,6 +534,21 @@ async def database(doc, args: argparse.Namespace) -> int:
                           "chars": chars}, ensure_ascii=False))
         return 0
 
+    if args.command == "row-delete":
+        from room_database import delete_row_plan
+        d = resolve_db(maps, args.db)
+        row = resolve_row(d, args.row)
+        r = row_json(d, row, doc.row_body(d["id"], row["id"]), names.get(d["id"], ""))
+        if not args.yes:
+            print(render_row(r), file=sys.stderr)
+            raise RoomDocError("row-delete removes this row, its values and its page for everyone; "
+                               "run it again with --yes to delete it")
+        await doc.put_database(delete_row_plan(maps, d["id"], row["id"]))
+        await doc.settle(args.settle)
+        print(json.dumps({"ok": True, "db": d["id"], "row": row["id"], "deleted": True,
+                          "title": r.get("title", "")}, ensure_ascii=False))
+        return 0
+
     by = resolve_identity(args.user_id)
     out: dict = {"ok": True}
     if args.command == "create":
@@ -1319,6 +1334,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--file", help="read the body from this file (`-` for stdin)")
     s.add_argument("--append", action="store_true", help="add to the end instead of replacing")
 
+    s = sub.add_parser("row-delete", help="delete a database row with its values and page body, for "
+                                          "everyone (implies --kind db; needs --yes)")
+    s.add_argument("room")
+    s.add_argument("db", help="the database, by name or id; `-` for the only one")
+    s.add_argument("row", help="the row's id, or its title")
+    s.add_argument("--yes", action="store_true", help="really delete it; without this, show the row and stop")
+
     s = sub.add_parser("state", help="read or write the HTML page's shared state, the one its scripts "
                                      "see as artifact.state (needs --kind html)")
     s.add_argument("room")
@@ -1427,7 +1449,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command in ("row-read", "row-body"):
+    if args.command in ("row-read", "row-body", "row-delete"):
         args.kind = "db"  # a row page lives only in the databases document
     try:
         return asyncio.run(run(args))

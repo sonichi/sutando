@@ -493,6 +493,13 @@ def import_plan(d: dict, records: list[dict], by: str, now_ms: int | None = None
     return ids, writes
 
 
+def delete_row_plan(maps: dict, db: str, row: str) -> dict:
+    """The row and every cell it had, as the web client deletes it; put_database drops its page body."""
+    pre = f"{key(db, row)}|"
+    return {"rows": {key(db, row): None},
+            "cells": {k: None for k in (maps.get("cells") or {}) if k.startswith(pre)}}
+
+
 def move_plan(d: dict, row: str, group_prop: dict, group_id, by: str, now_ms: int | None = None) -> dict:
     """Moving a card on a board = writing its group value."""
     if group_prop["type"] == "multi_select":
