@@ -817,6 +817,80 @@ class RoomDoc:
         await self._commit(lambda: index.__setitem__(pid, entry))
         return {"id": pid, "kind": f"html-{pid}", **entry}
 
+    def _require_versions(self, what: str) -> tuple:
+        from html_versions import VERSION_TEXTS_KEY, VERSIONS_KEY
+        if not is_html_kind(self._kind):
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: versions belong "
+                               f"to an HTML page (--kind {HTML_KIND} or html-<id>)")
+        return (self._doc.get(VERSIONS_KEY, type=Map), self._doc.get(VERSION_TEXTS_KEY, type=Map))
+
+    @property
+    def versions(self) -> list[dict]:
+        """The page's named snapshots, newest first."""
+        from html_versions import read_versions
+        meta, _ = self._require_versions("list versions")
+        return read_versions(dict(self._items(meta)))
+
+    def _snapshot(self, meta: Any, texts: Any, text: str, name: str, by: str,
+                  auto: bool) -> tuple:
+        """Plan one snapshot, returning (vid, entry, prune) — or VersionRefused."""
+        from html_versions import new_version_id, plan_snapshot, read_versions
+        entry, prune = plan_snapshot(read_versions(dict(self._items(meta))), text, name, by, auto=auto)
+        return new_version_id(), entry, prune
+
+    @staticmethod
+    def _write_snapshot(meta: Any, texts: Any, vid: str, entry: dict, prune: list, text: str) -> None:
+        for old in prune:
+            if old in meta:
+                del meta[old]
+            if old in texts:
+                del texts[old]
+        texts[vid] = text
+        meta[vid] = entry
+
+    async def save_version(self, name: str, by: str) -> dict:
+        """Snapshot the page as it is now, under the web client's caps."""
+        from html_versions import VersionRefused
+        meta, texts = self._require_versions("save a version")
+        self._require_text("save a version")
+        current = self.text
+        try:
+            vid, entry, prune = self._snapshot(meta, texts, current, name, by, False)
+        except VersionRefused as exc:
+            raise RoomDocError(str(exc)) from None
+        await self._commit(lambda: self._write_snapshot(meta, texts, vid, entry, prune, current))
+        return {"id": vid, **entry, "pruned": prune}
+
+    async def restore_version(self, ref: str, by: str) -> dict:
+        """Put a version back for everyone, snapshotting the current page first when the cap
+        allows; the whole text is replaced in one transaction."""
+        from html_versions import VersionRefused, before_restore_name, find_version
+        meta, texts = self._require_versions("restore a version")
+        text = self._require_text("restore a version")
+        chosen = find_version(self.versions, ref)
+        if chosen is None:
+            raise RoomDocError(f"no version {ref!r} on this page; run `versions` to list them")
+        body = texts.get(chosen["id"]) if chosen["id"] in texts else None
+        if not isinstance(body, str):
+            raise RoomDocError(f"the text of version {chosen['name']!r} is missing; it cannot be restored")
+        current = self.text
+        saved, note = None, None
+        if current != body and current.strip():
+            try:
+                saved = self._snapshot(meta, texts, current, before_restore_name(), by, True)
+            except VersionRefused as exc:
+                note = f"restored without saving the current page first: {exc}"
+
+        def mutate() -> None:
+            if saved:
+                self._write_snapshot(meta, texts, *saved, current)
+            del text[0:len(current.encode("utf-8"))]
+            text.insert(0, body)
+
+        await self._commit(mutate)
+        return {"restored": chosen["id"], "name": chosen["name"],
+                "saved_before": saved[0] if saved else None, "note": note}
+
     async def set_app_state(self, key: str, value) -> None:
         """Set (or, with None, delete) one key of the page's shared state, under the web client's bounds."""
         import json as _json
