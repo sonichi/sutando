@@ -41,11 +41,14 @@ class RestartArgvValidation(unittest.TestCase):
 
     def test_the_validation_block_runs_before_any_destructive_line(self):
         """The whole block (multi-arg check + case) must sit before the
-        script's first service-affecting command, or an unknown flag still
-        reaches it."""
+        script's first side-effecting command -- _shutdown_state mark writes
+        a sentinel file, which is the true first effect, earlier than any
+        pkill (a prose mention of 'pkill -f' in a comment sits earlier still
+        and would pass this check without proving anything)."""
         block_pos = self.text.index('if [ "$#" -gt 1 ]; then')
-        first_pkill = self.text.index("pkill -f")
-        self.assertLess(block_pos, first_pkill, "argv validation sits after a pkill")
+        first_side_effect = self.text.index('_shutdown_state mark')
+        self.assertLess(block_pos, first_side_effect,
+                         "argv validation sits after the first side effect")
 
     def test_no_args_passes_through(self):
         r = self._run_block()
