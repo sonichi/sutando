@@ -25,13 +25,25 @@ import { join } from 'node:path';
  * The osascript and fetch calls are injected — no Contacts app is touched — while
  * the consent check runs the REAL Python script against a temp workspace, so the
  * parity with the Python side is exercised, not asserted from a copy. The tool is
- * built with a macOS stub so the gate is exercised on every CI platform.
+ * built with a macOS stub so the gate is exercised on every CI platform, and the
+ * interpreter is pinned through $SUTANDO_PY below so the Linux lane has one.
  * Run: npx tsx --test tests/call-contact-consent.test.ts
  */
 
 import { makeCallContactTool } from '../src/meeting-tools.js';
 import { checkNativePimConsent, consentScriptPath, reportNativePimError } from '../src/native-pim-consent.js';
-import { requirePython } from '../src/python-binary.js';
+import { pythonOnPath, requirePython, resetCacheForTests } from '../src/python-binary.js';
+
+// The interpreter is named explicitly for this process. python-binary's cascade is
+// written for macOS: on the Linux CI runner it reads /usr/bin/python3 as the CLT
+// stub, finds no xcode-select, and answers "no runnable python3" — which the
+// helper correctly reports as `unavailable`, not as the consent verdict under
+// test. $SUTANDO_PY is tier 1 of that cascade on every platform.
+if (!process.env.SUTANDO_PY) {
+	const onPath = pythonOnPath();
+	if (onPath) process.env.SUTANDO_PY = onPath;
+}
+resetCacheForTests();
 
 type Result = Record<string, unknown>;
 
