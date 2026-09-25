@@ -485,8 +485,8 @@ async def database(doc, args: argparse.Namespace) -> int:
     """The room's databases: list, create from a template, read a view, add, update,
     move on a board, import a CSV. Values are set by property name and checked first."""
     from room_database import (add_row_plan, assignments, cell_writes, create_plan, group_target,
-                               list_dbs, move_plan, read_db, render_view, resolve_db, resolve_prop,
-                               resolve_row, resolve_view, view_json)
+                               list_dbs, move_plan, read_db, render_row, render_view, resolve_db,
+                               resolve_prop, resolve_row, resolve_view, row_json, view_json)
 
     if args.command == "peers":
         print(render("peers", peers=doc.peers, as_json=args.json))
@@ -508,6 +508,30 @@ async def database(doc, args: argparse.Namespace) -> int:
         d = resolve_db(maps, args.db)
         v = view_json(d, resolve_view(d, args.view), names.get(d["id"], ""))
         print(json.dumps(v, ensure_ascii=False, indent=2) if args.json else render_view(v))
+        return 0
+
+    if args.command == "row-read":
+        d = resolve_db(maps, args.db)
+        row = resolve_row(d, args.row)
+        r = row_json(d, row, doc.row_body(d["id"], row["id"]), names.get(d["id"], ""))
+        print(json.dumps(r, ensure_ascii=False, indent=2) if args.json else render_row(r))
+        return 0
+    if args.command == "row-body":
+        d = resolve_db(maps, args.db)
+        row = resolve_row(d, args.row)["id"]
+        if (args.text is None) == (args.file is None):
+            raise RoomDocError("row-body needs exactly one of --text or --file")
+        if args.file is None:
+            text = args.text
+        elif args.file == "-":
+            text = sys.stdin.read()
+        else:
+            with open(args.file, encoding="utf-8") as fh:
+                text = fh.read()
+        chars = await doc.put_row_body(d["id"], row, text, append=args.append)
+        await doc.settle(args.settle)
+        print(json.dumps({"ok": True, "db": d["id"], "row": row, "appended" if args.append else "set": True,
+                          "chars": chars}, ensure_ascii=False))
         return 0
 
     by = resolve_identity(args.user_id)
@@ -542,7 +566,7 @@ async def database(doc, args: argparse.Namespace) -> int:
             out.update(rows_added=len(ids), **report)
     else:
         raise RoomDocError(f"{args.command!r} is not a database command; use dbs, create, read, add, "
-                           "update, move, import or peers.")
+                           "update, move, import, row-read, row-body or peers.")
     out["written"] = await doc.put_database(writes)
     await doc.settle(args.settle)
     print(json.dumps(out, ensure_ascii=False))
@@ -1192,6 +1216,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--set", action="append", metavar="PROP=VALUE",
                    help="a value by property name (repeatable); empty clears it")
 
+    s = sub.add_parser("row-read", help="print a database row as a page: its properties, then its "
+                                        "body (implies --kind db)")
+    s.add_argument("room")
+    s.add_argument("db", help="the database, by name or id; `-` for the only one")
+    s.add_argument("row", help="the row's id, or its title")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="machine-readable output")
+
+    s = sub.add_parser("row-body", help="set a database row's page body, markdown (implies --kind db)")
+    s.add_argument("room")
+    s.add_argument("db", help="the database, by name or id; `-` for the only one")
+    s.add_argument("row", help="the row's id, or its title")
+    s.add_argument("--text", help="the body")
+    s.add_argument("--file", help="read the body from this file (`-` for stdin)")
+    s.add_argument("--append", action="store_true", help="add to the end instead of replacing")
+
     s = sub.add_parser("state", help="read or write the HTML page's shared state, the one its scripts "
                                      "see as artifact.state (needs --kind html)")
     s.add_argument("room")
@@ -1294,6 +1333,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in ("row-read", "row-body"):
+        args.kind = "db"  # a row page lives only in the databases document
     try:
         return asyncio.run(run(args))
     except RoomDocError as exc:

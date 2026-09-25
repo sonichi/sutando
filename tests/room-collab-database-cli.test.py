@@ -19,7 +19,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "skills" / "room-collab" / "scripts"))
 
 try:
-    from pycrdt import Awareness, Doc
+    from pycrdt import Awareness, Doc, Map
 except ImportError as exc:  # pragma: no cover
     print(f"room-collab database cli: FAIL — dependencies missing ({exc}).")
     sys.exit(1)
@@ -176,6 +176,64 @@ def test_other_kinds_are_told_to_open_the_db():
         raise AssertionError("an unknown map is refused")
 
 
+def test_every_row_is_a_page_with_a_body():
+    page = room()
+    db = json.loads(ok(["create", "!r:x", "--template", "meetings", "--name", "Standups"], page))["db"]
+    row = json.loads(ok(["add", "!r:x", "--set", "Meeting=Monday standup", "--set", "Type=Standup"], page))["row"]
+    assert page.row_body(db, row) == "", "a row is created with its (empty) body"
+    text = ok(["row-read", "!r:x", "standups", "monday standup"], page)
+    assert text.startswith("# Monday standup") and "Type: Standup" in text and "(the page is empty)" in text, text
+    out = json.loads(ok(["row-body", "!r:x", "-", "Monday standup", "--text", "# Notes\n\n- ship Friday"], page))
+    assert out == {"ok": True, "db": db, "row": row, "set": True, "chars": 22}, out
+    ok(["row-body", "!r:x", "-", row, "--text", "\n- démo on Thursday", "--append"], page)
+    assert page.row_body(db, row) == "# Notes\n\n- ship Friday\n- démo on Thursday"
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+        fh.write("# Notes\n\n- ship Monday\n- démo on Thursday")
+    ok(["row-body", "!r:x", "-", row, "--file", fh.name], page)
+    assert page.row_body(db, row) == "# Notes\n\n- ship Monday\n- démo on Thursday", "only the middle changed"
+    r = json.loads(ok(["row-read", "!r:x", "-", row, "--json"], page))
+    assert r["title"] == "Monday standup" and r["values"]["Type"] == "Standup", r
+    assert r["body"] == "# Notes\n\n- ship Monday\n- démo on Thursday", r
+    assert page.database["rows"] and "bodies" not in page.database, "bodies stay out of the plain maps"
+
+
+def test_row_pages_refuse_what_they_cannot_do():
+    page = room()
+    db = json.loads(ok(["create", "!r:x", "--template", "tasks"], page))["db"]
+    row = json.loads(ok(["add", "!r:x", "--set", "Name=x"], page))["row"]
+    sent = page._ws.sent
+    rc, _, err = cli(["row-body", "!r:x", "-", row], page)
+    assert rc == 2 and "--text or --file" in err, err
+    rc, _, err = cli(["row-body", "!r:x", "-", row, "--text", "a", "--file", "b"], page)
+    assert rc == 2 and "--text or --file" in err, err
+    rc, _, err = cli(["row-read", "!r:x", "-", "nope"], page)
+    assert rc == 2 and "no row" in err, err
+    rc, _, err = cli(["row-body", "!r:x", "-", row, "--text", "x" * 200_001], page)
+    assert rc == 2 and "at most" in err, err
+    assert page._ws.sent == sent and page.row_body(db, row) == "", "nothing reached the room"
+    try:
+        asyncio.run(page.put_row_body(db, "ghost", "x"))
+    except RoomDocError as exc:
+        assert "no row" in str(exc), exc
+    else:
+        raise AssertionError("a body for a row that does not exist is refused")
+
+
+def test_deleting_a_row_deletes_its_body_and_old_rows_get_one():
+    page = room()
+    db = json.loads(ok(["create", "!r:x", "--template", "tasks"], page))["db"]
+    row = json.loads(ok(["add", "!r:x", "--set", "Name=x"], page))["row"]
+    ok(["row-body", "!r:x", "-", row, "--text", "gone soon"], page)
+    asyncio.run(page.put_database({"rows": {f"{db}|{row}": None}}))
+    assert page.row_body(db, row) is None
+    # A row written before bodies existed: its body appears on the first write.
+    page._doc.get("rows", type=Map)[f"{db}|old"] = {"order": 5, "created": 1, "by": BY}
+    assert page.row_body(db, "old") is None
+    assert "(the page is empty)" in ok(["row-read", "!r:x", "-", "old"], page)
+    ok(["row-body", "!r:x", "-", "old", "--text", "late notes"], page)
+    assert page.row_body(db, "old") == "late notes"
+
+
 def test_kanban_add_and_move_still_need_their_arguments():
     parser = room_collab.build_parser()
     args = parser.parse_args(["--kind", "kanban", "add", "!r:x", "ship it"])
@@ -184,6 +242,8 @@ def test_kanban_add_and_move_still_need_their_arguments():
     assert (args.card_id, args.column) == ("c1", "doing")
     args = parser.parse_args(["--json", "--kind", "db", "read", "!r:x"])
     assert args.json is True, "a --json before the command survives the command's own --json"
+    args = parser.parse_args(["row-read", "!r:x", "Launch", "Write the demo"])
+    assert (args.db, args.row, args.kind) == ("Launch", "Write the demo", "markdown"), "main() sets --kind db"
 
 
 for name, fn in list(globals().items()):
