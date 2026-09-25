@@ -17,6 +17,10 @@ deck = outline("""<main><section class="slide active" id="s1"><h1>My <b>AI</b> S
 assert deck["kind"] == "deck", deck
 assert deck["slides"][0] == {"n": 1, "id": "s1", "title": "My AI Stand", "topics": [{"topic": "ag2", "text": "AG2 framework"}]}, deck
 assert deck["slides"][1]["title"] == "Loop" and deck["slides"][1]["topics"] == [{"topic": "step1", "text": "Observe"}]
+reveal = outline('<div class="reveal"><div class="slides"><section><h2>One</h2><section><h3>nested</h3></section>'
+                 '</section><section><h1>Two</h1><p data-topic="k">key</p></section></div></div>')
+assert [s["title"] for s in reveal["slides"]] == ["One", "Two"], reveal
+assert reveal["slides"][1]["topics"] == [{"topic": "k", "text": "key"}], reveal
 page = outline("<h1>Report</h1><p>x</p><h2>Findings</h2>")
 assert page == {"kind": "page", "headings": ["Report", "Findings"]}, page
 print("room-collab page outline: ok")

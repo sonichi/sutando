@@ -58,7 +58,12 @@ export function toBeats(steps: ScriptItem[][], topicSlide: Record<string, number
 /** The relay paths that put the deck where a beat belongs, whatever happened since. */
 export function anchorPaths(anchor: Anchor | null): string[] {
 	if (!anchor) return ['/slide/1'];
-	if ('topic' in anchor) return [`/highlight/${encodeURIComponent(anchor.topic)}`];
+	// The slide first, for decks that do not jump to a topic themselves; the topic after.
+	if ('topic' in anchor)
+		return [
+			...(anchor.slide ? [`/slide/${anchor.slide}`] : []),
+			`/highlight/${encodeURIComponent(anchor.topic)}`,
+		];
 	return [`/slide/${anchor.slide}`];
 }
 

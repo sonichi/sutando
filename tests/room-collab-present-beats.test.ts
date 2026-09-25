@@ -36,8 +36,9 @@ describe('room-collab talk beats', () => {
 			{ slide: 17 },
 			{ slide: 17 },
 		]);
-		// A topic the deck reaches by itself is re-sent as the topic, not as a slide number.
-		assert.deepEqual(anchorPaths({ topic: 'trust', slide: 18 }), ['/highlight/trust']);
+		// A topic is re-applied as its slide, then the topic, so any deck lands on it.
+		assert.deepEqual(anchorPaths({ topic: 'trust', slide: 18 }), ['/slide/18', '/highlight/trust']);
+		assert.deepEqual(anchorPaths({ topic: 'x' }), ['/highlight/x']);
 		assert.deepEqual(anchorPaths({ slide: 4 }), ['/slide/4']);
 		assert.deepEqual(anchorPaths(null), ['/slide/1']);
 	});

@@ -1,6 +1,7 @@
 """What an HTML page shows, as a voice agent needs it: slides and what can be pointed at.
 
-A deck (elements whose class includes `slide`) is listed slide by slide: its
+A deck is listed slide by slide — elements whose class includes `slide`, or a
+reveal.js deck's top-level `.slides > section` — with its
 number, its title (first h1–h3), and its `data-topic` keys with the words they
 label. Any other page is listed by its headings. The page is parsed, never run,
 so text a script adds at runtime is not here.
@@ -26,8 +27,13 @@ class _Outline(HTMLParser):
         if tag in VOID:
             return
         a = dict(attrs)
-        node = {"tag": tag, "text": [], "slide": None, "topic": a.get("data-topic"), "heading": tag in ("h1", "h2", "h3")}
-        if "slide" in (a.get("class") or "").split() and not any(n["slide"] is not None for n in self.stack):
+        node = {"tag": tag, "text": [], "slide": None, "topic": a.get("data-topic"), "heading": tag in ("h1", "h2", "h3"),
+                "classes": []}
+        classes = (a.get("class") or "").split()
+        in_slide = any(n["slide"] is not None for n in self.stack)
+        reveal = tag == "section" and bool(self.stack) and "slides" in self.stack[-1]["classes"]
+        node["classes"] = classes
+        if ("slide" in classes or reveal) and not in_slide:
             node["slide"] = {"n": len(self.slides) + 1, "id": a.get("id"), "title": None, "topics": []}
             self.slides.append(node["slide"])
         if tag in SKIP:
