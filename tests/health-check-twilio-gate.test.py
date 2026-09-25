@@ -42,11 +42,24 @@ Gate cases (python == startup; grep fallback in parentheses when it differs):
   k) .env SID + token, number in the vault           → True  (grep: False)
   l) .env SID + number, token in the vault           → True  (grep: False)
 
-Phone-block cases (the real block from src/startup.sh, its services stubbed):
-  1) vault SID + token, no number → server not launched, no ngrok
-  2) all three, server binds :3100 → server launched, ngrok started
-  3) all three, server exits       → server launched, NO ngrok
-  4) all three, server never binds → server launched, NO ngrok
+Phone-block cases (the real block from src/startup.sh, its services stubbed).
+The bind probe is `lsof -ti :3100 -sTCP:LISTEN`, and the tunnel opens only
+when a LISTEN socket belongs to the conversation-server process itself: the
+pid startup.sh launched (or a descendant — the bound node runs under a
+backgrounded function and tsx) in the start branch, one of pgrep's pids in
+the already-running branch. A bare `lsof -i :3100` also answers for a stale
+client connection or a foreign listener, and the old already-running branch
+trusted pgrep alone; both published a public tunnel to a socket that was not
+the server's. The `lsof` stub refuses any call without `-sTCP:LISTEN`.
+  1) vault SID + token, no number             → server not launched, no ngrok
+  2) all three, server binds :3100 (a child)  → server launched, ngrok started
+  3) all three, server exits                  → server launched, NO ngrok
+  4) all three, server never binds            → server launched, NO ngrok
+  5) foreign process listens on :3100, server exits (port in use) → NO ngrok
+  6) foreign process listens on :3100, server alive, never binds  → NO ngrok
+  7) already running (pgrep), nothing listens on :3100            → NO ngrok
+  8) already running (pgrep), that pid listens on :3100           → ngrok started
+  9) already running (pgrep), a foreign pid listens on :3100      → NO ngrok
 
 Run: python3 tests/health-check-twilio-gate.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -129,30 +142,50 @@ def startup_gate(env_content: str | None, vault: dict[str, str], resolver: bool)
         return r.returncode == 0
 
 
-def phone_block(env_content: str, vault: dict[str, str], server: str) -> dict:
+def phone_block(env_content: str, vault: dict[str, str], server: str,
+                foreign_listener: bool = False, running: str | None = None) -> dict:
     """Run the real phone block with its services stubbed.
 
-    `server` is what the stubbed conversation-server does: 'binds' (marks
-    :3100 listening, stays up), 'exits' (returns at once, like the real one
-    on a missing credential), or 'hangs' (stays up, never binds). The block's
+    `server` is what the stubbed conversation-server does: 'binds' (a child
+    of the launched pid is the :3100 listener, stays up), 'exits' (returns at
+    once, like the real one on a missing credential or a port in use), or
+    'hangs' (stays up, never binds). `foreign_listener` parks a live process
+    that is not the server on :3100 before the block runs. `running` drives
+    the already-running branch: 'listener' (pgrep names the pid that listens
+    on :3100), 'silent' (pgrep names a live pid, nothing listens), 'foreign'
+    (pgrep names a live pid, a different live pid listens). The block's
     literal /tmp/ log paths are redirected into the sandbox so the harness
     never writes over a running host's logs. `lsof`, `pgrep`, `ngrok`, `curl`
-    and `sleep` are shell functions, so the block resolves them first.
+    and `sleep` are shell functions, so the block resolves them first; `ps`
+    is the real one, so the ancestor walk runs against live pids. `lsof`
+    answers only `-sTCP:LISTEN` queries, with the pid in `bound`.
     """
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / ".env").write_text(env_content)
         stubs = {
-            "binds": "touch bound; /bin/sleep 3",
+            "binds": "/bin/sleep 3 & echo $! > bound; wait",
             "exits": "exit 1",
             "hangs": "/bin/sleep 3",
         }[server]
+        setup = []
+        if foreign_listener:
+            setup.append("/bin/sleep 3 > /dev/null 2>&1 & echo $! > bound")
+        if running == "listener":
+            setup.append("/bin/sleep 3 > /dev/null 2>&1 & echo $! > running; cp running bound")
+        elif running == "silent":
+            setup.append("/bin/sleep 3 > /dev/null 2>&1 & echo $! > running")
+        elif running == "foreign":
+            setup.append("/bin/sleep 3 > /dev/null 2>&1 & echo $! > running")
+            setup.append("/bin/sleep 3 > /dev/null 2>&1 & echo $! > bound")
         script = "\n".join([
             f"cd {shlex.quote(d)}",
             "VERIFY_SETTLE_S=1",
+            *setup,
             "phone_stack_enabled() { return 0; }",
             f"run_node_service() {{ touch launched; {stubs}; }}",
-            "lsof() { [ -f bound ]; }",
-            "pgrep() { return 1; }",
+            'lsof() { case "$*" in *-sTCP:LISTEN*) cat bound 2>/dev/null;; '
+            '*) echo "lsof without -sTCP:LISTEN: $*" >&2; return 2;; esac; }',
+            'pgrep() { case "$*" in *conversation-server*) cat running 2>/dev/null;; *) return 1;; esac; }',
             "ngrok() { touch ngrok-started; /bin/sleep 3; }",
             'curl() { printf \'{"tunnels":[{"public_url":"https://t.ngrok-free.app"}]}\'; }',
             "sleep() { /bin/sleep 0.1; }",
@@ -191,13 +224,27 @@ CASES = [
      {"TWILIO_AUTH_TOKEN": "tokvault"}, True, False),
 ]
 
-# (name, .env content, vault values, server behaviour, expect launched, expect ngrok, expected output fragment)
+# (name, .env content, vault values, server behaviour, foreign listener, already-running mode,
+#  expect launched, expect ngrok, expected output fragment)
 BLOCK_CASES = [
-    ("1) vault SID + token, no number: phone stack stays off", PLACEHOLDER, VAULT_SID_TOKEN, "binds",
+    ("1) vault SID + token, no number: phone stack stays off", PLACEHOLDER, VAULT_SID_TOKEN, "binds", False, None,
      False, False, "no Twilio creds"),
-    ("2) all three, server binds: tunnel opens", ALL_THREE, {}, "binds", True, True, "ngrok (https://t.ngrok-free.app)"),
-    ("3) all three, server exits: no tunnel to a dead port", ALL_THREE, {}, "exits", True, False, "conversation server exited"),
-    ("4) all three, server never binds: no tunnel", ALL_THREE, {}, "hangs", True, False, "did not bind port 3100"),
+    ("2) all three, server binds: tunnel opens", ALL_THREE, {}, "binds", False, None,
+     True, True, "ngrok (https://t.ngrok-free.app)"),
+    ("3) all three, server exits: no tunnel to a dead port", ALL_THREE, {}, "exits", False, None,
+     True, False, "conversation server exited"),
+    ("4) all three, server never binds: no tunnel", ALL_THREE, {}, "hangs", False, None,
+     True, False, "did not bind port 3100 within 1s"),
+    ("5) foreign listener on :3100, server exits (port in use): no tunnel to it", ALL_THREE, {}, "exits", True, None,
+     True, False, "held by pid"),
+    ("6) foreign listener on :3100, server alive but not bound: no tunnel to it", ALL_THREE, {}, "hangs", True, None,
+     True, False, "held by pid"),
+    ("7) already running, nothing listens: no tunnel", ALL_THREE, {}, "binds", False, "silent",
+     False, False, "nothing listens on port 3100"),
+    ("8) already running, its pid listens: tunnel opens", ALL_THREE, {}, "binds", False, "listener",
+     False, True, "conversation server (already running)"),
+    ("9) already running, a foreign pid listens: no tunnel to it", ALL_THREE, {}, "binds", False, "foreign",
+     False, False, "held by pid"),
 ]
 
 
@@ -215,8 +262,8 @@ def main() -> int:
         if not ok:
             fails.append(name)
     print("phone block:")
-    for name, env, vault, server, want_launched, want_ngrok, fragment in BLOCK_CASES:
-        got = phone_block(env, vault, server)
+    for name, env, vault, server, foreign, running, want_launched, want_ngrok, fragment in BLOCK_CASES:
+        got = phone_block(env, vault, server, foreign_listener=foreign, running=running)
         ok = got["launched"] == want_launched and got["ngrok"] == want_ngrok and fragment in got["out"]
         status = "PASS" if ok else "FAIL"
         print(f"  {status} {name} (launched={got['launched']}, ngrok={got['ngrok']}, "

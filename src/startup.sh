@@ -1215,13 +1215,48 @@ twilio_creds_present() {
   done
   return 0
 }
+# One settle window for the bind wait below and the verify pass (default 10s).
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+# Pids holding a LISTEN socket on :3100, one per line. LISTEN only: a stale
+# client connection or a foreign listener also answers a bare `lsof -i :3100`.
+cs_listen_pids() { lsof -ti :3100 -sTCP:LISTEN 2>/dev/null || true; }
+# 0 when a :3100 listener is $1 or descends from it — the server runs under a
+# backgrounded function and tsx, so the node that binds is a child of $!.
+cs_listening_under() {
+  local _root="$1" _pid _p
+  for _pid in $(cs_listen_pids); do
+    _p="$_pid"
+    while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null; do
+      [ "$_p" = "$_root" ] && return 0
+      _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
+}
+# 0 when a :3100 listener is one of the pids given (a pgrep result).
+cs_listening_by_any() {
+  local _pid _q
+  for _pid in $(cs_listen_pids); do
+    for _q in "$@"; do [ "$_pid" = "$_q" ] && return 0; done
+  done
+  return 1
+}
+cs_port_holder() {
+  local _pid
+  _pid=$(cs_listen_pids | head -1)
+  [ -n "$_pid" ] || return 1
+  echo "pid $_pid ($(ps -o comm= -p "$_pid" 2>/dev/null | tr -d ' ' || true))"
+}
 if [ "${SKIP_PHONE:-}" = "1" ]; then
   echo "  ~ conversation server (skipped via SKIP_PHONE)"
 elif ! phone_stack_enabled; then
   echo "  ~ conversation server (disabled — no Gemini voice key)"
 elif twilio_creds_present; then
+  # _cs_up=1 only when a :3100 LISTEN socket belongs to the conversation-server
+  # process itself; a dead or foreign socket must never get a public tunnel.
   _cs_up=0
-  if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
+  _cs_running=$(pgrep -f "conversation-server" 2>/dev/null || true)
+  if [ -z "$_cs_running" ]; then
     echo "  Starting conversation server..."
     run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     _cs_pid=$!
@@ -1229,24 +1264,30 @@ elif twilio_creds_present; then
     # it. ngrok to a port nothing answers on is a PUBLIC URL to a dead socket,
     # and the server exits at once on a missing credential or a rejected key.
     # The gate above keeps the credential case out; this keeps every other exit
-    # out. Bounded by the verify pass's own settle window: a server merely
+    # out. Bounded by the same settle window as the verify pass: a server merely
     # slower than that gets no startup tunnel and reports itself below.
-    _cs_deadline=$(( $(date +%s) + ${VERIFY_SETTLE_S:-15} ))
-    while ! lsof -i :3100 > /dev/null 2>&1 && kill -0 "$_cs_pid" 2>/dev/null \
+    _cs_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
+    while ! cs_listening_under "$_cs_pid" && kill -0 "$_cs_pid" 2>/dev/null \
         && [ "$(date +%s)" -lt "$_cs_deadline" ]; do
       sleep 1
     done
-    if lsof -i :3100 > /dev/null 2>&1; then
+    if cs_listening_under "$_cs_pid"; then
       _cs_up=1
       echo "  ✓ conversation server (port 3100)"
+    elif _cs_holder=$(cs_port_holder); then
+      echo "  ✗ conversation server did not bind port 3100 — held by $_cs_holder, not the server; free it (lsof -ti :3100 -sTCP:LISTEN | xargs kill) and restart; ngrok not started"
     elif kill -0 "$_cs_pid" 2>/dev/null; then
-      echo "  ✗ conversation server did not bind port 3100 within ${VERIFY_SETTLE_S:-15}s — check /tmp/conversation-server.log; ngrok not started"
+      echo "  ✗ conversation server did not bind port 3100 within ${VERIFY_SETTLE_S}s — check /tmp/conversation-server.log; ngrok not started"
     else
       echo "  ✗ conversation server exited — check /tmp/conversation-server.log; ngrok not started"
     fi
-  else
+  elif cs_listening_by_any $_cs_running; then
     _cs_up=1
     echo "  ✓ conversation server (already running)"
+  elif _cs_holder=$(cs_port_holder); then
+    echo "  ✗ conversation server process found ($(echo $_cs_running | tr ' ' ,)) but port 3100 is held by $_cs_holder, not the server; free it and restart; ngrok not started"
+  else
+    echo "  ✗ conversation server process found ($(echo $_cs_running | tr ' ' ,)) but nothing listens on port 3100 — check /tmp/conversation-server.log; ngrok not started"
   fi
   if [ "$_cs_up" -ne 1 ]; then
     : # nothing behind the port, so no tunnel to it (reported above)
@@ -1349,7 +1390,7 @@ if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
 fi
 # A single probe races a service still binding, so retry briefly. The deadline is
 # GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
-VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+# VERIFY_SETTLE_S is assigned before the phone block, which shares the window.
 verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
