@@ -8,7 +8,9 @@
 # seen for its inbox, and disarms the moment one appears.
 set -u
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# BASH_SOURCE, not $0: this file's own path whether executed or sourced (a test
+# sources it to exercise the helpers); $0 would be the sourcing shell's name.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # shellcheck source=../../../tasks-dir-resolve.sh
@@ -36,6 +38,81 @@ target_alive() {
   fi
 }
 declared_target() { [ -n "${SUTANDO_TMUX_PANE:-}${SUTANDO_TMUX_WINDOW:-}" ]; }
+
+# The same pane the notifier types into, resolved the same way, for the pre-arm
+# classify: a declared pane, else the session's core window.
+NUDGE_TARGET="${SUTANDO_TMUX_PANE:-$SESSION:${SUTANDO_TMUX_WINDOW:-0}}"
+STALE_S="${SUTANDO_NOTIFIER_BEAT_STALE_S:-90}"
+
+# classify_pane's verdict for the target, or "unknown" when the pane cannot be
+# read or classified -- unknown is never idle, so it never earns a nudge.
+pane_state() {
+  local cap
+  cap="$(tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -t "$NUDGE_TARGET" 2>/dev/null)" || { echo unknown; return; }
+  printf '%s' "$cap" | "$PY" -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); from delivery.pane_gate import classify_pane, CLAUDE; print(classify_pane(sys.stdin.read(), CLAUDE).state)' \
+    "$REPO/src" 2>/dev/null || echo unknown
+}
+
+# The liveness beat file for THIS session: a worker's when launched as one
+# (SUTANDO_INSTANCE_ID set), else the core's by host label. Empty when the
+# workspace or host label cannot be resolved -- the caller then treats health as
+# unknown, which arms, rather than as absent, which would suppress the standby.
+beat_path_for_session() {
+  local ws
+  ws="${SUTANDO_WORKSPACE_DIR:-$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)}"
+  [ -n "$ws" ] || return 0
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+    printf '%s/state/workers/%s.alive' "$ws" "$SUTANDO_INSTANCE_ID"
+  else
+    local host
+    host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
+    [ -n "$host" ] || return 0
+    printf '%s/state/cores/%s.alive' "$ws" "$host"
+  fi
+}
+
+# nudge / alert / arm, from the pane verdict and the beat freshness. An
+# unresolvable beat path is passed as health=unknown, which decides "arm".
+decide_action() {
+  local ps beat
+  ps="$(pane_state)"
+  beat="$(beat_path_for_session)"
+  if [ -n "$beat" ]; then
+    "$PY" "$REPO/src/delivery/nudge_gate.py" --pane-state "$ps" --beat-path "$beat" --stale-s "$STALE_S" 2>/dev/null || echo arm
+  else
+    "$PY" "$REPO/src/delivery/nudge_gate.py" --pane-state "$ps" --health unknown 2>/dev/null || echo arm
+  fi
+}
+
+# One nudge, then wait grace-until-idle for the session to re-arm its own
+# watcher. Returns 0 when a session-role watcher appears (restored -- the caller
+# stays in standby), 1 when the nudge could not be delivered or none appeared
+# within the grace (the caller arms the standby instead).
+nudge_and_wait() {
+  "$PY" -c 'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], "--nudge"])' "$NOTIFIER" \
+    || { echo "task-notifier-supervisor: nudge could not be delivered; arming" >&2; return 1; }
+  local waited=0
+  while [ "$waited" -lt "$GRACE_PERIOD" ]; do
+    target_alive || return 1
+    [ "$(session_role_verdict)" = "yes" ] && {
+      echo "task-notifier-supervisor: nudge restored the session watcher; staying in standby" >&2
+      return 0
+    }
+    sleep "$ROLE_POLL"
+    waited=$((waited + ROLE_POLL))
+  done
+  echo "task-notifier-supervisor: nudge did not restore a session watcher within the grace; arming" >&2
+  return 1
+}
+
+# An idle frame over a dead or hung agent: injection reaches no one, so surface
+# it for a restart (the owner's lane) rather than arm a standby into a corpse.
+health_alert() {
+  echo "task-notifier-supervisor: pane idle-ready but the session beat is stale/absent for $NUDGE_TARGET; needs a restart, not a nudge or standby" >&2
+  command -v osascript >/dev/null 2>&1 \
+    && osascript -e 'display notification "A Sutando session looks idle but its heartbeat is stale. It may need a restart." with title "Sutando"' >/dev/null 2>&1 || true
+}
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
 TARGET_POLL="${SUTANDO_NOTIFIER_TARGET_POLL:-2}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
@@ -117,6 +194,10 @@ run_notifier_once() {
   return 0
 }
 
+# Sourced by a test to exercise the helpers in isolation: stop here, before the
+# standby loop, so decide_action and its callees can be invoked directly.
+if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise
 # never get a watcher at all -- so an unknown that persists for the whole grace
@@ -153,6 +234,19 @@ while target_alive; do
       # early -- a transient ps failure costs time, never coverage either way.
     done
     [ "$clear_to_arm" -eq 1 ] || continue
+    # Grace elapsed on a clean "no session watcher". Before arming the external
+    # standby, prefer restoring the session's own watcher when it is idle and
+    # alive; the unknown-verdict path above skips this and arms as before.
+    case "$(decide_action)" in
+      nudge)
+        nudge_and_wait && continue   # restored -> back to standby, do not arm
+        ;;                            # not restored -> fall through and arm
+      alert)
+        health_alert
+        continue                      # dead/hung: skip arming, re-poll (restart is the owner's)
+        ;;
+      # arm: fall through to the existing arm loop unchanged.
+    esac
   fi
   unknown_since=""
   while target_alive; do
