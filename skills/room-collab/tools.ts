@@ -3,7 +3,7 @@
 
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { cuePath, lineInstruction, toBeats, type Beat, type ScriptItem } from './present.js';
+import { anchorPaths, cuePath, lineInstruction, toBeats, type Beat, type ScriptItem } from './present.js';
 
 // Read at call time: manifest config lands in process.env after imports are hoisted.
 const relayUrl = () => (process.env.ROOM_COLLAB_RELAY_URL || 'http://127.0.0.1:7877').replace(/\/$/, '');
@@ -12,7 +12,14 @@ const START_HINT =
 	"python3 skills/room-collab/scripts/room_collab.py --kind html relay '<room id>'";
 
 // One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
-const talk: { beats: Beat[]; pos: number; active: boolean } = { beats: [], pos: 0, active: false };
+// `synced` is false once anything but the talk may have moved the deck (start, resume,
+// goto, a manual move); the next beat then re-applies its position before speaking.
+const talk: { beats: Beat[]; pos: number; active: boolean; synced: boolean } = {
+	beats: [],
+	pos: 0,
+	active: false,
+	synced: false,
+};
 
 // The session's context channel, from setup(), to restate the slide rule when a talk starts.
 let injectContext: ((text: string) => void) | null = null;
@@ -37,6 +44,7 @@ export const ROOM_SLIDE_RULE =
 
 /** A user-directed move during a talk pauses it, or the next beat would move the deck away again. */
 function pauseForManualMove(): string | undefined {
+	talk.synced = false;
 	if (!talk.active) return undefined;
 	talk.active = false;
 	return 'The talk is paused so this move sticks. Call room_present resume to continue from where you were.';
@@ -145,8 +153,13 @@ export const roomScriptTool: ToolDefinition = {
 };
 
 
-/** Take a beat's actions (in order, waiting out pauses), then hand back its line. */
-async function runBeat(beat: Beat): Promise<string | null> {
+/** Take a beat's actions (in order, waiting out pauses), then hand back its line.
+ *  Out of sync, the deck is first put where the script was before this beat. */
+async function runBeat(beat: Beat, before: Beat | null): Promise<string | null> {
+	if (!talk.synced) {
+		for (const path of anchorPaths(before?.anchor ?? null)) await relay('POST', path);
+		talk.synced = true;
+	}
 	for (const cue of beat.cues) {
 		if (cue.cue === 'pause') await new Promise((r) => setTimeout(r, Math.min(cue.seconds, 10) * 1000));
 		const path = cuePath(cue);
@@ -158,8 +171,9 @@ async function runBeat(beat: Beat): Promise<string | null> {
 /** Run beats until one has a line to say (a beat of only actions just runs). */
 async function nextLine(): Promise<{ say: string; n: number } | null> {
 	while (talk.pos < talk.beats.length) {
+		const before = talk.pos > 0 ? talk.beats[talk.pos - 1] : null;
 		const beat = talk.beats[talk.pos++];
-		const say = await runBeat(beat);
+		const say = await runBeat(beat, before);
 		if (say) return { say, n: talk.pos };
 	}
 	talk.active = false;
@@ -190,7 +204,12 @@ export const roomPresentTool: ToolDefinition = {
 		if (action === 'start' || talk.beats.length === 0) {
 			const script = await relay('GET', '/script');
 			if (script.error) return script;
-			talk.beats = toBeats((script.steps as ScriptItem[][]) ?? []);
+			const outline = await relay('GET', '/outline');
+			const topicSlide: Record<string, number> = {};
+			((outline.slides as { n: number; topics: { topic: string }[] }[]) ?? []).forEach((s) =>
+				s.topics.forEach((tp) => (topicSlide[tp.topic] ??= s.n)),
+			);
+			talk.beats = toBeats((script.steps as ScriptItem[][]) ?? [], topicSlide);
 			talk.pos = 0;
 			await relay('POST', '/highlight/clear'); // a talk starts from a clean stage
 			if (!talk.beats.length) return { error: 'the Talk script is empty' };
@@ -203,6 +222,7 @@ export const roomPresentTool: ToolDefinition = {
 			talk.pos -= 1; // re-deliver the beat that was interrupted
 		}
 		talk.active = true;
+		talk.synced = false; // whatever moved the deck meanwhile, the next beat puts it back
 		if (action === 'start') injectContext?.(ROOM_SLIDE_RULE);
 		const line = await nextLine();
 		if (!line) return { ok: true, state: 'the talk is over' };

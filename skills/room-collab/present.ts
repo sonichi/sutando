@@ -7,23 +7,59 @@ export type ScriptItem =
 	| { cue: 'highlight'; topic: string }
 	| { cue: 'pause'; seconds: number };
 
-/** One beat: the actions to take, then the line to say (empty on a trailing-cues beat). */
-export type Beat = { step: number; cues: Exclude<ScriptItem, { say: string }>[]; say: string };
+/**
+ * Where the deck must be for a beat, in absolute terms, so the talk can always put
+ * it back: a slide number, or the topic whose highlight the deck jumps to.
+ */
+export type Anchor = { slide: number } | { topic: string; slide?: number };
 
-/** Beats in order: each line carries the cues that stand before it in its step. */
-export function toBeats(steps: ScriptItem[][]): Beat[] {
+/** One beat: the actions to take, then the line to say (empty on a trailing-cues beat). */
+export type Beat = {
+	step: number;
+	cues: Exclude<ScriptItem, { say: string }>[];
+	say: string;
+	anchor: Anchor | null;
+};
+
+/**
+ * Beats in order: each line carries the cues that stand before it in its step, and
+ * the position the deck is in once they have run. Relative moves are resolved here,
+ * against the topic→slide map from the page outline, so a replay can never drift.
+ */
+export function toBeats(steps: ScriptItem[][], topicSlide: Record<string, number> = {}): Beat[] {
 	const beats: Beat[] = [];
+	let anchor: Anchor | null = null;
+	const slideOf = (a: Anchor | null) => (a === null ? 1 : a.slide);
+	const apply = (cue: Beat['cues'][number]) => {
+		if (cue.cue === 'slide') {
+			const at = slideOf(anchor);
+			if (typeof cue.move === 'number') anchor = { slide: cue.move };
+			else if (at !== undefined) anchor = { slide: Math.max(1, at + (cue.move === 'next' ? 1 : -1)) };
+		} else if (cue.cue === 'highlight' && cue.topic !== 'clear') {
+			anchor = { topic: cue.topic, slide: topicSlide[cue.topic] };
+		}
+	};
 	steps.forEach((items, step) => {
 		let cues: Beat['cues'] = [];
 		items.forEach((it) => {
 			if ('say' in it) {
-				beats.push({ step, cues, say: it.say });
+				beats.push({ step, cues, say: it.say, anchor });
 				cues = [];
-			} else cues.push(it);
+			} else {
+				cues.push(it);
+				apply(it);
+			}
 		});
-		if (cues.length) beats.push({ step, cues, say: '' });
+		if (cues.length) beats.push({ step, cues, say: '', anchor });
 	});
 	return beats;
+}
+
+/** The relay paths that put the deck where a beat belongs, whatever happened since. */
+export function anchorPaths(anchor: Anchor | null): string[] {
+	if (!anchor) return ['/slide/1'];
+	if ('topic' in anchor) return [`/highlight/${encodeURIComponent(anchor.topic)}`];
+	return [`/slide/${anchor.slide}`];
 }
 
 /** The relay path for one cue; pauses are waited on by the driver, not sent. */
