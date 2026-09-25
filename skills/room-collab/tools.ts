@@ -357,6 +357,108 @@ export const roomPresentTool: ToolDefinition = {
 	},
 };
 
+// The databases are opened per call unless the relay holds them, so a call can take seconds.
+const DB_TIMEOUT_MS = 12_000;
+const dbPath = (database?: string) => `/db/${encodeURIComponent(database?.trim() || '-')}`;
+const setQuery = (set: string[]) => set.map((s) => `set=${encodeURIComponent(s)}`).join('&');
+const DATABASE_ARG = z
+	.string()
+	.max(200)
+	.optional()
+	.describe('The database, by name or id (from room_db_list); omit when the room has only one');
+const SET_ARG = z
+	.array(z.string().min(3).max(2000))
+	.describe(
+		'Values as "Property=Value", by the property\'s name: options by name ("Status=Confirmed"), ' +
+			'people by Matrix id ("Assignee=@mark:server", comma-separate several), dates YYYY-MM-DD, "Prop=" clears'
+	);
+
+export const roomDbListTool: ToolDefinition = {
+	name: 'room_db_list',
+	description:
+		'List the databases in the AG2 Space room (tables of rows with typed properties, like a demo-day schedule or a task list): ' +
+		'each one\'s name, row count and views. Call it before reading or writing one whose name you do not know. Takes ~1–3 s.',
+	parameters: z.object({}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute() {
+		return relay('GET', '/db', DB_TIMEOUT_MS);
+	},
+};
+
+export const roomDbReadTool: ToolDefinition = {
+	name: 'room_db_read',
+	description:
+		'Read a room database\'s rows as one of its views shows them (sorted and filtered; a board view also lists its groups), ' +
+		'with every value as displayed. Use it to answer "who is presenting on the 25th?" or "what is still in progress?". Takes ~1–3 s.',
+	parameters: z.object({
+		database: DATABASE_ARG,
+		view: z.string().max(200).optional().describe('A view name (e.g. "By status"); omit for the first view'),
+	}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute(args) {
+		const { database, view } = args as { database?: string; view?: string };
+		const path = view ? `${dbPath(database)}/view/${encodeURIComponent(view)}` : dbPath(database);
+		return relay('GET', path, DB_TIMEOUT_MS);
+	},
+};
+
+export const roomDbAddTool: ToolDefinition = {
+	name: 'room_db_add',
+	description:
+		'Add a row to a room database for everyone, e.g. "add a row for Mark with status Confirmed" → ' +
+		'set ["Presenter=Mark", "Killer use case=Confirmed"]. A value that does not fit its property is refused and ' +
+		'nothing is written; the error names the allowed options — ask the user, then try again. Takes ~1–3 s.',
+	parameters: z.object({ database: DATABASE_ARG, set: SET_ARG }),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute(args) {
+		const { database, set } = args as { database?: string; set: string[] };
+		const q = setQuery(set ?? []);
+		return relay('POST', `${dbPath(database)}/row${q ? `?${q}` : ''}`, DB_TIMEOUT_MS);
+	},
+};
+
+export const roomDbUpdateTool: ToolDefinition = {
+	name: 'room_db_update',
+	description:
+		'Change values on an existing row of a room database, e.g. "give Shared browser 10 minutes" → row "Shared browser", ' +
+		'set ["Minutes=10"]. The row is named by its id or its title (the first column). A refused value writes nothing. Takes ~1–3 s.',
+	parameters: z.object({
+		database: DATABASE_ARG,
+		row: z.string().min(1).max(200).describe('The row\'s title or id (from room_db_read)'),
+		set: SET_ARG,
+	}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute(args) {
+		const { database, row, set } = args as { database?: string; row: string; set: string[] };
+		if (!set?.length) return { error: 'nothing to set' };
+		return relay('POST', `${dbPath(database)}/row/${encodeURIComponent(row)}?${setQuery(set)}`, DB_TIMEOUT_MS);
+	},
+};
+
+export const roomDbMoveTool: ToolDefinition = {
+	name: 'room_db_move',
+	description:
+		'Move a row to another column of a room database\'s board view, e.g. "move Shared browser to Done" — ' +
+		'writes the row\'s group value (status or select) for everyone. "none" empties it. Takes ~1–3 s.',
+	parameters: z.object({
+		database: DATABASE_ARG,
+		row: z.string().min(1).max(200).describe('The row\'s title or id'),
+		to: z.string().min(1).max(200).describe('The board column\'s name, e.g. "Confirmed", or "none"'),
+		view: z.string().max(200).optional().describe('The board view, when the database has several'),
+	}),
+	execution: 'inline',
+	timeout: 15_000,
+	async execute(args) {
+		const { database, row, to, view } = args as { database?: string; row: string; to: string; view?: string };
+		const q = `row=${encodeURIComponent(row)}&to=${encodeURIComponent(to)}${view ? `&view=${encodeURIComponent(view)}` : ''}`;
+		return relay('POST', `${dbPath(database)}/move?${q}`, DB_TIMEOUT_MS);
+	},
+};
+
 export const tools: ToolDefinition[] = [
 	roomUseTool,
 	roomSlideTool,
@@ -367,6 +469,11 @@ export const tools: ToolDefinition[] = [
 	roomSurfaceTool,
 	roomScriptTool,
 	roomPresentTool,
+	roomDbListTool,
+	roomDbReadTool,
+	roomDbAddTool,
+	roomDbUpdateTool,
+	roomDbMoveTool,
 ];
 
 /** The slide rule, in the voice prompt of every session this skill is loaded into. */
