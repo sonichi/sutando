@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
 import worker_picker_commands as wpc  # noqa: E402
@@ -99,7 +102,35 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
-def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
+def _write_result(results_dir, task_id: str, body: str) -> Path:
+    """Whole-or-not: the drain claims a result the moment its name appears."""
+    rd = Path(results_dir)
+    rd.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{task_id}.", dir=rd)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    out = rd / f"{task_id}.txt"
+    os.replace(tmp, out)
+    return out
+
+
+def _add_reply(out: dict) -> str:
+    wid = out["worker_id"]
+    tmux = out.get("tmux") or {}
+    lines = [f"Worker created: {out.get('label') or wid[:8]} ({wid})",
+             f"  inbox     {out.get('delivery_dir') or '(unknown)'}",
+             f"  tmux      {tmux.get('socket', '?')} / {tmux.get('session_name', '?')}",
+             f"  roster    v{out.get('roster_version')}"]
+    if out.get("advertisement") == "unpublished":
+        lines.append("  NOTE: the picker's advertisement could not be written; it will "
+                     "show this worker after the next successful publish.")
+    lines.append("Pin a room to it from the picker; until then it receives only work "
+                 "addressed to it by id.")
+    return "\n".join(lines) + "\n"
+
+
+def apply_picker(workspace, task_file, results_dir=None, *, repo=None, runtime=None,
+                 probe=False) -> "dict | None":
     """A pin is live the moment it arrives: applied and published here, at the
     edge, so the bridge ships the new binding without waiting for another
     task. Runs on the probe as well: the watcher probes once and, on DECLINE,
@@ -109,11 +140,38 @@ def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     Idempotent; a failure is reported, never fatal."""
     try:
         cmd = wpc.authorized_command(task_file, workspace)
+        if cmd and cmd.get("action") == "add" and probe:
+            # A spawn is not a probe-safe act: claim the task now, create on the run.
+            return {"action": "add", "room": None, "deferred": True}
         out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
-                        results_dir=results_dir) if cmd else None
+                        results_dir=results_dir, repo=repo, runtime=runtime) if cmd else None
+    except wpc.AddRefused as e:
+        # The record says what was or was not made; a human finishes it.
+        print(f"pool_route_handler: add not applied: {e}", file=sys.stderr)
+        return {"action": "add", "room": None, "refused": True}
     except (pr.RosterError, OSError, ValueError) as e:
         print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
         return None
+    if out and out.get("action") == "add" and not out.get("deferred"):
+        stem = Path(task_file).stem
+        rd = wpc._results_dir(workspace, results_dir)
+        try:
+            found = ltp.find_result(rd, stem)
+            body = read_ready_result(found) if found is not None else None
+            # A reply that already names the worker is out; anything else (none, or
+            # a generic failure notice) still owes the owner the worker's id.
+            if body is None or out["worker_id"] not in body:
+                _write_result(rd, stem, _add_reply(out))
+            wpc.mark_add_published(workspace, stem)
+        except OSError as e:
+            # The record is durable: the next run of this retained task restores it.
+            print(f"pool_route_handler: worker {out['worker_id']} exists but its reply "
+                  f"could not be published: {e}", file=sys.stderr)
+            return {**out, "publish_failed": True}
+        print(f"pool_route_handler: worker {out['worker_id']} "
+              f"(roster v{out['roster_version']}) {'restored' if out.get('replayed') else 'created'}; "
+              f"replied", file=sys.stderr)
+        return out
     if out and out.get("action") == "skipped":
         print(f"pool_route_handler: picker command for {out['room']} not replayed: "
               f"{out['reason']}", file=sys.stderr)
@@ -131,8 +189,9 @@ def main(argv=None) -> int:
     # The watcher passes its RESOLVED results dir; the replay gate reads it, so
     # it is a real argument here rather than one parsed and thrown away.
     p.add_argument("--results-dir", default=None)
-    for ignored in ("--runtime", "--repo"):
-        p.add_argument(ignored, default=None)
+    # `add` spawns from the checkout the watcher named, in the runtime it runs.
+    p.add_argument("--runtime", default=None)
+    p.add_argument("--repo", default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
@@ -150,7 +209,14 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
-        apply_picker(ws, args.task_file, args.results_dir)
+        picked = apply_picker(ws, args.task_file, args.results_dir, repo=args.repo,
+                              runtime=args.runtime, probe=args.probe)
+        if picked and picked.get("room") is None and picked.get("action") in ("add", "skipped"):
+            # Refused → the core; unpublished → keep it from the core, fail loudly;
+            # handled (now or earlier) → never reaches the core a second time.
+            if picked.get("refused"):
+                return DECLINE
+            return MUST_HANDLE if picked.get("publish_failed") else 0
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:

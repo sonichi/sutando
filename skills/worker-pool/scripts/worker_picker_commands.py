@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import re
 import sys
@@ -45,6 +46,7 @@ for _p in (str(_SCRIPTS), str(_SCRIPTS.parents[2] / "src")):
 import local_task_protocol as ltp  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
 
+import create_worker as cw  # noqa: E402
 import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
@@ -346,7 +348,8 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
     seq = int(log.get("seq") or 0) + 1
     log["seq"] = seq
     log.setdefault("applied", {})[str(task_id)] = {
-        "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq}
+        "room": cmd.get("room"), "action": cmd.get("action"), "seq": seq,
+        **({"worker_id": cmd["worker_id"]} if cmd.get("worker_id") else {})}
     if cmd.get("room"):
         log.setdefault("rooms", {})[cmd["room"]] = {
             "seq": seq, "task_id": str(task_id), "action": cmd.get("action")}
@@ -354,15 +357,97 @@ def _record_applied(workspace, cmd: dict, task_id) -> int:
     return seq
 
 
-def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | None":
-    """Apply a parsed pin or unpin: binding, roster and (through the roster's
-    own writer) the advertisement, so the new binding is on the wire without
-    waiting for another task. `add` is create_worker's and returns None.
+class AddRefused(RuntimeError):
+    """`add` could not create a worker here; the live core keeps the task."""
 
-    `task_id` is required for a pin or unpin: without it the call cannot be
-    replay-gated, and an ungated door is how this defect returns.
+
+ADDS_KEY = "adds"
+_ADD_FIELDS = ("worker_id", "label", "roster_version", "advertisement", "delivery_dir", "tmux")
+
+
+def add_worker_id(task_id) -> str:
+    """The worker a picker task creates has an id derived from the task, so a
+    run interrupted after the spawn can find what it made instead of making another."""
+    return hashlib.sha256(f"worker-add:{task_id}".encode()).hexdigest()[:32]
+
+
+def add_state(workspace, task_id) -> "dict | None":
+    return (_read_applied(workspace).get(ADDS_KEY) or {}).get(str(task_id))
+
+
+def _write_add_state(workspace, task_id, rec: dict) -> None:
+    log = _read_applied(workspace)
+    log.setdefault(ADDS_KEY, {})[str(task_id)] = rec
+    pr._write_atomic(applied_path(workspace), log)
+
+
+def mark_add_published(workspace, task_id) -> None:
+    """The reply is on disk: a replay now has nothing left to restore."""
+    with _applied_locked(workspace):
+        rec = add_state(workspace, task_id)
+        if rec and rec.get("state") != "published":
+            _write_add_state(workspace, task_id, {**rec, "state": "published"})
+
+
+def _apply_add(workspace, cmd: dict, *, task_id, results_dir, repo, runtime) -> dict:
+    # creating → created → published, each durable before the next step, so a
+    # crash at any boundary replays to at most one worker and one reply.
+    if not task_id:
+        return {"action": "skipped", "room": None,
+                "reason": "no task id, so this command cannot be replay-gated"}
+    with _applied_locked(workspace):
+        rec = add_state(workspace, task_id)
+        state = (rec or {}).get("state")
+        if state == "published":
+            return {"action": "skipped", "room": None, "reason": "add already published"}
+        if state == "created":
+            return {"action": "add", "room": None, "replayed": True,
+                    **{k: rec.get(k) for k in _ADD_FIELDS}}
+        wid = add_worker_id(task_id)
+        label = cmd.get("label") or ""
+        made = None
+        if rec is None:
+            rd = _results_dir(workspace, results_dir)
+            found = ltp.find_result(rd, str(task_id))
+            if found is not None and read_ready_result(found) is not None:
+                return {"action": "skipped", "room": None,
+                        "reason": f"a completed result already exists for this task ({found.name})"}
+            _write_add_state(workspace, task_id,
+                             {"state": "creating", "worker_id": wid, "label": label})
+        else:  # "creating": the spawn may or may not have happened
+            try:
+                made = cw.adopt(workspace, wid)
+            except cw.CreatedUnrostered as e:
+                raise AddRefused(str(e)) from e
+        if made is None:
+            try:
+                made = cw.create(workspace, repo, label=label, runtime=runtime, worker_id=wid)
+            except (cw.Refused, cw.sw.SpawnRefused, cw.CreatedUnrostered) as e:
+                raise AddRefused(str(e)) from e
+        rec2 = {"state": "created", "worker_id": made["worker_id"], "label": label,
+                "roster_version": made["roster_version"], "advertisement": made["advertisement"],
+                "delivery_dir": str(made.get("delivery_dir") or ""), "tmux": made.get("tmux") or {}}
+        _write_add_state(workspace, task_id, rec2)
+    return {"action": "add", "room": None, **{k: rec2[k] for k in _ADD_FIELDS}}
+
+
+def apply(workspace, cmd: dict, *, task_id=None, results_dir=None,
+          repo=None, runtime=None) -> "dict | None":
+    """Apply a parsed picker command. A pin or unpin binds, recompiles and
+    (through the roster's own writer) publishes, so the binding is on the wire
+    without waiting for another task. An `add` creates the worker when the
+    caller names the `repo` to spawn from; without one it returns None and the
+    live core does it.
+
+    `task_id` is required: without it the call cannot be replay-gated, and an
+    ungated door is how this defect returns.
     """
     action = (cmd or {}).get("action")
+    if action == "add":
+        if repo is None:
+            return None
+        return _apply_add(workspace, cmd, task_id=task_id, results_dir=results_dir,
+                          repo=repo, runtime=runtime)
     if action not in ("pin", "unpin"):
         return None
     # ONE critical section for gate, record and mutation: split, two probes can

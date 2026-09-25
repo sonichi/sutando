@@ -47,7 +47,7 @@ class Base(unittest.TestCase):
         self.spawned = []
 
         def fake_spawn(workspace, repo, **kw):
-            wid = f"{len(self.spawned):032x}"
+            wid = kw.get("worker_id") or f"{len(self.spawned):032x}"
             self.spawned.append(wid)
             (Path(workspace) / "deliveries" / wid).mkdir(parents=True)
             (Path(workspace) / "state" / "workers" / wid).mkdir(parents=True)
@@ -217,6 +217,81 @@ class TestUnrosteredRecordsAreReportedNotAdopted(Base):
         self.run_cli()
         kept = pr.load_roster(self.ws)["workers"]["a" * 32]
         self.assertEqual(kept["state"], "recovering")
+
+
+class TestCreateIsTheCommandAsOneCall(Base):
+    """`create()` is what the route handler calls on a picker `add`: the same
+    preflight → runtime → spawn → compile as the CLI, with failures typed so the
+    caller can name them rather than parse stderr."""
+
+    def test_create_spawns_compiles_and_publishes(self):
+        out = cw.create(str(self.ws), str(REPO), label="scribe")
+        self.assertEqual(out["worker_id"], self.spawned[0])
+        self.assertEqual(out["advertisement"], "published")
+        self.assertIsNone(out["room"])
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        self.assertEqual(out["roster_version"], roster["version"])
+        self.assertEqual(roster["workers"][out["worker_id"]]["label"], "scribe")
+        self.assertTrue((self.ws / "state" / "pool-advertisement.json").exists())
+        self.assertEqual(out["unrostered_records"], [])
+
+    def test_create_with_a_room_binds_it(self):
+        out = cw.create(str(self.ws), str(REPO), label="r", room=ROOM)
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        self.assertEqual(roster["bindings"][ROOM], out["worker_id"])
+
+    def test_a_publish_failure_returns_the_worker_as_unpublished(self):
+        real = cw.pa.write_advertisement
+        cw.pa.write_advertisement = lambda ws, now=None: (_ for _ in ()).throw(OSError(28, "No space left"))
+        self.addCleanup(lambda: setattr(cw.pa, "write_advertisement", real))
+        out = cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(out["advertisement"], "unpublished")
+        self.assertIn(out["worker_id"], json.loads((self.ws / "state" / "roster.json").read_text())["workers"])
+
+    def test_a_compile_failure_after_the_spawn_names_the_worker(self):
+        real = cw.compile_with
+        cw.compile_with = lambda *a, **k: (_ for _ in ()).throw(pr.RosterError("bad roster"))
+        self.addCleanup(lambda: setattr(cw, "compile_with", real))
+        with self.assertRaises(cw.CreatedUnrostered) as c:
+            cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(c.exception.worker_id, self.spawned[0])
+        self.assertIn("could not be compiled", str(c.exception))
+
+    def test_a_preflight_refusal_creates_nothing(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = "deadbeef"
+        with self.assertRaises(cw.Refused):
+            cw.create(str(self.ws), str(REPO), label="x")
+        self.assertEqual(self.spawned, [])
+
+
+class TestAdoptFindsWhatAnInterruptedRunMade(Base):
+    def _probe(self, state):
+        real = sw.session_probe
+        sw.session_probe = lambda name, socket=None, runner=None: (state, "")
+        self.addCleanup(lambda: setattr(sw, "session_probe", real))
+
+    def test_create_uses_the_callers_worker_id(self):
+        out = cw.create(str(self.ws), str(REPO), label="x", worker_id="f" * 32)
+        self.assertEqual(out["worker_id"], "f" * 32)
+
+    def test_nothing_made_is_none(self):
+        self._probe("absent")
+        self.assertIsNone(cw.adopt(str(self.ws), "e" * 32))
+
+    def test_a_whole_worker_is_adopted(self):
+        made = cw.create(str(self.ws), str(REPO), label="x", worker_id="d" * 32)
+        self._probe("exists")
+        got = cw.adopt(str(self.ws), "d" * 32)
+        self.assertEqual(got["worker_id"], made["worker_id"])
+        self.assertEqual(got["roster_version"], made["roster_version"])
+        self.assertEqual(got["tmux"]["session_name"], sw.wi.tmux_session_name("d" * 32))
+
+    def test_a_rostered_worker_without_a_session_is_not_adopted(self):
+        cw.create(str(self.ws), str(REPO), label="x", worker_id="c" * 32)
+        self._probe("absent")
+        with self.assertRaises(cw.CreatedUnrostered) as c:
+            cw.adopt(str(self.ws), "c" * 32)
+        self.assertIn("half-made", str(c.exception))
 
 
 class TestARefusalNamesTheRetainedWorker(Base):
