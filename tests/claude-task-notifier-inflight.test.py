@@ -445,45 +445,49 @@ class MainLoopWiringTest(FakeTmuxHarness):
             text=True,
             start_new_session=True,
         )
+        def with_stderr(msg):
+            return msg + "\nnotifier stderr:\n" + errf_path.read_text(errors="replace")
+
         try:
-            self.assertTrue(
-                self._wait_for_fswatch_attach(),
-                "fswatch never attached to the watched tasks dir",
-            )
-            self.write_task("task-p.txt")
-            # Let the (failing) first wake pass, then clear the draft -- no
-            # new task file is EVER written from here on.
-            time.sleep(1.5)
-            self.assertNotIn("TYPE", self.sendkeys_log_text(),
-                              "a busy composer must not have been typed over")
-            self.pane_file.write_text(IDLE_FOOTER + "\n")
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if "TYPE Sutando task ready: task-p.txt" in self.sendkeys_log_text():
-                    break
-                time.sleep(0.2)
-            else:
-                self.fail("the periodic self-poll never retried the queued task:\n"
-                          + self.sendkeys_log_text()
-                          + "\nnotifier stderr:\n" + errf_path.read_text(errors="replace"))
-            self.write_result("task-p.txt")
-            deadline = time.time() + 10
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.2)
-        finally:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                self.assertTrue(
+                    self._wait_for_fswatch_attach(),
+                    with_stderr("fswatch never attached to the watched tasks dir"),
+                )
+                self.write_task("task-p.txt")
+                # Let the (failing) first wake pass, then clear the draft -- no
+                # new task file is EVER written from here on.
+                time.sleep(1.5)
+                self.assertNotIn("TYPE", self.sendkeys_log_text(),
+                                  with_stderr("a busy composer must not have been typed over"))
+                self.pane_file.write_text(IDLE_FOOTER + "\n")
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if "TYPE Sutando task ready: task-p.txt" in self.sendkeys_log_text():
+                        break
+                    time.sleep(0.2)
+                else:
+                    self.fail(with_stderr("the periodic self-poll never retried the queued task:\n"
+                                           + self.sendkeys_log_text()))
+                self.write_result("task-p.txt")
+                deadline = time.time() + 10
+                while time.time() < deadline and proc.poll() is None:
+                    time.sleep(0.2)
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=5)
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=5)
+        finally:
             errf.close()
 
     def test_claimed_task_is_never_selected_by_an_unrelated_wake(self):
