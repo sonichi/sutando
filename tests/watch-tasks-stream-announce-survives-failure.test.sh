@@ -46,7 +46,14 @@ run_sweep() {
 line="$(run_sweep)"
 echo "  watcher emitted after handler failure: ${line:-<nothing>}"
 [ "$line" = "TASK_FILE: $PAYLOAD" ]
-check $? "a failed handler's fallback emission still names the resolved payload path"
+rc=$?
+check $rc "a failed handler's fallback emission still names the resolved payload path"
+# Both were already captured (sweep.out/.err) and never shown -- a FAIL had
+# nothing beyond the one grepped line to diagnose from (#4750).
+if [ "$rc" != "0" ]; then
+  echo "  watcher stdout:"; sed 's/^/    /' "$TMP/sweep.out" 2>/dev/null
+  echo "  watcher stderr:"; sed 's/^/    /' "$TMP/sweep.err" 2>/dev/null
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
