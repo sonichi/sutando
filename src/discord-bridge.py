@@ -165,7 +165,7 @@ from policy.egress.result import guard_result_for_tier, resolve_access_tier as _
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, readable_attachments, readable_content, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import bare_mention_context_line, format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, readable_attachments, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3769,21 +3769,9 @@ async def _handle_discord_message(message, force=False):
             context_lines = []
             try:
                 async for prev in message.channel.history(limit=5, before=message):
-                    prev_author = str(prev.author)
-                    prev_content = readable_content(prev)
-                    prev_atts = readable_attachments(prev)
-                    # Strip mentions so they don't pollute the context snippet
-                    for u in prev.mentions:
-                        prev_content = prev_content.replace(f"<@{u.id}>", f"@{u.name}")
-                    for r in prev.role_mentions:
-                        prev_content = prev_content.replace(f"<@&{r.id}>", f"@&{r.name}")
-                    if not prev_content and not prev_atts:
-                        continue
-                    # Truncate each message and collapse newlines
-                    snippet = prev_content[:200].replace("\n", " ")
-                    if prev_atts:
-                        snippet += f" [+{len(prev_atts)} attachment(s)]"
-                    context_lines.append(f"  {prev_author}: {snippet}")
+                    line = bare_mention_context_line(str(prev.author), prev)
+                    if line is not None:
+                        context_lines.append(line)
             except Exception as e:
                 print(f"  [bare-mention] history fetch failed: {e}", flush=True)
             if context_lines:

@@ -113,6 +113,28 @@ def readable_attachments(msg) -> list:
     return atts
 
 
+def bare_mention_context_line(author: str, msg) -> "str | None":
+    """One ``"  author: snippet"`` history line for the bare-mention fallback, or
+    ``None`` to skip ``msg`` (no readable content and no attachments, forwarded or
+    otherwise). Forward-aware for the same reason ``readable_content``/
+    ``readable_attachments`` are: a forward's body and files live in
+    ``message_snapshots``, so reading ``msg.content``/``msg.attachments`` directly
+    silently drops a forwarded-then-bare-mentioned message from the context.
+    """
+    content = readable_content(msg)
+    for u in getattr(msg, "mentions", None) or []:
+        content = content.replace(f"<@{u.id}>", f"@{u.name}")
+    for r in getattr(msg, "role_mentions", None) or []:
+        content = content.replace(f"<@&{r.id}>", f"@&{r.name}")
+    atts = readable_attachments(msg)
+    if not content and not atts:
+        return None
+    snippet = content[:200].replace("\n", " ")
+    if atts:
+        snippet += f" [+{len(atts)} attachment(s)]"
+    return f"  {author}: {snippet}"
+
+
 def should_fetch_reply_context(has_reference: bool, has_message_id: bool,
                                is_forward: bool) -> bool:
     """Whether the bridge should fetch the referenced message for reply context.

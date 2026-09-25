@@ -339,25 +339,36 @@ check("no raw `ref_msg.attachments` iteration remains",
 check("the bridge imports the helper it calls",
       "readable_attachments" in _bridge.split("async def")[0])
 
-# --- the bare-mention history fallback has the SAME blind spot the reply-context path did
-check("the bare-mention history walk is forward-aware (readable_content)",
-      "prev_content = readable_content(prev)" in _bridge)
-check("the bare-mention history walk is forward-aware (readable_attachments)",
-      "prev_atts = readable_attachments(prev)" in _bridge)
-check("no raw `prev.content` read remains in the bare-mention walk",
+# --- the bare-mention history fallback had the SAME blind spot the reply-context path did
+check("the bridge routes the bare-mention walk through the pure helper",
+      "bare_mention_context_line(str(prev.author), prev)" in _bridge)
+check("no raw `prev.content` read remains in the bridge's bare-mention walk",
       'prev_content = (prev.content or "").strip()' not in _bridge)
-check("no raw `prev.attachments` truthiness check remains in the bare-mention walk",
-      "if not prev_content and not prev.attachments:" not in _bridge)
+check("the bridge imports the new helper",
+      "bare_mention_context_line" in _bridge.split("async def")[0])
 
 # Same fixture TustinOC's finding used: a forward with no own text, carrying two
-# files, must produce a real, non-empty history-context snippet -- not `continue`.
+# files, must NOT be dropped from the bare-mention history context.
 _fwd_only = _M("", [], [_S(_M("", [_A("sutando-trayicon.svg"), _A("sutando-logo.svg")]))])
-_fwd_content = rc.readable_content(_fwd_only)
-_fwd_atts = rc.readable_attachments(_fwd_only)
-check("bare-mention fixture: a content-less forward is NOT dropped (would `continue` on raw read)",
-      bool(_fwd_content) or bool(_fwd_atts))
-check("bare-mention fixture: the forwarded files are visible to the history walk",
-      len(_fwd_atts) == 2)
+check("bare-mention: a content-less forward is not skipped (None would mean `continue`)",
+      rc.bare_mention_context_line("someone", _fwd_only) is not None)
+check("bare-mention: the forwarded filenames appear in the rendered line",
+      "sutando-logo.svg" in rc.bare_mention_context_line("someone", _fwd_only))
+check("bare-mention: the attachment count is rendered",
+      "[+2 attachment(s)]" in rc.bare_mention_context_line("someone", _fwd_only))
+
+# Controls: the pure cases this helper must still get right.
+check("bare-mention: an ordinary message renders author + text",
+      rc.bare_mention_context_line("chi", _plain) == "  chi: just text [+1 attachment(s)]")
+check("bare-mention: a genuinely empty message is skipped (None)",
+      rc.bare_mention_context_line("chi", _M("")) is None)
+_mention_msg = _M("hey <@1> ping")
+class _U:
+    id, name = 1, "sonichi"
+_mention_msg.mentions = [_U()]
+_mention_msg.role_mentions = []
+check("bare-mention: a raw <@id> mention is rendered as @name",
+      rc.bare_mention_context_line("chi", _mention_msg) == "  chi: hey @sonichi ping")
 
 print()
 if _fails:
