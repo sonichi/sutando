@@ -182,6 +182,42 @@ def test_presence_is_published_when_a_name_is_given():
     assert ("presence", "mars") in doc.calls, doc.calls
 
 
+def _snapshot_file(body):
+    import tempfile
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(body, f); f.close()
+    return f.name
+
+
+def test_snapshot_writes_the_board_to_a_file():
+    import tempfile
+    doc = FakeDoc()
+    out = tempfile.mktemp(suffix=".json")
+    rc, _ = run_cli(BASE + ["--kind", "board", "snapshot", "!r:s", "--out", out], doc)
+    body = json.loads(open(out).read())
+    assert rc == 0 and body["room"] == "!r:s" and body["surface"] == "board", body
+    assert [e["id"] for e in body["elements"]] == ["a"], body
+
+
+def test_restore_is_a_dry_run_unless_applied():
+    snap = _snapshot_file({"room": "!r:s", "surface": "board",
+                           "elements": [{"id": "lost", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 3}]})
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap], doc)
+    assert rc == 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
+    assert json.loads(out)["would_write"] == 1, out
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("put", ["lost"]) in doc.calls, doc.calls
+
+
+def test_restore_refuses_another_rooms_snapshot():
+    snap = _snapshot_file({"room": "!other:s", "surface": "board", "elements": []})
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap, "--apply"], doc)
+    assert rc != 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 

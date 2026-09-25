@@ -113,6 +113,26 @@ def changed_elements(elements: Iterable[dict],
     return out
 
 
+def restore_plan(backup: Iterable[dict], stored: Callable[[str], Any]) -> list[dict]:
+    """The backup elements a restore writes: those missing from the board or held
+    there at an older version. One the board holds at the same or a newer version
+    was changed since the snapshot (edited, or deleted on purpose) and is left as
+    it is. Each write carries a version above both, so it lands."""
+    out = []
+    for element in backup:
+        if not is_board_element(element):
+            continue
+        current = stored(element["id"])
+        if not is_board_element(current, element["id"]):
+            current = None
+        if current is not None and current["version"] >= element["version"]:
+            continue
+        restored = {k: v for k, v in element.items() if k != "versionNonce"}
+        restored["version"] = max(element["version"], (current or {}).get("version", 0)) + 1
+        out.append(restored)
+    return out
+
+
 # What Excalidraw's own restoreElement() fills in; the panel hands the map to
 # the editor without it, so an element missing any of these crashes selection.
 ELEMENT_DEFAULTS: dict[str, Any] = {

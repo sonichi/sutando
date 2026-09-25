@@ -19,6 +19,7 @@ from room_collab_board import (  # noqa: E402
     BOARD_KIND, ELEMENTS_KEY, FILES_KEY, changed_elements, describe_invalid,
     elements_from_map, is_board_element, is_board_file, is_newer, live_elements,
     sort_elements,
+    restore_plan,
 )
 
 FAILS = []
@@ -178,6 +179,17 @@ def test_describe_invalid_names_the_reason():
     assert "finite" in describe_invalid(el(width=float("nan")))
     assert "id" in describe_invalid({})
     assert describe_invalid(el()) == "valid", "a control: a good element says so"
+
+
+def test_restore_plan_brings_back_only_what_is_missing_or_behind():
+    mk = lambda i, v, **o: {"id": i, "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": v, **o}  # noqa: E731
+    backup = [mk("gone", 3), mk("behind", 5), mk("edited", 2), mk("deleted", 4)]
+    board = {"behind": mk("behind", 2), "edited": mk("edited", 7), "deleted": mk("deleted", 6, isDeleted=True)}
+    plan = {e["id"]: e for e in restore_plan(backup, board.get)}
+    assert set(plan) == {"gone", "behind"}, plan
+    assert plan["gone"]["version"] == 4 and plan["behind"]["version"] == 6, "one above both, so it lands"
+    assert "versionNonce" not in plan["gone"], "a fresh nonce, not the snapshot's"
+    assert restore_plan([{"id": "junk"}], board.get) == [], "an invalid backup element is skipped"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
