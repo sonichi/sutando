@@ -556,6 +556,21 @@ By voice: `room_db_list`, `room_db_read`, `room_db_add`, `room_db_update`,
 to sign writes). They work whichever surface the relay holds; `POST /surface/db`
 holds the databases open for faster calls.
 
+## Searching the whole room
+
+```bash
+python3 skills/room-collab/scripts/room_collab.py search '!room:ag2.space' "launch checklist" [--limit 10] [--json]
+```
+
+One query over every Doc page, HTML page, database row (title, values and page body) and sheet
+cell. Every word must appear; case does not matter; a title or heading counts more than body text.
+An HTML page matches only on what a viewer sees — never its scripts or styles. Each hit carries
+`go`, the relay steps that open it (`/surface/doc` then `/page/<id>`, or `/db/<db>/row/<row>`).
+A surface that cannot be opened is listed under `failed`, so "no matches" never hides a
+connection error. The relay answers `GET /search?q=<words>&limit=N`, and the voice tool
+`room_search` calls it. It opens each surface once per query — a room with a large deck takes a
+few seconds; the first 30 pages of each kind are searched.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:

@@ -59,4 +59,10 @@ describe('room-collab surface tools', () => {
 		}
 		assert.match(tools.ROOM_SLIDE_RULE, /room_surface/);
 	});
+	it('room_search asks the relay to search the whole room', async () => {
+		await tools.roomSearchTool.execute({ query: 'launch day', limit: 5 }, {} as never);
+		await tools.roomSearchTool.execute({ query: 'a&b' }, {} as never);
+		assert.deepEqual(hits.slice(-2), ['GET /search?q=launch%20day&limit=5', 'GET /search?q=a%26b']);
+		assert.ok(tools.tools.includes(tools.roomSearchTool), 'the tool is contributed');
+	});
 });

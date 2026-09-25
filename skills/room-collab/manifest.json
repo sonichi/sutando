@@ -6,7 +6,7 @@
   "stability": "experimental",
   "access_tier": "owner",
   "enabled": true,
-  "description": "Read and write a room's collaborative surfaces, and stay resident in one after a summon. Contributes the room_use / room_surface / room_slide / room_highlight / room_point / room_outline / room_stage / room_script / room_present voice tools, and room_db_list / room_db_read / room_db_add / room_db_update / room_db_move / room_db_row for the room's databases, which present a room's HTML page, whiteboard or Doc for everyone watching through the local stage relay (ROOM_COLLAB_RELAY_URL). ROOM_COLLAB_PYTHON is the interpreter the presence daemon runs under \u2014 the skill needs pycrdt + websockets, which the core's own python is not required to have, so sparrowd refuses to supervise the daemon until this names a real interpreter rather than guessing sys.executable.",
+  "description": "Read and write a room's collaborative surfaces, and stay resident in one after a summon. Contributes the room_use / room_surface / room_slide / room_highlight / room_point / room_outline / room_search / room_stage / room_script / room_present voice tools, and room_db_list / room_db_read / room_db_add / room_db_update / room_db_move / room_db_row for the room's databases, which present a room's HTML page, whiteboard or Doc for everyone watching through the local stage relay (ROOM_COLLAB_RELAY_URL). ROOM_COLLAB_PYTHON is the interpreter the presence daemon runs under \u2014 the skill needs pycrdt + websockets, which the core's own python is not required to have, so sparrowd refuses to supervise the daemon until this names a real interpreter rather than guessing sys.executable.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },

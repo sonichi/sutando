@@ -197,6 +197,24 @@ export const roomOutlineTool: ToolDefinition = {
 	},
 };
 
+export const roomSearchTool: ToolDefinition = {
+	name: 'room_search',
+	description:
+		'Find where something is in the room: searches every Doc page, HTML page, database row (title, values and page body) and sheet ' +
+		'cell for words that must all appear. Each hit has its surface, title, a snippet and `go`, the relay steps that open it: ' +
+		'call room_surface with that surface (and page id), or room_db_row for a database row. Use it when asked "where did we write…" ' +
+		'or to go to something by what it says rather than by page. Takes a few seconds on a large room.',
+	parameters: z.object({
+		query: z.string().min(1).max(200).describe('Words to find, e.g. "launch checklist"'),
+		limit: z.number().int().min(1).max(50).optional().describe('Most hits (default 10)'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { query, limit } = args as { query: string; limit?: number };
+		return relay('GET', `/search?q=${encodeURIComponent(query)}${limit ? `&limit=${limit}` : ''}`);
+	},
+};
+
 export const roomPointTool: ToolDefinition = {
 	name: 'room_point',
 	description:
@@ -534,6 +552,7 @@ export const tools: ToolDefinition[] = [
 	roomHighlightTool,
 	roomPointTool,
 	roomOutlineTool,
+	roomSearchTool,
 	roomPageStateTool,
 	roomStageTool,
 	roomSurfaceTool,
