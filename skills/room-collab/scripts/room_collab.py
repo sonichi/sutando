@@ -634,10 +634,12 @@ async def run(args: argparse.Namespace) -> int:
         return 0
     if args.command == "relay":
         from room_collab_relay import serve
-        await serve(lambda: open_room_collab(url, args.room, token, kind=args.kind,
-                                             insecure=args.insecure), args.port,
-                    open_text=lambda: open_room_collab(url, args.room, token,
-                                                       insecure=args.insecure))
+        await serve(lambda room: open_room_collab(url, room, token, kind=args.kind,
+                                                  insecure=args.insecure), args.port,
+                    room=args.room,
+                    open_text=lambda room: open_room_collab(url, room, token,
+                                                            insecure=args.insecure),
+                    list_rooms=joined_rooms)
         return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -844,6 +846,31 @@ def room_ops_script() -> Path | None:
     return cand if cand.is_file() else None
 
 
+def joined_rooms(*, runner=subprocess.run, script: Path | None = None) -> list[dict]:
+    """The agent's joined rooms as [{id, name}], through room-ops `rooms`: the
+    gateway's list is that skill's, and a skill does not import another's code."""
+    script = script or room_ops_script()
+    if script is None:
+        raise RoomDocError("listing rooms needs the agent-room-ops skill installed beside this one")
+    try:
+        proc = runner([sys.executable, str(script), "rooms"], capture_output=True, text=True,
+                      timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RoomDocError(f"could not list rooms: {exc}") from exc
+    try:
+        res = json.loads(proc.stdout or "")
+    except ValueError:
+        res = {}
+    if not isinstance(res, dict) or not res.get("ok"):
+        why = (res.get("reason") if isinstance(res, dict) else None) or \
+            (proc.stderr or proc.stdout or "").strip()[-300:] or f"exit {proc.returncode}"
+        raise RoomDocError(f"could not list rooms: {why}")
+    named = {r.get("room_id"): r.get("name") for r in res.get("rooms_detailed") or []
+             if isinstance(r, dict)}
+    ids = list(dict.fromkeys([*(res.get("rooms") or []), *named]))
+    return [{"id": i, "name": named.get(i) or None} for i in ids if isinstance(i, str) and i]
+
+
 def post_comment(room: str, body: str, extra: dict, *, runner=subprocess.run,
                  script: Path | None = None) -> dict:
     """Post the comment through room-ops `say`; the reply is its receipt."""
@@ -938,7 +965,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html)")
-    s.add_argument("room")
+    s.add_argument("room", help="the room to hold first; POST /room/<id> switches it")
     s.add_argument("--port", type=int, default=7877)
 
     s = sub.add_parser("templates", help="list the HTML page templates, or start the page from one "

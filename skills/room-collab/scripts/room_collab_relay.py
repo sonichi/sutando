@@ -12,6 +12,8 @@ talk-highlight API, so an existing voice tool drives the room's page unchanged:
   POST /spot/<words>        spotlight the passage with these words (`clear` clears)
   GET  /script              the talk script in the room's Doc, as steps (talk_script.py)
   GET  /outline             slides, titles and pointable topics on the page (page_outline.py)
+  POST /room/<room id>      hold that room instead (url-encoded `!abc:server`)
+  GET  /rooms               the agent's joined rooms, {id, name}, to resolve a spoken name
 
 It listens on 127.0.0.1 only: whoever reaches the port drives the stage as
 this agent, so it must never be exposed beyond the machine.
@@ -25,6 +27,8 @@ import re
 from room_collab_protocol import HTML_KIND, RoomDocError
 
 TOPIC_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+ROOM_ID_RE = re.compile(r"![^\s:/]+:[^\s/]+")
+SWITCH_WAIT_S = 8
 RECONNECT_S = (1, 2, 5, 10, 30)
 
 
@@ -45,8 +49,11 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         return ("script", None)
     if method == "GET" and path == "/outline":
         return ("outline", None)
+    if method == "GET" and path == "/rooms":
+        return ("rooms", None)
     if method != "POST":
-        return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/"))
+        return (405 if path.startswith(("/highlight/", "/slide/", "/spot/", "/speaking/", "/presenter/",
+                                        "/room/"))
                 else 404,
                 {"ok": False, "error": "not found"})
     if path.startswith("/highlight/"):
@@ -56,6 +63,12 @@ def route(method: str, path: str) -> tuple[str, object] | tuple[int, dict]:
         if not TOPIC_RE.fullmatch(topic):
             return (400, {"ok": False, "error": f"not a topic key: {topic!r}"})
         return ("highlight", topic)
+    if path.startswith("/room/"):
+        from urllib.parse import unquote
+        room = unquote(path[len("/room/"):]).strip()
+        if len(room) > 255 or not ROOM_ID_RE.fullmatch(room):
+            return (400, {"ok": False, "error": f"not a room id: {room[:80]!r} (like !abc:server)"})
+        return ("room", room)
     if path.startswith("/spot/"):
         from urllib.parse import unquote
         words = " ".join(unquote(path[len("/spot/"):]).split())
@@ -88,33 +101,71 @@ async def read_script(open_text) -> dict:
     return {"ok": True, "steps": parse(section)}
 
 
-async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open_text=None) -> None:
-    """Hold the page open (reconnecting when it drops) and answer HTTP on `port`.
-    `open_text` opens the room's Doc, for GET /script."""
-    holder: dict = {"doc": None}
+async def serve(open_doc, port: int, *, room: str, host: str = "127.0.0.1", log=print,
+                open_text=None, list_rooms=None) -> None:
+    """Hold `room`'s page open (reconnecting when it drops) and answer HTTP on `port`.
+    `open_doc(room)` opens a room's page and `open_text(room)` its Doc, for GET /script;
+    `list_rooms()` (blocking) returns the joined rooms as [{id, name}], for GET /rooms."""
+    holder: dict = {"doc": None, "room": room, "error": None}
     ready = asyncio.Event()
+    switched = asyncio.Event()
+
+    async def hold_until_closed_or_switched(doc) -> None:
+        waits = [asyncio.ensure_future(doc.closed()), asyncio.ensure_future(switched.wait())]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
 
     async def keep_connected() -> None:
         attempt = 0
         while True:
+            held = holder["room"]
+            switched.clear()
             try:
-                async with open_doc() as doc:
+                async with open_doc(held) as doc:
                     if doc.kind != HTML_KIND:
                         raise RoomDocError("the relay drives the HTML page: open it with --kind html")
-                    holder["doc"], attempt = doc, 0
-                    ready.set()
-                    log(f"relay: connected; {len(doc.text)} chars on the page")
-                    await doc.closed()
+                    if held == holder["room"]:
+                        holder["doc"], holder["error"], attempt = doc, None, 0
+                        ready.set()
+                        log(f"relay: connected to {held}; {len(doc.text)} chars on the page")
+                        await hold_until_closed_or_switched(doc)
             except RoomDocError as exc:
+                holder["error"] = str(exc)
                 log(f"relay: {exc}")
                 if "--kind html" in str(exc):
                     raise
             holder["doc"] = None
             ready.clear()
+            if holder["room"] != held:
+                attempt = 0
+                continue
             delay = RECONNECT_S[min(attempt, len(RECONNECT_S) - 1)]
             attempt += 1
             log(f"relay: reconnecting in {delay}s")
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(switched.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def switch_to(target: str) -> dict:
+        if target != holder["room"]:
+            log(f"relay: switching to {target}")
+            holder.update(room=target, doc=None, error=None)
+            ready.clear()
+            switched.set()
+        try:
+            await asyncio.wait_for(ready.wait(), SWITCH_WAIT_S)
+        except asyncio.TimeoutError:
+            return {"ok": True, "room": target, "connected": False,
+                    "error": holder["error"] or "not connected to the room yet; still trying"}
+        if holder["doc"] is None or holder["room"] != target:
+            return {"ok": False, "room": holder["room"], "error": "another switch overtook this one"}
+        text = holder["doc"].text
+        return {"ok": True, "room": target, "connected": True, "has_page": bool(text.strip()),
+                "chars": len(text)}
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         status, body = 500, {"ok": False}
@@ -129,13 +180,23 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
             elif what[0] == "script":
                 if open_text is None:
                     raise RoomDocError("this relay was started without the room's Doc")
-                status, body = 200, await read_script(open_text)
+                current = holder["room"]
+                status, body = 200, await read_script(lambda: open_text(current))
+            elif what[0] == "room":
+                status, body = 200, await switch_to(what[1])
+            elif what[0] == "rooms":
+                if list_rooms is None:
+                    raise RoomDocError("this relay was started without a room list")
+                rooms = await asyncio.to_thread(list_rooms)
+                status, body = 200, {"ok": True, "rooms": rooms, "current": holder["room"]}
             else:
                 try:
                     await asyncio.wait_for(ready.wait(), 5)
                 except asyncio.TimeoutError:
                     raise RoomDocError("not connected to the room yet") from None
                 doc = holder["doc"]
+                if doc is None:
+                    raise RoomDocError("the relay is switching rooms; try again")
                 kind, arg = what
                 if kind == "highlight":
                     state = await doc.set_stage(arg)
@@ -157,9 +218,11 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
                     stage = doc.stage
                     status, body = 200, {"topic": stage.get("topic") or None,
                                          "ts": stage.get("ts", 0),
-                                         "speaking": bool(stage.get("speaking"))}
+                                         "speaking": bool(stage.get("speaking")),
+                                         "room": holder["room"]}
         except (RoomDocError, asyncio.TimeoutError, ConnectionError) as exc:
-            status, body = 503, {"ok": False, "error": str(exc) or type(exc).__name__}
+            status, body = 503, {"ok": False, "error": str(exc) or type(exc).__name__,
+                                 "room": holder["room"]}
         payload = json.dumps(body).encode()
         writer.write(f"HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n"
                      f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
@@ -170,6 +233,6 @@ async def serve(open_doc, port: int, *, host: str = "127.0.0.1", log=print, open
             writer.close()
 
     server = await asyncio.start_server(handle, host, port)
-    log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /speaking/on|off; GET /state")
+    log(f"relay: http://{host}:{port} — POST /highlight/<topic>, /room/<id>; GET /state, /rooms")
     async with server:
         await asyncio.gather(server.serve_forever(), keep_connected())

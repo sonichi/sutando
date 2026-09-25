@@ -332,6 +332,17 @@ python3 $P --kind html relay '!room:server' --port 7877
 Point the voice tool's highlight URL at it. It binds to this machine only:
 whoever reaches the port drives the stage as this agent.
 
+The room on the command line is only the first one held. `POST /room/<id>`
+(url-encoded `!abc:server`) makes the relay drop that room and hold another —
+its page, and its Doc for `/script`; `GET /state` names the room held, and
+`GET /rooms` lists the agent's joined rooms with names (through
+`agent-room-ops rooms`, which must be installed beside this skill).
+The voice tool `room_use` switches by name or id ("present in the Qingyun Group
+room") and says whether that room has a page. On a voice agent that exposes the
+session's docked room (`getVoiceSessionOrigin`), the tools also follow the room
+the owner moves to before acting; a room picked with `room_use` holds until then.
+Older hosts skip the following silently.
+
 The skill's own voice tools use the relay: `room_slide` (next / previous / go to),
 `room_highlight`, `room_stage`, and `room_script`. The last one loads a **talk
 script** from the room's Doc. Under a heading "Talk script", each paragraph is a

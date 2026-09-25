@@ -12,12 +12,15 @@ import {
 	type Beat,
 	type ScriptItem,
 } from './present.js';
+import { matchRoom, originRoom, ROOM_ID_RE, type RoomEntry } from './room-match.js';
 
 // Read at call time: manifest config lands in process.env after imports are hoisted.
 const relayUrl = () => (process.env.ROOM_COLLAB_RELAY_URL || 'http://127.0.0.1:7877').replace(/\/$/, '');
 const START_HINT =
 	'The room relay is not running. Ask the core to start it: ' +
 	"python3 skills/room-collab/scripts/room_collab.py --kind html relay '<room id>'";
+// Covers the relay's own wait for a switched room to connect.
+const SWITCH_TIMEOUT_MS = 12_000;
 
 // One talk at a time per voice agent: which beat is next, and whether turn ends advance it.
 // `synced` is false once anything but the talk may have moved the deck (start, resume,
@@ -46,10 +49,14 @@ function talkPosition(): Record<string, unknown> | null {
 // The session's context channel, from setup(), to restate the slide rule when a talk starts.
 let injectContext: ((text: string) => void) | null = null;
 
-async function relay(method: 'GET' | 'POST', path: string): Promise<Record<string, unknown>> {
+// The host's voice-session origin, from setup(), when it has one; the room last followed from it.
+let voiceOrigin: (() => unknown) | null = null;
+let followed: string | null = null;
+
+async function call(method: 'GET' | 'POST', path: string, ms = 2_000): Promise<Record<string, unknown>> {
 	let res: Response;
 	try {
-		res = await fetch(`${relayUrl()}${path}`, { method, signal: AbortSignal.timeout(2_000) });
+		res = await fetch(`${relayUrl()}${path}`, { method, signal: AbortSignal.timeout(ms) });
 	} catch {
 		return { error: START_HINT };
 	}
@@ -57,12 +64,34 @@ async function relay(method: 'GET' | 'POST', path: string): Promise<Record<strin
 	return res.ok ? body : { error: String(body.error ?? `relay answered ${res.status}`) };
 }
 
+/** Move the relay to the room this session is docked in, once per change of that room,
+ *  so a room chosen with room_use holds until the owner moves to another room. */
+async function follow(): Promise<void> {
+	if (!voiceOrigin) return;
+	let room: RoomEntry | null;
+	try {
+		room = originRoom(voiceOrigin());
+	} catch {
+		return;
+	}
+	if (!room || room.id === followed) return;
+	const res = await call('POST', `/room/${encodeURIComponent(room.id)}`, SWITCH_TIMEOUT_MS);
+	if (res.error !== START_HINT) followed = room.id;
+	talk.synced = false;
+}
+
+async function relay(method: 'GET' | 'POST', path: string): Promise<Record<string, unknown>> {
+	await follow();
+	return call(method, path);
+}
+
 // Which slide tool to use is the model's most common mistake: slide_control moves a local tab.
 export const ROOM_SLIDE_RULE =
 	'When the deck being presented is open as an AG2 Space room page (room_present, or the room relay is up), ' +
 	'every slide request — "next", "go back", "go to slide N" — uses room_slide; to find where something is, room_outline; ' +
 	'to point at it, room_highlight (topic key) or room_point (its words). ' +
-	'slide_control moves only a browser tab on this computer and does nothing in the room.';
+	'slide_control moves only a browser tab on this computer and does nothing in the room. ' +
+	'When the user names a room ("present in the Design room"), call room_use with that name first.';
 
 /** A user-directed move during a talk pauses it, or the next beat would move the deck away again. */
 function pauseForManualMove(): string | undefined {
@@ -166,6 +195,7 @@ export const roomScriptTool: ToolDefinition = {
 	execution: 'inline',
 	timeout: 15_000,
 	async execute() {
+		await follow();
 		let res: Response;
 		try {
 			res = await fetch(`${relayUrl()}/script`, { signal: AbortSignal.timeout(12_000) });
@@ -205,10 +235,46 @@ async function nextLine(): Promise<{ say: string; n: number; showing?: string } 
 	return null;
 }
 
+export const roomUseTool: ToolDefinition = {
+	name: 'room_use',
+	description:
+		'Choose which AG2 Space room the room_* tools act in. Call it FIRST whenever the user names a room — ' +
+		'"present in the Qingyun Group room", "show the deck in Design", "switch to <room>". ' +
+		'Pass the room\'s name as the user said it (or its id, !abc:server). Returns the room\'s id and name and ' +
+		'whether it has an HTML page to present; if the name is ambiguous or unknown, ask the user which room. Takes ~1–5 s.',
+	parameters: z.object({ room: z.string().min(1).max(255).describe('A room name, or a room id like !abc:server') }),
+	execution: 'inline',
+	timeout: 20_000,
+	async execute(args) {
+		const { room } = args as { room: string };
+		let rooms: RoomEntry[] = [];
+		if (!ROOM_ID_RE.test(room.trim())) {
+			const listed = await call('GET', '/rooms', 8_000);
+			if (listed.error) return listed;
+			rooms = (listed.rooms as RoomEntry[]) ?? [];
+		}
+		const match = matchRoom(room, rooms);
+		if ('error' in match) return match;
+		const res = await call('POST', `/room/${encodeURIComponent(match.room.id)}`, SWITCH_TIMEOUT_MS);
+		if (res.error && res.connected !== false) return res;
+		talk.synced = false;
+		return {
+			ok: true,
+			room: match.room.id,
+			name: match.room.name,
+			connected: res.connected,
+			has_page: res.has_page,
+			...(res.connected === false ? { error: res.error } : {}),
+			...(res.has_page === false ? { note: 'this room has no HTML page yet, so there is nothing to present' } : {}),
+		};
+	},
+};
+
 export const roomPresentTool: ToolDefinition = {
 	name: 'room_present',
 	description:
 		'Give the talk in the room\'s "Talk script", for everyone watching the room\'s deck. ' +
+		'If the user names a room to present in, call room_use with it first. ' +
 		'"start" loads the script and runs the first beat (it moves the slides and highlights ITSELF), then returns the first line: say it. ' +
 		'After each line you say, the next beat arrives by itself as a silent control message: say only its line. Never narrate the script ahead. ' +
 		'If someone interrupts or asks a question: call "pause", answer them, then call "resume" to continue from the same place. ' +
@@ -266,6 +332,7 @@ export const roomPresentTool: ToolDefinition = {
 };
 
 export const tools: ToolDefinition[] = [
+	roomUseTool,
 	roomSlideTool,
 	roomHighlightTool,
 	roomPointTool,
@@ -285,8 +352,11 @@ export function setup(ctx: {
 	session: unknown;
 	injectText: (session: unknown, text: string) => void;
 	injectContext?: (text: string) => void;
+	getVoiceSessionOrigin?: () => unknown;
 }): void {
 	if (typeof ctx?.injectContext === 'function') injectContext = ctx.injectContext;
+	// Hosts older than the voice-session origin have no getter: the relay keeps its room.
+	if (typeof ctx?.getVoiceSessionOrigin === 'function') voiceOrigin = ctx.getVoiceSessionOrigin;
 	const sess = ctx?.session as { eventBus?: { subscribe?: (ev: string, fn: () => void) => void } } | undefined;
 	if (!sess?.eventBus?.subscribe || typeof ctx.injectText !== 'function') {
 		console.warn('[room-collab] no turn events on this session; room_present runs one line per call');
