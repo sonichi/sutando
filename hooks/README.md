@@ -204,9 +204,7 @@ chain): `grep -rn "open -gja Calendar" src/`, `git log -S "open -a Contacts"` an
 `grep osascript f | grep 'application "Calendar"'` are reads and pass, while a
 wrapper (`bash -c`, `sh -c`, `xargs`, `sudo`, `env`, `eval`, …) is scanned whole and
 an `osascript` heredoc or `;`-joined script is scanned to the end of the command.
-Unrelated `osascript`/`open` commands and every non-Bash tool pass through. Known
-gap: a script file that names the app only indirectly, or a split string such as
-`"Cont"&"acts"` — a best-effort regex.
+Unrelated `osascript`/`open` commands and every other tool pass through.
 
 Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
 position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
@@ -218,8 +216,21 @@ terminal**. The agent never writes that record: the hook denies `grant`, any com
 outside a read-only one (`cat`, `ls`, `grep`, `git`, `test`, …) that names
 `native-pim-consent` or a `*-automation-denied` marker — `touch`, `echo … >`, `tee`,
 `cp`, `rm`, `python3 -c "open(…)"`, `sed -i` — and any Python that imports or runs
-`native_pim_consent` other than the CLI's `status`/`revoke`. A redirect onto the
-marker is denied even from a read-only command. Fail-OPEN on hook errors.
+`native_pim_consent` other than the CLI's `status`/`revoke` (with their
+`--workspace` option). A redirect onto the marker is denied even from a read-only
+command. The file tools are matched too: a `Write`, `Edit`, `MultiEdit` or
+`NotebookEdit` whose `file_path`/`notebook_path` resolves (symlinks followed) to the
+consent marker or a denial marker under `<workspace>/state/` is denied; any other
+path, and every `Read`, passes. Fail-OPEN on hook errors.
+
+**Known limits.** The Bash side is a command-string matcher and cannot close
+obfuscated forms: `native""-pim-consent`, `native\-pim-consent`, the glob
+`native-pim-consen?`, a `$var` concatenation, `'native-pim-'+'consent'` or
+`importlib.import_module('native_pim'+'_consent')` inside `python -c`,
+`base64 -d | sh`, or running a script written earlier; a script file that names the
+app only indirectly, or a split string such as `"Cont"&"acts"`, gets past the app
+match the same way. Those are the documented gap of an initiative guard, not an
+authorisation boundary.
 
 **One policy.** The marker names, the host opt-in and the bound task's tier are
 `native_pim_consent.py`'s (`skills/macos-tools/scripts/`), which this hook imports;
@@ -252,9 +263,11 @@ are not intercepted.
 
 **Auto-registered** for every core session, next to `gmail-write-guard.py`:
 `session-launch.sh` passes this hook to `build-core-settings.mjs`, which registers
-it under `PreToolUse` with matcher `Bash`. For a non-core session, add the same
-`PreToolUse` entry by hand as in the block above, with matcher `Bash` and
-command `python3 <deployed path>/native-pim-guard.py`.
+it under `PreToolUse` with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit` (the
+file tools, so the consent record cannot be written directly — the same reason the
+results-dir and `MEMORY.md` guards below match `Write`/`Edit`/`MultiEdit`). For a
+non-core session, add the same `PreToolUse` entry by hand as in the block above,
+with that matcher and command `python3 <deployed path>/native-pim-guard.py`.
 
 Test: `python3 tests/native-pim-guard.test.py`.
 

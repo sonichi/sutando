@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""native-pim-guard — PreToolUse hook on Bash that denies commands driving the
-native macOS Calendar, Reminders or Contacts apps without the owner's consent.
+"""native-pim-guard — PreToolUse hook on Bash (and the file tools) that denies
+commands driving the native macOS Calendar, Reminders or Contacts apps without
+the owner's consent, and any write to the consent record.
 
 Driving those apps (``osascript``/JXA ``tell application "Calendar"``, ``open -a
 Calendar``, a script file or ``shortcuts run`` that can do the same) raises a
@@ -16,8 +17,9 @@ host opt-in ``<workspace>/state/native-pim-consent`` written by the owner with
 ``native_pim_consent.py grant``. The agent never writes that consent: ``grant``,
 any command that names ``state/native-pim-consent`` or a ``*-automation-denied``
 marker outside a read-only command, and any Python that imports
-``native_pim_consent`` are denied, so the owner runs ``grant`` in their own
-terminal. The consent counts only on the owner's own task: when
+``native_pim_consent`` are denied, and so is a Write / Edit / MultiEdit /
+NotebookEdit whose path resolves to one of those markers, so the owner runs
+``grant`` in their own terminal. The consent counts only on the owner's own task: when
 ``state/bindings/active-execution.json`` names the running task and its file
 resolves to a non-owner tier, the hatch is ignored. Without a binding the consent
 is self-attested (the model wrote the string), so this hook guards against acting
@@ -63,7 +65,9 @@ SHORTCUTS_RUN = re.compile(r"\bshortcuts\s+run\b")
 GRANT_COMMAND = re.compile(r"native_pim_consent(?:\.py)?\s+grant\b")
 CONSENT_MODULE = re.compile(r"\bnative_pim_consent\b")
 # The CLI reads the state (`status`) or narrows it (`revoke`): the only module uses allowed.
-CONSENT_READ_CLI = re.compile(r"^(?:\S*python[0-9.]*\s+)?\S*native_pim_consent\.py\s+(?:status|revoke)\s*$")
+CONSENT_READ_CLI = re.compile(
+    r"^(?:\S*python[0-9.]*\s+)?\S*native_pim_consent\.py(?:\s+--workspace\s+\S+)?"
+    r"\s+(?:status|revoke)(?:\s+--workspace\s+\S+)?\s*$")
 # The marker files by name; the TS/JS/doc sources that mention them are not the markers.
 MARKER_FILE = re.compile(
     r"\b(?:%s|(?:%s)%s)\b(?!\.(?:ts|js|mjs|md|py))" % (
@@ -127,6 +131,7 @@ REASON_MARKER = (
     "status`; the owner grants with `… grant` in their own terminal, never the agent. "
     "[native-pim-guard]"
 )
+FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
 def segments(command: str):
@@ -215,6 +220,22 @@ def _state():
         return None
 
 
+def _real(p) -> str:
+    return os.path.realpath(os.path.expanduser(str(p)))
+
+
+def decide_file(path: str, state):
+    """A file tool on the consent record: REASON_MARKER when ``path`` resolves (symlinks
+    followed) to the consent marker or a denial marker; by name alone when state is unknown."""
+    if not path:
+        return None
+    if state is None:
+        return REASON_MARKER if MARKER_FILE.search(os.path.basename(path)) else None
+    markers = [consent.consent_marker(state)] + [consent.denial_marker(a, state) for a in consent.APPS]
+    target = _real(path)
+    return REASON_MARKER if any(target == _real(m) for m in markers) else None
+
+
 def consent_given(command: str, state) -> bool:
     if ESCAPE_HATCH.search(command) or consent.env_allows():
         return True
@@ -239,10 +260,17 @@ def decide(command: str, state):
 
 def main() -> None:
     data = json.loads(sys.stdin.read())
-    if str(data.get("tool_name") or "") != "Bash":
+    tool = str(data.get("tool_name") or "")
+    tool_input = data.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    if tool == "Bash":
+        reason = decide(str(tool_input.get("command") or ""), _state())
+    elif tool in FILE_TOOLS:
+        reason = decide_file(str(tool_input.get("file_path") or tool_input.get("notebook_path") or ""),
+                             _state())
+    else:
         sys.exit(0)
-    command = str((data.get("tool_input") or {}).get("command") or "")
-    reason = decide(command, _state())
     if reason:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",

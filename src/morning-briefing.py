@@ -273,12 +273,11 @@ def _calendar_source() -> str:
 def _native_pim_opted_in() -> bool:
     """Owner opt-in for the local Calendar/Reminders apps. They raise a macOS
     permission prompt, so an unattended cron never touches them unasked."""
-    from sutando_config import config_get_env_first
     if _calendar_source() == "macos":
         return True
-    if (config_get_env_first("SUTANDO_ALLOW_NATIVE_PIM", "") or "").strip() == "1":
-        return True
-    return consent is not None and consent.consent_marker(STATE_DIR).exists()
+    if consent is None:
+        return False
+    return consent.env_allows() or consent.consent_marker(STATE_DIR).exists()
 
 
 def _calendar_denied_marker() -> Path:

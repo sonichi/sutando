@@ -108,13 +108,15 @@ if (gmailWriteGuardHook.trim()) {
 }
 
 // Always-on: a native Calendar/Reminders/Contacts command raises a macOS
-// permission prompt, so the deny must reach the model before the command runs.
+// permission prompt, so the deny must reach the model before the command runs;
+// the file tools are matched so the consent record cannot be written directly.
 const nativePimGuardHook = process.argv[6] || '';
+const NATIVE_PIM_GUARD_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit';
 let nativePimGuardSettings = null;
 if (nativePimGuardHook.trim()) {
 	nativePimGuardSettings = {
 		hooks: {
-			PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `python3 ${shq(nativePimGuardHook)}` }] }],
+			PreToolUse: [{ matcher: NATIVE_PIM_GUARD_MATCHER, hooks: [{ type: 'command', command: `python3 ${shq(nativePimGuardHook)}` }] }],
 		},
 	};
 }

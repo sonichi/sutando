@@ -169,6 +169,48 @@ for t in ["Read", "mcp__sutando-station__composio_exec", "mcp__claude_ai_Google_
     r = run({"tool_name": t, "tool_input": {"command": "open -a Calendar"}})
     check(f"allow non-bash: {t}", r.returncode == 0 and decision(r) is None and not r.stdout.strip())
 
+# ── The file tools cannot write the consent record either (Write/Edit/MultiEdit/NotebookEdit) ──
+ws_file = Path(tempfile.mkdtemp(prefix="native-pim-file-"))
+(ws_file / "state").mkdir()
+ws_link = Path(tempfile.mkdtemp(prefix="native-pim-link-")) / "ws"
+ws_link.symlink_to(ws_file)  # the workspace reached through a symlink resolves to the same markers
+
+
+def file_tool(tool, path, ws=ws_file, key="file_path"):
+    payload = {"tool_name": tool, "tool_input": {key: str(path), "content": "owner"}}
+    if tool == "Edit":
+        payload["tool_input"].update({"old_string": "", "new_string": "owner"})
+    if tool == "MultiEdit":
+        payload["tool_input"].update({"edits": [{"old_string": "", "new_string": "owner"}]})
+    return run(payload, ws=ws)
+
+
+MARKERS = ["native-pim-consent", "calendar-automation-denied",
+           "reminders-automation-denied", "contacts-automation-denied"]
+for tool in ["Write", "Edit", "MultiEdit"]:
+    for name in MARKERS:
+        r = file_tool(tool, ws_file / "state" / name)
+        check(f"{tool} on {name} is denied", decision(r) == "deny" and "own terminal" in reason_of(r), r.stdout[:120])
+    r = file_tool(tool, ws_link / "state" / "native-pim-consent")
+    check(f"{tool} through a symlinked workspace path is denied", decision(r) == "deny", r.stdout[:120])
+    r = file_tool(tool, f"{ws_file}/state/../state/native-pim-consent")
+    check(f"{tool} through a ../ path is denied", decision(r) == "deny", r.stdout[:120])
+    for path in [ws_file / "state" / "core-status.json", ws_file / "state" / "native-pim-consent.md",
+                 ws_file / "notes" / "native-pim-consent", "src/native-pim-consent.ts",
+                 ws_file / "state" / "bindings" / "active-execution.json"]:
+        r = file_tool(tool, path)
+        check(f"{tool} on {Path(path).name} ({Path(path).parent.name}) is allowed",
+              r.returncode == 0 and decision(r) is None and not r.stdout.strip(), r.stdout[:120])
+r = file_tool("NotebookEdit", ws_file / "state" / "native-pim-consent", key="notebook_path")
+check("NotebookEdit on the marker (notebook_path) is denied", decision(r) == "deny", r.stdout[:120])
+r = file_tool("NotebookEdit", ws_file / "state" / "notes.ipynb", key="notebook_path")
+check("NotebookEdit on a sibling notebook is allowed", decision(r) is None and not r.stdout.strip())
+r = run({"tool_name": "Read", "tool_input": {"file_path": str(ws_file / "state" / "native-pim-consent")}}, ws=ws_file)
+check("Read of the marker is allowed", decision(r) is None and not r.stdout.strip())
+r = run({"tool_name": "Write", "tool_input": {"content": "x"}}, ws=ws_file)
+check("Write without a path fails open", r.returncode == 0 and decision(r) is None)
+check("no marker was written by the file-tool probes", not (ws_file / "state" / "native-pim-consent").exists())
+
 # ── Escape hatch: the env prefix on the command, or the hook's own environment ──
 for cmd in [
     "SUTANDO_ALLOW_NATIVE_PIM=1 osascript -e 'tell application \"Calendar\" to get every calendar'",
@@ -244,6 +286,8 @@ for cmd in [f"cat {MARKER}",
             "cat src/native-pim-consent.ts",
             "grep -rn automation-denied src/morning-briefing.py",
             "python3 skills/macos-tools/scripts/native_pim_consent.py revoke",
+            f"python3 skills/macos-tools/scripts/native_pim_consent.py status --workspace {WS}",
+            f"python3 skills/macos-tools/scripts/native_pim_consent.py --workspace {WS} revoke",
             "python3 tests/native-pim-guard.test.py",
             "npx tsx --test tests/call-contact-consent.test.ts",
             "cat state/calendar-automation-denied"]:
@@ -321,6 +365,10 @@ check("marker names and the bound tier come from native_pim_consent",
       and guard.MARKER_FILE.search("src/native-pim-consent.ts") is None)
 check("tier of the bound team task is read through the consent module",
       guard.consent.bound_task_tier(ws_team / "state") == "team")
+check("decide_file: unknown state falls back to the marker name",
+      guard.decide_file("/anywhere/native-pim-consent", None) == guard.REASON_MARKER
+      and guard.decide_file("/anywhere/native-pim-consent.ts", None) is None
+      and guard.decide_file("", STATE) is None)
 check("segments: env prefix skipped, wrapper and read-only words recognised",
       [w for w, _ in guard.segments("X=1 osascript -e 'a'; grep b | xargs open")] == ["osascript", "grep", "xargs"])
 
