@@ -774,7 +774,8 @@ async def run(args: argparse.Namespace) -> int:
                                                             insecure=args.insecure),
                     open_kind=lambda room, kind: open_room_collab(url, room, token, kind=kind,
                                                                   insecure=args.insecure),
-                    list_rooms=joined_rooms)
+                    list_rooms=joined_rooms,
+                    identity=lambda: resolve_identity(args.user_id))
         return 0
 
     async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -1149,7 +1150,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("relay", help="hold the HTML page open and serve the local talk-highlight "
                                      "API on 127.0.0.1, for a voice agent (needs --kind html); "
-                                     "POST /surface/board|doc moves it to the board or the Doc")
+                                     "POST /surface/board|doc|db moves it to the board, the Doc or "
+                                     "the databases; /db reads and writes the room's databases")
     s.add_argument("room", help="the room to hold first; POST /room/<id> switches it")
     s.add_argument("--port", type=int, default=7877)
 
