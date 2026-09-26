@@ -237,6 +237,21 @@ def test_the_document_snapshots_to_stdout_and_restores_only_when_applied():
     assert rc == 0 and ("append", "the saved text") in doc.calls, "an empty document is appended to"
 
 
+def test_the_document_snapshot_goes_to_a_file_and_a_mismatched_one_is_refused():
+    import tempfile
+    doc = FakeDoc()
+    out = tempfile.mktemp(suffix=".json")
+    rc, printed = run_cli(BASE + ["snapshot", "!r:s", "--out", out], doc)
+    body = json.loads(open(out).read())
+    assert rc == 0 and body["text"] == "hello" and body["surface"] == "markdown", body
+    assert json.loads(printed)["snapshot"] == out, printed
+    for wrong in ({"room": "!r:s", "surface": "board", "text": "x"},
+                  {"room": "!other:s", "surface": "markdown", "text": "x"}):
+        doc = FakeDoc()
+        rc, _ = run_cli(BASE + ["restore", "!r:s", _snapshot_file(wrong), "--apply"], doc)
+        assert rc != 0 and not any(c[0] in ("replace", "append") for c in doc.calls), (wrong, doc.calls)
+
+
 def test_restore_refuses_what_is_not_a_snapshot_of_this_surface():
     import tempfile
     doc = FakeDoc()
