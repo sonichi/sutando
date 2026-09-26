@@ -70,6 +70,11 @@ edit means durable; "what is" or "is it done" means ephemeral. The person's word
 wins either way ("just tell me", "put it in the doc"). If you can't tell, answer
 in chat and offer the surface in one line. A file asked for by name stays a file.
 
+A surface is shared and lasting, so clutter costs everyone: a page list full of
+one-offs, and summons that interrupt people for nothing. When iterating, update
+the page you already made instead of adding another, and summon only when
+something is ready to look at.
+
 ## First contact — if you were @-mentioned and have never done this
 
 ```bash
