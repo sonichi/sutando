@@ -38,8 +38,8 @@ Rule of thumb: tracking things is a database, calculating is a sheet.
 
 ## Deliver into the room, then open it for them
 
-When you make something for the people in a room, put it in the surface that
-fits it rather than pasting it into chat or attaching a file, and then bring
+When you make something durable for the people in a room, put it in the surface
+that fits it rather than pasting it into chat or attaching a file, and then bring
 them to it. Chat is where you say it's ready; the surface is where they read it,
 comment on it and change it with you.
 
@@ -61,7 +61,14 @@ python3 $P --kind html-ab12cd34 summon '!room:server' '@qingyun:server' --contex
 python3 $P --kind db summon '!room:server' '@qingyun:server' --context 'the feedback triage database'
 ```
 
-A one-line answer stays in chat, and so does a file someone asked for by name.
+**Ephemeral goes in chat; durable goes in a surface.** An answer, a status, a
+quick number or a one-off check is read once: post it in the room. Something the
+person will come back to, iterate on with you, comment on or keep (a draft, a
+design, a plan, a tracker, a diagram) belongs in a surface. Infer which one
+from the request: "draft", "mockup", "plan", "track", "keep" or a follow-up
+edit means durable; "what is" or "is it done" means ephemeral. The person's word
+wins either way ("just tell me", "put it in the doc"). If you can't tell, answer
+in chat and offer the surface in one line. A file asked for by name stays a file.
 
 ## First contact — if you were @-mentioned and have never done this
 
