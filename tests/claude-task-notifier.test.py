@@ -124,6 +124,20 @@ class FakeTmuxHarness(unittest.TestCase):
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
         # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
         self.gate_on_capture_flag = self.root / "gate-on-capture.flag"
+        # Holds N: captures numbered below N render the composer COLLAPSED to one row
+        # holding only the last 30 chars of the typed text (a turn streaming).
+        self.collapse_until_capture_flag = self.root / "collapse-until-capture.flag"
+        self.collapse_py = self.root / "collapse.py"
+        self.collapse_py.write_text(
+            "import sys, re\n"
+            "rows = sys.stdin.read().split('\\n')\n"
+            "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
+            "if last >= 0:\n"
+            "    j = last + 1\n"
+            "    while j < len(rows) and rows[j].startswith('  ') and not re.match(r'^\\s*\u23f5\u23f5', rows[j]): j += 1\n"
+            "    text = rows[last][1:].strip() + ''.join(r.strip() for r in rows[last + 1:j])\n"
+            "    if text: rows[last:j] = ['\u276f ' + text[-30:]]\n"
+            "print('\\n'.join(rows))\n")
         # Holds a row of owner text that lands under our paste (consumed once).
         self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
         # The pane's #{pane_pid}: the core incarnation an in-flight marker is keyed to.
@@ -246,6 +260,9 @@ case "$cmd" in
       else
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
+    fi
+    if [ -f "{self.collapse_until_capture_flag}" ] && [ "$n" -lt "$(cat "{self.collapse_until_capture_flag}")" ]; then
+      out="$(printf '%s\\n' "$out" | python3 "{self.collapse_py}")"
     fi
     if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
       out="$(printf '%s\\n' "$out" | fold -w {self.CAPTURE_COLS})"
@@ -1254,6 +1271,61 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         result = self.run_event("task-gate-race.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("TYPE", self.sendkeys_log_text(), "pasted the task into a trust gate")
+
+
+class CollapsedComposerTests(FakeTmuxHarness):
+    """While a turn streams, the CLI shows the composer as ONE row holding only the tail
+    of a long input (measured 2026-09-25 on the reporting worker's pane, #4793). The
+    paste is intact but cannot be verified until the box expands. The notifier must not
+    re-type (that appends to the box) and must not refuse; it waits for the box to
+    settle, then presses Enter. If it never settles, it fails closed."""
+
+    def _paste_capture(self):
+        self.write_task("task-cal.txt")
+        self.run_event("task-cal.txt", timeout=12,
+                       env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        m = re.search(r"CAPTURES@(\d+)", self.sendkeys_log_text())
+        self.assertIsNotNone(m, "control run never pasted; cannot calibrate")
+        return int(m.group(1))
+
+    def test_a_collapsed_composer_is_waited_out_then_submitted_without_retyping(self):
+        n = self._paste_capture()
+        self.sendkeys_log.write_text(""); self.capture_count.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.busy_on_capture_flag.write_text(str(n))
+        self.collapse_until_capture_flag.write_text(str(n + 4))  # expands after 3 more reads
+        self.write_task("task-collapsed.txt")
+        import threading
+        def _finish():
+            for _ in range(80):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-collapsed.txt"); return
+                time.sleep(0.1)
+        th = threading.Thread(target=_finish); th.start()
+        result = self.run_event("task-collapsed.txt", timeout=30)
+        th.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("TYPE Sutando task ready: task-collapsed.txt"), 1, "re-typing over a collapsed box appends")
+        self.assertIn("ENTER", log)
+        nlog = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("waiting up to", nlog)
+        self.assertNotIn("did not stage; re-typing", nlog)
+
+    def test_a_composer_that_never_settles_fails_closed_without_retyping(self):
+        n = self._paste_capture()
+        self.sendkeys_log.write_text(""); self.capture_count.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.busy_on_capture_flag.write_text(str(n))
+        self.collapse_until_capture_flag.write_text("99999")
+        self.write_task("task-stuck.txt")
+        result = self.run_event("task-stuck.txt", timeout=20,
+                                env_extra={"SUTANDO_NOTIFIER_STAGE_SETTLE_TIMEOUT": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("TYPE"), 1)
+        self.assertNotIn("ENTER", log)
+        self.assertIn("did not settle", (self.logs_dir / "claude-task-notifier.log").read_text())
 
 
 class OwnerRowResemblingUiTextTests(FakeTmuxHarness):

@@ -41,6 +41,9 @@ CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # composer and no result has appeared. See deliver_prompt.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
 SUBMIT_CONFIRM_TIMEOUT="${SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT:-5}"
+# While a turn streams, the CLI collapses the composer to one row showing only the TAIL of a
+# long input; the paste is intact but unverifiable. Wait this long for the box to expand.
+STAGE_SETTLE_TIMEOUT="${SUTANDO_NOTIFIER_STAGE_SETTLE_TIMEOUT:-120}"
 # A queued task with nothing left to re-trigger it (composer busy, staging
 # failed) would otherwise wait forever for an unrelated wake. See the main loop.
 RETRY_POLL_SEC="${SUTANDO_NOTIFIER_RETRY_POLL_SEC:-30}"
@@ -309,6 +312,31 @@ composer_holds_prompt() {
   return 1
 }
 
+# A collapsed composer: one row that is a proper suffix of our prompt (the CLI shows the
+# tail of a long input while a turn streams). Ours, staged, not yet verifiable.
+composer_is_prompt_tail() {
+  local c p
+  c="$(composer_text "$1" | tr -d '[:space:]')"; p="$(printf '%s' "$2" | tr -d '[:space:]')"
+  [ -n "$c" ] && [ "${#c}" -ge 12 ] && [ "$c" != "$p" ] || return 1
+  case "$p" in *"$c") return 0 ;; esac
+  return 1
+}
+
+# Poll until the composer reads as exactly our prompt (0), or stops holding its tail (1),
+# or STAGE_SETTLE_TIMEOUT passes (1). Never types: re-typing over a collapsed box appends.
+wait_for_composer_to_settle() {
+  local prompt="$1" filename="$2" waited=0 cap
+  log_notifier "composer shows only the tail of $filename's prompt (a running turn collapses the box); waiting up to ${STAGE_SETTLE_TIMEOUT}s for it to settle, not re-typing"
+  while [ "$waited" -lt "$STAGE_SETTLE_TIMEOUT" ]; do
+    sleep 1; waited=$((waited + 1))
+    cap="$(capture_raw)" || continue
+    if prompt_is_staged "$cap" "$prompt"; then return 0; fi
+    composer_is_prompt_tail "$cap" "$prompt" || { log_notifier "composer no longer holds $filename's prompt or its tail; leaving it queued (failing closed)"; return 1; }
+  done
+  log_notifier "composer did not settle for $filename within ${STAGE_SETTLE_TIMEOUT}s; leaving it queued (failing closed, the next pick resumes)"
+  return 1
+}
+
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
 # count -- blank rows occupy history too) is at the cap: the env var alone cannot fix it.
 # A visible empty marker is a marker; "no marker at all" is the only truncation shape.
@@ -377,6 +405,10 @@ deliver_prompt() {
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
     if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    if composer_is_prompt_tail "$staged_raw" "$prompt"; then
+      wait_for_composer_to_settle "$prompt" "$filename" && staged=1
+      break
+    fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
@@ -581,6 +613,13 @@ submit_task() {
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
+  elif composer_is_prompt_tail "$raw" "$prompt"; then
+    if wait_for_composer_to_settle "$prompt" "$filename" && [ -n "$incarnation" ]; then
+      log_notifier "prompt for $filename settled after a collapsed read; resuming its submission"
+      press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
+    else
+      return 0
+    fi
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
     return 0
