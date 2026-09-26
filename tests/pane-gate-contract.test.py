@@ -482,6 +482,19 @@ class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
         capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\n"
         self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
 
+    COLLAPSED = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-collapsed-mid-turn.txt"
+
+    def test_a_composer_collapsed_by_a_streaming_turn_parses_to_the_prompts_tail_never_the_prompt(self):
+        # While a turn streams the CLI shows one composer row holding only the last token
+        # of the input; the reader must not expand it, so EXACT equality cannot hold.
+        text = pg.composer_text(self.COLLAPSED.read_text())
+        self.assertEqual(text, '/scratchpad/witness-4795/ws/tasks"')
+        prompt = 'Sutando task ready: task-witness-4795.txt. Read it and reply. --inbox "/x/scratchpad/witness-4795/ws/tasks"'
+        self.assertNotEqual(text, prompt)
+        self.assertTrue(prompt.endswith(text))
+        for frame in ("⏵⏵", "⧉", "─", "Spinning"):
+            self.assertNotIn(frame, text)
+
 
 class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
     """The gate asks cli_wedge one question -- frame_abnormal -- and ranks nothing

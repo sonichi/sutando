@@ -205,6 +205,11 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # Healthy = the pane accepts input. One verdict from src/delivery/pane_gate.py,
 # the gate every notifier shares: an abnormal banner (parked or retrying, via
 # cli_wedge) or a dialog holds; a running turn still accepts (it queues).
+# The pane shows a turn streaming (pane_gate: busy/working), as opposed to idle or a gate.
+pane_text_is_streaming() {
+  [ "$(printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime claude 2>/dev/null)" = "busy" ]
+}
+
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
   printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" --probe >/dev/null 2>&1
@@ -392,6 +397,12 @@ deliver_prompt() {
     fi
     if ! pane_text_is_healthy "$baseline_raw"; then
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
+      return 1
+    fi
+    # A paste into a STREAMING turn is cut to its last row by the CLI: the line does
+    # not queue intact. Hold; the next pick retries.
+    if pane_text_is_streaming "$baseline_raw"; then
+      log_notifier "turn in progress at the paste for $filename; not typing (a paste during a streaming turn is cut to its last row); leaving it queued"
       return 1
     fi
     if ! pane_text_composer_is_empty "$baseline_esc"; then

@@ -495,28 +495,19 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("TYPE Sutando task ready: task-fresh.txt", self.sendkeys_log_text(),
                       "a self-reported 'running' must not outrank an idle pane")
 
-    def test_a_running_turn_still_receives_the_task(self):
+    def test_a_running_turn_holds_the_paste_until_idle(self):
         # The pane shows an in-flight turn. The Monitor tool's notification
         # never waited for it, and neither does this: the line queues behind it.
         self.write_task("task-c.txt")
         self.pane_file.write_text(BUSY_FOOTER + "\n")
-
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-c.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-c.txt")
-        t.join(timeout=5)
+        result = self.run_event("task-c.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.sendkeys_log_text()
-        self.assertIn("TYPE Sutando task ready: task-c.txt", log,
-                      "a running turn is not a gate; the line must be typed")
-        self.assertIn("ENTER", log, "and submitted, so the CLI queues it")
+        # A paste into a streaming turn is cut to its last row on the current CLI build
+        # (witnessed 2026-09-25): hold, and let the next pick deliver into an idle pane.
+        self.assertNotIn("TYPE", log, "typed into a streaming turn")
+        self.assertNotIn("ENTER", log)
+        self.assertIn("turn in progress at the paste", (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_trust_gate_on_stale_status_blocks_dispatch(self):
         # Pins the delegation to the REAL core-input-watch.py: a stale status
@@ -1008,24 +999,16 @@ class EventDispatchTests(FakeTmuxHarness):
         return t
 
     def test_the_queued_messages_composer_is_not_a_draft(self):
-        # A line already queued behind the turn leaves this hint in the composer;
-        # the next task must still go in, on top of the queue.
+        # A line already queued behind the turn leaves this hint in the composer; it
+        # is not a draft. The turn IS streaming, so the paste holds -- for that reason.
         self.write_task("task-q.txt")
         self.pane_file.write_text("❯ Press up to edit queued messages\n" + BUSY_STATUS + "\n")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-q.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-q.txt")
-        t.join(timeout=5)
+        result = self.run_event("task-q.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-q.txt", self.sendkeys_log_text())
-
+        nlog = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertNotIn("composer not empty", nlog, "the queued-messages hint was read as a draft")
+        self.assertIn("turn in progress at the paste", nlog)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
     def test_a_busy_footer_alone_does_not_confirm_a_submit(self):
         # Busy is trivially true once a turn runs, so it proves nothing about our
         # line: a swallowed C-m on a busy pane must still be re-pressed.
@@ -1233,32 +1216,18 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         self.assertIsNotNone(m, "control run never pasted; cannot calibrate")
         return int(m.group(1))
 
-    def test_a_turn_starting_right_before_the_paste_still_gets_the_line(self):
+    def test_a_turn_streaming_at_the_baseline_holds_the_paste(self):
+        # A paste into a streaming turn is cut to its last row on the current CLI
+        # build (witnessed 2026-09-25), so the notifier holds instead of typing.
         n = self._captures_before_first_paste()
-        # Fresh harness state for the real run, same fake, same read order.
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
-        # CAPTURES@n is the count AT the paste: capture n IS the last read
-        # before it (the baseline). A turn starting there is not a gate.
         self.busy_on_capture_flag.write_text(str(n))
         self.write_task("task-race.txt")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-race.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-race.txt")
-        t.join(timeout=5)
+        result = self.run_event("task-race.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertIn("TYPE", log, "a turn that just started must not hold the line")
-        self.assertIn("ENTER", log, "the line queues behind the turn")
-        self.assertNotIn("not healthy at the paste",
-                         (self.logs_dir / "claude-task-notifier.log").read_text())
+        self.assertNotIn("TYPE", self.sendkeys_log_text(), "typed into a streaming turn")
+        self.assertIn("turn in progress at the paste", (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_a_gate_replacing_idle_on_the_baseline_read_blocks_the_paste(self):
         # Not-busy is not idle: a trust gate has no "esc to interrupt" and
@@ -1292,7 +1261,7 @@ class CollapsedComposerTests(FakeTmuxHarness):
         n = self._paste_capture()
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
-        self.busy_on_capture_flag.write_text(str(n))
+        self.busy_on_capture_flag.write_text(str(n + 1))  # the turn starts right after the baseline
         self.collapse_until_capture_flag.write_text(str(n + 4))  # expands after 3 more reads
         self.write_task("task-collapsed.txt")
         import threading
@@ -1316,7 +1285,7 @@ class CollapsedComposerTests(FakeTmuxHarness):
         n = self._paste_capture()
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
-        self.busy_on_capture_flag.write_text(str(n))
+        self.busy_on_capture_flag.write_text(str(n + 1))
         self.collapse_until_capture_flag.write_text("99999")
         self.write_task("task-stuck.txt")
         result = self.run_event("task-stuck.txt", timeout=20,
