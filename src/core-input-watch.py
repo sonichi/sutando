@@ -114,8 +114,8 @@ def _load_runtime_health():
 # Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
-    AWAIT_HINT, BORDER_LINE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE, COMPOSER_PLACEHOLDER, FABLE_TEXT,
-    composer_text as _pg_composer_text,
+    ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, RuntimeAdapter, composer_text as _pg_composer_text,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -194,10 +194,13 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None."""
+def classify(pane: str, adapter: RuntimeAdapter = CLAUDE):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `adapter` is the core's runtime: its dialogs use their own glyph and key hints."""
+    signatures, await_hint = list(adapter.gate_signatures), adapter.await_hint
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
-    if not _AWAIT_HINT.search(tail):
+    if not await_hint.search(tail):
         return None
     # Idle-footer suppression: the normal footer ("⏵⏵ bypass permissions on … ←
     # for agents") also carries an await-affordance, so a genuinely idle pane would
@@ -210,11 +213,11 @@ def classify(pane: str):
     # The footer vouches only for itself: a hint on any OTHER line is a live
     # prompt sharing the window with an old footer, and must not be suppressed.
     beyond_footer = "\n".join(ln for ln in tail.splitlines() if not _IDLE.search(ln))
-    if (_IDLE.search(tail) and not _AWAIT_HINT.search(beyond_footer)
-            and not any(rx.search(tail) for _, rx in _SIGNATURES)):
+    if (_IDLE.search(tail) and not await_hint.search(beyond_footer)
+            and not any(rx.search(tail) for _, rx in signatures)):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
-    hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
+    hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(signatures)
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
     if hits:
         start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
@@ -317,7 +320,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True):
+def compose_state(pane, base_health, gateway_alive, process=True, adapter=CLAUDE):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -334,7 +337,7 @@ def compose_state(pane, base_health, gateway_alive, process=True):
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane) if pane else None
+    hit = classify(pane, adapter) if pane else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -463,6 +466,18 @@ def gateway_alive(app_data, state_dir=None):
     # primary. Same reasoning as startup.sh's launcher P1; instance-aware
     # probing tracked separately.
     return _pgrep("remote-gateway-bridge")
+
+
+def session_adapter(socket, session):
+    """The runtime adapter for the watched core, from the SUTANDO_CORE_RUNTIME its launcher
+    stamped on the session; Claude when unset or unknown, the runtime this watcher assumed."""
+    try:
+        out = subprocess.run(["tmux", "-S", socket, "show-environment", "-t", f"={session}",
+                              "SUTANDO_CORE_RUNTIME"], capture_output=True, text=True, timeout=8)
+        runtime = out.stdout.strip().partition("=")[2] if out.returncode == 0 else ""
+    except Exception:
+        runtime = ""
+    return ADAPTERS.get(runtime, CLAUDE)
 
 
 def capture(socket, session):
@@ -715,7 +730,8 @@ def main():
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True))
+            process=(base.get("signals") or {}).get("process", True),
+            adapter=session_adapter(a.socket, a.session))
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).

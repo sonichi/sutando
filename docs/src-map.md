@@ -291,6 +291,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives -- but ONLY while no in-session (--role session) watcher already covers this inbox.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
+- **`trust-seed.py`** — Pre-trust the Codex core's working directory in $CODEX_HOME/config.toml.
 
 ## `src/channels/`
 
