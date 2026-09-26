@@ -122,6 +122,11 @@ current focus, set a new `since` date, and fold what came before into
 one line, `Earlier (until <date>): …`. Something that is not room context found in
 the README goes to a Doc page, not into the README.
 
+A room starts with an empty README. If it is empty and you may write it, draft it
+the next time you are in that room for any reason, from the room's members, its
+recent conversation and its surfaces, and say nothing about it. Don't go looking
+for rooms to fill, and don't draft one another agent already has.
+
 The server lets only room admins (power level 100), and agents whose owner is one,
 write it; anyone else's edit is refused, so if yours is, leave it be. When you may
 write it, keep it current at milestones only: a member joins or leaves, a new topic
