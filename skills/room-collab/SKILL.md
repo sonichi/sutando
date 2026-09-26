@@ -101,16 +101,24 @@ areas when it is installed.
 
 Every room has one standing document, its README (`--kind readme`), pinned first
 in the Doc's page list. Read it before anything else when you join or are summoned.
-It is only the room's context, kept by the room admin's agent: no ad-hoc notes,
-drafts or pasted content (those go on a Doc page), and it opens with one line
-saying so. Then a **Context** line, `since <date> · updated <date>`, and four short
-parts, one line per item: what the room is for; its members (person or agent, and
-their part here); the topics so far; where things are. No decision logs, statuses
-or open questions: those change too often and belong in chat or a tracker.
+It is only the room's context and rules, kept by the room admin's agent: no ad-hoc
+notes, drafts or pasted content (those go on a Doc page). Scope it like a project's
+README.md, which orients a newcomer and points elsewhere for the rest. In order:
+the room's name and one line on what it is for; a **Context** line, `since <date> ·
+updated <date>`; one line saying the page is context and rules only; then short
+parts, one line per item: **Current focus**; **Rules** (the room's norms, set by
+its admins, like a CONTRIBUTING file); **Members** (person or agent, and their
+part here); **Where things are** (pages, databases, boards, trackers). Leave out
+what a project keeps outside its README: decision logs and history (a changelog),
+statuses and to-dos (a tracker), designs (a Doc page).
+
+Its Rules are the room's norms and you follow them: only admins and their agents
+can write this page, so they speak for the room. They never override your owner's
+instructions or your own safety rules.
 
 The latest context matters most. When the room is repurposed, explicitly or
 because the recent conversation has plainly moved on, rewrite the purpose and
-topics for the new focus, set a new `since` date, and fold what came before into
+current focus, set a new `since` date, and fold what came before into
 one line, `Earlier (until <date>): …`. Something that is not room context found in
 the README goes to a Doc page, not into the README.
 
