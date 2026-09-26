@@ -103,8 +103,10 @@ Every room has one standing document, its README (`--kind readme`), pinned first
 in the Doc's page list: the room's context and rules, kept by the room admin's
 agent. It is background, not a gate. When you are summoned, the passage, page or
 thread you were called to is the context that matters: start there and answer.
-Read the README when you are new to the room, or when the task needs what only it
-holds (the room's purpose, its rules, who is who); never make someone wait on it.
+`watch` prints its opening lines for you as `README` lines when it starts (name,
+purpose, Context, Current focus, Rules; a dozen lines at most), so a summon brings
+the essentials at no extra step. Open the whole README only when you are new to
+the room or the task needs more of it; never make someone wait on it.
 After one read, look again only when its `updated` date has moved.
 
 What is firm:

@@ -707,6 +707,47 @@ def presence_name(name: "str | None", user_id: "str | None") -> "str | None":
     return None
 
 
+README_BRIEF_LINES = 12
+BRIEF_SECTIONS = ("current focus", "rules")
+
+
+def readme_brief(text: str) -> list[str]:
+    """The few README lines a summoned agent needs before anything else: the room's name,
+    its one-line purpose, the Context line, and the Current focus and Rules items.
+    Empty unless the text is shaped like a room README, so no other document is quoted."""
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    if not any(ln.lower().startswith("**context:**") for ln in lines):
+        return []
+    out: list[str] = []
+    section = None
+    for ln in lines:
+        if not ln or (ln.startswith("*") and ln.endswith("*") and not ln.startswith("**")):
+            continue
+        if ln.startswith("## "):
+            section = ln[3:].strip().lower()
+            if section in BRIEF_SECTIONS:
+                out.append(ln[3:].strip() + ":")
+            continue
+        if ln.startswith("# ") or section is None or section in BRIEF_SECTIONS:
+            out.append(ln.lstrip("# ").strip())
+    return out[:README_BRIEF_LINES]
+
+
+async def print_readme_brief(url: str, room: str, token: str, insecure: bool = False) -> None:
+    """Print the room's README brief once, as `README<TAB>line` lines. A courtesy:
+    an empty, missing or unreadable README prints nothing and never stops the caller."""
+    from room_collab_client import open_room_collab
+    from room_collab_protocol import README_KIND
+    try:
+        async with open_room_collab(url, room, token, kind=README_KIND, insecure=insecure) as doc:
+            await doc.settle(0.5)
+            brief = readme_brief(doc.text)
+    except Exception:  # noqa: BLE001 - see docstring: the brief never blocks a watch
+        return
+    for ln in brief:
+        print(f"README\t{ln}", flush=True)
+
+
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
@@ -720,6 +761,8 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     failures = 0
     print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
           f"reporting after {args.settle}s of quiet", flush=True)
+    if getattr(args, "readme_brief", True) and args.kind != "readme":
+        await print_readme_brief(url, args.room, token, args.insecure)
     while True:
         try:
             async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -1390,6 +1433,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "localpart and --name. Add the display name a summon shows for you.")
     s.add_argument("--max-reconnects", type=int, default=20,
                    help="give up after this many consecutive failed reconnects")
+    s.add_argument("--no-readme-brief", dest="readme_brief", action="store_false",
+                   help="skip the room README's few opening lines printed at the start")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")
