@@ -1,0 +1,29 @@
+
+  Ran 5 shell commands, wrote 1 memory 
+
+⏺ Monitor event: "Re-arm the session watcher on the standby delivery path"
+
+⏺ Monitor event: "Re-arm the session watcher on the standby delivery path"
+
+⏺ Worktree ready. Reading the existing busy-before-paste test contract, and picking up the new task that just arrived.
+
+  Capturing my own busy pane and running the notifier's composer parser on it to test why staging fails mid-turn
+  ⎿  $ SP=/private/tmp/claude-501/-Users-wangchi-stando-ui-sutando/426b7da9-edb5-45e2-9528-0c3b746e7815/scratchpad; 
+     S=/tmp/sutando-tmux.sock; T=sutando-worker-17c6c3222a4a483b8c68652d58018ad7; tmux -S $S capture-pane -p -e -S -200
+     -t "$T:0" > "$SP/mypane-busy.esc.txt" 2>&1; LC_ALL=C sed $'s#\x1b\\[[0-9;…
+
+✽ Infusing… (5m 15s · ↓ 15.4k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+                                                                                ✔ Update installed · Restart to update
+────────────────────────────────────────────────────────────────────── sutando-worker-17c6c3222a4a483b8c68652d58018ad7 ─
+❯ Sutando task ready: task-325dc8f4149e103d54.txt. Read
+  /Users/wangchi/stando-ui/sutando/workspace/tasks/task-325dc8f4149e103d54.txt, follow CLAUDE.md, complete the task,
+  and write the result to /Users/wangchi/stando-ui/sutando/workspace/results/task-325dc8f4149e103d54.txt. Delivered by
+  the standby: no session-role watcher holds
+  /Users/wangchi/stando-ui/sutando/workspace/deliveries/17c6c3222a4a483b8c68652d58018ad7. Re-arm yours via the Monitor
+  tool: bash "/Users/wangchi/stando-ui/sutando/src/watch-tasks-stream.sh"
+  "/Users/wangchi/stando-ui/sutando/workspace/deliveries/17c6c3222a4a483b8c68652d58018ad7" --role session --inbox
+  "/Users/wangchi/stando-ui/sutando/workspace/deliveries/17c6c3222a4a483b8c68652d58018ad7"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 3 shells, 1 monitor · 1 feedback draft
+  ⧉  errand-deck

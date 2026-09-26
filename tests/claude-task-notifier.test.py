@@ -139,6 +139,39 @@ class FakeTmuxHarness(unittest.TestCase):
 
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
+        # Holds N: a `-l` paste longer than N bytes lands as only its bytes after N,
+        # as one tmux write past the CLI's input limit does on a real pane.
+        self.cut_paste_over_flag = self.root / "cut-paste-over.flag"
+        # Holds N: the Nth and every later `-l` paste is dropped (a chunk the CLI never
+        # took), never consumed; paste_count numbers them from 1.
+        self.drop_paste_from_flag = self.root / "drop-paste-from.flag"
+        self.paste_count = self.root / "paste-count.txt"
+        # Window rows (29, a pool worker's): above 29 the box fits and the view flag lapses;
+        # resize-window logs `RESIZE -y N enters=<ENTERs so far>`; the flags: exit 1, pane unchanged.
+        self.window_rows = self.root / "window-rows.txt"
+        self.resize_log = self.root / "resize.log"
+        # The window-local window-size option (empty = inherited); resize-window sets it
+        # to manual as real tmux does, set-window-option rewrites it and logs `WINOPT`.
+        self.window_size_opt = self.root / "window-size-opt.txt"
+        self.grow_fails_flag = self.root / "grow-fails.flag"
+        self.split_pane_flag = self.root / "split-pane.flag"
+        # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
+        # rows from row N (0-based): the box cut by the screen bottom on a short pane.
+        self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
+        self.view_py = self.root / "view.py"
+        self.view_py.write_text(
+            "import sys, re\n"
+            "k, _, n = sys.argv[1].partition('@'); k = int(k); n = int(n or -1); rows = sys.stdin.read().split('\\n')\n"
+            "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
+            "if last >= 0:\n"
+            "    j = last + 1\n"
+            "    while j < len(rows) and rows[j].startswith('  ') and '\u23f5\u23f5' not in rows[j] and not re.match(r'^[\\s\u2500-\u257f-]+$', rows[j]): j += 1\n"
+            "    box = rows[last:j]\n"
+            "    if len(box) > k:\n"
+            "        keep = box[-k:] if n < 0 else box[n:n + k]; keep[0] = '\u276f ' + keep[0].strip()\n"
+            "        rows[last:j] = keep\n"
+            "        if n >= 0: rows[last + k:] = []  # cut by the screen: the frame is off screen too\n"
+            "print('\\n'.join(rows))\n")
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -172,6 +205,12 @@ if idx is None:
     lines.append("❯ "); idx = len(lines) - 1
 row = lines[idx]
 row = "❯ " if re.match(r'^❯ *$|^❯ Try "|^❯ Press up to edit queued messages', row) else row
+# The box's own continuation rows (everything down to the frame) belong to the
+# text: a later chunk re-wraps all of it.
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    row += lines[end].strip() if style == "word" else lines[end]; end += 1
 new = row + text
 if wrap <= 0:
     rows = [new]
@@ -181,7 +220,7 @@ elif style == "word":
                          break_on_hyphens=False)
 else:
     rows = [new[i:i + wrap] for i in range(0, len(new), wrap)]
-lines[idx:idx + 1] = rows
+lines[idx:end] = rows
 open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
 }}
@@ -247,6 +286,11 @@ case "$cmd" in
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
     fi
+    grown=0; [ "$(cat "{self.window_rows}" 2>/dev/null || echo 29)" -gt 29 ] && grown=1
+    [ -f "{self.split_pane_flag}" ] && grown=0
+    if [ -f "{self.composer_view_rows_flag}" ] && [ "$grown" = 0 ]; then
+      out="$(printf '%s\\n' "$out" | python3 "{self.view_py}" "$(cat "{self.composer_view_rows_flag}")")"
+    fi
     if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
       out="$(printf '%s\\n' "$out" | fold -w {self.CAPTURE_COLS})"
     fi
@@ -263,6 +307,7 @@ case "$cmd" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
       *pane_pid*) cat "{self.pane_pid_file}" 2>/dev/null || echo 4242 ;;
+      *window_height*) cat "{self.window_rows}" 2>/dev/null || echo 29 ;;
 
       *pane_id*)
         if [ -f "{self.pane_gone_flag}" ]; then echo ""; exit 0; fi
@@ -279,7 +324,15 @@ case "$cmd" in
       shift 2  # -l --
       text="$1"
       printf 'CAPTURES@%s\\nTYPE %s\\n' "$(cat "{self.capture_count}" 2>/dev/null || echo 0)" "$text" >> "{self.sendkeys_log}"
+      # Real tmux: a trailing ';' is its command separator and is lost; a trailing '\\;' lands as ';'.
+      case "$text" in *'\\;') text="${{text%\\\\;}};" ;; *';') text="${{text%;}}" ;; esac
+      if [ -f "{self.cut_paste_over_flag}" ] && [ "${{#text}}" -gt "$(cat "{self.cut_paste_over_flag}")" ]; then
+        text="${{text:$(cat "{self.cut_paste_over_flag}")}}"
+      fi
+      pn=$(( $(cat "{self.paste_count}" 2>/dev/null || echo 0) + 1 )); echo "$pn" > "{self.paste_count}"
       if [ -f "{self.swallow_always_flag}" ]; then
+        :
+      elif [ -f "{self.drop_paste_from_flag}" ] && [ "$pn" -ge "$(cat "{self.drop_paste_from_flag}")" ]; then
         :
       elif [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"
@@ -327,6 +380,23 @@ PYEOF
         append_typed "owner is typing something else"
       fi
     fi
+    exit 0
+    ;;
+  resize-window)
+    [ -f "{self.grow_fails_flag}" ] && exit 1
+    rows=""; while [ $# -gt 0 ]; do [ "$1" = -y ] && rows="$2"; shift; done
+    printf 'RESIZE -y %s enters=%s\\n' "$rows" "$({{ grep -c '^ENTER' "{self.sendkeys_log}" || true; }} 2>/dev/null)" >> "{self.resize_log}"
+    echo "$rows" > "{self.window_rows}"
+    echo manual > "{self.window_size_opt}"
+    exit 0
+    ;;
+  show-window-options)
+    cat "{self.window_size_opt}" 2>/dev/null
+    exit 0
+    ;;
+  set-window-option)
+    unset_opt=0; val=""; while [ $# -gt 0 ]; do case "$1" in -u) unset_opt=1 ;; -t) shift ;; window-size) val="${{2:-}}" ;; esac; shift; done
+    if [ "$unset_opt" = 1 ]; then : > "{self.window_size_opt}"; echo "WINOPT unset" >> "{self.resize_log}"; else echo "$val" > "{self.window_size_opt}"; echo "WINOPT $val" >> "{self.resize_log}"; fi
     exit 0
     ;;
   new-session|kill-session|setenv)
@@ -1059,15 +1129,16 @@ class StandbyReminderTests(FakeTmuxHarness):
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         self.write_task("task-sb.txt")
         self.run_event("task-sb.txt", timeout=15)
-        typed = self.sendkeys_log_text()
+        # The paste goes out in chunks; what they reassemble to is the line typed.
+        typed = "".join(l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE "))
         # Equality, not containment: this is what pins expected_prompt() — which the
         # inflight suite stages into its composer — to what the notifier really types.
-        self.assertIn(f"TYPE {self.expected_prompt('task-sb.txt')}", typed)
+        self.assertEqual(self.expected_prompt('task-sb.txt'), typed)
         self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
         # The script path is quoted: a desktop install lives under "Application Support".
         self.assertIn(f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
         import shlex
-        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1].split("\n", 1)[0]
+        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1]
         self.assertEqual(shlex.split(rearm)[1], f"{REPO}/src/watch-tasks-stream.sh", "the script path survives shell parsing as ONE word")
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertIn(f"delivering task-sb.txt as the standby: no session-role watcher holds {self.tasks_dir}", log)
