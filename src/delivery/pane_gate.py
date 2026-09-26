@@ -291,6 +291,24 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     return "".join(block)
 
 
+def composer_frame_visible(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[bool]:
+    """Whether the CLI's frame below the composer (its closing rule, the idle footer) is
+    on screen; None with no <glyph> line. False = the box is cut by the screen bottom, so
+    its last rows are unseen and no capture can show where the typed text ends."""
+    lines = [ln for ln in capture.splitlines() if ln.strip()]
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _prompt_glyph(lines[i], adapter) is not None:
+            start = i
+            break
+    if start is None:
+        return None
+    for row in lines[start + 1:]:
+        if BORDER_LINE.match(row) or adapter.idle_ready.search(row):
+            return True
+    return False
+
+
 def _tail_lines(capture: str) -> List[str]:
     """The last TAIL_LINES non-blank lines, attributes kept (the composer parse needs them)."""
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
@@ -453,6 +471,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    cf = sub.add_parser("composer-frame")
+    cf.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
@@ -508,6 +528,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("pane_gate: no prompt line found — prompt unknown", file=sys.stderr)
             return EXIT_UNSAFE
         print(text)
+        return 0
+    if a.cmd == "composer-frame":
+        seen = composer_frame_visible(_read_stdin(), adapter)
+        if seen is None:
+            print("pane_gate: no prompt line found — frame unknown", file=sys.stderr)
+            return EXIT_UNSAFE
+        print("visible" if seen else "cut")
         return 0
     if a.cmd == "safe":
         v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),

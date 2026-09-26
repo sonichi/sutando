@@ -142,6 +142,10 @@ class FakeTmuxHarness(unittest.TestCase):
         # Holds N: a `-l` paste longer than N bytes lands as only its bytes after N,
         # as one tmux write past the CLI's input limit does on a real pane.
         self.cut_paste_over_flag = self.root / "cut-paste-over.flag"
+        # Holds N: the Nth and every later `-l` paste is dropped (a chunk the CLI never
+        # took), never consumed; paste_count numbers them from 1.
+        self.drop_paste_from_flag = self.root / "drop-paste-from.flag"
+        self.paste_count = self.root / "paste-count.txt"
         # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
         # rows from row N (0-based): the box cut by the screen bottom on a short pane.
         self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
@@ -157,6 +161,7 @@ class FakeTmuxHarness(unittest.TestCase):
             "    if len(box) > k:\n"
             "        keep = box[-k:] if n < 0 else box[n:n + k]; keep[0] = '\u276f ' + keep[0].strip()\n"
             "        rows[last:j] = keep\n"
+            "        if n >= 0: rows[last + k:] = []  # cut by the screen: the frame is off screen too\n"
             "print('\\n'.join(rows))\n")
         self._write_fake_tmux()
 
@@ -310,7 +315,10 @@ case "$cmd" in
       if [ -f "{self.cut_paste_over_flag}" ] && [ "${{#text}}" -gt "$(cat "{self.cut_paste_over_flag}")" ]; then
         text="${{text:$(cat "{self.cut_paste_over_flag}")}}"
       fi
+      pn=$(( $(cat "{self.paste_count}" 2>/dev/null || echo 0) + 1 )); echo "$pn" > "{self.paste_count}"
       if [ -f "{self.swallow_always_flag}" ]; then
+        :
+      elif [ -f "{self.drop_paste_from_flag}" ] && [ "$pn" -ge "$(cat "{self.drop_paste_from_flag}")" ]; then
         :
       elif [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"

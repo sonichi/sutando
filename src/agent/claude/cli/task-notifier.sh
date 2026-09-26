@@ -295,13 +295,25 @@ composer_text() {
 
 squeeze() { tr -d '[:space:]'; }
 
-# The composer box shows only some of its rows (the last ones, or with a tall transcript
-# tail above it on a short pane, a middle stretch cut by the screen bottom): a prompt
-# taller than the box reads as a stretch of itself. Shorter than one chunk proves nothing.
+# The frame below the box (its closing rule, the footer) is off screen: the box is cut
+# by the screen bottom and its last rows are unseen.
+pane_frame_is_cut() {
+  [ "$(printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-frame --runtime claude 2>/dev/null)" = "cut" ]
+}
+
+# The box shows only some of its rows. With its frame on screen those are the LAST rows,
+# so the window must end where the prompt ends; cut by the screen bottom it shows a
+# middle stretch, accepted only while this process has read every chunk back (TYPED_ALL).
+# A window shorter than one chunk proves nothing.
+TYPED_ALL=0
 composer_is_window_of() {
-  local c="$1" p="$2"
+  local c="$1" p="$2" cut="${3:-0}"
   [ "${#c}" -ge "$PASTE_CHUNK" ] && [ "${#c}" -lt "${#p}" ] || return 1
-  case "$p" in *"$c"*) return 0 ;; esac
+  if [ "$cut" = 1 ] && [ "$TYPED_ALL" = 1 ]; then
+    case "$p" in *"$c"*) return 0 ;; esac
+  else
+    case "$p" in *"$c") return 0 ;; esac
+  fi
   return 1
 }
 
@@ -311,18 +323,20 @@ composer_is_window_of() {
 # Whitespace is ignored on both sides: the input box word-wraps at the pane width and
 # indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
 prompt_is_staged() {
-  local c p
+  local c p cut=0
   c="$(composer_text "$1" | squeeze)"; p="$(printf '%s' "$2" | squeeze)"
-  [ "$c" = "$p" ] || composer_is_window_of "$c" "$p"
+  pane_frame_is_cut "$1" && cut=1
+  [ "$c" = "$p" ] || composer_is_window_of "$c" "$p" "$cut"
 }
 
 # The composer still carries our prompt at all (exactly, its window, or with owner
 # text mixed in). False once it left: submitted, or queued behind a running turn.
 composer_holds_prompt() {
-  local c p
+  local c p cut=0
   c="$(composer_text "$1" | squeeze)"; p="$(printf '%s' "$2" | squeeze)"
+  pane_frame_is_cut "$1" && cut=1
   case "$c" in *"$p"*) return 0 ;; esac
-  composer_is_window_of "$c" "$p"
+  composer_is_window_of "$c" "$p" "$cut"
 }
 
 # A paste cut short: the composer holds a proper tail of our prompt shorter than one
@@ -336,17 +350,25 @@ composer_is_cut_prompt() {
 }
 
 # Type the prompt in chunks, each read back (exactly, or as the box's window of what
-# was typed so far) before the next. Stops at the first chunk that did not land.
+# was typed so far) before the next. Stops at the first chunk that did not read back:
+# that is final, the caller never judges what landed as staged.
 # One measured write of 1064 bytes kept only its last 42; no chunk this size was ever cut.
 type_prompt() {
-  local prompt="$1" i=0 typed="" chunk c t
+  local prompt="$1" i=0 typed="" chunk cap c t cut
+  TYPED_ALL=0
   while [ "$i" -lt "${#prompt}" ]; do
     chunk="${prompt:$i:$PASTE_CHUNK}"; i=$((i + PASTE_CHUNK)); typed="$typed$chunk"
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$chunk"
     sleep "$POLL_INTERVAL"
-    c="$(composer_text "$(capture_raw)" | squeeze)"; t="$(printf '%s' "$typed" | squeeze)"
-    [ "$c" = "$t" ] || composer_is_window_of "$c" "$t" || return 1
+    cap="$(capture_raw)" || cap=""
+    c="$(composer_text "$cap" | squeeze)"; t="$(printf '%s' "$typed" | squeeze)"
+    cut=0; pane_frame_is_cut "$cap" && cut=1
+    if [ "$c" != "$t" ]; then
+      TYPED_ALL=1
+      composer_is_window_of "$c" "$t" "$cut" || { TYPED_ALL=0; return 1; }
+    fi
   done
+  TYPED_ALL=1
 }
 
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
@@ -415,9 +437,13 @@ deliver_prompt() {
       return 1
     fi
     clear_composer_block
-    type_prompt "$prompt" || true
-    staged_raw="$(capture_raw)"
-    if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    if type_prompt "$prompt"; then
+      staged_raw="$(capture_raw)"
+      if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    else
+      staged_raw="$(capture_raw)"
+      log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
+    fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
@@ -541,9 +567,10 @@ nudge_deliver() {
     return 1
   fi
   while :; do
-    type_prompt "$prompt" || true
-    staged_raw="$(capture_raw)"
-    if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    if type_prompt "$prompt"; then
+      staged_raw="$(capture_raw)"
+      if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "nudge: typed prompt did not stage; re-typing (2/2)"
@@ -623,6 +650,9 @@ submit_task() {
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
   elif composer_is_cut_prompt "$raw" "$prompt"; then
     log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); leaving it queued (failing closed, core may need attention)"
+    return 0
+  elif pane_frame_is_cut "$raw" && TYPED_ALL=1 composer_is_window_of "$(composer_text "$raw" | squeeze)" "$(printf '%s' "$prompt" | squeeze)" 1; then
+    log_notifier "composer shows a stretch of $filename's prompt under a box cut by the screen; its end cannot be verified after a restart; leaving it queued (core may need attention)"
     return 0
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"

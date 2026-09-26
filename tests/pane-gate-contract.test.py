@@ -496,6 +496,24 @@ class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
             self.assertNotIn(frame, text)
 
 
+class ComposerFrameVisibility(unittest.TestCase):
+    """composer_frame_visible: the closing rule or the idle footer below the prompt line
+    means the box's end is on screen; neither means the screen bottom cut the box."""
+
+    REAL = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
+
+    def test_the_real_capture_shows_its_frame(self):
+        self.assertIs(pg.composer_frame_visible(self.REAL.read_text()), True)
+
+    def test_a_box_running_off_the_screen_bottom_is_cut(self):
+        capture = ("❯ Sutando task ready: task-x.txt. Read /some/where/task-x.txt, follow\n"
+                   "  CLAUDE.md, complete the task, and write the result to /some/where/results\n")
+        self.assertIs(pg.composer_frame_visible(capture), False)
+
+    def test_no_prompt_line_is_unknown(self):
+        self.assertIsNone(pg.composer_frame_visible("just transcript\n"))
+
+
 class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
     """The gate asks cli_wedge one question -- frame_abnormal -- and ranks nothing
     itself. A gate that composed the detectors and ordered them by hand once put

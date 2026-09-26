@@ -84,6 +84,32 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertIn("ENTER", self.sendkeys_log_text())
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_a_dropped_last_chunk_is_never_submitted(self):
+        # The frame is on screen, so the box's window must end where the prompt ends; a
+        # missing last chunk means the read-back fails and nothing that landed is staged.
+        self.drop_paste_from_flag.write_text("5")
+        self.write_task(self.LONG)
+        r = self.run_event(self.LONG, timeout=40)
+        log = self.sendkeys_log_text()
+        self.assertNotIn("ENTER", log)
+        self.assertEqual(log.count("TYPE "), 5, "kept typing past the chunk that never landed")
+        self.assertIn("did not read back", r.stderr)
+        self.assertIn("composer not empty", r.stderr)
+
+    def test_a_stretch_under_a_cut_box_found_at_pick_is_not_submitted(self):
+        # A restart between typing and Enter: this process read no chunk back, so a
+        # stretch under a cut box cannot prove the prompt is whole.
+        import textwrap
+        rows = textwrap.wrap("❯ " + self.expected_prompt(self.LONG)[:768], 118, subsequent_indent="  ",
+                             break_long_words=True, break_on_hyphens=False)
+        self.composer_view_rows_flag.write_text("4@1")
+        self.pane_file.write_text("\n".join(rows) + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        self.write_task(self.LONG)
+        r = self.run_event(self.LONG, timeout=40)
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertIn("cannot be verified after a restart", r.stderr)
+
     def test_a_box_narrower_than_a_chunk_fails_closed(self):
         self.composer_view_rows_flag.write_text("2")  # under one chunk visible
         self.write_task(self.LONG)
