@@ -3,7 +3,7 @@
  "tools": [
   {
    "name": "call_contact",
-   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name (only when the owner allowed the local Contacts app on this host; otherwise it tells you what to ask the owner). Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
    "params": {
     "message": "What to tell the person. They have no tools — include all details they might need.",
@@ -12,7 +12,7 @@
   },
   {
    "name": "call_contact",
-   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name (only when the owner allowed the local Contacts app on this host; otherwise it tells you what to ask the owner). Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
    "params": {
     "message": "What to tell the person. They have no tools — include all details they might need.",

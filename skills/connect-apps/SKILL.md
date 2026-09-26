@@ -22,6 +22,15 @@ The room sees nothing about connecting, only your reply once the request is done
 
 Every request gets exactly one answer: the steps below check for a wait before answering.
 
+**Calendar, contacts and reminders: the connector first, the native Mac apps never on your own.**
+Order: (1) the Station connector (`composio_find {"apps": ["google calendar"]}` → `composio_exec`,
+toolkit `googlecalendar`); (2) if it is not connected, the owner's own tools when they are in your
+tool list (`mcp__claude_ai_Google_Calendar__*`); (3) otherwise the Connect card below, or ask the
+owner. Never fall back to the macOS Calendar, Reminders or Contacts app by yourself — it raises a
+permission prompt on the owner's screen (the `native-pim-guard` hook denies the command). Only when
+the owner asked for the local app: `skills/macos-tools` scripts with `--owner-asked`. Once the owner
+denied that permission, never re-prompt.
+
 ## Tools
 
 - `mcp__sutando-station__composio_find` `{query?, apps?: [names], toolkit?, limit?}` returns JSON

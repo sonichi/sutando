@@ -237,7 +237,7 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"

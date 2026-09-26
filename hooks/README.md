@@ -224,6 +224,93 @@ Fail-OPEN on uncaught hook errors. Registered for every core session by
 `build-core-settings.mjs` (arg 5, matcher `mcp__.*__composio_exec` on both
 events). Test: `python3 tests/gdocs-write-guard.test.py`.
 
+## `native-pim-guard.py`
+
+Denies **Bash commands that drive the native macOS Calendar, Reminders or Contacts
+app** — `osascript`/JXA by app name or bundle id (`tell application "Calendar"`,
+`application id "com.apple.iCal"`, `Application("com.apple.reminders")`), an
+`osascript` script file whose name or first 64 KB scripts one of the apps,
+`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal`, `.app` paths, `open
+x-apple-reminderkit://…`, and `shortcuts run` (a shortcut can drive any of the
+three; `shortcuts list`/`view` pass) — with a reason that gives the order: the
+Station connector first (`composio_find {"apps": ["google calendar"]}` →
+`composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
+present, then ask the owner; and never re-prompt once the owner denied the
+permission. Driving those apps raises a macOS Automation prompt on the owner's
+screen (user report, 2026-09-24). Only a command at **command position** counts
+(the start, or after `;`, `&&`, `||`, `|`, `$(`, a backtick, `(`/`{`, an env-prefix
+chain): `grep -rn "open -gja Calendar" src/`, `git log -S "open -a Contacts"` and
+`grep osascript f | grep 'application "Calendar"'` are reads and pass, while a
+wrapper (`bash -c`, `sh -c`, `xargs`, `sudo`, `env`, `eval`, …) is scanned whole and
+an `osascript` heredoc or `;`-joined script is scanned to the end of the command.
+Unrelated `osascript`/`open` commands and every other tool pass through.
+
+Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
+position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
+SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count), that variable in the
+hook's own environment, or the owner's persisted host opt-in
+`<workspace>/state/native-pim-consent`, written by `python3
+skills/macos-tools/scripts/native_pim_consent.py grant` in the **owner's own
+terminal**. The agent never writes that record: the hook denies `grant`, any command
+outside a read-only one (`cat`, `ls`, `grep`, `git`, `test`, …) that names
+`native-pim-consent` or a `*-automation-denied` marker — `touch`, `echo … >`, `tee`,
+`cp`, `rm`, `python3 -c "open(…)"`, `sed -i` — and any Python that imports or runs
+`native_pim_consent` other than the CLI's `status`/`revoke` (with their
+`--workspace` option). A redirect onto the marker is denied even from a read-only
+command. The file tools are matched too: a `Write`, `Edit`, `MultiEdit` or
+`NotebookEdit` whose `file_path`/`notebook_path` resolves (symlinks followed) to the
+consent marker or a denial marker under `<workspace>/state/` is denied; any other
+path, and every `Read`, passes. Fail-OPEN on hook errors.
+
+**Known limits.** The Bash side is a command-string matcher and cannot close
+obfuscated forms: `native""-pim-consent`, `native\-pim-consent`, the glob
+`native-pim-consen?`, a `$var` concatenation, `'native-pim-'+'consent'` or
+`importlib.import_module('native_pim'+'_consent')` inside `python -c`,
+`base64 -d | sh`, or running a script written earlier; a script file that names the
+app only indirectly, or a split string such as `"Cont"&"acts"`, gets past the app
+match the same way. Those are the documented gap of an initiative guard, not an
+authorisation boundary.
+
+**One policy.** The marker names, the host opt-in and the bound task's tier are
+`native_pim_consent.py`'s (`skills/macos-tools/scripts/`), which this hook imports;
+the hook only parses the command line. The scripts, the morning briefing and the
+voice `call_contact` tool (through `native_pim_consent.py check` / `report-error`)
+read the same module, so there is no second copy to drift.
+
+**What this consent is, honestly.** The prefix and the env var are strings the
+model writes, so on their own they guard against the agent acting on its own
+initiative; they are **not an authorisation boundary** for who asked. The hook
+binds them where the session tells it whose task is running: when
+`<workspace>/state/bindings/active-execution.json` names the task and
+`<workspace>/tasks/<task_id>.txt` resolves (via `policy.egress.result.
+resolve_access_tier`) to a non-owner tier (`team`, `guest`, unreadable), every form
+of consent is ignored and the command is denied with a reason saying so. Without a
+binding — a chat session, a cron, a binding the core did not write — the consent is
+self-attested and a task's injected text saying "the owner asked" is not
+distinguishable from the owner asking. Do not rely on this hook as access control.
+The scripts apply the same tier inside an agent session (`CLAUDECODE=1`): on a
+non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
+so the script gate does not accept what the hook would deny. A cron such as the
+morning briefing is not the core's bound task and is not tier-checked.
+
+**Codex cores.** This is a Claude-runtime `PreToolUse` hook. On a Codex core only
+the script gate (`native_pim_consent.py`, exit 2 without consent) and the inline
+`call_contact` tool's own check protect; ad-hoc `osascript`/`open` commands there
+are not intercepted.
+
+### Registration
+
+**Auto-registered** for every core session, next to `gmail-write-guard.py`:
+`session-launch.sh` passes this hook to `build-core-settings.mjs` (arg 6, after the
+Google Docs guard), which registers
+it under `PreToolUse` with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit` (the
+file tools, so the consent record cannot be written directly — the same reason the
+results-dir and `MEMORY.md` guards below match `Write`/`Edit`/`MultiEdit`). For a
+non-core session, add the same `PreToolUse` entry by hand as in the block above,
+with that matcher and command `python3 <deployed path>/native-pim-guard.py`.
+
+Test: `python3 tests/native-pim-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /
