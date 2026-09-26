@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Shared gateway plumbing for the room-ops capabilities (read / media / react / …).
 
 Every room-ops module is a thin **gateway-only** client: it speaks the stable

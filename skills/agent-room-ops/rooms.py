@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · rooms — list THIS agent's joined rooms (op `joined_rooms`).
 
 Closes a documented gap: the platform agent-card references a `rooms` verb that

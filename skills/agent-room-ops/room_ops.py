@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops — an agent's room-participation capability collection (one skill).
 
 A single gateway-only client surface for everything an agent does in a room beyond

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · events — client half of Agent Event Subscription & Delivery (#184).
 
 Four surfaces, all speaking the FIXED #184 contract (the server half is built

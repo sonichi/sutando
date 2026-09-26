@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · events_acceptance — end-to-end acceptance runner for the #184
 events client (push-observation + durable-cursor replay).
 

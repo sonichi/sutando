@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · members — enumerate a room's members (op `members`).
 
 Closes the client half of a gap the gateway never had: `POST /v1/room`

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """grant — make a room's access policy authoritative (design-response-policy-v0.2).
 
 Writes the room's `space.ag2.policy` state event so its `authoritative`/`tiers`/

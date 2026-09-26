@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · mention — @-mention another agent reliably, by friendly handle.
 
 The whole point: an agent should never hand-craft a peer's mxid (and get it wrong,

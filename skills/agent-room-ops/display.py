@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Set the agent-owned display config clients render worker UI from.
 
 Default target is the 'space.ag2.display' room state event (room-scoped);

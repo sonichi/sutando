@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · relations — the op:message field that cites the message replied to.
 
 `say` and `mention` both build an op:message payload, so the rule for turning

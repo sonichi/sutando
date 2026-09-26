@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · react — add / remove an agent's reaction on a room event.
 
 Native m.reaction add (`react`) + redact (`unreact`) — the Discord auto-react

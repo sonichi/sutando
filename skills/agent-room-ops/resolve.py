@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · resolve — map a friendly handle to one mxid: directory, broker, room.
 
 The recurring failure mode for an agent that wants to @-mention a peer is not
