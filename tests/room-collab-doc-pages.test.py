@@ -156,8 +156,16 @@ async def test_a_comment_on_a_doc_page_names_its_page():
     assert "page" not in main[room_collab.COMMENT_KEY], "the main Doc keeps the old shape"
     _, onpage = room_collab.comment_content(anchor, "q", 0, "hi", page="ab12cd34")
     assert onpage[room_collab.COMMENT_KEY]["page"] == "ab12cd34"
+    body, extra = room_collab.summon_content("!r:x", "@b:x", PAGE, None, "Product  roadmap")
+    marker = extra[room_collab.SUMMON_KEY]
+    assert marker["kind"] == PAGE and marker["page_title"] == "Product roadmap", marker
+    assert '"Product roadmap" in this room\'s Doc' in body, body
     body, extra = room_collab.summon_content("!r:x", "@b:x", PAGE)
-    assert extra[room_collab.SUMMON_KEY]["kind"] == DEFAULT_KIND and "Doc" in body, (body, extra)
+    assert "page_title" not in extra[room_collab.SUMMON_KEY] and '"a page" in' in body, body
+    body, extra = room_collab.summon_content("!r:x", "@b:x", "html-zz99zz99", None, "Poll")
+    assert '"Poll" in this room\'s HTML page' in body and extra[room_collab.SUMMON_KEY]["kind"] == "html-zz99zz99"
+    body, extra = room_collab.summon_content("!r:x", "@b:x", DEFAULT_KIND, None, "ignored")
+    assert "page_title" not in extra[room_collab.SUMMON_KEY] and "ignored" not in body, "the main Doc names no page"
 
 
 async def test_page_routes_follow_the_held_surface():
