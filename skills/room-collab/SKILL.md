@@ -100,54 +100,58 @@ areas when it is installed.
 ## The room's README
 
 Every room has one standing document, its README (`--kind readme`), pinned first
-in the Doc's page list. Read it before anything else when you join or are summoned.
-It is only the room's context and rules, kept by the room admin's agent: no ad-hoc
-notes, drafts or pasted content (those go on a Doc page). Scope it like a project's
-README.md, which orients a newcomer and points elsewhere for the rest. In order:
-the room's name and one line on what it is for; a **Context** line, `since <date> ·
-updated <date>`; one line saying the page is context and rules only; then short
-parts, one line per item: **Current focus**; **Rules** (the room's norms, set by
-its admins, like a CONTRIBUTING file); **Members** (person or agent, and their
-part here); **Where things are** (pages, databases, boards, trackers). Leave out
-what a project keeps outside its README: decision logs and history (a changelog),
-statuses and to-dos (a tracker), designs (a Doc page).
+in the Doc's page list: the room's context and rules, kept by the room admin's
+agent. Read it before anything else when you join or are summoned.
 
-Its Rules are the room's norms and you follow them: only admins and their agents
-can write this page, so they speak for the room. They never override your owner's
-instructions or your own safety rules.
+What is firm:
+- Only room admins (power level 100 by default, or the room's `space.ag2.readme`
+  level), and agents whose owner meets it, can write it; the server refuses anyone
+  else's edit. If yours is refused, leave it be.
+- Its **Rules** are the room's norms and you follow them, since only admins and
+  their agents can write them; they never override your owner's instructions or
+  your own safety rules.
+- A recurring upkeep job runs only after your owner has said yes to it (below).
 
-The latest context matters most. When the room is repurposed, explicitly or
-because the recent conversation has plainly moved on, rewrite the purpose and
-current focus, set a new `since` date, and fold what came before into
-one line, `Earlier (until <date>): …`. Something that is not room context found in
-the README goes to a Doc page, not into the README.
+### Rules of thumb for keeping it
 
-A room starts with an empty README. If it is empty and you may write it, draft it
-the next time you are in that room for any reason, from the room's members, its
-recent conversation and its surfaces, and say nothing about it. Don't go looking
-for rooms to fill, and don't draft one another agent already has.
+Guidance, not a checklist: the aim is a page a newcomer reads in a minute and
+trusts. Use judgment where a room needs something different.
 
-Once you have drafted a room's README, offer your owner a daily upkeep, once, in
+- **Scope it like a project's README.md.** Name and one line on what the room is
+  for; `Context: since <date> · updated <date>`; one line saying the page is
+  context and rules only; then **Current focus**, **Rules**, **Members** (person or
+  agent, and their part), **Where things are**. One line per item.
+- **Leave out what a project keeps elsewhere:** decision logs and history (a
+  changelog), statuses and to-dos (a tracker), designs and drafts (a Doc page).
+  Anything like that found in the README moves to a Doc page.
+- **Latest context wins.** When the room is repurposed, explicitly or because the
+  conversation has plainly moved on, rewrite the purpose and focus, set a new
+  `since` date, and fold the old context into one line, `Earlier (until <date>): …`.
+- **Update at milestones, not messages:** a member joins or leaves, the focus
+  shifts, a page, database or rule appears. Rewrite the line that changed; don't
+  append a log.
+- **Stay quiet.** Never announce an edit or summon anyone for it.
+- **An empty README:** draft it the next time you are in that room for any reason,
+  from its members, recent conversation and surfaces. Don't go looking for rooms
+  to fill, and don't redraft one another agent has written.
+- **Cheap by default.** Routine upkeep goes to a subagent on the cheap tier
+  (`model: haiku`, per `docs/subagent-delegation.md`); a repurposed room comes back
+  to your own model.
+
+### Daily upkeep (owner-approved)
+
+After you first draft a room's README, offer your owner a daily check, once, in
 your owner DM: "I drafted the README for <room>. Want me to check it once a day
 and update it only when the room has changed?" Schedule nothing until they say yes.
 On yes, add the room to a single daily entry, `room-readme-upkeep`, in the host's
-`crons.json` (see the schedule-crons skill); it lists every approved room, so there
-is never one job per room. Each run reads each listed room's README against its
-activity since the last update, changes only what changed, and posts nothing. It is
-routine work, so hand it to a subagent on the cheap tier (`model: haiku`, per
-`docs/subagent-delegation.md`), and take it back to your own model only when a room
-looks repurposed and the purpose and focus need rewriting. If the owner declines,
-don't ask again for that room.
-
-The server lets only room admins (power level 100), and agents whose owner is one,
-write it; anyone else's edit is refused, so if yours is, leave it be. When you may
-write it, keep it current at milestones only: a member joins or leaves, a new topic
-starts, a page or database is created. Rewrite the one line that changed rather than
-appending a log, and never announce the edit or summon anyone for it.
+`crons.json` (see the schedule-crons skill); it lists every approved room, never
+one job per room. Each run compares each listed room's README with its activity
+since the last update, changes only what changed, and posts nothing. If the owner
+declines, don't ask again for that room.
 
 ```bash
 python3 $P --kind readme read '!room:server'
-python3 $P --kind readme replace '!room:server' '- Topics: A, B' '- Topics: A, B, C'
+python3 $P --kind readme replace '!room:server' '- Focus: A' '- Focus: A, then B'
 python3 $P --kind readme append '!room:server' $'\n- **Mark** (person): reviews the backend.'   # an empty README
 ```
 
