@@ -725,6 +725,36 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
             await asyncio.sleep(wait)
 
 
+def emit_snapshot(args: argparse.Namespace, content: dict) -> int:
+    """A surface's current content as a self-describing JSON file (or stdout)."""
+    body = {"room": args.room, "surface": args.kind,
+            "taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **content}
+    data = json.dumps(body, ensure_ascii=False, indent=2)
+    if args.out:
+        remember(Path(args.out), data)
+        print(json.dumps({"snapshot": args.out, "surface": args.kind,
+                          "items": len(content.get("elements", [])) if "elements" in content
+                          else len(content.get("text", ""))}))
+    else:
+        print(data)
+    return 0
+
+
+def load_snapshot(args: argparse.Namespace) -> dict:
+    """A snapshot for THIS room and surface; anything else is refused, since
+    restoring another room's board onto this one is almost always a mistake."""
+    try:
+        body = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RoomDocError(f"cannot read snapshot {args.file}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise RoomDocError(f"{args.file} is not a room-collab snapshot")
+    if body.get("room") != args.room or body.get("surface") != args.kind:
+        raise RoomDocError(f"{args.file} is a snapshot of {body.get('room')} ({body.get('surface')}), "
+                           f"not {args.room} ({args.kind})")
+    return body
+
+
 def page_family(args: argparse.Namespace) -> str:
     """The main document whose pages `pages`/`page-add` act on: the HTML page unless told the Doc."""
     family = main_kind(getattr(args, "page_kind", None) or HTML_KIND)
@@ -831,7 +861,7 @@ async def run(args: argparse.Namespace) -> int:
     # of them must not need pycrdt installed.
     from room_collab_client import open_room_collab
 
-    from room_collab_board import BOARD_KIND, place_clear, stale_writes
+    from room_collab_board import BOARD_KIND, place_clear, restore_plan, stale_writes
     from room_kanban import KANBAN_KIND
     if args.command == "summon":
         # No document connection: a summon is a room message, and its context is
@@ -911,6 +941,8 @@ async def run(args: argparse.Namespace) -> int:
             await doc.set_presence(args.name, user_id=args.user_id)
 
         if args.kind == KANBAN_KIND:
+            if args.command in ("snapshot", "restore"):
+                raise RoomDocError(f"{args.command} does not cover the kanban yet: use --kind board or the default document.")
             return await kanban(doc, args)
         if args.kind == "sheet":
             return await sheet(doc, args)
@@ -956,6 +988,18 @@ async def run(args: argparse.Namespace) -> int:
             if args.command == "peers":
                 print(render("peers", peers=doc.peers, as_json=args.json))
                 return 0
+            if args.command == "snapshot":
+                return emit_snapshot(args, {"elements": doc.elements})
+            if args.command == "restore":
+                backup = load_snapshot(args)
+                plan = restore_plan(backup.get("elements") or [], {e.get("id"): e for e in doc.elements}.get)
+                if args.apply and plan:
+                    await doc.put_elements(plan)
+                    await doc.settle(args.settle)
+                print(json.dumps({"restore": "applied" if args.apply else "dry run",
+                                  "would_write" if not args.apply else "written": len(plan),
+                                  "ids": [e["id"] for e in plan][:50]}, ensure_ascii=False))
+                return 0
             written = None
             if args.command == "draw":
                 elements = parse_elements(args.elements)
@@ -988,6 +1032,22 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "snapshot":
+            return emit_snapshot(args, {"text": doc.text})
+        if args.command == "restore":
+            want = load_snapshot(args).get("text")
+            if not isinstance(want, str):
+                raise RoomDocError("the snapshot holds no document text")
+            change = want != doc.text
+            if args.apply and change:
+                if doc.text:
+                    await doc.replace(doc.text, want)
+                else:
+                    await doc.append(want)
+                await doc.settle(args.settle)
+            print(json.dumps({"restore": "applied" if args.apply else "dry run",
+                              "text_differs": change, "chars_now": len(doc.text), "chars_in_snapshot": len(want)}))
+            return 0
         if args.command == "templates":
             return await templates(doc, args, url)
         if args.command == "highlight":
@@ -1441,6 +1501,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--page-title", dest="page_title", default=None,
                    help="with --kind markdown-<id> or html-<id>: the page's title for the card "
                         "(read from the page list when left out)")
+
+    s = sub.add_parser("snapshot", help="save a surface's current content as JSON (board or document)")
+    s.add_argument("room")
+    s.add_argument("--out", help="file to write (default: print to stdout)")
+
+    s = sub.add_parser("restore", help="bring a surface back from a snapshot; a dry run unless --apply")
+    s.add_argument("room")
+    s.add_argument("file", help="a file written by `snapshot` for this room and surface")
+    s.add_argument("--apply", action="store_true",
+                   help="write it: board elements missing or older than the snapshot; the document text")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")

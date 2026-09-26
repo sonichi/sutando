@@ -230,6 +230,9 @@ python3 $P --kind board draw '!room:server' '[
    "text":"Worker 1","fontSize":20,"fontFamily":1,"textAlign":"left","verticalAlign":"top"}]'
 python3 $P --kind board erase '!room:server' 'w1'     # marks isDeleted, the editor's own deletion
 python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
+python3 $P --kind board snapshot '!room:server' --out board.json     # the surface as JSON (doc: drop --kind)
+python3 $P --kind board restore  '!room:server' board.json           # dry run: what a restore would bring back
+python3 $P --kind board restore  '!room:server' board.json --apply   # missing or older elements only; newer edits kept
 ```
 
 **Where a drawing lands.** The board is usually not empty, and a drawing that
