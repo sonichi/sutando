@@ -191,12 +191,25 @@ def list_vault_keys() -> list[str]:
     return sorted(_read_manifest().keys())
 
 
+_KEYCHAIN_READ_TIMEOUT_S = 5
+
+
 def get_vault_key(key: str) -> str:
-    """Retrieve a secret value from Keychain. Raises KeyError if not found."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
-        capture_output=True,
-    )
+    """Retrieve a secret value from Keychain. Raises KeyError if not found —
+    or when `security` gives no answer within _KEYCHAIN_READ_TIMEOUT_S.
+
+    `security` can block on a locked keychain's unlock dialog; a reader on the
+    startup or health-check path (channel_token.token_from_vault) must not
+    hang behind it, so no answer in time reads as "not present".
+    """
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+            capture_output=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise KeyError(f"vault: key '{key}' not read — security gave no answer "
+                       f"within {_KEYCHAIN_READ_TIMEOUT_S}s") from None
     if result.returncode != 0:
         raise KeyError(f"vault: key '{key}' not found in Keychain")
     return result.stdout.decode().strip()
