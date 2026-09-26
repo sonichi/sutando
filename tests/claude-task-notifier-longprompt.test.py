@@ -55,7 +55,7 @@ class LongPromptTests(FakeTmuxHarness):
         return self.resize_log.read_text().splitlines() if self.resize_log.exists() else []
 
     def _sizes(self):
-        return [int(l.split()[2]) for l in self._resizes()]
+        return [int(l.split()[2]) for l in self._resizes() if l.startswith("RESIZE ")]
 
     def test_a_prompt_past_the_cut_is_typed_in_chunks_that_reassemble_to_it(self):
         self.cut_paste_over_flag.write_text("1022")
@@ -85,7 +85,32 @@ class LongPromptTests(FakeTmuxHarness):
         sizes = self._sizes()
         self.assertGreater(sizes[0], 29, sizes)
         self.assertEqual(sizes[-1], 29, sizes)
-        self.assertTrue(self._resizes()[-1].endswith("enters=1"), "put back after Enter, not before: " + self._resizes()[-1])
+        restores = [l for l in self._resizes() if l.startswith("RESIZE -y 29")]
+        self.assertTrue(restores[0].endswith("enters=1"), "put back after Enter, not before: " + restores[0])
+        # resize-window pinned window-size to manual; the inherited value is back afterwards.
+        self.assertEqual(self._resizes()[-1], "WINOPT unset", self._resizes())
+        self.assertEqual(self.window_size_opt.read_text(), "", "window-size left pinned")
+
+    def test_a_window_local_window_size_value_is_put_back_as_it_was(self):
+        self.window_size_opt.write_text("latest\n")
+        r = self._run_long(self.LONG)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._resizes()[-1], "WINOPT latest", self._resizes())
+        self.assertEqual(self.window_size_opt.read_text().strip(), "latest")
+
+    def test_a_chunk_boundary_never_splits_a_character(self):
+        # The name puts a two-byte character across bytes 255-256 of the prompt; the first
+        # chunk stops at 255 bytes and every chunk decodes on its own.
+        name = "task-" + "x" * 230 + "é" + "y.txt"
+        self.assertEqual(self.expected_prompt(name).encode()[255:257], "é".encode())
+        self.write_task(name)
+        t = self._finish_on(name, lambda log: "ENTER" in log)
+        r = self.run_event(name, timeout=40)
+        t.join()
+        chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
+        self.assertEqual(len(chunks[0].encode()), 255, len(chunks[0].encode()))
+        self.assertEqual("".join(chunks), self.expected_prompt(name))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_box_cut_by_the_screen_bottom_is_grown_and_then_read_whole(self):
         # A 29-row pane under a tall transcript tail shows rows 2-5 of the box and pushes
@@ -148,6 +173,7 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertIn("TYPE ", self.sendkeys_log_text(), "never started typing")
         p.send_signal(signal.SIGTERM); p.wait(timeout=10)
         self.assertEqual(self._sizes()[-1], 29, self._resizes())
+        self.assertEqual(self._resizes()[-1], "WINOPT unset", self._resizes())
         self.assertNotIn("ENTER", self.sendkeys_log_text())
 
     def test_a_cut_tail_found_at_pick_is_left_alone(self):

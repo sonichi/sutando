@@ -305,11 +305,13 @@ pane_frame_is_cut() {
 
 # Claude Code lays the composer box out inside the window; a tall prompt on a short window
 # runs off the screen, unseen. Grow the window for a paste and its confirmation, then put it back.
-WINDOW_GROWN=0; WINDOW_ROWS=""
+# resize-window also pins the window's window-size option to manual; the option is put back too.
+WINDOW_GROWN=0; WINDOW_ROWS=""; WINDOW_SIZE_OPT=""
 grow_window() {
   [ "$WINDOW_GROWN" = 1 ] && return 0
   WINDOW_ROWS="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" '#{window_height}' 2>/dev/null)"
   case "$WINDOW_ROWS" in ''|*[!0-9]*) return 1 ;; esac
+  WINDOW_SIZE_OPT="$(tmux -S "$TMUX_SOCKET" show-window-options -t "$TARGET" -v window-size 2>/dev/null)"
   tmux -S "$TMUX_SOCKET" resize-window -t "$TARGET" -y $((WINDOW_ROWS + $1)) 2>/dev/null || return 1
   WINDOW_GROWN=1
   sleep "$POLL_INTERVAL"
@@ -317,6 +319,11 @@ grow_window() {
 restore_window() {
   [ "$WINDOW_GROWN" = 1 ] || return 0
   tmux -S "$TMUX_SOCKET" resize-window -t "$TARGET" -y "$WINDOW_ROWS" 2>/dev/null
+  if [ -n "$WINDOW_SIZE_OPT" ]; then
+    tmux -S "$TMUX_SOCKET" set-window-option -t "$TARGET" window-size "$WINDOW_SIZE_OPT" 2>/dev/null
+  else
+    tmux -S "$TMUX_SOCKET" set-window-option -t "$TARGET" -u window-size 2>/dev/null
+  fi
   WINDOW_GROWN=0
 }
 # Rows a prompt needs beyond the window: its own wrapped rows at the narrowest sane pane, plus frame.
@@ -345,12 +352,27 @@ composer_is_cut_prompt() {
   return 1
 }
 
-# Type the prompt in byte-sized chunks (LC_ALL=C: the 1022 limit is bytes), each read back
+# Byte lengths of the chunks: at most PASTE_CHUNK bytes each, cut only between characters.
+chunk_lengths() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import sys
+cap = int(sys.argv[1]); out = []; cur = 0
+for ch in sys.stdin.buffer.read().decode("utf-8", "surrogateescape"):
+    n = len(ch.encode("utf-8", "surrogateescape"))
+    if cur and cur + n > cap:
+        out.append(cur); cur = 0
+    cur += n
+if cur:
+    out.append(cur)
+print(" ".join(map(str, out)))' "$PASTE_CHUNK"
+}
+
+# Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
 # EXACTLY before the next; the first chunk that does not read back ends it, and that is final.
 type_prompt() {
-  local prompt="$1" filename="$2" i=0 typed="" chunk arg cap LC_ALL=C
-  while [ "$i" -lt "${#prompt}" ]; do
-    chunk="${prompt:$i:$PASTE_CHUNK}"; i=$((i + PASTE_CHUNK)); typed="$typed$chunk"
+  local prompt="$1" filename="$2" i=0 n typed="" chunk arg cap LC_ALL=C
+  for n in $(chunk_lengths "$prompt"); do
+    chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
     # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
     arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
     tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$arg"

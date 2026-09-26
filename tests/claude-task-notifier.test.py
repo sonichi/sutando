@@ -150,6 +150,9 @@ class FakeTmuxHarness(unittest.TestCase):
         # resize-window logs `RESIZE -y N enters=<ENTERs so far>`; the flags: exit 1, pane unchanged.
         self.window_rows = self.root / "window-rows.txt"
         self.resize_log = self.root / "resize.log"
+        # The window-local window-size option (empty = inherited); resize-window sets it
+        # to manual as real tmux does, set-window-option rewrites it and logs `WINOPT`.
+        self.window_size_opt = self.root / "window-size-opt.txt"
         self.grow_fails_flag = self.root / "grow-fails.flag"
         self.split_pane_flag = self.root / "split-pane.flag"
         # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
@@ -384,6 +387,16 @@ PYEOF
     rows=""; while [ $# -gt 0 ]; do [ "$1" = -y ] && rows="$2"; shift; done
     printf 'RESIZE -y %s enters=%s\\n' "$rows" "$({{ grep -c '^ENTER' "{self.sendkeys_log}" || true; }} 2>/dev/null)" >> "{self.resize_log}"
     echo "$rows" > "{self.window_rows}"
+    echo manual > "{self.window_size_opt}"
+    exit 0
+    ;;
+  show-window-options)
+    cat "{self.window_size_opt}" 2>/dev/null
+    exit 0
+    ;;
+  set-window-option)
+    unset_opt=0; val=""; while [ $# -gt 0 ]; do case "$1" in -u) unset_opt=1 ;; -t) shift ;; window-size) val="${{2:-}}" ;; esac; shift; done
+    if [ "$unset_opt" = 1 ]; then : > "{self.window_size_opt}"; echo "WINOPT unset" >> "{self.resize_log}"; else echo "$val" > "{self.window_size_opt}"; echo "WINOPT $val" >> "{self.resize_log}"; fi
     exit 0
     ;;
   new-session|kill-session|setenv)
