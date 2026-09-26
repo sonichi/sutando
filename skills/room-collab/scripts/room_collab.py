@@ -41,6 +41,7 @@ SUMMON_CONTEXT_MAX = 400
 # a summon naming "qingyun" would post a message that renders as plain prose.
 MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
 # The surface as the summon's prose names it; the marker carries `kind` verbatim.
+SUMMON_PAGE_TITLE_MAX = 80
 SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board",
                   "html": "HTML page", "sheet": "sheet"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
@@ -835,7 +836,10 @@ async def run(args: argparse.Namespace) -> int:
     if args.command == "summon":
         # No document connection: a summon is a room message, and its context is
         # what the caller states rather than a passage this command verifies.
-        body, extra = summon_content(args.room, args.invitee, args.kind, args.context)
+        title = args.page_title
+        if title is None and main_kind(args.kind) not in (None, args.kind):
+            title = await summon_page_title(args)
+        body, extra = summon_content(args.room, args.invitee, args.kind, args.context, title)
         if args.dry_run:
             print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
                              ensure_ascii=False, indent=2))
@@ -1095,8 +1099,22 @@ def reply_content(message: str, mentions: list[str] | None = None) -> str:
     return lead + " " + text if lead else text
 
 
+async def summon_page_title(args: argparse.Namespace) -> str | None:
+    """The title of the page a summon names, from its family's page list; None when it cannot be read,
+    so a summon still goes out without one."""
+    from room_collab_client import open_room_collab
+    try:
+        token, url = resolve_token(args.token), resolve_url(args.url)
+        async with open_room_collab(url, args.room, token, kind=main_kind(args.kind),
+                                    insecure=args.insecure) as doc:
+            page = args.kind.rsplit("-", 1)[1]
+            return next((p["title"] for p in doc.pages if p["id"] == page), None)
+    except Exception:  # noqa: BLE001 — a title is a courtesy; the summon is the point
+        return None
+
+
 def summon_content(room: str, invitee: str, kind: str,
-                   context: str | None = None) -> tuple[str, dict]:
+                   context: str | None = None, page_title: str | None = None) -> tuple[str, dict]:
     """The room message a summon is: prose any client shows, and the marker the
     collab client renders as the summon card.
 
@@ -1108,19 +1126,24 @@ def summon_content(room: str, invitee: str, kind: str,
     if not MXID_RE.match(who):
         raise RoomDocError(f"a summon needs the mxid of whoever is called, like "
                            f"@name:server — got {invitee!r}")
-    # A page's summon calls to its surface: the client opens surfaces, not pages.
-    kind = main_kind(kind) or kind
-    where = SUMMON_SURFACE.get(kind)
+    # A page keeps its own kind: the client's card names the page and its Join opens it.
+    family = main_kind(kind) or kind
+    where = SUMMON_SURFACE.get(family)
     if where is None:
         raise RoomDocError(f"{kind!r} is not a surface to summon anyone to; "
                            f"use one of {', '.join(sorted(SUMMON_SURFACE))}")
+    on_page = kind != family
+    title = " ".join((page_title or "").split())[:SUMMON_PAGE_TITLE_MAX]
     quoted = " ".join((context or "").split())[:SUMMON_CONTEXT_MAX]
-    body = f"{who} — you're needed in this room's {where}."
+    place = f'"{title or "a page"}" in this room\'s {where}' if on_page else f"this room's {where}"
+    body = f"{who} — you're needed in {place}."
     if quoted:
         body += f"\n\n> {quoted}"
-    marker = {"room_id": room, "kind": kind, "invitee": who, "v": 3}
+    marker = {"room_id": room, "kind": kind if on_page else family, "invitee": who, "v": 3}
     if quoted:
         marker["context"] = quoted
+    if on_page and title:
+        marker["page_title"] = title
     return body, {SUMMON_KEY: marker, "m.mentions": {"user_ids": [who]}}
 
 
@@ -1415,6 +1438,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "stated by you, not checked against the document")
     s.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="print the room message the summon would be and post nothing")
+    s.add_argument("--page-title", dest="page_title", default=None,
+                   help="with --kind markdown-<id> or html-<id>: the page's title for the card "
+                        "(read from the page list when left out)")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")
