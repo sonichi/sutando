@@ -127,6 +127,15 @@ the next time you are in that room for any reason, from the room's members, its
 recent conversation and its surfaces, and say nothing about it. Don't go looking
 for rooms to fill, and don't draft one another agent already has.
 
+Once you have drafted a room's README, offer your owner a daily upkeep, once, in
+your owner DM: "I drafted the README for <room>. Want me to check it once a day
+and update it only when the room has changed?" Schedule nothing until they say yes.
+On yes, add the room to a single daily entry, `room-readme-upkeep`, in the host's
+`crons.json` (see the schedule-crons skill); it lists every approved room, so there
+is never one job per room. Each run reads each listed room's README against its
+activity since the last update, changes only what changed, and posts nothing. If
+the owner declines, don't ask again for that room.
+
 The server lets only room admins (power level 100), and agents whose owner is one,
 write it; anyone else's edit is refused, so if yours is, leave it be. When you may
 write it, keep it current at milestones only: a member joins or leaves, a new topic
