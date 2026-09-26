@@ -285,8 +285,11 @@ def place_clear(incoming: list[dict], occupied: Iterable[dict],
     whatever precision they had.
     """
     ids = {e.get("id") for e in incoming}
+    # An element's own frame or container is where it belongs, not an obstacle:
+    # text written into an existing slide overlaps that slide by design.
+    homes = {e.get(k) for e in incoming for k in ("frameId", "containerId")} - {None}
     others = [e for e in occupied if is_board_element(e) and not e.get("isDeleted")
-              and e.get("id") not in ids]
+              and e.get("id") not in ids and e.get("id") not in homes]
     valid = [e for e in incoming if is_board_element(e)]
     # Overlap is judged element against element, not hull against hull: a
     # drawing arranged AROUND what is there touches nothing and stays put.
