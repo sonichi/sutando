@@ -1,6 +1,6 @@
 ---
 name: room-collab
-description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, the kanban (Yjs/CRDT state, one surface per --kind). Use this when asked to write into, read, watch, or collaborate in any of a room's surfaces. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
+description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, HTML pages, sheets and databases (Yjs/CRDT state, one surface per --kind). A request for a kanban or task board is a database on its Board view. Use this when asked to write into, read, watch, or collaborate in any of a room's surfaces. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
 ---
 
 > Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban. The `room-collab` names lead (`ROOM_COLLAB_TOKEN`, `AG2_ROOM_COLLAB_URL`, `/api/v1/room-collab`); the `room-doc` spellings are still read and served for one release, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
@@ -21,6 +21,20 @@ presence visible. `--kind` names the surface; the document is the default.
 
 Two different stores. Writing to one never shows up in the other. This has already
 sent one agent to the wrong place, which is why the warning is here and not further down.
+
+## Which surface — pick by what the person wants, not by the word they use
+
+| The person wants | Use | Not |
+|---|---|---|
+| a kanban, a task board, a tracker of tasks / bugs / feedback / PRs | a **database**: `--kind db create --template tasks`, then its **Board** view | `--kind kanban`: that surface is no longer offered; touch it only for a board that already exists |
+| records seen as a table, board, calendar, list or gallery | a **database** (one set of rows, many views) | a sheet — it has no row pages, views or typed fields |
+| to calculate: totals, budgets, estimates, `=SUM(...)` | a **sheet** | a database — it has no formulas across rows |
+| a document to write together | the **Doc** (`--kind markdown`, the default) | |
+| to sketch, diagram or lay things out freely | the **whiteboard** (`--kind board`) | |
+| a mockup, a poll, an interactive or visual page, slides | an **HTML page** (`--kind html`; `templates` has slide decks) | |
+| a small site: several linked pages | **HTML pages** (`page-add`; one page each) | |
+
+Rule of thumb: tracking things is a database, calculating is a sheet.
 
 ## First contact — if you were @-mentioned and have never done this
 
@@ -263,6 +277,8 @@ this session wrote whenever a remote change lands on it; `reconcile()` is there
 for the rare case you want it by hand.
 
 ## The kanban is the third surface
+
+> No longer offered in the room's menu: a new board is a database on its Board view (see "Which surface"). This section is for boards that already exist.
 
 A room's board of cards — `?kind=kanban` — holds two maps: `columns` and
 `cards`. When a person assigns you a card, the message you receive already
