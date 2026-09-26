@@ -158,7 +158,7 @@ class FrozenCard(unittest.TestCase):
         self.assertEqual(out["outcome"], "carded")
         self.assertIn(("send_escape", "Send Escape"), [(a.id, a.label) for a in req.actions])
         self.assertIn(f"Open terminal ({NAME})", [a.label for a in req.actions])
-        self.assertEqual(req.device["name"], "worker comm (7c54b230)")
+        self.assertEqual(req.device["name"], f"worker comm ({WID})")
         self.assertEqual(t.acted(), [])
         t2 = Tmux(PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=t2, manager=manager(self.ws)), {})
