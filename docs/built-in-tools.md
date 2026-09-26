@@ -272,7 +272,13 @@ Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
 Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
-ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+ToolSearch is the fallback when the tool is not in your list). **Google Docs edits are partial by
+default**: read the document first (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`; the read is kept as a snapshot
+under `<workspace>/data/gdocs-backups/<doc id>/`), then `GOOGLEDOCS_INSERT_TEXT_ACTION`,
+`GOOGLEDOCS_REPLACE_ALL_TEXT` or `GOOGLEDOCS_INSERT_TEXT_IN_TABLE_CELL` for the change.
+`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the ENTIRE document — a hook denies it without a read
+from the last 15 minutes (an owner's doc was wiped that way, 2026-09-20); use it only for a full rewrite
+the owner asked for, and say so. Connecting one is the `connect-apps`
 skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
 payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
 owner-only card and nothing is posted. Its helper:

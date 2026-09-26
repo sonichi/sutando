@@ -190,6 +190,40 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `gdocs-write-guard.py`
+
+One script on two events for the Station's `composio_exec` tool, toolkit
+`googledocs`. **PreToolUse** denies a body-replacing action
+(`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` — "replaces the entire content of an
+existing document" — plus `UPDATE_EXISTING_DOCUMENT`, `REPLACE_DOCUMENT`,
+`DELETE_CONTENT_RANGE`) unless a snapshot of that document younger than
+`SUTANDO_GDOCS_BACKUP_MAX_AGE_S` (900 s) exists, with a reason that says to read
+the doc first and to prefer the partial-edit actions (`INSERT_TEXT_ACTION`,
+`REPLACE_ALL_TEXT`, `INSERT_TEXT_IN_TABLE_CELL`, always allowed).
+**PostToolUse** keeps every *successful* read (`GET_DOCUMENT_PLAINTEXT`,
+`GET_DOCUMENT_BY_ID`) as `<workspace>/data/gdocs-backups/<doc id>/<epoch>.md`
+(the document text when the envelope carries it, newest 20), so a wrong rewrite
+can be restored from the last thing the owner had. A read whose envelope says
+`successful: false` / `error` / `is_error`, or that returns no text, is never a
+snapshot: it could restore nothing, so it must not lift the deny. Owner report
+(user feedback): a doc "gets unexpectedly cleared, or unrelated content is
+inserted or rewritten" — the whole-replace action was the natural pick for
+"update the doc", and nothing warned or kept a copy.
+
+**The repo root is CONFIGURED, never discovered** (same rule as
+`result-file-marker-guard.py`): `build-core-settings.mjs` registers the hook as
+`python3 <hook> --repo <checkout>`; `$SUTANDO_REPO_ROOT` is the fallback. The
+workspace then comes from `workspace_default.resolve_workspace`. Without a root
+no snapshot can be recorded, so a whole replace stays denied and stderr says why.
+
+Settings are read through `sutando_config` (`env` stanza of
+`sutando.config.local.json`, environment as the fallback): the max age above and
+the operator override `SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1`. Inside a session the
+way past the deny is the read itself — one call, then the replace is allowed.
+Fail-OPEN on uncaught hook errors. Registered for every core session by
+`build-core-settings.mjs` (arg 5, matcher `mcp__.*__composio_exec` on both
+events). Test: `python3 tests/gdocs-write-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

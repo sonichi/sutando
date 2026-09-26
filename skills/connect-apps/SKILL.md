@@ -440,6 +440,11 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - Never disconnect an app, and never switch one without the owner's card tap. Change which of two
   accounts is the default only when the owner asks for that (`set-default`, Step 3b2); never on your
   own, and never to make one call easier (a call that means the other account passes `account`).
+- A Google Doc is edited in place, never rewritten from memory: read it first
+  (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`), then insert / replace-text actions for the change.
+  `GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the whole document and is denied without a read from
+  the last 15 minutes (`hooks/gdocs-write-guard.py`, which also keeps each read as a snapshot under
+  `<workspace>/data/gdocs-backups/`); it is for a full rewrite the owner asked for, and you say so.
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room
