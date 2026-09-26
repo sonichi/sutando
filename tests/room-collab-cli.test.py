@@ -736,7 +736,7 @@ def test_readme_access_reads_the_lock_from_the_room_doc_authz():
 
     got = room_collab.readme_access("https://h/api/v1/room-collab", "!r:x", "tok",
                                     opener=answering({"mxid": "@a:x", "readme_editor": True}))
-    assert seen["url"] == "https://h/api/v1/rooms/%21r%3Ax/room-doc/authz", seen
+    assert seen["url"] == "https://h/api/v1/rooms/%21r%3Ax/room-collab/authz", seen
     assert seen["agent"] == room_collab.USER_AGENT
     assert got == {"locked": True, "may_edit": True}, got
     got = room_collab.readme_access("https://h", "!r:x", "tok",

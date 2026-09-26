@@ -230,7 +230,7 @@ def readme_access(url: str, room: str, token: str, opener=None) -> dict:
     for tail in ("/api/v1/room-collab", "/api/v1/room-doc"):
         if root.endswith(tail):
             root = root[: -len(tail)]
-    endpoint = f"{root}/api/v1/rooms/{urllib.parse.quote(room, safe='')}/room-doc/authz"
+    endpoint = f"{root}/api/v1/rooms/{urllib.parse.quote(room, safe='')}/room-collab/authz"
     req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}",
                                                     "User-Agent": USER_AGENT})
     try:
