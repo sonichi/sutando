@@ -39,8 +39,6 @@ CORE = "core"
 # The states the design gives the router a rule for; anything else is a typo we
 # refuse rather than silently treat as not-live.
 STATES = ("live", "recovering", "abandoned", "retired")
-# Every state the router still delivers to; a retired worker leaves the roster.
-ROUTABLE_STATES = ("live", "recovering", "abandoned")
 
 
 class RosterError(Exception):
@@ -313,18 +311,26 @@ def publish_task_event_handler(workspace):
     return cfg
 
 
+def routing_roster(workspace):
+    """The roster exactly as the router admits a task against it: None when
+    absent (no pool), the roster otherwise. Raises RosterError when unreadable,
+    which means a pool nobody can read, never no pool."""
+    return _load_existing_roster_strict(workspace)
+
+
 def ensure_task_event_handler(workspace) -> "Path | None":
     """Backfill for a pool that predates this file (register_worker() is its
     only writer, so an install that upgraded without a new registration since
     never gets it written) or whose declaration has gone stale. Republishes
-    only when needed, so a healthy sweep costs one read. None when every worker
-    is retired: the router targets any other state (it never asks liveness).
+    only when needed, so a healthy sweep costs one read. None only when the
+    router would read no pool at all: any roster it could route against,
+    including an unreadable one it must fail closed on, gets the declaration.
     """
-    roster = load_roster(workspace) or {}
-    workers = roster.get("workers") or {}
-    if not any(isinstance(w, dict) and w.get("state") in ROUTABLE_STATES
-               for w in workers.values()):
-        return None
+    try:
+        if routing_roster(workspace) is None:
+            return None
+    except RosterError:
+        pass
     handler = Path(__file__).resolve().parent / "pool_route_handler.py"
     cfg = task_event_handler_config_path(Path(workspace) / "state")
     current = _read(cfg, None)

@@ -80,7 +80,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
     try:
-        raw = pr._load_existing_roster_strict(workspace)
+        raw = pr.routing_roster(workspace)
     except pr.RosterError:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
