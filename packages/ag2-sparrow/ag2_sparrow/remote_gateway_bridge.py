@@ -1338,6 +1338,12 @@ POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
 POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+# Backoff alone caps at 60s and never gives up, so a relay that stays down
+# leaves a live process polling into the void. 0 disables the exit.
+POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
+# Exiting only helps where something restarts us. startup-runtime.sh launches the
+# primary and every named lane as a bare `&`, so the owner must be declared here.
+POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -4883,6 +4889,49 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _poll_stalled(last_ok: float, now: float,
+                  limit: float = POLL_STALL_EXIT_S) -> bool:
+    """Whether the poll loop has gone `limit` seconds without a success."""
+    return limit > 0 and (now - last_ok) > limit
+
+
+_STALL_REPORTED_FOR: float | None = None
+
+
+def _abort_if_poll_stalled(last_ok: float) -> None:
+    """Record a wedged-but-alive bridge, and exit only if something restarts us.
+
+    Every poll failure loops instead of exiting, so the stall is invisible to a
+    wrapper that restarts only on exit. Exiting an UNSUPERVISED lane is worse
+    than the loop it replaces -- it ends the lane until someone reruns startup --
+    so the exit is armed only when a restart owner is declared, while the status
+    sidecar records the stall either way.
+    """
+    global _STALL_REPORTED_FOR
+    now = time.time()
+    # Pass the limit explicitly: the parameter default binds at def time,
+    # so a reconfigured module global would otherwise never be read.
+    if not _poll_stalled(last_ok, now, POLL_STALL_EXIT_S):
+        return
+    stalled_s = int(now - last_ok)
+    if not POLL_STALL_RESTART_OWNER:
+        # Once per stall episode, not once per poll: the loop calls this on every
+        # iteration and the sidecar is a file write.
+        if _STALL_REPORTED_FOR != last_ok:
+            _STALL_REPORTED_FOR = last_ok
+            _emit_gateway_status(False, error=(
+                f"stalled: no successful poll in {stalled_s}s (limit "
+                f"{POLL_STALL_EXIT_S:g}s); retrying -- no restart owner declared, "
+                "so exiting would end this lane"))
+            _log(f"WARN: no successful poll in {stalled_s}s and no restart owner "
+                 "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
+        return
+    _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+    sys.exit(f"FATAL: no successful poll in {stalled_s}s "
+             f"(limit {POLL_STALL_EXIT_S:g}s) -- exiting so {POLL_STALL_RESTART_OWNER} "
+             "restarts the bridge.")
+
+
 def main() -> None:
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
@@ -4917,6 +4966,7 @@ def main() -> None:
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
+            _abort_if_poll_stalled(last_poll_ok)
             if not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
