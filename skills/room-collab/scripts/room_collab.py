@@ -834,8 +834,8 @@ async def run(args: argparse.Namespace) -> int:
     from room_collab_board import BOARD_KIND, place_clear, stale_writes
     from room_kanban import KANBAN_KIND
     if args.command == "summon":
-        # No document connection: a summon is a room message, and its context is
-        # what the caller states rather than a passage this command verifies.
+        # A summon is a room message; only a page summon opens a document, to read its title.
+        # The context is what the caller states, not a passage this command verifies.
         title = args.page_title
         if title is None and main_kind(args.kind) not in (None, args.kind):
             title = await summon_page_title(args)

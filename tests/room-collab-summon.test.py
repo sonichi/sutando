@@ -186,6 +186,43 @@ def test_a_page_summon_reads_the_page_title_and_survives_when_it_cannot():
         ["summon", ROOM, WHO, "--page-title", "Plan"]).page_title == "Plan"
 
 
+def test_the_summon_command_names_the_page_from_its_list_or_from_page_title():
+    import contextlib
+    import io
+    import room_collab_client
+
+    class Main:
+        pages = [{"id": "ut9pkft9", "title": "Product-roadmap"}]
+
+    opened = []
+
+    @contextlib.asynccontextmanager
+    async def fake_open(url, room, token, *, kind="markdown", insecure=False):
+        opened.append(kind)
+        yield Main()
+
+    base = ["--url", "https://h", "--token", "t"]
+    real = room_collab_client.open_room_collab
+
+    def run(argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert room_collab.main(base + argv) == 0, argv
+        return json.loads(out.getvalue())
+
+    try:
+        room_collab_client.open_room_collab = fake_open
+        got = run(["--kind", "markdown-ut9pkft9", "summon", ROOM, WHO, "--dry-run"])
+        assert got["extra_content"][room_collab.SUMMON_KEY]["page_title"] == "Product-roadmap", got
+        assert opened == ["markdown"], opened
+        got = run(["--kind", "html-zz99zz99", "summon", ROOM, WHO, "--page-title", "Poll", "--dry-run"])
+        assert '"Poll" in this room\'s HTML page' in got["body"] and opened == ["markdown"], "a given title opens nothing"
+        got = run(["summon", ROOM, WHO, "--dry-run"])
+        assert "page_title" not in got["extra_content"][room_collab.SUMMON_KEY] and opened == ["markdown"]
+    finally:
+        room_collab_client.open_room_collab = real
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 
