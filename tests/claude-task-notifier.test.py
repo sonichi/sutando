@@ -124,20 +124,6 @@ class FakeTmuxHarness(unittest.TestCase):
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
         # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
         self.gate_on_capture_flag = self.root / "gate-on-capture.flag"
-        # Holds N: captures numbered below N render the composer COLLAPSED to one row
-        # holding only the last 30 chars of the typed text (a turn streaming).
-        self.collapse_until_capture_flag = self.root / "collapse-until-capture.flag"
-        self.collapse_py = self.root / "collapse.py"
-        self.collapse_py.write_text(
-            "import sys, re\n"
-            "rows = sys.stdin.read().split('\\n')\n"
-            "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
-            "if last >= 0:\n"
-            "    j = last + 1\n"
-            "    while j < len(rows) and rows[j].startswith('  ') and not re.match(r'^\\s*\u23f5\u23f5', rows[j]): j += 1\n"
-            "    text = rows[last][1:].strip() + ''.join(r.strip() for r in rows[last + 1:j])\n"
-            "    if text: rows[last:j] = ['\u276f ' + text[-30:]]\n"
-            "print('\\n'.join(rows))\n")
         # Holds a row of owner text that lands under our paste (consumed once).
         self.extra_owner_row_flag = self.root / "extra-owner-row.flag"
         # The pane's #{pane_pid}: the core incarnation an in-flight marker is keyed to.
@@ -153,6 +139,24 @@ class FakeTmuxHarness(unittest.TestCase):
 
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
+        # Holds N: a `-l` paste longer than N bytes lands as only its bytes after N,
+        # as one tmux write past the CLI's input limit does on a real pane.
+        self.cut_paste_over_flag = self.root / "cut-paste-over.flag"
+        # Holds K: the composer box shows only the last K of its rows (needs WRAP_COLS).
+        self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
+        self.view_py = self.root / "view.py"
+        self.view_py.write_text(
+            "import sys, re\n"
+            "k = int(sys.argv[1]); rows = sys.stdin.read().split('\\n')\n"
+            "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
+            "if last >= 0:\n"
+            "    j = last + 1\n"
+            "    while j < len(rows) and rows[j].startswith('  ') and '\u23f5\u23f5' not in rows[j] and not re.match(r'^[\\s\u2500-\u257f-]+$', rows[j]): j += 1\n"
+            "    box = rows[last:j]\n"
+            "    if len(box) > k:\n"
+            "        keep = box[-k:]; keep[0] = '\u276f ' + keep[0].strip()\n"
+            "        rows[last:j] = keep\n"
+            "print('\\n'.join(rows))\n")
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -186,6 +190,12 @@ if idx is None:
     lines.append("❯ "); idx = len(lines) - 1
 row = lines[idx]
 row = "❯ " if re.match(r'^❯ *$|^❯ Try "|^❯ Press up to edit queued messages', row) else row
+# The box's own continuation rows (everything down to the frame) belong to the
+# text: a later chunk re-wraps all of it.
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    row += lines[end].strip() if style == "word" else lines[end]; end += 1
 new = row + text
 if wrap <= 0:
     rows = [new]
@@ -195,7 +205,7 @@ elif style == "word":
                          break_on_hyphens=False)
 else:
     rows = [new[i:i + wrap] for i in range(0, len(new), wrap)]
-lines[idx:idx + 1] = rows
+lines[idx:end] = rows
 open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
 }}
@@ -261,8 +271,8 @@ case "$cmd" in
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
     fi
-    if [ -f "{self.collapse_until_capture_flag}" ] && [ "$n" -lt "$(cat "{self.collapse_until_capture_flag}")" ]; then
-      out="$(printf '%s\\n' "$out" | python3 "{self.collapse_py}")"
+    if [ -f "{self.composer_view_rows_flag}" ]; then
+      out="$(printf '%s\\n' "$out" | python3 "{self.view_py}" "$(cat "{self.composer_view_rows_flag}")")"
     fi
     if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
       out="$(printf '%s\\n' "$out" | fold -w {self.CAPTURE_COLS})"
@@ -296,6 +306,9 @@ case "$cmd" in
       shift 2  # -l --
       text="$1"
       printf 'CAPTURES@%s\\nTYPE %s\\n' "$(cat "{self.capture_count}" 2>/dev/null || echo 0)" "$text" >> "{self.sendkeys_log}"
+      if [ -f "{self.cut_paste_over_flag}" ] && [ "${{#text}}" -gt "$(cat "{self.cut_paste_over_flag}")" ]; then
+        text="${{text:$(cat "{self.cut_paste_over_flag}")}}"
+      fi
       if [ -f "{self.swallow_always_flag}" ]; then
         :
       elif [ -f "{self.swallow_flag}" ]; then
@@ -495,19 +508,28 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("TYPE Sutando task ready: task-fresh.txt", self.sendkeys_log_text(),
                       "a self-reported 'running' must not outrank an idle pane")
 
-    def test_a_running_turn_holds_the_paste_until_idle(self):
+    def test_a_running_turn_still_receives_the_task(self):
         # The pane shows an in-flight turn. The Monitor tool's notification
         # never waited for it, and neither does this: the line queues behind it.
         self.write_task("task-c.txt")
         self.pane_file.write_text(BUSY_FOOTER + "\n")
-        result = self.run_event("task-c.txt", timeout=8)
+
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-c.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-c.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.sendkeys_log_text()
-        # A paste into a streaming turn is cut to its last row on the current CLI build
-        # (witnessed 2026-09-25): hold, and let the next pick deliver into an idle pane.
-        self.assertNotIn("TYPE", log, "typed into a streaming turn")
-        self.assertNotIn("ENTER", log)
-        self.assertIn("turn in progress at the paste", (self.logs_dir / "claude-task-notifier.log").read_text())
+        self.assertIn("TYPE Sutando task ready: task-c.txt", log,
+                      "a running turn is not a gate; the line must be typed")
+        self.assertIn("ENTER", log, "and submitted, so the CLI queues it")
 
     def test_trust_gate_on_stale_status_blocks_dispatch(self):
         # Pins the delegation to the REAL core-input-watch.py: a stale status
@@ -999,16 +1021,24 @@ class EventDispatchTests(FakeTmuxHarness):
         return t
 
     def test_the_queued_messages_composer_is_not_a_draft(self):
-        # A line already queued behind the turn leaves this hint in the composer; it
-        # is not a draft. The turn IS streaming, so the paste holds -- for that reason.
+        # A line already queued behind the turn leaves this hint in the composer;
+        # the next task must still go in, on top of the queue.
         self.write_task("task-q.txt")
         self.pane_file.write_text("❯ Press up to edit queued messages\n" + BUSY_STATUS + "\n")
-        result = self.run_event("task-q.txt", timeout=8)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-q.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-q.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        nlog = (self.logs_dir / "claude-task-notifier.log").read_text()
-        self.assertNotIn("composer not empty", nlog, "the queued-messages hint was read as a draft")
-        self.assertIn("turn in progress at the paste", nlog)
-        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertIn("TYPE Sutando task ready: task-q.txt", self.sendkeys_log_text())
+
     def test_a_busy_footer_alone_does_not_confirm_a_submit(self):
         # Busy is trivially true once a turn runs, so it proves nothing about our
         # line: a swallowed C-m on a busy pane must still be re-pressed.
@@ -1059,15 +1089,16 @@ class StandbyReminderTests(FakeTmuxHarness):
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         self.write_task("task-sb.txt")
         self.run_event("task-sb.txt", timeout=15)
-        typed = self.sendkeys_log_text()
+        # The paste goes out in chunks; what they reassemble to is the line typed.
+        typed = "".join(l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE "))
         # Equality, not containment: this is what pins expected_prompt() — which the
         # inflight suite stages into its composer — to what the notifier really types.
-        self.assertIn(f"TYPE {self.expected_prompt('task-sb.txt')}", typed)
+        self.assertEqual(self.expected_prompt('task-sb.txt'), typed)
         self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
         # The script path is quoted: a desktop install lives under "Application Support".
         self.assertIn(f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
         import shlex
-        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1].split("\n", 1)[0]
+        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1]
         self.assertEqual(shlex.split(rearm)[1], f"{REPO}/src/watch-tasks-stream.sh", "the script path survives shell parsing as ONE word")
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertIn(f"delivering task-sb.txt as the standby: no session-role watcher holds {self.tasks_dir}", log)
@@ -1216,18 +1247,32 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         self.assertIsNotNone(m, "control run never pasted; cannot calibrate")
         return int(m.group(1))
 
-    def test_a_turn_streaming_at_the_baseline_holds_the_paste(self):
-        # A paste into a streaming turn is cut to its last row on the current CLI
-        # build (witnessed 2026-09-25), so the notifier holds instead of typing.
+    def test_a_turn_starting_right_before_the_paste_still_gets_the_line(self):
         n = self._captures_before_first_paste()
+        # Fresh harness state for the real run, same fake, same read order.
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
+        # CAPTURES@n is the count AT the paste: capture n IS the last read
+        # before it (the baseline). A turn starting there is not a gate.
         self.busy_on_capture_flag.write_text(str(n))
         self.write_task("task-race.txt")
-        result = self.run_event("task-race.txt", timeout=8)
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-race.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-race.txt")
+        t.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("TYPE", self.sendkeys_log_text(), "typed into a streaming turn")
-        self.assertIn("turn in progress at the paste", (self.logs_dir / "claude-task-notifier.log").read_text())
+        log = self.sendkeys_log_text()
+        self.assertIn("TYPE", log, "a turn that just started must not hold the line")
+        self.assertIn("ENTER", log, "the line queues behind the turn")
+        self.assertNotIn("not healthy at the paste",
+                         (self.logs_dir / "claude-task-notifier.log").read_text())
 
     def test_a_gate_replacing_idle_on_the_baseline_read_blocks_the_paste(self):
         # Not-busy is not idle: a trust gate has no "esc to interrupt" and
@@ -1240,61 +1285,6 @@ class BusyBeforePasteTests(FakeTmuxHarness):
         result = self.run_event("task-gate-race.txt", timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("TYPE", self.sendkeys_log_text(), "pasted the task into a trust gate")
-
-
-class CollapsedComposerTests(FakeTmuxHarness):
-    """While a turn streams, the CLI shows the composer as ONE row holding only the tail
-    of a long input (measured 2026-09-25 on the reporting worker's pane, #4793). The
-    paste is intact but cannot be verified until the box expands. The notifier must not
-    re-type (that appends to the box) and must not refuse; it waits for the box to
-    settle, then presses Enter. If it never settles, it fails closed."""
-
-    def _paste_capture(self):
-        self.write_task("task-cal.txt")
-        self.run_event("task-cal.txt", timeout=12,
-                       env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
-        m = re.search(r"CAPTURES@(\d+)", self.sendkeys_log_text())
-        self.assertIsNotNone(m, "control run never pasted; cannot calibrate")
-        return int(m.group(1))
-
-    def test_a_collapsed_composer_is_waited_out_then_submitted_without_retyping(self):
-        n = self._paste_capture()
-        self.sendkeys_log.write_text(""); self.capture_count.unlink()
-        self.pane_file.write_text(IDLE_FOOTER + "\n")
-        self.busy_on_capture_flag.write_text(str(n + 1))  # the turn starts right after the baseline
-        self.collapse_until_capture_flag.write_text(str(n + 4))  # expands after 3 more reads
-        self.write_task("task-collapsed.txt")
-        import threading
-        def _finish():
-            for _ in range(80):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-collapsed.txt"); return
-                time.sleep(0.1)
-        th = threading.Thread(target=_finish); th.start()
-        result = self.run_event("task-collapsed.txt", timeout=30)
-        th.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertEqual(log.count("TYPE Sutando task ready: task-collapsed.txt"), 1, "re-typing over a collapsed box appends")
-        self.assertIn("ENTER", log)
-        nlog = (self.logs_dir / "claude-task-notifier.log").read_text()
-        self.assertIn("waiting up to", nlog)
-        self.assertNotIn("did not stage; re-typing", nlog)
-
-    def test_a_composer_that_never_settles_fails_closed_without_retyping(self):
-        n = self._paste_capture()
-        self.sendkeys_log.write_text(""); self.capture_count.unlink()
-        self.pane_file.write_text(IDLE_FOOTER + "\n")
-        self.busy_on_capture_flag.write_text(str(n + 1))
-        self.collapse_until_capture_flag.write_text("99999")
-        self.write_task("task-stuck.txt")
-        result = self.run_event("task-stuck.txt", timeout=20,
-                                env_extra={"SUTANDO_NOTIFIER_STAGE_SETTLE_TIMEOUT": "2"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertEqual(log.count("TYPE"), 1)
-        self.assertNotIn("ENTER", log)
-        self.assertIn("did not settle", (self.logs_dir / "claude-task-notifier.log").read_text())
 
 
 class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
@@ -1458,6 +1448,78 @@ class ComposerBlockPathTests(unittest.TestCase):
         b = self.up.composer_block_path(self.d, instance="w2", agent="@a:x")
         self.assertNotEqual(a, b)
         self.assertEqual({a.parent, b.parent}, {self.d})
+
+
+class LongPromptTests(FakeTmuxHarness):
+    """One tmux write past the CLI's input limit lands as only its tail (measured on
+    the live build at 1022 bytes: the composer held the last 42 chars of a 1064-char
+    prompt, and Enter would have submitted them). A prompt is typed in chunks below
+    the limit, each read back before the next; the box shows at most its last rows,
+    so a tall prompt is verified through that window; a cut tail is never submitted."""
+
+    WRAP_COLS = 118
+    WRAP_STYLE = "word"
+    LONG = "task-" + "l" * 200 + ".txt"
+
+    def _finish_on(self, name, predicate):
+        import threading
+        def _run():
+            for _ in range(100):
+                if predicate(self.sendkeys_log_text()):
+                    self.write_result(name); return
+                time.sleep(0.1)
+        th = threading.Thread(target=_run); th.start()
+        return th
+
+    def _run_long(self, name, env=None):
+        self.write_task(name)
+        t = self._finish_on(name, lambda log: "ENTER" in log)
+        r = self.run_event(name, env, timeout=40)
+        t.join()
+        return r
+
+    def test_a_prompt_past_the_cut_is_typed_in_chunks_that_reassemble_to_it(self):
+        self.cut_paste_over_flag.write_text("1022")
+        r = self._run_long(self.LONG)
+        chunks = [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
+        self.assertGreater(len(chunks), 2, chunks)
+        self.assertTrue(all(len(c) <= 256 for c in chunks), [len(c) for c in chunks])
+        self.assertEqual("".join(chunks), self.expected_prompt(self.LONG))
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_chunk_that_lands_short_is_never_submitted_or_typed_over(self):
+        self.cut_paste_over_flag.write_text("100")  # a limit below even one chunk
+        self.write_task(self.LONG)
+        r = self.run_event(self.LONG, timeout=40)
+        log = self.sendkeys_log_text()
+        self.assertNotIn("ENTER", log)
+        self.assertEqual(log.count("TYPE "), 1, "typed over what landed")
+        self.assertIn("composer not empty", r.stderr)
+
+    def test_a_prompt_taller_than_the_box_is_verified_through_its_window(self):
+        self.composer_view_rows_flag.write_text("6")
+        r = self._run_long(self.LONG)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        self.assertNotIn("never verifiably staged", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_box_narrower_than_a_chunk_fails_closed(self):
+        self.composer_view_rows_flag.write_text("2")  # under one chunk visible
+        self.write_task(self.LONG)
+        r = self.run_event(self.LONG, timeout=40)
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertEqual(self.sendkeys_log_text().count("TYPE "), 1, "typed over what landed")
+        self.assertIn("composer not empty", r.stderr)
+
+    def test_a_cut_tail_found_at_pick_is_left_alone(self):
+        tail = self.expected_prompt(self.LONG)[-200:]
+        self.pane_file.write_text("❯ " + tail + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        self.write_task(self.LONG)
+        r = self.run_event(self.LONG, timeout=40)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("a paste cut short", r.stderr)
 
 
 if __name__ == "__main__":
