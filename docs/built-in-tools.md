@@ -201,6 +201,18 @@ node src/browser.mjs "https://example.com" --headed           # watch automation
 node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+
+Claude Code's own `--chrome` browsing needs the **Claude in Chrome extension** installed
+in the person's Chrome (https://claude.ai/chrome); nothing can install it for them, and
+the desktop's setup card ("Let it see and act") shows whether it is there. Without it,
+fall back to `src/browser.mjs` or `skills/macos-use`.
+
+**Show browser steps as they happen.** For any task that browses on someone's behalf, post
+each step (one line + a screenshot of the page), and always a screenshot before a purchase,
+booking or submit: `skills/task-progress/scripts/step.py --message "…" --screenshot <path>`,
+the path being a picture the working session took of the live page (`--capture <url>` is a
+fresh load, never the approval shot). An owner errand and anything read from the owner's
+accounts go to the owner DM, not a shared room (details in `skills/task-progress/SKILL.md`).
 Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
 raise that command-level limit to at most 300,000 ms. Navigation uses the
 remaining command budget, and declared `wait:` actions must fit the budget or

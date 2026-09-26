@@ -23,10 +23,12 @@ block the task itself. The caller should always continue working regardless of e
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -111,7 +113,7 @@ def _token(source: str, var: str) -> str:
     return val or _env_file(str(env_path)).get(var, "")
 
 
-def _post(url: str, payload: dict, headers: dict) -> bool:
+def _post(url: str, payload: dict, headers: dict, timeout: float = 10) -> bool:
     """POST JSON payload. Returns True on 2xx."""
     try:
         data = json.dumps(payload).encode()
@@ -119,7 +121,7 @@ def _post(url: str, payload: dict, headers: dict) -> bool:
             "Content-Type": "application/json",
             **headers,
         })
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read())
             # Slack returns {"ok": true/false}; Discord/Telegram return the message object.
             if isinstance(body, dict) and "ok" in body:
@@ -271,14 +273,14 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
-    """Generic sender for gateway-bridged channels (any --source with a
-    channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
+def _gateway_config(source: str) -> "tuple[str, str] | None":
+    """(url, token) for a gateway-bridged source, or None (reason already
+    printed). Shared by the text and media senders so the two cannot drift."""
     if not _SOURCE_SLUG_RE.match(source or ""):
         print(f"[task-progress] invalid gateway source {source!r} — "
               "provider names are lowercase slugs; dots allowed only between "
               "alphanumerics (e.g. dev.ag2.space)", file=sys.stderr)
-        return False
+        return None
     # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
     _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
@@ -316,13 +318,29 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
         if not _channel_env_is_contained(env_path, channels_dir, source):
             print(f"[task-progress] refusing env path outside channels dir: {env_path}",
                   file=sys.stderr)
-            return False
+            return None
         env = _env_file(os.path.realpath(env_path))
         url, token = _derive(lambda k: os.environ.get(k, "") or env.get(k, ""))
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
               f"for source '{source}' (looked in {env_path})", file=sys.stderr)
+        return None
+    return url, token
+
+
+def _gateway_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}",
+            # some gateway edges (CDN/WAF) reject the default Python-urllib UA
+            "User-Agent": "sutando-task-progress/1.0"}
+
+
+def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
+    """Generic sender for gateway-bridged channels (any --source with a
+    channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
+    cfg = _gateway_config(source)
+    if cfg is None:
         return False
+    url, token = cfg
     # Progress updates carry the same worker stamp as results, so a notify
     # renders with the sender's attribution instead of stripping it.
     worker = os.environ.get("SUTANDO_WORKER_ID") or (
@@ -331,13 +349,56 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     payload = {"op": "message", "room_id": channel_id, "body": message}
     if worker:
         payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
-    return _post(
-        f"{url}/v1/room",
-        payload,
-        {"Authorization": f"Bearer {token}",
-         # some gateway edges (CDN/WAF) reject the default Python-urllib UA
-         "User-Agent": "sutando-task-progress/1.0"},
-    )
+    return _post(f"{url}/v1/room", payload, _gateway_headers(token))
+
+
+# The gateway's own cap (remote_gateway_bridge MAX_MEDIA_BYTES), same env knob.
+MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+
+
+def _load_attachment_policy():
+    """The shared `[file:]` allowlist (src/policy/egress/attachment.py), or a
+    fail-closed stub: an unimportable policy never widens what may be sent."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        from policy.egress.attachment import is_path_sendable  # type: ignore
+        return is_path_sendable
+    except Exception:
+        return lambda fpath, extra_roots=(): False
+
+
+_is_path_sendable = _load_attachment_policy()
+
+
+def upload_room_media(source: str, channel_id: str, path: str,
+                      extra_roots: "tuple[str, ...]" = ()) -> "tuple[bool, str]":
+    """Upload one local file into the originating room through the gateway's
+    `POST /v1/rooms/<room>/media` — the route the task bridge's `[file:]`
+    markers take, under the same allowlist (policy/egress/attachment.py) and
+    size cap. Gateway sources only: Slack/Discord/Telegram progress updates
+    stay text. Returns (ok, reason); the reason is already human-readable."""
+    if source in ("slack", "discord", "telegram"):
+        return False, f"media steps are not supported on {source}; the text step was sent"
+    cfg = _gateway_config(source)
+    if cfg is None:
+        return False, "no gateway config"
+    url, token = cfg
+    fpath = os.path.realpath(os.path.expanduser((path or "").strip()))
+    if not _is_path_sendable(fpath, extra_roots):
+        return False, f"path not allowlisted: {fpath}"
+    try:
+        size = os.path.getsize(fpath)
+        if size > MAX_MEDIA_BYTES:
+            return False, f"file exceeds {MAX_MEDIA_BYTES} bytes"
+        with open(fpath, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        return False, f"read failed: {e}"
+    safe_room = urllib.parse.quote(channel_id, safe="")
+    ok = _post(f"{url}/v1/rooms/{safe_room}/media",
+               {"filename": os.path.basename(fpath), "content_b64": content_b64},
+               _gateway_headers(token), timeout=60)
+    return (True, "") if ok else (False, "upload failed")
 
 
 def main() -> int:
