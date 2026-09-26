@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import pathlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -444,7 +443,7 @@ class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
     strip were all glued onto the staged text and EXACT equality never held.
     The composer ends at its closing rule; everything after it is frame."""
 
-    REAL = pathlib.Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
+    REAL = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
 
     def test_the_real_capture_reads_as_exactly_the_staged_prompt(self):
         text = pg.composer_text(self.REAL.read_text())
@@ -466,6 +465,19 @@ class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
                    "────────────────────────────\n"
                    "  ⏵⏵ bypass permissions on · 3 shells\n")
         self.assertEqual(pg.composer_text(capture), "first line  ⧉ this is what I typed")
+
+    def test_an_interior_rule_row_is_typed_text_and_the_owner_draft_after_it_survives(self):
+        # rui's probe on #4795: cutting at the FIRST rule made this read as exactly the
+        # prompt, and Enter would have submitted the owner's draft. Fail closed: the
+        # draft stays in the text, so EXACT equality with the prompt cannot hold.
+        capture = ("❯ Sutando task ready: task-x.txt\n"
+                   "  ────────────\n"
+                   "  owner draft\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells\n")
+        text = pg.composer_text(capture)
+        self.assertIn("owner draft", text)
+        self.assertNotEqual(text.replace(" ", ""), "Sutandotaskready:task-x.txt")
 
     def test_no_rule_still_strips_the_one_row_footer(self):
         capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\n"

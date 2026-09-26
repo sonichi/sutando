@@ -253,7 +253,8 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     row, at most one hint/tip row -- so the strip removes exactly those, once each,
     from the back. It never re-classifies an interior row: an owner's own typed
     line that happens to read one of those rows' words survives, because only the
-    LAST matching row of each kind is ever popped, and never a second time.
+    LAST matching row of each kind is ever popped, and never a second time. The cut
+    at the closing rule follows the same rule: the LAST rule row, never an interior one.
     """
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
@@ -265,8 +266,8 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
         return None
     block = lines[start:]
     # The CLI boxes the composer: everything past its closing rule is frame (footer, tip,
-    # "⧉ <artifact>" strip), whatever a release draws there. The pops below cover no-box builds.
-    for i in range(1, len(block)):
+    # "⧉ <artifact>" strip). The LAST rule is the closing one; an interior rule is typed text.
+    for i in range(len(block) - 1, 0, -1):
         if BORDER_LINE.match(block[i]):
             block = block[:i]
             break
