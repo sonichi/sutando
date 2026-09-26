@@ -467,9 +467,8 @@ class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
         self.assertEqual(pg.composer_text(capture), "first line  ⧉ this is what I typed")
 
     def test_an_interior_rule_row_is_typed_text_and_the_owner_draft_after_it_survives(self):
-        # rui's probe on #4795: cutting at the FIRST rule made this read as exactly the
-        # prompt, and Enter would have submitted the owner's draft. Fail closed: the
-        # draft stays in the text, so EXACT equality with the prompt cannot hold.
+        # An interior rule is typed text: the draft after it must stay in the text, so
+        # EXACT equality with the prompt cannot hold (a first-rule cut hid it: fail-open).
         capture = ("❯ Sutando task ready: task-x.txt\n"
                    "  ────────────\n"
                    "  owner draft\n"
