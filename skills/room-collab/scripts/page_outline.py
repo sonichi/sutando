@@ -1,0 +1,103 @@
+"""What an HTML page shows, as a voice agent needs it: slides and what can be pointed at.
+
+A deck is listed slide by slide — elements whose class includes `slide`, or a
+reveal.js deck's top-level `.slides > section` — with its
+number, its title (first h1–h3), and its `data-topic` keys with the words they
+label. Any other page is listed by its headings. The page is parsed, never run,
+so text a script adds at runtime is not here.
+"""
+from __future__ import annotations
+
+import re
+from html.parser import HTMLParser
+
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+SKIP = {"script", "style", "svg", "template", "noscript"}
+TEXT_MAX = 80
+# The web client pins a comment to `el:<attr>=<value>` only for values of this shape.
+ANCHOR_VALUE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+class _Outline(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[dict] = []
+        self.slides: list[dict] = []
+        self.headings: list[str] = []
+        self.anchors: list[dict] = []
+        self.skip = 0
+
+    def _anchor(self, tag: str, a: dict, own_slide: dict | None) -> dict | None:
+        for attr in ("data-id", "data-topic"):
+            value = a.get(attr)
+            if value and ANCHOR_VALUE.fullmatch(value) and not self.skip:
+                slide = own_slide or next((n["slide"] for n in reversed(self.stack) if n["slide"]), None)
+                found = {"anchor": f"el:{attr}={value}", "tag": tag, "text": "",
+                         "slide": slide["n"] if slide else None}
+                self.anchors.append(found)
+                return found
+        return None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in VOID:
+            self._anchor(tag, dict(attrs), None)
+            return
+        a = dict(attrs)
+        node = {"tag": tag, "text": [], "slide": None, "topic": a.get("data-topic"), "heading": tag in ("h1", "h2", "h3"),
+                "classes": []}
+        classes = (a.get("class") or "").split()
+        in_slide = any(n["slide"] is not None for n in self.stack)
+        reveal = tag == "section" and bool(self.stack) and "slides" in self.stack[-1]["classes"]
+        node["classes"] = classes
+        if ("slide" in classes or reveal) and not in_slide:
+            node["slide"] = {"n": len(self.slides) + 1, "id": a.get("id"), "title": None, "topics": []}
+            self.slides.append(node["slide"])
+        node["anchor"] = self._anchor(tag, a, node["slide"])
+        if tag in SKIP:
+            self.skip += 1
+        self.stack.append(node)
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        while self.stack:
+            node = self.stack.pop()
+            if node["tag"] in SKIP:
+                self.skip = max(0, self.skip - 1)
+            words = " ".join(" ".join(node["text"]).split())[:TEXT_MAX]
+            if self.stack:
+                self.stack[-1]["text"].append(" ".join(node["text"]))
+            slide = next((n["slide"] for n in reversed(self.stack) if n["slide"]), None) or node["slide"]
+            if node.get("anchor"):
+                node["anchor"]["text"] = words
+            if node["heading"] and words:
+                if slide is not None and slide["title"] is None:
+                    slide["title"] = words
+                elif slide is None:
+                    self.headings.append(words)
+            if node["topic"] and slide is not None and "'" not in node["topic"]:
+                slide["topics"].append({"topic": node["topic"], "text": words})
+            if node["tag"] == tag:
+                break
+
+    def handle_data(self, data):
+        if self.stack and not self.skip:
+            self.stack[-1]["text"].append(data)
+
+
+def outline(html: str) -> dict:
+    p = _Outline()
+    p.feed(html)
+    p.close()
+    if p.slides:
+        return {"kind": "deck", "slides": p.slides}
+    return {"kind": "page", "headings": p.headings}
+
+
+def anchors(html: str) -> list[dict]:
+    """Elements a comment can be pinned to by name, in page order: `data-id`
+    before `data-topic` on one element, as the web client prefers."""
+    p = _Outline()
+    p.feed(html)
+    p.close()
+    return p.anchors

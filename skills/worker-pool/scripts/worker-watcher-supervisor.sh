@@ -27,7 +27,11 @@ SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 WORKER_SESSION="$SUTANDO_TMUX_SESSION"
 SUP_SESSION="${WORKER_SESSION}-watcher"
 SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
-NOTIFIER="$REPO/src/agent/claude/cli/task-notifier.sh"
+case "${SUTANDO_WORKER_RUNTIME:-claude}" in
+  claude) NOTIFIER="$REPO/src/agent/claude/cli/task-notifier.sh" ;;
+  codex) NOTIFIER="$REPO/src/agent/codex/cli/task-notifier.sh" ;;
+  *) echo "worker-watcher-supervisor: unsupported runtime $SUTANDO_WORKER_RUNTIME" >&2; exit 2 ;;
+esac
 BEAT="$REPO/skills/worker-pool/scripts/pool_beat.py"
 PY="${SUTANDO_PY:-python3}"
 
@@ -36,18 +40,26 @@ PY="${SUTANDO_PY:-python3}"
 ENV_ARGS=(
   -e "SUTANDO_TMUX_SOCKET=$SOCK"
   -e "SUTANDO_TMUX_SESSION=$WORKER_SESSION"
+  -e "PATH=$PATH"
   -e "SUTANDO_TMUX_WINDOW=0"
   -e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER"
   -e "SUTANDO_NOTIFIER_PY=$PY"
+  -e "SUTANDO_PY=$PY"
   -e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR"
   -e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID"
+  -e "SUTANDO_WORKER_RUNTIME=${SUTANDO_WORKER_RUNTIME:-claude}"
   -e "SUTANDO_WATCHER_BEAT=$BEAT"
 )
+if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
+  ENV_ARGS+=(-e SUTANDO_TASK_EVENT_HANDLER= -e SUTANDO_CORE_SESSION=)
+fi
 # The resolver is what turns a delivery sentinel into its task body: without it the
 # standby watcher announces nothing for a worker inbox.
 for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
          SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT \
          SUTANDO_TASK_EVENT_HANDLER SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL; do
+  if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ] \
+     && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
 CMD=(tmux -S "$SOCK" new-session -d -s "$SUP_SESSION" "${ENV_ARGS[@]}" bash "$SUPERVISOR")

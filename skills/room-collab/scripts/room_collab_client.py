@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 import ssl
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable
 
@@ -59,7 +61,9 @@ from room_composer import (  # noqa: E402
 
 from room_collab_protocol import (  # noqa: E402
     close_code,
-    DEFAULT_KIND, DEFAULT_TEXT_NAME, RoomDocError, close_reason, doc_socket_url,
+    DEFAULT_KIND, DEFAULT_TEXT_NAME, HTML_KIND, HTML_PAGES_KEY, HTML_STAGE_KEY, HTML_STATE_KEY, STATE_KEY_RE,
+    STATE_VALUE_MAX, TEXT_ROOTS, RoomDocError, close_reason, doc_socket_url, has_stage, is_html_kind,
+    new_page_entry, new_page_id, read_pages, text_root,
     explain,
     http_status,
     unanswered,
@@ -84,9 +88,9 @@ class RoomDoc:
         self._awareness = awareness
         self._kind = kind
         self._text_name = text_name
-        # Only markdown has a text by default; a composer holds one per post,
-        # which `open_post` selects. Naming another kind accepts unseen writes.
-        self._text = doc.get(text_name, type=Text) if kind == DEFAULT_KIND else None
+        # Only the text kinds have a text by default; a composer holds one per
+        # post, which `open_post` selects. Naming another kind accepts unseen writes.
+        self._text = doc.get(text_name, type=Text) if text_root(kind) else None
         self._post_id: str | None = None
         # Two states, not one: a reader that dies is not a sync that finished.
         self._synced = asyncio.Event()
@@ -118,8 +122,8 @@ class RoomDoc:
                          self._kind, "structured data")
             raise RoomDocError(
                 f"cannot {what} on the {self._kind!r} document: it holds {where}, "
-                f"not text. Only the {DEFAULT_KIND!r} document is a text — open "
-                "that, or use the API for this kind.")
+                f"not text. Only the {', '.join(map(repr, TEXT_ROOTS))} documents (and their html-<id> and markdown-<id> pages) are text — "
+                "open one of those, or use the API for this kind.")
         return self._text
 
     @property
@@ -495,7 +499,7 @@ class RoomDoc:
         """What this document looks like right now, for whichever kind it is,
         plus who is present — the unit `events()` diffs."""
         snap: dict = {"peers": list(self.peers)}
-        if self._kind == DEFAULT_KIND:
+        if text_root(self._kind):
             snap["text"] = self.text
         elif self._kind == BOARD_KIND:
             snap["elements"] = self.elements
@@ -527,7 +531,7 @@ class RoomDoc:
             if origin != LOCAL_ORIGIN:
                 fn()
 
-        if self._kind == DEFAULT_KIND:
+        if text_root(self._kind):
             subs.append((self._text, self._text.observe(on_doc)))
         elif self._kind == BOARD_KIND:
             m = self._doc.get(ELEMENTS_KEY, type=Map)
@@ -729,6 +733,308 @@ class RoomDoc:
         rows = [v for k, v in self._items(columns) if is_column(v, k)]
         return sorted(rows, key=lambda c: (c["order"], c["id"]))
 
+    def _require_stage(self, what: str) -> Any:
+        if not has_stage(self._kind):
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: only the HTML page, "
+                               "the board and the Doc have a stage")
+        return self._doc.get(HTML_STAGE_KEY, type=Map)
+
+    @property
+    def stage(self) -> dict:
+        """The surface's live stage: {topic, ts, speaking} on the page; nav and spot on any."""
+        return dict(self._items(self._require_stage("read the stage")))
+
+    async def set_stage(self, topic: str | None, *, speaking: bool | None = None) -> dict:
+        """Highlight `topic` on the page for everyone in the room (None clears it).
+        `ts` changes on every call, so repeating a topic re-triggers it."""
+        if not is_html_kind(self._kind):
+            raise RoomDocError(f"the stage belongs to the HTML page, not the {self._kind!r} document")
+        if topic is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", topic):
+            raise RoomDocError(f"not a topic key: {topic!r} (letters, digits, . _ -; up to 64)")
+        stage = self._doc.get(HTML_STAGE_KEY, type=Map)
+        state = {"topic": topic or "", "ts": int(time.time() * 1000)}
+        if speaking is not None:
+            state["speaking"] = speaking
+
+        def mutate() -> None:
+            for k, v in state.items():
+                stage[k] = v
+
+        await self._commit(mutate)
+        return state
+
+    async def navigate(self, cmd: str, n: int | None = None) -> dict:
+        """Move every viewer: `next`, `prev`, or `goto` part `n` (1-based) — the page's
+        slides, the board's frames, the Doc's headings. A move carries a rising `seq`;
+        a surface opened later never replays it."""
+        stage = self._require_stage("move the stage")
+        if cmd not in ("next", "prev", "goto"):
+            raise RoomDocError(f"not a move: {cmd!r} (next, prev or goto)")
+        if cmd == "goto" and not (isinstance(n, int) and 1 <= n <= 999):
+            raise RoomDocError(f"goto needs a slide number 1–999, not {n!r}")
+        prev = stage.get("nav")
+        last = prev.get("seq", 0) if isinstance(prev, dict) else 0
+        nav = {"cmd": cmd, "seq": max(int(time.time() * 1000), int(last) + 1)}
+        if cmd == "goto":
+            nav["n"] = n
+        await self._commit(lambda: stage.__setitem__("nav", nav))
+        return nav
+
+    async def set_spot(self, text: str | None) -> dict:
+        """Point every viewer at the passage with these words (None clears): the page
+        spotlights it, the board selects and zooms to it, the Doc scrolls to and flashes it."""
+        stage = self._require_stage("point")
+        words = " ".join((text or "").split())
+        if len(words) > 200:
+            raise RoomDocError("a spotlight is at most 200 characters of the page's words")
+        prev = stage.get("spot")
+        last = prev.get("seq", 0) if isinstance(prev, dict) else 0
+        spot = {"text": words, "seq": max(int(time.time() * 1000), int(last) + 1)}
+        await self._commit(lambda: stage.__setitem__("spot", spot))
+        return spot
+
+    @property
+    def app_state(self) -> dict:
+        """The page's shared state, as its scripts see it through `artifact.state`."""
+        if not is_html_kind(self._kind):
+            raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
+        return dict(self._items(self._doc.get(HTML_STATE_KEY, type=Map)))
+
+    @property
+    def pages(self) -> list[dict]:
+        """The extra pages of the main HTML page or the main Doc, in order, as its `pages` map lists them."""
+        if self._kind not in (HTML_KIND, DEFAULT_KIND):
+            raise RoomDocError(f"the page list lives in the main HTML page (--kind {HTML_KIND}) or the "
+                               f"main Doc (--kind {DEFAULT_KIND}), not the {self._kind!r} document")
+        return read_pages(dict(self._items(self._doc.get(HTML_PAGES_KEY, type=Map))), self._kind)
+
+    async def add_page(self, title: str, by: str, parent: str | None = None) -> dict:
+        """List a new page (under `parent`, one level); it is written by opening its kind, as any page is."""
+        pages = self.pages
+        pid = new_page_id()
+        entry = new_page_entry(title, by, pages, int(time.time() * 1000), parent)
+        index = self._doc.get(HTML_PAGES_KEY, type=Map)
+        await self._commit(lambda: index.__setitem__(pid, entry))
+        return {"id": pid, "kind": f"{self._kind}-{pid}", **entry}
+
+    def _require_versions(self, what: str) -> tuple:
+        from html_versions import VERSION_TEXTS_KEY, VERSIONS_KEY
+        if not is_html_kind(self._kind):
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: versions belong "
+                               f"to an HTML page (--kind {HTML_KIND} or html-<id>)")
+        return (self._doc.get(VERSIONS_KEY, type=Map), self._doc.get(VERSION_TEXTS_KEY, type=Map))
+
+    @property
+    def versions(self) -> list[dict]:
+        """The page's named snapshots, newest first."""
+        from html_versions import read_versions
+        meta, _ = self._require_versions("list versions")
+        return read_versions(dict(self._items(meta)))
+
+    def _snapshot(self, meta: Any, texts: Any, text: str, name: str, by: str,
+                  auto: bool) -> tuple:
+        """Plan one snapshot, returning (vid, entry, prune) — or VersionRefused."""
+        from html_versions import new_version_id, plan_snapshot, read_versions
+        entry, prune = plan_snapshot(read_versions(dict(self._items(meta))), text, name, by, auto=auto)
+        return new_version_id(), entry, prune
+
+    @staticmethod
+    def _write_snapshot(meta: Any, texts: Any, vid: str, entry: dict, prune: list, text: str) -> None:
+        for old in prune:
+            if old in meta:
+                del meta[old]
+            if old in texts:
+                del texts[old]
+        texts[vid] = text
+        meta[vid] = entry
+
+    async def save_version(self, name: str, by: str) -> dict:
+        """Snapshot the page as it is now, under the web client's caps."""
+        from html_versions import VersionRefused
+        meta, texts = self._require_versions("save a version")
+        self._require_text("save a version")
+        current = self.text
+        try:
+            vid, entry, prune = self._snapshot(meta, texts, current, name, by, False)
+        except VersionRefused as exc:
+            raise RoomDocError(str(exc)) from None
+        await self._commit(lambda: self._write_snapshot(meta, texts, vid, entry, prune, current))
+        return {"id": vid, **entry, "pruned": prune}
+
+    async def restore_version(self, ref: str, by: str) -> dict:
+        """Put a version back for everyone, snapshotting the current page first when the cap
+        allows; the whole text is replaced in one transaction."""
+        from html_versions import VersionRefused, before_restore_name, find_version
+        meta, texts = self._require_versions("restore a version")
+        text = self._require_text("restore a version")
+        chosen = find_version(self.versions, ref)
+        if chosen is None:
+            raise RoomDocError(f"no version {ref!r} on this page; run `versions` to list them")
+        body = texts.get(chosen["id"]) if chosen["id"] in texts else None
+        if not isinstance(body, str):
+            raise RoomDocError(f"the text of version {chosen['name']!r} is missing; it cannot be restored")
+        current = self.text
+        saved, note = None, None
+        if current != body and current.strip():
+            try:
+                saved = self._snapshot(meta, texts, current, before_restore_name(), by, True)
+            except VersionRefused as exc:
+                note = f"restored without saving the current page first: {exc}"
+
+        def mutate() -> None:
+            if saved:
+                self._write_snapshot(meta, texts, *saved, current)
+            del text[0:len(current.encode("utf-8"))]
+            text.insert(0, body)
+
+        await self._commit(mutate)
+        return {"restored": chosen["id"], "name": chosen["name"],
+                "saved_before": saved[0] if saved else None, "note": note}
+
+    async def set_app_state(self, key: str, value) -> None:
+        """Set (or, with None, delete) one key of the page's shared state, under the web client's bounds."""
+        import json as _json
+        if not is_html_kind(self._kind):
+            raise RoomDocError(f"page state belongs to the HTML page, not the {self._kind!r} document")
+        if not re.fullmatch(STATE_KEY_RE, key):
+            raise RoomDocError(f"not a state key: {key!r} (letters, digits, . _ -; up to 64)")
+        if value is not None and len(_json.dumps(value).encode()) > STATE_VALUE_MAX:
+            raise RoomDocError(f"the value for {key!r} is over {STATE_VALUE_MAX} bytes of JSON")
+        state = self._doc.get(HTML_STATE_KEY, type=Map)
+
+        def mutate() -> None:
+            if value is None:
+                if key in state:
+                    del state[key]
+            else:
+                state[key] = value
+
+        await self._commit(mutate)
+
+    async def set_speaking(self, speaking: bool) -> None:
+        """Say whether a presenter is talking, without touching the highlight:
+        a new `ts` would make a deck re-run the current topic."""
+        stage = self._require_stage("set speaking")
+        await self._commit(lambda: stage.__setitem__("speaking", bool(speaking)))
+
+    def _require_sheet(self, what: str) -> tuple:
+        from room_sheet import CELLS_KEY as SC, COLS_KEY as SK, ROWS_KEY as SR, SHEET_KIND
+        if self._kind != SHEET_KIND:
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: open the sheet "
+                               f"with kind={SHEET_KIND!r}.")
+        return (self._doc.get(SR, type=Map), self._doc.get(SK, type=Map), self._doc.get(SC, type=Map))
+
+    @property
+    def sheet(self) -> tuple[dict, dict, dict]:
+        """(rows, cols, cells) as plain dicts: axis id → {order}, `<row>|<col>` → {v, updated, by}."""
+        rows, cols, cells = self._require_sheet("read the sheet")
+        return tuple(dict(self._items(m)) for m in (rows, cols, cells))
+
+    async def put_sheet(self, new_rows: dict, new_cols: dict, writes: dict) -> int:
+        """Add axis entries and write cells in one update; a None value removes a cell."""
+        rows, cols, cells = self._require_sheet("write the sheet")
+
+        def mutate() -> None:
+            for k, v in new_rows.items():
+                rows[k] = v
+            for k, v in new_cols.items():
+                cols[k] = v
+            for k, v in writes.items():
+                if v is None:
+                    if k in cells:
+                        del cells[k]
+                else:
+                    cells[k] = v
+
+        await self._commit(mutate)
+        return len(writes)
+
+    def _require_db(self, what: str) -> dict:
+        from room_database import DB_KIND, MAPS
+        if self._kind != DB_KIND:
+            raise RoomDocError(f"cannot {what} on the {self._kind!r} document: open the room's "
+                               f"databases with kind={DB_KIND!r}.")
+        return {m: self._doc.get(m, type=Map) for m in MAPS}
+
+    @property
+    def database(self) -> dict:
+        """The five maps (dbs, props, rows, cells, views) as plain dicts; see DATABASE.md."""
+        return {m: dict(self._items(y)) for m, y in self._require_db("read the databases").items()}
+
+    async def put_database(self, writes: dict) -> int:
+        """Apply {map: {key: value | None}} in one update; None removes the key. Returns how many."""
+        maps = self._require_db("write a database")
+        unknown = sorted(set(writes) - set(maps))
+        if unknown:
+            raise RoomDocError(f"not a database map: {', '.join(unknown)}. Nothing was written.")
+
+        from room_database import BODIES
+        bodies = self._doc.get(BODIES, type=Map)
+
+        def mutate() -> None:
+            for name, entries in writes.items():
+                ymap = maps[name]
+                for k, v in entries.items():
+                    if v is None:
+                        if k in ymap:
+                            del ymap[k]
+                    else:
+                        ymap[k] = v
+                    # A row's page body lives and dies with the row, as in the web client.
+                    if name == "rows" and v is None and k in bodies:
+                        del bodies[k]
+                    elif name == "rows" and v is not None and k not in bodies:
+                        bodies[k] = Text()
+
+        await self._commit(mutate)
+        return sum(len(e) for e in writes.values())
+
+    def row_body(self, db: str, row: str) -> str | None:
+        """A row page's markdown body; None when the row has none yet (see DATABASE.md)."""
+        from room_database import BODIES, key
+        self._require_db("read a row page")
+        t = self._doc.get(BODIES, type=Map).get(key(db, row))
+        return str(t) if isinstance(t, Text) else None
+
+    async def put_row_body(self, db: str, row: str, text: str, *, append: bool = False) -> int:
+        """Set (or append to) a row page's body; only the changed middle is rewritten,
+        so people typing elsewhere in it keep their place. Returns the body's length."""
+        from room_database import BODIES, BODY_MAX, DbRefusal, key
+        maps = self._require_db("write a row page")
+        k = key(db, row)
+        if k not in maps["rows"]:
+            raise DbRefusal(f"no row {row!r} in database {db!r}. Nothing was written.")
+        bodies = self._doc.get(BODIES, type=Map)
+        current = self.row_body(db, row) or ""
+        new = current + text if append else text
+        if len(new) > BODY_MAX:
+            raise DbRefusal(f"a row page holds at most {BODY_MAX} characters. Nothing was written.")
+        if new == current and k in bodies:
+            return len(new)
+        p = 0
+        while p < min(len(current), len(new)) and current[p] == new[p]:
+            p += 1
+        q = 0
+        while q < min(len(current), len(new)) - p and current[-1 - q] == new[-1 - q]:
+            q += 1
+        # pycrdt indexes Text by UTF-8 bytes.
+        start = len(current[:p].encode("utf-8"))
+        width = len(current[p:len(current) - q].encode("utf-8"))
+        middle = new[p:len(new) - q]
+
+        def mutate() -> None:
+            t = bodies.get(k)
+            if not isinstance(t, Text):
+                bodies[k] = Text()
+                t = bodies[k]
+            if width:
+                del t[start:start + width]
+            if middle:
+                t.insert(start, middle)
+
+        await self._commit(mutate)
+        return len(new)
+
     async def put_cards(self, cards: list[dict]) -> int:
         """Write cards that are newer than what is stored. Returns how many.
         Refuses a card the panel would drop, rather than writing it."""
@@ -803,10 +1109,12 @@ class RoomDoc:
 @asynccontextmanager
 async def open_room_collab(api_root: str, room_id: str, token: str, *,
                         kind: str = DEFAULT_KIND,
-                        text_name: str = DEFAULT_TEXT_NAME,
+                        text_name: str | None = None,
                         insecure: bool = False) -> AsyncIterator[RoomDoc]:
     """Open one of a room's surfaces. `kind` selects which — the default
-    markdown document, or another surface such as the board or the kanban."""
+    markdown document, the HTML page, or a structured surface such as the board
+    or the kanban. A text kind's root comes from TEXT_ROOTS unless named."""
+    text_name = text_name or text_root(kind) or DEFAULT_TEXT_NAME
     url = doc_socket_url(api_root, room_id, kind=kind)
     sslctx = None
     if url.startswith("wss://"):

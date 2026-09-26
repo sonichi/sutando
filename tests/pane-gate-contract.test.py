@@ -29,6 +29,8 @@ FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 CODEX_DIM_IDLE = "\x1b[1m›\x1b[0m \x1b[2mImprove documentation in @filename\x1b[0m\n"
 CODEX_PICKER = "  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven previous-generation model\n"
 CODEX_IDLE = f"\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n{FOOTER}\n"
+CODEX_157_FOOTER = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+CODEX_157_IDLE = f"\x1b[1m»\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n{CODEX_157_FOOTER}\n"
 CLAUDE_IDLE = f"❯ \n{FOOTER}\n"
 # (gate kind, prose a finished turn may print, the live dialog of that kind)
 BROAD_SIGNATURES = [
@@ -159,6 +161,33 @@ class ClaudeClassification(unittest.TestCase):
 
 
 class CodexClassification(unittest.TestCase):
+    def test_model_footer_without_a_composer_is_not_permission_to_type(self):
+        self.assertEqual(pg.classify_pane(CODEX_157_FOOTER, pg.CODEX).state, "unknown")
+
+    def test_current_codex_composer_and_model_footer_are_idle_ready(self):
+        for capture in (CODEX_157_IDLE, "› stale startup draft\n" + CODEX_157_IDLE):
+            v = pg.classify_pane(capture, pg.CODEX)
+            self.assertEqual((v.state, v.pending), ("idle-ready", ""))
+        self.assertEqual(pg.pending_text(CODEX_157_IDLE, pg.CODEX), "")
+        self.assertEqual(pg.composer_text(CODEX_157_IDLE, pg.CODEX), "")
+        self.assertEqual(pg.after_prompt(CODEX_157_IDLE, pg.CODEX), f"\n{CODEX_157_FOOTER.strip()}")
+
+    def test_current_codex_glyph_with_a_typed_draft_is_pending(self):
+        capture = f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n"
+        v = pg.classify_pane(capture, pg.CODEX)
+        self.assertEqual((v.state, v.pending), ("pending", "half typed"))
+        self.assertEqual(pg.composer_text(capture, pg.CODEX), "half typed")
+
+    def test_both_codex_glyphs_are_recognized_when_the_prompt_changes(self):
+        capture = "› stale draft\n\x1b[1m»\x1b[0m current draft\n"
+        self.assertEqual(pg.pending_text(capture, pg.CODEX), "current draft")
+        self.assertEqual(pg.composer_text(capture, pg.CODEX), "current draft")
+        self.assertEqual(pg.after_prompt(capture, pg.CODEX), "")
+
+    def test_current_codex_picker_row_is_busy(self):
+        v = pg.classify_pane("  Select Model and Effort\n» 4. gpt-5.5 (current)\n", pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+
     def test_dim_placeholder_is_idle_ready_not_pending(self):
         v = pg.classify_pane(CODEX_DIM_IDLE, pg.CODEX)
         self.assertEqual((v.state, v.pending), ("idle-ready", ""))

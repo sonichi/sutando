@@ -23,26 +23,15 @@ exec 9>&1
 
 set -u
 
-# Defined above the runner because the runner is where a worker can put its name
-# down BEFORE the handler publishes the result that record attributes.
+# The handler records ownership before publishing; this wrapper passes its
+# resolved interpreter to the shared stage writer.
 record_worker_done() {
-  local task_id="${1%.txt}" stage="$2" ws="$3"
-  # Only a pool recipient has a claim to record, and the core cannot locate the
-  # writer: its spawner injects one, so unset means "not a worker", not an error.
-  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
-  [ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
-  # `-f` not `-x`: we hand it to the interpreter below, so the execute bit is
-  # the wrong property to require of a script the pool may ship non-executable.
-  [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
-  # The RESOLVED interpreter, never the shebang: a worker's PATH python3 may be
-  # the macOS CLT stub, which is why the launcher forwards one at all.
-  [ -n "${SUTANDO_PY_BIN:-}" ] || return 1
-  "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" \
-    --workspace "$ws" --recipient "$SUTANDO_INSTANCE_ID" \
-    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
+  write_worker_stage "$1" "$2" "$3" "${SUTANDO_PY_BIN:-}"
 }
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=delivery/worker-stage.sh
+source "$__SCRIPT_DIR/delivery/worker-stage.sh"
 # shellcheck source=watcher_sentinel.sh
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh

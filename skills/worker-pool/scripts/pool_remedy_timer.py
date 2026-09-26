@@ -9,35 +9,78 @@ core at all. It runs the sweep and nothing else; `escalate` decisions are still
 returned to whoever reads the log, never acted on.
 
     python3 pool_remedy_timer.py install   --workspace WS --repo REPO [--interval 300]
-    python3 pool_remedy_timer.py uninstall
-    python3 pool_remedy_timer.py status
+    python3 pool_remedy_timer.py uninstall --workspace WS
+    python3 pool_remedy_timer.py status    --workspace WS
 
-Idempotent: install boots the existing job out before bootstrapping the rendered
-plist, so re-running after a path or interval change replaces the job in place.
+Each resolved workspace has its own label. Install migrates a legacy singleton
+only when its plist names that workspace, preserving other pools' timers.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows can import spawn_worker even though it has no launchd.
+    fcntl = None
 
 LABEL = "com.sutando.pool-remedy"
 DEFAULT_INTERVAL_S = 300
 _HERE = Path(__file__).resolve().parent
 
 
-def plist_path(launch_agents: Path | None = None) -> Path:
-    base = launch_agents or (Path.home() / "Library" / "LaunchAgents")
-    return base / f"{LABEL}.plist"
+def label_for(workspace) -> str:
+    digest = hashlib.sha256(os.fsencode(Path(workspace).resolve())).hexdigest()[:16]
+    return f"{LABEL}.{digest}"
 
 
-def service_target() -> str:
+def _launch_agents(launch_agents: Path | None = None) -> Path:
+    return Path(launch_agents) if launch_agents is not None else Path.home() / "Library" / "LaunchAgents"
+
+
+def plist_path(workspace, launch_agents: Path | None = None) -> Path:
+    return _launch_agents(launch_agents) / f"{label_for(workspace)}.plist"
+
+
+def legacy_plist_path(launch_agents: Path | None = None) -> Path:
+    return _launch_agents(launch_agents) / f"{LABEL}.plist"
+
+
+@contextmanager
+def timer_lock(launch_agents: Path | None = None):
+    """Serialize auto-ensure and explicit CLI changes to the host's timer jobs."""
+    if fcntl is None:
+        raise RuntimeError("launchd timer requires Unix file locking")
+    base = _launch_agents(launch_agents)
+    base.mkdir(parents=True, exist_ok=True)
+    with open(base / f".{LABEL}.lock", "a+b") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def service_target(workspace) -> str:
+    return f"gui/{os.getuid()}/{label_for(workspace)}"
+
+
+def legacy_service_target() -> str:
     return f"gui/{os.getuid()}/{LABEL}"
+
+
+def remedy_script_path() -> str:
+    return str(_HERE / "pool_remedy.py")
 
 
 def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
@@ -56,8 +99,8 @@ def render(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S,
         parts.insert(0, str(Path(tmux).parent))
     path = ":".join(dict.fromkeys(parts)) or os.defpath
     return {
-        "Label": LABEL,
-        "ProgramArguments": [python or sys.executable, str(_HERE / "pool_remedy.py"),
+        "Label": label_for(workspace),
+        "ProgramArguments": [python or sys.executable, remedy_script_path(),
                              "--workspace", str(workspace), "--repo", str(repo), "--sweep"],
         "StartInterval": int(interval_s),
         "RunAtLoad": True,
@@ -78,62 +121,142 @@ def _launchctl(argv, runner=None):
     return subprocess.run(["launchctl", *argv], capture_output=True, text=True)
 
 
-def is_loaded(runner=None) -> bool:
-    return _launchctl(["print", service_target()], runner).returncode == 0
+def _is_loaded(target, runner=None) -> bool:
+    return _launchctl(["print", target], runner).returncode == 0
 
 
-def bootout(runner=None, *, sleep=time.sleep) -> None:
-    if not is_loaded(runner):
+def is_loaded(workspace, runner=None) -> bool:
+    return _is_loaded(service_target(workspace), runner)
+
+
+def _bootout(target, runner=None, *, sleep=time.sleep) -> None:
+    if not _is_loaded(target, runner):
         return
-    _launchctl(["bootout", service_target()], runner)
+    result = _launchctl(["bootout", target], runner)
+    if result.returncode != 0:
+        raise RuntimeError(f"launchctl bootout failed rc={result.returncode}: "
+                           f"{(result.stderr or result.stdout or '').strip()}")
     # bootout is asynchronous; a bootstrap that races it fails as "already loaded".
     for _ in range(10):
-        if not is_loaded(runner):
+        if not _is_loaded(target, runner):
             return
         sleep(0.3)
+    raise RuntimeError(f"launchctl service remained loaded after bootout: {target}")
+
+
+def bootout(workspace, runner=None, *, sleep=time.sleep) -> None:
+    _bootout(service_target(workspace), runner, sleep=sleep)
+
+
+def _status_for(label, dest, runner=None) -> dict:
+    out = {"plist": str(dest), "label": label, "installed": dest.exists(),
+           "loaded": _is_loaded(f"gui/{os.getuid()}/{label}", runner)}
+    if not out["installed"]:
+        return out
+    try:
+        with open(dest, "rb") as fh:
+            job = plistlib.load(fh)
+        if job.get("Label") != label:
+            raise ValueError(f"plist label {job.get('Label')!r} does not match {label!r}")
+        out["interval_s"] = job.get("StartInterval")
+        out["log"] = job.get("StandardOutPath")
+        args = job.get("ProgramArguments") or []
+        if len(args) > 1:
+            out["script"] = args[1]
+        for key in ("workspace", "repo"):
+            flag = "--" + key
+            if flag in args and args.index(flag) + 1 < len(args):
+                out[key] = args[args.index(flag) + 1]
+    except (OSError, ValueError, TypeError) as e:
+        out["error"] = f"plist unreadable: {e}"
+    return out
+
+
+def status(workspace, *, launch_agents: Path | None = None, runner=None) -> dict:
+    return _status_for(label_for(workspace), plist_path(workspace, launch_agents), runner)
+
+
+def legacy_status(*, launch_agents: Path | None = None, runner=None) -> dict:
+    return _status_for(LABEL, legacy_plist_path(launch_agents), runner)
 
 
 def install(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S, python=None,
             launch_agents: Path | None = None, runner=None,
             sleep=time.sleep) -> dict:
     job = render(workspace, repo, interval_s=interval_s, python=python)
-    dest = plist_path(launch_agents)
+    dest = plist_path(workspace, launch_agents)
     dest.parent.mkdir(parents=True, exist_ok=True)
     Path(job["StandardOutPath"]).parent.mkdir(parents=True, exist_ok=True)
+    prior = status(workspace, launch_agents=launch_agents, runner=runner)
+    old_bytes = dest.read_bytes() if dest.exists() else None
+    legacy = legacy_status(launch_agents=launch_agents, runner=runner)
+    migrate = (legacy.get("installed") and not legacy.get("error")
+               and legacy.get("workspace")
+               and Path(legacy["workspace"]).resolve() == Path(workspace).resolve())
+    legacy_hold = (Path(legacy["plist"]).with_name(f".{LABEL}.{uuid.uuid4().hex}.migrating")
+                   if migrate else None)
     tmp = dest.with_name(dest.name + ".tmp")
     with open(tmp, "wb") as fh:
         plistlib.dump(job, fh)
     os.replace(tmp, dest)
-    bootout(runner, sleep=sleep)
-    r = _launchctl(["bootstrap", f"gui/{os.getuid()}", str(dest)], runner)
-    if r.returncode != 0:
-        raise RuntimeError(f"launchctl bootstrap failed rc={r.returncode}: "
-                           f"{(r.stderr or r.stdout or '').strip()}")
-    return {"plist": str(dest), "label": LABEL, "interval_s": job["StartInterval"],
-            "log": job["StandardOutPath"], "loaded": is_loaded(runner)}
+    try:
+        bootout(workspace, runner, sleep=sleep)
+        if migrate:
+            _bootout(legacy_service_target(), runner, sleep=sleep)
+            os.replace(legacy["plist"], legacy_hold)
+        r = _launchctl(["bootstrap", f"gui/{os.getuid()}", str(dest)], runner)
+        if r.returncode != 0:
+            raise RuntimeError(f"launchctl bootstrap failed rc={r.returncode}: "
+                               f"{(r.stderr or r.stdout or '').strip()}")
+    except (RuntimeError, OSError) as e:
+        rollback_errors = []
+        try:
+            if old_bytes is None:
+                dest.unlink(missing_ok=True)
+            else:
+                tmp.write_bytes(old_bytes)
+                os.replace(tmp, dest)
+        except OSError as restore_error:
+            rollback_errors.append(str(restore_error))
+        if migrate and legacy_hold.exists():
+            try:
+                os.replace(legacy_hold, legacy["plist"])
+            except OSError as restore_error:
+                rollback_errors.append(str(restore_error))
+        for was_loaded, target, path in (
+                (prior["loaded"], service_target(workspace), str(dest)),
+                (bool(migrate and legacy["loaded"]), legacy_service_target(), legacy["plist"])):
+            if was_loaded and not _is_loaded(target, runner):
+                if not Path(path).exists():
+                    rollback_errors.append(f"could not restore {target}: plist missing at {path}")
+                    continue
+                restored = _launchctl(["bootstrap", f"gui/{os.getuid()}", path], runner)
+                if restored.returncode != 0:
+                    rollback_errors.append(f"could not restore {target}: "
+                                           f"{(restored.stderr or restored.stdout or '').strip()}")
+        if rollback_errors:
+            raise RuntimeError(f"{e}; rollback failed: {'; '.join(rollback_errors)}") from e
+        raise
+    if migrate:
+        legacy_hold.unlink(missing_ok=True)
+    return {"plist": str(dest), "label": job["Label"], "interval_s": job["StartInterval"],
+            "log": job["StandardOutPath"], "loaded": is_loaded(workspace, runner),
+            "legacy_migrated": bool(migrate)}
 
 
-def uninstall(*, launch_agents: Path | None = None, runner=None,
+def uninstall(workspace, *, launch_agents: Path | None = None, runner=None,
               sleep=time.sleep) -> dict:
-    bootout(runner, sleep=sleep)
-    dest = plist_path(launch_agents)
+    bootout(workspace, runner, sleep=sleep)
+    dest = plist_path(workspace, launch_agents)
     removed = dest.exists()
     dest.unlink(missing_ok=True)
-    return {"plist": str(dest), "removed": removed, "loaded": is_loaded(runner)}
-
-
-def status(*, launch_agents: Path | None = None, runner=None) -> dict:
-    dest = plist_path(launch_agents)
-    out = {"plist": str(dest), "installed": dest.exists(), "loaded": is_loaded(runner)}
-    if out["installed"]:
-        try:
-            with open(dest, "rb") as fh:
-                job = plistlib.load(fh)
-            out["interval_s"] = job.get("StartInterval")
-            out["log"] = job.get("StandardOutPath")
-        except (OSError, ValueError) as e:
-            out["error"] = f"plist unreadable: {e}"
-    return out
+    legacy = legacy_status(launch_agents=launch_agents, runner=runner)
+    if (legacy.get("installed") and legacy.get("workspace")
+            and Path(legacy["workspace"]).resolve() == Path(workspace).resolve()):
+        _bootout(legacy_service_target(), runner, sleep=sleep)
+        Path(legacy["plist"]).unlink(missing_ok=True)
+        removed = True
+    return {"plist": str(dest), "removed": removed, "loaded": is_loaded(workspace, runner)}
 
 
 def main(argv=None) -> int:
@@ -147,14 +270,18 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     la = Path(a.launch_agents) if a.launch_agents else None
     try:
+        if not a.workspace:
+            p.error(f"{a.command} needs --workspace")
         if a.command == "install":
-            if not (a.workspace and a.repo):
-                p.error("install needs --workspace and --repo")
-            out = install(a.workspace, a.repo, interval_s=a.interval, launch_agents=la)
+            if not a.repo:
+                p.error("install needs --repo")
+            with timer_lock(la):
+                out = install(a.workspace, a.repo, interval_s=a.interval, launch_agents=la)
         elif a.command == "uninstall":
-            out = uninstall(launch_agents=la)
+            with timer_lock(la):
+                out = uninstall(a.workspace, launch_agents=la)
         else:
-            out = status(launch_agents=la)
+            out = status(a.workspace, launch_agents=la)
     except (ValueError, RuntimeError, OSError) as e:
         print(f"pool_remedy_timer: {e}", file=sys.stderr)
         return 1
