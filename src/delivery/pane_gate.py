@@ -264,6 +264,12 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     if start is None:
         return None
     block = lines[start:]
+    # The CLI boxes the composer: everything past its closing rule is frame (footer, tip,
+    # "⧉ <artifact>" strip), whatever a release draws there. The pops below cover no-box builds.
+    for i in range(1, len(block)):
+        if BORDER_LINE.match(block[i]):
+            block = block[:i]
+            break
 
     def _pop_borders():
         while len(block) > 1 and BORDER_LINE.match(block[-1]):

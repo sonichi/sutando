@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import pathlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -432,6 +433,43 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
             code = pg.main(["composer-text", "--runtime", "claude"])
         self.assertEqual(code, pg.EXIT_UNSAFE)
         self.assertEqual(out.getvalue(), "")
+
+
+class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
+    """The recurrence of #4320 round 5 with a new trailing row (2026-09-25, two
+    deliveries the owner had to press Enter on himself): Claude Code boxes the
+    composer, and below the closing rule it now also draws an attachment strip
+    ("⧉ <artifact>") after the status row. The trailing-row pops matched neither
+    that strip nor the status row behind it, so the rule, the status row and the
+    strip were all glued onto the staged text and EXACT equality never held.
+    The composer ends at its closing rule; everything after it is frame."""
+
+    REAL = pathlib.Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
+
+    def test_the_real_capture_reads_as_exactly_the_staged_prompt(self):
+        text = pg.composer_text(self.REAL.read_text())
+        self.assertTrue(text.startswith("Sutando task ready: task-325dc8f4149e103d54.txt."), text[:80])
+        self.assertTrue(text.rstrip().endswith('--inbox  "/Users/wangchi/stando-ui/sutando/workspace/deliveries/17c6c3222a4a483b8c68652d58018ad7"'), text[-120:])
+        for frame in ("⏵⏵", "⧉", "─", "bypass permissions"):
+            self.assertNotIn(frame, text)
+
+    def test_a_status_row_and_an_attachment_strip_below_the_rule_are_frame(self):
+        capture = ("❯ Sutando task ready: task-x.txt\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells, 1 monitor · 1 feedback draft\n"
+                   "  ⧉  errand-deck\n")
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
+
+    def test_owner_rows_above_the_rule_survive_even_when_they_look_like_frame(self):
+        capture = ("❯ first line\n"
+                   "  ⧉ this is what I typed\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells\n")
+        self.assertEqual(pg.composer_text(capture), "first line  ⧉ this is what I typed")
+
+    def test_no_rule_still_strips_the_one_row_footer(self):
+        capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\n"
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
 
 
 class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
