@@ -218,6 +218,38 @@ def test_restore_refuses_another_rooms_snapshot():
     assert rc != 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
 
 
+def test_the_document_snapshots_to_stdout_and_restores_only_when_applied():
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["snapshot", "!r:s"], doc)
+    body = json.loads(out)
+    assert rc == 0 and body["surface"] == "markdown" and body["text"] == "hello", body
+    snap = _snapshot_file({"room": "!r:s", "surface": "markdown", "text": "the saved text"})
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["restore", "!r:s", snap], doc)
+    assert rc == 0 and json.loads(out)["text_differs"] is True, out
+    assert not any(c[0] in ("replace", "append") for c in doc.calls), "a dry run writes nothing"
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("replace", "hello", "the saved text") in doc.calls, doc.calls
+    doc = FakeDoc()
+    doc.text = ""
+    rc, _ = run_cli(BASE + ["restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("append", "the saved text") in doc.calls, "an empty document is appended to"
+
+
+def test_restore_refuses_what_is_not_a_snapshot_of_this_surface():
+    import tempfile
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["restore", "!r:s", tempfile.mktemp(suffix=".json")], doc)
+    assert rc != 0, "an unreadable file is refused"
+    assert run_cli(BASE + ["restore", "!r:s", _snapshot_file(["not", "a", "snapshot"])], doc)[0] != 0
+    no_text = _snapshot_file({"room": "!r:s", "surface": "markdown", "elements": []})
+    assert run_cli(BASE + ["restore", "!r:s", no_text, "--apply"], doc)[0] != 0
+    rc, _ = run_cli(BASE + ["--kind", "kanban", "snapshot", "!r:s"], doc)
+    assert rc != 0, "the kanban is out of scope, and says so"
+    assert not any(c[0] in ("replace", "append", "put") for c in doc.calls), doc.calls
+
+
 def test_an_edit_of_an_element_changed_since_reading_is_refused():
     """The board holds "a" at v1. Sending v1 again (a tie) or v0 means the writer
     read an older state: refuse, write nothing, name the element."""
