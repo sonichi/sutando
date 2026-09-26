@@ -38,7 +38,7 @@ test('fireGuardedRestart spawns the guarded wrapper, detached', () => {
 });
 
 test('the wrapper path is the repo restart-voice-agent.sh and it exists', () => {
-	assert.match(GUARDED_RESTART_SCRIPT, /scripts\/restart-voice-agent\.sh$/);
+	assert.match(GUARDED_RESTART_SCRIPT, /scripts[\\/]restart-voice-agent\.sh$/);
 	assert.ok(existsSync(GUARDED_RESTART_SCRIPT), `${GUARDED_RESTART_SCRIPT} missing`);
 	// And it really is the guarded wrapper: it runs the voice-lock.py takeover
 	// transaction before its kickstart.

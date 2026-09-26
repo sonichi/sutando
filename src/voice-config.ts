@@ -27,10 +27,9 @@
  * works on BOTH the MAIN and VOICE Gemini keys (3.1+search needs paid-tier
  * entitlement that only MAIN currently has on most setups; 3.1 without search
  * works on either key but loses Web grounding by default — that's degrading
- * capability rather than picking a safe baseline). Surfaces that explicitly
- * want a different combo (e.g. voice-agent prefers 3.1 + search:false for the
- * web client's code-heavy workload) ship a `.example` template carrying that
- * override. Phone inherits the default, so a fresh install behaves identically.
+ * capability rather than picking a safe baseline). The browser voice-agent
+ * surface explicitly ships a newer `.example` template; phone inherits this
+ * package default unless its own config overrides it.
  */
 
 import { readFileSync, existsSync } from 'fs';
