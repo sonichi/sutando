@@ -201,8 +201,10 @@ def _load_existing_roster_strict(workspace):
     p = roster_path(workspace)
     try:
         text = p.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+    except FileNotFoundError as e:
+        if not os.path.lexists(p):
+            return None
+        raise RosterError(f"roster entry exists but cannot be followed: {p}: {e}") from e
     except OSError as e:
         raise RosterError(f"roster unreadable, refusing to touch it: {p}: {e}") from e
     try:
