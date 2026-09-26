@@ -99,7 +99,7 @@ class EnsurePerSeat(unittest.TestCase):
         self.assertIn(f"--socket={SOCK}", words)
         self.assertIn(f"--session={NAME}", words)
         self.assertIn(f"--out={self.ws}/state/core-supervisor.{NAME}.json", words)
-        self.assertIn("--seat=worker comm (7c54b230)", words)
+        self.assertIn(f"--seat=worker comm ({WID})", words)
 
     def test_idempotent_by_its_tmux_session(self):
         t = Tmux({NAME, NAME + "-input"})

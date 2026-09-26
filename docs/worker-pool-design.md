@@ -44,16 +44,24 @@ be captured reliably. A dead Codex worker starts a fresh conversation under
 the same worker ID and inbox; `--resume` refuses rather than claim continuity it
 cannot prove. Pending deliveries remain assigned to that worker.
 
-**A worker has an id and a label.** The id is the worker's identity, opaque, never
-changed or reused; every path, filename, roster key and header names it. The label
-is the owner's display name — mutable, one roster field, never in a path or a glob.
-Renaming is a one-field edit. Labels resolve to ids where intent is captured, never
-at routing.
+**A worker has an id, a base label, and an optional display override.** The id is
+the worker's identity, opaque, never changed or reused; every path, filename,
+roster key and header names it. The base `label` is a mutable routing alias,
+never in a path or glob. An exact full ID or `core` selects that recipient;
+unique base and display labels resolve to a worker ID where intent is captured.
+A human name shared by workers is refused. New broker display names equal to
+`core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
+Registration refuses a new ID already used as another worker's name. The
+optional `display_label` from AG2 Space also changes the name shown to people;
+removing it restores the base label. Human status renders the effective name
+with the full ID, such as
+`kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
 
 | field | example | use |
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
-| `label` | `worker-1`, `code reviewer` | shown to the owner; renameable |
+| `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
+| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
@@ -453,11 +461,24 @@ parses the headers with `local_task_protocol`, never by hand.
 
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
- "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","state":"live","model":"…","scopes":["…"]}},
+ "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","display_label":"kc-reviewer-ryan","state":"live","model":"…","scopes":["…"]}},
  "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
 ```
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
+
+The broker's complete `display.worker_labels` map is applied atomically under
+the roster lock. `worker_label_config_version` tracks the last fully applied
+label snapshot independently of the general `config_version`, and
+`worker_label_profile_mxid` scopes that cursor to the enrolled profile. A new
+profile may start at a lower version. Unrelated roster compiles preserve both
+fields. Retired IDs are ignored. A snapshot with an unknown ID can update
+known workers, but it does not advance the label version, so a later poll can
+apply the missing worker after registration. A broker label edit can persist
+without advancing `config.version`, so reapplying the current version follows
+the owner's map and also repairs local label drift. The pool advertisement, session
+list, and human status use `display_label` when present. Routing accepts the
+display name when unique, while the roster key and base label remain unchanged.
 
 ### Router pass
 
