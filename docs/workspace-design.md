@@ -76,6 +76,7 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |
 | `logs/conversation.log` | ❌ no | Per-host runtime | Voice/phone/discord log; large + per-host |
 | `data/conversation.sqlite` | ❌ no | Per-host runtime | SQLite mirror of conversation log |
+| `skills/<name>/` | opt-in (`vault.sync.include`) | Persistent, user-authored | Your own skills; `skills/install.sh` links them next to the shipped ones and survives an engine update. A synced workspace runs them on every host, so only skills you trust belong here |
 | `skill-repos/<repo-name>/` | ❌ no | Per-host clone | Git checkouts of skill **source** repos; each is linked by its OWN installer, not by `skills/install.sh` |
 | `.env` | ❌ no | Per-host secret | Tokens, API keys — must NOT sync |
 
@@ -89,7 +90,7 @@ Clone skill repos there rather than into `$HOME`. A checkout outside the workspa
 
 `skill-repos/` is **not** synced. The blanket `*` in the carrier-set gitignore already excludes it, which is what you want: these are independent git repos with their own remotes and history, some of them large, and the vault should not be carrying a nested checkout.
 
-**`skills/install.sh` does not manage these.** It iterates only its own directory — `for skill_dir in "$SKILLS_DIR"/*/` — so it links the built-in `skills/*/` of this repo and nothing else; the string `skill-repos` does not appear in it. Each external checkout is linked by **its own** installer, at `skill-repos/<repo-name>/scripts/install.sh`. Measured on this host: 58 links point into this repo, 35 into `skill-repos/`, 3 elsewhere.
+**`skills/install.sh` does not manage these.** It iterates its own directory — `for skill_dir in "$SKILLS_DIR"/*/` — and `<workspace>/skills/*/`, so it links the built-in `skills/*/` of this repo and the owner's own skills and nothing else; the string `skill-repos` does not appear in it. Each external checkout is linked by **its own** installer, at `skill-repos/<repo-name>/scripts/install.sh`. Measured on this host: 58 links point into this repo, 35 into `skill-repos/`, 3 elsewhere.
 
 Relocating a clone therefore depends on which installer owns it, because they differ on the one step that matters:
 

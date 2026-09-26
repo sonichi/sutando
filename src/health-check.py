@@ -855,7 +855,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -863,7 +864,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
