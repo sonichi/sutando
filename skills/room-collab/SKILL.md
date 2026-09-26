@@ -51,9 +51,9 @@ comment on it and change it with you.
 | a set of records (items, rows, a list of things) | a **database** | `--kind db create --template …` or `import` a CSV |
 | numbers to add up or compare | a **sheet** | `--kind sheet import data.csv --at A1` |
 
-**Read the room first.** Start with its README (`--kind readme`, below). Before
-you add anything, or answer a question the room may already answer, look at what
-is there. `presence` shows which surfaces are
+**Read the room first.** Before you add anything, or answer a question the room
+may already answer, look at what is there (the README, below, holds the room's
+purpose and rules when you need them). `presence` shows which surfaces are
 live, `pages` (and `pages --kind markdown`) and `--kind db dbs` list what exists,
 and `search '!room' "words"` looks through every Doc page, HTML page, database row
 and sheet row at once. Then build on it: update the page that already covers the
@@ -101,9 +101,11 @@ areas when it is installed.
 
 Every room has one standing document, its README (`--kind readme`), pinned first
 in the Doc's page list: the room's context and rules, kept by the room admin's
-agent. Read it when you join or are summoned, and after that only when its
-`updated` date has moved: it rarely changes, and a busy room should not pay for it
-on every turn.
+agent. It is background, not a gate. When you are summoned, the passage, page or
+thread you were called to is the context that matters: start there and answer.
+Read the README when you are new to the room, or when the task needs what only it
+holds (the room's purpose, its rules, who is who); never make someone wait on it.
+After one read, look again only when its `updated` date has moved.
 
 What is firm:
 - Only room admins (power level 100 by default, or the room's `space.ag2.readme`
