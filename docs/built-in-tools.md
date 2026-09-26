@@ -59,8 +59,11 @@ Content here...
 
 **Email (Gmail, Outlook)** — the Station connector first: `composio_find` `{"apps": ["gmail"], "query": "<what
 you need>"}`, then `composio_exec` with the action it returns (search, read, draft, send). Not connected →
-the `connect-apps` skill, as for Calendar. Fallback only when the Station tools aren't available: the
-`gws-gmail` skill (OAuth, no app password needed):
+the `connect-apps` skill, as for Calendar; never ask the owner to generate an app password (connecting is
+one Connect card). **After a send, read it back**: fetch the sent message by id and confirm recipient and
+subject match what the owner approved before reporting it sent — that is the check the older draft/send
+mismatch incidents lacked. Fallback only when the Station tools aren't available: the
+`gws-gmail` skill (OAuth, no app password needed), and after that the app-password IMAP/SMTP path below:
 ```bash
 gws gmail +send --to "to@x.com" --subject "subj" --body "body"
 gws gmail +triage                               # unread inbox summary

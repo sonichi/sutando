@@ -178,6 +178,13 @@ It is read from the task's words and a 30-second cache of the owner's connection
 - Anything else (`mentions=` with `connected=unknown`, an app the request needs that the line does
   not name, a `needs_connect=none`, no line at all): call `composio_find` **once**, with `apps`
   naming every app the request needs and `query` set to the request.
+- `prefer_skill=<skill> for <app>`: a local skill owns that app's job end to end with the owner's own
+  API key from the vault (Smartlead → `campaign-runner`: attach mailboxes, upload leads, write the
+  sequence, preflight, launch). `installed`: invoke that skill and never `composio_exec` the bare
+  toolkit for campaign, sequence, mailbox or lead-upload work — the bare Smartlead connector only
+  creates, reads and deletes a campaign shell, which is what left the owner doing the rest by hand.
+  `not installed`: offer to install it (`marketplace` skill, `install <skill>`), then continue with
+  it; no Connect card for that app.
 
 For each app the request needs:
 

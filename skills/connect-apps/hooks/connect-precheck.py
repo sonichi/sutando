@@ -70,21 +70,38 @@ def load_table(path: Path = TABLE_PATH) -> list[dict]:
         words = [k for k in app.get("keywords") or [] if isinstance(k, str) and k.strip()]
         patterns = [re.compile(r"(?<![a-z0-9])" + re.escape(k.strip().lower()).replace(r"\ ", r"\s+") + r"(?![a-z0-9])")
                     for k in words]
+        prefer = app.get("prefer_skill")
         out.append({"slug": app["slug"], "name": app.get("name") or app["slug"], "patterns": patterns,
-                    "keywords": words})
+                    "keywords": words, "prefer_skill": prefer if isinstance(prefer, str) and prefer.strip() else None})
     return out
 
 
 def match_apps(text: str, table: list[dict]) -> list[dict]:
-    """The apps the text names, in table order, each with the keyword that matched."""
+    """The apps the text names, in table order, each with the keyword that matched. A match lying strictly
+    inside another app's longer match at that spot does not count ("email" in "cold email"); one elsewhere does."""
     low = " ".join(text.lower().split())
+    matched = [(app, [(kw, m.span()) for kw, pat in zip(app["keywords"], app["patterns"]) for m in pat.finditer(low)])
+               for app in table]
+    matched = [(app, spans) for app, spans in matched if spans]
     hits = []
-    for app in table:
-        for kw, pat in zip(app["keywords"], app["patterns"]):
-            if pat.search(low):
-                hits.append({"slug": app["slug"], "name": app["name"], "keyword": kw})
-                break
+    for app, spans in matched:
+        others = [sp for other, ospans in matched if other is not app for _, sp in ospans]
+        own = [kw for kw, (s, e) in spans if not any(a <= s and e <= b and (a, b) != (s, e) for a, b in others)]
+        if own:
+            hits.append({"slug": app["slug"], "name": app["name"], "keyword": own[0],
+                         "prefer_skill": app.get("prefer_skill")})
     return hits
+
+
+def skill_installed(name: str) -> bool:
+    """True when the skill is materialised where the core loads skills from (<claude home>/skills)."""
+    try:
+        sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+        from util_paths import claude_home_path  # noqa: PLC0415
+        root = claude_home_path("skills")
+    except Exception:  # noqa: BLE001 — no core tree: the stock default only
+        root = Path.home() / ".claude" / "skills"
+    return (root / name / "SKILL.md").is_file()
 
 
 # --------------------------------------------------------------------------- the task
@@ -197,14 +214,20 @@ def first_touch(ws: Path, sid: str, tid: str, event: str, now: float) -> bool:
 
 def context_line(hits: list[dict], connected: set[str] | None, fields: dict, tid: str) -> str:
     kind = room_kind(fields)
+    # An app a local skill owns end to end is the skill's job: no Connect card, no bare connector.
+    skilled = [h for h in hits if h.get("prefer_skill")]
+    hits = [h for h in hits if not h.get("prefer_skill")]
     if connected is None:
-        parts = ["mentions=" + ",".join(f"{h['slug']} ({h['name']})" for h in hits),
+        parts = ["mentions=" + (",".join(f"{h['slug']} ({h['name']})" for h in hits) or "none"),
                  "connected=unknown (cache cold; connectors.py card or status reads the cloud)"]
         missing = [h["slug"] for h in hits]
     else:
         missing = [h["slug"] for h in hits if h["slug"] not in connected]
         parts = ["needs_connect=" + (",".join(f"{h['slug']} ({h['name']})" for h in hits if h["slug"] in missing) or "none"),
                  "connected=" + (",".join(sorted(connected)[:MAX_CONNECTED]) or "none")]
+    for h in skilled:
+        state = "installed" if skill_installed(h["prefer_skill"]) else "not installed: offer to install it (marketplace skill)"
+        parts.append(f"prefer_skill={h['prefer_skill']} for {h['slug']} ({state}; never the bare {h['slug']} connector)")
     parts.append(f"room_kind={kind}")
     parts.append(f"reply_to={reply_to(fields)}")
     if missing and card_eligible(fields):
