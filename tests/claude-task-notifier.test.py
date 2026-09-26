@@ -146,6 +146,12 @@ class FakeTmuxHarness(unittest.TestCase):
         # took), never consumed; paste_count numbers them from 1.
         self.drop_paste_from_flag = self.root / "drop-paste-from.flag"
         self.paste_count = self.root / "paste-count.txt"
+        # Window rows (29, a pool worker's): above 29 the box fits and the view flag lapses;
+        # resize-window logs `RESIZE -y N enters=<ENTERs so far>`; the flags: exit 1, pane unchanged.
+        self.window_rows = self.root / "window-rows.txt"
+        self.resize_log = self.root / "resize.log"
+        self.grow_fails_flag = self.root / "grow-fails.flag"
+        self.split_pane_flag = self.root / "split-pane.flag"
         # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
         # rows from row N (0-based): the box cut by the screen bottom on a short pane.
         self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
@@ -277,7 +283,9 @@ case "$cmd" in
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
     fi
-    if [ -f "{self.composer_view_rows_flag}" ]; then
+    grown=0; [ "$(cat "{self.window_rows}" 2>/dev/null || echo 29)" -gt 29 ] && grown=1
+    [ -f "{self.split_pane_flag}" ] && grown=0
+    if [ -f "{self.composer_view_rows_flag}" ] && [ "$grown" = 0 ]; then
       out="$(printf '%s\\n' "$out" | python3 "{self.view_py}" "$(cat "{self.composer_view_rows_flag}")")"
     fi
     if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
@@ -296,6 +304,7 @@ case "$cmd" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
       *pane_pid*) cat "{self.pane_pid_file}" 2>/dev/null || echo 4242 ;;
+      *window_height*) cat "{self.window_rows}" 2>/dev/null || echo 29 ;;
 
       *pane_id*)
         if [ -f "{self.pane_gone_flag}" ]; then echo ""; exit 0; fi
@@ -312,6 +321,8 @@ case "$cmd" in
       shift 2  # -l --
       text="$1"
       printf 'CAPTURES@%s\\nTYPE %s\\n' "$(cat "{self.capture_count}" 2>/dev/null || echo 0)" "$text" >> "{self.sendkeys_log}"
+      # Real tmux: a trailing ';' is its command separator and is lost; a trailing '\\;' lands as ';'.
+      case "$text" in *'\\;') text="${{text%\\\\;}};" ;; *';') text="${{text%;}}" ;; esac
       if [ -f "{self.cut_paste_over_flag}" ] && [ "${{#text}}" -gt "$(cat "{self.cut_paste_over_flag}")" ]; then
         text="${{text:$(cat "{self.cut_paste_over_flag}")}}"
       fi
@@ -366,6 +377,13 @@ PYEOF
         append_typed "owner is typing something else"
       fi
     fi
+    exit 0
+    ;;
+  resize-window)
+    [ -f "{self.grow_fails_flag}" ] && exit 1
+    rows=""; while [ $# -gt 0 ]; do [ "$1" = -y ] && rows="$2"; shift; done
+    printf 'RESIZE -y %s enters=%s\\n' "$rows" "$({{ grep -c '^ENTER' "{self.sendkeys_log}" || true; }} 2>/dev/null)" >> "{self.resize_log}"
+    echo "$rows" > "{self.window_rows}"
     exit 0
     ;;
   new-session|kill-session|setenv)

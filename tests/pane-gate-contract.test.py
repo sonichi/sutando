@@ -513,6 +513,21 @@ class ComposerFrameVisibility(unittest.TestCase):
     def test_no_prompt_line_is_unknown(self):
         self.assertIsNone(pg.composer_frame_visible("just transcript\n"))
 
+    def test_the_cli_prints_visible_cut_or_refuses(self):
+        import contextlib
+        import io
+        cases = [(self.REAL.read_text(), "visible\n", 0), ("❯ typed text\n  more typed text\n", "cut\n", 0),
+                 ("just transcript\n", "", pg.EXIT_UNSAFE)]
+        for capture, want, want_code in cases:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                sys.stdin = io.StringIO(capture)
+                try:
+                    code = pg.main(["composer-frame", "--runtime", "claude"])
+                finally:
+                    sys.stdin = sys.__stdin__
+            self.assertEqual((out.getvalue(), code), (want, want_code), err.getvalue())
+
 
 class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):
     """The gate asks cli_wedge one question -- frame_abnormal -- and ranks nothing
