@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import re
 import shutil
 import signal
@@ -397,7 +398,8 @@ esac
                 f"complete the task, and write the result to {self.results_dir}/{name}. "
                 f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}. "
                 f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" '
-                f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"')
+                f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"'
+                f" #stage-{hashlib.sha256(name.encode()).hexdigest()[:10]}")
 
     def sendkeys_log_text(self):
         return self.sendkeys_log.read_text()
@@ -1309,15 +1311,17 @@ class CollapsedComposerTests(FakeTmuxHarness):
         self.assertEqual(log.count("TYPE Sutando task ready: task-collapsed.txt"), 1, "re-typing over a collapsed box appends")
         self.assertIn("ENTER", log)
         nlog = (self.logs_dir / "claude-task-notifier.log").read_text()
-        self.assertIn("waiting up to", nlog)
         self.assertNotIn("did not stage; re-typing", nlog)
 
-    def test_a_composer_that_never_settles_fails_closed_without_retyping(self):
+    def test_a_collapsed_row_that_lost_our_token_is_never_submitted(self):
+        # Owner text typed after the paste displaces the last token: the row is a
+        # tail of ours without the stage token, so it is not proof and Enter stays unpressed.
         n = self._paste_capture()
         self.sendkeys_log.write_text(""); self.capture_count.unlink()
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         self.busy_on_capture_flag.write_text(str(n))
         self.collapse_until_capture_flag.write_text("99999")
+        self.interleaved_owner_flag.write_text("1")
         self.write_task("task-stuck.txt")
         result = self.run_event("task-stuck.txt", timeout=20,
                                 env_extra={"SUTANDO_NOTIFIER_STAGE_SETTLE_TIMEOUT": "2"})
@@ -1325,7 +1329,6 @@ class CollapsedComposerTests(FakeTmuxHarness):
         log = self.sendkeys_log_text()
         self.assertEqual(log.count("TYPE"), 1)
         self.assertNotIn("ENTER", log)
-        self.assertIn("did not settle", (self.logs_dir / "claude-task-notifier.log").read_text())
 
 
 class OwnerRowResemblingUiTextTests(FakeTmuxHarness):
