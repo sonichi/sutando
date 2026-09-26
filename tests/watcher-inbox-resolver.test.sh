@@ -76,12 +76,18 @@ check $? "a hanging resolver is bounded, not left to block the watcher forever (
 
 # 2d/2e. The bound itself, on the one path production takes: a fast resolver
 #     must not wait for the deadline, and a TERM-resistant one must still die.
-export SUTANDO_INBOX_RESOLVER="$GOOD" SUTANDO_INBOX_RESOLVER_TIMEOUT=3
+#     `elapsed` is whole seconds from `date +%s`, so a 1-second budget is not a
+#     1-second budget: start and end can straddle a boundary, making the real
+#     allowance anywhere in 0-1s. Widen the deadline instead of tightening the
+#     clock -- the property is "returned on its own, not at the deadline", and a
+#     30s deadline against a <10s bound separates those two by 20s, which no
+#     runner contention closes. 2c above already uses this shape.
+export SUTANDO_INBOX_RESOLVER="$GOOD" SUTANDO_INBOX_RESOLVER_TIMEOUT=30
 start=$(date +%s)
 out="$(resolve_inbox_entry "$INBOX/task-probe1.txt" 2>/dev/null)"; rc=$?
 elapsed=$(( $(date +%s) - start ))
-[ "$rc" = "0" ] && [ "$out" = "$PAYLOAD" ] && [ "$elapsed" -le 1 ]
-check $? "bounded: a fast resolver returns at once, not at the deadline (elapsed ${elapsed}s of 3)"
+[ "$rc" = "0" ] && [ "$out" = "$PAYLOAD" ] && [ "$elapsed" -lt 10 ]
+check $? "bounded: a fast resolver returns at once, not at the deadline (elapsed ${elapsed}s of 30)"
 STUBBORN="$(mk stubborn.sh "#!/bin/sh
 trap '' TERM
 sleep 30
