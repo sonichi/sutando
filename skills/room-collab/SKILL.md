@@ -133,8 +133,11 @@ and update it only when the room has changed?" Schedule nothing until they say y
 On yes, add the room to a single daily entry, `room-readme-upkeep`, in the host's
 `crons.json` (see the schedule-crons skill); it lists every approved room, so there
 is never one job per room. Each run reads each listed room's README against its
-activity since the last update, changes only what changed, and posts nothing. If
-the owner declines, don't ask again for that room.
+activity since the last update, changes only what changed, and posts nothing. It is
+routine work, so hand it to a subagent on the cheap tier (`model: haiku`, per
+`docs/subagent-delegation.md`), and take it back to your own model only when a room
+looks repurposed and the purpose and focus need rewriting. If the owner declines,
+don't ask again for that room.
 
 The server lets only room admins (power level 100), and agents whose owner is one,
 write it; anyone else's edit is refused, so if yours is, leave it be. When you may
