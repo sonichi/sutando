@@ -298,30 +298,18 @@ composer_text() {
 # Whitespace is ignored on both sides: the input box word-wraps at the pane width and
 # indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
 prompt_is_staged() {
-  local raw="$1" prompt="$2" c p
-  c="$(composer_text "$raw" | tr -d '[:space:]')"; p="$(printf '%s' "$prompt" | tr -d '[:space:]')"
-  [ "$c" = "$p" ] && return 0
-  composer_is_our_collapsed_row "$c" "$p"
-}
-
-# A running turn collapses the composer to ONE row showing the input's last token. That
-# row is ours only if it is a suffix of the prompt ending in the prompt's stage token.
-composer_is_our_collapsed_row() {
-  local c="$1" p="$2" tok
-  tok="${p##*#stage-}"; [ "$tok" != "$p" ] || return 1; tok="#stage-$tok"
-  [ -n "$c" ] && [ "${#c}" -lt "${#p}" ] || return 1
-  case "$c" in *"$tok") ;; *) return 1 ;; esac
-  case "$p" in *"$c") return 0 ;; esac
-  return 1
+  local raw="$1" prompt="$2"
+  [ "$(composer_text "$raw" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ]
 }
 
 # The composer still carries our prompt at all (exactly, or with owner text
 # mixed in). False once it left: submitted, or queued behind a running turn.
 composer_holds_prompt() {
-  local raw="$1" prompt="$2" c p
-  c="$(composer_text "$raw" | tr -d '[:space:]')"; p="$(printf '%s' "$prompt" | tr -d '[:space:]')"
-  case "$c" in *"$p"*) return 0 ;; esac
-  composer_is_our_collapsed_row "$c" "$p"
+  local raw="$1" prompt="$2"
+  case "$(composer_text "$raw" | tr -d '[:space:]')" in
+    *"$(printf '%s' "$prompt" | tr -d '[:space:]')"*) return 0 ;;
+  esac
+  return 1
 }
 
 # A collapsed composer: one row that is a proper suffix of our prompt (the CLI shows the
@@ -418,8 +406,6 @@ deliver_prompt() {
     staged_raw="$(capture_raw)"
     if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
     if composer_is_prompt_tail "$staged_raw" "$prompt"; then
-      # A collapsed row that is a tail of ours but lacks the stage token: owner text
-      # displaced it, or the CLI cut inside the token. Never re-type over it.
       wait_for_composer_to_settle "$prompt" "$filename" && staged=1
       break
     fi
@@ -508,15 +494,9 @@ task_payload() {
 # The notifier only ever delivers as the STANDBY (a session watcher stands it
 # down), so the prompt says so and names the re-arm: the session reading it is
 # looking at exactly the problem the Stop hook would otherwise block on later.
-# The prompt's LAST token, derived from the task name: a collapsed composer shows only
-# that token, and owner text typed after the paste displaces it, so it proves ours.
-stage_token() {
-  printf '#stage-%s' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-10)"
-}
-
 task_prompt() {
-  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s" %s' \
-    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR" "$(stage_token "$1")"
+  printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
+    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
 # The nudge (supervisor --nudge): restore the session's OWN watcher instead of
