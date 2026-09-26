@@ -133,6 +133,26 @@ def restore_plan(backup: Iterable[dict], stored: Callable[[str], Any]) -> list[d
     return out
 
 
+def stale_writes(elements: Iterable[dict],
+                 stored: Callable[[str], Any]) -> list[tuple[str, float, float]]:
+    """(id, version sent, version stored) for each element the board has already
+    moved past. An edit carries the version the writer read plus one; a stored
+    version at or above it means someone else changed that element since — a tie
+    would be settled by a random nonce, a lower write silently dropped. Elements
+    sent without a version ask to go on top of whatever is there, and pass."""
+    out = []
+    for element in elements:
+        sent = element.get("version")
+        if isinstance(sent, bool) or not isinstance(sent, (int, float)):
+            continue
+        current = stored(element.get("id"))
+        if not is_board_element(current, element.get("id")):
+            continue
+        if current["version"] >= sent:
+            out.append((element["id"], sent, current["version"]))
+    return out
+
+
 # What Excalidraw's own restoreElement() fills in; the panel hands the map to
 # the editor without it, so an element missing any of these crashes selection.
 ELEMENT_DEFAULTS: dict[str, Any] = {

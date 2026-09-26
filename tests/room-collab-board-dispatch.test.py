@@ -218,6 +218,31 @@ def test_restore_refuses_another_rooms_snapshot():
     assert rc != 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
 
 
+def test_an_edit_of_an_element_changed_since_reading_is_refused():
+    """The board holds "a" at v1. Sending v1 again (a tie) or v0 means the writer
+    read an older state: refuse, write nothing, name the element."""
+    for sent in (1, 0):
+        doc = FakeDoc()
+        el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": sent}])
+        rc, out = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el], doc)
+        assert rc != 0, f"v{sent} over a stored v1 must be refused"
+        assert not any(c[0] == "put" for c in doc.calls), doc.calls
+
+
+def test_the_next_version_is_an_ordinary_edit():
+    doc = FakeDoc()
+    el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 2}])
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el], doc)
+    assert rc == 0 and ("put", ["a"]) in doc.calls, doc.calls
+
+
+def test_force_overwrites_a_stale_edit():
+    doc = FakeDoc()
+    el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 1}])
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el, "--force"], doc)
+    assert rc == 0 and ("put", ["a"]) in doc.calls, doc.calls
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 

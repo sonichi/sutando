@@ -548,7 +548,20 @@ def _hitl_manager(out_path):
         return None
 
 
-def escalate(manager, state, detail, kind, prompt, session):
+def _name_seat(req, session, seat):
+    """Say which seat is asking: a card from one of several watched panes must
+    name its own, and its terminal jump must name that pane's session."""
+    from hitl.schema import Action
+    req.title = f"{seat} · {req.title}"
+    req.message = f"{seat} (tmux session {session})\n\n{req.message}"
+    req.device = {"id": session, "name": seat}
+    req.subject = {**(req.subject or {}), "seat": seat}
+    req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
+                   if a.kind == "open_terminal" else a for a in req.actions]
+    return req
+
+
+def escalate(manager, state, detail, kind, prompt, session, seat=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -561,6 +574,8 @@ def escalate(manager, state, detail, kind, prompt, session):
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt))
+        if seat:
+            req = _name_seat(req, session, seat)
         return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
@@ -673,6 +688,8 @@ def main():
                     help="report allowlisted gates without typing their safe answer")
     ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
                     help="write the supervisor state but never raise a card for a block")
+    ap.add_argument("--seat", default="",
+                    help="who this pane is, named on every card it raises (default: none)")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -736,7 +753,7 @@ def main():
             if state in _CHAT_ESCALATE_STATES:
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
-                escalate(hitl, state, detail, kind, prompt, a.session)
+                escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None)
             else:
                 resolve_escalations(hitl, a.session)
         if a.once:

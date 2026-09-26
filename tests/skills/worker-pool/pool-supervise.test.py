@@ -100,6 +100,14 @@ class TheSessionProbe(Base):
         self.assertIsNone(sup.probe_session(self.ws, wid, runner=t))
         self.assertEqual(t.calls, [], "probed tmux for a worker that has no open run")
 
+    def test_a_crashed_last_run_remains_probeable_after_failed_recovery(self):
+        wid = make_worker(self.ws)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        t = Tmux()
+        self.assertIs(sup.probe_session(self.ws, wid, runner=t), False)
+        self.assertEqual(t.calls[-1][:3], ["tmux", "-S", SOCK])
+
     def test_an_open_run_with_no_recorded_socket_is_unknown(self):
         wid = make_worker(self.ws, socket="")
         self.assertIsNone(sup.probe_session(self.ws, wid, runner=Tmux()))
@@ -125,10 +133,10 @@ class Observing(Base):
         pb.touch(pb.beat_path(self.ws, "worker", wid))
         obs = sup.observe(self.ws, __import__("time").time(),
                           runner=Tmux(live={wi.tmux_session_name(wid)}))
-        # No watcher beat was written and the tmux stub answers no holder scan,
-        # so the watcher reads absent and its holder stays unknown.
+        # No watcher beat, no holder scan answer, an empty inbox, an unreadable pane.
         self.assertEqual(obs[wid], ps.Observation(beat=pb.LIVE, session_alive=True, paused=False,
-                                                  watcher_beat=pb.ABSENT, watcher_held=None))
+                                                  watcher_beat=pb.ABSENT, watcher_held=None,
+                                                  work_outstanding=False))
 
     def test_the_owners_marker_is_what_pauses_a_worker(self):
         wid = make_worker(self.ws)
@@ -225,6 +233,17 @@ class TheLadderSurvivesBetweenTicks(Base):
         self.assertEqual(seen, [ps.NOTHING, ps.NOTHING, ps.NOTHING, ps.RECOVER],
                          "each tick is a separate process in production: the ladder "
                          "only advances if the state really persisted between them")
+
+    def test_failed_recovery_with_no_open_run_still_escalates(self):
+        wid = make_worker(self.ws)
+        for now in (1000.0, 1030.0, 1060.0, 1095.0):
+            out = sup.tick(self.ws, now, runner=Tmux())
+        self.assertEqual(out["decisions"][wid], ps.RECOVER)
+        for run in wi.incarnations(self.ws, wid):
+            wi.end_incarnation(self.ws, wid, run["incarnation_id"], "crashed")
+        out = sup.tick(self.ws, 1210.0, runner=Tmux())
+        self.assertEqual(out["observations"][wid]["session_alive"], False)
+        self.assertEqual(out["decisions"][wid], ps.ESCALATE)
 
     def test_no_persist_decides_without_advancing_the_ladder(self):
         wid = make_worker(self.ws)
@@ -428,7 +447,7 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised", "routing"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing", "wedged"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

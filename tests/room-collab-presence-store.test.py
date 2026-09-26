@@ -144,24 +144,25 @@ def main() -> int:
     print("── the lock: concurrent agents must not lose a registration ──")
     race = TMP / "race.json"
     N = 16
-    # Bounded: a worker exception that cannot be pickled back leaves the parent
-    # waiting forever, and the suite then blames a timeout instead of the cause.
-    timed_out = False
-    with mp.Pool(8) as pool:
-        try:
-            pool.map_async(_register, [(str(race), n) for n in range(N)]).get(timeout=120)
-        except mp.TimeoutError:
-            timed_out = True
-            pool.terminate()
-        except Exception as exc:  # noqa: BLE001 - the cause belongs in the report
-            check(f"all {N} concurrent registrations survive", False, f"worker raised: {exc!r}")
-            timed_out = True
-    if not timed_out:
-        rooms = sorted(e["room"] for e in store.read_entries(race))
-        check(f"all {N} concurrent registrations survive",
-              rooms == sorted((f"!r{n}" for n in range(N))), f"got {len(rooms)} of {N}")
-    elif timed_out:
-        check(f"all {N} concurrent registrations survive within 120s", False, "timed out")
+    # Plain Processes, not a Pool: a Pool's teardown SIGTERMs workers holding the
+    # result-queue lock, and coverage's sigterm handler deadlocks acquiring it.
+    procs = [mp.Process(target=_register, args=((str(race), n),)) for n in range(N)]
+    for pr in procs:
+        pr.start()
+    stuck = []
+    for n, pr in enumerate(procs):
+        pr.join(timeout=60)
+        if pr.is_alive():
+            stuck.append(n)
+            pr.terminate()
+            pr.join(timeout=5)
+    check(f"all {N} writers finish", not stuck, f"still running: {stuck}")
+    bad = [n for n, pr in enumerate(procs) if pr.exitcode not in (0, None)]
+    check("...each exiting cleanly", not bad,
+          f"non-zero exits: {[(n, procs[n].exitcode) for n in bad]}")
+    rooms = sorted(e["room"] for e in store.read_entries(race))
+    check(f"all {N} concurrent registrations survive",
+          rooms == sorted((f"!r{n}" for n in range(N))), f"got {len(rooms)} of {N}")
 
     print("── upsert / without ──")
     es = [{"room": "!a", "kind": "markdown", "summoned_at": 1}]
