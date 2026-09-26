@@ -10248,6 +10248,89 @@ def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     return {"name": name, "status": "warn", "detail": detail}
 
 
+# The bridge writes this verbatim when the sandbox could not produce a reply.
+SANDBOX_UNAVAILABLE_MARK = "Sandbox unavailable"
+
+
+def check_sandbox_delegation(window_sec: int = 86400) -> dict:
+    """Report guest/team tasks that got the fallback sentinel instead of an answer.
+
+    Resolving on PATH is not drivability: `codex-presence` stayed ok for two days
+    while every `codex exec` exited 1 on an unsupported model pin. Keying on the
+    sentinel is cause-agnostic — pin, login, quota or wiped binary all land here —
+    and it fires only when a real sender was actually denied a reply.
+    """
+    name = "sandbox-delegation"
+    results_dir = WORKSPACE_DIR / "results"
+    if not results_dir.exists():
+        return {"name": name, "status": "ok", "detail": "results/ not yet created"}
+    now = time.time()
+    # results/ is drained fast, so the evidence is usually already in the
+    # month-partitioned archive; scan both or a same-day outage reads as clean.
+    roots = [results_dir]
+    # archive-stale-results.py sweeps into results/archive-<date>/, a SIBLING of
+    # archive/, on a retention tunable below this probe's fixed 24h window.
+    try:
+        roots += [results_dir / e.name for e in os.scandir(results_dir)
+                  if e.is_dir() and e.name.startswith("archive-")]
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"could not scan results/: {exc}"}
+    archive = results_dir / "archive"
+    if archive.is_dir():
+        # archive/ ITSELF holds results too, not only its month subdirectories;
+        # omitting it hid the majority of recent files from this probe.
+        roots.append(archive)
+        try:
+            roots += [archive / e.name for e in os.scandir(archive) if e.is_dir()]
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan results/archive/: {exc}"}
+    hits, unreadable = [], 0
+    for root in roots:
+        try:
+            # scandir, not glob: glob swallows a directory-level EACCES and
+            # yields nothing, so an unscannable dir would report a clean one.
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"could not scan {root.name}/: {exc}"}
+        for e in entries:
+            if not e.name.endswith(".txt") or not e.name.startswith("task-"):
+                continue
+            try:
+                if now - e.stat().st_mtime > window_sec:
+                    continue
+                with open(e.path, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(200)
+            except OSError:
+                # Per-file isolation: one unreadable entry must not decide the
+                # answer for the directory.
+                unreadable += 1
+                continue
+            if SANDBOX_UNAVAILABLE_MARK in head:
+                hits.append(e.name)
+    if not hits:
+        detail = (f"no sandboxed delegation failed in the last {window_sec // 3600}h "
+                  "(0 fallback sentinels written)")
+        if unreadable:
+            detail += f"; {unreadable} result file(s) unreadable"
+        return {"name": name, "status": "ok", "detail": detail}
+    shown = ", ".join(sorted(hits)[:3])
+    detail = (
+        f"{len(hits)} guest/team task(s) in the last {window_sec // 3600}h got "
+        f"'{SANDBOX_UNAVAILABLE_MARK}' instead of a reply ({shown}"
+        f"{', …' if len(hits) > 3 else ''}). The sandbox is the ONLY permitted path "
+        "for a non-owner task, so those senders were answered by nobody. "
+        "Isolation held; the capability behind it did not. Run "
+        "`codex exec --sandbox read-only -C /tmp -- 'reply OK'` to see the reason "
+        "— a model pin in ~/.codex/config.toml the installed CLI rejects is one."
+    )
+    if unreadable:
+        detail += f" ({unreadable} result file(s) unreadable.)"
+    return {"name": name, "status": "warn", "detail": detail}
+
+
 def check_codex_task_notifier() -> dict:
     """Detect a missing managed notifier even when a bare watcher looks alive."""
     if not _codex_runtime_selected():
@@ -13155,6 +13238,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
+    checks.append(check_sandbox_delegation())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
