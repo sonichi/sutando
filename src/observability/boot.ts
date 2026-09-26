@@ -24,11 +24,13 @@ import { loadObservabilityConfig } from './config.js';
 import { ClaudeCodeHookNormalizer } from './claude/hook-normalizer.js';
 import { ClaudeCodeOtelNormalizer, CC_OTEL_SOURCE } from './claude/otel-normalizer.js';
 import { RealtimeNormalizer } from './realtime-normalizer.js';
+import { CoreStateNormalizer } from './core-state-normalizer.js';
 
 const collector = new Collector()
 	.register(new ClaudeCodeHookNormalizer()) // obs events  (hooks → /ingest/claude-code-hooks)
 	.register(new ClaudeCodeOtelNormalizer()) // token+cost metering (OTLP → /v1/metrics)
-	.register(new RealtimeNormalizer()); // voice + phone seconds (voice-agent/phone → /ingest/realtime)
+	.register(new RealtimeNormalizer()) // voice + phone seconds (voice-agent/phone → /ingest/realtime)
+	.register(new CoreStateNormalizer()); // core supervisor transitions: login required, crashed, gateway (→ /ingest/core-state)
 // Next sources plug in the SAME collector — one ingestion point, many normalizers:
 //   .register(new FileWatcherNormalizer())
 
