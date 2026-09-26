@@ -2594,6 +2594,15 @@ def _push_pool_advertisement_now() -> None:
         _log(f"pool advertisement push failed: {e}")
 
 
+def _workers_body(ad: dict) -> dict:
+    """The per-worker report when the record carries one: only it tells the broker
+    a worker is retired; the legacy snapshot has no per-worker state."""
+    rep = ad.get("report")
+    if isinstance(rep, dict) and isinstance(rep.get("workers"), list):
+        return rep
+    return ad["workers"]
+
+
 def _maybe_push_workers_snapshot(record) -> bool:
     """Push-on-change relay of the pool's workers snapshot (the worker
     picker's read path). An unavailable advertisement pushes NOTHING and
@@ -2612,7 +2621,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
     if identity == _workers_pushed_identity:
         return False
     try:
-        _req("POST", "/v1/workers", ad["workers"], timeout=15)
+        _req("POST", "/v1/workers", _workers_body(ad), timeout=15)
     except urllib.error.HTTPError as e:
         _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
         return False
