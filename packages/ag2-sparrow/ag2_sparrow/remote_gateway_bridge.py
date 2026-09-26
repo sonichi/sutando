@@ -2589,6 +2589,7 @@ def _push_pool_advertisement_now() -> None:
         record = _advertisement_or_none()
         _maybe_push_workers_snapshot(record)
         _maybe_push_agent_profile(record)
+        _maybe_pull_worker_labels(record)
     except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
         _log(f"pool advertisement push failed: {e}")
 
@@ -2626,6 +2627,13 @@ def _maybe_push_workers_snapshot(record) -> bool:
 
 _profile_pushed_identity = ""
 _profile_push_retry_at = 0.0
+
+# The host injects this optional adapter before executing the standalone bridge.
+# AG2 Space owns overrides; the skill owns the roster.
+_WORKER_LABEL_APPLIER = globals().get("_SUTANDO_WORKER_LABEL_APPLIER")
+_PROFILE_LABEL_REFRESH_S = 60.0
+_profile_labels_checked_at = 0.0
+_profile_labels_retry_at = 0.0
 
 
 def _build_agent_profile(workers: "dict") -> "dict":
@@ -2682,6 +2690,62 @@ def _maybe_push_agent_profile(record) -> bool:
         return False
     _profile_pushed_identity = key
     _log(f"agent-profile pushed for {mxid}")
+    return True
+
+
+def _maybe_pull_worker_labels(record) -> bool:
+    """Apply explicit owner label overrides after our profile is published."""
+    global _profile_labels_checked_at, _profile_labels_retry_at
+    if not callable(_WORKER_LABEL_APPLIER) or not _publication_permitted():
+        return False
+    now = time.time()
+    if now < max(_profile_labels_retry_at,
+                 _profile_labels_checked_at + _PROFILE_LABEL_REFRESH_S):
+        return False
+    mxid = _reenroll_identity()
+    identity, ad = record
+    if not mxid or ad is None or _profile_pushed_identity != f"{mxid}\n{identity}":
+        return False
+    path = f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile"
+    try:
+        profile = _req("GET", path, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_labels_retry_at = _defer_push("worker-label read", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label read failed, retrying in 5m: {e}")
+        return False
+
+    _profile_labels_checked_at = now
+    config = profile.get("config") if isinstance(profile, dict) else None
+    display = profile.get("display") if isinstance(profile, dict) else None
+    version = config.get("version") if isinstance(config, dict) else None
+    labels = display.get("worker_labels") if isinstance(display, dict) else None
+    if (not isinstance(profile, dict)
+            or type(profile.get("schema_version")) is not int
+            or profile.get("schema_version") != 1
+            or profile.get("mxid") != mxid or type(version) is not int
+            or version < 0 or not isinstance(labels, dict)
+            or len(labels) > 10000
+            or any(not isinstance(wid, str) or not _is_worker_id(wid)
+                   or not isinstance(label, str) or not label
+                   or label != label.strip() or len(label) > 120
+                   or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)
+                   for wid, label in labels.items())):
+        _profile_labels_retry_at = now + 300
+        _log("worker-label read returned an invalid profile; keeping local labels")
+        return False
+    if _reenroll_identity() != mxid:
+        return False
+    try:
+        result = _WORKER_LABEL_APPLIER(labels, version, mxid)
+    except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        return False
+    if isinstance(result, dict) and result.get("changed"):
+        _log(f"worker labels applied from owner profile config v{version}")
     return True
 
 

@@ -177,10 +177,26 @@ success: 2xx, body ignored
 The broker REPLACES the profile document, so the gateway sends this only from
 an advertisement it could read in full.
 
-**Unsupported is not an error.** A relay that does not implement either route
+### `GET /v1/agents/<mxid>/profile` *(optional worker labels)*
+
+After a successful profile PUT, the Sutando adapter may read the owner's
+display-name overrides for its workers. The broker response must identify the
+same `<mxid>` and provide `schema_version: 1`, a nonnegative integer
+`config.version`, and `display.worker_labels` as a map from stable worker IDs
+to nonempty display names. An empty map explicitly clears all overrides.
+`workers[]` in this response is an effective presentation projection; the
+adapter never treats it as rename intent.
+
+Sutando stores these names separately from its own routing aliases. The
+worker ID remains the routing and attribution key, and clearing an owner
+override reveals the original local label. The read and local application run
+off the task poll path. An unsupported, unavailable, or invalid response keeps
+the last local state and cannot delay task delivery.
+
+**Unsupported is not an error.** A relay that does not implement an optional route
 answers `404`, `405` or `501`; the gateway logs once and stops trying for an
 hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
-Neither call can fail the task loop: both are handed to a background thread
+These calls cannot fail the task loop: all run in a background thread
 AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
 a slow push is still in flight and an optional push never delays an
 owner-approved publication. A push still running when the next beat arrives is

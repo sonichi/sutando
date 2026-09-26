@@ -39,10 +39,17 @@ CORE = "core"
 # The states the design gives the router a rule for; anything else is a typo we
 # refuse rather than silently treat as not-live.
 STATES = ("live", "recovering", "abandoned", "retired")
+MAX_DISPLAY_LABEL_LENGTH = 120
+PROFILE_WORKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+RESERVED_DISPLAY_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 
 class RosterError(Exception):
     """A declaration the roster cannot represent, refused at compile time."""
+
+
+class AmbiguousWorkerName(RosterError):
+    """A requested name would select more than one recipient."""
 
 
 class PublishError(OSError):
@@ -131,17 +138,29 @@ def load_roster(workspace):
     return raw
 
 
-def resolve_label(roster: dict, name: str) -> str:
-    """A worker's display label to its id; anything else unchanged.
+def display_label(row: dict, worker_id: str) -> str:
+    """The name shown to people and accepted when it identifies one worker."""
+    row = row if isinstance(row, dict) else {}
+    return row.get("display_label") or row.get("label") or worker_id
 
-    An unknown or AMBIGUOUS label is returned as given, so the caller fails the
-    task by that name instead of picking one of the workers that share it.
+
+def resolve_label(roster: dict, name: str) -> str:
+    """Resolve an exact id or core, then a unique base or display label.
+
+    An unknown name stays unchanged for the caller's usual unknown-name policy.
+    Human names shared by recipients are refused. Exact recipient names win so
+    an old stored display label cannot make an id or the core unavailable.
     """
     workers = roster.get("workers") or {}
     if name in workers or name == CORE:
         return name
-    hits = [wid for wid, row in workers.items() if (row or {}).get("label") == name]
-    return hits[0] if len(hits) == 1 else name
+    hits = set()
+    for wid, row in workers.items():
+        if name in ((row or {}).get("label"), (row or {}).get("display_label")):
+            hits.add(wid)
+    if len(hits) > 1:
+        raise AmbiguousWorkerName(f"{name!r} names more than one recipient")
+    return next(iter(hits)) if hits else name
 
 
 LEGACY_WORKER_FIELD = "target_worker"
@@ -228,6 +247,16 @@ def validate_workers(workers) -> None:
         state = row.get("state")
         if state not in STATES:
             raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
+        if "display_label" in row:
+            _validate_display_label(row["display_label"], wid)
+
+
+def _validate_display_label(label, worker_id: str) -> str:
+    if not isinstance(label, str) or not label or label != label.strip():
+        raise RosterError(f"worker {worker_id!r} has an invalid display label")
+    if len(label) > MAX_DISPLAY_LABEL_LENGTH or any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+        raise RosterError(f"worker {worker_id!r} has an invalid display label")
+    return label
 
 
 def validate_current_roster(workspace) -> None:
@@ -238,7 +267,9 @@ def validate_current_roster(workspace) -> None:
         validate_workers(raw.get("workers"))
 
 
-def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dict:
+def compile_roster(workspace, workers: dict, bindings=None, version=None,
+                   *, worker_label_config_version=None,
+                   worker_label_profile_mxid=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
@@ -264,6 +295,15 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
+    for field in ("config_version", "worker_label_config_version", "worker_label_profile_mxid"):
+        if field in prev:
+            roster[field] = prev[field]
+    if worker_label_profile_mxid is not None:
+        if roster.get("worker_label_profile_mxid") != worker_label_profile_mxid:
+            roster.pop("worker_label_config_version", None)
+        roster["worker_label_profile_mxid"] = worker_label_profile_mxid
+    if worker_label_config_version is not None:
+        roster["worker_label_config_version"] = worker_label_config_version
     _write_atomic(roster_path(workspace), roster)
     _publish(workspace, roster)
     return roster
@@ -275,6 +315,14 @@ def _publish(workspace, roster: dict) -> None:
     import pool_advertise as pa  # sibling; it imports this module, so bound late
     try:
         pa.write_advertisement(workspace)
+    except OSError as e:
+        raise PublishError(roster, e) from e
+
+
+def _ensure_advertisement(workspace, roster: dict) -> None:
+    import pool_advertise as pa
+    try:
+        pa.ensure_advertisement(workspace)
     except OSError as e:
         raise PublishError(roster, e) from e
 
@@ -321,11 +369,18 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
     drops one of them from the result.
     """
     with _locked(workspace):
-        # Before any durable write: a registration that survived a failed publish
-        # would leave a real pool the launcher cannot distinguish from no pool.
-        publish_task_event_handler(workspace)
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
+        for other, row in workers.items():
+            if other != worker_id and isinstance(row, dict) and worker_id in (
+                    row.get("label"), row.get("display_label")):
+                raise RosterError(f"worker id {worker_id!r} conflicts with worker {other}'s name")
+        # Before roster or binding writes: a registration that survived a failed
+        # handler publish would leave a pool the launcher cannot recognize.
+        publish_task_event_handler(workspace)
+        previous = workers.get(worker_id) or {}
         workers[worker_id] = {"state": "live", "label": label or worker_id}
+        if isinstance(previous, dict) and "display_label" in previous:
+            workers[worker_id]["display_label"] = previous["display_label"]
         if runtime:
             workers[worker_id]["runtime"] = str(runtime)
         bindings = dict(load_bindings(workspace))
@@ -359,13 +414,11 @@ def bind_room(workspace, room: str, target: str) -> dict:
 
 
 def rename_worker(workspace, target: str, label: str) -> "tuple[str, str, dict | None]":
-    """Change one worker's display label — the one production writer for a
-    rename. Returns (worker id, old label, roster), roster None on a no-op.
+    """Change one worker's base routing label under the roster lock.
+    Returns (worker id, old label, roster), roster None on a no-op.
 
-    The label lives only in the roster; the advertisement is derived from it
-    and republished by the compile, and the id-derived session name is untouched.
-    A new name another worker already answers to is refused, so `resolve_label`
-    never becomes ambiguous.
+    A broker display-label override remains separate. The id-derived session
+    name is untouched. Names another worker answers to are refused.
     """
     new = (label or "").strip()
     if not new:
@@ -375,26 +428,99 @@ def rename_worker(workspace, target: str, label: str) -> "tuple[str, str, dict |
         if raw is None:
             raise RosterError("no roster; nothing to rename")
         workers = dict(raw.get("workers") or {})
-        if target in workers:
-            wid = target
-        else:
-            hits = [w for w, row in workers.items() if (row or {}).get("label") == target]
-            if len(hits) > 1:
-                raise RosterError(f"{target!r} is the label of {len(hits)} workers; "
-                                  "name one by id")
-            if not hits:
-                raise RosterError(f"{target!r} is not a worker id or label")
-            wid = hits[0]
+        wid = resolve_label(raw, target)
+        if wid not in workers:
+            raise RosterError(f"{target!r} is not a worker id or label")
         old = (workers[wid] or {}).get("label") or wid
         if new == old:
             return wid, old, None
         if new == CORE:
             raise RosterError(f"{CORE!r} names the core; a worker cannot take it")
         for other, row in workers.items():
-            if other != wid and new in (other, (row or {}).get("label")):
+            if other != wid and new in (other, (row or {}).get("label"),
+                                       (row or {}).get("display_label")):
                 raise RosterError(f"{new!r} already names worker {other}")
         workers[wid] = {**(workers[wid] or {}), "label": new}
         return wid, old, compile_roster(workspace, workers, load_bindings(workspace))
+
+
+def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
+                                  profile_mxid: str) -> dict:
+    """Apply a complete display snapshot without changing worker IDs or base labels."""
+    if type(config_version) is not int or config_version < 0:
+        raise RosterError("worker label config version must be a non-negative integer")
+    if not isinstance(labels, dict):
+        raise RosterError("worker label overrides must be an object")
+    if (not isinstance(profile_mxid, str) or not profile_mxid.startswith("@")
+            or ":" not in profile_mxid or profile_mxid != profile_mxid.strip()
+            or len(profile_mxid) > 255
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in profile_mxid)):
+        raise RosterError("worker label profile mxid is invalid")
+    with _locked(workspace):
+        roster = _load_existing_roster_strict(workspace)
+        if roster is None:
+            raise RosterError("no roster; nothing to label")
+        validate_workers(roster.get("workers"))
+        stored_version = roster.get("worker_label_config_version", -1)
+        if type(stored_version) is not int or stored_version < -1 or (
+                "worker_label_config_version" in roster and stored_version < 0):
+            raise RosterError("stored worker label config version is invalid")
+        stored_source = roster.get("worker_label_profile_mxid")
+        if stored_source is not None and (not isinstance(stored_source, str) or not stored_source):
+            raise RosterError("stored worker label profile mxid is invalid")
+        source_changed = stored_source != profile_mxid
+        previous = -1 if source_changed else stored_version
+        if config_version < previous:
+            return {"changed": False, "stale": True, "roster_version": roster["version"],
+                    "worker_label_config_version": previous, "pending_worker_ids": []}
+
+        workers = {wid: dict(row) for wid, row in roster["workers"].items()}
+        pending = []
+        for wid, label in labels.items():
+            if not isinstance(wid, str) or not PROFILE_WORKER_ID_RE.fullmatch(wid):
+                raise RosterError(f"invalid worker id in display labels: {wid!r}")
+            _validate_display_label(label, wid)
+            if (label == CORE or RESERVED_DISPLAY_ID_RE.fullmatch(label)
+                    or (label in workers and label != wid)):
+                raise RosterError(f"worker {wid!r} display label uses a reserved recipient name")
+            if wid not in workers:
+                pending.append(wid)
+        changed = False
+        for wid, row in workers.items():
+            if row["state"] == "retired":
+                continue
+            wanted = labels.get(wid)
+            if wanted is None:
+                changed |= row.pop("display_label", None) is not None
+            elif row.get("display_label") != wanted:
+                row["display_label"] = wanted
+                changed = True
+        if config_version == previous:
+            if not changed and not pending:
+                _ensure_advertisement(workspace, roster)
+                return {"changed": False, "stale": False, "roster_version": roster["version"],
+                        "worker_label_config_version": previous, "pending_worker_ids": []}
+        if not changed and pending:
+            if source_changed:
+                roster["worker_label_profile_mxid"] = profile_mxid
+                roster.pop("worker_label_config_version", None)
+                _write_atomic(roster_path(workspace), roster)
+            _ensure_advertisement(workspace, roster)
+            return {"changed": False, "stale": False, "roster_version": roster["version"],
+                    "worker_label_config_version": previous, "pending_worker_ids": pending}
+        if not changed:
+            roster["worker_label_profile_mxid"] = profile_mxid
+            roster["worker_label_config_version"] = config_version
+            _write_atomic(roster_path(workspace), roster)
+            _ensure_advertisement(workspace, roster)
+            return {"changed": False, "stale": False, "roster_version": roster["version"],
+                    "worker_label_config_version": config_version, "pending_worker_ids": []}
+        updated = compile_roster(workspace, workers, load_bindings(workspace),
+                                 worker_label_config_version=config_version if not pending else None,
+                                 worker_label_profile_mxid=profile_mxid)
+        return {"changed": True, "stale": False, "roster_version": updated["version"],
+                "worker_label_config_version": config_version if not pending else previous,
+                "pending_worker_ids": pending}
 
 
 def unbind_room(workspace, room: str) -> dict:

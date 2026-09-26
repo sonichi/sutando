@@ -69,7 +69,7 @@ def _labels(roster: dict) -> dict:
         row = row or {}
         if row.get("state") == "retired":
             continue
-        out[wid] = str(row.get("label") or wid)
+        out[wid] = str(pr.display_label(row, wid))
     return out
 
 
