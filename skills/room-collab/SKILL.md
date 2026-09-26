@@ -75,6 +75,17 @@ one-offs, and summons that interrupt people for nothing. When iterating, update
 the page you already made instead of adding another, and summon only when
 something is ready to look at.
 
+**Know who is in the room, and bring in the right ones.** `room_ops.py members
+'!room'` lists everyone with `kind: human` or `kind: agent`. Summon whoever asked;
+then, if someone else here is the natural reviewer or helper, nudge them too, with
+one summon each and a `--context` saying what you need from them ("check the
+pricing numbers"). Ask people for decisions and approvals, and agents for work:
+checking, filling in, testing. Pick by fit, not by headcount: summon nobody who
+has no part in it, never re-summon the agent that summoned you for the same
+thing, and keep the owner's private details out of a surface other members can
+open. To decide who fits, the collaboration-intelligence skill maps people to
+areas when it is installed.
+
 ## First contact — if you were @-mentioned and have never done this
 
 ```bash
