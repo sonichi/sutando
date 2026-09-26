@@ -9042,10 +9042,24 @@ def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
     return own, sup
 
 
-def _watcher_trees(ps_output: "str | None" = None) -> dict:
+def _watcher_trees(ps_output: "str | None" = None, repo: "str | None" = None) -> dict:
     """Root PID -> member PIDs per distinct watcher TREE; None runs `ps`.
-    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`."""
-    return watcher_identity.watcher_trees(ps_output, is_watcher=_is_watcher_argv)
+    A failed `ps` is {} here -- callers that must tell that apart take `_ps_snapshot()`.
+
+    `repo` drops only trees PROVABLY owned by another checkout, and defaults off:
+    this probe reports every instance on the host, so filtering it by default
+    would hide a pool's watchers. The boot gate asks the narrower question.
+    """
+    return watcher_identity.watcher_trees(
+        ps_output, is_watcher=_is_watcher_argv, repo=repo,
+        argv_vector=watcher_identity.proc_argv_vector,
+        cwd_of=watcher_identity.proc_cwd)
+
+
+def _watcher_trees_here(ps_output: "str | None" = None) -> dict:
+    """The watcher trees belonging to THIS checkout. A tree whose owner cannot
+    be proven is KEPT: a duplicate watcher processes every task twice."""
+    return _watcher_trees(ps_output, repo=str(REPO_DIR))
 
 
 def extras_present(trees, live) -> bool:
