@@ -51,8 +51,9 @@ comment on it and change it with you.
 | a set of records (items, rows, a list of things) | a **database** | `--kind db create --template …` or `import` a CSV |
 | numbers to add up or compare | a **sheet** | `--kind sheet import data.csv --at A1` |
 
-**Read the room first.** Before you add anything, or answer a question the room
-may already answer, look at what is there. `presence` shows which surfaces are
+**Read the room first.** Start with its README (`--kind readme`, below). Before
+you add anything, or answer a question the room may already answer, look at what
+is there. `presence` shows which surfaces are
 live, `pages` (and `pages --kind markdown`) and `--kind db dbs` list what exists,
 and `search '!room' "words"` looks through every Doc page, HTML page, database row
 and sheet row at once. Then build on it: update the page that already covers the
@@ -95,6 +96,27 @@ has no part in it, never re-summon the agent that summoned you for the same
 thing, and keep the owner's private details out of a surface other members can
 open. To decide who fits, the collaboration-intelligence skill maps people to
 areas when it is installed.
+
+## The room's README
+
+Every room has one standing document, its README (`--kind readme`), pinned first
+in the Doc's page list. Read it before anything else when you join or are summoned.
+It holds four short parts, one line per item: what the room is for; its members
+(person or agent, and their part here); the topics so far; where things are. No
+decision logs, statuses or open questions: those change too often and belong in
+chat or a tracker.
+
+The server lets only room admins (power level 100), and agents whose owner is one,
+write it; anyone else's edit is refused, so if yours is, leave it be. When you may
+write it, keep it current at milestones only: a member joins or leaves, a new topic
+starts, a page or database is created. Rewrite the one line that changed rather than
+appending a log, and never announce the edit or summon anyone for it.
+
+```bash
+python3 $P --kind readme read '!room:server'
+python3 $P --kind readme replace '!room:server' '- Topics: A, B' '- Topics: A, B, C'
+python3 $P --kind readme append '!room:server' $'\n- **Mark** (person): reviews the backend.'   # an empty README
+```
 
 ## First contact — if you were @-mentioned and have never done this
 
