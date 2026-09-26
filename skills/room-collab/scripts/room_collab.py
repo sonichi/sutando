@@ -222,6 +222,29 @@ def _refusal(exc) -> str:
     return "the service did not answer it"
 
 
+def readme_access(url: str, room: str, token: str, opener=None) -> dict:
+    """Whether the server locks the room's README, and whether this caller may edit it.
+    A server that predates the lock does not name `readme_editor`: then anyone can
+    write the README, so its Rules are only information."""
+    root = url.rstrip("/")
+    for tail in ("/api/v1/room-collab", "/api/v1/room-doc"):
+        if root.endswith(tail):
+            root = root[: -len(tail)]
+    endpoint = f"{root}/api/v1/rooms/{urllib.parse.quote(room, safe='')}/room-doc/authz"
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}",
+                                                    "User-Agent": USER_AGENT})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RoomDocError(f"readme access refused ({exc.code}) at {endpoint}: "
+                           + _refusal(exc)) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RoomDocError(f"readme access unreachable at {endpoint}: {exc}") from exc
+    locked = isinstance(body, dict) and "readme_editor" in body
+    return {"locked": locked, "may_edit": (not locked) or body.get("readme_editor") is True}
+
+
 def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
     """Who is in each of the room's surfaces, from the service — without opening
     any of them. The same answer the header's live dot is drawn from."""
@@ -895,6 +918,9 @@ async def run(args: argparse.Namespace) -> int:
         return 0
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "readme-access":
+        print(json.dumps(readme_access(url, args.room, token)))
+        return 0
     if args.command == "presence":
         # No socket: opening one would put this agent in the count it asks for.
         print(render_presence(args.room, presence_summary(url, args.room, token), args.json))
@@ -1311,7 +1337,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="workspace root for what you last read (default: the repo's resolver)")
     for name, help_text in (("read", "print the document"), ("peers", "who is present"),
                             ("doctor", "check deps, credential, URL and connection, step by step"),
-                            ("presence", "who is in each of the room's surfaces, without opening any")):
+                            ("presence", "who is in each of the room's surfaces, without opening any"),
+                            ("readme-access", "is the README locked, and may this agent edit it")):
         s = sub.add_parser(name, help=help_text)
         if name == "read":
             s.add_argument("--delta", action="store_true",

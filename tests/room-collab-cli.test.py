@@ -710,6 +710,79 @@ def test_the_comment_command_parses_its_flags():
     assert b.nth is None and b.mention == [] and b.dry_run is False
 
 
+
+def test_readme_access_reads_the_lock_from_the_room_doc_authz():
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    seen = {}
+
+    def answering(body):
+        def opener(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["agent"] = req.get_header("User-agent")
+            return _Resp(json.dumps(body).encode())
+        return opener
+
+    got = room_collab.readme_access("https://h/api/v1/room-collab", "!r:x", "tok",
+                                    opener=answering({"mxid": "@a:x", "readme_editor": True}))
+    assert seen["url"] == "https://h/api/v1/rooms/%21r%3Ax/room-doc/authz", seen
+    assert seen["agent"] == room_collab.USER_AGENT
+    assert got == {"locked": True, "may_edit": True}, got
+    got = room_collab.readme_access("https://h", "!r:x", "tok",
+                                    opener=answering({"readme_editor": False}))
+    assert got == {"locked": True, "may_edit": False}, got
+    # A server without the lock names no field: anyone may write, so the Rules are information only.
+    got = room_collab.readme_access("https://h", "!r:x", "tok", opener=answering({"mxid": "@a:x"}))
+    assert got == {"locked": False, "may_edit": True}, got
+
+    def refusing(req, timeout=0):
+        raise room_collab.urllib.error.HTTPError(req.full_url, 403, "no", {}, None)
+    try:
+        room_collab.readme_access("https://h", "!r:x", "tok", opener=refusing)
+    except RoomDocError as exc:
+        assert "refused (403)" in str(exc)
+    else:
+        raise AssertionError("a refusal must raise")
+
+    def down(req, timeout=0):
+        raise OSError("no route")
+    try:
+        room_collab.readme_access("https://h", "!r:x", "tok", opener=down)
+    except RoomDocError as exc:
+        assert "unreachable" in str(exc)
+    else:
+        raise AssertionError("an unreachable server must raise")
+
+
+
+def test_the_readme_access_command_prints_the_verdict():
+    import contextlib
+    import io
+    saved = (room_collab.readme_access, room_collab.resolve_token, room_collab.resolve_url)
+    room_collab.readme_access = lambda url, room, token: {"locked": True, "may_edit": False, "room": room}
+    room_collab.resolve_token = lambda explicit: "tok"
+    room_collab.resolve_url = lambda explicit: "https://h"
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = room_collab.main(["readme-access", "!r:x"])
+    finally:
+        room_collab.readme_access, room_collab.resolve_token, room_collab.resolve_url = saved
+    assert rc == 0
+    assert json.loads(out.getvalue()) == {"locked": True, "may_edit": False, "room": "!r:x"}
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 
