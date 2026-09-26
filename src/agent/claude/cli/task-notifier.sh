@@ -130,8 +130,9 @@ clear_composer_block() {
     || log_notifier "could not clear composer-block record $COMPOSER_BLOCK_FILE; continuing"
 }
 
+# $2 empty = the count could not be read.
 alert_composer_block() {
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for ${2:-an unknown number of} consecutive attempts; clear the composer or press Enter to resume"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
@@ -152,28 +153,41 @@ alert_composer_block() {
   ) >/dev/null 2>&1 &
 }
 
-# Record "n incarnation filename [alerted]", keyed so the count spans --event runs and retries.
+# Record "n incarnation -|alerted filename": the free-form filename is last, so spaces survive.
 # Persist before alerting; at-least-once: a lost "alerted" write may repeat the alert.
 note_composer_block() {
-  local filename="$1" incarnation="$2" n=0 alerted="" rec_n rec_inc rec_file rec_alerted
-  if [ -n "$COMPOSER_BLOCK_FILE" ] \
-     && read -r rec_n rec_inc rec_file rec_alerted 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
-     && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
-    case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
-    [ "$rec_alerted" = alerted ] && alerted=alerted
+  local filename="$1" incarnation="$2" n=0 alerted="" known=1 rec="" rest rec_n rec_inc rec_flag rec_file
+  if [ -z "$COMPOSER_BLOCK_FILE" ]; then
+    known=""
+  elif [ -e "$COMPOSER_BLOCK_FILE" ] && ! IFS= read -r rec 2>/dev/null <"$COMPOSER_BLOCK_FILE"; then
+    known=""
   fi
+  case "$rec" in *" "*" "*)
+    rec_n="${rec%% *}"; rest="${rec#* }"; rec_inc="${rest%% *}"; rest="${rest#* }"
+    # Also reads the older "n incarnation filename [alerted]" record.
+    case "$rest" in
+      "- "*|"alerted "*) rec_flag="${rest%% *}"; rec_file="${rest#* }" ;;
+      *" alerted") rec_flag=alerted; rec_file="${rest% alerted}" ;;
+      *) rec_flag=-; rec_file="$rest" ;;
+    esac
+    if [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
+      case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
+      [ "$rec_flag" = alerted ] && alerted=alerted
+    fi
+    ;;
+  esac
   n=$((n + 1))
-  if write_composer_block "$n $incarnation $filename${alerted:+ $alerted}"; then
+  if write_composer_block "$n $incarnation ${alerted:--} $filename"; then
     [ -z "$alerted" ] && [ "$n" -ge "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
     alert_composer_block "$filename" "$n"
-    write_composer_block "$n $incarnation $filename alerted" \
+    write_composer_block "$n $incarnation alerted $filename" \
       || log_notifier "could not record the composer-block alert for $filename; it may repeat"
     return 0
   fi
   log_notifier "could not persist composer-block count for $filename (${COMPOSER_BLOCK_FILE:-path unresolved}); alerting now"
   [ "$COMPOSER_BLOCK_ALERTED" = "$incarnation $filename" ] && return 0
   COMPOSER_BLOCK_ALERTED="$incarnation $filename"
-  alert_composer_block "$filename" "$n"
+  alert_composer_block "$filename" "${known:+$n}"
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -369,7 +383,8 @@ deliver_prompt() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       warn_if_capture_truncated "$baseline_raw" "$filename"
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
-      note_composer_block "$filename" "$incarnation"
+      # Our own earlier paste is not an owner draft; the next pick resumes or reports it.
+      composer_holds_prompt "$baseline_raw" "$prompt" || note_composer_block "$filename" "$incarnation"
       return 1
     fi
     clear_composer_block
@@ -424,12 +439,14 @@ press_enter_and_confirm() {
       # Confirmed when the prompt has LEFT the composer: submitted, or queued
       # behind a running turn. A busy footer proves nothing about our line.
       if has_result "$filename"; then
+        clear_composer_block
         return 0
       fi
       # A failed capture says nothing about the composer; only a read that
       # shows the prompt gone confirms.
       if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
+        clear_composer_block
         return 0
       fi
       sleep 1

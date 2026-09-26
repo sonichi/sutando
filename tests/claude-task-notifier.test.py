@@ -669,10 +669,86 @@ class EventDispatchTests(FakeTmuxHarness):
         record.write_text(f"5 {inc} task-t.txt\n")
         self.run_event("task-t.txt", env_extra=env, timeout=8)
         self.assertEqual(self._notifications(calls, 1), 1)
-        self.assertEqual(record.read_text().split(), ["6", inc, "task-t.txt", "alerted"])
+        self.assertEqual(record.read_text().split(), ["6", inc, "alerted", "task-t.txt"])
         self.run_event("task-t.txt", env_extra=env, timeout=8)
         time.sleep(0.5)
         self.assertEqual(self._notifications(calls, 1), 1, "an alerted episode must not re-alert")
+
+    def test_a_filename_with_spaces_keeps_its_count(self):
+        # The flag sits before the free-form filename, so a space cannot shift it.
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-s p.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "2"}
+        self._block("task-s p.txt", 3, env)
+        record = self._block_path().read_text()
+        self.assertTrue(record.startswith("3 ") and record.endswith(" alerted task-s p.txt\n"), record)
+        self.assertEqual(self._notifications(calls, 1), 1, "escalate once, at the 2nd refusal")
+
+    def test_an_old_format_alerted_record_is_still_read(self):
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-o2.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        inc = self._incarnation("task-o2.txt", env)
+        record = self._block_path()
+        record.write_text(f"5 {inc} task-o2.txt alerted\n")
+        self.run_event("task-o2.txt", env_extra=env, timeout=8)
+        self.assertEqual(record.read_text().split(), ["6", inc, "alerted", "task-o2.txt"])
+        self.assertEqual(self._notifications(calls, 0), 0, "an episode alerted under the old format must not re-alert")
+
+    def test_an_unreadable_record_alerts_with_an_unknown_count(self):
+        # The degraded path must not print a count it never read.
+        self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-v.txt")
+        self._block_path().mkdir(parents=True)
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "4"}
+        self.run_event("task-v.txt", env_extra=env, timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("for an unknown number of consecutive attempts", log)
+        self.assertNotIn("for 1 consecutive attempts", log)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores a read-only directory")
+    def test_an_unwritable_record_alerts_with_the_count_it_read(self):
+        self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-w.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "9"}
+        inc = self._incarnation("task-w.txt", env)
+        record = self._block_path()
+        record.write_text(f"3 {inc} - task-w.txt\n")
+        record.parent.chmod(0o555)
+        self.addCleanup(record.parent.chmod, 0o755)
+        self.run_event("task-w.txt", env_extra=env, timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("could not persist composer-block count", log)
+        self.assertIn("for 4 consecutive attempts", log)
+
+    def test_our_own_unstaged_paste_is_not_counted_as_an_owner_draft(self):
+        # A row the parser does not strip keeps our paste from reading as staged;
+        # the retype then sees our own prompt, which is not an owner block.
+        self.pane_file.write_text(IDLE_FOOTER + "\n  unrecognised hint row\n")
+        self.write_task("task-own.txt")
+        self.run_event("task-own.txt", timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("did not stage; re-typing", log)
+        self.assertIn("composer not empty for task-own.txt", log)
+        self.assertFalse(self._block_path().exists(), "our own paste must not count as an owner block")
+
+    def test_a_resumed_submit_clears_the_block_record(self):
+        # The owner cleared the draft and the staged prompt was sent: the episode is over.
+        self.write_task("task-r.txt")
+        prompt = (f"Sutando task ready: task-r.txt. Read {self.tasks_dir}/task-r.txt, follow "
+                  f"CLAUDE.md, complete the task, and write the result to {self.results_dir}/task-r.txt.")
+        self.pane_file.write_text("❯ " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        record = self._block_path()
+        record.write_text("1 4242 - task-r.txt\n")
+        self.run_event("task-r.txt", timeout=8, env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("is staged but unsent; resuming", log)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        self.assertFalse(record.exists(), "a confirmed submit must end the block episode")
 
     def test_startup_survives_an_unremovable_block_record(self):
         # The startup reset is best-effort: under set -e a failed rm must not kill the notifier.
@@ -690,14 +766,17 @@ class EventDispatchTests(FakeTmuxHarness):
                 pass
             proc.wait(timeout=5)
 
-    def _notifications(self, calls, expect):
-        # The notification is backgrounded, so its stub may land just after the event returns.
+    def _notifications(self, calls, expect, settle=0.5):
+        # The alert is backgrounded and may land after the event returns: wait for `expect`,
+        # then settle, so an extra or early alert is still counted (an expect of 0 waits too).
+        def count():
+            return calls.read_text().count("display notification") if calls.exists() else 0
         for _ in range(40):
-            got = calls.read_text().count("display notification") if calls.exists() else 0
-            if got >= expect:
+            if count() >= expect:
                 break
             time.sleep(0.05)
-        return got
+        time.sleep(settle)
+        return count()
 
     def _osascript_stub(self, body=""):
         calls = self.root / "osascript.calls"
