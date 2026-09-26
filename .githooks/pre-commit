@@ -52,6 +52,27 @@ if [[ -n "$offenders" ]]; then
   exit 1
 fi
 
+# Refuse a commit on a non-main branch in the PRIMARY checkout (never in a
+# worktree, where feature branches are the whole point). A worktree's
+# git-dir path contains "/worktrees/"; the primary checkout's does not.
+# Bridges/core auto-restart onto the primary checkout, so a leftover feature
+# branch there ships stale/unreviewed code to the live runtime — this
+# recurred four times (2026-07-25, 08-06, 09-14, 09-26) before this guard.
+gitdir="$(git rev-parse --git-dir)"
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo)"
+if [[ "$gitdir" != */worktrees/* ]] && [[ -n "$branch" ]] && [[ "$branch" != "main" ]] && [[ "$branch" != "HEAD" ]]; then
+  printf '\n\033[31m✖ pre-commit refusing: committing to branch '"'"'%s'"'"' in the PRIMARY checkout.\033[0m\n\n' "$branch"
+  printf 'The primary checkout stays on main -- bridges/core auto-restart onto this\n'
+  printf 'tree, so a leftover feature branch here ships stale/unreviewed code (recurred\n'
+  printf '2026-07-25, 08-06, 09-14, 09-26).\n\n'
+  printf 'Author PRs in a worktree instead:\n'
+  printf '  git worktree add ../wt-%s\n\n' "$branch"
+  printf 'or (Claude Code sessions): the EnterWorktree tool.\n\n'
+  printf 'If this commit is deliberate, pass --no-verify and switch back to main\n'
+  printf 'immediately after: git switch main\n\n'
+  exit 1
+fi
+
 # Pre-filter, never an authority: fails open when ruff is absent or cannot run.
 # Lints the STAGED blob via --stdin-filename so ruff.toml still resolves.
 
