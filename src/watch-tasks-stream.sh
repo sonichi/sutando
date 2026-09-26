@@ -975,17 +975,30 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
-startup_sweep() {
+# The periodic floor (#4590) and the startup pass are the same walk; only the
+# occasion differs. Dedup is dispatch_task's: it admits one file identity
+# (name|inode:cksum) per watcher lifetime, on every path, so a task seen by
+# both fswatch and a sweep is admitted once without a second ledger here.
+catchup_sweep() {
   local fn
   while IFS= read -r fn; do
     dispatch_task "$TASKS_DIR/$fn"
   done < <(priority_sorted_tasks)
+}
+
+startup_sweep() {
+  catchup_sweep
 }
 # A session watcher sweeps only once the standby has stopped (below); any other
 # role has no peer on its inbox and sweeps before it subscribes, as always.
 if [ "$WATCHER_ROLE" != "session" ]; then
   startup_sweep
 fi
+
+CATCHUP_INTERVAL="${SUTANDO_WATCHER_CATCHUP_SECONDS:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+case "$CATCHUP_INTERVAL" in
+  ''|*[!0-9]*|0) CATCHUP_INTERVAL=30 ;;
+esac
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -1131,9 +1144,29 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
-# readiness replay above, since a second open of the FIFO would race it for bytes.
-while IFS= read -r path <&3; do
+# -t bounds the read so a stretch with no fswatch event still gets a periodic,
+# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
+# event shape the platform's fswatch monitor backend turns out to use.
+while true; do
+  IFS= read -r -t "$CATCHUP_INTERVAL" path <&3
+  read_rc=$?
+  if [ "$read_rc" -ne 0 ]; then
+    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
+    # exit code alone can't distinguish them -- ask whether fswatch is still
+    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
+    catchup_sweep
+    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
+      if [ -n "$HANDLER_CONFIG_PATH" ]; then
+        reload_current_handler
+        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
+        redispatch_held_tasks
+      fi
+      continue
+    fi
+    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
+    # to the script's normal exit path rather than spinning on a dead FIFO.
+    break
+  fi
   handle_event "$path"
   retry_held_tasks_if_due
 done
