@@ -45,14 +45,14 @@ def main() -> int:
     rm = REPO / "src" / "result_markers.py"
     if not rm.exists():
         return fail(f"{rm} not found — #873 module missing")
-    rm_src = rm.read_text()
+    rm_src = rm.read_text(encoding="utf-8")
     for name in ("def parse_markers", "class Action", "class ParseResult"):
         if name not in rm_src:
             return fail(f"src/result_markers.py missing public surface: {name}")
 
     # 2. Slack bridge wires the parser
     sb = REPO / "src" / "slack-bridge.py"
-    sb_src = sb.read_text()
+    sb_src = sb.read_text(encoding="utf-8")
     if "from result_markers import parse_markers" not in sb_src:
         return fail("src/slack-bridge.py must import parse_markers from result_markers")
     if "parse_markers(" not in sb_src:
@@ -67,7 +67,7 @@ def main() -> int:
 
     # 3. Telegram bridge wires the parser
     tb = REPO / "src" / "telegram-bridge.py"
-    tb_src = tb.read_text()
+    tb_src = tb.read_text(encoding="utf-8")
     if "from result_markers import parse_markers" not in tb_src:
         return fail("src/telegram-bridge.py must import parse_markers from result_markers")
     if "parse_markers(" not in tb_src:
@@ -83,7 +83,7 @@ def main() -> int:
 
     # 3b. Discord bridge wires the parser (#896)
     db = REPO / "src" / "discord-bridge.py"
-    db_src = db.read_text()
+    db_src = db.read_text(encoding="utf-8")
     if "from result_markers import parse_markers" not in db_src:
         return fail("src/discord-bridge.py must import parse_markers from result_markers (#896)")
     if "parse_markers(" not in db_src:
@@ -102,7 +102,7 @@ def main() -> int:
     # guard reads the package source; the package imports its bundled copy
     # relatively ("from .result_markers import ...").
     gb = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
-    gb_src = gb.read_text()
+    gb_src = gb.read_text(encoding="utf-8")
     if "from .result_markers import parse_markers" not in gb_src:
         return fail("ag2_sparrow/remote_gateway_bridge.py must import parse_markers from .result_markers")
     if "parse_markers(" not in gb_src:
@@ -113,7 +113,7 @@ def main() -> int:
                 f"ag2_sparrow/remote_gateway_bridge.py still has hand-rolled skip check {hand_rolled!r} — "
                 "must route through parse_markers() per #873"
             )
-    # Name-independent grammar ban (mirrors the src/ consumer loop below): the
+    # Name-independent grammar ban (mirrors the consumer loop below): the
     # proactive drain once compiled its own `[channel:...]` regex, which this
     # guard waved through because only the four src/ bridges were scanned.
     # Destination-FORMAT validation (e.g. a Matrix `!room:server` shape) is
@@ -170,15 +170,17 @@ def main() -> int:
     # a dead module-scope FILE_MARKER_RE. Delivery already went through
     # parse_markers(), so nothing misbehaved — but the guard stayed green over a
     # live drift artifact that a future edit could revive. Regex removed and
-    # Slack added here, so all four delivery consumers are enforced.
+    # Slack and the gateway bridge are enforced here, so every delivery
+    # consumer is covered.
     consumers = (
         "src/discord-bridge.py",
         "src/dm-result.py",
         "src/telegram-bridge.py",
         "src/slack-bridge.py",
+        "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
     )
     for rel in consumers:
-        src = (REPO / rel).read_text()
+        src = (REPO / rel).read_text(encoding="utf-8")
         if "_FILE_MARKER_RE" in src:
             return fail(
                 f"{rel} defines/uses _FILE_MARKER_RE — the attachment-marker "
@@ -211,7 +213,7 @@ def main() -> int:
 
     # dm-result.py must actually USE the canonical parser for delivery prep,
     # not merely import it for skip markers.
-    dm = (REPO / "src" / "dm-result.py").read_text()
+    dm = (REPO / "src" / "dm-result.py").read_text(encoding="utf-8")
     if "from result_markers import parse_markers" not in dm:
         return fail("dm-result.py does not import parse_markers from result_markers")
     if "parse_markers(text)" not in dm:
@@ -236,11 +238,18 @@ def main() -> int:
         "slack-bridge.py": REPO / "src" / "slack-bridge.py",
         "telegram-bridge.py": REPO / "src" / "telegram-bridge.py",
         "dm-result.py": REPO / "src" / "dm-result.py",
+        "remote_gateway_bridge.py": REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py",
     }
     conforming = {
         name
         for name, path in consumers.items()
-        if path.is_file() and "from result_markers import parse_markers" in path.read_text()
+        if path.is_file() and any(
+            needle in path.read_text(encoding="utf-8")
+            for needle in (
+                "from result_markers import parse_markers",
+                "from .result_markers import parse_markers",
+            )
+        )
     }
 
     doc_path = REPO / "docs" / "architecture-boundaries.md"
@@ -256,7 +265,7 @@ def main() -> int:
         "still compiles a",
         "live instance of the drift",
     )
-    for para in doc_path.read_text().split("\n\n"):
+    for para in doc_path.read_text(encoding="utf-8").split("\n\n"):
         flat = " ".join(para.split())
         if not any(claim in flat for claim in non_conformance_claims):
             continue
