@@ -36,6 +36,33 @@ sent one agent to the wrong place, which is why the warning is here and not furt
 
 Rule of thumb: tracking things is a database, calculating is a sheet.
 
+## Deliver into the room, then open it for them
+
+When you make something for the people in a room, put it in the surface that
+fits it rather than pasting it into chat or attaching a file, and then bring
+them to it. Chat is where you say it's ready; the surface is where they read it,
+comment on it and change it with you.
+
+| You made | Put it in | How |
+|---|---|---|
+| an HTML page, mockup, poll or slides | an **HTML page** | `page-add '!room' 'Title'`, then `--kind html-<id> append` |
+| a write-up, plan, notes or a report | a **Doc page** | `page-add --kind markdown '!room' 'Title'`, then `--kind markdown-<id> append` |
+| a diagram, figure or sketch | the **whiteboard** | `--kind board draw` |
+| a set of records (items, rows, a list of things) | a **database** | `--kind db create --template …` or `import` a CSV |
+| numbers to add up or compare | a **sheet** | `--kind sheet import data.csv --at A1` |
+
+Then open it for whoever asked: `summon` them with the same `--kind` (a page
+keeps its own kind, so the card names the page), and a one-line `--context`.
+Their card's Join button opens that surface beside the chat. In the room, say
+one line: what it is and where. Don't repeat its content.
+
+```bash
+python3 $P --kind html-ab12cd34 summon '!room:server' '@qingyun:server' --context 'the sidebar mockup'
+python3 $P --kind db summon '!room:server' '@qingyun:server' --context 'the feedback triage database'
+```
+
+A one-line answer stays in chat, and so does a file someone asked for by name.
+
 ## First contact — if you were @-mentioned and have never done this
 
 ```bash

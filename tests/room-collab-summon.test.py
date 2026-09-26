@@ -66,10 +66,10 @@ def test_the_mention_is_what_reaches_the_person():
 
 
 def test_every_surface_the_client_knows_is_summonable_and_nothing_else():
-    for kind in ("markdown", "board", "kanban"):
+    for kind in ("markdown", "board", "kanban", "html", "sheet", "db"):
         _b, e = room_collab.summon_content(ROOM, WHO, kind)
         assert e[room_collab.SUMMON_KEY]["kind"] == kind
-    for bad in ("presentation", "doc", "whiteboard", "", "MARKDOWN"):
+    for bad in ("presentation", "doc", "whiteboard", "database", "", "MARKDOWN"):
         try:
             room_collab.summon_content(ROOM, WHO, bad)
         except RoomDocError:

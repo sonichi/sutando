@@ -43,7 +43,7 @@ MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
 # The surface as the summon's prose names it; the marker carries `kind` verbatim.
 SUMMON_PAGE_TITLE_MAX = 80
 SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board",
-                  "html": "HTML page", "sheet": "sheet"}
+                  "html": "HTML page", "sheet": "sheet", "db": "database"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
