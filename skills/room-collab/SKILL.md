@@ -101,10 +101,18 @@ areas when it is installed.
 
 Every room has one standing document, its README (`--kind readme`), pinned first
 in the Doc's page list. Read it before anything else when you join or are summoned.
-It holds four short parts, one line per item: what the room is for; its members
-(person or agent, and their part here); the topics so far; where things are. No
-decision logs, statuses or open questions: those change too often and belong in
-chat or a tracker.
+It is only the room's context, kept by the room admin's agent: no ad-hoc notes,
+drafts or pasted content (those go on a Doc page), and it opens with one line
+saying so. Then a **Context** line, `since <date> · updated <date>`, and four short
+parts, one line per item: what the room is for; its members (person or agent, and
+their part here); the topics so far; where things are. No decision logs, statuses
+or open questions: those change too often and belong in chat or a tracker.
+
+The latest context matters most. When the room is repurposed, explicitly or
+because the recent conversation has plainly moved on, rewrite the purpose and
+topics for the new focus, set a new `since` date, and fold what came before into
+one line, `Earlier (until <date>): …`. Something that is not room context found in
+the README goes to a Doc page, not into the README.
 
 The server lets only room admins (power level 100), and agents whose owner is one,
 write it; anyone else's edit is refused, so if yours is, leave it be. When you may
