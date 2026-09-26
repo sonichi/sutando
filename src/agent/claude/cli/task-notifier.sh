@@ -295,17 +295,19 @@ composer_text() {
 
 squeeze() { tr -d '[:space:]'; }
 
-# The composer box shows at most its last rows: a prompt taller than the box reads as
-# the window that ends where the prompt ends. A window shorter than one chunk proves nothing.
+# The composer box shows only some of its rows (the last ones, or with a tall transcript
+# tail above it on a short pane, a middle stretch cut by the screen bottom): a prompt
+# taller than the box reads as a stretch of itself. Shorter than one chunk proves nothing.
 composer_is_window_of() {
   local c="$1" p="$2"
   [ "${#c}" -ge "$PASTE_CHUNK" ] && [ "${#c}" -lt "${#p}" ] || return 1
-  case "$p" in *"$c") return 0 ;; esac
+  case "$p" in *"$c"*) return 0 ;; esac
   return 1
 }
 
 # Staged = the composer holds EXACTLY our prompt (not merely our marker as a
-# substring -- interleaved owner text would still match that), or its window.
+# substring -- interleaved owner text would still match that), or a window of it
+# at least one chunk long, every chunk having been read back as it landed.
 # Whitespace is ignored on both sides: the input box word-wraps at the pane width and
 # indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
 prompt_is_staged() {
@@ -335,6 +337,7 @@ composer_is_cut_prompt() {
 
 # Type the prompt in chunks, each read back (exactly, or as the box's window of what
 # was typed so far) before the next. Stops at the first chunk that did not land.
+# One measured write of 1064 bytes kept only its last 42; no chunk this size was ever cut.
 type_prompt() {
   local prompt="$1" i=0 typed="" chunk c t
   while [ "$i" -lt "${#prompt}" ]; do

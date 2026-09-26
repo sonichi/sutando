@@ -142,19 +142,20 @@ class FakeTmuxHarness(unittest.TestCase):
         # Holds N: a `-l` paste longer than N bytes lands as only its bytes after N,
         # as one tmux write past the CLI's input limit does on a real pane.
         self.cut_paste_over_flag = self.root / "cut-paste-over.flag"
-        # Holds K: the composer box shows only the last K of its rows (needs WRAP_COLS).
+        # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
+        # rows from row N (0-based): the box cut by the screen bottom on a short pane.
         self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
         self.view_py = self.root / "view.py"
         self.view_py.write_text(
             "import sys, re\n"
-            "k = int(sys.argv[1]); rows = sys.stdin.read().split('\\n')\n"
+            "k, _, n = sys.argv[1].partition('@'); k = int(k); n = int(n or -1); rows = sys.stdin.read().split('\\n')\n"
             "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
             "if last >= 0:\n"
             "    j = last + 1\n"
             "    while j < len(rows) and rows[j].startswith('  ') and '\u23f5\u23f5' not in rows[j] and not re.match(r'^[\\s\u2500-\u257f-]+$', rows[j]): j += 1\n"
             "    box = rows[last:j]\n"
             "    if len(box) > k:\n"
-            "        keep = box[-k:]; keep[0] = '\u276f ' + keep[0].strip()\n"
+            "        keep = box[-k:] if n < 0 else box[n:n + k]; keep[0] = '\u276f ' + keep[0].strip()\n"
             "        rows[last:j] = keep\n"
             "print('\\n'.join(rows))\n")
         self._write_fake_tmux()

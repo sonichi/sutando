@@ -76,6 +76,14 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertNotIn("never verifiably staged", r.stderr)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_a_box_cut_by_the_screen_bottom_still_verifies_a_stretch_of_the_prompt(self):
+        # A 29-row pane under a tall transcript tail shows rows 2-5 of the box and pushes
+        # its frame off screen: the tail is unseen, the stretch shown is ours.
+        self.composer_view_rows_flag.write_text("4@1")
+        r = self._run_long(self.LONG)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_a_box_narrower_than_a_chunk_fails_closed(self):
         self.composer_view_rows_flag.write_text("2")  # under one chunk visible
         self.write_task(self.LONG)
