@@ -81,9 +81,12 @@ def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason_from(e))
+        return _result(False, room_id=room_id, reason=degrade_reason_from(e),
+                       state=_receipt.http_error_state(e.code))
     except (URLError, TimeoutError) as e:
-        return _result(False, room_id=room_id, reason=f"network error: {e}")
+        # Same reading as `say`/`mention`: only 4xx is a proven refusal.
+        return _result(False, room_id=room_id, reason=f"network error: {e}",
+                       state=_receipt.UNKNOWN)
     if not isinstance(res, dict):
         return _result(False, room_id=room_id, reason="malformed gateway response")
     if res.get("error"):
