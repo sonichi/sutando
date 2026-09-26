@@ -577,7 +577,7 @@ def _unanswered_open():
 
 def _args(**over):
     base = dict(room="!r:x", kind="markdown", handles=["mars"], settle=0.01, name="mars",
-                user_id=None, insecure=False, max_reconnects=3)
+                user_id=None, insecure=False, max_reconnects=3, readme_brief=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -741,6 +741,73 @@ async def test_a_refused_handshake_carries_its_status_out_of_the_client():
         assert e.status == 503 and "not being served right now (503)" in str(e), (e.status, str(e))
     finally:
         room_collab_client.websockets.connect = real
+
+
+
+async def test_readme_brief_keeps_the_orienting_lines_and_quotes_nothing_else():
+    readme = ("# Launch room\n\nShip the October launch.\n\n**Context:** since 2026-09-01 · updated 2026-09-20\n\n"
+              "*This page is only for the room's context and rules.*\n\n## Current focus\n- Pricing page.\n\n"
+              "## Rules\n- English only.\n\n## Members\n- **Ann** (human): owner.\n")
+    assert cli.readme_brief(readme) == [
+        "Launch room", "Ship the October launch.", "**Context:** since 2026-09-01 · updated 2026-09-20",
+        "Current focus:", "- Pricing page.", "Rules:", "- English only."]
+    assert cli.readme_brief("# Notes\n\nsome text") == [], "not a README: nothing quoted"
+    assert cli.readme_brief("") == []
+    long = "# R\n**Context:** x\n## Rules\n" + "".join(f"- r{i}\n" for i in range(40))
+    assert len(cli.readme_brief(long)) == cli.README_BRIEF_LINES
+
+
+async def test_watch_prints_the_readme_brief_once_and_survives_without_one():
+    import room_collab_client
+
+    class _Doc:
+        text = "# Room\n**Context:** since today\n## Rules\n- Be kind.\n"
+
+        async def settle(self, *_):
+            return None
+
+    @contextlib.asynccontextmanager
+    async def readme_only(url, room, token, kind="markdown", insecure=False):
+        assert kind == "readme"
+        yield _Doc()
+
+    real = room_collab_client.open_room_collab
+    out = io.StringIO()
+    room_collab_client.open_room_collab = readme_only
+    try:
+        with contextlib.redirect_stdout(out):
+            await cli.print_readme_brief("https://h", "!r:x", "tok")
+    finally:
+        room_collab_client.open_room_collab = real
+    assert out.getvalue().splitlines() == ["README\tRoom", "README\t**Context:** since today",
+                                           "README\tRules:", "README\t- Be kind."], out.getvalue()
+
+    @contextlib.asynccontextmanager
+    async def refusing(*a, **k):
+        raise RoomDocError("no README here")
+        yield  # pragma: no cover
+
+    out = io.StringIO()
+    room_collab_client.open_room_collab = refusing
+    try:
+        with contextlib.redirect_stdout(out):
+            await cli.print_readme_brief("https://h", "!r:x", "tok")
+    finally:
+        room_collab_client.open_room_collab = real
+    assert out.getvalue() == "", "an unreadable README prints nothing"
+
+    seen = []
+
+    async def stub(url, room, token, insecure=False):
+        seen.append(room)
+    real_brief = cli.print_readme_brief
+    cli.print_readme_brief = stub
+    try:
+        rc, _out, _calls = await _run_watch([_Session([], None)], readme_brief=True)
+        rc2, _o, _c = await _run_watch([_Session([], None)], readme_brief=True, kind="readme")
+    finally:
+        cli.print_readme_brief = real_brief
+    assert rc == 0 and rc2 == 0 and seen == ["!r:x"], (rc, rc2, seen)
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

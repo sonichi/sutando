@@ -222,6 +222,29 @@ def _refusal(exc) -> str:
     return "the service did not answer it"
 
 
+def readme_access(url: str, room: str, token: str, opener=None) -> dict:
+    """Whether the server locks the room's README, and whether this caller may edit it.
+    A server that predates the lock does not name `readme_editor`: then anyone can
+    write the README, so its Rules are only information."""
+    root = url.rstrip("/")
+    for tail in ("/api/v1/room-collab", "/api/v1/room-doc"):
+        if root.endswith(tail):
+            root = root[: -len(tail)]
+    endpoint = f"{root}/api/v1/rooms/{urllib.parse.quote(room, safe='')}/room-collab/authz"
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}",
+                                                    "User-Agent": USER_AGENT})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RoomDocError(f"readme access refused ({exc.code}) at {endpoint}: "
+                           + _refusal(exc)) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RoomDocError(f"readme access unreachable at {endpoint}: {exc}") from exc
+    locked = isinstance(body, dict) and "readme_editor" in body
+    return {"locked": locked, "may_edit": (not locked) or body.get("readme_editor") is True}
+
+
 def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
     """Who is in each of the room's surfaces, from the service — without opening
     any of them. The same answer the header's live dot is drawn from."""
@@ -684,6 +707,47 @@ def presence_name(name: "str | None", user_id: "str | None") -> "str | None":
     return None
 
 
+README_BRIEF_LINES = 12
+BRIEF_SECTIONS = ("current focus", "rules")
+
+
+def readme_brief(text: str) -> list[str]:
+    """The few README lines a summoned agent needs before anything else: the room's name,
+    its one-line purpose, the Context line, and the Current focus and Rules items.
+    Empty unless the text is shaped like a room README, so no other document is quoted."""
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    if not any(ln.lower().startswith("**context:**") for ln in lines):
+        return []
+    out: list[str] = []
+    section = None
+    for ln in lines:
+        if not ln or (ln.startswith("*") and ln.endswith("*") and not ln.startswith("**")):
+            continue
+        if ln.startswith("## "):
+            section = ln[3:].strip().lower()
+            if section in BRIEF_SECTIONS:
+                out.append(ln[3:].strip() + ":")
+            continue
+        if ln.startswith("# ") or section is None or section in BRIEF_SECTIONS:
+            out.append(ln.lstrip("# ").strip())
+    return out[:README_BRIEF_LINES]
+
+
+async def print_readme_brief(url: str, room: str, token: str, insecure: bool = False) -> None:
+    """Print the room's README brief once, as `README<TAB>line` lines. A courtesy:
+    an empty, missing or unreadable README prints nothing and never stops the caller."""
+    from room_collab_client import open_room_collab
+    from room_collab_protocol import README_KIND
+    try:
+        async with open_room_collab(url, room, token, kind=README_KIND, insecure=insecure) as doc:
+            await doc.settle(0.5)
+            brief = readme_brief(doc.text)
+    except Exception:  # noqa: BLE001 - see docstring: the brief never blocks a watch
+        return
+    for ln in brief:
+        print(f"README\t{ln}", flush=True)
+
+
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
@@ -697,6 +761,8 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     failures = 0
     print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
           f"reporting after {args.settle}s of quiet", flush=True)
+    if getattr(args, "readme_brief", True) and args.kind != "readme":
+        await print_readme_brief(url, args.room, token, args.insecure)
     while True:
         try:
             async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -895,6 +961,9 @@ async def run(args: argparse.Namespace) -> int:
         return 0
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "readme-access":
+        print(json.dumps(readme_access(url, args.room, token)))
+        return 0
     if args.command == "presence":
         # No socket: opening one would put this agent in the count it asks for.
         print(render_presence(args.room, presence_summary(url, args.room, token), args.json))
@@ -1311,7 +1380,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="workspace root for what you last read (default: the repo's resolver)")
     for name, help_text in (("read", "print the document"), ("peers", "who is present"),
                             ("doctor", "check deps, credential, URL and connection, step by step"),
-                            ("presence", "who is in each of the room's surfaces, without opening any")):
+                            ("presence", "who is in each of the room's surfaces, without opening any"),
+                            ("readme-access", "is the README locked, and may this agent edit it")):
         s = sub.add_parser(name, help=help_text)
         if name == "read":
             s.add_argument("--delta", action="store_true",
@@ -1363,6 +1433,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "localpart and --name. Add the display name a summon shows for you.")
     s.add_argument("--max-reconnects", type=int, default=20,
                    help="give up after this many consecutive failed reconnects")
+    s.add_argument("--no-readme-brief", dest="readme_brief", action="store_false",
+                   help="skip the room README's few opening lines printed at the start")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")

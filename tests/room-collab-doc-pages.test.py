@@ -62,6 +62,16 @@ def opened(kind):
     return s
 
 
+async def test_the_readme_is_a_doc_text_outside_the_page_list():
+    from room_collab_protocol import README_KIND
+    assert is_markdown_kind(README_KIND) and text_root(README_KIND) == "markdown"
+    assert main_kind(README_KIND) == DEFAULT_KIND and not is_html_kind(README_KIND)
+    # Not a listed page: no page id, so the page list and page lookups never see it.
+    import room_collab_protocol as proto
+    assert proto.DOC_PAGE_KIND_RE.fullmatch(README_KIND) is None
+    assert doc_socket_url("https://x", "!r:x", kind=README_KIND).endswith("kind=readme")
+
+
 async def test_a_doc_page_is_markdown_wherever_markdown_is_special():
     for k in (DEFAULT_KIND, PAGE, "markdown-00000000"):
         assert is_markdown_kind(k) and text_root(k) == "markdown" and has_stage(k), k
