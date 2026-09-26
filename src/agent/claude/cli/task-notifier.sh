@@ -204,7 +204,7 @@ sys.exit(0 if getattr(ciw, sys.argv[2])(sys.stdin.read()) else 1)
 # cli_wedge) or a dialog holds; a running turn still accepts (it queues).
 pane_text_is_healthy() {
   [ -n "$1" ] || return 1
-  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude >/dev/null 2>&1
+  printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" healthy --runtime claude --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" --probe >/dev/null 2>&1
 }
 
 pane_text_composer_is_empty() {
@@ -467,6 +467,70 @@ task_prompt() {
     "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
+# The nudge (supervisor --nudge): restore the session's OWN watcher instead of
+# running the external standby. No task is delivered, so the prompt asks it to
+# drain any backlog and re-arm the same watcher the standby would otherwise be.
+nudge_prompt() {
+  printf 'No session-role watcher holds %s and your Monitor task watcher is not running. Check for any pending deliveries in %s, then re-arm your watcher via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
+    "$TASKS_DIR" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
+}
+
+# One nudge injection into an idle, healthy, clean-composer session, reusing the
+# same paste safety as a task delivery: core healthy, composer empty, prompt
+# verifiably staged before Enter, never typed over a draft. A nudge has no result
+# file, so "done" is the prompt LEAVING the composer (submitted or queued behind a
+# turn), not a result appearing. Returns 0 when submitted, 1 when it could not be
+# delivered (unhealthy, dirty composer, or an unverifiable paste); on 1 the
+# supervisor arms the standby instead.
+nudge_deliver() {
+  local prompt type_tries=0 staged=0 baseline_esc baseline_raw staged_raw="" waited=0 cap
+  prompt="$(nudge_prompt)"
+  if ! wait_for_core_healthy; then
+    log_notifier "nudge: core did not become healthy; not nudging"
+    return 1
+  fi
+  baseline_esc="$(capture_view_esc)"
+  baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
+  if ! pane_text_is_healthy "$baseline_raw"; then
+    log_notifier "nudge: core not healthy at the paste; not nudging (failing closed)"
+    return 1
+  fi
+  if ! pane_text_composer_is_empty "$baseline_esc"; then
+    log_notifier "nudge: composer not empty; not nudging (the supervisor arms the standby instead)"
+    return 1
+  fi
+  while :; do
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
+    sleep "$POLL_INTERVAL"
+    staged_raw="$(capture_raw)"
+    if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    type_tries=$((type_tries + 1))
+    [ "$type_tries" -ge 2 ] && break
+    log_notifier "nudge: typed prompt did not stage; re-typing (2/2)"
+    sleep "$POLL_INTERVAL"
+  done
+  if [ "$staged" != 1 ]; then
+    log_notifier "nudge: prompt never verifiably staged after $((type_tries + 1)) attempts; not pressing Enter (failing closed)"
+    return 1
+  fi
+  # Same guard as a task paste: the composer must hold EXACTLY the nudge at Enter.
+  if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+    log_notifier "nudge: composer changed since staged; not pressing Enter (failing closed)"
+    return 1
+  fi
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
+    if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
+      log_notifier "nudge submitted for $TASKS_DIR"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log_notifier "nudge: submit not confirmed; prompt may still be staged (core may need attention)"
+  return 1
+}
+
 # Whitespace is not identity in a wrapped composer: when another pending task's
 # prompt also reads as staged, the composer cannot say whose it is.
 staged_prompt_is_ambiguous() {
@@ -538,6 +602,14 @@ if [ "${1:-}" = "--event" ]; then
   [ -n "${2:-}" ] || { echo "task-notifier: --event requires a filename" >&2; exit 2; }
   submit_task "$2"
   exit 0
+fi
+
+# One-shot: nudge the session to re-arm its own watcher, then exit with the
+# delivery outcome (0 submitted, 1 could-not-deliver). The supervisor calls this
+# in place of arming when the pane is idle-ready and the session is live.
+if [ "${1:-}" = "--nudge" ]; then
+  nudge_deliver
+  exit $?
 fi
 
 # A new notifier starts a new episode; a record left by the previous one is not its history.

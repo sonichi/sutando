@@ -1013,10 +1013,18 @@ _vault_scanner_check() {
   [ -n "$_vsc_py" ] || return 0
   if ! "$_vsc_py" -c "import detect_secrets" >/dev/null 2>&1; then
     echo "  ~ $_vsc_who: detect-secrets missing in $_vsc_py — unquoted \`vault set\` will be REFUSED"
-    # Both plain and --user installs are blocked by PEP 668 on stock
-    # Homebrew/macOS python, so the fallback is named up front rather than
-    # leaving the operator to rediscover it.
-    echo "      fix: $_vsc_py -m pip install detect-secrets   (add --break-system-packages if PEP 668 blocks it)"
+    case "$_vsc_py" in
+      */engine/runtime/python/*)
+        # Twin of secret_scanner.install_hint: a pip install into the desktop's bundled
+        # python is erased by the next engine update; the app build vendors it instead.
+        echo "      fix: update the app — this build did not vendor detect-secrets into its bundled Python; a pip install there is erased by the next engine update"
+        ;;
+      *)
+        # Plain and --user installs are both blocked by PEP 668 on stock Homebrew/macOS
+        # python, so the fallback is named up front.
+        echo "      fix: $_vsc_py -m pip install detect-secrets   (add --break-system-packages if PEP 668 blocks it)"
+        ;;
+    esac
   fi
 }
 

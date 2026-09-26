@@ -45,7 +45,10 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, frame_abnormal, frame_working  # noqa: E402
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
+                       frame_abnormal, frame_working)
+from quota_availability import provider_allows_now  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -100,19 +103,26 @@ class RuntimeAdapter:
     idle_ready: "re.Pattern[str]"
     gate_signatures: Tuple[Tuple[str, "re.Pattern[str]"], ...]
     await_hint: "re.Pattern[str]" = AWAIT_HINT
+    alternate_glyphs: Tuple[str, ...] = ()
+    idle_requires_prompt: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph="❯", idle_ready=CLAUDE_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
 )
-# Codex prints the same footer when launched with Sutando's flags; a selected
-# picker row is its own glyph followed by a number, and is itself the affordance.
-CODEX_PICKER_ROW = re.compile(r"›\s*\d+\.")
+# Codex's composer glyph varies by CLI version; its model row is the idle footer.
+CODEX_IDLE = re.compile(
+    rf"{CLAUDE_IDLE.pattern}|^[ \t]*(?:gpt-[\w.-]+|codex[\w.-]*|o[1-9][\w.-]*)\b[^\n]*[·•]",
+    re.I | re.M,
+)
+CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
-    name="codex", glyph="›", idle_ready=CLAUDE_IDLE,
+    name="codex", glyph="›", idle_ready=CODEX_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
+    alternate_glyphs=("»",),
+    idle_requires_prompt=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -140,6 +150,12 @@ class Outcome:
     message: str
 
 
+def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
+    plain = _SGR.sub("", raw).lstrip(" \t")
+    return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
+                 if plain.startswith(glyph)), None)
+
+
 def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Optional[PromptLine]:
     """The LAST line starting with the runtime's glyph (scrollback holds old ones):
     its input is what follows the glyph and one optional space/nbsp, with any
@@ -149,10 +165,10 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
     lines_ = capture.splitlines()
     last_i, found = -1, None
     for i, raw in enumerate(lines_):
-        plain = _SGR.sub("", raw).lstrip(" \t")
-        if not plain.startswith(adapter.glyph):
+        glyph = _prompt_glyph(raw, adapter)
+        if glyph is None:
             continue
-        rest_raw = raw[raw.find(adapter.glyph) + len(adapter.glyph):]
+        rest_raw = raw[raw.find(glyph) + len(glyph):]
         rest_ghostless, n = _GHOST.subn("", rest_raw)
         rest = _SGR.sub("", rest_ghostless)
         placeholder = n > 0
@@ -167,7 +183,7 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
         if not prev_full:
             break
         plain = _SGR.sub("", nxt)
-        if plain.lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(nxt, adapter) is not None:
             break
         raw_parts.append(nxt)
         prev_full = len(plain) >= width
@@ -195,7 +211,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
     lines_ = capture.splitlines()
     last_i = -1
     for i, raw in enumerate(lines_):
-        if _SGR.sub("", raw).lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(raw, adapter) is not None:
             last_i = i
     if last_i < 0:
         return ""
@@ -208,7 +224,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
             if not prev_full:
                 break
             plain = _SGR.sub("", lines_[j])
-            if plain.lstrip(" \t").startswith(adapter.glyph):
+            if _prompt_glyph(lines_[j], adapter) is not None:
                 break
             end = j
             prev_full = len(plain) >= width
@@ -242,7 +258,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(lines[i], adapter) is not None:
             start = i
             break
     if start is None:
@@ -264,7 +280,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     _pop_borders()
     if not block or (len(block) == 1 and COMPOSER_PLACEHOLDER.match(block[0])):
         return ""
-    block[0] = block[0].lstrip().lstrip(adapter.glyph).lstrip()
+    block[0] = prompt_line(block[0], adapter).text
     return "".join(block)
 
 
@@ -312,8 +328,28 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
-    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle."""
+def _limit_is_stale(abn, workspace, socket, session, probe=False) -> bool:
+    """A quota-only banner beside a FRESH proxy record that says accepted, on a seat
+    whose own traffic is ROUTED through that proxy, is a line from before the reset:
+    scrollback, not a hold. Anything else keeps the hold -- another abnormal family,
+    an unrouted or unobserved seat, or a record absent, stale or rejected. A retry
+    never reaches here: classify_pane returns on it before any gate."""
+    if abn.kind != "provider-limit":
+        return False
+    if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
+        return False
+    try:
+        ws = workspace if workspace is not None else resolve_workspace()
+        return provider_allows_now(ws, socket, session, probe=probe)
+    except Exception:  # noqa: BLE001 -- an unreadable record is not permission
+        return False
+
+
+def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
+                  socket=None, session=None, probe=False) -> Verdict:
+    """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle.
+    `workspace` locates the proxy's quota record (None: the configured one); `socket`
+    and `session` name the seat whose routing that record must vouch for."""
     if capture is None:
         return Verdict("unknown", "no capture")
     if not capture.strip():
@@ -333,19 +369,22 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
-    if abn:
+    if abn and not _limit_is_stale(abn, workspace, socket, session, probe):
         return Verdict("abnormal", ",".join(abn.names))
     if frame_working(tail):
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
-    if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
+    if ((adapter.idle_ready.search(tail) and
+         (not adapter.idle_requires_prompt or line is not None))
+            or (line is not None and line.placeholder)):
         return Verdict("idle-ready", "idle footer or empty composer", "" if line else None)
     return Verdict("unknown", "no idle affordance")
 
 
 def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: str = "tmux",
-            runner: Callable = subprocess.run, env: Optional[dict] = None) -> Verdict:
+            runner: Callable = subprocess.run, env: Optional[dict] = None, workspace=None,
+            probe=False) -> Verdict:
     """Capture the core window through cli_wedge's one capture path, then classify it."""
     target = core_target(socket_path, session, tmux_bin, runner, env)
     if target is None:
@@ -353,7 +392,7 @@ def observe(socket_path: str, session: str, adapter: RuntimeAdapter, tmux_bin: s
     # Both runtimes need attributes: Codex draws a dim placeholder, Claude a
     # grey ghost suggestion, and prompt_line() strips either before deciding pending.
     text = capture_pane(socket_path, target, tmux_bin, runner, env, escapes=True)
-    return classify_pane(text, adapter)
+    return classify_pane(text, adapter, workspace, socket_path, session, probe)
 
 
 # tmux-send-line.sh's contract; 2 is its own argument rejection.
@@ -400,10 +439,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--width", type=int, default=0)
         if name == "classify":
             p.add_argument("--json", action="store_true")
+        if name in ("classify", "safe"):
+            p.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+            p.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+            p.add_argument("--session", default=None, help="the seat the record must vouch for")
+            p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+    hp.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+    hp.add_argument("--session", default=None, help="the seat the record must vouch for")
+    hp.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -420,7 +468,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     adapter = ADAPTERS[a.runtime]
     if a.cmd == "classify":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         print(json.dumps(v.as_dict()) if a.json else v.state)
         return 0
     if a.cmd == "pending":
@@ -435,7 +485,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.cmd == "healthy":
         # The notifier's pre-typing question, answered by the same verdict every
         # caller gets: exit 0 when typed input reaches the composer, else refuse.
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         if not accepts_input(v):
             print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
             return EXIT_UNSAFE
@@ -451,7 +503,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(text)
         return 0
     if a.cmd == "safe":
-        v = classify_pane(_read_stdin(), adapter)
+        v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),
+                          getattr(a, "socket", None), getattr(a, "session", None),
+                          getattr(a, "probe", False))
         if state_is_unsafe(v.state):
             print(f"pane_gate: {v.state} — not safe to type into", file=sys.stderr)
             return EXIT_UNSAFE

@@ -26,15 +26,20 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
+LAST_STDERR = [""]
 
 
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
+        if LAST_STDERR[0].strip():
+            print("  watcher stderr:")
+            for line in LAST_STDERR[0].strip().splitlines()[-20:]:
+                print("    " + line)
 
 
-def start_watcher(ws, instance=None):
+def start_watcher(ws, errf, instance=None):
     env = dict(os.environ)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     if instance:
@@ -44,7 +49,7 @@ def start_watcher(ws, instance=None):
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)  # no operator pin -- config file only
     return subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=env, stdout=subprocess.PIPE, stderr=errf,
         text=True, start_new_session=True)
 
 
@@ -89,6 +94,12 @@ def read_available(p, out):
         pass
 
 
+def snapshot_stderr(errf_path):
+    # A fresh open+read: errf's own fd is the child's stderr, so seeking on
+    # it (rather than reading through the path) races the watcher's writes.
+    return errf_path.read_text(errors="replace") if errf_path.exists() else ""
+
+
 def stop(p):
     try:
         os.killpg(os.getpgid(p.pid), 15)
@@ -116,12 +127,16 @@ handler.chmod(0o755)
 cfg = ws / "state" / "task-event-handler.json"
 
 # (1) No config file yet: a task must reach the live core directly.
-p = start_watcher(ws)
+# stderr is kept: a FAIL with nothing to read cannot be diagnosed (#4568).
+errf_path = tmp / "watcher-first.err"
+errf = open(errf_path, "w")
+p = start_watcher(ws, errf)
 out: list[str] = []
 try:
     wait_for_fswatch(p)
     write_task(ws, "task-one.txt")
     ok = wait_for(lambda: (read_available(p, out), any("TASK_FILE" in s for s in out))[1])
+    LAST_STDERR[0] = snapshot_stderr(errf_path)
     check("(1) no config file: the task is emitted straight to the live core",
           ok and not log.exists(), f"out={out} log_exists={log.exists()}")
 
@@ -136,27 +151,33 @@ try:
     out2: list[str] = []
     write_task(ws, "task-two.txt")
     ok2 = wait_for(lambda: (read_available(p, out2), log.exists() and "handle" in log.read_text())[1])
+    LAST_STDERR[0] = snapshot_stderr(errf_path)
     check("(2) config written mid-run: the VERY NEXT task is routed through it, no restart",
           ok2 and log.exists() and "handle" in log.read_text(),
           f"out2={out2} log={log.read_text() if log.exists() else None}")
 finally:
     stop(p)
+    errf.close()
 
 # (3) cfg still names `handler` from step (2); log content before this
 # section is the control -- must be byte-identical after, proving no call.
 log_before = log.read_text() if log.exists() else ""
-p2 = start_watcher(ws, instance="worker-1")
+errf2_path = tmp / "watcher-second.err"
+errf2 = open(errf2_path, "w")
+p2 = start_watcher(ws, errf2, instance="worker-1")
 out3: list[str] = []
 try:
     wait_for_fswatch(p2)
     write_task(ws, "task-three.txt")
     ok3 = wait_for(lambda: (read_available(p2, out3), any("TASK_FILE" in s for s in out3))[1])
     log_after = log.read_text() if log.exists() else ""
+    LAST_STDERR[0] = snapshot_stderr(errf2_path)
     check("(3) a worker never reads an already-present config file -- bypasses unconditionally",
           ok3 and log_after == log_before,
           f"out3={out3} log_before={log_before!r} log_after={log_after!r}")
 finally:
     stop(p2)
+    errf2.close()
 
 print(f"watch-tasks-stream-config-hot-reload: {3 - len(FAILURES)}/3 passed")
 for f in FAILURES:

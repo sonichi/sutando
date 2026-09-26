@@ -182,6 +182,114 @@ def test_presence_is_published_when_a_name_is_given():
     assert ("presence", "mars") in doc.calls, doc.calls
 
 
+def _snapshot_file(body):
+    import tempfile
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(body, f); f.close()
+    return f.name
+
+
+def test_snapshot_writes_the_board_to_a_file():
+    import tempfile
+    doc = FakeDoc()
+    out = tempfile.mktemp(suffix=".json")
+    rc, _ = run_cli(BASE + ["--kind", "board", "snapshot", "!r:s", "--out", out], doc)
+    body = json.loads(open(out).read())
+    assert rc == 0 and body["room"] == "!r:s" and body["surface"] == "board", body
+    assert [e["id"] for e in body["elements"]] == ["a"], body
+
+
+def test_restore_is_a_dry_run_unless_applied():
+    snap = _snapshot_file({"room": "!r:s", "surface": "board",
+                           "elements": [{"id": "lost", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 3}]})
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap], doc)
+    assert rc == 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
+    assert json.loads(out)["would_write"] == 1, out
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("put", ["lost"]) in doc.calls, doc.calls
+
+
+def test_restore_refuses_another_rooms_snapshot():
+    snap = _snapshot_file({"room": "!other:s", "surface": "board", "elements": []})
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["--kind", "board", "restore", "!r:s", snap, "--apply"], doc)
+    assert rc != 0 and not any(c[0] == "put" for c in doc.calls), doc.calls
+
+
+def test_the_document_snapshots_to_stdout_and_restores_only_when_applied():
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["snapshot", "!r:s"], doc)
+    body = json.loads(out)
+    assert rc == 0 and body["surface"] == "markdown" and body["text"] == "hello", body
+    snap = _snapshot_file({"room": "!r:s", "surface": "markdown", "text": "the saved text"})
+    doc = FakeDoc()
+    rc, out = run_cli(BASE + ["restore", "!r:s", snap], doc)
+    assert rc == 0 and json.loads(out)["text_differs"] is True, out
+    assert not any(c[0] in ("replace", "append") for c in doc.calls), "a dry run writes nothing"
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("replace", "hello", "the saved text") in doc.calls, doc.calls
+    doc = FakeDoc()
+    doc.text = ""
+    rc, _ = run_cli(BASE + ["restore", "!r:s", snap, "--apply"], doc)
+    assert rc == 0 and ("append", "the saved text") in doc.calls, "an empty document is appended to"
+
+
+def test_the_document_snapshot_goes_to_a_file_and_a_mismatched_one_is_refused():
+    import tempfile
+    doc = FakeDoc()
+    out = tempfile.mktemp(suffix=".json")
+    rc, printed = run_cli(BASE + ["snapshot", "!r:s", "--out", out], doc)
+    body = json.loads(open(out).read())
+    assert rc == 0 and body["text"] == "hello" and body["surface"] == "markdown", body
+    assert json.loads(printed)["snapshot"] == out, printed
+    for wrong in ({"room": "!r:s", "surface": "board", "text": "x"},
+                  {"room": "!other:s", "surface": "markdown", "text": "x"}):
+        doc = FakeDoc()
+        rc, _ = run_cli(BASE + ["restore", "!r:s", _snapshot_file(wrong), "--apply"], doc)
+        assert rc != 0 and not any(c[0] in ("replace", "append") for c in doc.calls), (wrong, doc.calls)
+
+
+def test_restore_refuses_what_is_not_a_snapshot_of_this_surface():
+    import tempfile
+    doc = FakeDoc()
+    rc, _ = run_cli(BASE + ["restore", "!r:s", tempfile.mktemp(suffix=".json")], doc)
+    assert rc != 0, "an unreadable file is refused"
+    assert run_cli(BASE + ["restore", "!r:s", _snapshot_file(["not", "a", "snapshot"])], doc)[0] != 0
+    no_text = _snapshot_file({"room": "!r:s", "surface": "markdown", "elements": []})
+    assert run_cli(BASE + ["restore", "!r:s", no_text, "--apply"], doc)[0] != 0
+    rc, _ = run_cli(BASE + ["--kind", "kanban", "snapshot", "!r:s"], doc)
+    assert rc != 0, "the kanban is out of scope, and says so"
+    assert not any(c[0] in ("replace", "append", "put") for c in doc.calls), doc.calls
+
+
+def test_an_edit_of_an_element_changed_since_reading_is_refused():
+    """The board holds "a" at v1. Sending v1 again (a tie) or v0 means the writer
+    read an older state: refuse, write nothing, name the element."""
+    for sent in (1, 0):
+        doc = FakeDoc()
+        el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": sent}])
+        rc, out = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el], doc)
+        assert rc != 0, f"v{sent} over a stored v1 must be refused"
+        assert not any(c[0] == "put" for c in doc.calls), doc.calls
+
+
+def test_the_next_version_is_an_ordinary_edit():
+    doc = FakeDoc()
+    el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 2}])
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el], doc)
+    assert rc == 0 and ("put", ["a"]) in doc.calls, doc.calls
+
+
+def test_force_overwrites_a_stale_edit():
+    doc = FakeDoc()
+    el = json.dumps([{"id": "a", "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1, "version": 1}])
+    rc, _ = run_cli(BASE + ["--kind", "board", "draw", "!r:s", el, "--force"], doc)
+    assert rc == 0 and ("put", ["a"]) in doc.calls, doc.calls
+
+
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):
     check(_name, _fn)
 

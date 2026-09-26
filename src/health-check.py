@@ -855,7 +855,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -863,7 +864,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
@@ -3159,6 +3160,7 @@ _SERVICE_SOURCES = (
     # KeepAlive jobs in src/launchd/ whose program SURVIVES as a process. A
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -5460,64 +5462,14 @@ def core_env_has_proxy_url(
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
     """
-    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
-    if ps_runner is None:
-        def ps_runner(pid):
-            return subprocess.run(
-                ["ps", "eww", "-o", "command=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=15,
-            )
+    from quota_availability import seat_env_base_url  # src/ is on sys.path
     sock = socket_path or _local_core_socket()
     if not sock:
         return None                       # no live LOCAL core -> unknown, not a bypass
-    # `-s` = every pane in the SESSION, not just the current window's.
-    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
-    if panes is None or getattr(panes, "returncode", 1) != 0:
-        return None                       # no such session / tmux unavailable
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
-    if not pids:
-        return None
-    # Identify the core by argv, not by position: `--name <session>` is what
-    # start-cli.sh passes and no sibling window carries it.
-    #
-    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
-    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
-    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
-    # True where the contract is None). This is the SAME lookalike class as the
-    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
-    # axis and then introduced the identical hole on the session-name axis.
-    def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":  # the =-joined spelling
-                return True
-        return False
-
-    matches = []
-    for pid in pids:
-        try:
-            proc = ps_runner(pid)
-        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
-            return None
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            continue                      # this pane vanished; keep looking
-        out = proc.stdout or ""
-        if _names_this_session(out):
-            matches.append(out)
-    # Zero matches: the core is not in this session (or ps could not read any pane).
-    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
-    if len(matches) != 1:
-        return None
-    tokens = matches[0].split()
-    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
-    # is what keeps an unreadable env reporting None rather than an empty env.
-    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-    if not env_pairs:
-        return None
-    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
-
+    env = seat_env_base_url(sock, session,
+                            tmux_runner=tmux_runner or (lambda s, *a: _run_tmux(s, *a)),
+                            ps_runner=ps_runner)
+    return None if not env.observed else env.base_url is not None
 
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
@@ -5882,10 +5834,12 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # Every unified window is read, not just 5h/7d: a per-model window such as
-    # 7d_oi can be the one rejected while the headline windows sit low.
+    # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
+    # low); overage is shown but never pages, it is purchase eligibility.
+    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
-    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    full = [w for w, (u, st) in _limit_windows(headers).items()
+            if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
         summary = _window_summary(windows)
         check["status"] = "warn"
@@ -5925,24 +5879,6 @@ def _window_summary(windows: dict) -> str:
         elif u is not None:
             parts.append(f"{w} {u:.0%}")
     return ", ".join(parts)
-
-
-def _quota_windows(headers: dict) -> dict:
-    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
-    window, as (utilization or None, that window's own status or None)."""
-    out = {}
-    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
-    for k, v in headers.items():
-        if not (k.startswith(prefix) and k.endswith(suffix)):
-            continue
-        w = k[len(prefix):-len(suffix)]
-        try:
-            u = float(v)
-        except (TypeError, ValueError):
-            u = None
-        st = headers.get(f"{prefix}{w}-status")
-        out[w] = (u, str(st) if st is not None else None)
-    return out
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
@@ -9244,9 +9180,11 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh --role session --inbox "
+                          "restart via Monitor (timeout_ms 1800000, re-armed on its expiry notice): "
+                          "bash src/watch-tasks-stream.sh --role session --inbox "
                           "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
-                          "($SUTANDO_TASKS_DIR as the inbox when set)"}
+                          "($SUTANDO_TASKS_DIR as the inbox when set); until then the standby "
+                          "supervisor announces tasks through the pane after its 45 s grace"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
@@ -9656,7 +9594,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[str] = []
+    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9670,18 +9608,21 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append(str(d.get("item_id") or "?"))
+            parked.append((root.name, str(d.get("item_id") or "?")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
-        shown = ", ".join(sorted(parked)[:4])
+        parked.sort()
+        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                           for root_name, item_id in parked[:4])
         more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
         return {"name": name, "status": "warn",
                 "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
                           f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                          f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 

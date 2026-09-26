@@ -1,6 +1,6 @@
 ---
 name: room-collab
-description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, the kanban (Yjs/CRDT state, one surface per --kind). Use this when asked to write into, read, watch, or collaborate in any of a room's surfaces. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
+description: Read and write a room's LIVE collaborative surfaces — the document behind the Doc tab, the whiteboard, HTML pages, sheets and databases (Yjs/CRDT state, one surface per --kind). A request for a kanban or task board is a database on its Board view. Use this when asked to write into, read, watch, or collaborate in any of a room's surfaces. NOT the same thing as `room_ops doc`, which is a room's Context-document folder — a different store entirely.
 ---
 
 > Formerly `room-doc`. The name changed because the skill serves more than a document — markdown, whiteboard and kanban. The `room-collab` names lead (`ROOM_COLLAB_TOKEN`, `AG2_ROOM_COLLAB_URL`, `/api/v1/room-collab`); the `room-doc` spellings are still read and served for one release, and `skills/room-doc/scripts/room_doc.py` still runs (it forwards here).
@@ -21,6 +21,20 @@ presence visible. `--kind` names the surface; the document is the default.
 
 Two different stores. Writing to one never shows up in the other. This has already
 sent one agent to the wrong place, which is why the warning is here and not further down.
+
+## Which surface — pick by what the person wants, not by the word they use
+
+| The person wants | Use | Not |
+|---|---|---|
+| a kanban, a task board, a tracker of tasks / bugs / feedback / PRs | a **database**: `--kind db create --template tasks`, then its **Board** view | `--kind kanban`: that surface is no longer offered; touch it only for a board that already exists |
+| records seen as a table, board, calendar, list or gallery | a **database** (one set of rows, many views) | a sheet — it has no row pages, views or typed fields |
+| to calculate: totals, budgets, estimates, `=SUM(...)` | a **sheet** | a database — it has no formulas across rows |
+| a document to write together | the **Doc** (`--kind markdown`, the default) | |
+| to sketch, diagram or lay things out freely | the **whiteboard** (`--kind board`) | |
+| a mockup, a poll, an interactive or visual page, slides | an **HTML page** (`--kind html`; `templates` has slide decks) | |
+| a small site: several linked pages | **HTML pages** (`page-add`; one page each) | |
+
+Rule of thumb: tracking things is a database, calculating is a sheet.
 
 ## First contact — if you were @-mentioned and have never done this
 
@@ -230,6 +244,9 @@ python3 $P --kind board draw '!room:server' '[
    "text":"Worker 1","fontSize":20,"fontFamily":1,"textAlign":"left","verticalAlign":"top"}]'
 python3 $P --kind board erase '!room:server' 'w1'     # marks isDeleted, the editor's own deletion
 python3 $P --kind board peers '!room:server'          # presence is its own channel — works on any kind
+python3 $P --kind board snapshot '!room:server' --out board.json     # the surface as JSON (doc: drop --kind)
+python3 $P --kind board restore  '!room:server' board.json           # dry run: what a restore would bring back
+python3 $P --kind board restore  '!room:server' board.json --apply   # missing or older elements only; newer edits kept
 ```
 
 **Where a drawing lands.** The board is usually not empty, and a drawing that
@@ -260,6 +277,8 @@ this session wrote whenever a remote change lands on it; `reconcile()` is there
 for the rare case you want it by hand.
 
 ## The kanban is the third surface
+
+> No longer offered in the room's menu: a new board is a database on its Board view (see "Which surface"). This section is for boards that already exist.
 
 A room's board of cards — `?kind=kanban` — holds two maps: `columns` and
 `cards`. When a person assigns you a card, the message you receive already
@@ -294,6 +313,286 @@ same rule as the panel — so a move you make is a newer version, and an older
 one you re-send writes nothing. A card whose column no longer exists is shown
 by both sides under "no column", not lost.
 
+## The HTML page is a fourth surface
+
+`--kind html` is one self-contained web page the room renders live beside its
+source: slides, UI mockups, landing pages, dashboards. It is text, so `read`,
+`append` and `replace` work as on the Doc, sent as deltas so a person typing
+alongside loses nothing.
+
+```bash
+python3 $P --kind html templates '!room:server'                   # the library, and what a page can do
+python3 $P --kind html templates '!room:server' --use slides-swiss-modern   # start an empty page from one
+python3 $P --kind html templates '!room:server' --use dashboard --replace    # overwrite a page, for everyone
+python3 $P --kind html read '!room:server'
+```
+
+Stay inside the scope `templates` prints: HTML, CSS and JavaScript, inline or
+from the CDNs it lists (reveal.js, Tailwind, React via esm.sh, D3, Chart.js…).
+The preview has no fetch, form posts or storage, so data lives in the page. Several screens in one file (sections shown
+and hidden by JS) stand in for several pages. People comment by pinning a point
+on the rendered page; the comment's quote names what was under it.
+
+### Presenting it: highlights, and a relay for voice
+
+`highlight <room> <topic>` lights a `data-topic` on the page for everyone
+watching (`clear` removes it). A talk deck written for a local highlight server
+polls `/state`; the page answers that from the room, so the deck runs unchanged.
+
+A voice agent needs sub-second calls, and a one-shot command re-opens the page
+each time. Run the relay instead: it holds the page open and serves the local
+talk-highlight API on 127.0.0.1 (`POST /highlight/<topic>`, `/speaking/on|off`,
+`GET /state`):
+
+```bash
+python3 $P --kind html relay '!room:server' --port 7877
+```
+
+Point the voice tool's highlight URL at it. It binds to this machine only:
+whoever reaches the port drives the stage as this agent.
+
+The room on the command line is only the first one held. `POST /room/<id>`
+(url-encoded `!abc:server`) makes the relay drop that room and hold another —
+its page, and its Doc for `/script`; `GET /state` names the room held, and
+`GET /rooms` lists the agent's joined rooms with names (through
+`agent-room-ops rooms`, which must be installed beside this skill).
+The voice tool `room_use` switches by name or id ("present in the Qingyun Group
+room") and says whether that room has a page. On a voice agent that exposes the
+session's docked room (`getVoiceSessionOrigin`), the tools also follow the room
+the owner moves to before acting; a room picked with `room_use` holds until then.
+Older hosts skip the following silently.
+
+The skill's own voice tools use the relay: `room_slide` (next / previous / go to),
+`room_highlight`, `room_point`, `room_outline`, `room_stage`, `room_surface` and
+`room_script`. The last one loads a **talk
+script** from the room's Doc. Under a heading "Talk script", each paragraph is a
+step, and bracketed cues fire where they stand:
+
+```text
+…and that closes the loop. [next] Here is what we learned. [highlight: trust]
+```
+
+The cues are `[next]`, `[prev]`, `[slide 5]`, `[highlight: topic]`, `[clear]` and
+`[pause 2]`; other brackets stay part of the words. To check one:
+`python3 $P script '!room:server'`. Keep the script in the Doc so people can
+review the words and cues before the talk.
+
+### The same moves on the whiteboard and the Doc
+
+The board and the Doc keep a `stage` map too, with the page's `nav` and `spot`
+shapes, so one set of verbs drives all three. On the **board** a slide is a
+frame, numbered in the board's own Present order (rows top to bottom, each row
+left to right): a move changes the slide of anyone presenting, and pans everyone
+else to that frame; `spot` selects and zooms to the shape or frame whose words
+match. On the **Doc** a slide is a `#` heading outside code fences: a move
+scrolls to it, and `spot` scrolls to and flashes the passage. Nothing is edited,
+and as on the page, a surface opened later does not replay earlier moves. Topic
+highlights (`/highlight`) stay page-only.
+
+The relay holds one surface at a time: `POST /surface/board` (or `doc`, `html`)
+switches, `GET /surface` names it, and `/slide`, `/spot`, `/outline`, `/state`
+then act on it. `GET /outline` lists the board's frames (number, name, texts) or
+the Doc's headings (number, level, title), so a "go to 3" lands where the
+viewers see 3. The voice tool `room_surface` makes the switch. From the command
+line: `python3 $P --kind board slide '!room:server' 2`.
+
+### Many pages in one room
+
+`--kind html` is the room's **main** page. A room can hold more: each extra page
+is its own document, `--kind html-<id>` (8 characters of `a-z0-9`), and every
+HTML command — `read`, `append`, `replace`, `templates`, `highlight`, `slide`,
+`state`, `relay` — works on it exactly as on the main page. The list of pages
+lives in the main page (its `pages` map), and the web client's page switcher
+reads the same list.
+
+```bash
+python3 $P pages '!room:server'                      # main first, then each page's --kind and title
+python3 $P page-add '!room:server' 'Q3 numbers'      # lists a new page; prints the --kind to write it with
+python3 $P --kind html-ab12cd34 templates '!room:server' --use dashboard
+```
+
+A page removed in the web client leaves the list only; its document is kept. The
+relay holds one page at a time too: `POST /page/<id>` (or `/surface/html-<id>`;
+`/page/main` goes back), `GET /pages` lists them, and the voice tool
+`room_surface` takes `surface: "pages"` to list and `page` to pick one. A comment
+on an extra page anchors to `<id>/pt:…`, `<id>/sl:…` or `<id>/el:…`; a main-page
+comment keeps the bare id.
+
+### Comments pinned to elements
+
+A comment placed inside an element with `data-id`, `data-topic` or `id` (in that
+preference, nearest ancestor) pins to it as `el:<attr>=<value>` (values up to 64
+characters of `A-Za-z0-9._:-`), so it follows the element when the page is
+rearranged; its pin sits at the element's top-right, and if the element is removed
+the comment shows "Element no longer on the page". Elsewhere the comment keeps a
+`pt:`/`sl:` coordinate. Give the parts people will discuss a stable `data-id`, and
+keep it when rewriting the page. To see what a page offers:
+
+```bash
+python3 $P --kind html anchors '!room:server'      # el:data-id=… / el:data-topic=… with slide and words
+```
+
+### Versions of a page
+
+Every HTML page (main or `html-<id>`) keeps named snapshots in its own document —
+the web client's **Versions** button reads the same list:
+
+```bash
+python3 $P --kind html versions '!room:server'                          # id, when, size, who, name
+python3 $P --kind html version-save '!room:server' --name "Before review"
+python3 $P --kind html version-restore '!room:server' "Before review"    # by id or name
+```
+
+A restore replaces the whole page for everyone in one change, after saving the
+current page as an automatic "Before restore …" version. A page over 2 MB (a deck
+with embedded media) cannot be versioned; a page keeps at most 50 versions, the
+oldest automatic ones pruned first, and a 51st named one is refused. Save a version
+before rewriting a page someone else wrote.
+
+### Doc pages
+
+The Doc has pages the same way: `--kind markdown` is the main Doc, and each
+extra page is `--kind markdown-<id>`, a text document every Doc command
+(`read`, `append`, `replace`, `comment`, `slide`) works on. The list lives in
+the main Doc's `pages` map, with a title, an order, an optional icon and an
+optional parent (one level of nesting); the web client shows it beside the Doc.
+
+```bash
+python3 $P pages --kind markdown '!room:server'                     # the main Doc, then each page
+python3 $P page-add --kind markdown '!room:server' 'Notes'          # prints the --kind to write it with
+python3 $P page-add --kind markdown --parent ab12cd34 '!room:server' 'Details'   # nested under a page
+python3 $P --kind markdown-ab12cd34 append '!room:server' '## Next steps'
+```
+
+A comment on a Doc page records its page and shows on that page only. In the
+relay, `POST /surface/doc` then `POST /page/<id>` opens a Doc page (`/page/main`
+goes back to the Doc) and `GET /pages` lists the Doc's pages while the Doc is
+held; `room_surface` takes `surface: "doc"` with `page`.
+
+### Pages that remember: the artifact runtime
+
+A page's own scripts get `window.artifact`: `artifact.state.get / set / keys / on` for
+shared state (saved in the room; a late joiner gets all of it), `artifact.emit / on`
+for one-shot events (only viewers online at that moment see one), and `artifact.me`
+(a stable per-viewer id and name). The host checks every request: keys are
+`[A-Za-z0-9._-]` up to 64 characters, values are JSON up to 4 KB, there are at most 500
+keys, and events are limited to 20 per second. The page never gets network or storage.
+An agent reads and writes the same state:
+
+```bash
+python3 $P --kind html state '!room:server'                  # every key
+python3 $P --kind html state '!room:server' votes            # one key
+python3 $P --kind html state '!room:server' votes '{}'       # set (JSON); `null` deletes
+```
+
+The Library's **Live poll** is a worked example.
+
+### Writing a good page
+
+Condensed from `html-artifacts` (Apache-2.0) and `effective-html` (MIT):
+
+- **Choose HTML only when the page earns it**: options side by side, a diagram
+  or timeline, data or a chart, something to try (a slider, a flow), or a page
+  people will share. For a few paragraphs, use the Doc.
+- **Start from a template** (`templates`) that matches the form, and keep its
+  scope: data lives in the page, since it has no fetch and no storage.
+- **Readable in five seconds**: a heading and a one-line framing before any
+  detail. Lay it out for real: a comparison gets columns, a sequence gets drawn.
+  Headings and paragraphs alone should have been the Doc.
+- **Real content, never filler**: no placeholder statistics and no controls that
+  do nothing. Check any number the page states.
+- **Tasteful and specific**: 60–75 characters per line, and colour only where it
+  carries meaning. Avoid generic AI looks such as purple gradients on white or
+  card grids for their own sake. If the design would suit a neighbouring topic
+  just as well, it is too generic.
+- **Works for everyone**: readable at phone width, semantic elements, controls
+  that work from the keyboard, visible focus.
+- **No `<form>` submits**: the sandbox never fires `submit`, so a form does nothing.
+  Use buttons and an Enter-key handler, and keep shared data in `artifact.state`.
+- **Give discussable parts a `data-id`**, so comments and agents can point at them.
+- **Check it before you announce it**: render it, then look at it wide and
+  narrow. Exercise the controls, read the console, and fix what you see. People
+  review the page by pinning comments on it; answer each one in its thread.
+
+## The sheet is a fifth surface
+
+`--kind sheet` is a shared grid with formulas. Rows and columns have stable ids,
+so an address like `B4` is resolved when you write, and your edit lands where B4
+is now, even after someone inserts a row.
+
+```bash
+python3 $P --kind sheet read '!room:server'                       # inputs as CSV (formulas as typed)
+python3 $P --kind sheet read '!room:server' --json                # {"B4": "=SUM(B1:B3)", ...}
+python3 $P --kind sheet set '!room:server' B4 '=SUM(B1:B3)'       # one cell: a value or =formula
+python3 $P --kind sheet import '!room:server' data.csv --at A1    # a block; the grid grows to fit
+```
+
+Formulas: `+ - * / ^ &`, comparisons, ranges, and SUM, AVERAGE, MIN, MAX,
+COUNT, COUNTA, IF, AND, OR, NOT, ROUND, ABS, CONCAT, LEN, UPPER and LOWER.
+The web client computes the values; `read` returns what was typed.
+
+## Databases are a sixth surface
+
+`--kind db` holds every database in the room: typed properties, rows, and views
+(table, board, calendar, list, gallery) over the same rows. The model is shared
+with the web client — see `DATABASE.md`. Values are set by **property name**:
+options by name, persons by mxid (comma-separated), dates `YYYY-MM-DD` (`A..B`
+for a range), `Prop=` to clear. A value that does not fit is refused with the
+allowed options named, and nothing is written.
+
+```bash
+python3 $P --kind db dbs '!room:server'                                        # the databases, their views
+python3 $P --kind db create '!room:server' --template tasks --name Launch      # tasks|meetings|demo_day|wiki
+python3 $P --kind db read '!room:server' --db Launch --view Board [--json]     # a view's rows; a board by group
+python3 $P --kind db add '!room:server' --db Launch --set 'Name=Write the demo' \
+    --set 'Status=In progress' --set 'Assignee=@mark:server' --set 'Due=2026-09-25'
+python3 $P --kind db update '!room:server' --db Launch --row 'Write the demo' --set 'Priority=High'
+python3 $P --kind db move '!room:server' --db Launch --row 'Write the demo' --to Done   # a board move
+python3 $P --kind db import '!room:server' --db Launch rows.csv                # headers = property names
+python3 $P row-read '!room:server' Launch 'Write the demo' [--json]           # a row as a page: properties + body
+python3 $P row-body '!room:server' Launch 'Write the demo' --text '# Plan'     # set the page body (markdown)
+python3 $P row-body '!room:server' - 'Write the demo' --file notes.md --append # `-` = the only database
+```
+
+Every row is also a page: `row-read` and `row-body` read and write its markdown
+body (they imply `--kind db`). Setting a body rewrites only the part that changed,
+so people typing elsewhere in it keep their place.
+`row-delete <room> <db> <row> --yes` removes a row with its values and its page,
+for everyone; without `--yes` it shows the row and stops. Confirm with the owner
+before deleting a row someone else wrote.
+
+`--db` may be left out when the room has one database; `--row` is a row id or
+its title. A CSV's headers map to properties case-blind; `--map 'CSV header=Property'`
+names the rest (a unique header prefix is enough), `--header-row N` skips notes
+above the headers, and `--year` completes dates like `Sep 25`. Unmatched headers
+are reported, never created. A Google Sheet exported as CSV becomes a database:
+
+```bash
+python3 $P --kind db create '!room:server' --template demo_day --from-csv sheet.csv \
+    --header-row 2 --year 2026 --map 'Team Demo Date=Demo date' --map 'Persenter=Presenter' \
+    --map 'Use case brief=Use case' --map 'Time needed=Minutes' --map 'Killer Use Case Status=Killer use case'
+```
+
+By voice: `room_db_list`, `room_db_read`, `room_db_add`, `room_db_update`,
+`room_db_move` and `room_db_row` (read a row's page, or write its body) go through the relay's `/db` routes (the relay needs `--user-id`
+to sign writes). They work whichever surface the relay holds; `POST /surface/db`
+holds the databases open for faster calls.
+
+## Searching the whole room
+
+```bash
+python3 skills/room-collab/scripts/room_collab.py search '!room:ag2.space' "launch checklist" [--limit 10] [--json]
+```
+
+One query over every Doc page, HTML page, database row (title, values and page body) and sheet
+row. Every word must appear; case does not matter; a title or heading counts more than body text.
+An HTML page matches only on what a viewer sees — never its scripts or styles. Each hit carries
+`go`, the relay steps that open it (`/surface/doc` then `/page/<id>`, or `/db/<db>/row/<row>`).
+A surface that cannot be opened is listed under `failed`, so "no matches" never hides a
+connection error. The relay answers `GET /search?q=<words>&limit=N`, and the voice tool
+`room_search` calls it. It opens each surface once per query — a room with a large deck takes a
+few seconds; the first 30 pages of each kind are searched.
+
 ## Collaborating, rather than submitting
 
 For anything beyond one edit, import the library and **hold the connection**:
@@ -322,6 +621,72 @@ Three things that matter more than they look:
 3. **Send deltas, not the document.** `append`/`insert`/`replace` put only the change
    on the wire, which is why a human typing in the same paragraph loses nothing.
    Rewriting the whole text would be a last-writer-wins overwrite.
+
+### Working alongside other agents
+
+A surface is often shared with one or more other agents, not only with people.
+Six rules, each learned from a live session where breaking it cost a correction.
+With only one agent on the surface, rules 2 and 3 still apply (the owner of the
+facts is then a person); the rest start mattering the moment a second agent
+joins.
+
+1. **Address an agent by @-mention, never by name alone.** A plain room message
+   (`room.message.send` without `mentions`, or `room_ops say`) notifies nobody —
+   the people read it, the agent you named never sees it. Put its mxid in
+   `mentions` (or use `room_ops mention`); a display name typed as plain text
+   reaches it only if a bridge happens to match it.
+2. **Work in your own space.** On a board, build in your own column or frames
+   and let `draw` place new shapes in clear space (the default); never
+   `--absolute` onto someone else's shapes. An edit to an element you did not
+   just read will be refused if it changed meanwhile — re-read and re-apply,
+   don't `--force` over it. Build a multi-part piece one part per write, a few
+   seconds apart, so people watching see it grow and can redirect you early.
+3. **Get it reviewed by whoever owns the facts.** When your work describes or
+   extends another agent's (its diagram, its pool, its PRs), @-mention that
+   agent to review it before calling it done, and apply its corrections. Your
+   own memory and host are the usual source of error: another host's setup, a PR
+   still in review stated as shipped, an overclaim.
+4. **Read the thread before acting.** A message routed to you is not necessarily
+   addressed to you. If it is a reply (`reply_to_event`, `thread_root`) in
+   another agent's thread, or @-mentions another agent and not you, it is theirs
+   — leave it unless you are named or summoned.
+5. **When a message is addressed to nobody, one agent asks once.** If it could
+   be yours or another agent's, post one mentioned line — "mine or yours?" —
+   rather than both leaving it. Rule 4 without this pair loses the request.
+6. **Hand work to an agent in a mentioned message, not in a task result.** A
+   result answers the person who asked and carries no mention, so the agent you
+   meant never receives it. Send the handoff separately, with that agent in
+   `mentions`.
+
+### Working alongside people
+
+A surface can be shared with one or more people. The skill already covers the
+mechanics (presence, sending deltas, who-wrote-what, commenting, summon); these
+are the rules for using them. Each one was learned in a live session.
+
+1. **Answer where you were asked, in the room's language.** Under their line in
+   the doc, threaded in the room — then one short line in the room pointing to
+   it. Detail goes in the surface, not the timeline.
+2. **A person's words and shapes are theirs.** Check who wrote a passage
+   (`--with-authors`) before touching it. Never rewrite a person's text; ask in
+   a comment pinned beside it, and edit only when they ask you to.
+3. **Work in visible steps.** Hold presence so they see you, and build one part
+   at a time so a person watching can redirect you early.
+4. **With several people, act within each asker's authority for you.** Your
+   owner's ask is an instruction. A collaborator's is an instruction within what
+   their tier allows. Anyone else's is input to discuss, not act on. When two
+   asks conflict, don't pick one quietly: name the conflict, mention both
+   people, and let your owner decide. If your owner is one of the two, their ask
+   stands, and you say so.
+5. **People don't @-mention you.** In a surface you were summoned to, a person's
+   message that addresses nobody may be for you. Ask once (rule 5 for agents,
+   above) rather than ignoring it or acting on a guess.
+6. **What's private to one person stays off shared surfaces.** Their mail,
+   calendar, files and anything they told you privately don't go onto a board,
+   doc or room other people can read, even when they asked for it in that room.
+   Answer them privately and say one line in the room.
+7. **Keep what is decided apart from what is discussion.** Put the final text in
+   its own labelled part and notes below it, so a reader knows what ships.
 
 **Before you design where something is stored, read
 [`CRDT-SHAPES.md`](CRDT-SHAPES.md).** It is the measured answer to which

@@ -19,9 +19,10 @@ function buildCore(
 	gmailWriteGuardHook?: string,
 	nativePimGuardHook?: string,
 ): any {
+	// The native PIM guard is arg6: the gdocs guard's slot (arg5) is passed empty.
 	const args =
 		nativePimGuardHook !== undefined
-			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook ?? '', nativePimGuardHook]
+			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook ?? '', '', nativePimGuardHook]
 			: gmailWriteGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
 			: skillTelemetryHook === undefined
@@ -43,10 +44,25 @@ function shellParsedPath(command: string): string {
 	return execFileSync('/bin/bash', ['-c', `printf %s ${arg}`], { encoding: 'utf8' });
 }
 
+/** Same, for a command with arguments: every word the shell would pass, in order. */
+function shellParsedWords(command: string): string[] {
+	const arg = command.replace(/^(python3|bash) /, '');
+	return execFileSync('/bin/bash', ['-c', `printf '%s\\n' ${arg}`], { encoding: 'utf8' }).split('\n').filter(Boolean);
+}
+
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
 const NATIVE_PIM_GUARD = '/x/hooks/native-pim-guard.py';
+const GDOCS_WRITE_GUARD = '/x/hooks/gdocs-write-guard.py';
+
+function buildCoreAll(): any {
+	return JSON.parse(
+		execFileSync('node', [CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD], {
+			encoding: 'utf8',
+		}),
+	);
+}
 
 describe('build-core-settings.mjs', () => {
 	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
@@ -152,6 +168,33 @@ describe('build-core-settings.mjs', () => {
 		assert.ok(!re.test('Bash'));
 	});
 
+	// The guard's read half (PostToolUse snapshot) and write half (PreToolUse deny)
+	// must land together on composio_exec, or the deny can never be lifted.
+	it('registers the Google Docs write guard on composio_exec for BOTH hook events, with the checkout as --repo', () => {
+		const o = buildCoreAll();
+		for (const event of ['PreToolUse', 'PostToolUse']) {
+			const blk = o.hooks[event].find((b: any) => b.hooks.some((h: any) => h.command.includes('gdocs-write-guard')));
+			assert.ok(blk, `no ${event} block registers gdocs-write-guard`);
+			assert.equal(blk.matcher, 'mcp__.*__composio_exec');
+			assert.deepEqual(shellParsedWords(blk.hooks[0].command), [GDOCS_WRITE_GUARD, '--repo', '/x']);
+			const re = new RegExp(blk.matcher);
+			assert.ok(re.test('mcp__sutando-station__composio_exec'));
+			assert.ok(!re.test('mcp__sutando-station__composio_find'));
+			assert.ok(!re.test('mcp__claude_ai_Google_Drive__create_file'));
+		}
+		// The other guards stay: concat, not replace.
+		assert.deepEqual(
+			o.hooks.PreToolUse.map((b: any) => b.matcher),
+			['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'mcp__.*__composio_exec'],
+		);
+	});
+
+	it('omitting the Google Docs guard path leaves the four-argument shape untouched', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		assert.ok(!JSON.stringify(o).includes('gdocs-write-guard'));
+		assert.equal(o.hooks.PostToolUse.length, 1, 'only the skill telemetry PostToolUse entry');
+	});
+
 	it('omitting the Gmail guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY);
 		assert.equal(o.hooks.PreToolUse.length, 1);
@@ -183,6 +226,20 @@ describe('build-core-settings.mjs', () => {
 		const o = buildCore(GUARD, buildObs('/x/obs-hook.sh'), SKILL_TELEMETRY, GMAIL_WRITE_GUARD, NATIVE_PIM_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', '*', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'Bash|Write|Edit|MultiEdit|NotebookEdit']);
+	});
+
+	it('registers every guard together: the native PIM guard rides after the Google Docs guard', () => {
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD], {
+				encoding: 'utf8',
+			}),
+		);
+		assert.deepEqual(
+			o.hooks.PreToolUse.map((b: any) => b.matcher),
+			['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', 'mcp__.*__composio_exec', 'Bash|Write|Edit|MultiEdit|NotebookEdit'],
+		);
+		const blk = o.hooks.PreToolUse.find((b: any) => b.hooks.some((h: any) => h.command.includes('native-pim-guard')));
+		assert.equal(shellParsedPath(blk.hooks[0].command), NATIVE_PIM_GUARD);
 	});
 
 	it('omitting the native PIM guard path leaves the previous shape untouched', () => {

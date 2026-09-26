@@ -14,10 +14,10 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
-# This runtime has no worker mode: everything below is the canonical core's
-# ceremony, so an instance launch is refused before the first step of it.
+# This entry point only launches the canonical core. A Codex pool worker uses
+# the pool's runtime launcher instead.
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  echo "start-cli: SUTANDO_INSTANCE_ID is set; launch Codex workers through the pool launcher." >&2
   exit 2
 fi
 

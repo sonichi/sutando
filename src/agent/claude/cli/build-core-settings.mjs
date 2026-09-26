@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-native-pim-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -27,11 +27,15 @@
 //                    script honors the telemetry opt-out on its own.
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
-//   arg5 (optional): path to hooks/native-pim-guard.py — registered under
+//   arg5 (optional): path to hooks/gdocs-write-guard.py — registered under BOTH
+//                    PreToolUse and PostToolUse for the Station's composio_exec tool.
+//   arg6 (optional): path to hooks/native-pim-guard.py — registered under
 //                    PreToolUse[Bash]: denies commands that drive the native
 //                    macOS Calendar/Reminders/Contacts apps without consent.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
+
+import path from 'node:path';
 
 const guardHook = process.argv[2];
 if (!guardHook) {
@@ -107,10 +111,23 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
+// Both events point at one script: the read (PostToolUse) records the snapshot the
+// write (PreToolUse) requires. The hook re-checks toolkit/action itself.
+const gdocsWriteGuardHook = process.argv[6] || '';
+let gdocsWriteGuardSettings = null;
+if (gdocsWriteGuardHook.trim()) {
+	// The hook imports src/ from a CONFIGURED root, never a walk from __file__:
+	// the registration embeds this checkout (the hook file's grandparent).
+	const repoRoot = path.resolve(gdocsWriteGuardHook, '..', '..');
+	const command = `python3 ${shq(gdocsWriteGuardHook)} --repo ${shq(repoRoot)}`;
+	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command }] };
+	gdocsWriteGuardSettings = { hooks: { PreToolUse: [entry], PostToolUse: [entry] } };
+}
+
 // Always-on: a native Calendar/Reminders/Contacts command raises a macOS
 // permission prompt, so the deny must reach the model before the command runs;
 // the file tools are matched so the consent record cannot be written directly.
-const nativePimGuardHook = process.argv[6] || '';
+const nativePimGuardHook = process.argv[7] || '';
 const NATIVE_PIM_GUARD_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit';
 let nativePimGuardSettings = null;
 if (nativePimGuardHook.trim()) {
@@ -123,6 +140,6 @@ if (nativePimGuardHook.trim()) {
 
 process.stdout.write(
 	JSON.stringify(
-		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, nativePimGuardSettings),
+		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings, nativePimGuardSettings),
 	),
 );

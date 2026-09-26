@@ -170,6 +170,58 @@ class Failures(Base):
         self.assertEqual((rc, line["error"]), (1, "api_error"))
         self.assertIn("dns down", line["message"])
 
+    # A zero-quota free-tier key: Google's 429 names the per-day free-tier metric with a 0 limit.
+    FREE_TIER_429 = (b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded for quota '
+                     b'metric \'Generate requests per day\', limit: 0. Please check your plan and billing details."}}')
+
+    def test_a_429_is_quota_with_the_billing_remedy_and_the_key_named(self):
+        err = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(self.FREE_TIER_429))
+        with mock.patch.object(gen, "resolve_key", lambda: ("k", "env")), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k"}):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual((rc, line["error"]), (1, "quota"))
+        self.assertIn("Quota exceeded", line["message"])
+        self.assertIn("GEMINI_API_KEY", line["message"], "the owner's own key is named")
+        self.assertNotIn("GEMINI_VOICE_API_KEY", line["message"])
+        self.assertIn("billing", line["remedy"])
+        self.assertIn("0 image requests", line["remedy"])
+        with mock.patch.object(gen, "resolve_key", lambda: ("k", "managed")):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(error=urllib.error.HTTPError(
+                "u", 429, "Too Many Requests", {}, io.BytesIO(self.FREE_TIER_429))))
+        self.assertEqual(line["error"], "quota")
+        self.assertIn("managed key", line["message"])
+
+    def test_the_key_note_names_the_env_variable_actually_in_use(self):
+        # An install that only has the voice key must not be told to look at GEMINI_API_KEY.
+        with mock.patch.dict(os.environ, {"GEMINI_VOICE_API_KEY": "vk"}):
+            os.environ.pop("GEMINI_API_KEY", None)
+            self.assertIn("GEMINI_VOICE_API_KEY)", gen.key_note("env", "vk"))
+            self.assertNotIn("GEMINI_API_KEY)", gen.key_note("env", "vk"))
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "tk", "GEMINI_VOICE_API_KEY": "vk"}):
+            self.assertIn("GEMINI_API_KEY)", gen.key_note("env", "tk"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GEMINI_API_KEY", None); os.environ.pop("GEMINI_VOICE_API_KEY", None)
+            self.assertIn("GEMINI_API_KEY or GEMINI_VOICE_API_KEY", gen.key_note("env", "zz"))
+        self.assertEqual(gen.key_note("managed", "k"), " (the managed key)")
+        self.assertEqual(gen.key_note("none", "k"), "")
+
+    def test_a_per_minute_429_is_retryable_not_a_billing_problem(self):
+        # A paid key can hit the per-minute rate limit; that is also a 429 and must keep the retry advice.
+        body = b'{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Resource has been exhausted (e.g. check quota): requests per minute"}}'
+        err = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(body))
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual((rc, line["error"]), (1, "api_error"))
+        self.assertIn("Try again", line["remedy"])
+        self.assertNotIn("billing", line["remedy"])
+
+    def test_a_quota_body_on_another_status_is_still_quota_and_a_plain_400_is_not(self):
+        err = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b'{"error": {"message": "free tier quota_value: 0 for images"}}'))
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual((rc, line["error"]), (1, "quota"))
+        err = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b'{"error": {"message": "model not found"}}'))
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(error=err))
+        self.assertEqual(line["error"], "api_error")
+
     def test_a_missing_input_image_is_bad_input_before_any_request(self):
         rc, line = self.run_main("--prompt", "x", "--input", str(self.ws / "nope.png"), opener=self.opener(response()))
         self.assertEqual((rc, line["error"], self.calls), (2, "bad_input", []))

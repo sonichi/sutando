@@ -72,8 +72,11 @@ Content here...
 
 **Email (Gmail, Outlook)** — the Station connector first: `composio_find` `{"apps": ["gmail"], "query": "<what
 you need>"}`, then `composio_exec` with the action it returns (search, read, draft, send). Not connected →
-the `connect-apps` skill, as for Calendar. Fallback only when the Station tools aren't available: the
-`gws-gmail` skill (OAuth, no app password needed):
+the `connect-apps` skill, as for Calendar; never ask the owner to generate an app password (connecting is
+one Connect card). **After a send, read it back**: fetch the sent message by id and confirm recipient and
+subject match what the owner approved before reporting it sent — that is the check the older draft/send
+mismatch incidents lacked. Fallback only when the Station tools aren't available: the
+`gws-gmail` skill (OAuth, no app password needed), and after that the app-password IMAP/SMTP path below:
 ```bash
 gws gmail +send --to "to@x.com" --subject "subj" --body "body"
 gws gmail +triage                               # unread inbox summary
@@ -223,6 +226,18 @@ node src/browser.mjs "https://example.com" --headed           # watch automation
 node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+
+Claude Code's own `--chrome` browsing needs the **Claude in Chrome extension** installed
+in the person's Chrome (https://claude.ai/chrome); nothing can install it for them, and
+the desktop's setup card ("Let it see and act") shows whether it is there. Without it,
+fall back to `src/browser.mjs` or `skills/macos-use`.
+
+**Show browser steps as they happen.** For any task that browses on someone's behalf, post
+each step (one line + a screenshot of the page), and always a screenshot before a purchase,
+booking or submit: `skills/task-progress/scripts/step.py --message "…" --screenshot <path>`,
+the path being a picture the working session took of the live page (`--capture <url>` is a
+fresh load, never the approval shot). An owner errand and anything read from the owner's
+accounts go to the owner DM, not a shared room (details in `skills/task-progress/SKILL.md`).
 Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
 raise that command-level limit to at most 300,000 ms. Navigation uses the
 remaining command budget, and declared `wait:` actions must fit the budget or
@@ -294,7 +309,13 @@ Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
 Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
-ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+ToolSearch is the fallback when the tool is not in your list). **Google Docs edits are partial by
+default**: read the document first (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`; the read is kept as a snapshot
+under `<workspace>/data/gdocs-backups/<doc id>/`), then `GOOGLEDOCS_INSERT_TEXT_ACTION`,
+`GOOGLEDOCS_REPLACE_ALL_TEXT` or `GOOGLEDOCS_INSERT_TEXT_IN_TABLE_CELL` for the change.
+`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the ENTIRE document — a hook denies it without a read
+from the last 15 minutes (an owner's doc was wiped that way, 2026-09-20); use it only for a full rewrite
+the owner asked for, and say so. Connecting one is the `connect-apps`
 skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
 payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
 owner-only card and nothing is posted. Its helper:

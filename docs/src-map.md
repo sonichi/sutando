@@ -144,6 +144,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
+- **`quota_availability.py`** — Shared authority for whether Claude quota telemetry is usable.
 - **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
@@ -308,10 +309,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`nudge_gate.py`** — Whether a supervisor with no session-role watcher should nudge, alert, or arm.
 - **`pane_gate.py`** — Pane idle-gate and line delivery for a core CLI pane — the consumer-side policy every external task-notifier shares.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`task_dispatch.py`** — Consumer-side dispatch policy shared by every external task-notifier.
+- **`worker-stage.sh`** — One pool delivery stage writer for the Claude watcher and Codex notifier.
 
 ## `src/hitl/`
 

@@ -305,9 +305,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
             try:
-                from secret_scanner import DETECT_SECRETS_ACTIVE, scan_secrets
+                from secret_scanner import DETECT_SECRETS_ACTIVE, install_hint, scan_secrets
             except ImportError:
                 DETECT_SECRETS_ACTIVE = False
+                # No secret_scanner at all: the refusal must still name a repair for THIS interpreter.
+                install_hint = lambda py: (f"run '{py} -m pip install detect-secrets' (add "  # noqa: E731
+                                           f"--break-system-packages if PEP 668 blocks it)")
             # Capability gate: the guarded import loads even when degraded,
             # so an ImportError gate would skip this refusal (yixuan, #3103).
             if not DETECT_SECRETS_ACTIVE:
@@ -345,12 +348,9 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # on the most common Sutando host. Verified 2026-07-20.
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
-                    f"can't validate an unquoted value. AGENT: run "
-                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
-                    f"with 'externally-managed-environment' (PEP 668), retry the same "
-                    f"command with --break-system-packages. Then tell the owner to "
-                    f"re-send this vault set (or quote the value next time). Never echo "
-                    f"or ask for the value.]"
+                    f"can't validate an unquoted value. AGENT: {install_hint(sys.executable)}. "
+                    f"Then tell the owner to re-send this vault set (or quote the value next "
+                    f"time). Never echo or ask for the value.]"
                 )
             if not scan_secrets(value):
                 if _LOOKS_LIKE_PLAIN_LOWERCASE_WORD.fullmatch(key):

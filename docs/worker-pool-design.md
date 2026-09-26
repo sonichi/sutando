@@ -34,20 +34,34 @@ core created), **router** (turns a declared target into a delivery), **Task Brid
 (the single admission gate), **process supervisor** (`launchd` on macOS), **pool**
 (core + router + workers). "Lead" and "follower" are retired.
 
-A worker runs on whatever agent runtime the install uses — Claude Code today, whose
-unit of execution is a *session*. That is the runtime's concept, not Sutando's: a
-worker is not a session, has many over its life, and exists with none running.
+A worker selects a supported CLI runtime at creation. Claude Code and Codex run in
+separate tmux sessions with the same delivery and result protocol. A worker is
+not a runtime session: it keeps its id and inbox across runs.
 
-**A worker has an id and a label.** The id is the worker's identity, opaque, never
-changed or reused; every path, filename, roster key and header names it. The label
-is the owner's display name — mutable, one roster field, never in a path or a glob.
-Renaming is a one-field edit. Labels resolve to ids where intent is captured, never
-at routing.
+Claude accepts a chosen session ID and can resume that conversation. Codex
+assigns its own ID, so Codex workers record `session_id: null` until that ID can
+be captured reliably. A dead Codex worker starts a fresh conversation under
+the same worker ID and inbox; `--resume` refuses rather than claim continuity it
+cannot prove. Pending deliveries remain assigned to that worker.
+
+**A worker has an id, a base label, and an optional display override.** The id is
+the worker's identity, opaque, never changed or reused; every path, filename,
+roster key and header names it. The base `label` is a mutable routing alias,
+never in a path or glob. An exact full ID or `core` selects that recipient;
+unique base and display labels resolve to a worker ID where intent is captured.
+A human name shared by workers is refused. New broker display names equal to
+`core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
+Registration refuses a new ID already used as another worker's name. The
+optional `display_label` from AG2 Space also changes the name shown to people;
+removing it restores the base label. Human status renders the effective name
+with the full ID, such as
+`kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
 
 | field | example | use |
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
-| `label` | `worker-1`, `code reviewer` | shown to the owner; renameable |
+| `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
+| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
@@ -280,6 +294,48 @@ watcher and the rung acts on it after the sustain, which is the right outcome
 for a watcher that cannot hear. A holder check that could not be told is not
 evidence either way.
 
+**A live session that will not progress is the third rung.** A seat's session can
+answer alive while its pane holds a limit menu, a permission dialog, an error it
+parked on, or a turn whose frame never changes. Each tick reads that pane with the
+core's readers (`pane_gate`, `cli_wedge`) and what the worker owes: the tasks
+`task_dispatch owned-by` says were handed to it, less those with a ready result,
+live or archived (the contract `check-pending-tasks.sh` uses; sentinels are never
+renamed or flagged done on a live pool, so their mere presence is not work). Only a
+worker that owes work is wedged; one at its prompt with work queued is the watcher
+rung's. "Frozen" compares the raw frame across ticks, so a static custom pane that
+owes work would read as stuck; a running Claude turn's timer keeps it changing.
+
+**A wedged live session is never restarted** (owner decision, 2026-09-24): a fresh
+session meets the same network error, rate limit, API error or retry, and loses the
+turn in flight. With the same sustain and stale line, once per episode:
+
+- a gate or a limit escalates, as a gate always has;
+- abnormal text raises a card that quotes the banner line and names the cause. On a
+  seat routed through the credential proxy, a retry, API or network cause offers the
+  proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
+  what `src/restart.sh` runs); the click reaches the core as a task. The worker's
+  session is never the target;
+- a frozen turn raises a card offering "Send Escape". Nothing is typed unless the
+  owner presses it; the next tick then re-reads the pane and types one Escape only
+  if it still shows the frame the card was raised for, and refuses otherwise.
+
+A card decision repeats on each tick until the card is actually created, so one
+unreadable capture delays it by a tick rather than suppressing it. The clocks are
+tick-bound: with the 300 s timer the three-sighting sustain, not the 90 s line,
+decides, so a card lands about ten minutes after first sighting, and a pressed
+Escape is typed on the tick after the press. The 90 s line binds only for a tick
+of 45 s or less.
+
+Only a dead session is respawned (the death rung below). Every live seat also runs
+its own `core-input-watch.py`, ensured by the same tick, so a gate reaches the owner
+as a card naming the seat within seconds rather than at the ladder's pace.
+
+**A dead worker that still owes work recovers at the first confirming tick.** A
+gone session is not something a host sleep explains, so for such a worker the
+resume sample after a reboot counts as first detection and the next tick recovers
+it; without a resume, the tick after first detection does. A worker that owes
+nothing keeps the full sustain.
+
 **Recovery is narrower than a sweep.** A worker reads its own folder at boot, and a
 an accepted sentinel with no result releases to that same worker — the only party allowed to take
 it. The ordinary case resolves itself with nobody sweeping. What remains for the
@@ -322,6 +378,7 @@ remedy or to the core for diagnosis.
 |---|---|---|
 | process death | beat expired, session gone, not owner-paused, sustained | a pre-authorised restart |
 | task stalled | unfinished work whose progress has not advanced | diagnosis only |
+| wedged | session alive, work owed, pane on a gate, limit, abnormal text or a frozen turn, sustained | a card only: escalate, name the cause (proxy restart when proxied), or offer Escape; never a restart |
 
 **Sub-agent activity counts as progress**, or the detector escalates the busiest
 workers. Owner-paused outranks every signal. Detection and the pre-authorised remedy
@@ -404,11 +461,24 @@ parses the headers with `local_task_protocol`, never by hand.
 
 ```json
 {"version":41,"compiled_at":"<RFC3339>",
- "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","state":"live","model":"…","scopes":["…"]}},
+ "workers":{"7c54b230a8d94ea9b86f52d70134ac68":{"label":"support","display_label":"kc-reviewer-ryan","state":"live","model":"…","scopes":["…"]}},
  "bindings":{"!abc:ag2.space":"7c54b230a8d94ea9b86f52d70134ac68","!def:ag2.space":["7c54b230a8d94ea9b86f52d70134ac68","e1f0a94c73bd4a1e8c6f2b5d09a7e341"]}}
 ```
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
+
+The broker's complete `display.worker_labels` map is applied atomically under
+the roster lock. `worker_label_config_version` tracks the last fully applied
+label snapshot independently of the general `config_version`, and
+`worker_label_profile_mxid` scopes that cursor to the enrolled profile. A new
+profile may start at a lower version. Unrelated roster compiles preserve both
+fields. Retired IDs are ignored. A snapshot with an unknown ID can update
+known workers, but it does not advance the label version, so a later poll can
+apply the missing worker after registration. A broker label edit can persist
+without advancing `config.version`, so reapplying the current version follows
+the owner's map and also repairs local label drift. The pool advertisement, session
+list, and human status use `display_label` when present. Routing accepts the
+display name when unique, while the roster key and base label remain unchanged.
 
 ### Router pass
 
