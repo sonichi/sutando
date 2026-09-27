@@ -14,7 +14,9 @@ alone, or to its whole process group (the notifiers' stop), right after `handle`
     parent, rc 0, pid TERM   -> stdout=[TASK_FILE: task-demo.txt]  (the duplicate)
     HEAD,   rc 0, pid TERM   -> stdout=[]   stderr: handler ... had already finished
     HEAD,   rc 4, pid TERM   -> stdout=[]   a terminal failure is published instead
-    HEAD,   rc 0, handler group + watcher group TERM
+    HEAD,   rc 0, watcher group TERM (the notifiers' stop; the handler has its own group now)
+                             -> stdout=[]   the handler finishes inside the grace and is settled done
+    HEAD,   rc 0, handler group + watcher group TERM (not what production sends)
                              -> stdout=[TASK_FILE: ...]  the handler died too: unknown, so the fallback stays
     HEAD,   TERM-resistant handler, group TERM, RUN_TIMEOUT=2
                              -> the settle stops the handler's whole group within its grace and only
@@ -116,13 +118,15 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
         # group id is captured now, since only that can name a descendant after the exit.
         hpg = handler_pgid(h)
         t1 = time.time()
-        if kill_group:
-            # The handler runs in its own group now, so a stop that is meant to take it
-            # down too must say so: TERM its group, then the watcher's (the notifiers' stop).
+        if kill_group == "with-handler":
+            # Not what the notifiers send: their group TERM no longer reaches a handler in
+            # its own group, so the arm that kills the handler too says so explicitly.
             if hpg:
                 try: os.killpg(hpg, 15)
                 except ProcessLookupError: pass
             os.killpg(os.getpgid(p.pid), 15)
+        elif kill_group:
+            os.killpg(os.getpgid(p.pid), 15)   # the notifiers' stop: the watcher's group only
         else:
             os.kill(p.pid, 15)
         # Everything the settle emits arrives before the process exits.
@@ -178,13 +182,22 @@ try:
     check("...a terminal failure is published instead", pub != [] and "exit 4" in LAST_STDERR[0],
           f"{pub} {LAST_STDERR[0].strip().splitlines()[-1:]}")
 
-    so, hl, _, _ = run(kill_group=True)
+    so, hl, _, _ = run(kill_group="with-handler")
     check("control: the handler killed along with the watcher: the fallback to the live core stays",
           hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so), f"{so} {hl}")
     check("...with the interrupted-handler line",
           "handler interrupted" in LAST_STDERR[0], LAST_STDERR[0].strip().splitlines()[-1:])
     check("...and the receipt that marks the hand-off, no claim, no sentinel",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": True}, str(STATE[0]))
+
+    # The notifiers' stop as it now behaves: the watcher's group is TERMed, the handler in
+    # its own group is untouched and finishes; the settle collects it and settles done.
+    so, hl, elapsed, _ = run(kill_group=True)
+    check("the notifiers' stop (watcher group only), a TERM-susceptible handler still finishing: NOT handed to the live core",
+          hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so) and "had already finished" in LAST_STDERR[0], f"{so} {hl}")
+    check("...collected inside the grace, no claim, no sentinel, no receipt, group empty",
+          elapsed is not None and elapsed < 4 and STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [],
+          f"elapsed={elapsed} {STATE[0]} {STATE_PG[0]}")
 
     so, hl, elapsed, pub = run(kill_group=True, resistant=True, run_timeout=2, want_results=True)
     check("a TERM-resistant handler under the group stop: the watcher still exits, within the settle grace",
@@ -218,5 +231,5 @@ finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {19 - len(FAILURES)}/19 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {21 - len(FAILURES)}/21 passed")
 sys.exit(1 if FAILURES else 0)
