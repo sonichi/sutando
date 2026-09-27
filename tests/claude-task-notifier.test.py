@@ -94,6 +94,9 @@ class FakeTmuxHarness(unittest.TestCase):
         self.logs_dir = self.root / "workspace" / "logs"
         for d in (self.tasks_dir, self.results_dir, self.state_dir, self.logs_dir):
             d.mkdir(parents=True)
+        # Standby watchers call setsid(); killpg of the notifier cannot reach them,
+        # and SIGKILL skips its EXIT trap. Reap before the tmp tree is removed.
+        self.addCleanup(self._stop_fixture_watchers)
         self.pane_file = self.root / "pane.txt"
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         # Non-empty = the CLI is showing this ghost text in an empty composer.
@@ -408,6 +411,63 @@ PYEOF
 esac
 ''')
         script.chmod(0o755)
+
+
+    def _strays(self):
+        """Pids of watch-tasks-stream / fswatch still naming this fixture."""
+        needle = str(self.root)
+        me = os.getpid()
+        found = []
+        for pattern in ("watch-tasks-stream", "fswatch"):
+            out = subprocess.run(
+                ["pgrep", "-f", pattern], capture_output=True, text=True,
+            ).stdout
+            for token in out.split():
+                if not token.isdigit():
+                    continue
+                pid = int(token)
+                if pid == me or pid in found:
+                    continue
+                # -ww: macOS `ps -o command=` truncates and would hide the inbox path.
+                cmd = subprocess.run(
+                    ["ps", "-p", str(pid), "-ww", "-o", "command="],
+                    capture_output=True, text=True,
+                ).stdout
+                if needle in cmd:
+                    found.append(pid)
+        return found
+
+    def _kill_strays(self, grace=5.0):
+        """Stop every watcher this fixture started; returns any that survive."""
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            pids = self._strays()
+            if not pids:
+                return []
+            for pid in pids:
+                for killer in (os.killpg, os.kill):
+                    try:
+                        killer(pid, signal.SIGTERM)
+                        break
+                    except (ProcessLookupError, PermissionError):
+                        continue
+            time.sleep(0.3)
+        for pid in self._strays():
+            for killer in (os.killpg, os.kill):
+                try:
+                    killer(pid, signal.SIGKILL)
+                    break
+                except (ProcessLookupError, PermissionError):
+                    continue
+        time.sleep(0.3)
+        return self._strays()
+
+    def _stop_fixture_watchers(self):
+        left = self._kill_strays()
+        if left:
+            raise AssertionError(
+                "fixture watcher(s) survived cleanup: %s" % (left,)
+            )
 
     def _env(self, extra=None):
         env = dict(os.environ)
