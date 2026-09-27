@@ -40,6 +40,7 @@ LAST_STDERR = [""]
 TREES: list[Path] = []
 STATE = [{}]
 STATE_PG = [{}]
+CLAIM_SEEN = [None]
 
 
 def handler_pgid(h):
@@ -106,6 +107,7 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
             for _ in range(50):
                 if claims.exists() and any(q.name.startswith("task-") for q in claims.iterdir()): break
                 time.sleep(0.05)
+            CLAIM_SEEN[0] = claims.exists() and any(q.name.startswith("task-") for q in claims.iterdir())
             os.chmod(claims, 0o500)
         if signal_after_exit:
             # Let the handler finish first: the record must still be there afterwards.
@@ -159,7 +161,7 @@ def check(name, cond, detail=""):
 
 
 try:
-    so, hl, _, _ = run(kill_group=False)
+    so, hl, elapsed, _ = run(kill_group=False)
     check("SIGTERM to the watcher alone, handler finishing with 0: the task is NOT handed to the live core",
           hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so), f"{so} {hl}")
     check("...and the settle says why",
@@ -167,6 +169,8 @@ try:
     check("...leaving no claim, no sentinel, and no fallback receipt",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": False}, str(STATE[0]))
     check("...and nothing of the handler's process group survives", STATE_PG[0]["pgid"] is not None and STATE_PG[0]["survivors"] == [], str(STATE_PG[0]))
+    check("...and with its env unset the test-only fork-gap pause did not fire (exit well under the 3 s it would add)",
+          elapsed is not None and elapsed < 2.5, f"elapsed={elapsed}")
 
     so, hl, _, pub = run(kill_group=False, rc=4, want_results=True)
     check("handler finishing with 4 (must-handle): NOT handed to the live core",
@@ -203,6 +207,8 @@ try:
     # Boundary 2: the handler finished and the release FAILED (claims dir read-only); the
     # record must survive so a later signal settles from the outcome, never from the claim.
     so, hl, _, pub = run(kill_group=False, release_fails=True, signal_after_exit=True, want_results=True)
+    check("the claim existed before the claims dir was made read-only (the induced failure is the release)",
+          CLAIM_SEEN[0] is True, str(CLAIM_SEEN[0]))
     check("release failed after rc 0, then a signal: the task is NOT handed to the live core",
           hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so), f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-2:]}")
     check("...the settle read the kept outcome (done) and left the unreleasable claim alone",
@@ -212,5 +218,5 @@ finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {17 - len(FAILURES)}/17 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {19 - len(FAILURES)}/19 passed")
 sys.exit(1 if FAILURES else 0)
