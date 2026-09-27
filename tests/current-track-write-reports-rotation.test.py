@@ -83,5 +83,26 @@ with tempfile.TemporaryDirectory() as d:
           m is not None and int(m.group(1)) == on_disk,
           f"printed={m.group(1) if m else None} on_disk={on_disk} stderr={r.stderr!r}")
 
+    # In-process too: the checks above run the writer as a subprocess, so coverage of the
+    # pinned branch depends on subprocess instrumentation being wired up.
+    import contextlib
+    import importlib.util
+    import io
+
+    spec = importlib.util.spec_from_file_location("ctw", WRITER)
+    ctw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ctw)
+    track.write_text(pinned, encoding="utf-8")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        stdin, sys.stdin = sys.stdin, io.StringIO(
+            "\n## in-proc, 2026-07-01T00:00Z\nin force until the owner says stop\nb\n")
+        try:
+            rc = ctw.main(["append", str(track)])
+        finally:
+            sys.stdin = stdin
+    check("the pinned clause is reached in-process, not only via a subprocess",
+          rc == 0 and "pinned entr" in err.getvalue(), f"rc={rc} stderr={err.getvalue()!r}")
+
 print(f"\n{'PASS' if failures == 0 else f'FAIL — {failures} check(s) failed'}")
 sys.exit(1 if failures else 0)
