@@ -93,10 +93,8 @@ class AppendRotates(unittest.TestCase):
             self.assertIn(tag, head, f"{tag} is pinned and must stay in the head")
 
     def test_default_signature_keeps_the_head_under_the_real_budget(self):
-        # The case that is red at the PARENT on BEHAVIOUR, not on a signature: it calls
-        # append(path, text) exactly as every caller did, and asks only that the head
-        # ends up under DEFAULT_KEEP. Before this change it stayed oversized until some
-        # later probe warned and a human rotated by hand.
+        # Red at the parent on BEHAVIOUR, not on a signature: the old two-arg call,
+        # asking only that the head end up under DEFAULT_KEEP.
         big = "".join(entry(f"e{i}", 1200, f"2026-09-{i + 1:02d}T00:00Z") for i in range(30))
         self.head.write_text("preamble\n" + big)
         self.assertGreater(len(self.head.read_text().encode()), ct.DEFAULT_KEEP,
@@ -106,9 +104,8 @@ class AppendRotates(unittest.TestCase):
         self.assertIn("fresh", self.head.read_text())
 
     def test_append_does_not_deadlock_on_the_writer_lock(self):
-        # locked() is not reentrant: two fds on the same lock file block each other, so
-        # calling rotate() from inside append()'s lock would hang forever rather than
-        # fail. This case simply completing is the assertion; a regression HANGS here.
+        # locked() is not reentrant, so nesting rotate() inside append()'s lock HANGS
+        # rather than failing: this case completing IS the assertion.
         self.head.write_text("preamble\n" + entry("a", 3000, "2026-09-01T00:00Z"))
         ct.append(self.head, entry("b", 3000, "2026-09-02T00:00Z"), keep_bytes=4096)
         self.assertIn("— b", self.head.read_text())
