@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import DEFAULT_KEEP, PIN_DEFAULT, rotate, split  # noqa: E402
+from current_track import DEFAULT_KEEP, PIN_DEFAULT, NotAHostAnchor, rotate, split  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -50,6 +50,9 @@ def main(argv=None) -> int:
     path = Path(a.path)
     try:
         r = rotate(path, a.keep_bytes, a.dry_run, pin)
+    except NotAHostAnchor as e:
+        print(f"current-track-rotate: {e}", file=sys.stderr)
+        return 2
     except OSError as e:
         print(f"current-track-rotate: cannot read {path}: {e}", file=sys.stderr)
         return 1
