@@ -112,9 +112,10 @@ request to build, not to point:
 3. Reuse a page that already covers it, or create one. Several pages are fine when
    the ask needs them (a mockup plus a notes Doc); put the primary one first.
 4. Reply to the request message (or in its thread) with one short line and each
-   page as `[Title](<room link>?collab=<surface>&page=<id>)`, primary first. Leave
+   page as `[Title](<room link>?surface=<surface>&page=<id>)`, primary first. Leave
    out `&page=` for a surface's main page; for a database, `page` is the database
-   id. The card then shows "<agent> opened: <title>" with an Open button.
+   id. The card then shows "<agent> opened: <title>" with an Open button. (Older
+   links used `?collab=` instead of `?surface=`; the client still reads them.)
 
 If only the one-line body reaches you, follow the same four steps.
 
