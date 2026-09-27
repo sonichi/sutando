@@ -15,7 +15,8 @@ alone, or to its whole process group (the notifiers' stop), right after `handle`
     HEAD,   rc 0, pid TERM   -> stdout=[]   stderr: handler ... had already finished
     HEAD,   rc 4, pid TERM   -> stdout=[]   a terminal failure is published instead
     HEAD,   rc 0, watcher group TERM (the notifiers' stop; the handler has its own group now)
-                             -> stdout=[]   the handler finishes inside the grace and is settled done
+                             -> linger inside SUTANDO_SETTLE_GRACE: stdout=[]  settled done
+                             -> linger past it: group stopped, then stdout=[TASK_FILE: ...] and a receipt
     HEAD,   rc 0, handler group + watcher group TERM (not what production sends)
                              -> stdout=[TASK_FILE: ...]  the handler died too: unknown, so the fallback stays
     HEAD,   TERM-resistant handler, group TERM, RUN_TIMEOUT=2
@@ -61,7 +62,7 @@ def group_members(pgid):
 
 
 def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_results=False,
-        pause_before_register=None, release_fails=False, signal_after_exit=False):
+        pause_before_register=None, release_fails=False, signal_after_exit=False, settle_grace=None):
     tmp = Path(tempfile.mkdtemp(prefix="b4816-")); TREES.append(tmp)
     ws = tmp / "ws"
     (ws / "tasks").mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
@@ -86,6 +87,8 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
         env["SUTANDO_HANDLER_RUN_TIMEOUT"] = str(run_timeout)
     if pause_before_register is not None:
         env["SUTANDO_WATCHER_TEST_PAUSE_BEFORE_REGISTER"] = str(pause_before_register)
+    if settle_grace is not None:
+        env["SUTANDO_SETTLE_GRACE"] = str(settle_grace)
     errf = open(tmp / "watcher.err", "w+")
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby",
                           "--inbox", str(ws / "tasks")], cwd=str(REPO), env=env,
@@ -190,13 +193,19 @@ try:
     check("...and the receipt that marks the hand-off, no claim, no sentinel",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": True}, str(STATE[0]))
 
-    # The notifiers' stop as it now behaves: the watcher's group is TERMed, the handler in
-    # its own group is untouched and finishes; the settle collects it and settles done.
-    so, hl, elapsed, _ = run(kill_group=True)
-    check("the notifiers' stop (watcher group only), a TERM-susceptible handler still finishing: NOT handed to the live core",
+    # The notifiers' stop: the watcher's group TERMed, the handler's own group untouched. The
+    # decision under test is which side of SUTANDO_SETTLE_GRACE the linger sits on: both run.
+    so, hl, elapsed, _ = run(kill_group=True, linger="1", settle_grace=3)
+    check("notifiers' stop, susceptible handler finishing INSIDE the grace (1 s < 3 s): settled done, NOT handed to the live core",
           hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so) and "had already finished" in LAST_STDERR[0], f"{so} {hl}")
-    check("...collected inside the grace, no claim, no sentinel, no receipt, group empty",
-          elapsed is not None and elapsed < 4 and STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [],
+    check("...no claim, no sentinel, no receipt, group empty",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [], f"{STATE[0]} {STATE_PG[0]}")
+    so, hl, elapsed, pub = run(kill_group=True, linger="6", settle_grace=2, want_results=True)
+    check("notifiers' stop, susceptible handler lingering PAST the grace (6 s > 2 s): stopped as a group, then handed to the live core",
+          hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so) and "stopping its process group" in LAST_STDERR[0] and pub == [],
+          f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...within the grace plus the kill second, receipt written, no claim, no sentinel, group empty",
+          elapsed is not None and elapsed < 5 and STATE[0] == {"claims": [], "sentinels": [], "receipt": True} and STATE_PG[0]["survivors"] == [],
           f"elapsed={elapsed} {STATE[0]} {STATE_PG[0]}")
 
     so, hl, elapsed, pub = run(kill_group=True, resistant=True, run_timeout=2, want_results=True)
@@ -231,5 +240,5 @@ finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {21 - len(FAILURES)}/21 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {23 - len(FAILURES)}/23 passed")
 sys.exit(1 if FAILURES else 0)
