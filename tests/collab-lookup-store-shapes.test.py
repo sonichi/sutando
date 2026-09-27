@@ -71,6 +71,26 @@ class StoreShapes(unittest.TestCase):
             hits = lk.match(rows, "john-the-dev")
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
 
+    def test_missing_pyyaml_degrades_to_roster(self):
+        # An interpreter without PyYAML is the same degradation as an unparseable
+        # file; before the guard the ImportError escaped and lookup.py crashed.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n    - id: present\n", roster=ROSTER)
+            saved = sys.modules.get("yaml", "absent")
+            sys.modules["yaml"] = None      # makes `import yaml` raise ImportError
+            try:
+                q, ents = lk.load(d)        # must not raise
+            finally:
+                if saved == "absent":
+                    del sys.modules["yaml"]
+                else:
+                    sys.modules["yaml"] = saved
+            self.assertEqual(q, {})
+            self.assertEqual(ents, [])
+            rows = lk.load_roster(d)
+            hits = lk.match(rows, "john-the-dev")
+            self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
+
     def test_roster_github_field_not_key(self):
         with tempfile.TemporaryDirectory() as t:
             d = store(t, roster=ROSTER)
