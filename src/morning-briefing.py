@@ -2,7 +2,8 @@
 """Morning briefing for Sutando.
 
 Runs daily at 6:57am via cron. No external credentials needed.
-Sources: weather (Open-Meteo), macOS Calendar, macOS Reminders,
+Sources: weather (Open-Meteo), the agent-written Google-calendar cache, macOS
+Calendar + Reminders (owner opt-in only: they raise a macOS permission prompt),
 overnight Discord DMs, pending questions, system health.
 
 Output: results/proactive-<ts>.txt (voice speaks it) + Discord DM.
@@ -27,6 +28,13 @@ sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
+_MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
+sys.path.insert(0, str(_MACOS_TOOLS_SCRIPTS))
+try:
+    import native_pim_consent as consent  # noqa: E402  (the one denial/opt-in policy)
+except ImportError:  # the skill is optional: without it the local apps are simply not read
+    consent = None
+
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
@@ -35,6 +43,29 @@ STATE_DIR = WORKSPACE / "state"
 # standalone script cannot reach the Station connector, but the core agent can —
 # it writes today's events here during the morning cron. See get_calendar_events.
 CALENDAR_CACHE_FILE = STATE_DIR / "calendar-today.json"
+
+# Why the calendar came back None, when the owner can act on it; None = plain "couldn't read".
+CALENDAR_UNREAD_NOTE: str | None = None
+NO_CALENDAR_SOURCE_NOTE = (
+    "I couldn't read your calendar: no calendar source is configured. "
+    "Connect Google Calendar via Settings → Integrations, or set "
+    "MORNING_BRIEFING_CALENDAR_SOURCE=macos to use the local Calendar app."
+)
+NO_MACOS_TOOLS_NOTE = (
+    "I couldn't read your calendar: the local Calendar app needs the macos-tools skill, "
+    "which is not installed. Connect Google Calendar via Settings → Integrations."
+)
+CALENDAR_DENIED_NOTE = (
+    "I couldn't read your calendar: macOS denied Calendar access "
+    "(System Settings → Privacy & Security → Automation); I won't ask again."
+)
+# Why reminders came back None, when the owner can act on it; None = say nothing extra.
+REMINDERS_UNREAD_NOTE: str | None = None
+NO_REMINDERS_SOURCE_NOTE = (
+    "Reminders not read: the local Reminders app is opt-in "
+    "(set MORNING_BRIEFING_CALENDAR_SOURCE=macos to include it)."
+)
+NO_REMINDERS_SKILL_NOTE = "Reminders not read: the local Reminders app needs the macos-tools skill."
 
 # Weather codes → one-word description
 WEATHER_CODES = {
@@ -234,38 +265,54 @@ def _next_event(events: list[dict], now=None):
     return min(future, key=lambda pair: pair[0])[1] if future else None
 
 
-def get_calendar_events() -> list[dict] | None:
-    """Get today's calendar events, preferring the owner's real Google calendar.
+def _calendar_source() -> str:
+    from sutando_config import config_get_env_first
+    return (config_get_env_first("MORNING_BRIEFING_CALENDAR_SOURCE", "") or "").strip().lower()
 
-    Source preference:
+
+def _native_pim_opted_in() -> bool:
+    """Owner opt-in for the local Calendar/Reminders apps. They raise a macOS
+    permission prompt, so an unattended cron never touches them unasked."""
+    if _calendar_source() == "macos":
+        return True
+    if consent is None:
+        return False
+    return consent.env_allows() or consent.consent_marker(STATE_DIR).exists()
+
+
+def _calendar_denied_marker() -> Path:
+    return consent.denial_marker("Calendar", STATE_DIR)
+
+
+def get_calendar_events() -> list[dict] | None:
+    """Today's calendar events, or None when no source could be read.
+
+    Source order:
       1. The Google-calendar cache (``state/calendar-today.json``) written by the
-         core agent — the ONLY source that sees the owner's Google Workspace
-         calendar, which a local macOS Calendar.app may not have subscribed.
-      2. Local macOS Calendar.app via AppleScript (fallback). An EMPTY result
-         from this source is only trusted on hosts that have never written a
-         Google cache; where one exists, empty means blind, so None is returned.
+         core agent from the Station connector — the default, and the ONLY source
+         that sees the owner's Google Workspace calendar.
+      2. Local macOS Calendar.app via AppleScript — only when the owner opted in
+         with ``MORNING_BRIEFING_CALENDAR_SOURCE=macos`` (or
+         ``SUTANDO_ALLOW_NATIVE_PIM=1``). It raises a macOS Automation prompt,
+         so it never runs unasked. An EMPTY result is only trusted on hosts that
+         have never written a Google cache; where one exists, empty means blind.
+
+    ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` pins the cache as the only trusted
+    source: missing/stale → None ("couldn't read"), never a local read. With no
+    source at all, None comes with ``CALENDAR_UNREAD_NOTE`` naming the fix.
 
     Returns a list of events ([] means verified empty) or None when the calendar
     could not be read — callers must not render None as "clear".
 
-    When ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` is set, the cache is the only
-    TRUSTED source: if it's missing/stale, return None (→ "couldn't read your
-    calendar") rather than a misleading empty read from a local calendar that
-    doesn't include the work account. This is exactly the 2026-07-21 bug — the
-    briefing announced "calendar is clear" off an empty local read while the
-    owner had three Google meetings that day.
-
-    Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of
-    calendar names to exclude, e.g. "Home,Wedding,Birthdays"). Useful for
-    filtering out subscribed shared calendars that clutter the briefing
-    (closes #964). Case-insensitive match on calendar name.
+    Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of calendar
+    names to exclude, e.g. "Home,Wedding,Birthdays"; case-insensitive).
     """
-    import os as _os
-
+    global CALENDAR_UNREAD_NOTE
+    CALENDAR_UNREAD_NOTE = None
     cached = _read_calendar_cache()
     if cached is not None:
         return cached
-    if _os.environ.get("MORNING_BRIEFING_CALENDAR_SOURCE", "").strip().lower() == "google":
+    if _calendar_source() == "google":
         # Trusted source expected but unavailable — do NOT fall back to a local
         # read that can't see the work calendar and would look falsely "clear".
         print(
@@ -273,7 +320,18 @@ def get_calendar_events() -> list[dict] | None:
             file=sys.stderr,
         )
         return None
-    script = '''
+    if _native_pim_opted_in():
+        return _read_local_calendar()
+    CALENDAR_UNREAD_NOTE = NO_CALENDAR_SOURCE_NOTE
+    print(
+        "  calendar: no source — no Google cache for today, and the local Calendar.app "
+        "is opt-in (MORNING_BRIEFING_CALENDAR_SOURCE=macos); reporting unread",
+        file=sys.stderr,
+    )
+    return None
+
+
+_CALENDAR_SCRIPT = '''
 set theDate to (current date)
 set hours of theDate to 0
 set minutes of theDate to 0
@@ -303,25 +361,40 @@ tell application "Calendar"
 end tell
 return output
 '''
-    result, err = _run_applescript(script, timeout=10)
-    if result is None:
-        # Calendar.app not running fails the query with -600 ("Application
-        # isn't running"). Launch it in the background and retry once.
-        try:
-            subprocess.run(["open", "-gja", "Calendar"], timeout=5)
-            time.sleep(3)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-        result, err = _run_applescript(script, timeout=10)
+
+
+def _record_calendar_denial(marker: Path) -> None:
+    consent.record_denial("Calendar", STATE_DIR)
+    print(
+        "  calendar: Automation permission denied (-1743). Recorded in "
+        f"{marker.name}; the local read stays off until the owner grants Calendar under "
+        f"System Settings → Privacy & Security → Automation and runs `{consent.GRANT_COMMAND}`.",
+        file=sys.stderr,
+    )
+
+
+def _read_local_calendar() -> list[dict] | None:
+    """One AppleScript read of Calendar.app — never launches the app, never retries.
+    A stored denial (-1743) is final: recorded once, later runs skip the read."""
+    global CALENDAR_UNREAD_NOTE
+    if consent is None:
+        CALENDAR_UNREAD_NOTE = NO_MACOS_TOOLS_NOTE
+        print("  calendar: local read needs the macos-tools skill (native_pim_consent); not installed",
+              file=sys.stderr)
+        return None
+    marker = _calendar_denied_marker()
+    if marker.exists():
+        CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
+        print(f"  calendar: automation denied earlier ({marker.name}); not asking again",
+              file=sys.stderr)
+        return None
+    result, err = _run_applescript(_CALENDAR_SCRIPT, timeout=10)
     if result is None:
         if err:
             print(f"  calendar: AppleScript error — {err}", file=sys.stderr)
-            if "-1743" in err:
-                print(
-                    "  calendar: Automation permission needed. "
-                    "System Settings → Privacy & Security → Automation → grant Calendar access.",
-                    file=sys.stderr,
-                )
+        if consent.is_denied(err):
+            CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
+            _record_calendar_denial(marker)
         return None
     from sutando_config import config_get
     skip_cals_raw = config_get("MORNING_BRIEFING_SKIP_CALENDARS", "") or ""
@@ -373,13 +446,25 @@ def get_reminders() -> "list[str] | None":
     clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
     (#2256), which is why `get_calendar_events()` already draws this line.
     """
-    script_path = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
-    if not script_path.exists():
+    global REMINDERS_UNREAD_NOTE
+    REMINDERS_UNREAD_NOTE = None
+    if not _native_pim_opted_in():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SOURCE_NOTE
+        print("  reminders: local Reminders.app is opt-in "
+              "(MORNING_BRIEFING_CALENDAR_SOURCE=macos); not read", file=sys.stderr)
+        return None
+    script_path = _MACOS_TOOLS_SCRIPTS / "reminders.py"
+    if consent is None or not script_path.exists():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SKILL_NOTE
+        print("  reminders: local read needs the macos-tools skill; not installed", file=sys.stderr)
         return None
     try:
+        # The host opt-in was verified above; it is passed as the env consent,
+        # never as --owner-asked (nobody asked in a conversation here).
         r = subprocess.run(
             [sys.executable, str(script_path), "list", "--due-today"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, consent.ENV: "1"},
         )
         if r.returncode != 0:
             return None
@@ -726,7 +811,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
 
     # Calendar — None means the query failed (distinct from verified empty).
     if events is None:
-        parts.append("I couldn't read your calendar this morning.")
+        parts.append(CALENDAR_UNREAD_NOTE or "I couldn't read your calendar this morning.")
     elif events:
         count = len(events)
         if count == 1:
@@ -752,6 +837,8 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         shown = reminders[:3]
         more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
         parts.append(f"Reminders due: {', '.join(shown)}{more}.")
+    elif reminders is None and REMINDERS_UNREAD_NOTE:
+        parts.append(REMINDERS_UNREAD_NOTE)
 
     # Pending questions
     if pending_qs:

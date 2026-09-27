@@ -75,7 +75,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/cli_wedge.py",
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
+            "src/delivery/worker-stage.sh",
             "src/delivery/pane_gate.py",
+            # pane_gate consults the proxy's quota record through this authority.
+            "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/local_task_protocol.py",
@@ -89,6 +92,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime-api/instance_key.py",
             "src/runtime-api/rundir.py",
             "src/watch-tasks-stream.sh",
+            "src/tasks-dir-resolve.sh",
+            "src/watcher_identity.py",
             "src/workspace_default.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
@@ -232,6 +237,8 @@ exit 0
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
             str(self.root / "src/agent/codex/cli/task-notifier.sh"),
             str(self.root / "src/watch-tasks-stream.sh"),
+            str(self.root / "src/tasks-dir-resolve.sh"),
+            str(self.root / "src/watcher_identity.py"),
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
@@ -333,25 +340,14 @@ exit 0
             if slave >= 0:
                 os.close(slave)
 
-    def _install_pool_skill(self):
-        script = self.root / "skills" / "pool" / "scripts" / "route_handler.py"
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("#!/bin/sh\nexit 0\n")
-        script.chmod(0o755)
-        (script.parent.parent / "manifest.json").write_text(
-            '{"config": {"SUTANDO_TASK_EVENT_HANDLER_SCRIPT": "scripts/route_handler.py"}}\n')
-        # realpath: the resolver resolves symlinks, and /tmp is one on macOS.
-        return Path(os.path.realpath(script))
-
-    def test_pool_route_handler_is_not_forwarded_but_resolves_live(self):
-        """Unpinned: not forwarded to env (that froze it at boot); the watcher
-        resolves it live on its own instead (see task-event-handler-live-resolution.test.py)."""
-        self._install_pool_skill()
-        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+    def test_an_explicit_pin_reaches_the_watcher_verbatim(self):
+        # Since #4503 the launcher resolves nothing; only a genuine pin forwards.
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh",
+                                    env_extra={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
+        self.assertIn("-e SUTANDO_TASK_EVENT_HANDLER=/opt/handler", self.log.read_text())
 
-    def test_no_pool_skill_sets_no_handler(self):
+    def test_no_pin_sets_no_handler(self):
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
@@ -389,8 +385,8 @@ exit 0
         self.assertIn("install --workspace", invocation)
         self.assertIn("--host-label test-host", invocation)
     def test_a_worker_instance_launch_is_refused_before_any_core_write(self):
-        """There is no Codex worker mode. Through the dispatcher's --runtime and
-        directly, an instance launch is refused, and none of the core's durable
+        """The core entry point refuses a pool instance. Through the dispatcher's
+        --runtime and directly, an instance launch touches none of the core's durable
         records or managed processes is touched."""
         worker = {"SUTANDO_INSTANCE_ID": "a" * 32,
                   "SUTANDO_TMUX_SESSION": "sutando-worker-" + "a" * 32,
@@ -401,7 +397,7 @@ exit 0
                 result = self.run_launcher(*args, env_extra=worker, launcher=entry)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("SUTANDO_INSTANCE_ID", result.stderr)
-                self.assertIn("Codex workers are unsupported", result.stderr)
+                self.assertIn("pool launcher", result.stderr)
         state = self.root / "workspace" / "state"
         self.assertFalse((state / "core-runtime.json").exists(),
                          "a worker wrote the core's runtime record")
@@ -657,12 +653,18 @@ exit 23
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(100):
+            # Each notifier lifetime now spawns a role-verdict check, so a
+            # restart is a property to wait for, not a one-second deadline.
+            for _ in range(1000):
                 observed = _read_count(count)
                 if observed >= 2:
                     break
@@ -703,6 +705,10 @@ sleep 60
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
+                   SUTANDO_NOTIFIER_GRACE_PERIOD="0",
+                   SUTANDO_NOTIFIER_ROLE_POLL="0.05",
+                   SUTANDO_NOTIFIER_TARGET_POLL="0.05",
+                   SUTANDO_TASKS_DIR=str(Path(self.tmp.name) / "inbox-under-test"),
                    SUPERVISOR_COUNT=str(count))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         process = subprocess.Popen(["/bin/bash", str(supervisor)], env=env,
@@ -1081,7 +1087,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(2)\n",
+            needle + "    import time as _slow_history\n    _slow_history.sleep(4)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1120,7 +1126,8 @@ exit 0
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertLess(elapsed, 1.0, f"unassigned delivery took {elapsed:.2f}s")
+        # Well under the injected 4s scan, well over a loaded runner's own overhead.
+        self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
         calls = self.log.read_text()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
@@ -1258,7 +1265,9 @@ exit 0
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
 
-    def test_managed_notifier_waits_for_idle_then_prioritizes_owner_task(self):
+    def test_managed_notifier_waits_for_idle_then_submits_in_watcher_announced_order(self):
+        # Priority now lives in the watcher's sweep (closes #3017); this stub
+        # emits in that real order (urgent before low), matching a real sweep.
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
         results = workspace / "results"
@@ -1276,7 +1285,7 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
             "#!/bin/bash\n"
-            "printf 'TASK_FILE: task-low.txt\\nTASK_FILE: task-owner.txt\\n'\n"
+            "printf 'TASK_FILE: task-owner.txt\\nTASK_FILE: task-low.txt\\n'\n"
         )
         watcher.chmod(0o755)
         early = Path(self.tmp.name) / "submitted-while-busy"
@@ -1683,6 +1692,277 @@ exit 0
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
         self.assertFalse(done.exists())
+
+    def test_worker_done_writer_failure_is_logged_without_crashing_notifier(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (tasks / "task-owner.txt").write_text("task: already delivered\n")
+        (results / "task-owner.txt").write_text("done\n")
+        writer_log = Path(self.tmp.name) / "writer-calls"
+        writer = Path(self.tmp.name) / "failing-writer.py"
+        writer.write_text(
+            "import os, sys\n"
+            "with open(os.environ['WRITER_LOG'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "sys.exit(9)\n"
+        )
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   WRITER_LOG=str(writer_log),
+                   SUTANDO_INSTANCE_ID="worker-3",
+                   SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
+                   SUTANDO_WORKSPACE_DIR=str(workspace),
+                   SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_RESULTS_DIR=str(results))
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not record done for task-owner", result.stderr)
+        self.assertIn("mark-done", writer_log.read_text())
+        self.assertNotIn("prune-spent", writer_log.read_text())
+        self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
+
+    def test_worker_done_prunes_spent_sentinel(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        inbox = workspace / "deliveries" / "worker-3"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        inbox.mkdir(parents=True)
+        (tasks / "task-owner.txt").write_text("task: already delivered\n")
+        (results / "task-owner.txt").write_text("done\n")
+        sentinel = inbox / "task-owner.accepted"
+        sentinel.touch()
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   SUTANDO_INSTANCE_ID="worker-3",
+                   SUTANDO_POOL_DELIVERY_SCRIPT=str(
+                       REAL_REPO / "skills/worker-pool/scripts/pool_delivery.py"),
+                   SUTANDO_WORKSPACE_DIR=str(workspace),
+                   SUTANDO_TASKS_DIR=str(inbox),
+                   SUTANDO_RESULTS_DIR=str(results))
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(sentinel.exists(), "successful done must retire the spent hold")
+        self.assertTrue((workspace / "state/workers/worker-3/done/task-owner.flag").exists())
+
+    def test_worker_prune_failure_is_logged_without_losing_completion(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (tasks / "task-owner.txt").write_text("task: already delivered\n")
+        (results / "task-owner.txt").write_text("done\n")
+        writer = Path(self.tmp.name) / "fail-prune.py"
+        writer.write_text(
+            "import sys\n"
+            "sys.exit(9 if 'prune-spent' in sys.argv else 0)\n"
+        )
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   SUTANDO_INSTANCE_ID="worker-3",
+                   SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
+                   SUTANDO_WORKSPACE_DIR=str(workspace),
+                   SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_RESULTS_DIR=str(results))
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not prune spent delivery sentinels", result.stderr)
+        self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
+
+    def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (tasks / "task-owner.txt").write_text("task: delivery needs attribution\n")
+        writer = Path(self.tmp.name) / "failing-writer.py"
+        writer.write_text("import sys\nsys.exit(9)\n")
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = has-session ] && exit 0
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   TMUX_LOG=str(self.log),
+                   SUTANDO_INSTANCE_ID="worker-3",
+                   SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
+                   SUTANDO_WORKSPACE_DIR=str(workspace),
+                   SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_RESULTS_DIR=str(results),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core")
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not record pending for task-owner", result.stderr)
+        self.assertNotIn("send-keys", self.log.read_text())
+        self.assertFalse((results / "task-owner.txt").exists())
+
+    def test_one_shot_missing_session_exits_nonzero(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        tasks.mkdir(exist_ok=True)
+        (tasks / "task-owner.txt").write_text("task: deliver me\n")
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   TMUX_LOG=str(self.log),
+                   SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core")
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex session is unavailable", result.stderr)
+        self.assertNotIn("send-keys", self.log.read_text())
+
+    def test_one_shot_composer_refusal_exits_nonzero_without_typing(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        tasks.mkdir(exist_ok=True)
+        (tasks / "task-owner.txt").write_text("task: deliver me\n")
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = has-session ] && exit 0
+[ "${1:-}" = capture-pane ] && { printf '› my unsent draft\n← for agents\n'; exit 0; }
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   TMUX_LOG=str(self.log),
+                   SUTANDO_TASKS_DIR=str(tasks),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                   SUTANDO_NOTIFIER_COMPOSER_POLL="0.02",
+                   SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1")
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh"),
+             "--event", "task-owner.txt"],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refusing --event task-owner.txt: composer was not idle-ready", result.stderr)
+        self.assertNotIn("will retry on the next idle cycle", result.stderr)
+        self.assertNotIn("send-keys", self.log.read_text())
+
+    def test_worker_pending_writer_failure_retries_same_task_before_typing(self):
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        inbox = workspace / "deliveries" / "worker-3"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        inbox.mkdir(parents=True)
+        payload = tasks / "task-owner.txt"
+        payload.write_text("priority: normal\ntask: deliver me\n")
+        (inbox / "task-owner.txt").write_text("")
+        event_log = Path(self.tmp.name) / "delivery-events"
+        first_failure = Path(self.tmp.name) / "first-failure"
+        writer = Path(self.tmp.name) / "fail-first-pending.py"
+        writer.write_text(
+            "import os, pathlib, sys\n"
+            "if 'prune-spent' in sys.argv:\n"
+            "    with open(os.environ['EVENT_LOG'], 'a') as f: f.write('prune\\n')\n"
+            "    sys.exit(0)\n"
+            "stage = sys.argv[sys.argv.index('--stage') + 1]\n"
+            "with open(os.environ['EVENT_LOG'], 'a') as f: f.write('stage:' + stage + '\\n')\n"
+            "first = pathlib.Path(os.environ['FIRST_FAILURE'])\n"
+            "if stage == 'pending' and not first.exists():\n"
+            "    first.touch()\n"
+            "    sys.exit(9)\n"
+        )
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(
+            "#!/bin/bash\n"
+            f"printf 'TASK_FILE: {payload}\\n'\n"
+            "sleep 3\n"
+        )
+        watcher.chmod(0o755)
+        pane_buf = Path(self.tmp.name) / "pane-buffer"
+        self._write_exe("tmux", '''#!/bin/bash
+[ "${1:-}" = -S ] && shift 2
+case "${1:-}" in
+  has-session) exit 0 ;;
+  capture-pane)
+    if [ -s "$PANE_BUF" ]; then
+      printf '› %s\n← for agents\n' "$(cat "$PANE_BUF")"
+    else
+      printf '› \n← for agents\n'
+    fi
+    exit 0 ;;
+  send-keys)
+    printf 'send-keys\n' >> "$EVENT_LOG"
+    if [ "${*: -1}" = C-m ]; then
+      printf 'done\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+      : > "$PANE_BUF"
+    else
+      printf '%s' "${*: -1}" > "$PANE_BUF"
+    fi
+    exit 0 ;;
+esac
+exit 0
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+                   EVENT_LOG=str(event_log), FIRST_FAILURE=str(first_failure),
+                   PANE_BUF=str(pane_buf),
+                   SUTANDO_INSTANCE_ID="worker-3",
+                   SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
+                   SUTANDO_WORKSPACE_DIR=str(workspace),
+                   SUTANDO_TASKS_DIR=str(inbox),
+                   SUTANDO_RESULTS_DIR=str(results),
+                   SUTANDO_INBOX_RESOLVER="pool-delivery",
+                   SUTANDO_INBOX_KIND="deliveries",
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                   SUTANDO_NOTIFIER_RETRY_INTERVAL="1",
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2")
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "src/agent/codex/cli/task-notifier.sh")],
+            env=env, capture_output=True, text=True, timeout=8,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = event_log.read_text().splitlines()
+        self.assertEqual(events[:2], ["stage:pending", "stage:pending"], events)
+        self.assertIn("send-keys", events[2:], events)
+        self.assertIn("stage:done", events)
+        self.assertIn("could not record pending for task-owner", result.stderr)
+        self.assertIn("could not record worker ownership", result.stderr)
+        self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ const TASK_DIR = join(TMP, 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
 mkdirSync(TASK_DIR, { recursive: true });
 
-const { _isVoiceTask } = await import('../src/task-bridge.js');
+const { _isVoiceTask, voiceTaskOrigin, setVoiceTaskOriginResolver } = await import('../src/task-bridge.js');
 
 after(() => {
 	try { rmSync(TMP, { recursive: true, force: true }); } catch {}
@@ -55,6 +55,48 @@ source: voice
 interaction_type: realtime_audio
 media_form: live_stream
 channel_id: local-voice
+task: hello world
+`;
+
+// Room-bound voice (2026-09): a session docked in a room addresses the task to
+// that room, so `channel_id` carries the room id and no longer says
+// `local-voice`. The verdict keys on `source: voice`; the literal stays only
+// for files archived before rooms. `media_form: live_stream` is NOT a voice
+// key: the phone skill stamps it on `source: phone` tasks.
+const VOICE_BODY_ROOM = `id: task-isvoice-test-room-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: voice
+interaction_type: realtime_audio
+media_form: live_stream
+channel_id: !abc123:ag2.space
+channel_kind: room
+source_room_id: !abc123:ag2.space
+user_id: voice-local
+access_tier: owner
+priority: urgent
+task: hello room
+`;
+// Legacy archived shape: only the channel_id literal identifies voice.
+const VOICE_BODY_LEGACY_LITERAL = `id: task-isvoice-test-legacy-aaa
+timestamp: 2026-05-06T00:00:00Z
+channel_id: local-voice
+task: hello world
+`;
+// A non-voice room task carrying source_room_id must not read as a voice room.
+const GATEWAY_ROOM_BODY = `id: task-isvoice-test-gw-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: ag2space
+channel_id: !abc123:ag2.space
+source_room_id: !abc123:ag2.space
+task: hello world
+`;
+// A room-bound body whose forged room id is not a Matrix room id.
+const VOICE_BODY_BAD_ROOM = `id: task-isvoice-test-badroom-aaa
+timestamp: 2026-09-18T00:00:00Z
+source: voice
+media_form: live_stream
+channel_id: not-a-room
+source_room_id: ../../etc
 task: hello world
 `;
 
@@ -93,6 +135,57 @@ describe('_isVoiceTask — archive-path coverage', () => {
 		const id = 'task-isvoice-test-ls-aaa';
 		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_LIVESTREAM);
 		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('returns true for a room-bound voice task (channel_id is the room, not local-voice)', () => {
+		const id = 'task-isvoice-test-room-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY_ROOM);
+		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('returns false for a phone task: media_form: live_stream alone is not voice', () => {
+		const id = 'task-isvoice-test-phone-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), `id: ${id}\ntimestamp: 2026-09-18T00:00:00Z\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: CA1\naccess_tier: owner\ntask: hello\n`);
+		assert.equal(_isVoiceTask(id), false);
+	});
+
+	it('keeps the legacy channel_id: local-voice literal for archived files', () => {
+		const id = 'task-isvoice-test-legacy-aaa';
+		writeTask(join(ARCHIVE_DIR, '2026-05', `${id}.txt`), VOICE_BODY_LEGACY_LITERAL);
+		assert.equal(_isVoiceTask(id), true);
+	});
+
+	it('voiceTaskOrigin: the adapter\'s resolver rebuilds an origin from a voice task\'s header, and only a voice task\'s', () => {
+		const seen: string[] = [];
+		setVoiceTaskOriginResolver((header) => {
+			const line = header.find(l => l.startsWith('source_room_id:')) ?? '';
+			const target = line.slice('source_room_id:'.length).trim();
+			seen.push(target);
+			return target ? { channel: 'fakechan', target } : null;
+		});
+		try {
+			writeTask(join(TASK_DIR, 'task-isvoice-test-room-aaa.txt'), VOICE_BODY_ROOM);
+			assert.deepEqual(voiceTaskOrigin('task-isvoice-test-room-aaa'), { channel: 'fakechan', target: '!abc123:ag2.space' });
+			writeTask(join(TASK_DIR, 'task-isvoice-test-aaa.txt'), VOICE_BODY);
+			assert.equal(voiceTaskOrigin('task-isvoice-test-aaa'), null, 'a DM voice task has no origin');
+			const before = seen.length;
+			writeTask(join(TASK_DIR, 'task-isvoice-test-gw-aaa.txt'), GATEWAY_ROOM_BODY);
+			assert.equal(voiceTaskOrigin('task-isvoice-test-gw-aaa'), null, 'a non-voice task never reaches the resolver');
+			assert.equal(seen.length, before);
+			writeTask(join(TASK_DIR, 'task-isvoice-test-badroom-aaa.txt'), VOICE_BODY_BAD_ROOM);
+			assert.deepEqual(voiceTaskOrigin('task-isvoice-test-badroom-aaa'), { channel: 'fakechan', target: '../../etc' }, 'target grammar is the adapter\'s to refuse; the core only keeps it one bracket-free token');
+			assert.equal(voiceTaskOrigin('task-isvoice-test-no-such-file'), null);
+			// Archived copies resolve too — the result can land after the task moved.
+			writeTask(join(ARCHIVE_DIR, '2026-09', 'task-isvoice-test-room-arch.txt'), VOICE_BODY_ROOM.replace('room-aaa', 'room-arch'));
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-arch')?.target, '!abc123:ag2.space');
+			setVoiceTaskOriginResolver(() => ({ channel: 'Bad Channel', target: 'x' }));
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'an unusable origin is no origin');
+			setVoiceTaskOriginResolver(() => { throw new Error('boom'); });
+			assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'a throwing resolver is no origin');
+		} finally {
+			setVoiceTaskOriginResolver(null);
+		}
+		assert.equal(voiceTaskOrigin('task-isvoice-test-room-aaa'), null, 'with no resolver a header alone binds nothing');
 	});
 
 	it('returns true for a voice task in tasks/processed/', () => {

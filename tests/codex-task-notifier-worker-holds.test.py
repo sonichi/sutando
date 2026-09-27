@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""The Codex notifier's pick never selects a worker-held task.
+"""The Codex notifier never types a worker-held or watcher-claimed task into
+the core: filename_is_worker_held/filename_is_claimed are extracted from
+src/agent/codex/cli/task-notifier.sh and run directly, so the assertion is on
+the shipped functions, not a copy.
 
-`next_pending_task` is extracted from src/agent/codex/cli/task-notifier.sh and run
-in a bash harness, so the assertion is on the shipped function, not a copy.
+These replace the old test against next_pending_task/probe_optional_task_handler,
+deleted by the single-decider redesign -- the notifier no longer picks or
+probes; it only validates an announced filename before typing it.
 """
 import os
 import re
@@ -22,51 +26,42 @@ def _function_text(name: str, text: str) -> str:
     return m.group(0)
 
 
-class CodexNotifierWorkerHoldsTest(unittest.TestCase):
+class CodexNotifierGuardsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         ws = Path(self.tmp.name)
-        (ws / "tasks").mkdir(); (ws / "results").mkdir()
         (ws / "state" / "task-event-handler-claims").mkdir(parents=True)
-        (ws / "state" / "task-event-handler-fallbacks").mkdir(parents=True)
         (ws / "deliveries" / "worker-1").mkdir(parents=True)
-        (ws / "tasks" / "task-held.txt").write_text("task: held\n")
-        (ws / "tasks" / "task-free.txt").write_text("task: free\n")
         (ws / "deliveries" / "worker-1" / "task-held.claimed").write_text("")
+        (ws / "state" / "task-event-handler-claims" / "task-claimed.txt").write_text(
+            "12345\n12345-1\n/tmp/task-claimed.txt\nfallback\n")
         self.ws = ws
 
-    def _pick(self, script_text: str) -> str:
-        fn = _function_text("next_pending_task", script_text)
-        harness = (
-            "probe_optional_task_handler() { return 1; }\n" + fn + "\n"
-            "next_pending_task\n"
-        )
+    def _check(self, fn_name: str, filename: str) -> int:
+        text = SCRIPT.read_text()
+        fn = _function_text(fn_name, text)
+        harness = fn + f'\n{fn_name} "{filename}"\n'
         env = {**os.environ,
-               "TASKS_DIR": str(self.ws / "tasks"), "RESULTS_DIR": str(self.ws / "results"),
-               "TASK_HANDLER_CLAIMS_DIR": str(self.ws / "state" / "task-event-handler-claims"),
-               "TASK_HANDLER_FALLBACKS_DIR": str(self.ws / "state" / "task-event-handler-fallbacks"),
                "DELIVERIES_DIR": str(self.ws / "deliveries"),
+               "CLAIMS_DIR": str(self.ws / "state" / "task-event-handler-claims"),
                "NOTIFIER_PY": sys.executable,
                "DISPATCH_PY": str(REPO / "src" / "delivery" / "task_dispatch.py")}
-        r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, env=env, timeout=30)
-        return r.stdout.strip()
+        r = subprocess.run(["bash", "-c", harness], env=env, timeout=30)
+        return r.returncode
 
-    def test_shipped_pick_skips_the_worker_held_task(self):
-        self.assertEqual(self._pick(SCRIPT.read_text()), "task-free.txt")
+    def test_shipped_worker_held_check_blocks_the_held_task(self):
+        self.assertEqual(self._check("filename_is_worker_held", "task-held.txt"), 0)
 
-    def test_pick_passes_the_deliveries_dir(self):
-        text = SCRIPT.read_text()
-        self.assertIn('--deliveries-dir "$DELIVERIES_DIR"', _function_text("next_pending_task", text))
+    def test_shipped_worker_held_check_allows_a_free_task(self):
+        self.assertEqual(self._check("filename_is_worker_held", "task-free.txt"), 1)
 
-    def test_without_the_argument_the_held_task_is_picked(self):
-        # Oracle: the pre-fix function selects the held task (older by mtime, same
-        # priority), so the shipped-pick assertion above discriminates.
-        held = self.ws / "tasks" / "task-held.txt"
-        os.utime(held, (1, 1))
-        text = SCRIPT.read_text().replace(' --deliveries-dir "$DELIVERIES_DIR"', "")
-        self.assertEqual(self._pick(text), "task-held.txt")
-        self.assertEqual(self._pick(SCRIPT.read_text()), "task-free.txt")
+    def test_shipped_claimed_check_blocks_the_claimed_task(self):
+        self.assertEqual(self._check("filename_is_claimed", "task-claimed.txt"), 0)
+
+    def test_shipped_claimed_check_allows_an_unclaimed_task(self):
+        self.assertEqual(self._check("filename_is_claimed", "task-free.txt"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

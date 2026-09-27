@@ -83,7 +83,7 @@ def test_context_is_registered_and_doc_still_is():
 def test_the_old_name_points_at_the_new_one_and_at_the_other_store():
     _, err = run(["doc", "get", "!x:y"])
     assert "room_ops context" in err, f"the old name must point at the new one: {err!r}"
-    assert "room-doc" in err, "and must name where the LIVE document lives"
+    assert "room-collab" in err, "and must name where the LIVE document lives"
 
 
 def test_the_note_never_lands_on_stdout():

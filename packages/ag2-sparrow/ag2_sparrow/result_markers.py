@@ -485,8 +485,8 @@ def render_skill_prelude(
             "confidence is exactly the signal that fails. The only exception is a "
             'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
         _step += 1
-        # No notify step here: the broker's status glyph already shows
-        # received/working, and pickup is the 🫡 reaction, not a chat message.
+        # No notify step here: the broker's delivery status already shows
+        # pickup and working, so no notify message is sent.
     _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
     return _skill
 

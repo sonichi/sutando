@@ -2,16 +2,22 @@
 # Persistent Codex CLI implementation of the Sutando core.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# Pure bash, no external dirname: this is the launcher's own first line, run
+# before anything has confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../../../.." && pwd)"
+unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
-. "$REPO/src/agent/task-event-handler-lookup.sh"
 
-# This runtime has no worker mode: everything below is the canonical core's
-# ceremony, so an instance launch is refused before the first step of it.
+# This entry point only launches the canonical core. A Codex pool worker uses
+# the pool's runtime launcher instead.
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  echo "start-cli: SUTANDO_INSTANCE_ID is set; launch Codex workers through the pool launcher." >&2
   exit 2
 fi
 
@@ -185,29 +191,16 @@ apply_tmux_defaults() {
 ensure_task_notifier() {
   local expected_version active_version
   local version_files
-  # Captured before the resolve-if-unset below overwrites the var: only a
-  # genuine pin, never our own boot-time cache, may reach the notifier's env.
-  local operator_pinned_handler="${SUTANDO_TASK_EVENT_HANDLER:-}"
   version_files=(
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
-  # The resolved outcome is part of the identity below, so resolve first: a
-  # publisher installed, removed or duplicated must replace a running watcher.
-  handler_rc=0
-  if [ -z "${SUTANDO_TASK_EVENT_HANDLER:-}" ]; then
-    SUTANDO_TASK_EVENT_HANDLER="$(resolve_task_event_handler "$REPO")" || handler_rc=$?
-    [ "$handler_rc" = 0 ] || SUTANDO_TASK_EVENT_HANDLER=""
-  fi
-  # Fail CLOSED: without the router probe a worker-bound task would fall
-  # through to the unrestricted core, the inheritance the handler prevents.
-  if [ "$handler_rc" = 2 ]; then
-    echo "  ⚠ task notifier not started: several skills publish skills/*/task-event-handler." >&2
-    echo "    Pin one with SUTANDO_TASK_EVENT_HANDLER and relaunch." >&2
-    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    return 0
-  fi
+  # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
+  # itself and fswatches it for changes, so the launcher forwards only a genuine
+  # operator pin (if one is already set) and nothing computed.
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
@@ -225,9 +218,7 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
-  # Only a genuine operator pin is forwarded. task-notifier.sh and the
-  # watch-tasks-stream.sh it spawns both re-resolve live when this is unset.
-  [ -n "$operator_pinned_handler" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$operator_pinned_handler")
+  [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
@@ -236,6 +227,12 @@ ensure_task_notifier() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  # Standby/grace-period knobs: unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }

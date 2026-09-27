@@ -656,21 +656,48 @@ def _vault_remote_url(vault: "dict | None" = None) -> str:
 # Checks
 # ---------------------------------------------------------------------------
 
-def twilio_configured(env_content: str) -> bool:
-    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+# Everything conversation-server.ts exits without (its own startup check).
+TWILIO_SERVER_VARS = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+
+
+def _dotenv_active_value(env_content: str, var: str) -> str:
+    """The value of an ACTIVE `var=` line in .env text; '' when the line is
+    absent, commented out, or has nothing after the `=`."""
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(var + "="):
+            value = stripped.split("=", 1)[1].strip()
+            if value:
+                return value
+    return ""
+
+
+def twilio_configured(env_content: str, vault_get=None) -> bool:
+    """True when every credential the phone server refuses to start without
+    (TWILIO_SERVER_VARS) resolves: an ACTIVE line with a value in .env, or the
+    Keychain vault (`vault set …`) for each one.
 
     A plain substring test also matched the commented placeholder shipped in
     the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
     never configured Twilio still ran the conversation-server + tunnel
     checks — and startup.sh's matching gate kept a public ngrok tunnel open
-    to a port with nothing behind it (caught 2026-07-02). startup.sh's
-    phone block carries the anchored-grep equivalent of this test.
+    to a port with nothing behind it (caught 2026-07-02). Asking for the SID
+    alone reopened the same hole from the other side: the documented setup
+    vaults the SID + token first and writes TWILIO_PHONE_NUMBER only at
+    `twilio-setup.py buy`, and in that gap the server exits at once while the
+    check reported it down on every run (review of #4666). startup.sh's phone
+    block (`twilio_creds_present`) answers the same question through the
+    channel-token resolver with the anchored test as its grep fallback;
+    tests/health-check-twilio-gate.test.py drives both. `vault_get` is the
+    test seam for the vault tier (None reads the real Keychain).
     """
-    for line in env_content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
-            return True
-    return False
+    for var in TWILIO_SERVER_VARS:
+        if _dotenv_active_value(env_content, var):
+            continue
+        if token_from_vault(var, vault_get=vault_get):
+            continue
+        return False
+    return True
 
 
 def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
@@ -856,7 +883,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -864,7 +892,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
@@ -3160,6 +3188,7 @@ _SERVICE_SOURCES = (
     # KeepAlive jobs in src/launchd/ whose program SURVIVES as a process. A
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -5461,64 +5490,14 @@ def core_env_has_proxy_url(
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
     """
-    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
-    if ps_runner is None:
-        def ps_runner(pid):
-            return subprocess.run(
-                ["ps", "eww", "-o", "command=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=15,
-            )
+    from quota_availability import seat_env_base_url  # src/ is on sys.path
     sock = socket_path or _local_core_socket()
     if not sock:
         return None                       # no live LOCAL core -> unknown, not a bypass
-    # `-s` = every pane in the SESSION, not just the current window's.
-    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
-    if panes is None or getattr(panes, "returncode", 1) != 0:
-        return None                       # no such session / tmux unavailable
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
-    if not pids:
-        return None
-    # Identify the core by argv, not by position: `--name <session>` is what
-    # start-cli.sh passes and no sibling window carries it.
-    #
-    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
-    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
-    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
-    # True where the contract is None). This is the SAME lookalike class as the
-    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
-    # axis and then introduced the identical hole on the session-name axis.
-    def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":  # the =-joined spelling
-                return True
-        return False
-
-    matches = []
-    for pid in pids:
-        try:
-            proc = ps_runner(pid)
-        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
-            return None
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            continue                      # this pane vanished; keep looking
-        out = proc.stdout or ""
-        if _names_this_session(out):
-            matches.append(out)
-    # Zero matches: the core is not in this session (or ps could not read any pane).
-    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
-    if len(matches) != 1:
-        return None
-    tokens = matches[0].split()
-    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
-    # is what keeps an unreadable env reporting None rather than an empty env.
-    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-    if not env_pairs:
-        return None
-    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
-
+    env = seat_env_base_url(sock, session,
+                            tmux_runner=tmux_runner or (lambda s, *a: _run_tmux(s, *a)),
+                            ps_runner=ps_runner)
+    return None if not env.observed else env.base_url is not None
 
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
@@ -5883,10 +5862,12 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # Every unified window is read, not just 5h/7d: a per-model window such as
-    # 7d_oi can be the one rejected while the headline windows sit low.
+    # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
+    # low); overage is shown but never pages, it is purchase eligibility.
+    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
-    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    full = [w for w, (u, st) in _limit_windows(headers).items()
+            if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
         summary = _window_summary(windows)
         check["status"] = "warn"
@@ -5926,24 +5907,6 @@ def _window_summary(windows: dict) -> str:
         elif u is not None:
             parts.append(f"{w} {u:.0%}")
     return ", ".join(parts)
-
-
-def _quota_windows(headers: dict) -> dict:
-    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
-    window, as (utilization or None, that window's own status or None)."""
-    out = {}
-    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
-    for k, v in headers.items():
-        if not (k.startswith(prefix) and k.endswith(suffix)):
-            continue
-        w = k[len(prefix):-len(suffix)]
-        try:
-            u = float(v)
-        except (TypeError, ValueError):
-            u = None
-        st = headers.get(f"{prefix}{w}-status")
-        out[w] = (u, str(st) if st is not None else None)
-    return out
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
@@ -9245,7 +9208,11 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+                          "restart via Monitor (timeout_ms 1800000, re-armed on its expiry notice): "
+                          "bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set); until then the standby "
+                          "supervisor announces tasks through the pane after its 45 s grace"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
@@ -9421,6 +9388,20 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # A watcher holds its inbox whether or not anything consumes what it
+    # announces; the reader is the only difference visible from outside.
+    unread = []
+    for _p in sorted(live):
+        _sink = watcher_identity.output_sink(_p)
+        if _sink.observed and _sink.read is False:
+            unread.append(f"{_p} -> {_sink.kind} {_sink.target}".rstrip())
+    if unread:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(unread)} announce(s) where nothing is reading: "
+                          f"{'; '.join(unread)}. That inbox is held but not served — "
+                          "a session start will exit naming the holder, so clearing it "
+                          "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
         return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
     return {"name": name, "status": "ok",
@@ -9641,7 +9622,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[str] = []
+    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9655,18 +9636,21 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append(str(d.get("item_id") or "?"))
+            parked.append((root.name, str(d.get("item_id") or "?")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
-        shown = ", ".join(sorted(parked)[:4])
+        parked.sort()
+        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                           for root_name, item_id in parked[:4])
         more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
         return {"name": name, "status": "warn",
                 "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
                           f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <ws>/results/.outbox requeue <id>`"}
+                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                          f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
@@ -13129,12 +13113,10 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
-            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
                            "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is recovered by nothing "
-                                     "while the CLI is busy"})
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -14338,9 +14320,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -14424,9 +14405,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:
@@ -14684,6 +14664,31 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
+
+
+def publish_health_report(checks, state_dir=None):
+    """Publish only aggregate health; diagnostics and user data stay local."""
+    state_dir = Path(state_dir) if state_dir is not None else WORKSPACE_DIR / "state"
+    tmp = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report = {"version": 1, "checked_at": time.time(), "total": len(checks),
+                  "failures": sum(is_issue(c) for c in checks)}
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir,
+                                         prefix=".agent-health-", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump(report, out)
+        os.replace(tmp, state_dir / "agent-health.json")
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -14695,6 +14700,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    publish_health_report(checks)
     track_health_fix(checks)
     if do_fix:
         track_health_fix(checks, start=True)
@@ -14982,6 +14988,7 @@ def main():
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
         residual_checks = run_all_checks()
+        publish_health_report(residual_checks)
         emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)

@@ -1349,6 +1349,9 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -2586,8 +2589,18 @@ def _push_pool_advertisement_now() -> None:
         record = _advertisement_or_none()
         _maybe_push_workers_snapshot(record)
         _maybe_push_agent_profile(record)
+        _maybe_pull_worker_labels(record)
     except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
         _log(f"pool advertisement push failed: {e}")
+
+
+def _workers_body(ad: dict) -> dict:
+    """The per-worker report when the record carries one: only it tells the broker
+    a worker is retired; the legacy snapshot has no per-worker state."""
+    rep = ad.get("report")
+    if isinstance(rep, dict) and isinstance(rep.get("workers"), list):
+        return rep
+    return ad["workers"]
 
 
 def _maybe_push_workers_snapshot(record) -> bool:
@@ -2608,7 +2621,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
     if identity == _workers_pushed_identity:
         return False
     try:
-        _req("POST", "/v1/workers", ad["workers"], timeout=15)
+        _req("POST", "/v1/workers", _workers_body(ad), timeout=15)
     except urllib.error.HTTPError as e:
         _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
         return False
@@ -2623,6 +2636,13 @@ def _maybe_push_workers_snapshot(record) -> bool:
 
 _profile_pushed_identity = ""
 _profile_push_retry_at = 0.0
+
+# The host injects this optional adapter before executing the standalone bridge.
+# AG2 Space owns overrides; the skill owns the roster.
+_WORKER_LABEL_APPLIER = globals().get("_SUTANDO_WORKER_LABEL_APPLIER")
+_PROFILE_LABEL_REFRESH_S = 60.0
+_profile_labels_checked_at = 0.0
+_profile_labels_retry_at = 0.0
 
 
 def _build_agent_profile(workers: "dict") -> "dict":
@@ -2682,6 +2702,91 @@ def _maybe_push_agent_profile(record) -> bool:
     return True
 
 
+def _maybe_pull_worker_labels(record) -> bool:
+    """Apply explicit owner label overrides after our profile is published."""
+    global _profile_labels_checked_at, _profile_labels_retry_at
+    if not callable(_WORKER_LABEL_APPLIER) or not _publication_permitted():
+        return False
+    now = time.time()
+    if now < max(_profile_labels_retry_at,
+                 _profile_labels_checked_at + _PROFILE_LABEL_REFRESH_S):
+        return False
+    mxid = _reenroll_identity()
+    identity, ad = record
+    if not mxid or ad is None or _profile_pushed_identity != f"{mxid}\n{identity}":
+        return False
+    path = f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile"
+    try:
+        profile = _req("GET", path, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_labels_retry_at = _defer_push("worker-label read", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label read failed, retrying in 5m: {e}")
+        return False
+
+    _profile_labels_checked_at = now
+    config = profile.get("config") if isinstance(profile, dict) else None
+    display = profile.get("display") if isinstance(profile, dict) else None
+    version = config.get("version") if isinstance(config, dict) else None
+    labels = display.get("worker_labels") if isinstance(display, dict) else None
+    if (not isinstance(profile, dict)
+            or type(profile.get("schema_version")) is not int
+            or profile.get("schema_version") != 1
+            or profile.get("mxid") != mxid or type(version) is not int
+            or version < 0 or not isinstance(labels, dict)
+            or len(labels) > 10000
+            or any(not isinstance(wid, str) or not _is_worker_id(wid)
+                   or not isinstance(label, str) or not label
+                   or label != label.strip() or len(label) > 120
+                   or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)
+                   for wid, label in labels.items())):
+        _profile_labels_retry_at = now + 300
+        _log("worker-label read returned an invalid profile; keeping local labels")
+        return False
+    if _reenroll_identity() != mxid:
+        return False
+    try:
+        result = _WORKER_LABEL_APPLIER(labels, version, mxid)
+    except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        return False
+    if isinstance(result, dict) and result.get("changed"):
+        _log(f"worker labels applied from owner profile config v{version}")
+    return True
+
+
+# The primary app checks every 30 minutes; the fallback checks every five.
+_HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
+def _reported_core_status() -> tuple[str | None, str | None]:
+    """Overlay independent diagnostics without exporting their private details."""
+    status, step = _read_core_status()
+    if status in ("error", "offline"):
+        return status, step
+    try:
+        report = json.loads((_STATE / "agent-health.json").read_text())
+    except FileNotFoundError:
+        return status, step
+    except Exception:
+        return "unknown", "Health check unavailable"
+    try:
+        ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
+        if (report.get("version") != 1 or type(ts) not in (int, float)
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or type(total) is not int or total <= 0
+                or type(failures) is not int or not 0 <= failures <= total):
+            return "unknown", "Health check unavailable"
+        if failures:
+            return "error", f"Health check: {failures} failing check(s)"
+    except Exception:
+        return "unknown", "Health check unavailable"
+    return status, step
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2692,7 +2797,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
-    _status, _step = _read_core_status()
+    _status, _step = _reported_core_status()
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3499,6 +3604,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3658,7 +3777,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3681,8 +3802,11 @@ def _post_proactive() -> None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3716,6 +3840,20 @@ def _post_proactive() -> None:
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -4484,6 +4622,17 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
             continue
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is not None:
+            try:
+                headers = local_task_protocol.parse_task_headers(
+                    task.read_text(encoding="utf-8", errors="replace")).headers
+            except OSError:
+                continue
+            # Cron completions belong to the local scheduler, not a gateway lease.
+            # Leave their delivery and retirement to the local consumers.
+            if headers.get("source") == "cron":
+                continue
         try:
             age = now - rfile.stat().st_mtime
         except OSError:
@@ -4509,7 +4658,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
-        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
             if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue
@@ -4746,7 +4894,9 @@ def main() -> None:
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
-        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
+        # A live bridge already polls this workspace: stand down. 75 tells a
+        # supervising wrapper not to relaunch; a plain exit would loop it.
+        sys.exit(75)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()

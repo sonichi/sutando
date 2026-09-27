@@ -80,10 +80,13 @@ echo "$COMMIT_MAIN_BLOCK" | grep -qF '[ "$NO_CLAUDE_IMPORT" = "0" ]' \
 TMP_E2E="$(mktemp -d -t sutando-mig-e2e.XXXXXX)"
 mkdir -p "$TMP_E2E/src-c/notes"
 echo "src-c-content" > "$TMP_E2E/src-c/notes/foo.md"
+# `--import` exits 1 when its source (~/.claude by default) is absent, as on a
+# cold CI runner; a seeded fixture keeps this a wiring test, not a host test.
+mkdir -p "$TMP_E2E/seed-claude/projects"
 
 # Run with bounded timeout via background-kill pattern (no `timeout` cmd on macOS)
 e2e_out="$(
-    ( SUTANDO_MIGRATE_DEST="$TMP_E2E/dest" \
+    ( SUTANDO_MIGRATE_DEST="$TMP_E2E/dest" SOURCE_CLAUDE_CONFIG_DIR="$TMP_E2E/seed-claude" \
       bash "$MIGRATE" commit --source C --no-confirm < /dev/null 2>&1 &
       PID=$!
       _slept=0

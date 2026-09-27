@@ -5550,14 +5550,26 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                redirect_target_is_foreign, should_claim_proactive_file)
-            for f in RESULTS_DIR.iterdir():
+                body_target_channel, redirect_target_is_foreign,
+                should_claim_proactive_file)
+
+            def _discord_claims(f):
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
+                if should_claim_proactive_file(
+                        f.name, STATE_DIR / "last-owner-activity.json", "discord"):
+                    return True
+                # An explicit body [channel:] target also outranks activity
+                # routing, matching slack/telegram's body_claimable_by peek.
+                try:
+                    peek = f.read_text(errors="ignore")
+                except OSError:
+                    return False
+                return body_target_channel(peek) == "discord"
+
+            for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
-                        and should_claim_proactive_file(
-                            f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                        and _discord_claims(f):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -221,21 +222,29 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
                   if (got := parse_sentinel(p.name)) and got[1])
 
 
+def regular_file_state(path) -> str:
+    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, a
+    symlink or a FIFO at the name) or "unknown" (any other OSError: EACCES, EIO).
+    Only the first three are verdicts about the path; "unknown" is about this call.
+    O_NONBLOCK: a FIFO at the name would otherwise block the open with no writer."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as e:
+        return "non-regular" if e.errno == errno.ELOOP else "unknown"
+    try:
+        return "regular" if stat.S_ISREG(os.fstat(fd).st_mode) else "non-regular"
+    finally:
+        os.close(fd)
+
+
 def is_regular_file(path) -> bool:
     """A REGULAR file at that exact name, never followed. `exists()` accepts a
     directory or a symlink, and authorising delivery on one lets a planted link
-    decide which body the caller reads.
+    decide which body the caller reads. Fail-closed: an unopenable path is False.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError:
-        return False  # ELOOP on a symlink: not a delivery, not an error to raise
-    try:
-        return stat.S_ISREG(os.fstat(fd).st_mode)
-    finally:
-        os.close(fd)
+    return regular_file_state(path) == "regular"
 
 
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
@@ -353,6 +362,43 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
 
 
+def prune_spent(workspace: Path, recipient: str) -> dict:
+    """Retire `recipient`'s SPENT sentinels and nothing else: no release, no
+    re-offer. A sentinel is spent when its payload is gone (`stale-sentinel`),
+    or the work is finished AND nothing could hand it back — the flag alone is
+    not enough, because the core re-queues a payload whose sentinel is gone and
+    whose result it cannot find. Safe beside a live watcher, which `sweep` is not.
+    """
+    ws = Path(workspace)
+    seen = set()
+    actions = {"retired": [], "stale": [], "kept": []}
+    for p in accepted(ws, recipient) + pending(ws, recipient):
+        task_id = parse_sentinel(p.name)[0]
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        state = residue(ws, recipient, task_id)
+        if state == "stale-sentinel":
+            p.unlink()
+            actions["stale"].append(task_id)
+        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
+            p.unlink()
+            actions["retired"].append(task_id)
+        else:
+            actions["kept"].append(task_id)
+    return actions
+
+
+def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
+    """True when removing the sentinel cannot put the task back in the core's
+    queue: either the payload is gone, or a result the core can find remains."""
+    if not payload_path(ws, task_id).is_file():
+        return True
+    if read_ready_result(result_path(ws, task_id)) is not None:
+        return True
+    return archived_payload(ws, task_id).is_file()
+
+
 def sweep(workspace: Path, recipient: str) -> dict:
     """Boot reconciliation. An event that fired while nobody listened is gone,
     so a reader that only streams never learns about it."""
@@ -412,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="read one recipient's delivery folder")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--recipient", default="core")
-    ap.add_argument("command", choices=("sweep", "pending", "watch", "residue",
+    ap.add_argument("command", choices=("sweep", "pending", "watch", "prune-spent", "residue",
                                        "payload", "mark-done", "writer-path"))
     ap.add_argument("--task-id")
     ap.add_argument("--sentinel")
@@ -454,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.command == "sweep":
         print(json.dumps(sweep(ws, a.recipient), indent=2))
+        return 0
+    if a.command == "prune-spent":
+        print(json.dumps(prune_spent(ws, a.recipient), indent=2))
         return 0
 
     # A release puts the name back as pending, and pending-at-boot is exactly

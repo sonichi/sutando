@@ -31,9 +31,23 @@ if [ -z "$SKILLS_DST" ]; then
   _cfg="${SUTANDO_REPO_DIR:-$_repo}/scripts/sutando-config.sh"
   # -f, not -x: it is invoked via `bash`, so a missing exec bit must not
   # silently disable resolution and fall through to the wrong directory.
-  [ -f "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
-  SKILLS_DST="${SKILLS_DST:-$HOME/.claude/skills}"
+  if [ -f "$_cfg" ]; then
+    # A helper that exists but fails is not "no helper": guessing ~/.claude/skills
+    # here reads every installed skill as NOT INSTALLED and refreshes nothing.
+    _err="$(mktemp)"
+    if ! SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>"$_err")" || [ -z "$SKILLS_DST" ]; then
+      echo "refresh-skill: cannot resolve the skills dir — '$_cfg claude-home-path skills' failed:" >&2
+      sed 's/^/  /' "$_err" >&2; rm -f "$_err"; exit 3
+    fi
+    rm -f "$_err"
+  elif [ -n "${SUTANDO_REPO_DIR:-}" ]; then
+    echo "refresh-skill: SUTANDO_REPO_DIR=$SUTANDO_REPO_DIR has no scripts/sutando-config.sh — refusing to guess the skills dir" >&2
+    exit 3
+  else
+    SKILLS_DST="$HOME/.claude/skills"   # pre-revamp install: no helper anywhere
+  fi
 fi
+echo "refresh-skill: skills dir $SKILLS_DST"
 SETTLE_S="${REFRESH_SKILL_SETTLE_S:-1}"
 # --all concurrency. The settle is a fixed per-skill wait, so serialising it made
 # --all cost SETTLE_S x skill-count — 97s at 97 skills, past a 120s cron budget.

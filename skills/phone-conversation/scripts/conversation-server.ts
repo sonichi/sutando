@@ -54,6 +54,7 @@ import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, exi
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
+import { envOrVault } from '../../../src/vault-secret.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
@@ -66,6 +67,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
+import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -98,9 +100,14 @@ function detachVisionFromCall(): void {
 // chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
 // billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
 const GEMINI_API_KEY = voiceApiKey();
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
+// Each Twilio credential resolves the way twilio-setup.py and startup.sh's
+// phone gate resolve it: the environment (sourced .env included) wins, the
+// Keychain vault answers when it is empty. All three are required below, and
+// the gate starts this server only when all three resolve — a `vault set` of
+// the SID alone is not a start signal.
+const TWILIO_ACCOUNT_SID = envOrVault('TWILIO_ACCOUNT_SID');
+const TWILIO_AUTH_TOKEN = envOrVault('TWILIO_AUTH_TOKEN');
+const TWILIO_PHONE_NUMBER = envOrVault('TWILIO_PHONE_NUMBER');
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? '';
 const PORT = Number(process.env.PHONE_PORT) || 3100;
 const WORKSPACE_DIR = resolveWorkspace();
@@ -203,7 +210,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (42 keys) — injection-guard-sweep
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (51 keys) — injection-guard-sweep
 // asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
 	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
@@ -211,7 +218,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
 	'author_name|author_id|' +
 	'chat_id|thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
-	'thread_root|source_room_id|' +
+	'thread_root|source_room_id|channel_kind|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
 	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click)\\s*:',
@@ -1868,6 +1875,14 @@ async function start(): Promise<void> {
 			console.log(`${ts()} [Server] Using external tunnel: ${WEBHOOK_BASE_URL}`);
 		} else {
 			WEBHOOK_BASE_URL = await startNgrokCli(PORT);
+		}
+		// Opt-in: re-point the number at the tunnel bound just above (the runtime
+		// URL, never a recorded one); a number shared with another host stays put.
+		if (process.env.TWILIO_AUTO_WEBHOOK === '1') {
+			await syncTwilioWebhook({ sid: TWILIO_ACCOUNT_SID, token: TWILIO_AUTH_TOKEN, number: TWILIO_PHONE_NUMBER }, WEBHOOK_BASE_URL, {
+				log: (line) => console.log(`${ts()} ${line}`),
+				error: (line) => console.error(`${ts()} ${line}`),
+			});
 		}
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);

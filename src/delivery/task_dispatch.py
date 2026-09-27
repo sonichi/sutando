@@ -30,6 +30,13 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
     task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1
     task_dispatch.py inflight-clear <inflight_dir> <filename>
+    task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
+
+`announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
+`tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
+sentinel stands for) and is accepted only from such a watcher, and only inside the payload store the
+caller names (`--resolved <payload_dir>`). The key is what every result, marker and queue entry is
+filed under; the payload is what the prompt tells the session to read.
 
 `inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
 ready result, keyed to the core incarnation, because terminal history is a lossy record.
@@ -50,15 +57,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import iter_result_candidates  # noqa: E402
+from local_task_protocol import index_result_candidates, iter_result_candidates  # noqa: E402
 
-from task_priority import sort_tasks_by_priority  # noqa: E402
+from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
 __all__ = [
-    "find_ready_result", "has_ready_result", "find_ready_result_for_filename",
+    "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
+    "announced_entry",
 ]
+
+
+def announced_entry(tasks_dir: "Path | str", announced: str, *,
+                    payload_dir: "Path | str | None" = None) -> "tuple[str, Path] | None":
+    """(queue key, payload path) for one `TASK_FILE:` announcement, or None to refuse it.
+
+    A bare name is a file in `tasks_dir`. An absolute path is accepted only when the
+    caller runs a resolver-backed watcher and says where that watcher's payloads live
+    (`payload_dir`, the owning workspace's task store), only for an existing regular
+    file directly inside it; its basename is the key. Anything else (empty, traversal,
+    a relative path, any absolute path when no `payload_dir` is given, a file anywhere
+    else) is refused: the caller then types nothing.
+    """
+    if not announced or ".." in announced:
+        return None
+    if "/" not in announced:
+        return announced, Path(tasks_dir) / announced
+    if payload_dir is None or not announced.startswith("/"):
+        return None
+    payload = Path(announced)
+    if not payload.name or payload.resolve().parent != Path(payload_dir).resolve() or not payload.is_file():
+        return None
+    return payload.name, payload
 
 
 def _task_id_for_filename(filename: str) -> str:
@@ -101,6 +132,25 @@ def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
     does not stop the search; `find_ready_result` walks past it.
     """
     return find_ready_result_for_filename(results_dir, filename) is not None
+
+
+def ready_result_filenames(results_dir: "Path | str", filenames, *,
+                           reader=read_ready_result) -> "set[str]":
+    """The subset of task FILENAMES that `has_ready_result` would answer True for, resolved
+    together: one listing per result layout (`index_result_candidates`), then only the
+    candidates that belong to these ids are read. A caller with many filenames (a
+    worker's inbox, hundreds of never-retired sentinels) pays for the listings once,
+    not for a glob over the flat archive per filename.
+    """
+    by_id: dict[str, list[str]] = {}
+    for f in filenames:
+        by_id.setdefault(_task_id_for_filename(f), []).append(f)
+    index = index_result_candidates(Path(results_dir), by_id)
+    ready: set[str] = set()
+    for task_id, candidates in index.items():
+        if any(reader(c) is not None for c in candidates):
+            ready.update(by_id[task_id])
+    return ready
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
@@ -287,9 +337,12 @@ def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
+    "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
@@ -315,6 +368,22 @@ def _parse_dir_options(rest: list[str]) -> dict:
 
 
 def _main(argv: list[str]) -> int:
+    # A pure sort, no eligibility filtering -- the caller still decides
+    # whether a file is eligible; this only changes the offered order.
+    if argv and argv[0] == "sort-by-priority":
+        if len(argv) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        for name in names:
+            print(name)
+        return 0 if names else 1
+    if argv and argv[0] == "priority-tier":
+        if len(argv) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        print(parse_priority_from_file(Path(argv[1])))
+        return 0
     if len(argv) < 3:
         print(_USAGE, file=sys.stderr)
         return 2
@@ -365,6 +434,15 @@ def _main(argv: list[str]) -> int:
             return 2
         for task_id in ids:
             print(task_id)
+        return 0
+    if cmd == "announced-entry":
+        if rest and (len(rest) != 2 or rest[0] != "--resolved" or not rest[1]):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        entry = announced_entry(first, second, payload_dir=rest[1] if rest else None)
+        if entry is None:
+            return 1
+        print(f"{entry[0]}\t{entry[1]}")
         return 0
     if cmd == "worker-holds":
         if rest:

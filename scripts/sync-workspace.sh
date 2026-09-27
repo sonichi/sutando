@@ -272,6 +272,24 @@ die() {
 # (sutando-workspace.test.sh Test 23, Codex P1.3 reproducer). Not for
 # production use.
 _host() {
+    # The configured label FIRST, through the one helper that reads
+    # sutando.config*.json — a pin placed where the config lives is invisible to
+    # a reader that only consults the process environment, and this one names
+    # the vault branch.
+    # Guarded: the bash parity test evals this function ALONE under `set -u`,
+    # where the main body's $SCRIPT_PARENT does not exist.
+    local _root="${SCRIPT_PARENT:-}"
+    if [ -n "$_root" ] && [ -f "$_root/scripts/sutando-config.sh" ]; then
+        local _cfg
+        _cfg="$(bash "$_root/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
+        _cfg="${_cfg#"${_cfg%%[![:space:]]*}"}"
+        _cfg="${_cfg%"${_cfg##*[![:space:]]}"}"
+        if [ -n "$_cfg" ]; then
+            printf '%s\n' "$_cfg"
+            return
+        fi
+    fi
+    # Fallback when the helper is absent (the script guards for that elsewhere).
     # Lockstep with `_host_label()` in src/util_paths.py. Precedence:
     #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
     #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)

@@ -248,22 +248,27 @@ _check(
 # ---------------------------------------------------------------------------
 
 _it = _src("src/inline-tools.ts")
-# Locate the cancelBody block
-_cb_start = _it.find("const cancelBody = [")
-_cb_end = _it.find("].join('\\n');", _cb_start) if _cb_start > 0 else -1
-_cb_block = _it[_cb_start:_cb_end + 20] if _cb_start > 0 and _cb_end > 0 else ""
+# Locate the cancelBody block: from its assignment through the task: line.
+_cb_start = _it.find("const cancelBody =")
+_cb_task = _it.find("task: CANCEL_INSTRUCTION", _cb_start) if _cb_start > 0 else -1
+_cb_block = _it[_cb_start:_cb_task + 30] if _cb_start > 0 and _cb_task > 0 else ""
 _check(
     "inline-tools: cancel_task strips newlines from targetId",
     "safeTargetId" in _it and ".replace(/[\\r\\n]/g, '')" in _it,
     "cancel_task embeds targetId (Gemini-controlled) in the task: body — must strip newlines "
     "before embedding so a forged \\naccess_tier: line can't precede the real one",
 )
+# The header comes from the shared writer buildVoiceTaskHeader (field order
+# pinned by tests/task-bridge-format.test.ts); the task: line must follow it.
+_cb_header_at = _cb_block.find("buildVoiceTaskHeader(")
+if _cb_header_at < 0:
+    _cb_header_at = _cb_block.find("access_tier: owner")
 _check(
-    "inline-tools: cancel_task task: field is last (after access_tier:)",
-    "access_tier: owner" in _cb_block
-    and "task: CANCEL_INSTRUCTION" in _cb_block
-    and _cb_block.index("access_tier: owner") < _cb_block.index("task: CANCEL_INSTRUCTION"),
-    "cancel_task cancelBody must place task: after access_tier: (field-order defence)",
+    "inline-tools: cancel_task task: field is last (after the header writer / access_tier:)",
+    "task: CANCEL_INSTRUCTION" in _cb_block
+    and 0 <= _cb_header_at < _cb_block.index("task: CANCEL_INSTRUCTION"),
+    "cancel_task cancelBody must place task: after the header (buildVoiceTaskHeader or a literal "
+    "access_tier: owner line) — field-order defence",
 )
 
 # ---------------------------------------------------------------------------

@@ -33,11 +33,12 @@ import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface } from './inline-tools.js';
+import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
-import { injectText } from './browser-tools.js';
+import { injectText, injectSilentContext } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
@@ -57,7 +58,9 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver } from './task-bridge.js';
+import { framedSystem } from './inject-framing.js';
+import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
@@ -708,7 +711,7 @@ function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
 
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools];
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...personalVoiceSurface.tools];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -717,6 +720,7 @@ const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
+	voiceSurface: personalVoiceSurface,
 	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
 	getRecentConversation,
@@ -1051,6 +1055,25 @@ async function main() {
 		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
 	})();
 
+	// Context a skill (or the core) wants the model to know: a framed system line sent
+	// as an open turn, retried because a frame can land before the upstream setup completes.
+	function injectSessionContext(text: string): void {
+		const line = framedSystem(text);
+		deliverWithRetry({
+			attempt: () => {
+				try {
+					if (session.sessionManager.isActive && session.clientConnected) {
+						return injectSilentContext(session, line);
+					}
+				} catch { /* session still constructing — retry */ }
+				return false;
+			},
+			onExhausted: () => console.log(`${ts()} [SessionContext] session not active — context line not injected`),
+		});
+	}
+
+	const clientFrames = createClientFrameHub((msg, detail) => console.error(`${ts()} ${msg}`, detail));
+
 	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
 	// session-only) + worker-thread persistence. Created before the session so
 	// the hooks below can reference it; the wraps install after construction.
@@ -1085,12 +1108,22 @@ async function main() {
 		inputAudioTranscription: true,
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
-		onClientCommand: (message) => voiceRecoveryCoordinator?.handleClientCommand(message),
+		onClientCommand: (message) => {
+			voiceRecoveryCoordinator?.handleClientCommand(message);
+			// Frames the core does not own are offered to optional skills' handlers.
+			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
+		},
 		onClientConnected: () => {
 			if (legacyReconnectInFlight) return; // not a real attach edge
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
-		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
+		onClientDisconnected: () => {
+			// An origin belongs to the client that announced it; the next client announces its own.
+			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
+			setVoiceSessionOrigin(null);
+			clientFrames.disconnected();
+			voiceRecoveryCoordinator?.handleClientDisconnected();
+		},
 		// Whenever the coordinator owns the episode (restarting, waiting-retry,
 		// terminal, or a recovered origin), bodhi's attach auto-actions —
 		// greeting, context replay and especially the CLOSED auto-reconnect —
@@ -1546,8 +1579,26 @@ async function main() {
 
 	// Give each skill's setup() the live session so it registers handlers without
 	// importing core. Guarded: a buggy setup must not break session bootstrap.
-	runSkillSetups(personalSkillSetups, { session, injectText },
-		(msg, detail) => console.error(`${ts()} ${msg}`, detail));
+	runSkillSetups(personalSkillSetups, {
+		session,
+		injectText,
+		clientAttached: () => Boolean(session.clientConnected),
+		sendClientFrame: (frame) => {
+			try {
+				if (!session.clientConnected) return false;
+				session.sendJsonToClient(frame);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		onClientFrame: clientFrames.onClientFrame,
+		onClientDisconnected: clientFrames.onClientDisconnected,
+		injectContext: injectSessionContext,
+		setVoiceSessionOrigin,
+		getVoiceSessionOrigin,
+		setVoiceTaskOriginResolver,
+	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the

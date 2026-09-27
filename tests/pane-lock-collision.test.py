@@ -63,7 +63,9 @@ def _fake_tmux_notifier(td: Path) -> tuple[Path, Path]:
     refused, not "safe to send". The footer text is what CLAUDE_IDLE (shared by
     the Codex adapter) matches, so the composer reads as idle-ready once the
     pane lock is free -- the same shape a live Codex/Claude pane prints between
-    turns.
+    turns. CODEX.idle_requires_prompt also needs an actual `>` composer line
+    (not just the footer): without one, classify_pane reads it as "unknown",
+    never "idle-ready", and the notifier never types even on a free pane.
     """
     log = td / "tmux.log"
     log.unlink(missing_ok=True)
@@ -72,7 +74,7 @@ def _fake_tmux_notifier(td: Path) -> tuple[Path, Path]:
         "#!/bin/sh\n"
         f'echo "$@" >> "{log}"\n'
         'case "$*" in\n'
-        '  *capture-pane*) printf "%s\\n" "⏵⏵ bypass permissions on" ;;\n'
+        '  *capture-pane*) printf "%s\\n%s\\n" "⏵⏵ bypass permissions on" "› " ;;\n'
         "esac\n"
         "exit 0\n"
     )
@@ -178,9 +180,9 @@ def _notifier_repo(td: Path) -> Path:
         # tmux-pane-lock.bash delegates the acquisition here; without it every
         # take fails and the notifier looks like it declined rather than could not.
         "src/tmux_pane_lock.py",
-        # Sourced unconditionally at startup (optional task-handler capability lookup);
-        # missing it kills the script under `set -e` before it ever reaches the lock.
-        "src/agent/task-event-handler-lookup.sh",
+        # Sourced unconditionally at startup; missing it kills the script under
+        # `set -e` before it ever reaches the lock.
+        "src/delivery/worker-stage.sh",
         # pane_gate.py owns the composer-safety verdict deliver_prompt now checks
         # (keweichen round-4); cli_wedge.py and its own deps are its capture path.
         "src/delivery/__init__.py",
@@ -188,6 +190,11 @@ def _notifier_repo(td: Path) -> Path:
         "src/cli_wedge.py",
         "src/file_lock.py",
         "src/sutando_platform.py",
+        # pane_gate.py imports this at module load; without it EVERY subcommand
+        # fails closed (import error), and "healthy"/"classify" read as unknown
+        # forever -- the notifier then retries for its full timeout instead of
+        # ever typing, so the collision case would time out for the wrong reason.
+        "src/quota_availability.py",
     ):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +278,14 @@ def _claude_notifier_repo(td: Path) -> Path:
         "src/cli_wedge.py",
         "src/file_lock.py",
         "src/sutando_platform.py",
+        # Same load-time import pane_gate.py needs (see the codex fixture's
+        # comment) -- missing it fails "healthy" closed and the notifier
+        # retries for its full CORE_READY_TIMEOUT instead of ever typing.
+        "src/quota_availability.py",
+        # cleanup_notifier's standby_end_log reads this on every exit; a
+        # missing file degrades to "unknown" (same observable result), but
+        # keep it present so the case exercises the real read, not its error path.
+        "src/watcher_identity.py",
     ):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -393,10 +408,16 @@ def case_claude_task_notifier_staged_resume_collision() -> list[str]:
         # the staged text must match exactly what the notifier itself computes.
         workspace = (root / "workspace").resolve()
         filename = "task-collision.txt"
+        # Must match task_prompt() in src/agent/claude/cli/task-notifier.sh EXACTLY --
+        # prompt_is_staged() requires an exact (whitespace-squeezed) match, and the
+        # standby/re-arm suffix is part of that string, not decoration on top of it.
         staged_prompt = (
             f"Sutando task ready: {filename}. Read {workspace}/tasks/{filename}, "
             "follow CLAUDE.md, complete the task, and write the result to "
-            f"{workspace}/results/{filename}."
+            f"{workspace}/results/{filename}. Delivered by the standby: no "
+            f"session-role watcher holds {workspace}/tasks. Re-arm yours via the "
+            f'Monitor tool: bash "{root}/src/watch-tasks-stream.sh" '
+            f'"{workspace}/tasks" --role session --inbox "{workspace}/tasks"'
         )
         staged_line_file = tdp / "staged_line.txt"
         staged_line_file.write_text(f"\u276f {staged_prompt}")

@@ -143,8 +143,13 @@ events above, argv[1] = hook name as a stdin fallback. Test:
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
 label_thread, unlabel_thread, create_label, apply_sensitive_*_label, archive,
-trash, send, …) and routes the model to the app-password IMAP/SMTP path
-(docs/built-in-tools.md → Email). Field report 05cb849a: the connector's OAuth
+trash, send, …) and routes the model to the **Station Gmail connector**
+(`composio_find` → `composio_exec`, a different tool name this guard never
+matches), with a read-back after every send; the app-password IMAP/SMTP path
+(docs/built-in-tools.md → Email) is named only as the fallback when the Station
+tools are absent. (Until 2026-09-23 the reason led with IMAP/SMTP, so an owner
+with Gmail connected in Settings → Integrations was still asked to generate an
+app password by hand.) Field report 05cb849a: the connector's OAuth
 flow doesn't actually grant Gmail write scopes (label/archive fail with a raw
 "insufficient authentication scopes" error) and `create_draft` caused 7
 documented incidents incl. a wrong-recipient send — while READ tools work fine
@@ -184,6 +189,127 @@ PY
 ```
 
 Test: `python3 tests/gmail-write-guard.test.py`.
+
+## `gdocs-write-guard.py`
+
+One script on two events for the Station's `composio_exec` tool, toolkit
+`googledocs`. **PreToolUse** denies a body-replacing action
+(`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` — "replaces the entire content of an
+existing document" — plus `UPDATE_EXISTING_DOCUMENT`, `REPLACE_DOCUMENT`,
+`DELETE_CONTENT_RANGE`) unless a snapshot of that document younger than
+`SUTANDO_GDOCS_BACKUP_MAX_AGE_S` (900 s) exists, with a reason that says to read
+the doc first and to prefer the partial-edit actions (`INSERT_TEXT_ACTION`,
+`REPLACE_ALL_TEXT`, `INSERT_TEXT_IN_TABLE_CELL`, always allowed).
+**PostToolUse** keeps every *successful* read (`GET_DOCUMENT_PLAINTEXT`,
+`GET_DOCUMENT_BY_ID`) as `<workspace>/data/gdocs-backups/<doc id>/<epoch>.md`
+(the document text when the envelope carries it, newest 20), so a wrong rewrite
+can be restored from the last thing the owner had. A read whose envelope says
+`successful: false` / `error` / `is_error`, or that returns no text, is never a
+snapshot: it could restore nothing, so it must not lift the deny. Owner report
+(user feedback): a doc "gets unexpectedly cleared, or unrelated content is
+inserted or rewritten" — the whole-replace action was the natural pick for
+"update the doc", and nothing warned or kept a copy.
+
+**The repo root is CONFIGURED, never discovered** (same rule as
+`result-file-marker-guard.py`): `build-core-settings.mjs` registers the hook as
+`python3 <hook> --repo <checkout>`; `$SUTANDO_REPO_ROOT` is the fallback. The
+workspace then comes from `workspace_default.resolve_workspace`. Without a root
+no snapshot can be recorded, so a whole replace stays denied and stderr says why.
+
+Settings are read through `sutando_config` (`env` stanza of
+`sutando.config.local.json`, environment as the fallback): the max age above and
+the operator override `SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1`. Inside a session the
+way past the deny is the read itself — one call, then the replace is allowed.
+Fail-OPEN on uncaught hook errors. Registered for every core session by
+`build-core-settings.mjs` (arg 5, matcher `mcp__.*__composio_exec` on both
+events). Test: `python3 tests/gdocs-write-guard.test.py`.
+
+## `native-pim-guard.py`
+
+Denies **Bash commands that drive the native macOS Calendar, Reminders or Contacts
+app** — `osascript`/JXA by app name or bundle id (`tell application "Calendar"`,
+`application id "com.apple.iCal"`, `Application("com.apple.reminders")`), an
+`osascript` script file whose name or first 64 KB scripts one of the apps,
+`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal`, `.app` paths, `open
+x-apple-reminderkit://…`, and `shortcuts run` (a shortcut can drive any of the
+three; `shortcuts list`/`view` pass) — with a reason that gives the order: the
+Station connector first (`composio_find {"apps": ["google calendar"]}` →
+`composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
+present, then ask the owner; and never re-prompt once the owner denied the
+permission. Driving those apps raises a macOS Automation prompt on the owner's
+screen (user report, 2026-09-24). Only a command at **command position** counts
+(the start, or after `;`, `&&`, `||`, `|`, `$(`, a backtick, `(`/`{`, an env-prefix
+chain): `grep -rn "open -gja Calendar" src/`, `git log -S "open -a Contacts"` and
+`grep osascript f | grep 'application "Calendar"'` are reads and pass, while a
+wrapper (`bash -c`, `sh -c`, `xargs`, `sudo`, `env`, `eval`, …) is scanned whole and
+an `osascript` heredoc or `;`-joined script is scanned to the end of the command.
+Unrelated `osascript`/`open` commands and every other tool pass through.
+
+Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
+position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
+SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count), that variable in the
+hook's own environment, or the owner's persisted host opt-in
+`<workspace>/state/native-pim-consent`, written by `python3
+skills/macos-tools/scripts/native_pim_consent.py grant` in the **owner's own
+terminal**. The agent never writes that record: the hook denies `grant`, any command
+outside a read-only one (`cat`, `ls`, `grep`, `git`, `test`, …) that names
+`native-pim-consent` or a `*-automation-denied` marker — `touch`, `echo … >`, `tee`,
+`cp`, `rm`, `python3 -c "open(…)"`, `sed -i` — and any Python that imports or runs
+`native_pim_consent` other than the CLI's `status`/`revoke` (with their
+`--workspace` option). A redirect onto the marker is denied even from a read-only
+command. The file tools are matched too: a `Write`, `Edit`, `MultiEdit` or
+`NotebookEdit` whose `file_path`/`notebook_path` resolves (symlinks followed) to the
+consent marker or a denial marker under `<workspace>/state/` is denied; any other
+path, and every `Read`, passes. Fail-OPEN on hook errors.
+
+**Known limits.** The Bash side is a command-string matcher and cannot close
+obfuscated forms: `native""-pim-consent`, `native\-pim-consent`, the glob
+`native-pim-consen?`, a `$var` concatenation, `'native-pim-'+'consent'` or
+`importlib.import_module('native_pim'+'_consent')` inside `python -c`,
+`base64 -d | sh`, or running a script written earlier; a script file that names the
+app only indirectly, or a split string such as `"Cont"&"acts"`, gets past the app
+match the same way. Those are the documented gap of an initiative guard, not an
+authorisation boundary.
+
+**One policy.** The marker names, the host opt-in and the bound task's tier are
+`native_pim_consent.py`'s (`skills/macos-tools/scripts/`), which this hook imports;
+the hook only parses the command line. The scripts, the morning briefing and the
+voice `call_contact` tool (through `native_pim_consent.py check` / `report-error`)
+read the same module, so there is no second copy to drift.
+
+**What this consent is, honestly.** The prefix and the env var are strings the
+model writes, so on their own they guard against the agent acting on its own
+initiative; they are **not an authorisation boundary** for who asked. The hook
+binds them where the session tells it whose task is running: when
+`<workspace>/state/bindings/active-execution.json` names the task and
+`<workspace>/tasks/<task_id>.txt` resolves (via `policy.egress.result.
+resolve_access_tier`) to a non-owner tier (`team`, `guest`, unreadable), every form
+of consent is ignored and the command is denied with a reason saying so. Without a
+binding — a chat session, a cron, a binding the core did not write — the consent is
+self-attested and a task's injected text saying "the owner asked" is not
+distinguishable from the owner asking. Do not rely on this hook as access control.
+The scripts apply the same tier inside an agent session (`CLAUDECODE=1`): on a
+non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
+so the script gate does not accept what the hook would deny. A cron such as the
+morning briefing is not the core's bound task and is not tier-checked.
+
+**Codex cores.** This is a Claude-runtime `PreToolUse` hook. On a Codex core only
+the script gate (`native_pim_consent.py`, exit 2 without consent) and the inline
+`call_contact` tool's own check protect; ad-hoc `osascript`/`open` commands there
+are not intercepted.
+
+### Registration
+
+**Auto-registered** for every core session, next to `gmail-write-guard.py`:
+`session-launch.sh` passes this hook to `build-core-settings.mjs` (arg 6, after the
+Google Docs guard), which registers
+it under `PreToolUse` with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit` (the
+file tools, so the consent record cannot be written directly — the same reason the
+results-dir and `MEMORY.md` guards below match `Write`/`Edit`/`MultiEdit`). For a
+non-core session, add the same `PreToolUse` entry by hand as in the block above,
+with that matcher and command `python3 <deployed path>/native-pim-guard.py`.
+
+Test: `python3 tests/native-pim-guard.test.py`.
 
 ## `review-authority-guard.py`
 

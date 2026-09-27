@@ -801,6 +801,22 @@ class TestMarkDoneCli(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
 
+    def test_prune_spent_cli_retires_a_finished_sentinel_but_keeps_inflight_work(self):
+        self.ws.payload("task-finished")
+        finished = pd.accept(self.ws.deliver("worker-3", "task-finished"))
+        self.ws.result("task-finished")
+        pd.mark_done(self.root, "worker-3", "task-finished", published=True)
+        self.ws.payload("task-inflight")
+        inflight = pd.accept(self.ws.deliver("worker-3", "task-inflight"))
+
+        rc, out = self._main("prune-spent")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"retired": ["task-finished"],
+                                           "stale": [], "kept": ["task-inflight"]})
+        self.assertFalse(finished.exists())
+        self.assertTrue(inflight.exists())
+
 
 class TestClearPending(Base):
     """A hold the worker will not finish is withdrawn; a finish is never undone."""

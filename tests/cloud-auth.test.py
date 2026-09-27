@@ -14,6 +14,45 @@ sys.path.insert(0, str(ROOT / "src"))
 import cloud_auth  # noqa: E402
 
 
+class TestResolveCloudOrigin(unittest.TestCase):
+    """A retired production origin, from any source, reads as the current one.
+
+    A skill manifest's `config` block is surfaced to process.env for the whole
+    engine, so one manifest can name the origin every consumer resolves. The
+    session lives under the current origin's key; resolving the retired one
+    made read_keychain_auth look for a key that never exists."""
+
+    def test_default_when_unset(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os_env = __import__("os").environ
+            os_env.pop("AG2_CLOUD_ORIGIN", None)
+            self.assertEqual(cloud_auth.resolve_cloud_origin(), cloud_auth.DEFAULT_CLOUD_ORIGIN)
+
+    def test_retired_origin_reads_as_current(self):
+        for retired in cloud_auth.RETIRED_CLOUD_ORIGINS:
+            with mock.patch.dict("os.environ", {"AG2_CLOUD_ORIGIN": retired + "/"}):
+                self.assertEqual(cloud_auth.resolve_cloud_origin(), cloud_auth.DEFAULT_CLOUD_ORIGIN)
+
+    def test_other_origin_is_kept(self):
+        with mock.patch.dict("os.environ", {"AG2_CLOUD_ORIGIN": "http://127.0.0.1:3000/"}):
+            self.assertEqual(cloud_auth.resolve_cloud_origin(), "http://127.0.0.1:3000")
+
+    def test_session_found_under_current_key_when_env_names_retired_origin(self):
+        current_key = cloud_auth.origin_vault_key(cloud_auth.DEFAULT_CLOUD_ORIGIN)
+        store = {current_key: "tok-current"}
+        with mock.patch.dict("os.environ", {"AG2_CLOUD_ORIGIN": cloud_auth.RETIRED_CLOUD_ORIGINS[0]}):
+            origin, tok = cloud_auth.read_keychain_auth(get=store.get)[:2]
+        self.assertEqual((origin, tok), (cloud_auth.DEFAULT_CLOUD_ORIGIN, "tok-current"))
+
+    def test_no_skill_manifest_names_a_retired_origin(self):
+        offenders = []
+        for m in (ROOT / "skills").glob("*/manifest.json"):
+            cfg = json.loads(m.read_text()).get("config") or {}
+            if cfg.get("AG2_CLOUD_ORIGIN") in cloud_auth.RETIRED_CLOUD_ORIGINS:
+                offenders.append(str(m.relative_to(ROOT)))
+        self.assertEqual(offenders, [])
+
+
 class TestKeyDerivation(unittest.TestCase):
     def test_matches_desktop_host_keys(self):
         # cloud_session.rs origin_key_suffix: a drifted slug or FNV hash orphans every session.

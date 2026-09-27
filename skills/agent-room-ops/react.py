@@ -9,8 +9,6 @@ Emoji convention (owner-finalized): 🫡 = task acknowledged (accepted into the
 queue), 👀 = event merely OBSERVED. "received" is a task-ack, so it is 🫡 — 👀
 belongs to ambient observation (events_acceptance.OBSERVE_REACTION) and must
 not double as the receipt ack, which is the collision this convention retires.
-The broker also emits 🫡 server-side at task intake (ag2space-backend#188), so
-this client alias agrees with that one glyph everywhere.
 """
 from __future__ import annotations
 

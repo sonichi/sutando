@@ -69,6 +69,38 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Session hooks: `setup(ctx)` and `voiceSurface()`
+
+A tools entry point may export two optional hooks besides `tools`. Both are
+product-neutral: the host names no skill, and works unchanged when none exports them.
+
+**`setup(ctx)`** runs once per voice session, synchronously, after the session
+exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
+
+| Member | Purpose |
+|---|---|
+| `session`, `injectText(session, text)` | the live session and the realtime text inject |
+| `clientAttached()` | true while a client is attached |
+| `sendClientFrame(frame)` | send one JSON frame to the attached client; `false` when none took it |
+| `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
+| `onClientDisconnected(handler)` | the client left: drop per-client state |
+| `injectContext(text)` | a framed system line the model should know, retried until the session is live |
+| `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
+| `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
+
+A handler that throws or rejects is logged and never reaches another skill's handler.
+
+**`voiceSurface()`** is evaluated once at load and returns what the skill adds to
+the **web voice session only** (`VoiceSurfaceContribution`):
+
+| Field | Effect |
+|---|---|
+| `tools` | declared on the voice session and listed in its prompt; never on the phone tool table. Return `[]` when the install cannot serve them, so the tool is gated at exposure |
+| `promptRules` | lines added to the voice prompt's RULES block |
+| `contextLines()` | lines added to the voice context, re-evaluated at every prompt build |
+
+With no contribution the voice prompt is byte-identical to the default.
+
 ## Config-only manifests (non-tools skills)
 
 A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).
@@ -82,6 +114,25 @@ CLI arg  >  env override  >  manifest.json config[key]  >  another config file (
 ```
 
 Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
+
+## Supervised workers (`supervised_worker`)
+
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+
+```json
+"supervised_worker": {
+  "name": "room-collab-presence",
+  "script": "scripts/presence_daemon.py",
+  "interpreter": { "config": "ROOM_COLLAB_PYTHON", "needs": "pycrdt + websockets" }
+}
+```
+
+- `name` — the supervisor's worker name; a plain name, not a path (it reaches a state dir and a log line).
+- `script` — relative to the skill directory, and it must resolve **inside** it. A manifest is attacker-adjacent (`skills/trusted-capabilities` installs third-party skills), so traversal is refused rather than trusted.
+- `interpreter.config` — the config key naming the interpreter, read **env first, then this manifest's `config` block**. It is required and never guessed: these loops may import packages the core's own python does not have, and started under the wrong one the worker crash-loops under the supervisor, which reads as a broken daemon rather than a missing setting. Unset is a skipped worker with a reason on stderr.
+- `interpreter.needs` — optional; quoted back in that reason so the operator knows what the interpreter must provide.
+
+**Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
 
 ## Currently active manifest skills
 
@@ -154,6 +205,7 @@ backend swap, never a re-format.
 | `contract` | opt | `{inputs, outputs, guarantees}` — what downstream depends on across versions |
 | `provenance` | opt | `{source_repo, forked_from, upstream_intent}` — keeps forks trackable |
 | `enabled`, `access_tier`, `tools`, `server`, `startup`, `config` | — | manifest-loaded skills only (see above) |
+| `documented_for_core`, `core_description` | opt | a skill the core runs (no `tools`): `core_description` is read by `loadCoreDocumentedSkills()` (`src/inline-tools.ts`) into the voice prompt, so voice delegates it through `work` instead of saying it cannot |
 
 `permissions` is a **declaration the linter cross-checks**: e.g. `network: false`
 on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that
