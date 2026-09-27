@@ -74,10 +74,8 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
 
     def test_missing_pyyaml_degrades_to_roster(self):
-        # An interpreter without PyYAML is the same degradation as an unparseable
-        # file; before the guard the ImportError escaped and lookup.py crashed.
-        # BOTH stores are written: each has its own import, so a fixture with only
-        # quick-lookup.yaml leaves the entities.yaml half unpinned (caught in review).
+        # Each store has its OWN import, so a fixture writing one leaves the other
+        # unpinned; both warnings are asserted so neither degradation goes silent.
         with tempfile.TemporaryDirectory() as t:
             d = store(t, "people:\n    - id: present\n", roster=ROSTER)
             (d / "entities.yaml").write_text("entities:\n  - entity_id: present\n")
@@ -94,10 +92,11 @@ class StoreShapes(unittest.TestCase):
                     sys.modules["yaml"] = saved
             self.assertEqual(q, {})
             self.assertEqual(ents, [])
-            # One warning per store, so neither degradation is silent.
             warned = err.getvalue()
-            self.assertIn("quick-lookup.yaml" if "quick-lookup" in warned else "PyYAML missing",
-                          warned, warned)
+            # Count, not substring: the quick-lookup warning does not name its file,
+            # so the entities one alone satisfies any shared-phrase assertion.
+            self.assertEqual(warned.count("PyYAML missing"), 2, warned)
+            self.assertIn("using roster only", warned, warned)
             self.assertIn("entities.yaml", warned, warned)
             rows = lk.load_roster(d)
             hits = lk.match(rows, "john-the-dev")
