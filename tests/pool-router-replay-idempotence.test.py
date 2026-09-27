@@ -16,8 +16,10 @@ leaves the attribution absent after the retry.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,8 +45,13 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
+_TREES: list[Path] = []
+atexit.register(lambda: [shutil.rmtree(t, ignore_errors=True) for t in _TREES])
+
+
 def workspace(bound_to: str) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="router-replay-"))
+    _TREES.append(tmp)
     ws = tmp / "ws"
     for d in ("tasks", "state", "deliveries"):
         (ws / d).mkdir(parents=True)
@@ -197,8 +204,69 @@ def scenario_concurrent_passes_with_different_bindings() -> None:
     check("the attribution names the winner", pa.worker_for_task(ws, "task-r") == winner, str(pa.worker_for_task(ws, "task-r")))
 
 
+def scenario_unreadable_and_malformed_evidence_refuse() -> None:
+    print("\nscenario: unreadable or malformed evidence refuses instead of reading as absent")
+    import pool_route_handler as h
+    ws = workspace(B)
+    seed(ws, A, ".txt", None)
+    folder = ws / "deliveries" / A
+    folder.chmod(0o000)                          # A's real sentinel temporarily unreadable
+    try:
+        try:
+            rt.route(ws, task(ws))
+            check("unreadable sentinel folder: refused", False, "route returned")
+        except rt.UnreadableEvidence as e:
+            check("unreadable sentinel folder: refused and named", "refusing" in str(e), str(e))
+        code, targets, _ = h.classify(ws, task(ws))
+        check("...and the handler's probe answers must-handle", code == h.MUST_HANDLE, str((code, targets)))
+    finally:
+        folder.chmod(0o755)
+    check("...and nothing was created for B meanwhile", not (ws / "deliveries" / B / "task-r.txt").exists())
+    after = rt.route(ws, task(ws))
+    check("readable again: the replay reports already for A", after["already"] == [A] and after["delivered"] == [], str(after))
+    ws = workspace(B)
+    seed(ws, A, ".txt", None)
+    pa.attribution_dir(ws).mkdir(parents=True, exist_ok=True)
+    pa.attribution_path(ws, "task-r").write_text("not-a-worker-id\n")
+    try:
+        rt.route(ws, task(ws))
+        check("malformed attribution: refused", False, "route returned")
+    except rt.ConflictingDelivery as e:
+        check("malformed attribution: refused, not reported as repaired", "malformed" in str(e), str(e))
+    check("...and the malformed record is left for a human", pa.attribution_path(ws, "task-r").read_text().strip() == "not-a-worker-id")
+
+
+def scenario_commit_outlives_the_roster() -> None:
+    print("\nscenario: after a committed delivery to A, the roster disappears; the replay still finishes it")
+    import pool_route_handler as h
+    ws = workspace(A)
+    rt.route(ws, task(ws))
+    (ws / "state" / "roster.json").unlink()
+    out = rt.route(ws, task(ws))
+    check("replay without a roster reports already for A", out["already"] == [A] and out["delivered"] == [] and out["targets"] == [A], str(out))
+    code, targets, _ = h.classify(ws, task(ws))
+    check("the probe accepts for A without a roster", (code, targets) == (0, [A]), str((code, targets)))
+    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    check("the handler's run settles (rc 0), judged by the route's committed target", rc == 0, str(rc))
+
+
+def scenario_handler_settles_by_the_routes_targets() -> None:
+    print("\nscenario: the probe saw B bound and nothing committed; A commits before the run; the run settles on A")
+    import pool_route_handler as h
+    ws = workspace(B)
+    code, targets, _ = h.classify(ws, task(ws))
+    check("probe snapshot names B", (code, targets) == (0, [B]), str((code, targets)))
+    seed(ws, A, ".txt", A)                       # A commits between the probe and the run
+    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    check("the run reports settled (rc 0): A already owns it, B is not a missing delivery", rc == 0, str(rc))
+    check("no sentinel for B", not (ws / "deliveries" / B / "task-r.txt").exists())
+
+
 def main() -> int:
     scenario_plain_replay_is_still_already()
+    scenario_unreadable_and_malformed_evidence_refuse()
+    scenario_commit_outlives_the_roster()
+    scenario_handler_settles_by_the_routes_targets()
     scenario_every_suffix_and_every_attribution_shape()
     scenario_concurrent_passes_with_different_bindings()
     scenario_handler_probe_follows_the_commit()

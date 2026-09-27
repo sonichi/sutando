@@ -21,6 +21,9 @@ wrapper that lingers before or after the router runs.
   b1/b2. during routing       -- the wrapper lingers before / after the router
   c. after delivery, before the done record -- barrier `after-handler`
   d. after the done record, before the release -- barrier `after-done`
+     (on the core path the done writer is a no-op without an instance id, so
+     c and d are two TERM locations over the SAME durable state: claim by this
+     pid, sentinel in A, attribution A; no done-record transition is claimed)
   e1/e2. the left-behind claim's pid recycled / its true owner still alive
   e3. the PRODUCTION writer's claim, taken from a live paused watcher, carries
       the start time in the C locale; a reader started under another locale
@@ -34,6 +37,14 @@ wrapper that lingers before or after the router runs.
      (`filename_is_claimed`) at the instant the TASK_FILE line appears
   g. the room is rebound A->B between the kill and the replay: the replay
      finishes the delivery to A and never delivers to B
+  h. a no-handler watcher meets a LIVE claim for its task (unknown owner while
+     its ps fails): zero TASK_FILE lines, no admission; when ps returns and the
+     owner dies, the same quiet watcher announces exactly once, on its own timer
+  i. a dead claim met by the task's own dispatch yields exactly one announcement,
+     with nothing else arriving (no recursive dispatch plus outer continuation)
+  j. a writer whose ps fails refuses to claim a task that nobody holds, holds it,
+     and routes it exactly once on its own timer after ps returns
+  k. fswatch closes while a task is held: genuine EOF still ends the watcher
 
 Every arm ends with exactly one sentinel across every recipient folder, the
 attribution naming that recipient, and no claim left behind; a bound task is
@@ -197,6 +208,7 @@ class Watcher:
         # A second standby on one inbox is refused by design; a SESSION watcher
         # takes over from a standby that has not stood down after this timeout.
         env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "2"
+        env["SUTANDO_HELD_RETRY_INTERVAL"] = "2"
         env["SUTANDO_WATCHER_START_LOCK_TIMEOUT_S"] = "3"   # the lock is held for a watcher's lifetime
         self.proc = subprocess.Popen(
             ["bash", "src/watch-tasks-stream.sh", inbox, "--role", self.role, "--inbox", inbox],
@@ -507,7 +519,9 @@ def arm_reader_ps_failure_keeps_then_recovers() -> None:
         check("with ps failing, the live owner's claim is kept",
               w.claim_pid("task-o.txt") == str(w1.proc.pid), w.claim_pid("task-o.txt"))
         check("...and the writer refused to claim rather than publish a blank identity",
-              "cannot read my own start time" in w2.err.read_text() or router_runs(w) == 1, w2.err.read_text()[-300:])
+              wait_for(lambda: "cannot read my own start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        check("...so no claim of w2's exists anywhere", all(
+              (w.claims / c.name).read_text().splitlines()[0] != str(w2.proc.pid) for c in w.claims.glob("task-*.txt")))
         check("...and the router did not run for it concurrently",
               w.sentinels("task-o") == [f"deliveries/{A}/task-o.txt"] and router_runs(w) == 1, str(w.log()))
         broken_ps.unlink()                 # observation recovers; the owner is still alive
@@ -586,11 +600,142 @@ def arm_no_handler_restart() -> None:
         verdict = guards_say_claimed(w, "task-n.txt")
         check("...and at that instant both production notifier guards let it through",
               verdict == {"claude": False, "codex": False}, str(verdict))
+        time.sleep(6.0)      # three held-retry intervals: no recursive/second announcement
+        check("...and it is announced exactly once", w2.announced("task-n.txt") == 1, w2.out.read_text()[-300:])
         check("nothing was delivered to a worker (no handler ran)", w.sentinels("task-n") == [], str(w.sentinels("task-n")))
     finally:
         w1.stop()
         if w2 is not None:
             w2.stop()
+        w.cleanup()
+
+
+def arm_no_handler_live_claim_holds_then_announces_once() -> None:
+    print("\narm h: no-handler watcher, a live claim whose owner it cannot identify — hold; then owner dies — announce once, on its own timer")
+    w = Workspace()
+    w.pause_at("after-handler")
+    w1 = Watcher(w)
+    w2 = None
+    broken_ps = w.tmp / "bin" / "ps"
+    try:
+        w1.start()
+        w1.deliver("task-h.txt")
+        check("the owner is paused with its production claim held",
+              wait_for(lambda: in_hook(w, "after-handler") and claimed(w, "task-h.txt"), 30.0))
+        w.pause_at("")
+        broken_ps.write_text("#!/bin/sh\nexit 1\n")
+        broken_ps.chmod(0o755)
+        w2 = Watcher(w, handler=False, role="session")
+        w2.start()
+        check("the reader says why it keeps the claim",
+              wait_for(lambda: "cannot read the start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        check("...and holds the task rather than announcing into the guards",
+              wait_for(lambda: "another watcher's claim stands" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        time.sleep(3.0)
+        check("zero TASK_FILE lines while the claim stands", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
+        broken_ps.unlink()               # ps returns; the owner is still alive
+        time.sleep(5.0)
+        check("still zero with ps back and the owner alive", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
+        w1.stop(graceful=True)           # the owner dies; nothing else is fed
+        check("the quiet watcher announces exactly once on its own timer",
+              wait_for(lambda: w2.announced("task-h.txt") == 1, 30.0), w2.out.read_text()[-300:])
+        time.sleep(6.0)
+        check("...and it stays exactly once", w2.announced("task-h.txt") == 1, w2.out.read_text()[-300:])
+        check("the dead claim is gone", not claimed(w, "task-h.txt"))
+    finally:
+        if w2 is not None:
+            w2.stop()
+        w1.stop()
+        w.cleanup()
+
+
+def arm_dead_claim_met_by_own_dispatch_once() -> None:
+    print("\narm i: a no-handler watcher's own dispatch meets a dead claim for the task — exactly one announcement")
+    w = Workspace()
+    w2 = Watcher(w, handler=False)
+    try:
+        w2.start()
+        wait_for(lambda: not list((w.ws / "state").glob("watch-tasks-stream.start-*.lock")), 20.0)
+        task = w.task("task-i.txt")
+        w.claims.mkdir(parents=True, exist_ok=True)
+        (w.claims / "task-i.txt").write_text(f"{dead_pid()}\nsome-dead-watcher\n{task}\nfallback\n\n")
+        with w2.feed.open("a") as fh:            # the task's own event, claim already dead
+            fh.write(str(task.resolve()) + "\n")
+        check("the task is announced", wait_for(lambda: w2.announced("task-i.txt") >= 1, 30.0), w2.out.read_text()[-200:])
+        time.sleep(7.0)                          # three held-retry intervals
+        check("...exactly once: no recursive dispatch plus outer continuation, no held re-emit",
+              w2.announced("task-i.txt") == 1, w2.out.read_text()[-300:])
+        check("the dead claim is gone", not claimed(w, "task-i.txt"))
+    finally:
+        w2.stop()
+        w.cleanup()
+
+
+def dead_pid() -> str:
+    p = subprocess.Popen(["sh", "-c", "true"])
+    p.wait()
+    return str(p.pid)
+
+
+def arm_eof_while_held_exits_promptly() -> None:
+    print("\narm k: fswatch closes while a task is held — genuine EOF still ends the watcher promptly")
+    w = Workspace()
+    broken_ps = w.tmp / "bin" / "ps"
+    broken_ps.write_text("#!/bin/sh\nexit 1\n")
+    broken_ps.chmod(0o755)
+    w2 = Watcher(w)
+    try:
+        w2.start()
+        w2.deliver("task-k.txt")
+        check("the task is held (writer refused)",
+              wait_for(lambda: "cannot read my own start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        # Close the stub fswatch (the sh wrapper or the `tail -f` it execs): the
+        # watcher's fd 3 sees EOF. Walk its process group, since the stub's name changes.
+        pg = os.getpgid(w2.proc.pid)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10 and w2.proc.poll() is None:
+            for ln in subprocess.run(["ps", "-o", "pid=,pgid=,command=", "-ax"], capture_output=True, text=True).stdout.splitlines():
+                parts = ln.split(None, 2)
+                if len(parts) == 3 and parts[1] == str(pg) and parts[0] != str(w2.proc.pid) \
+                        and ("fswatch" in parts[2] or "tail -n +1" in parts[2]):
+                    try:
+                        os.kill(int(parts[0]), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            time.sleep(0.25)
+        check("the watcher exits on EOF within a few seconds, not a retry loop",
+              w2.proc.poll() is not None, f"still running after {time.monotonic()-t0:.1f}s")
+        check("...and it announced nothing for the held task", w2.announced("task-k.txt") == 0)
+    finally:
+        w2.stop()
+        w.cleanup()
+
+
+def arm_writer_ps_failure_holds_then_routes_once() -> None:
+    print("\narm j: the writer's ps fails on a task nobody holds — refused, held, routed once after ps returns")
+    w = Workspace()
+    broken_ps = w.tmp / "bin" / "ps"
+    broken_ps.write_text("#!/bin/sh\nexit 1\n")
+    broken_ps.chmod(0o755)
+    w2 = Watcher(w)
+    try:
+        w2.start()
+        w2.deliver("task-j.txt")
+        check("the writer refuses to publish a blank identity",
+              wait_for(lambda: "cannot read my own start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        time.sleep(3.0)
+        check("nothing claimed, nothing routed, nothing announced",
+              not claimed(w, "task-j.txt") and w.sentinels("task-j") == [] and w2.announced("task-j.txt") == 0,
+              f"{claimed(w, 'task-j.txt')} {w.sentinels('task-j')}")
+        broken_ps.unlink()               # ps returns; nothing else is fed
+        check("the task is routed exactly once on the watcher's own timer",
+              wait_for(lambda: w.sentinels("task-j") == [f"deliveries/{A}/task-j.txt"] and router_runs(w) == 1, 30.0),
+              f"{w.sentinels('task-j')} {w.log()}")
+        check("...and its claim is released", wait_for(lambda: not claimed(w, "task-j.txt"), 30.0))
+        time.sleep(5.0)
+        check("...and it is not routed again", router_runs(w) == 1 and w2.announced("task-j.txt") == 0, str(w.log()))
+    finally:
+        w2.stop()
         w.cleanup()
 
 
@@ -633,6 +778,10 @@ def main() -> int:
     arm_reader_ps_failure_keeps_then_recovers()
     arm_legacy_four_line_claim()
     arm_no_handler_restart()
+    arm_no_handler_live_claim_holds_then_announces_once()
+    arm_dead_claim_met_by_own_dispatch_once()
+    arm_writer_ps_failure_holds_then_routes_once()
+    arm_eof_while_held_exits_promptly()
     arm_rebind_between_kill_and_replay()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")

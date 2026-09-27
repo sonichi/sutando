@@ -472,7 +472,7 @@ acquire_task_claim() {
   if [ -z "$own_start" ]; then
     # A claim without its owner's start time would read as pid-only forever.
     echo "watch-tasks-stream: cannot read my own start time (ps); not claiming $filename this pass" >&2
-    return 1
+    return 2
   fi
   printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" "$own_start" > "$temporary"
   while [ "$attempts" -lt 3 ]; do
@@ -576,26 +576,36 @@ publish_terminal_failure() {
 # the claim bookkeeping remains -- handler runs are synchronous, no queue.
 # Overlapping watchers preserve a live owner's claim. A dead owner's record is
 # quarantined before any dispatch: a stale claim makes both notifiers drop the task.
-# `redispatch`: a task freed mid-lifetime is dispatched again here, since no sweep follows.
+# `hold`: a task freed mid-lifetime joins the held list (retried by the existing
+# held-retry path, once), never a dispatch from inside a dispatch.
 reconcile_dead_claims() {
-  local claim task_path freed=""
+  local claim task_path fn
   [ -d "$CLAIMS_DIR" ] || return 0
-  [ "${RECONCILING:-0}" -eq 0 ] || return 0
-  RECONCILING=1
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
     claim_is_live "$claim" && continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
-    retire_stale_claim "$claim" && freed="$freed$task_path
-"
+    retire_stale_claim "$claim" || continue
+    [ "${1:-}" = "hold" ] || continue
+    fn="$(basename "$task_path")"
+    [ -f "$TASKS_DIR/$fn" ] || continue
+    hold_task "$fn" now
   done
   shopt -u nullglob
-  if [ "${1:-}" = "redispatch" ] && [ -n "$freed" ]; then
-    while IFS= read -r task_path; do
-      [ -n "$task_path" ] && [ -f "$task_path" ] && dispatch_task "$task_path"
-    done <<< "$freed"
+}
+
+# A task decided later: held names are replayed by redispatch_held_tasks once the
+# deadline passes ("now" makes the next event the deadline).
+hold_task() {
+  local fn="$1"
+  printf '%s' "$HELD_NAMES" | grep -qxF -- "$fn" && return 0
+  if [ "${2:-}" = "now" ]; then
+    HELD_RETRY_AT=0
+  elif [ -z "$HELD_NAMES" ]; then
+    HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
   fi
-  RECONCILING=0
+  HELD_NAMES="$HELD_NAMES$fn
+"
 }
 
 prepare_handler_state() {
@@ -661,9 +671,12 @@ run_handler_now() {
   announce="$(task_announce "$task_path")"
   prepare_handler_state
   transition before-claim "$filename"
-  if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
-    return 0
-  fi
+  acquire_task_claim "$filename" "$task_path" "$disposition"
+  case $? in
+    0) ;;
+    2) hold_task "$filename"; return 0 ;;   # our own identity unreadable: retry on the timer
+    *) return 0 ;;                          # another watcher holds it
+  esac
   record_admission
   activity_transition RUNNING "$task_path"
   timed_out=0
@@ -866,16 +879,21 @@ dispatch_task() {
   [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
 "
   read_handler_config_now
-  reconcile_dead_claims redispatch
+  reconcile_dead_claims hold
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
-    [ -n "$HELD_NAMES" ] || HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
-    HELD_NAMES="$HELD_NAMES$filename
-"
+    hold_task "$filename"
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
   fi
   DECISION_IDENTITY="$identity"
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+    # A claim that survived reconciliation has a live or unknown owner: both
+    # notifiers drop a line for it, so hold the task instead of admitting a dropped emit.
+    if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -e "$CLAIMS_DIR/$filename" ]; then
+      hold_task "$filename"
+      echo "watch-tasks-stream: holding $filename: another watcher's claim stands" >&2
+      return 0
+    fi
     emit_dispatch_task_file "$announce" && record_admission
     return
   fi
@@ -1184,7 +1202,30 @@ if [ "$WATCHER_ROLE" = "session" ]; then
 fi
 # EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
 # readiness replay above, since a second open of the FIFO would race it for bytes.
-while IFS= read -r path <&3; do
-  handle_event "$path"
+# While anything is held the read is timed, so a quiet inbox still reaches the
+# held retry: read returns >128 on the timeout and 1 on EOF, never the same.
+held_read_timeout() {
+  local left
+  [ -n "$HELD_NAMES" ] || { echo 0; return; }
+  left=$(( HELD_RETRY_AT - $(date +%s) ))
+  [ "$left" -gt 0 ] && echo "$left" || echo 1
+}
+while :; do
+  # A due deadline is served BEFORE the read, so `-t` is never 0 and the held
+  # set and deadline are current when the timeout is computed.
   retry_held_tasks_if_due
+  path=""
+  t="$(held_read_timeout)"
+  if [ "$t" -gt 0 ]; then
+    IFS= read -r -t "$t" path <&3; rc=$?
+  else
+    IFS= read -r path <&3; rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    handle_event "$path"
+  elif [ "$rc" -gt 128 ]; then
+    :   # the timeout: nothing arrived; the loop head serves the deadline
+  else
+    break   # EOF: fswatch is gone, held or not
+  fi
 done

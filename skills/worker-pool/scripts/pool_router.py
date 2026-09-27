@@ -67,13 +67,48 @@ def task_arbitration(workspace, task_id: str):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+class UnreadableEvidence(RouterRefused):
+    """A sentinel, folder or record could not be READ: absent and unreadable are not the same."""
+
+
 def holders(workspace, task_id: str) -> list[str]:
-    """Every recipient folder holding a sentinel for `task_id`, under any suffix."""
+    """Every recipient folder holding a sentinel for `task_id`, under any suffix.
+
+    Tri-state per name: regular (held), absent (not held), anything else
+    refuses. `find()`'s None covers both absent and unreadable, which is why
+    this reader asks `regular_file_state` itself.
+    """
     root = pd.deliveries_dir(workspace, pr.CORE).parent
-    if not root.is_dir():
-        return []
-    return sorted(f.name for f in root.iterdir()
-                  if f.is_dir() and pd.find(workspace, f.name, task_id) is not None)
+    try:
+        folders = sorted(f for f in root.iterdir() if f.is_dir()) if root.is_dir() else []
+    except OSError as e:
+        raise UnreadableEvidence(f"{task_id}: cannot list {root}: {e}") from e
+    held = []
+    for folder in folders:
+        for name in (task_id + pd.PENDING_SUFFIX, task_id + pd.ACCEPTED_SUFFIX,
+                     task_id + pd.LEGACY_ACCEPTED_SUFFIX):
+            state = pd.regular_file_state(folder / name)
+            if state == "regular":
+                held.append(folder.name)
+                break
+            if state != "absent":
+                raise UnreadableEvidence(f"{task_id}: {folder / name} is {state}; refusing to decide")
+    return held
+
+
+def attribution_state(workspace, task_id: str) -> tuple[str, str | None]:
+    """('absent' | 'worker' | 'malformed' | 'unreadable', worker id)."""
+    path = pa.attribution_path(workspace, task_id)
+    state = pd.regular_file_state(path)
+    if state == "absent":
+        return "absent", None
+    if state != "regular":
+        return "unreadable", None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unreadable", None
+    return ("worker", value) if pa.is_worker_id(value) else ("malformed", None)
 
 
 def committed_recipient(workspace, task_id: str) -> str | None:
@@ -81,11 +116,16 @@ def committed_recipient(workspace, task_id: str) -> str | None:
 
     Attribution is the record; a sentinel in ANY recipient folder is the fact
     behind it (a crash can leave the fact without the record). A replay must
-    follow this, never the current binding. Two holders, or a record naming
-    one recipient while the fact names another, is an anomaly: refused, so it
+    follow this, never the current binding. Two holders, a record naming one
+    recipient while the fact names another, a record that is present but
+    malformed, or evidence that cannot be read: all refused, so the anomaly
     surfaces instead of being resolved by whichever pass runs next.
     """
-    worker = pa.worker_for_task(workspace, task_id)
+    state, worker = attribution_state(workspace, task_id)
+    if state == "unreadable":
+        raise UnreadableEvidence(f"{task_id}: attribution record unreadable; refusing to decide")
+    if state == "malformed":
+        raise ConflictingDelivery(f"{task_id}: attribution record present but malformed; refusing to decide")
     held = holders(workspace, task_id)
     if len(held) > 1 or (worker is not None and held and held != [worker]):
         raise ConflictingDelivery(
@@ -146,21 +186,20 @@ def route(workspace, task: dict, roster=None) -> dict:
     rather than defaulting to the core, which would aim every task at one
     recipient the moment the file is unwritable.
     """
-    r = roster if roster is not None else pr.load_roster(workspace)
-    if r is None:
-        raise RouterRefused("roster is absent or unreadable — refusing the pass")
-
     task_id = task.get("id")
     if not task_id:
         raise RouterRefused("task has no id")
 
-    # The whole decision under one per-task lock: what is committed wins over
-    # the current binding, and only when nothing is may the binding create.
+    # One per-task lock around the whole decision; the commit is resolved before
+    # the roster is needed, so a replay finishes it even if the roster is gone.
     with task_arbitration(workspace, task_id):
         committed = committed_recipient(workspace, task_id)
         if committed is not None:
-            targets, unknown = [committed], []
+            targets, unknown, r = [committed], [], (roster if roster is not None else {})
         else:
+            r = roster if roster is not None else pr.load_roster(workspace)
+            if r is None:
+                raise RouterRefused("roster is absent or unreadable — refusing the pass")
             source = task.get("channel_id") or task.get("source") or ""
             try:
                 targets = pr.targets_for(r, source, pr.requested_worker_of(task))
@@ -178,7 +217,7 @@ def route(workspace, task: dict, roster=None) -> dict:
         buckets = {"delivered": [], "already": [], "no-payload": []}
         for t in targets:
             buckets[deliver_one(workspace, t, task_id)].append(t)
-    return {"task_id": task_id, "version": r.get("version"),
+    return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"],
             "redirected": unknown, "error": None}
