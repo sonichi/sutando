@@ -170,7 +170,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       - name: Typecheck
         run: npm run typecheck
@@ -227,7 +227,7 @@ jobs:
         run: npm ci
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` discovery. Same reason the skill-manifest
@@ -317,7 +317,7 @@ jobs:
         run: npm ci
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
       # existed but were never wired into CI (the discovery glob only covered
@@ -339,7 +339,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
       - name: Run shell standalone tests (serial tail)
         run: bash scripts/run-shell-suites.sh tail
 
@@ -378,7 +378,7 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # watch-tasks-stream-config-hot-reload.test.py exercises the real
       # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship

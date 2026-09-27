@@ -121,9 +121,9 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 
 ```json
 "supervised_worker": {
-  "name": "room-collab-presence",
+  "name": "example-presence",
   "script": "scripts/presence_daemon.py",
-  "interpreter": { "config": "ROOM_COLLAB_PYTHON", "needs": "pycrdt + websockets" }
+  "interpreter": { "config": "EXAMPLE_PYTHON", "needs": "pycrdt + websockets" }
 }
 ```
 
