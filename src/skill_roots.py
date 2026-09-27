@@ -36,12 +36,9 @@ def skill_roots(repo, workspace, env: Mapping[str, str] | None = None) -> list[P
 
     roots, seen = [], set()
     for c in candidates:
-        try:
-            if not c.is_dir():
-                continue
-            key = c.resolve()
-        except OSError:
+        if not c.is_dir():
             continue
+        key = c.resolve()
         if key not in seen:
             seen.add(key)
             roots.append(c)
