@@ -137,6 +137,46 @@ def case_health_check_cron_nudge() -> list[str]:
     return fails
 
 
+def case_differing_tmpdir_collision() -> list[str]:
+    """keweichen: `scripts/tmux-pane-lock.sh` used to place the lock under each
+    caller's OWN $TMPDIR, so identical socket+session arguments did not guarantee
+    contention -- the app and a shell can see different $TMPDIR values on macOS
+    (src/Sutando/main.swift's sutandoTmuxSocket comment). The owner and the writer
+    below run with DIFFERENT $TMPDIR values; if the lock ever splits by directory
+    again, this is the case that goes red first."""
+    fails = []
+    hc = _load("health_check_tmpdir_collision", "src/health-check.py")
+    saved_tmpdir = os.environ.get("TMPDIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            tmux, log = _fake_tmux(tdp)
+            owner_tmp = tdp / "owner-tmpdir"; owner_tmp.mkdir()
+            writer_tmp = tdp / "writer-tmpdir"; writer_tmp.mkdir()
+            os.environ["TMPDIR"] = str(owner_tmp)
+            with PaneOwner() as owner:
+                os.environ["TMPDIR"] = str(writer_tmp)
+                got = hc._default_cron_nudge(tmux_bin=str(tmux), sock=SOCK, session=SESSION)
+                if got:
+                    fails.append("differing-TMPDIR: nudge reported success while an owner elsewhere held the pane")
+                if _keys(log):
+                    fails.append(f"differing-TMPDIR: typed into an owned pane despite a different \\$TMPDIR: {_keys(log)}")
+                owner.release()
+            # The control: with the owner released, the SAME differing-TMPDIR writer must
+            # still deliver -- otherwise a case above could pass for a lock that never works.
+            if not hc._default_cron_nudge(tmux_bin=str(tmux), sock=SOCK, session=SESSION):
+                fails.append("differing-TMPDIR: nudge failed on a FREE pane (control)")
+            sent = _keys(log)
+            if len(sent) != 1 or "/schedule-crons" not in sent[0]:
+                fails.append(f"differing-TMPDIR: expected one /schedule-crons send on a free pane, got {sent}")
+    finally:
+        if saved_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = saved_tmpdir
+    return fails
+
+
 def case_core_input_watch_keypress() -> list[str]:
     """One auto-answer key is still a write: a digit typed into another writer's
     picker selects a row nobody asked for."""
@@ -190,10 +230,8 @@ def _notifier_repo(td: Path) -> Path:
         "src/cli_wedge.py",
         "src/file_lock.py",
         "src/sutando_platform.py",
-        # pane_gate.py imports this at module load; without it EVERY subcommand
-        # fails closed (import error), and "healthy"/"classify" read as unknown
-        # forever -- the notifier then retries for its full timeout instead of
-        # ever typing, so the collision case would time out for the wrong reason.
+        # pane_gate.py imports this at module load; without it every subcommand
+        # fails closed, and the notifier retries for its full timeout instead of typing.
         "src/quota_availability.py",
     ):
         target = root / rel
@@ -278,13 +316,11 @@ def _claude_notifier_repo(td: Path) -> Path:
         "src/cli_wedge.py",
         "src/file_lock.py",
         "src/sutando_platform.py",
-        # Same load-time import pane_gate.py needs (see the codex fixture's
-        # comment) -- missing it fails "healthy" closed and the notifier
-        # retries for its full CORE_READY_TIMEOUT instead of ever typing.
+        # Same load-time import pane_gate.py needs; missing it fails "healthy"
+        # closed and the notifier retries the full CORE_READY_TIMEOUT instead of typing.
         "src/quota_availability.py",
-        # cleanup_notifier's standby_end_log reads this on every exit; a
-        # missing file degrades to "unknown" (same observable result), but
-        # keep it present so the case exercises the real read, not its error path.
+        # standby_end_log reads this on every exit; keep it present so the case
+        # exercises the real read, not a missing-file error path with the same result.
         "src/watcher_identity.py",
     ):
         target = root / rel
@@ -408,9 +444,8 @@ def case_claude_task_notifier_staged_resume_collision() -> list[str]:
         # the staged text must match exactly what the notifier itself computes.
         workspace = (root / "workspace").resolve()
         filename = "task-collision.txt"
-        # Must match task_prompt() in src/agent/claude/cli/task-notifier.sh EXACTLY --
-        # prompt_is_staged() requires an exact (whitespace-squeezed) match, and the
-        # standby/re-arm suffix is part of that string, not decoration on top of it.
+        # Must match task_prompt()'s current output exactly (prompt_is_staged()
+        # requires it) -- the standby/re-arm suffix is part of that string now.
         staged_prompt = (
             f"Sutando task ready: {filename}. Read {workspace}/tasks/{filename}, "
             "follow CLAUDE.md, complete the task, and write the result to "
@@ -462,6 +497,7 @@ def case_claude_task_notifier_staged_resume_collision() -> list[str]:
 
 CASES = (
     ("health-check cron nudge", case_health_check_cron_nudge),
+    ("differing-TMPDIR collision", case_differing_tmpdir_collision),
     ("core-input-watch keypress", case_core_input_watch_keypress),
     ("task-notifier delivery", case_task_notifier_delivery),
     ("claude task-notifier delivery", case_claude_task_notifier_delivery),
