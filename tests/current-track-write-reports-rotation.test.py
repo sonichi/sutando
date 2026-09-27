@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""`current-track-write.py append` must SAY when it rotated.
+
+A rotation decides which entries a later pass can still read, so a silent one is a
+decision taken on the caller's behalf without telling them.
+"""
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+WRITER = REPO / "scripts" / "current-track-write.py"
+sys.path.insert(0, str(REPO / "src"))
+from current_track import DEFAULT_KEEP  # noqa: E402
+
+failures = 0
+
+
+def check(name: str, ok: bool, got: str = "") -> None:
+    global failures
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f" — got {got[:200]}" if not ok else ""))
+    if not ok:
+        failures += 1
+
+
+def write(target: Path, text: str):
+    return subprocess.run([sys.executable, str(WRITER), "append", str(target)],
+                          input=text, capture_output=True, text=True)
+
+
+with tempfile.TemporaryDirectory() as d:
+    host = Path(d) / "hosts" / "TESTHOST"
+    host.mkdir(parents=True)
+    track = host / "current-track.md"
+
+    # 1. A small append does NOT rotate, so it must stay quiet.
+    track.write_text("## seed, 2026-01-01T00:00Z\nbody\n", encoding="utf-8")
+    r = write(track, "\n## quiet, 2026-01-02T00:00Z\nbody\n")
+    check("a non-rotating append says nothing about rotation", r.returncode == 0
+          and "rotated" not in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
+
+    # 2. An append that crosses the budget rotates, and must SAY so.
+    entries = "".join(f"\n## e{i}, 2026-02-{(i % 27) + 1:02d}T00:00Z\n{'x' * 900}\n" for i in range(45))
+    track.write_text(entries, encoding="utf-8")
+    assert track.stat().st_size > DEFAULT_KEEP, track.stat().st_size
+    r = write(track, "\n## crosses, 2026-03-01T00:00Z\nbody\n")
+    check("a rotating append reports it on stderr", r.returncode == 0
+          and "current-track-write:" in r.stderr and "rotated" in r.stderr,
+          f"rc={r.returncode} stderr={r.stderr!r}")
+    check("and names what moved and what is left", "archived" in r.stderr and "head now" in r.stderr,
+          r.stderr)
+    check("and the head really did shrink", track.stat().st_size <= DEFAULT_KEEP,
+          str(track.stat().st_size))
+
+    # condense() keeps only pin-matching LINES, so only those lines can cause `oversized`;
+    # a large body cannot.
+    pinned = "".join(f"\n## p{i}, 2026-04-{(i % 27) + 1:02d}T00:00Z\n"
+                     + f"in force until the owner says stop: {'y' * 700}\n" * 3
+                     for i in range(30))
+    track.write_text(pinned, encoding="utf-8")
+    r = write(track, "\n## crosses-pinned, 2026-05-01T00:00Z\nin force until the owner says stop\nbody\n")
+    check("the pin-only oversized case is reported, not silent", r.returncode == 0
+          and "still over budget" in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
+    check("and it names the pinned bytes that caused it", "pinned entr" in r.stderr, r.stderr)
+
+print(f"\n{'PASS' if failures == 0 else f'FAIL — {failures} check(s) failed'}")
+sys.exit(1 if failures else 0)
