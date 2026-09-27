@@ -302,10 +302,13 @@ unset __my_kind __holders __hpid __hrole __hkids __k __kstart __hread __hsince _
 unset -f __holder_live __still_holder __abort_blind 2>/dev/null || true
 # Optional task handlers run synchronously, inline -- see run_handler_now().
 HANDLER_STATE_READY=""
-# The handler this watcher is waiting on right now, so a signal-time settle
-# can collect its exit status instead of guessing from the leftover claim.
+# The handler run this watcher is inside, kept until its claim is released, so a
+# signal-time settle can use the outcome run_handler_now() collected or collect it.
 INFLIGHT_HANDLER_PID=""
 INFLIGHT_HANDLER_TASK=""
+INFLIGHT_HANDLER_RC=""
+INFLIGHT_HANDLER_TIMED_OUT=""
+SUTANDO_SETTLE_GRACE="${SUTANDO_SETTLE_GRACE:-3}"
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
 FSWATCH_PID=""
@@ -640,16 +643,18 @@ run_handler_now() {
     watchdog_pid=$!
     INFLIGHT_HANDLER_PID="$handler_pid"
     INFLIGHT_HANDLER_TASK="$filename"
+    INFLIGHT_HANDLER_RC=""
+    INFLIGHT_HANDLER_TIMED_OUT=""
     wait "$handler_pid" 2>/dev/null
     handler_rc=$?
-    INFLIGHT_HANDLER_PID=""
-    INFLIGHT_HANDLER_TASK=""
     kill -TERM "$watchdog_pid" 2>/dev/null
     wait "$watchdog_pid" 2>/dev/null
     if [ -f "$timeout_flag" ]; then
       timed_out=1
       rm -f "$timeout_flag"
     fi
+    INFLIGHT_HANDLER_RC="$handler_rc"
+    INFLIGHT_HANDLER_TIMED_OUT="$timed_out"
     if [ "$handler_rc" -eq 0 ]; then
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
     fi
@@ -695,6 +700,7 @@ run_handler_now() {
   elif [ "$handler_rc" -eq 0 ]; then
     release_task_claim "$filename" || true
   fi
+  INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""; INFLIGHT_HANDLER_RC=""; INFLIGHT_HANDLER_TIMED_OUT=""
 }
 
 # A name is read relative to the reader's own inbox: a body that resolution
@@ -910,19 +916,28 @@ _tmux_wake() {
 #
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
 # to settle its own claim -- this settles directly from CLAIMS_DIR instead.
-# The signal cut run_handler_now()'s wait, not the handler: bash keeps a child's
-# status until it is waited for, and the run watchdog still bounds a live one.
-inflight_handler_finished() {
-  local filename="$1" rc
+# The signal cut run_handler_now()'s wait, not the handler. Its exit code is kept
+# by bash until waited for; a run still alive after the grace counts as timed out,
+# because the group-stop the notifiers use has already killed the run watchdog.
+inflight_handler_outcome() {
+  local filename="$1" deadline
   [ -n "$INFLIGHT_HANDLER_PID" ] && [ "$INFLIGHT_HANDLER_TASK" = "$filename" ] || return 1
-  wait "$INFLIGHT_HANDLER_PID" 2>/dev/null
-  rc=$?
-  INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""
-  [ "$rc" -eq 0 ]
+  if [ -z "$INFLIGHT_HANDLER_RC" ]; then
+    deadline=$(( $(date +%s) + SUTANDO_SETTLE_GRACE ))
+    while kill -0 "$INFLIGHT_HANDLER_PID" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do sleep 0.2; done
+    if kill -0 "$INFLIGHT_HANDLER_PID" 2>/dev/null; then
+      INFLIGHT_HANDLER_TIMED_OUT=1
+      kill -TERM "$INFLIGHT_HANDLER_PID" 2>/dev/null; sleep 1; kill -KILL "$INFLIGHT_HANDLER_PID" 2>/dev/null
+    fi
+    wait "$INFLIGHT_HANDLER_PID" 2>/dev/null
+    INFLIGHT_HANDLER_RC=$?
+    [ -n "$INFLIGHT_HANDLER_TIMED_OUT" ] || INFLIGHT_HANDLER_TIMED_OUT=0
+  fi
+  return 0
 }
 
 settle_own_claims_on_shutdown() {
-  local claim filename task_path announce claim_settled verdict
+  local claim filename task_path announce claim_settled verdict handler_rc timed_out
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
@@ -932,18 +947,37 @@ settle_own_claims_on_shutdown() {
     [ -n "$task_path" ] || continue
     announce="$(task_announce "$task_path")"
     claim_settled=1
-    if inflight_handler_finished "$filename"; then
-      echo "watch-tasks-stream: task handler for $filename had already finished; settling its claim as done" >&2
-      record_worker_done "$filename" done "$WORKSPACE_DIR" || true
-      release_task_claim "$filename" || true
-      continue
+    handler_rc=""; timed_out=0
+    if inflight_handler_outcome "$filename"; then
+      handler_rc="$INFLIGHT_HANDLER_RC"; timed_out="$INFLIGHT_HANDLER_TIMED_OUT"
+      # Same bar as the live path: a `done` the stage writer cannot record fails the task.
+      if [ "$timed_out" -ne 1 ] && [ "$handler_rc" -eq 0 ]; then
+        if record_worker_done "$filename" done "$WORKSPACE_DIR"; then
+          echo "watch-tasks-stream: task handler for $filename had already finished; settling its claim as done" >&2
+          release_task_claim "$filename" || true
+          continue
+        fi
+        handler_rc=1
+      fi
     fi
-    claim_disposition "$filename"
-    verdict=$?
+    if [ "$timed_out" -eq 1 ] || [ "${handler_rc:-0}" -eq 4 ]; then
+      verdict=0
+    else
+      claim_disposition "$filename"
+      verdict=$?
+    fi
     case $verdict in
       0)
-        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
+        if [ "$timed_out" -eq 1 ]; then
+          echo "watch-tasks-stream: task handler for $filename still running at shutdown after ${SUTANDO_SETTLE_GRACE}s; publishing safe terminal failure rather than assuming core may inherit it" >&2
+          publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
+        elif [ "${handler_rc:-}" = 4 ]; then
+          echo "watch-tasks-stream: required Team handler failed for $filename (exit 4) at shutdown; publishing safe terminal failure" >&2
+          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
+        else
+          echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
+          publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
+        fi
         ;;
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
