@@ -185,6 +185,26 @@ fi
 exit 0
 ''')
 
+    def _tmux_calls(self) -> str:
+        """The fake tmux's call log, waiting briefly for a lazily-created file.
+
+        The log is created lazily, on the fake tmux's first invocation, and a
+        process that was just SIGTERM'd can still be landing its own tmux
+        calls when this is read -- reading unconditionally races that, on a
+        slow runner turning a plain assertion failure into an unrelated
+        FileNotFoundError. Observed in CI on 2026-09-27.
+
+        Returning "" the instant the file is missing masks that race instead
+        of fixing it: assertNotIn("x", "") is trivially true, so a test
+        expecting absence would pass whether or not the real call ever
+        happens to land late. Poll like _read_when_nonempty does instead, and
+        only after actually waiting out the deadline call it genuinely empty
+        -- "" is still a valid outcome here (assertNotIn asserts absence), it
+        just has to be earned by waiting, not returned on the first miss.
+        """
+        text = _read_when_nonempty(self.log, time.monotonic() + 2.0)
+        return text if text is not None else ""
+
     def tearDown(self):
         # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
         pid_file = Path(self.tmp.name) / "heartbeat.pid"
@@ -338,12 +358,12 @@ exit 0
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh",
                                     env_extra={"SUTANDO_TASK_EVENT_HANDLER": "/opt/handler"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("-e SUTANDO_TASK_EVENT_HANDLER=/opt/handler", self.log.read_text())
+        self.assertIn("-e SUTANDO_TASK_EVENT_HANDLER=/opt/handler", self._tmux_calls())
 
     def test_no_pin_sets_no_handler(self):
         result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self._tmux_calls())
 
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={
@@ -351,7 +371,7 @@ exit 0
             "SUTANDO_SELF_DEVELOPMENT_ENABLED": "0",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("new-session -d -s sutando-core", calls)
         self.assertIn("codex -C", calls)
         self.assertIn("--sandbox danger-full-access", calls)
@@ -396,7 +416,7 @@ exit 0
                          "a worker wrote the core's runtime record")
         self.assertFalse((state / "session-starts.log").exists(),
                          "a worker appended the core's launch log")
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("new-session", calls, calls)
         self.assertNotIn("kill-session", calls, calls)
         for name in ("scheduler.log", "heartbeat.log", "monitor.log", "install.log"):
@@ -411,7 +431,7 @@ exit 0
         runtime = json.loads((state / "core-runtime.json").read_text())
         self.assertEqual(runtime["session"], "sutando-core")
         self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
-        self.assertIn("new-session -d -s sutando-core", self.log.read_text())
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
@@ -520,7 +540,7 @@ exit 0
     def test_restart_kills_core_and_notifier_before_launch(self):
         result = self.run_launcher("--restart")
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
 
@@ -530,7 +550,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
-            self.log.read_text(),
+            self._tmux_calls(),
         )
 
     def test_ambient_self_development_policy_overrides_dotenv(self):
@@ -541,11 +561,11 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=0",
-            self.log.read_text(),
+            self._tmux_calls(),
         )
         self.assertNotIn(
             "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
-            self.log.read_text(),
+            self._tmux_calls(),
         )
 
     def test_empty_ambient_self_development_policy_reaches_core_to_fail_closed(self):
@@ -556,25 +576,25 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=",
-            self.log.read_text(),
+            self._tmux_calls(),
         )
         self.assertNotIn(
             "-e SUTANDO_SELF_DEVELOPMENT_ENABLED=1",
-            self.log.read_text(),
+            self._tmux_calls(),
         )
 
     def test_dispatcher_restarts_when_active_runtime_differs(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "claude"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Core runtime changed (claude → codex)", result.stdout)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertLess(calls.index("kill-session -t =sutando-core\n"),
                         calls.index("new-session -d -s sutando-core"))
 
     def test_unmarked_existing_session_is_replaced(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "unknown"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("kill-session -t =sutando-core", calls)
         self.assertIn("new-session -d -s sutando-core", calls)
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
@@ -587,7 +607,7 @@ exit 0
             "TMUX_ACTIVE_NOTIFIER_VERSION": "stale",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("kill-session -t =sutando-core-watcher", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
@@ -601,7 +621,7 @@ exit 0
             "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(),
         })
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
 
@@ -611,7 +631,7 @@ exit 0
             "TMUX_ACTIVE_RUNTIME": "codex",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertNotIn(" attach ", f" {calls} ")
         self.assertIn("sutando-core already running (codex)", result.stdout)
 
@@ -620,7 +640,7 @@ exit 0
         result = self.run_launcher()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not authenticated", result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("new-session", calls)
 
     def test_notifier_supervisor_restarts_after_child_exit(self):
@@ -814,7 +834,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("send-keys -t sutando-core:0 -l -- Sutando task ready: task-123.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
         self.assertIn("/tasks/task-123.txt", calls)
@@ -832,7 +852,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_does_not_replay_task_with_archived_result(self):
@@ -848,7 +868,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_does_not_replay_task_with_archived_result_behind_empty_live_placeholder(self):
@@ -873,7 +893,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_does_not_replay_task_with_archived_result_behind_whitespace_live_placeholder(self):
@@ -897,7 +917,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_does_not_replay_task_with_gateway_archived_result(self):
@@ -913,7 +933,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_does_not_replay_task_with_retention_archived_result(self):
@@ -929,7 +949,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_notifier_recognizes_gateway_result_in_retention_archive(self):
@@ -945,7 +965,7 @@ exit 0
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.log.read_text() if self.log.exists() else ""
+        calls = self._tmux_calls()
         self.assertNotIn("send-keys", calls)
 
     def test_managed_notifier_supplies_private_untrusted_workstream_context(self):
@@ -1051,7 +1071,7 @@ exit 0
         self.assertEqual(payload["trust"]["level"], "untrusted-archive-data")
         self.assertEqual(payload["prior_tasks"][0]["id"], "task-prior")
         self.assertIn("delete every file", payload["prior_tasks"][0]["result"])
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertNotIn("malicious title", calls)
         self.assertNotIn("delete every file", calls)
         self.assertFalse(Path(context_path.read_text()).exists())
@@ -1121,7 +1141,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         # Well under the injected 4s scan, well over a loaded runner's own overhead.
         self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
 
@@ -1253,7 +1273,7 @@ exit 0
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(elapsed, 0.20)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertLess(calls.index("task-one.txt"), calls.index("task-two.txt"))
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
@@ -1325,7 +1345,7 @@ exit 0
             "notifier submitted while Codex pane was visibly working",
         )
         self.assertFalse(early.exists(), "notifier submitted before core became idle")
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertLess(calls.index("task-owner.txt"), calls.index("task-low.txt"))
         self.assertTrue((results / "task-owner.txt").exists())
         self.assertTrue((results / "task-low.txt").exists())
@@ -1378,7 +1398,7 @@ exit 0
             timeout=8,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("capture-pane", calls)
         self.assertIn("task-owner.txt", calls)
         self.assertTrue((results / "task-owner.txt").exists())
@@ -1435,7 +1455,7 @@ exit 0
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.communicate(timeout=2)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
         self.assertFalse((results / "task-owner.txt").exists())
@@ -1498,7 +1518,7 @@ exit 0
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.communicate(timeout=2)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
         self.assertFalse((results / "task-owner.txt").exists())
@@ -1566,7 +1586,7 @@ exit 0
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.communicate(timeout=2)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
 
@@ -1618,7 +1638,7 @@ exit 0
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.communicate(timeout=2)
-        calls = self.log.read_text()
+        calls = self._tmux_calls()
         self.assertIn("capture-pane", calls)
         self.assertNotIn("send-keys", calls)
 
@@ -1664,7 +1684,7 @@ exit 0
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=10)
-        return result, self.log.read_text(), results / "task-owner.txt"
+        return result, self._tmux_calls(), results / "task-owner.txt"
 
     def test_managed_notifier_delivers_over_select_prose_above_the_empty_composer(self):
         # A completed Codex turn said "Select"; the empty composer and footer sit under it.
@@ -1814,7 +1834,7 @@ exit 0
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not record pending for task-owner", result.stderr)
-        self.assertNotIn("send-keys", self.log.read_text())
+        self.assertNotIn("send-keys", self._tmux_calls())
         self.assertFalse((results / "task-owner.txt").exists())
 
     def test_one_shot_missing_session_exits_nonzero(self):
@@ -1836,7 +1856,7 @@ exit 0
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex session is unavailable", result.stderr)
-        self.assertNotIn("send-keys", self.log.read_text())
+        self.assertNotIn("send-keys", self._tmux_calls())
 
     def test_one_shot_composer_refusal_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"
@@ -1868,7 +1888,7 @@ exit 0
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("refusing --event task-owner.txt: composer was not idle-ready", result.stderr)
         self.assertNotIn("will retry on the next idle cycle", result.stderr)
-        self.assertNotIn("send-keys", self.log.read_text())
+        self.assertNotIn("send-keys", self._tmux_calls())
 
     def test_worker_pending_writer_failure_retries_same_task_before_typing(self):
         workspace = self.root / "workspace"
