@@ -220,14 +220,23 @@ try:
           pub != [] and elapsed is not None and elapsed < 5 and STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [],
           f"elapsed={elapsed} {pub} {STATE[0]} {STATE_PG[0]}")
 
-    # The hand-off control: past the grace the settle TERMs the handler, which answers with
-    # its own exit 1; that verdict, not the kill, is what earns the fallback.
-    so, hl, elapsed, pub = run(kill_group=True, declines_on_term=True, settle_grace=2, want_results=True)
-    check("control: a handler that answers the settle's TERM with its own exit 1 IS handed to the live core",
+    # The hand-off control: the handler exits 1 ON ITS OWN inside the grace, no signal of ours
+    # in between, so rc 1 is genuinely its verdict and the fallback is correct and provable.
+    so, hl, elapsed, pub = run(kill_group=True, rc=1, linger="1", settle_grace=3, want_results=True)
+    check("control: an optional handler finishing on its own with exit 1 (no signal of ours) IS handed to the live core",
           hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so) and pub == [] and "handler interrupted" in LAST_STDERR[0],
           f"{so} {hl} {pub} {LAST_STDERR[0].strip().splitlines()[-2:]}")
     check("...with the receipt that marks the hand-off, no claim, no sentinel, group empty",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": True} and STATE_PG[0]["survivors"] == [], f"{STATE[0]} {STATE_PG[0]}")
+
+    # A handler that answers the settle's TERM with exit 1 is NOT trusted: the code came after
+    # our signal and a tidy handler can exit with anything, so it is ambiguous and terminal.
+    so, hl, elapsed, pub = run(kill_group=True, declines_on_term=True, settle_grace=2, want_results=True)
+    check("a handler that exits 1 only in answer to the settle's TERM: NOT handed on, terminal failure",
+          hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so) and pub != [] and "before its outcome was known" in LAST_STDERR[0],
+          f"{so} {hl} {pub} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...no receipt, no claim, no sentinel, group empty",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [], f"{STATE[0]} {STATE_PG[0]}")
 
     so, hl, elapsed, pub = run(kill_group=True, resistant=True, run_timeout=2, want_results=True)
     check("a TERM-resistant handler under the group stop: the watcher still exits, within the settle grace",
@@ -276,5 +285,5 @@ finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {28 - len(FAILURES)}/28 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {30 - len(FAILURES)}/30 passed")
 sys.exit(1 if FAILURES else 0)

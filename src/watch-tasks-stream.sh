@@ -941,7 +941,7 @@ _tmux_wake() {
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
 # to settle its own claim -- this settles directly from CLAIMS_DIR instead.
 settle_own_claims_on_shutdown() {
-  local claim filename task_path announce claim_settled verdict handler_rc timed_out outcome hline hpid hpg hstart tflag deadline
+  local claim filename task_path announce claim_settled verdict handler_rc timed_out outcome hline hpid hpg hstart tflag deadline signalled
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
@@ -959,15 +959,17 @@ settle_own_claims_on_shutdown() {
       # The wait was cut, not the handler. Collect it under our own grace, by identity.
       deadline=$(( $(date +%s) + SUTANDO_SETTLE_GRACE ))
       while handler_identity_holds "$hpid" "$hstart" && [ "$(date +%s)" -lt "$deadline" ]; do sleep 0.2; done
+      signalled=0
       if handler_identity_holds "$hpid" "$hstart"; then
         echo "watch-tasks-stream: task handler for $filename still running at shutdown after ${SUTANDO_SETTLE_GRACE}s; stopping its process group" >&2
-        stop_handler_group "$hpid" "$hpg" "$hstart"
+        stop_handler_group "$hpid" "$hpg" "$hstart"; signalled=1
       fi
       wait "$hpid" 2>/dev/null; handler_rc=$?
       tflag="$(claim_phase "$filename" timeout-flag)"; timed_out=0
       [ -n "$tflag" ] && [ -f "$tflag" ] && { timed_out=1; rm -f "$tflag"; }
-      # Its own exit code is its verdict, even in answer to our TERM; a signal death is not.
-      if [ "$timed_out" -eq 0 ] && [ "$handler_rc" -ge 128 ]; then outcome="ambiguous"; else outcome="$timed_out:$handler_rc"; fi
+      # An exit code is the handler's verdict only when no signal of ours came first: after
+      # our TERM a tidy handler can exit with any code, so only a completed 0 still counts.
+      if [ "$timed_out" -eq 0 ] && { [ "$handler_rc" -ge 128 ] || { [ "$signalled" -eq 1 ] && [ "$handler_rc" -ne 0 ]; }; }; then outcome="ambiguous"; else outcome="$timed_out:$handler_rc"; fi
       claim_note "$filename" "outcome $outcome"
     elif [ -z "$outcome" ]; then
       # "starting" with no handler line, or nothing at all: whether a child ran is unknowable.
