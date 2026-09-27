@@ -37,8 +37,9 @@ with tempfile.TemporaryDirectory() as d:
     # 1. A small append does NOT rotate, so it must stay quiet.
     track.write_text("## seed, 2026-01-01T00:00Z\nbody\n", encoding="utf-8")
     r = write(track, "\n## quiet, 2026-01-02T00:00Z\nbody\n")
-    check("a non-rotating append says nothing about rotation", r.returncode == 0
-          and "rotated" not in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
+    # `== ""` not `"rotated" not in ...`: the looser form would also accept "still over budget".
+    check("a non-rotating append says nothing at all", r.returncode == 0
+          and r.stderr == "", f"rc={r.returncode} stderr={r.stderr!r}")
 
     # 2. An append that crosses the budget rotates, and must SAY so.
     entries = "".join(f"\n## e{i}, 2026-02-{(i % 27) + 1:02d}T00:00Z\n{'x' * 900}\n" for i in range(45))
@@ -63,6 +64,14 @@ with tempfile.TemporaryDirectory() as d:
     check("the pin-only oversized case is reported, not silent", r.returncode == 0
           and "still over budget" in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
     check("and it names the pinned bytes that caused it", "pinned entr" in r.stderr, r.stderr)
+
+    # 4. `oversized` without pins: the pinned clause would name nothing, so it must be absent.
+    track.write_text("## seed, 2026-01-01T00:00Z\nb\n", encoding="utf-8")
+    r = write(track, f"\n## huge-newest, 2026-06-02T00:00Z\n{'z' * (DEFAULT_KEEP + 7000)}\n")
+    check("an entry bigger than the budget reports still-over", r.returncode == 0
+          and "still over budget" in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
+    check("and says nothing about pins when there are none", "pinned entr" not in r.stderr, r.stderr)
+    check("every report names the budget", f"of a {DEFAULT_KEEP} B budget" in r.stderr, r.stderr)
 
 print(f"\n{'PASS' if failures == 0 else f'FAIL — {failures} check(s) failed'}")
 sys.exit(1 if failures else 0)

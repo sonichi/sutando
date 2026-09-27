@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import append, replace  # noqa: E402
+from current_track import DEFAULT_KEEP, append, replace  # noqa: E402
 
 OPS = {"append": append, "replace": replace}
 
@@ -35,11 +35,14 @@ def main(argv=None) -> int:
     rotated = OPS[argv[0]](Path(argv[1]), text)
     if rotated is not None:
         # A rotation is the caller's business: it decides which entries a later pass can still read.
+        # `oversized` fires with or without pins, so the pinned clause is only printed when it explains.
         where = "still over budget" if rotated.oversized else "rotated"
+        why = ""
+        if rotated.pinned_count:
+            why = (f", {rotated.pinned_count} pinned entr"
+                   f"{'y' if rotated.pinned_count == 1 else 'ies'} holding {rotated.pinned_bytes} B")
         print(f"current-track-write: {where} — archived {len(rotated.archived)} B, head now "
-              f"{len(rotated.head)} B, {rotated.pinned_count} pinned entr"
-              f"{'y' if rotated.pinned_count == 1 else 'ies'} holding {rotated.pinned_bytes} B",
-              file=sys.stderr)
+              f"{len(rotated.head)} B of a {DEFAULT_KEEP} B budget{why}", file=sys.stderr)
     return 0
 
 
