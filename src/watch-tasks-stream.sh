@@ -901,36 +901,18 @@ _tmux_wake() {
 #   either way so nothing downstream needs to observe them again.
 #
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
-# to settle its own claim -- this settles directly from CLAIMS_DIR instead.
+# to settle its own claim. Nothing is decided here either: the handler may
+# already have delivered, its delivery is idempotent, and the next watcher
+# retires this dead pid's claim and re-sweeps tasks/ (prepare_handler_state).
 settle_own_claims_on_shutdown() {
-  local claim filename task_path announce claim_settled verdict
+  local claim filename task_path
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
     filename="$(basename "$claim")"
     [ "$(sed -n '2p' "$claim" 2>/dev/null)" = "$WATCHER_ID" ] || continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
-    [ -n "$task_path" ] || continue
-    announce="$(task_announce "$task_path")"
-    claim_settled=1
-    claim_disposition "$filename"
-    verdict=$?
-    case $verdict in
-      0)
-        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
-        ;;
-      1)
-        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
-        emit_task_file "$announce"
-        ;;
-      *)
-        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
-        ;;
-    esac
-    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+    echo "watch-tasks-stream: task handler in flight for $filename at shutdown; leaving ${task_path:-$filename} to the next watcher's sweep" >&2
   done
   shopt -u nullglob
 }

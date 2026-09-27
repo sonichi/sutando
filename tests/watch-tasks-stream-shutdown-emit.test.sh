@@ -38,13 +38,12 @@ check "no emit still uses the silent \`|| true\` form" "0" "$silent"
 
 # fallback_outstanding_handlers()'s DISPATCH_DIR-queue loop (one of its two
 # emit_task_file sites) was retired -- no queue to recover once run_handler_now()
-# is synchronous. Its CLAIMS_DIR loop still applies: a SIGTERM can still
-# interrupt a claim this watcher owns, and settle_own_claims_on_shutdown()
-# (added to fix a real reviewer-found gap -- a dangling unsettled claim) is
-# its synchronous-era successor, with its own single emit_task_file site. 1 is
-# the correct count now, not 0.
-check "no remaining shutdown call site references the retired async recovery path" \
-      "1" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
+# is synchronous. settle_own_claims_on_shutdown() emits nothing either: an
+# in-flight claim is left to the next watcher's sweep (the handler's delivery
+# is idempotent), because announcing it here ran the task twice (#4816). 0 is
+# the correct count now; the emitter stays sourced for the fallback path.
+check "no shutdown call site announces a task to the live core" \
+      "0" "$(grep -cE '^\s+emit_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 check "the handler-fallback site goes through its own emitter" \
       "1" "$(grep -cE '^\s+emit_fallback_task_file "\$[A-Za-z_]+"' "$WATCHER" || true)"
 
@@ -195,21 +194,33 @@ run_shutdown_sweep() {  # $1 = 1 to set SUTANDO_INBOX_RESOLVER, 0 to leave it un
     done
     kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    grep 'TASK_FILE:' "$outfile" 2>/dev/null | tail -1
+    printf '%s|%s|%s\n' \
+        "$(grep -c 'TASK_FILE:' "$outfile" 2>/dev/null || true)" \
+        "$(grep -c 'leaving .* to the next watcher' "$RTMP/sweep-$1.err" 2>/dev/null || true)" \
+        "$(grep -o 'leaving [^ ]* to the next watcher' "$RTMP/sweep-$1.err" 2>/dev/null | head -1)"
 }
 
-line_with_resolver="$(run_shutdown_sweep 1)"
-echo "  shutdown recovery, resolver configured: ${line_with_resolver:-<nothing>}"
-check "a resolver-configured shutdown recovery names the RESOLVED payload, not the sentinel" \
-      "TASK_FILE: $RPAYLOAD" "$line_with_resolver"
+# A TERM mid-run announces NOTHING: the claim is left to the next watcher's
+# sweep (#4816 was this announce running the task twice). The log line still
+# names what was left, resolved when a resolver is configured, bare otherwise.
+IFS='|' read -r n_emit n_left left_line <<< "$(run_shutdown_sweep 1)"
+echo "  shutdown mid-run, resolver configured: emits=$n_emit left=$n_left ${left_line:-<nothing>}"
+check "a TERM mid-run announces no TASK_FILE to the live core" "0" "$n_emit"
+check "...and logs exactly one 'leaving to the next watcher' line" "1" "$n_left"
+check "...naming the RESOLVED payload, not the sentinel" \
+      "leaving $RPAYLOAD to the next watcher" "$left_line"
+check "the sentinel is still in the inbox for the next sweep" "yes" "$([ -e "$RINBOX/task-probe1.txt" ] && echo yes || echo no)"
+check "no terminal refusal was published" "0" "$(ls "$RWS/results" 2>/dev/null | wc -l | tr -d ' ')"
 
-# Control: no resolver must announce the bare basename. Without it, asserting
-# "not the bare sentinel" would pass even if resolution never engaged.
+# Control: no resolver must log the inbox entry itself (the claim records
+# what the watcher dispatched); without it, "names the payload" above would
+# pass even if resolution never engaged.
 : > "$RINBOX/task-probe1.txt"
-line_no_resolver="$(run_shutdown_sweep 0)"
-echo "  shutdown recovery, no resolver:          ${line_no_resolver:-<nothing>}"
-check "...and with no resolver configured, the control still names the bare basename" \
-      "TASK_FILE: task-probe1.txt" "$line_no_resolver"
+IFS='|' read -r n_emit n_left left_line <<< "$(run_shutdown_sweep 0)"
+echo "  shutdown mid-run, no resolver:          emits=$n_emit left=$n_left ${left_line:-<nothing>}"
+check "...with no resolver configured, still nothing is announced" "0" "$n_emit"
+check "...and the control logs the unresolved inbox entry, not the payload" \
+      "leaving $RINBOX/task-probe1.txt to the next watcher" "$left_line"
 
 rm -rf "$RTMP"
 
