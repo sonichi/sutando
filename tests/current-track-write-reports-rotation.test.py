@@ -4,6 +4,7 @@
 A rotation decides which entries a later pass can still read, so a silent one is a
 decision taken on the caller's behalf without telling them.
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,15 @@ with tempfile.TemporaryDirectory() as d:
           and "still over budget" in r.stderr, f"rc={r.returncode} stderr={r.stderr!r}")
     check("and says nothing about pins when there are none", "pinned entr" not in r.stderr, r.stderr)
     check("every report names the budget", f"of a {DEFAULT_KEEP} B budget" in r.stderr, r.stderr)
+
+    # 5. Multibyte: the printed head size must be BYTES, matching the file on disk.
+    track.write_text("## seed, 2026-01-01T00:00Z\nb\n", encoding="utf-8")
+    r = write(track, "\n## em, 2026-06-02T00:00Z\n" + ("\u2014" * 12000) + "\n")
+    on_disk = track.stat().st_size
+    m = re.search(r"head now (\d+) B", r.stderr)
+    check("the printed head size is bytes, not characters",
+          m is not None and int(m.group(1)) == on_disk,
+          f"printed={m.group(1) if m else None} on_disk={on_disk} stderr={r.stderr!r}")
 
 print(f"\n{'PASS' if failures == 0 else f'FAIL — {failures} check(s) failed'}")
 sys.exit(1 if failures else 0)

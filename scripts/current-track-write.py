@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from current_track import DEFAULT_KEEP, append, replace  # noqa: E402
+from current_track import DEFAULT_KEEP, _size, append, replace  # noqa: E402
 
 OPS = {"append": append, "replace": replace}
 
@@ -41,8 +41,9 @@ def main(argv=None) -> int:
         if rotated.pinned_count:
             why = (f", {rotated.pinned_count} pinned entr"
                    f"{'y' if rotated.pinned_count == 1 else 'ies'} holding {rotated.pinned_bytes} B")
-        print(f"current-track-write: {where} — archived {len(rotated.archived)} B, head now "
-              f"{len(rotated.head)} B of a {DEFAULT_KEEP} B budget{why}", file=sys.stderr)
+        # _size, not len: the budget and `oversized` are UTF-8 bytes, and these entries carry em-dashes.
+        print(f"current-track-write: {where} — archived {_size(rotated.archived)} B, head now "
+              f"{_size(rotated.head)} B of a {DEFAULT_KEEP} B budget{why}", file=sys.stderr)
     return 0
 
 
