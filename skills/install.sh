@@ -35,7 +35,10 @@ done
 CONFIG="$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh"
 WS="$(bash "$CONFIG" workspace 2>/dev/null || true)"
 ROOTS=""
-[ -n "$WS" ] && ROOTS="$(bash "$CONFIG" skill-roots "$WS" 2>/dev/null || true)"
+if [ -n "$WS" ] && ! ROOTS="$(bash "$CONFIG" skill-roots "$WS" 2>/dev/null)"; then
+  echo "  ⚠ could not list skill roots; linking workspace skills only"
+  ROOTS="$WS/skills"
+fi
 CLAIMED=$'\n'
 while IFS= read -r root; do
   [ -n "$root" ] || continue

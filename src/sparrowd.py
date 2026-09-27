@@ -31,8 +31,15 @@ def _skill_manifests(workspace=None) -> list:
     found, taken = [], set()
     ws = workspace if workspace is not None else resolve_workspace()
     for root in skill_roots(REPO, ws):
-        found += [m for m in sorted(root.glob("*/manifest.json")) if m.parent.name not in taken]
-        taken |= {d.name for d in root.iterdir() if d.is_dir()}
+        try:
+            skills = [d for d in sorted(root.iterdir()) if d.is_dir()]
+        except OSError:
+            continue  # an unreadable root is skipped, never fatal to the supervisor
+        # Only a real skill claims its name, as in skills/install.sh; a leftover folder does not.
+        skills = [d for d in skills if (d / "manifest.json").is_file() or (d / "SKILL.md").is_file()]
+        found += [d / "manifest.json" for d in skills
+                  if d.name not in taken and (d / "manifest.json").is_file()]
+        taken |= {d.name for d in skills}
     return found
 
 
@@ -62,6 +69,9 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             continue
         decl = data.get("supervised_worker")
         if not isinstance(decl, dict):
+            continue
+        if data.get("enabled") is not True:  # same gate as the voice loader
+            skipped.append(f"{skill_dir.name}: not enabled in its manifest")
             continue
         name, rel = decl.get("name"), decl.get("script")
         if not isinstance(name, str) or not _WORKER_NAME.match(name):

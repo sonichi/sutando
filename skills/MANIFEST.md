@@ -117,7 +117,7 @@ Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifes
 
 ## Supervised workers (`supervised_worker`)
 
-A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `*/manifest.json` in every skill root — shipped `skills/`, `<workspace>/skills/`, external plugin dirs and sibling checkouts, in the order `src/skill_roots.py` (`scripts/sutando-config.sh skill-roots`) gives; a shipped skill wins a name collision, as in `skills/install.sh` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `*/manifest.json` in every skill root — shipped `skills/`, `<workspace>/skills/`, external plugin dirs and, only in the app's `engine/` layout, sibling checkouts (a plain clone opts siblings in through `$SUTANDO_EXTERNAL_PLUGIN_DIRS`), in the order `src/skill_roots.py` (`scripts/sutando-config.sh skill-roots`) gives; a shipped skill wins a name collision, as in `skills/install.sh`; only a manifest with `"enabled": true` is started, the voice loader's gate; an unreadable root is skipped, and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
 
 ```json
 "supervised_worker": {

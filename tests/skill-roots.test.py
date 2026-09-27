@@ -30,6 +30,26 @@ class SkillRoots(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_an_unreadable_sibling_is_skipped_and_the_rest_still_listed(self):
+        locked = self.root / "engine" / "locked"
+        (locked / "skills").mkdir(parents=True)
+        locked.chmod(0)
+        try:
+            roots = skill_roots(self.engine, self.ws, {})
+        finally:
+            locked.chmod(0o755)
+        self.assertIn(self.ws / "skills", roots)
+        self.assertNotIn(locked / "skills", roots)
+
+    def test_a_plain_clone_scans_no_siblings(self):
+        clone = self.root / "code" / "sutando"
+        (clone / "skills").mkdir(parents=True)
+        (self.root / "code" / "unrelated" / "skills").mkdir(parents=True)
+        self.assertEqual(skill_roots(clone, self.ws, {}), [clone / "skills", self.ws / "skills"])
+        opted = {"SUTANDO_EXTERNAL_PLUGIN_DIRS": str(self.root / "code" / "unrelated")}
+        self.assertEqual(skill_roots(clone, self.ws, opted),
+                         [clone / "skills", self.ws / "skills", self.root / "code" / "unrelated" / "skills"])
+
     def test_order_is_shipped_workspace_memory_external_then_sorted_siblings(self):
         env = {"SUTANDO_MEMORY_DIR": str(self.root / "mem"),
                "SUTANDO_EXTERNAL_PLUGIN_DIRS": os.pathsep.join(["", str(self.root / "plugin"),

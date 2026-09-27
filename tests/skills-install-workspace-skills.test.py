@@ -6,6 +6,8 @@ loader's test-only SUTANDO_TEST_MODE hatch), never a private env var of the scri
 
 Run: python3 tests/skills-install-workspace-skills.test.py
 """
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
