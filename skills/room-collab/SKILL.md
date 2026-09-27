@@ -97,6 +97,27 @@ thing, and keep the owner's private details out of a surface other members can
 open. To decide who fits, the collaboration-intelligence skill maps people to
 areas when it is installed.
 
+### A surface request (someone asked from the New tab)
+
+A person can ask an agent for a surface from the panel's New tab. The message reads
+"<person> asked <agent> for a surface: <request>" and carries the details under
+`space.ag2.collab.room.request` (`request`, `surfaces`, `link_template`,
+`instructions`); your chat card shows it as "Waiting for <agent>…". Treat it as a
+request to build, not to point:
+
+1. Build what was asked on the page. Fill it in; don't hand back an empty page.
+2. Pick the surface by the ask, per the table above (mockups and anything
+   interactive → HTML; flows and diagrams → whiteboard; writing → Doc; comparisons
+   → sheet, or a database if the items need tracking).
+3. Reuse a page that already covers it, or create one. Several pages are fine when
+   the ask needs them (a mockup plus a notes Doc); put the primary one first.
+4. Reply to the request message (or in its thread) with one short line and each
+   page as `[Title](<room link>?collab=<surface>&page=<id>)`, primary first. Leave
+   out `&page=` for a surface's main page; for a database, `page` is the database
+   id. The card then shows "<agent> opened: <title>" with an Open button.
+
+If only the one-line body reaches you, follow the same four steps.
+
 ## The room's README
 
 Every room has one standing document, its README (`--kind readme`), pinned first
