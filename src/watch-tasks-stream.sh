@@ -581,6 +581,11 @@ publish_terminal_failure() {
 reconcile_dead_claims() {
   local claim task_path fn
   [ -d "$CLAIMS_DIR" ] || return 0
+  # Retiring is a handler's business: the freed task is replayed through a handler,
+  # and a watcher without one can only announce it, which a handler claim forbids.
+  if [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+    return 0
+  fi
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
     claim_is_live "$claim" && continue
@@ -674,8 +679,9 @@ run_handler_now() {
   acquire_task_claim "$filename" "$task_path" "$disposition"
   case $? in
     0) ;;
-    2) hold_task "$filename"; return 0 ;;   # our own identity unreadable: retry on the timer
-    *) return 0 ;;                          # another watcher holds it
+    # Not ours now: another watcher's live claim, or our own identity unreadable.
+    # Either may clear with nobody to tell us, so the timer re-asks.
+    *) hold_task "$filename"; return 0 ;;
   esac
   record_admission
   activity_transition RUNNING "$task_path"
@@ -887,11 +893,11 @@ dispatch_task() {
   fi
   DECISION_IDENTITY="$identity"
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
-    # A claim that survived reconciliation has a live or unknown owner: both
-    # notifiers drop a line for it, so hold the task instead of admitting a dropped emit.
+    # A handler claim means a handler's outcome is unknown; with no handler here
+    # to replay it, the task is held (not announced) until one returns.
     if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -e "$CLAIMS_DIR/$filename" ]; then
       hold_task "$filename"
-      echo "watch-tasks-stream: holding $filename: another watcher's claim stands" >&2
+      echo "watch-tasks-stream: holding $filename: a handler's claim stands and no handler is available here" >&2
       return 0
     fi
     emit_dispatch_task_file "$announce" && record_admission

@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_attribution as pa  # noqa: E402
 import pool_delivery as pd  # noqa: E402
+import pool_record as prec  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 PRIORITY_ORDER = {"urgent": 0, "normal": 1, "low": 2}
@@ -71,28 +72,46 @@ class UnreadableEvidence(RouterRefused):
     """A sentinel, folder or record could not be READ: absent and unreadable are not the same."""
 
 
-def holders(workspace, task_id: str) -> list[str]:
+def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None) -> list[str]:
     """Every recipient folder holding a sentinel for `task_id`, under any suffix.
 
-    Tri-state per name: regular (held), absent (not held), anything else
-    refuses. `find()`'s None covers both absent and unreadable, which is why
-    this reader asks `regular_file_state` itself.
+    Tri-state per name: regular is held, absent is not, anything else refuses
+    (`find()`'s None conflates absent with unreadable). Each folder's names are
+    read under that folder's arbitration lock, the one accept/release take, so
+    a release renaming `.accepted` to `.txt` cannot slip between two checks;
+    the task lock is already held by the caller, so the order is task, folder.
+    Which entries are recipients is the shared record policy's call
+    (`pool_record.iter_recipients`): an alias raises there, before any read
+    or lock here, so an alias never gains a lock.
     """
     root = pd.deliveries_dir(workspace, pr.CORE).parent
     try:
-        folders = sorted(f for f in root.iterdir() if f.is_dir()) if root.is_dir() else []
+        # The shared recipient policy: non-recipient names and non-directories are
+        # skipped, a recipient-named symlink raises, an unlistable root raises.
+        names = prec.iter_recipients(root) if root.is_dir() else []
     except OSError as e:
-        raise UnreadableEvidence(f"{task_id}: cannot list {root}: {e}") from e
+        raise UnreadableEvidence(f"{task_id}: cannot read the recipient folders under {root}: {e}") from e
     held = []
-    for folder in folders:
-        for name in (task_id + pd.PENDING_SUFFIX, task_id + pd.ACCEPTED_SUFFIX,
-                     task_id + pd.LEGACY_ACCEPTED_SUFFIX):
-            state = pd.regular_file_state(folder / name)
-            if state == "regular":
-                held.append(folder.name)
-                break
-            if state != "absent":
-                raise UnreadableEvidence(f"{task_id}: {folder / name} is {state}; refusing to decide")
+    for name_ in names:
+        folder = root / name_
+        seams = _arbitration_seams or {}
+        try:
+            lock = pd.arbitration(workspace, folder.name, **seams)
+            dfd = lock.__enter__()
+        except OSError as e:
+            raise UnreadableEvidence(f"{task_id}: cannot lock {folder}: {e}") from e
+        try:
+            for name in pd.sentinel_names(task_id):
+                state = pd.regular_file_state(name, dir_fd=dfd)     # anchored: never the path again
+                if _between_suffix_checks:
+                    _between_suffix_checks(folder / name, state)
+                if state == "regular":
+                    held.append(folder.name)
+                    break
+                if state != "absent":
+                    raise UnreadableEvidence(f"{task_id}: {folder / name} is {state}; refusing to decide")
+        finally:
+            lock.__exit__(None, None, None)
     return held
 
 
@@ -111,7 +130,7 @@ def attribution_state(workspace, task_id: str) -> tuple[str, str | None]:
     return ("worker", value) if pa.is_worker_id(value) else ("malformed", None)
 
 
-def committed_recipient(workspace, task_id: str) -> str | None:
+def committed_recipient(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None) -> str | None:
     """The recipient a delivery for `task_id` already committed to, or None.
 
     Attribution is the record; a sentinel in ANY recipient folder is the fact
@@ -126,7 +145,7 @@ def committed_recipient(workspace, task_id: str) -> str | None:
         raise UnreadableEvidence(f"{task_id}: attribution record unreadable; refusing to decide")
     if state == "malformed":
         raise ConflictingDelivery(f"{task_id}: attribution record present but malformed; refusing to decide")
-    held = holders(workspace, task_id)
+    held = holders(workspace, task_id, _between_suffix_checks, _arbitration_seams)
     if len(held) > 1 or (worker is not None and held and held != [worker]):
         raise ConflictingDelivery(
             f"{task_id}: attribution={worker!r} sentinels in {held}; refusing to choose")
@@ -136,7 +155,7 @@ def committed_recipient(workspace, task_id: str) -> str | None:
 
 
 def deliver_one(workspace, recipient: str, task_id: str,
-                _between_sentinel_and_attribution=None) -> str:
+                _between_sentinel_and_attribution=None, _arbitration_seams=None) -> str:
     """Create one sentinel. Returns 'delivered' | 'already' | 'no-payload'.
 
     Checks BOTH names: a sentinel already renamed to `.accepted` is work in
@@ -150,18 +169,16 @@ def deliver_one(workspace, recipient: str, task_id: str,
     `_between_sentinel_and_attribution` is a test seam: the two writes are not
     crash-atomic, so an existing sentinel is re-attributed on 'already'.
     """
-    d = pd.deliveries_dir(workspace, recipient)
-    # Check-of-both-names and create are ONE transition under the folder's lock:
-    # an accept between them renames the pending name away and O_EXCL recreates it.
-    with pd.arbitration(workspace, recipient):
-        if pd.find(workspace, recipient, task_id) is not None:
+    # Check-of-both-names and create are ONE transition under the folder's lock,
+    # through its directory fd: an accept between them cannot slip a rename in.
+    with pd.arbitration(workspace, recipient, **(_arbitration_seams or {})) as dfd:
+        if pd.find_in(dfd, task_id) is not None:
             _attribute(workspace, recipient, task_id)
             return "already"
         if not pd.payload_path(Path(workspace), task_id).is_file():
             return "no-payload"
         try:
-            os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
-                             os.O_CREAT | os.O_EXCL))
+            os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
             _attribute(workspace, recipient, task_id)
             return "already"
@@ -179,7 +196,7 @@ def _attribute(workspace, recipient: str, task_id: str) -> None:
         pa.record(workspace, task_id, recipient)
 
 
-def route(workspace, task: dict, roster=None) -> dict:
+def route(workspace, task: dict, roster=None, _between_suffix_checks=None, _arbitration_seams=None) -> dict:
     """One task through one pass.
 
     `roster=None` loads it; an absent or unreadable roster REFUSES the pass
@@ -193,7 +210,7 @@ def route(workspace, task: dict, roster=None) -> dict:
     # One per-task lock around the whole decision; the commit is resolved before
     # the roster is needed, so a replay finishes it even if the roster is gone.
     with task_arbitration(workspace, task_id):
-        committed = committed_recipient(workspace, task_id)
+        committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams)
         if committed is not None:
             targets, unknown, r = [committed], [], (roster if roster is not None else {})
         else:
@@ -216,7 +233,7 @@ def route(workspace, task: dict, roster=None) -> dict:
         # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
         buckets = {"delivered": [], "already": [], "no-payload": []}
         for t in targets:
-            buckets[deliver_one(workspace, t, task_id)].append(t)
+            buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams)].append(t)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"],

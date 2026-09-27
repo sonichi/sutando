@@ -32,16 +32,23 @@ wrapper that lingers before or after the router runs.
   e5. a reader whose `ps` fails keeps a live owner's claim and says so, then
       retires the dead owner on its next dispatch once `ps` answers again
   e6. a legacy four-line claim (the writer before this change) is read by pid alone
-  f. the next watcher has NO handler declared: the dead claim is retired before
-     its announcement, checked with both production notifiers' own claim guard
-     (`filename_is_claimed`) at the instant the TASK_FILE line appears
+  f. the next watcher has NO handler declared: the handler's dead claim is held
+     (both production notifiers' own claim guard, `filename_is_claimed`, would
+     drop a line for it), never announced; when a handler returns it replays once
   g. the room is rebound A->B between the kill and the replay: the replay
      finishes the delivery to A and never delivers to B
-  h. a no-handler watcher meets a LIVE claim for its task (unknown owner while
-     its ps fails): zero TASK_FILE lines, no admission; when ps returns and the
-     owner dies, the same quiet watcher announces exactly once, on its own timer
-  i. a dead claim met by the task's own dispatch yields exactly one announcement,
-     with nothing else arriving (no recursive dispatch plus outer continuation)
+  h. a no-handler watcher meets a LIVE claim for a task ALREADY delivered to A
+     (unknown owner while its ps fails): zero TASK_FILE lines, no admission; when
+     the owner dies the claim is preserved and the task held (a handler's outcome
+     is unknown and no handler is here); when a handler returns it replays as
+     "already": one sentinel, attribution A, never announced
+  h2. the same with the owner dead BEFORE delivering: held, never announced; the
+      returning handler routes it exactly once
+  l. a handler-enabled session watcher sweeps while the standby owner is alive
+     (claim lost, rc 1): held; the owner dies (TERM, and KILL); routed exactly
+     once on the timer, zero core lines
+  i. a dead handler claim met by the task's own dispatch in a no-handler watcher:
+     held, never announced; the returning handler replays it exactly once
   j. a writer whose ps fails refuses to claim a task that nobody holds, holds it,
      and routes it exactly once on its own timer after ps returns
   k. fswatch closes while a task is held: genuine EOF still ends the watcher
@@ -579,7 +586,7 @@ def guards_say_claimed(w: Workspace, name: str) -> dict:
 
 
 def arm_no_handler_restart() -> None:
-    print("\narm f: the next watcher has no handler declared — the dead claim must go before it announces")
+    print("\narm f: the next watcher has no handler declared — a handler's dead claim is held, never announced; the returning handler replays it once")
     w = Workspace()
     w.mode("hang-before")
     w1 = Watcher(w)
@@ -595,14 +602,19 @@ def arm_no_handler_restart() -> None:
               guards_say_claimed(w, "task-n.txt") == {"claude": True, "codex": True}, str(guards_say_claimed(w, "task-n.txt")))
         w2 = Watcher(w, handler=False)
         w2.start()
-        check("the no-handler watcher announces the task to the live core (its only consumer)",
-              wait_for(lambda: w2.announced("task-n.txt") == 1, 30.0), w2.out.read_text()[-200:])
-        verdict = guards_say_claimed(w, "task-n.txt")
-        check("...and at that instant both production notifier guards let it through",
-              verdict == {"claude": False, "codex": False}, str(verdict))
-        time.sleep(6.0)      # three held-retry intervals: no recursive/second announcement
-        check("...and it is announced exactly once", w2.announced("task-n.txt") == 1, w2.out.read_text()[-300:])
-        check("nothing was delivered to a worker (no handler ran)", w.sentinels("task-n") == [], str(w.sentinels("task-n")))
+        check("the no-handler watcher holds it: a handler's outcome is unknown and no handler is here",
+              wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        time.sleep(7.0)      # three held-retry intervals
+        check("...zero TASK_FILE lines, the dead claim preserved, nothing delivered",
+              w2.announced("task-n.txt") == 0 and claimed(w, "task-n.txt") and w.sentinels("task-n") == [],
+              w2.out.read_text()[-300:])
+        w.mode("normal")
+        (w.ws / "state" / "task-event-handler.json").write_text(json.dumps({"handler": str(w.handler)}))
+        check("the returning handler replays it exactly once and releases the claim",
+              wait_for(lambda: w.sentinels("task-n") == [f"deliveries/{A}/task-n.txt"] and router_runs(w) == 1
+                       and not claimed(w, "task-n.txt"), 40.0), f"{w.sentinels('task-n')} {w.log()}")
+        time.sleep(5.0)
+        check("...and it is never announced to the core", w2.announced("task-n.txt") == 0 and router_runs(w) == 1, str(w.log()))
     finally:
         w1.stop()
         if w2 is not None:
@@ -610,8 +622,8 @@ def arm_no_handler_restart() -> None:
         w.cleanup()
 
 
-def arm_no_handler_live_claim_holds_then_announces_once() -> None:
-    print("\narm h: no-handler watcher, a live claim whose owner it cannot identify — hold; then owner dies — announce once, on its own timer")
+def arm_no_handler_live_claim_committed_never_announced() -> None:
+    print("\narm h: no-handler watcher, a live claim it cannot identify on a task ALREADY delivered — hold; owner dies — still never announced")
     w = Workspace()
     w.pause_at("after-handler")
     w1 = Watcher(w)
@@ -620,28 +632,132 @@ def arm_no_handler_live_claim_holds_then_announces_once() -> None:
     try:
         w1.start()
         w1.deliver("task-h.txt")
-        check("the owner is paused with its production claim held",
-              wait_for(lambda: in_hook(w, "after-handler") and claimed(w, "task-h.txt"), 30.0))
+        check("the owner is paused with its production claim held, delivery committed to A",
+              wait_for(lambda: in_hook(w, "after-handler") and claimed(w, "task-h.txt"), 30.0)
+              and w.sentinels("task-h") == [f"deliveries/{A}/task-h.txt"] and w.attribution("task-h") == A)
         w.pause_at("")
         broken_ps.write_text("#!/bin/sh\nexit 1\n")
         broken_ps.chmod(0o755)
         w2 = Watcher(w, handler=False, role="session")
         w2.start()
-        check("the reader says why it keeps the claim",
-              wait_for(lambda: "cannot read the start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
-        check("...and holds the task rather than announcing into the guards",
-              wait_for(lambda: "another watcher's claim stands" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        check("the no-handler watcher holds the task rather than announcing into the guards",
+              wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
         time.sleep(3.0)
         check("zero TASK_FILE lines while the claim stands", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
         broken_ps.unlink()               # ps returns; the owner is still alive
         time.sleep(5.0)
         check("still zero with ps back and the owner alive", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
         w1.stop(graceful=True)           # the owner dies; nothing else is fed
-        check("the quiet watcher announces exactly once on its own timer",
-              wait_for(lambda: w2.announced("task-h.txt") == 1, 30.0), w2.out.read_text()[-300:])
-        time.sleep(6.0)
-        check("...and it stays exactly once", w2.announced("task-h.txt") == 1, w2.out.read_text()[-300:])
-        check("the dead claim is gone", not claimed(w, "task-h.txt"))
+        time.sleep(7.0)                  # three retry intervals with no handler available
+        check("with no handler here the dead claim is preserved, not retired", claimed(w, "task-h.txt"), w.claim_pid("task-h.txt"))
+        check("...and the task is held, never announced to the core", w2.announced("task-h.txt") == 0
+              and "no handler is available" in w2.err.read_text(), w2.out.read_text()[-300:])
+        check("A's sentinel and attribution are untouched",
+              w.sentinels("task-h") == [f"deliveries/{A}/task-h.txt"] and w.attribution("task-h") == A)
+        # Restart durability: the holding watcher dies; a fresh no-handler watcher must
+        # recover the same state from the claim on disk, not from the old HELD_NAMES.
+        w2.stop()
+        w3 = Watcher(w, handler=False)
+        w3.start()
+        check("a fresh no-handler watcher holds it again from the durable claim",
+              wait_for(lambda: "no handler is available" in w3.err.read_text(), 30.0), w3.err.read_text()[-300:])
+        time.sleep(5.0)
+        check("...zero core lines, no handler run, claim still there",
+              w3.announced("task-h.txt") == 0 and router_runs(w) == 1 and claimed(w, "task-h.txt"), str(w.log()))
+        # The handler returns (its declaration appears): the held task is replayed through it.
+        (w.ws / "state" / "task-event-handler.json").write_text(json.dumps({"handler": str(w.handler)}))
+        check("the returned handler replays it: the dead claim is retired and released",
+              wait_for(lambda: router_runs(w) == 2 and not claimed(w, "task-h.txt"), 40.0), f"{w.log()} {w.claim_pid('task-h.txt')}")
+        check("...as 'already': still one sentinel, attribution A, and still never announced",
+              w.sentinels("task-h") == [f"deliveries/{A}/task-h.txt"] and w.attribution("task-h") == A
+              and w3.announced("task-h.txt") == 0, str(w.sentinels("task-h")))
+        w3.stop()
+    finally:
+        if w2 is not None:
+            w2.stop()
+        w1.stop()
+        w.cleanup()
+
+
+def arm_no_handler_live_claim_uncommitted_announced_once() -> None:
+    print("\narm h2: the same, but the owner died BEFORE delivering — held until a handler returns, then routed once")
+    w = Workspace()
+    w.mode("hang-before")
+    w1 = Watcher(w)
+    w2 = None
+    broken_ps = w.tmp / "bin" / "ps"
+    try:
+        w1.start()
+        w1.deliver("task-u.txt")
+        check("the owner holds its production claim, nothing delivered",
+              wait_for(lambda: any(ln.startswith("run ") for ln in w.log()) and claimed(w, "task-u.txt"), 30.0)
+              and w.sentinels("task-u") == [])
+        broken_ps.write_text("#!/bin/sh\nexit 1\n")
+        broken_ps.chmod(0o755)
+        w2 = Watcher(w, handler=False, role="session")
+        w2.start()
+        check("held: a handler's claim stands and no handler is here",
+              wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        time.sleep(3.0)
+        check("zero TASK_FILE lines while the claim stands", w2.announced("task-u.txt") == 0)
+        broken_ps.unlink()
+        w1.stop(graceful=True)           # the owner dies before delivering; nothing else is fed
+        time.sleep(7.0)
+        check("with no handler here the dead claim is preserved and the task never announced",
+              claimed(w, "task-u.txt") and w2.announced("task-u.txt") == 0, w2.out.read_text()[-300:])
+        w2.stop()                        # restart durability: a successor recovers from the claim on disk
+        w3 = Watcher(w, handler=False)
+        w3.start()
+        check("a fresh no-handler watcher holds it again from the durable claim",
+              wait_for(lambda: "no handler is available" in w3.err.read_text(), 30.0), w3.err.read_text()[-300:])
+        time.sleep(5.0)
+        check("...zero core lines, no handler run, claim still there",
+              w3.announced("task-u.txt") == 0 and router_runs(w) == 0 and claimed(w, "task-u.txt"), str(w.log()))
+        w.mode("normal")
+        (w.ws / "state" / "task-event-handler.json").write_text(json.dumps({"handler": str(w.handler)}))
+        check("the returned handler replays it: routed exactly once, claim released",
+              wait_for(lambda: w.sentinels("task-u") == [f"deliveries/{A}/task-u.txt"] and router_runs(w) == 1
+                       and not claimed(w, "task-u.txt"), 40.0), f"{w.sentinels('task-u')} {w.log()}")
+        time.sleep(5.0)
+        check("...and never announced to the core, never routed twice",
+              w3.announced("task-u.txt") == 0 and router_runs(w) == 1, str(w.log()))
+        w3.stop()
+    finally:
+        if w2 is not None:
+            w2.stop()
+        w1.stop()
+        w.cleanup()
+
+
+def arm_handler_overlap_lost_acquisition_recovers(sig: str = "TERM") -> None:
+    print(f"\narm l ({sig}): a handler-enabled session watcher sweeps while the standby owner is alive (claim lost, rc 1); the owner dies; quiet inbox")
+    w = Workspace()
+    w.mode("hang-before")
+    w1 = Watcher(w)
+    w2 = None
+    try:
+        w1.start()
+        w1.deliver("task-v.txt")
+        check("the standby owner holds its claim, nothing delivered",
+              wait_for(lambda: any(ln.startswith("run ") for ln in w.log()) and claimed(w, "task-v.txt"), 30.0)
+              and w.sentinels("task-v") == [])
+        w.mode("normal")
+        w2 = Watcher(w, role="session")
+        w2.start()
+        time.sleep(8.0)                  # its sweep met the live claim
+        check("the session watcher did not route it while the owner lived (several timer passes)",
+              router_runs(w) == 0 and w.claim_pid("task-v.txt") == str(w1.proc.pid), str(w.log()))
+        if sig == "KILL":
+            os.killpg(os.getpgid(w1.proc.pid), signal.SIGKILL)   # no settle, no log line
+            w1.proc.wait(timeout=5)
+        else:
+            w1.stop(graceful=True)       # the owner dies; nothing else is fed
+        check("the session watcher routes it exactly once on its own timer",
+              wait_for(lambda: w.sentinels("task-v") == [f"deliveries/{A}/task-v.txt"] and router_runs(w) == 1, 30.0),
+              f"{w.sentinels('task-v')} {w.log()}")
+        check("...and releases its claim", wait_for(lambda: not claimed(w, "task-v.txt"), 30.0), w.claim_pid("task-v.txt"))
+        time.sleep(5.0)
+        check("...and never a second time", router_runs(w) == 1 and w2.announced("task-v.txt") == 0, str(w.log()))
     finally:
         if w2 is not None:
             w2.stop()
@@ -650,7 +766,7 @@ def arm_no_handler_live_claim_holds_then_announces_once() -> None:
 
 
 def arm_dead_claim_met_by_own_dispatch_once() -> None:
-    print("\narm i: a no-handler watcher's own dispatch meets a dead claim for the task — exactly one announcement")
+    print("\narm i: a no-handler watcher's own dispatch meets a dead handler claim — held, never announced; the returning handler replays it once")
     w = Workspace()
     w2 = Watcher(w, handler=False)
     try:
@@ -661,11 +777,17 @@ def arm_dead_claim_met_by_own_dispatch_once() -> None:
         (w.claims / "task-i.txt").write_text(f"{dead_pid()}\nsome-dead-watcher\n{task}\nfallback\n\n")
         with w2.feed.open("a") as fh:            # the task's own event, claim already dead
             fh.write(str(task.resolve()) + "\n")
-        check("the task is announced", wait_for(lambda: w2.announced("task-i.txt") >= 1, 30.0), w2.out.read_text()[-200:])
+        check("held, with the reason logged", wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0),
+              w2.err.read_text()[-300:])
         time.sleep(7.0)                          # three held-retry intervals
-        check("...exactly once: no recursive dispatch plus outer continuation, no held re-emit",
-              w2.announced("task-i.txt") == 1, w2.out.read_text()[-300:])
-        check("the dead claim is gone", not claimed(w, "task-i.txt"))
+        check("zero announcements, the dead claim preserved (a handler's outcome is unknown)",
+              w2.announced("task-i.txt") == 0 and claimed(w, "task-i.txt"), w2.out.read_text()[-300:])
+        (w.ws / "state" / "task-event-handler.json").write_text(json.dumps({"handler": str(w.handler)}))
+        check("the returning handler retires the dead claim and routes it exactly once",
+              wait_for(lambda: w.sentinels("task-i") == [f"deliveries/{A}/task-i.txt"] and router_runs(w) == 1
+                       and not claimed(w, "task-i.txt"), 40.0), f"{w.sentinels('task-i')} {w.log()}")
+        time.sleep(5.0)
+        check("...once, and never announced", router_runs(w) == 1 and w2.announced("task-i.txt") == 0, str(w.log()))
     finally:
         w2.stop()
         w.cleanup()
@@ -778,7 +900,10 @@ def main() -> int:
     arm_reader_ps_failure_keeps_then_recovers()
     arm_legacy_four_line_claim()
     arm_no_handler_restart()
-    arm_no_handler_live_claim_holds_then_announces_once()
+    arm_no_handler_live_claim_committed_never_announced()
+    arm_no_handler_live_claim_uncommitted_announced_once()
+    arm_handler_overlap_lost_acquisition_recovers("TERM")
+    arm_handler_overlap_lost_acquisition_recovers("KILL")
     arm_dead_claim_met_by_own_dispatch_once()
     arm_writer_ps_failure_holds_then_routes_once()
     arm_eof_while_held_exits_promptly()

@@ -23,6 +23,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -31,6 +33,8 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(REPO / "src"))
 
 import pool_attribution as pa  # noqa: E402
+
+import pool_delivery as pd  # noqa: E402
 import pool_router as rt  # noqa: E402
 
 A = "a" * 32
@@ -216,7 +220,7 @@ def scenario_unreadable_and_malformed_evidence_refuse() -> None:
             rt.route(ws, task(ws))
             check("unreadable sentinel folder: refused", False, "route returned")
         except rt.UnreadableEvidence as e:
-            check("unreadable sentinel folder: refused and named", "refusing" in str(e), str(e))
+            check("unreadable sentinel folder: refused and named", "refusing" in str(e) or "cannot lock" in str(e), str(e))
         code, targets, _ = h.classify(ws, task(ws))
         check("...and the handler's probe answers must-handle", code == h.MUST_HANDLE, str((code, targets)))
     finally:
@@ -251,22 +255,248 @@ def scenario_commit_outlives_the_roster() -> None:
 
 
 def scenario_handler_settles_by_the_routes_targets() -> None:
-    print("\nscenario: the probe saw B bound and nothing committed; A commits before the run; the run settles on A")
+    print("\nscenario: the probe saw B bound and nothing committed; A commits INSIDE the run's window; the run settles on A")
     import pool_route_handler as h
     ws = workspace(B)
     code, targets, _ = h.classify(ws, task(ws))
     check("probe snapshot names B", (code, targets) == (0, [B]), str((code, targets)))
-    seed(ws, A, ".txt", A)                       # A commits between the probe and the run
-    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    # Wrap the handler's route dependency: A commits on entry, then the real route
+    # runs. That lands A between main()'s own classification (B) and its route.
+    real_route = h.rt.route
+
+    def committing_route(workspace, task_dict, roster=None, **kw):
+        seed(ws, A, ".txt", A)
+        return real_route(workspace, task_dict, roster, **kw)
+    h.rt.route = committing_route
+    try:
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    finally:
+        h.rt.route = real_route
     check("the run reports settled (rc 0): A already owns it, B is not a missing delivery", rc == 0, str(rc))
     check("no sentinel for B", not (ws / "deliveries" / B / "task-r.txt").exists())
 
 
+def scenario_release_race_is_serialised_by_the_folder_lock() -> None:
+    print("\nscenario: A holds task-r.accepted (crash residue, no record); a production release races the replay's reads")
+    ws = workspace(B)
+    seed(ws, A, ".accepted", None)
+    accepted = ws / "deliveries" / A / "task-r.accepted"
+    started = threading.Event()
+
+    def releaser() -> None:
+        started.wait()
+        pd.release(accepted)                      # takes A's folder lock, renames .accepted -> .txt
+
+    th = threading.Thread(target=releaser, daemon=True)
+    th.start()
+
+    def between(name: Path, state: str) -> None:
+        if name.name.endswith(".txt") and not started.is_set():
+            started.set()                         # the releaser now wants A's lock
+            time.sleep(0.7)                       # long enough for it to run if the lock did not hold it
+    try:
+        out = rt.route(ws, task(ws), _between_suffix_checks=between)
+    except TypeError as e:               # a head without the serialised holder read
+        started.set()
+        th.join(5)
+        check("the replay reads each folder's suffix set under its lock", False, str(e))
+        return
+    th.join(5)
+    check("the replay saw A's delivery under one of its names and reported already for A",
+          out["already"] == [A] and out["delivered"] == [], str(out))
+    check("no sentinel was created for B", not (ws / "deliveries" / B / "task-r.txt").exists(), str(sentinels(ws)))
+    check("the release completed afterwards", (ws / "deliveries" / A / "task-r.txt").exists())
+
+
+def scenario_aliased_recipient_directory_refuses() -> None:
+    print("\nscenario: deliveries/A is a symlink to a directory outside deliveries/ holding task-r.txt")
+    ws = workspace(B)
+    outside = ws.parent / "outside"
+    outside.mkdir()
+    (outside / "task-r.txt").touch()
+    (ws / "deliveries" / A).symlink_to(outside)
+    try:
+        rt.route(ws, task(ws))
+        check("aliased recipient directory: refused", False, "route returned")
+    except rt.UnreadableEvidence as e:
+        check("aliased recipient directory: refused and named", "recipient folders" in str(e) or "alias" in str(e).lower(), str(e))
+    check("no attribution was written", pa.worker_for_task(ws, "task-r") is None)
+    check("no lock was created outside deliveries/", not (outside / ".lock").exists())
+    check("no sentinel for B", not (ws / "deliveries" / B / "task-r.txt").exists())
+    # The lock owner itself refuses an alias, so a swap after enumeration cannot gain a lock.
+    try:
+        with pd.arbitration(ws, A):
+            check("folder arbitration on an aliased recipient: refused", False, "lock taken")
+    except OSError as e:
+        check("folder arbitration on an aliased recipient: refused by the lock owner", "alias" in str(e), str(e))
+    check("...and still no lock outside deliveries/", not (outside / ".lock").exists())
+
+
+def scenario_unlistable_root_and_unreadable_record() -> None:
+    print("\nscenario: deliveries/ itself unlistable; the attribution record unreadable")
+    ws = workspace(B)
+    seed(ws, A, ".txt", None)
+    (ws / "deliveries").chmod(0o000)
+    try:
+        try:
+            rt.route(ws, task(ws))
+            check("unlistable deliveries/: refused", False, "route returned")
+        except rt.UnreadableEvidence as e:
+            check("unlistable deliveries/: refused and named", "cannot list" in str(e) or "cannot read the recipient folders" in str(e), str(e))
+    finally:
+        (ws / "deliveries").chmod(0o755)
+    ws = workspace(B)
+    seed(ws, A, ".txt", A)
+    pa.attribution_path(ws, "task-r").chmod(0o000)
+    try:
+        try:
+            rt.route(ws, task(ws))
+            check("unreadable attribution: refused", False, "route returned")
+        except rt.UnreadableEvidence as e:
+            check("unreadable attribution: refused and named", "attribution record unreadable" in str(e), str(e))
+    finally:
+        pa.attribution_path(ws, "task-r").chmod(0o644)
+    check("no sentinel for B in either case", not (ws / "deliveries" / B / "task-r.txt").exists())
+    ws = workspace(A)
+    calls = []
+    out = rt.deliver_one(ws, A, "task-r", _between_sentinel_and_attribution=lambda: calls.append(1))
+    check("the seam runs once inside deliver_one, between the sentinel and the attribution",
+          out == "delivered" and calls == [1] and pa.worker_for_task(ws, "task-r") == A, str((out, calls)))
+
+
+def snapshot(d: Path) -> dict:
+    return {str(q.relative_to(d)): (q.stat().st_size, q.stat().st_mtime_ns) for q in sorted(d.rglob("*"))}
+
+
+def swap_to_alias(ws: Path, outside: Path) -> Path:
+    """Replace deliveries/A (a real directory) with a symlink to `outside`; the real one is moved aside."""
+    real = ws / "deliveries" / A
+    moved = ws / "deliveries" / (A + ".moved")
+    os.rename(real, moved)
+    real.symlink_to(outside)
+    return moved
+
+
+def scenario_swap_before_open_refuses_without_touching_outside() -> None:
+    print("\nscenario: deliveries/A is swapped for A -> outside AFTER ownership validation, BEFORE the directory open")
+    ws = workspace(B)
+    seed(ws, A, ".txt", None)
+    outside = ws.parent / "outside"
+    outside.mkdir()
+    (outside / "task-r.txt").touch()
+    before = snapshot(outside)
+    seams = {"_between_validation_and_open": lambda: swap_to_alias(ws, outside)}
+    try:
+        rt.route(ws, task(ws), _arbitration_seams=seams)
+        check("pre-open swap: refused", False, "route returned")
+    except (rt.RouterRefused, TypeError) as e:
+        check("pre-open swap: refused by the lock owner (no-follow directory open)", isinstance(e, rt.RouterRefused), str(e))
+    check("no outside/.lock was created and outside is byte-for-byte untouched",
+          not (outside / ".lock").exists() and snapshot(outside) == before, str(sorted(p.name for p in outside.iterdir())))
+    check("no sentinel for B", not (ws / "deliveries" / B / "task-r.txt").exists())
+
+
+def scenario_swap_after_flock_body_stays_anchored() -> None:
+    print("\nscenario: deliveries/A is swapped for A -> outside AFTER the flock, BEFORE the first suffix probe (read/create path)")
+    ws = workspace(A)                                # bound to A: this pass will CREATE A's sentinel
+    (ws / "deliveries" / A).mkdir(parents=True, exist_ok=True)
+    outside = ws.parent / "outside"
+    outside.mkdir()
+    before = snapshot(outside)
+    moved = {}
+    seams = {"_after_lock": lambda: moved.setdefault("dir", swap_to_alias(ws, outside))}
+    try:
+        out = rt.deliver_one(ws, A, "task-r", _arbitration_seams=seams)   # the create, on its own lock
+    except TypeError as e:
+        check("post-flock swap (read/create): the body is anchored to the directory fd", False, str(e))
+        return
+    check("the delivery was made", out == "delivered", str(out))
+    check("...into the ORIGINAL directory, through the fd", (moved["dir"] / "task-r.txt").exists(), str(sorted(p.name for p in moved["dir"].iterdir())))
+    # A swap that lands between holders' lock and the create's lock is a refusal at the next lock, never a create through the alias.
+    import pool_route_handler as h
+    ws2 = workspace(A)
+    (ws2 / "deliveries" / A).mkdir(parents=True, exist_ok=True)
+    outside2 = ws2.parent / "outside"
+    outside2.mkdir()
+    before2 = snapshot(outside2)
+    moved2 = {}
+    real_route = rt.route
+    rt.route = lambda w_, t_, roster=None, **kw: real_route(w_, t_, roster, _arbitration_seams={"_after_lock": lambda: moved2.setdefault("d", swap_to_alias(ws2, outside2))})
+    try:
+        rc = h.main(["--task-file", str(ws2 / "tasks" / "task-r.txt"), "--workspace", str(ws2)])
+    finally:
+        rt.route = real_route
+    check("the handler answers must-handle when the alias appears between the holder read and the create", rc == h.MUST_HANDLE, str(rc))
+    check("...and nothing was created through the alias", snapshot(outside2) == before2 and not (outside2 / "task-r.txt").exists())
+    check("outside is byte-for-byte untouched (nothing read or created through the alias)",
+          snapshot(outside) == before and not (outside / "task-r.txt").exists() and not (outside / ".lock").exists(),
+          str(sorted(p.name for p in outside.iterdir())))
+    # And the rename/unlink path: release() of an accepted sentinel, swapped after its flock.
+    ws = workspace(A)
+    seed(ws, A, ".accepted", None)
+    outside = ws.parent / "outside"
+    outside.mkdir()
+    (outside / "task-r.accepted").touch()
+    before = snapshot(outside)
+    real_arb = pd.arbitration
+
+    @__import__("contextlib").contextmanager
+    def swapping_arb(workspace, recipient, **kw):
+        with real_arb(workspace, recipient, _after_lock=lambda: moved.setdefault("rel", swap_to_alias(ws, outside))) as dfd:
+            yield dfd
+    moved.clear()
+    pd.arbitration = swapping_arb
+    try:
+        dst = pd.release(ws / "deliveries" / A / "task-r.accepted")
+    finally:
+        pd.arbitration = real_arb
+    check("release renamed within the ORIGINAL directory, through the fd",
+          (moved["rel"] / "task-r.txt").exists() and not (moved["rel"] / "task-r.accepted").exists(), str(sorted(p.name for p in moved["rel"].iterdir())))
+    check("outside is byte-for-byte untouched by the rename path", snapshot(outside) == before, str(sorted(p.name for p in outside.iterdir())))
+    # clear_pending's unlink path, the same way.
+    ws = workspace(A)
+    seed(ws, A, ".txt", None)
+    outside = ws.parent / "outside"
+    outside.mkdir()
+    (outside / "task-r.txt").touch()
+    before = snapshot(outside)
+    moved.clear()
+    pd.arbitration = swapping_arb
+    try:
+        pd.clear_pending(ws, A, "task-r")
+    finally:
+        pd.arbitration = real_arb
+    check("clear_pending unlinked within the ORIGINAL directory, through the fd",
+          "rel" in moved and not (moved["rel"] / "task-r.txt").exists(), str(sorted(p.name for p in moved.get("rel", outside).iterdir())))
+    check("outside is byte-for-byte untouched by the unlink path", snapshot(outside) == before and (outside / "task-r.txt").exists())
+
+
+def scenario_every_arbitration_body_is_fd_relative() -> None:
+    print("\nscenario: structural pin — no path-based probe, create, rename or unlink inside any arbitration body")
+    import ast
+    offenders = []
+    for mod in ("pool_delivery.py", "pool_router.py"):
+        tree = ast.parse((SCRIPTS / mod).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.With) and any("arbitration" in ast.unparse(i.context_expr) for i in node.items):
+                body_src = "\n".join(ast.unparse(b) for b in node.body)
+                for bad in ("os.rename(sentinel,", "os.rename(src,", "os.unlink(sentinel)", ".exists()", "pd.find(", " find(", "os.open(d /", "os.open(str("):
+                    if bad in body_src:
+                        offenders.append(f"{mod}: {bad!r} in a with-arbitration body at line {node.lineno}")
+    check("every arbitration body reads and mutates through the directory fd", not offenders, "; ".join(offenders))
+
+
 def main() -> int:
     scenario_plain_replay_is_still_already()
+    scenario_swap_before_open_refuses_without_touching_outside()
+    scenario_swap_after_flock_body_stays_anchored()
+    scenario_every_arbitration_body_is_fd_relative()
     scenario_unreadable_and_malformed_evidence_refuse()
     scenario_commit_outlives_the_roster()
     scenario_handler_settles_by_the_routes_targets()
+    scenario_release_race_is_serialised_by_the_folder_lock()
+    scenario_aliased_recipient_directory_refuses()
+    scenario_unlistable_root_and_unreadable_record()
     scenario_every_suffix_and_every_attribution_shape()
     scenario_concurrent_passes_with_different_bindings()
     scenario_handler_probe_follows_the_commit()
