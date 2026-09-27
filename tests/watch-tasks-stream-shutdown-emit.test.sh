@@ -166,13 +166,14 @@ printf 'id: task-probe1\naccess_tier: owner\ntask: resolve me\n' > "$RPAYLOAD"
 RRESOLVER="$RTMP/resolver.sh"
 printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$RPAYLOAD" > "$RRESOLVER"; chmod +x "$RRESOLVER"
 
-# Accepts the probe, then the real run only sleeps, so the task is still
-# RUNNING when TERM lands: that forces the shutdown path, not the failure one.
+# Accepts the probe, then the real run sleeps until the shutdown settle stops it; it
+# answers that TERM with its own exit 1 (declined), which is what earns the fallback.
 RHANDLER="$RTMP/handler.sh"
 cat > "$RHANDLER" << 'HEOF'
 #!/bin/sh
 for a in "$@"; do [ "$a" = "--probe" ] && exit 0; done
-sleep 30
+trap 'exit 1' TERM
+sleep 30 & wait $!
 HEOF
 chmod +x "$RHANDLER"
 

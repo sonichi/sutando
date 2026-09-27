@@ -18,7 +18,7 @@ alone, or to its whole process group (the notifiers' stop), right after `handle`
                              -> linger inside SUTANDO_SETTLE_GRACE: stdout=[]  settled done
                              -> linger past it: group stopped, then stdout=[TASK_FILE: ...] and a receipt
     HEAD,   rc 0, handler group + watcher group TERM (not what production sends)
-                             -> stdout=[TASK_FILE: ...]  the handler died too: unknown, so the fallback stays
+                             -> stdout=[]   the handler died by signal: unknown, so terminal, never a hand-off
     HEAD,   TERM-resistant handler, group TERM, RUN_TIMEOUT=2
                              -> the settle stops the handler's whole group within its grace and only
                                 then hands the task on; nothing of the tree survives, no unbounded wait
@@ -44,6 +44,7 @@ TREES: list[Path] = []
 STATE = [{}]
 STATE_PG = [{}]
 CLAIM_SEEN = [None]
+CLAIM_LINES = [{}]
 
 
 def handler_pgid(h):
@@ -62,7 +63,8 @@ def group_members(pgid):
 
 
 def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_results=False,
-        pause_before_register=None, release_fails=False, signal_after_exit=False, settle_grace=None):
+        pause_before_spawn=None, release_fails=False, signal_after_exit=False, settle_grace=None,
+        exec_argv=False, two_tasks=False, declines_on_term=False):
     tmp = Path(tempfile.mkdtemp(prefix="b4816-")); TREES.append(tmp)
     ws = tmp / "ws"
     (ws / "tasks").mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
@@ -74,10 +76,16 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
     # The work is done the moment `handle` is logged; the linger is the window
     # in which a real router is still tearing down after delivering.
     tail = "trap '' TERM\nsleep 30\n" if resistant else f"sleep {linger}\n"
+    if exec_argv:
+        tail = "exec sleep 30\n"   # the argv the watcher launched no longer names the handler
+    if declines_on_term:
+        tail = "trap 'exit 1' TERM\nsleep 30 & wait $!\n"   # answers the settle's TERM with its own verdict
     h.write_text('#!/bin/bash\nfor a in "$@"; do [ "$a" = "--probe" ] && { echo probe >> %s; exit 0; }; done\n'
                  'echo handle >> %s\n%sexit %d\n' % (log, log, tail, rc)); h.chmod(0o755)
     name = "task-demo.txt"
     (ws / "tasks" / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
+    if two_tasks:
+        (ws / "tasks" / "task-demo2.txt").write_text("id: task-demo2\naccess_tier: owner\ntask: probe\n")
     env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
@@ -85,8 +93,8 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     if run_timeout is not None:
         env["SUTANDO_HANDLER_RUN_TIMEOUT"] = str(run_timeout)
-    if pause_before_register is not None:
-        env["SUTANDO_WATCHER_TEST_PAUSE_BEFORE_REGISTER"] = str(pause_before_register)
+    if pause_before_spawn is not None:
+        env["SUTANDO_WATCHER_TEST_PAUSE_BEFORE_SPAWN"] = str(pause_before_spawn)
     if settle_grace is not None:
         env["SUTANDO_SETTLE_GRACE"] = str(settle_grace)
     errf = open(tmp / "watcher.err", "w+")
@@ -104,6 +112,10 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
             except Exception: pass
             if log.exists() and "handle" in log.read_text():
                 break
+            if pause_before_spawn is not None:
+                # No handler will run in this arm: the signal goes in once the claim says "starting".
+                cl = ws / "state" / "task-event-handler-claims" / "task-demo.txt"
+                if cl.exists() and "starting" in cl.read_text(): break
         else:
             FAILURES.append("handler never ran"); return [], [], None, []
         claims = ws / "state" / "task-event-handler-claims"
@@ -146,6 +158,7 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
         try: os.chmod(ws / "state" / "task-event-handler-claims", 0o700)
         except Exception: pass
     published = sorted(q.name for q in (ws / "results").glob("*.txt")) if want_results else []
+    CLAIM_LINES[0] = {q.name: q.read_text().splitlines()[4:] for q in (ws / "state" / "task-event-handler-claims").glob("task-*")} if (ws / "state" / "task-event-handler-claims").exists() else {}
     time.sleep(0.5)
     STATE_PG[0] = {"pgid": hpg, "survivors": group_members(hpg)} if hpg else {"pgid": None, "survivors": []}
     # What the settle leaves behind is part of the verdict: no claim, no sentinel, and a
@@ -185,13 +198,13 @@ try:
     check("...a terminal failure is published instead", pub != [] and "exit 4" in LAST_STDERR[0],
           f"{pub} {LAST_STDERR[0].strip().splitlines()[-1:]}")
 
-    so, hl, _, _ = run(kill_group="with-handler")
-    check("control: the handler killed along with the watcher: the fallback to the live core stays",
-          hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so), f"{so} {hl}")
-    check("...with the interrupted-handler line",
-          "handler interrupted" in LAST_STDERR[0], LAST_STDERR[0].strip().splitlines()[-1:])
-    check("...and the receipt that marks the hand-off, no claim, no sentinel",
-          STATE[0] == {"claims": [], "sentinels": [], "receipt": True}, str(STATE[0]))
+    so, hl, _, pub = run(kill_group="with-handler", want_results=True)
+    check("the handler killed along with the watcher (a signal exit, no verdict of its own): NOT handed to the live core",
+          hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so), f"{so} {hl}")
+    check("...a terminal failure is published, naming the interruption",
+          pub != [] and "interrupted before its outcome was known" in LAST_STDERR[0], f"{pub} {LAST_STDERR[0].strip().splitlines()[-1:]}")
+    check("...no receipt, no claim, no sentinel",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": False}, str(STATE[0]))
 
     # The notifiers' stop: the watcher's group TERMed, the handler's own group untouched. The
     # decision under test is which side of SUTANDO_SETTLE_GRACE the linger sits on: both run.
@@ -201,30 +214,45 @@ try:
     check("...no claim, no sentinel, no receipt, group empty",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [], f"{STATE[0]} {STATE_PG[0]}")
     so, hl, elapsed, pub = run(kill_group=True, linger="6", settle_grace=2, want_results=True)
-    check("notifiers' stop, susceptible handler lingering PAST the grace (6 s > 2 s): stopped as a group, then handed to the live core",
-          hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so) and "stopping its process group" in LAST_STDERR[0] and pub == [],
-          f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-2:]}")
-    check("...within the grace plus the kill second, receipt written, no claim, no sentinel, group empty",
-          elapsed is not None and elapsed < 5 and STATE[0] == {"claims": [], "sentinels": [], "receipt": True} and STATE_PG[0]["survivors"] == [],
-          f"elapsed={elapsed} {STATE[0]} {STATE_PG[0]}")
+    check("notifiers' stop, susceptible handler lingering PAST the grace (6 s > 2 s): stopped as a group, and NOT handed on (it may have delivered)",
+          hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so) and "stopping its process group" in LAST_STDERR[0], f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...a terminal failure instead, no receipt, no claim, no sentinel, group empty, within the grace plus the kill second",
+          pub != [] and elapsed is not None and elapsed < 5 and STATE[0] == {"claims": [], "sentinels": [], "receipt": False} and STATE_PG[0]["survivors"] == [],
+          f"elapsed={elapsed} {pub} {STATE[0]} {STATE_PG[0]}")
+
+    # The hand-off control: past the grace the settle TERMs the handler, which answers with
+    # its own exit 1; that verdict, not the kill, is what earns the fallback.
+    so, hl, elapsed, pub = run(kill_group=True, declines_on_term=True, settle_grace=2, want_results=True)
+    check("control: a handler that answers the settle's TERM with its own exit 1 IS handed to the live core",
+          hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so) and pub == [] and "handler interrupted" in LAST_STDERR[0],
+          f"{so} {hl} {pub} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...with the receipt that marks the hand-off, no claim, no sentinel, group empty",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": True} and STATE_PG[0]["survivors"] == [], f"{STATE[0]} {STATE_PG[0]}")
 
     so, hl, elapsed, pub = run(kill_group=True, resistant=True, run_timeout=2, want_results=True)
     check("a TERM-resistant handler under the group stop: the watcher still exits, within the settle grace",
           elapsed is not None and elapsed < 10, f"elapsed={elapsed}")
-    check("...its group stopped, and only THEN the task handed to the live core (the handler is dead, so no duplicate)",
-          "stopping its process group" in LAST_STDERR[0] and any("TASK_FILE" in s for s in so) and pub == [],
+    check("...its group stopped, and the task NOT handed on: it may have delivered, so a terminal failure is published",
+          "stopping its process group" in LAST_STDERR[0] and not any("TASK_FILE" in s for s in so) and pub != [],
           f"{so} {pub} {LAST_STDERR[0].strip().splitlines()[-2:]}")
-    check("...with the receipt that marks the hand-off, no claim, no sentinel",
-          STATE[0] == {"claims": [], "sentinels": [], "receipt": True}, str(STATE[0]))
+    check("...no receipt, no claim, no sentinel",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": False}, str(STATE[0]))
     check("...and the TERM-resistant descendant is gone with its group (captured before the signal)",
           STATE_PG[0]["pgid"] is not None and STATE_PG[0]["survivors"] == [], str(STATE_PG[0]))
     # Boundary 1: TERM lands between the fork and the pid record (test-only pause holds
     # it open); the child exits 0 at once, so ownership cannot be proven from the table.
-    so, hl, _, pub = run(kill_group=False, linger="0", pause_before_register=3, want_results=True)
-    check("signal inside the fork-to-record window, child already gone: NOT handed to the live core",
-          not any("TASK_FILE" in s for s in so), f"{so} {hl}")
+    so, hl, _, pub = run(kill_group=False, linger="0", pause_before_spawn=3, want_results=True)
+    check("signal after 'starting' and before the spawn (no child could have run): NOT handed to the live core",
+          hl == ["probe"] and not any("TASK_FILE" in s for s in so), f"{so} {hl}")
     check("...it fails closed with a terminal failure and no receipt",
           pub != [] and STATE[0]["receipt"] is False and STATE[0]["claims"] == [], f"{pub} {STATE[0]}")
+
+    # Kewei's exec control: the handler execs into a process whose argv no longer names it;
+    # the child recorded itself before exec, so the settle stops the right group by identity.
+    so, hl, _, pub = run(kill_group=False, exec_argv=True, settle_grace=2, want_results=True)
+    check("handler exec'd into `sleep 30` (argv changed) and signalled: NOT handed on, terminal failure, and the exec'd process is gone",
+          not any("TASK_FILE" in s for s in so) and pub != [] and STATE_PG[0]["survivors"] == [] and STATE[0]["claims"] == [],
+          f"{so} {pub} {STATE_PG[0]} {STATE[0]}")
 
     # Boundary 2: the handler finished and the release FAILED (claims dir read-only); the
     # record must survive so a later signal settles from the outcome, never from the claim.
@@ -236,9 +264,17 @@ try:
     check("...the settle read the kept outcome (done) and left the unreleasable claim alone",
           "had already finished" in LAST_STDERR[0] and "could not release" in LAST_STDERR[0] and STATE[0]["receipt"] is False and pub == [],
           f"{STATE[0]} {pub} {LAST_STDERR[0].strip().splitlines()[-3:]}")
+    # Two claims: the first unreleasable (read-only dir), the second completed; a TERM
+    # must settle the first from ITS OWN lines, never from a shared slot.
+    so, hl, _, pub = run(kill_group=False, release_fails=True, signal_after_exit=True, two_tasks=True, want_results=True)
+    check("two claims, first unreleasable, second completed, then a signal: neither is handed to the live core",
+          not any("TASK_FILE" in s for s in so), f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-4:]}")
+    check("...each claim carried its own outcome line (no shared slot)",
+          all(any(l.startswith("outcome ") for l in lines) for lines in CLAIM_LINES[0].values()) if CLAIM_LINES[0] else "had already finished" in LAST_STDERR[0],
+          f"{CLAIM_LINES[0]} {LAST_STDERR[0].strip().splitlines()[-4:]}")
 finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {23 - len(FAILURES)}/23 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {28 - len(FAILURES)}/28 passed")
 sys.exit(1 if FAILURES else 0)
