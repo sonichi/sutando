@@ -90,11 +90,21 @@ def locked(path: Path):
         yield
 
 
-def append(path: Path, text: str) -> None:
-    """Append under the writer lock; O_APPEND keeps the write a single record."""
+def append(path: Path, text: str, keep_bytes: int = DEFAULT_KEEP,
+           auto_rotate: bool = True, pin=PIN_DEFAULT) -> "RotateResult | None":
+    """Append under the writer lock; O_APPEND keeps the write a single record.
+
+    Rotates in the SAME lock when the append crosses keep_bytes, because the writer is
+    the only place that knows the head just grew — leaving it to a later probe means
+    every pass in between pays the oversized read. Returns the RotateResult when it
+    rotated, else None. Nothing is deleted: head + archive is still the original.
+    """
     with locked(path):
         with open(path, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
+        if not auto_rotate or _size(path.read_text(encoding="utf-8")) <= keep_bytes:
+            return None
+        return _rotate_locked(path, keep_bytes, False, pin, None)
 
 
 def replace(path: Path, text: str) -> None:
@@ -230,16 +240,22 @@ def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
            pin=PIN_DEFAULT, _between_read_and_replace=None) -> RotateResult:
     """Rotate under the writer lock. `_between_read_and_replace` is a test seam."""
     with locked(path):
-        text = path.read_text(encoding="utf-8")
-        r = plan(text, keep_bytes, pin)
-        if _between_read_and_replace:
-            _between_read_and_replace()
-        if dry_run or not r.archived:
-            return r
-        archive = path.with_name(path.stem + "-archive.md")
-        with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
-            f.write(r.archived)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(r.head, encoding="utf-8")
-        os.replace(tmp, path)
+        return _rotate_locked(path, keep_bytes, dry_run, pin, _between_read_and_replace)
+
+
+def _rotate_locked(path: Path, keep_bytes: int, dry_run: bool, pin,
+                   _between_read_and_replace) -> RotateResult:
+    """rotate()'s body, with the writer lock ALREADY held. locked() is not reentrant."""
+    text = path.read_text(encoding="utf-8")
+    r = plan(text, keep_bytes, pin)
+    if _between_read_and_replace:
+        _between_read_and_replace()
+    if dry_run or not r.archived:
         return r
+    archive = path.with_name(path.stem + "-archive.md")
+    with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
+        f.write(r.archived)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(r.head, encoding="utf-8")
+    os.replace(tmp, path)
+    return r
