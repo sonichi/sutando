@@ -128,6 +128,20 @@ it is taught to (tracked in #4580). Re-run the stopgap if
 `bind_room()` on an install that has never registered a worker through
 `register_worker()`/`create_worker()`.
 
+**Finding your own name.** `pool_ask.py --who` already marks your own row:
+`whoami()` compares `$SUTANDO_INSTANCE_ID` against every row (it still lists
+every worker, not just yours), text output appends `  (you)` to the matching
+one, and `--json` sets `"me": true` on it:
+
+```bash
+python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who
+```
+
+Add `--json` for `"me": true`. Built from the roster
+(`pool_roster.py:load_roster`), not the advertisement file —
+`state/pool-advertisement.json`'s `profile_workers` map carries only `label`
+and (when known) `runtime`, never `display_label` or a self-marker.
+
 ## Talking to the other instances (core ↔ worker)
 
 You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)
