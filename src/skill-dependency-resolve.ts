@@ -38,26 +38,34 @@ export function engineFallback(repoRoot: string, specifier: string, ctx: Resolve
 
 /**
  * Mark `skillDir` as an out-of-tree skill root. Installs the hook on first use;
- * returns false when this Node has no in-thread module hooks (< 22.15).
+ * returns false when this Node has no in-thread module hooks (< 22.15) or installing them fails.
  */
-export function allowEngineDependencies(repoRoot: string, skillDir: string): boolean {
-	const register = (nodeModule as unknown as { registerHooks?: RegisterHooks }).registerHooks;
+export function allowEngineDependencies(
+	repoRoot: string,
+	skillDir: string,
+	host: { registerHooks?: RegisterHooks } = nodeModule as unknown as { registerHooks?: RegisterHooks },
+): boolean {
+	const register = host.registerHooks;
 	if (typeof register !== 'function') return false;
 	try { roots.add(realpathSync(skillDir)); } catch { return false; }
 	if (!installed) {
+		try {
+			register({
+				resolve(specifier, ctx, next) {
+					try {
+						return next(specifier, ctx);
+					} catch (err) {
+						let fallback: ResolveResult | null = null;
+						try { fallback = engineFallback(repoRoot, specifier, ctx, next); } catch { /* report the original */ }
+						if (fallback) return fallback;
+						throw err;
+					}
+				},
+			});
+		} catch {
+			return false;
+		}
 		installed = true;
-		register({
-			resolve(specifier, ctx, next) {
-				try {
-					return next(specifier, ctx);
-				} catch (err) {
-					let fallback: ResolveResult | null = null;
-					try { fallback = engineFallback(repoRoot, specifier, ctx, next); } catch { /* report the original */ }
-					if (fallback) return fallback;
-					throw err;
-				}
-			},
-		});
 	}
 	return true;
 }

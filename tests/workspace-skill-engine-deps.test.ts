@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { allowEngineDependencies } from '../src/skill-dependency-resolve.ts';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TSX_CLI = (() => {
@@ -59,5 +60,28 @@ test('a workspace skill imports engine dependencies from ESM and CommonJS tool f
 		assert.ok(!names.includes('fixture_missing_tool'), 'a dependency the engine lacks still fails');
 	} finally {
 		rmSync(base, { recursive: true, force: true });
+	}
+});
+
+test('without in-thread module hooks the fallback reports false', () => {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ws-skill-nohooks-')));
+	try {
+		assert.strictEqual(allowEngineDependencies(REPO_ROOT, dir, {}), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test('a failed hook installation reports false and a later call still installs', () => {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), 'ws-skill-failhooks-')));
+	try {
+		const failing = { registerHooks: () => { throw new Error('hooks unavailable'); } };
+		assert.strictEqual(allowEngineDependencies(REPO_ROOT, dir, failing), false);
+		let installs = 0;
+		const recording = { registerHooks: () => { installs += 1; } };
+		assert.strictEqual(allowEngineDependencies(REPO_ROOT, dir, recording), true);
+		assert.strictEqual(installs, 1, 'a failed install must not mark the hook as installed');
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
