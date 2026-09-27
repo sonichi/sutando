@@ -274,11 +274,13 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
         self.roster()
         self.task(tid)
         paused, resume = threading.Event(), threading.Event()
-        real_find = pd.find
+        # The publish body reads through the anchored `find_in` (directory fd), so
+        # that is the seam the pause instruments; the lock file itself is unchanged.
+        real_find_in = pd.find_in
         first = threading.local()
 
-        def pausing_find(workspace, recipient, task_id):
-            got = real_find(workspace, recipient, task_id)
+        def pausing_find(dir_fd, task_id):
+            got = real_find_in(dir_fd, task_id)
             if getattr(first, "publisher", False) and not paused.is_set():
                 paused.set()
                 resume.wait(10)
@@ -295,7 +297,7 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
             pending = pd.find(self.ws, W1, tid)
             outcomes["accept"] = pd.accept(pending).name if pending and pending.suffix == ".txt" else None
 
-        rt.pd.find = pausing_find
+        rt.pd.find_in = pausing_find
         try:
             a = threading.Thread(target=publisher_a)
             a.start()
@@ -307,7 +309,7 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
             resume.set()
             a.join(10); b.join(10)
         finally:
-            rt.pd.find = real_find
+            rt.pd.find_in = real_find_in
         return outcomes, b_blocked
 
     def test_an_accept_during_publish_cannot_leave_two_sentinels(self):
