@@ -14,10 +14,11 @@ alone, or to its whole process group (the notifiers' stop), right after `handle`
     parent, rc 0, pid TERM   -> stdout=[TASK_FILE: task-demo.txt]  (the duplicate)
     HEAD,   rc 0, pid TERM   -> stdout=[]   stderr: handler ... had already finished
     HEAD,   rc 4, pid TERM   -> stdout=[]   a terminal failure is published instead
-    HEAD,   rc 0, group TERM -> stdout=[TASK_FILE: ...]  the handler died too: unknown, so the fallback stays
+    HEAD,   rc 0, handler group + watcher group TERM
+                             -> stdout=[TASK_FILE: ...]  the handler died too: unknown, so the fallback stays
     HEAD,   TERM-resistant handler, group TERM, RUN_TIMEOUT=2
-                             -> the watcher exits within the settle grace, publishing the
-                                interrupted failure the retry test already expects; no unbounded wait
+                             -> the settle stops the handler's whole group within its grace and only
+                                then hands the task on; nothing of the tree survives, no unbounded wait
 
 The env is built from the clean fixture: a live core or worker shell carries
 SUTANDO_* names that would point this test at real state.
@@ -38,9 +39,26 @@ FAILURES: list[str] = []
 LAST_STDERR = [""]
 TREES: list[Path] = []
 STATE = [{}]
+STATE_PG = [{}]
 
 
-def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_results=False):
+def handler_pgid(h):
+    """The pgid of the running handler script (its own group under job control)."""
+    out = subprocess.run(["ps", "-axo", "pid=,pgid=,command="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[2].startswith(f"/bin/bash {h}") or (len(parts) == 3 and parts[2].startswith(f"bash {h}")):
+            return int(parts[1])
+    return None
+
+
+def group_members(pgid):
+    out = subprocess.run(["ps", "-axo", "pid=,pgid=,command="], capture_output=True, text=True).stdout
+    return [l.strip() for l in out.splitlines() if len(l.split(None, 2)) == 3 and l.split(None, 2)[1] == str(pgid)]
+
+
+def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_results=False,
+        pause_before_register=None, release_fails=False, signal_after_exit=False):
     tmp = Path(tempfile.mkdtemp(prefix="b4816-")); TREES.append(tmp)
     ws = tmp / "ws"
     (ws / "tasks").mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
@@ -63,6 +81,8 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     if run_timeout is not None:
         env["SUTANDO_HANDLER_RUN_TIMEOUT"] = str(run_timeout)
+    if pause_before_register is not None:
+        env["SUTANDO_WATCHER_TEST_PAUSE_BEFORE_REGISTER"] = str(pause_before_register)
     errf = open(tmp / "watcher.err", "w+")
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby",
                           "--inbox", str(ws / "tasks")], cwd=str(REPO), env=env,
@@ -80,10 +100,26 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
                 break
         else:
             FAILURES.append("handler never ran"); return [], [], None, []
-        # The handler has done its work and is still alive inside its linger:
-        # the watcher is blocked in `wait` on it. Signal now.
+        claims = ws / "state" / "task-event-handler-claims"
+        if release_fails:
+            # The claim is taken; a read-only claims dir makes its release (an mv) fail.
+            for _ in range(50):
+                if claims.exists() and any(q.name.startswith("task-") for q in claims.iterdir()): break
+                time.sleep(0.05)
+            os.chmod(claims, 0o500)
+        if signal_after_exit:
+            # Let the handler finish first: the record must still be there afterwards.
+            time.sleep(float(linger) + 0.7)
+        # The handler is alive inside its linger and the watcher blocked in `wait`; its
+        # group id is captured now, since only that can name a descendant after the exit.
+        hpg = handler_pgid(h)
         t1 = time.time()
         if kill_group:
+            # The handler runs in its own group now, so a stop that is meant to take it
+            # down too must say so: TERM its group, then the watcher's (the notifiers' stop).
+            if hpg:
+                try: os.killpg(hpg, 15)
+                except ProcessLookupError: pass
             os.killpg(os.getpgid(p.pid), 15)
         else:
             os.kill(p.pid, 15)
@@ -98,7 +134,11 @@ def run(kill_group, rc=0, linger="1", resistant=False, run_timeout=None, want_re
         try: os.killpg(os.getpgid(p.pid), 9)
         except Exception: pass
         errf.seek(0); LAST_STDERR[0] = errf.read(); errf.close()
+        try: os.chmod(ws / "state" / "task-event-handler-claims", 0o700)
+        except Exception: pass
     published = sorted(q.name for q in (ws / "results").glob("*.txt")) if want_results else []
+    time.sleep(0.5)
+    STATE_PG[0] = {"pgid": hpg, "survivors": group_members(hpg)} if hpg else {"pgid": None, "survivors": []}
     # What the settle leaves behind is part of the verdict: no claim, no sentinel, and a
     # fallback receipt only on the path that really handed the task to the core.
     STATE[0] = {"claims": [q.name for q in (ws / "state" / "task-event-handler-claims").glob("*") if not q.name.startswith(".")]
@@ -126,6 +166,7 @@ try:
           "had already finished" in LAST_STDERR[0], LAST_STDERR[0].strip().splitlines()[-1:])
     check("...leaving no claim, no sentinel, and no fallback receipt",
           STATE[0] == {"claims": [], "sentinels": [], "receipt": False}, str(STATE[0]))
+    check("...and nothing of the handler's process group survives", STATE_PG[0]["pgid"] is not None and STATE_PG[0]["survivors"] == [], str(STATE_PG[0]))
 
     so, hl, _, pub = run(kill_group=False, rc=4, want_results=True)
     check("handler finishing with 4 (must-handle): NOT handed to the live core",
@@ -134,7 +175,7 @@ try:
           f"{pub} {LAST_STDERR[0].strip().splitlines()[-1:]}")
 
     so, hl, _, _ = run(kill_group=True)
-    check("control: the whole group killed, handler dies with it: the fallback to the live core stays",
+    check("control: the handler killed along with the watcher: the fallback to the live core stays",
           hl == ["probe", "handle"] and any("TASK_FILE" in s for s in so), f"{so} {hl}")
     check("...with the interrupted-handler line",
           "handler interrupted" in LAST_STDERR[0], LAST_STDERR[0].strip().splitlines()[-1:])
@@ -144,14 +185,32 @@ try:
     so, hl, elapsed, pub = run(kill_group=True, resistant=True, run_timeout=2, want_results=True)
     check("a TERM-resistant handler under the group stop: the watcher still exits, within the settle grace",
           elapsed is not None and elapsed < 10, f"elapsed={elapsed}")
-    check("...as a timeout: no hand-off to the live core, a terminal failure published",
-          not any("TASK_FILE" in s for s in so) and pub != [] and "still running at shutdown" in LAST_STDERR[0],
-          f"{so} {pub} {LAST_STDERR[0].strip().splitlines()[-1:]}")
-    check("...leaving no claim, no sentinel, and no fallback receipt",
-          STATE[0] == {"claims": [], "sentinels": [], "receipt": False}, str(STATE[0]))
+    check("...its group stopped, and only THEN the task handed to the live core (the handler is dead, so no duplicate)",
+          "stopping its process group" in LAST_STDERR[0] and any("TASK_FILE" in s for s in so) and pub == [],
+          f"{so} {pub} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...with the receipt that marks the hand-off, no claim, no sentinel",
+          STATE[0] == {"claims": [], "sentinels": [], "receipt": True}, str(STATE[0]))
+    check("...and the TERM-resistant descendant is gone with its group (captured before the signal)",
+          STATE_PG[0]["pgid"] is not None and STATE_PG[0]["survivors"] == [], str(STATE_PG[0]))
+    # Boundary 1: TERM lands between the fork and the pid record (test-only pause holds
+    # it open); the child exits 0 at once, so ownership cannot be proven from the table.
+    so, hl, _, pub = run(kill_group=False, linger="0", pause_before_register=3, want_results=True)
+    check("signal inside the fork-to-record window, child already gone: NOT handed to the live core",
+          not any("TASK_FILE" in s for s in so), f"{so} {hl}")
+    check("...it fails closed with a terminal failure and no receipt",
+          pub != [] and STATE[0]["receipt"] is False and STATE[0]["claims"] == [], f"{pub} {STATE[0]}")
+
+    # Boundary 2: the handler finished and the release FAILED (claims dir read-only); the
+    # record must survive so a later signal settles from the outcome, never from the claim.
+    so, hl, _, pub = run(kill_group=False, release_fails=True, signal_after_exit=True, want_results=True)
+    check("release failed after rc 0, then a signal: the task is NOT handed to the live core",
+          hl == ["probe", "handle"] and not any("TASK_FILE" in s for s in so), f"{so} {hl} {LAST_STDERR[0].strip().splitlines()[-2:]}")
+    check("...the settle read the kept outcome (done) and left the unreleasable claim alone",
+          "had already finished" in LAST_STDERR[0] and "could not release" in LAST_STDERR[0] and STATE[0]["receipt"] is False and pub == [],
+          f"{STATE[0]} {pub} {LAST_STDERR[0].strip().splitlines()[-3:]}")
 finally:
     for t in TREES:
         shutil.rmtree(t, ignore_errors=True)
 
-print(f"watch-tasks-stream-shutdown-finished-handler: {11 - len(FAILURES)}/11 passed")
+print(f"watch-tasks-stream-shutdown-finished-handler: {17 - len(FAILURES)}/17 passed")
 sys.exit(1 if FAILURES else 0)

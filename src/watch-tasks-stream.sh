@@ -306,8 +306,9 @@ HANDLER_STATE_READY=""
 # signal-time settle can use the outcome run_handler_now() collected or collect it.
 INFLIGHT_HANDLER_PID=""
 INFLIGHT_HANDLER_TASK=""
-INFLIGHT_HANDLER_RC=""
-INFLIGHT_HANDLER_TIMED_OUT=""
+# "<timed_out>:<rc>", written in ONE assignment once both are known: a trap runs between
+# commands, never inside one, so the settle never sees half an outcome.
+INFLIGHT_HANDLER_OUTCOME=""
 SUTANDO_SETTLE_GRACE="${SUTANDO_SETTLE_GRACE:-3}"
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -625,6 +626,10 @@ run_handler_now() {
     # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
     # ~250x the measured normal ~35-40ms cost) bounds it regardless.
     timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/sutando-handler-timeout.XXXXXX")"
+    # The ownership record exists before the handler can: a signal between the fork and
+    # the pid assignment finds the task named and no pid, which the settle fails closed.
+    INFLIGHT_HANDLER_TASK="$filename"; INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_OUTCOME=""
+    set -m   # its own process group, so the watchdog and the settle can stop the whole tree
     "$CURRENT_HANDLER" \
       --runtime "${SUTANDO_CORE_RUNTIME:-}" \
       --workspace "$WORKSPACE_DIR" \
@@ -632,19 +637,19 @@ run_handler_now() {
       --results-dir "$RESULTS_DIR" \
       --repo "$__REPO_ROOT" >/dev/null &
     handler_pid=$!
+    set +m
+    # Test-only: holds the fork-to-record window open so a signal can land in it.
+    [ -z "${SUTANDO_WATCHER_TEST_PAUSE_BEFORE_REGISTER:-}" ] || sleep "$SUTANDO_WATCHER_TEST_PAUSE_BEFORE_REGISTER"
+    INFLIGHT_HANDLER_PID="$handler_pid"
     ( trap 'kill "${_s:-}" 2>/dev/null; exit 0' TERM
       sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
       # Reaching here (not cancelled by the handler finishing first) means
       # the timeout genuinely elapsed -- flag it BEFORE killing, so the
       # caller can tell "we gave up waiting" apart from a real exit/signal.
       : > "$timeout_flag"
-      kill -TERM "$handler_pid" 2>/dev/null; sleep 1
-      kill -KILL "$handler_pid" 2>/dev/null ) &
+      kill -TERM -- "-$handler_pid" 2>/dev/null; sleep 1
+      kill -KILL -- "-$handler_pid" 2>/dev/null ) &
     watchdog_pid=$!
-    INFLIGHT_HANDLER_PID="$handler_pid"
-    INFLIGHT_HANDLER_TASK="$filename"
-    INFLIGHT_HANDLER_RC=""
-    INFLIGHT_HANDLER_TIMED_OUT=""
     wait "$handler_pid" 2>/dev/null
     handler_rc=$?
     kill -TERM "$watchdog_pid" 2>/dev/null
@@ -653,8 +658,9 @@ run_handler_now() {
       timed_out=1
       rm -f "$timeout_flag"
     fi
-    INFLIGHT_HANDLER_RC="$handler_rc"
-    INFLIGHT_HANDLER_TIMED_OUT="$timed_out"
+    INFLIGHT_HANDLER_OUTCOME="$timed_out:$handler_rc"
+    # A descendant that ignored TERM outlives its parent; the group is what the watcher owns.
+    kill -KILL -- "-$handler_pid" 2>/dev/null
     if [ "$handler_rc" -eq 0 ]; then
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
     fi
@@ -696,11 +702,15 @@ run_handler_now() {
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
         ;;
     esac
-    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+    if [ "$claim_settled" -eq 1 ] && release_task_claim "$filename"; then
+      INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""; INFLIGHT_HANDLER_OUTCOME=""
+    fi
   elif [ "$handler_rc" -eq 0 ]; then
-    release_task_claim "$filename" || true
+    if release_task_claim "$filename"; then
+      INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""; INFLIGHT_HANDLER_OUTCOME=""
+    fi
   fi
-  INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""; INFLIGHT_HANDLER_RC=""; INFLIGHT_HANDLER_TIMED_OUT=""
+  # A record left here means the claim is still ours; the settle reads the outcome, never guesses.
 }
 
 # A name is read relative to the reader's own inbox: a body that resolution
@@ -916,23 +926,34 @@ _tmux_wake() {
 #
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
 # to settle its own claim -- this settles directly from CLAIMS_DIR instead.
-# The signal cut run_handler_now()'s wait, not the handler. Its exit code is kept
-# by bash until waited for; a run still alive after the grace counts as timed out,
-# because the group-stop the notifiers use has already killed the run watchdog.
+# A signal cut the wait, not the handler: bash keeps its exit code until waited for.
+# The group-stop the notifiers use has killed the run watchdog, so the grace is ours.
 inflight_handler_outcome() {
-  local filename="$1" deadline
-  [ -n "$INFLIGHT_HANDLER_PID" ] && [ "$INFLIGHT_HANDLER_TASK" = "$filename" ] || return 1
-  if [ -z "$INFLIGHT_HANDLER_RC" ]; then
+  local filename="$1" deadline found rc
+  [ "$INFLIGHT_HANDLER_TASK" = "$filename" ] || return 1
+  if [ -z "$INFLIGHT_HANDLER_PID" ]; then
+    # Forked but not yet recorded: the child is ours and names the handler; one match is it.
+    found="$(pgrep -P $$ -f "$CURRENT_HANDLER" 2>/dev/null | head -2)"
+    case "$found" in
+      "") ;;
+      *[!0-9]*) ;;
+      *) INFLIGHT_HANDLER_PID="$found" ;;
+    esac
+    [ -n "$INFLIGHT_HANDLER_PID" ] || { INFLIGHT_HANDLER_OUTCOME="1:"; return 0; }
+  fi
+  if [ -z "$INFLIGHT_HANDLER_OUTCOME" ]; then
     deadline=$(( $(date +%s) + SUTANDO_SETTLE_GRACE ))
     while kill -0 "$INFLIGHT_HANDLER_PID" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do sleep 0.2; done
     if kill -0 "$INFLIGHT_HANDLER_PID" 2>/dev/null; then
-      INFLIGHT_HANDLER_TIMED_OUT=1
-      kill -TERM "$INFLIGHT_HANDLER_PID" 2>/dev/null; sleep 1; kill -KILL "$INFLIGHT_HANDLER_PID" 2>/dev/null
+      echo "watch-tasks-stream: task handler for $filename still running at shutdown after ${SUTANDO_SETTLE_GRACE}s; stopping its process group" >&2
+      kill -TERM -- "-$INFLIGHT_HANDLER_PID" 2>/dev/null; sleep 1; kill -KILL -- "-$INFLIGHT_HANDLER_PID" 2>/dev/null
     fi
     wait "$INFLIGHT_HANDLER_PID" 2>/dev/null
-    INFLIGHT_HANDLER_RC=$?
-    [ -n "$INFLIGHT_HANDLER_TIMED_OUT" ] || INFLIGHT_HANDLER_TIMED_OUT=0
+    rc=$?
+    INFLIGHT_HANDLER_OUTCOME="0:$rc"
   fi
+  # Whatever the outcome, nothing of the handler's tree outlives this shutdown.
+  kill -KILL -- "-$INFLIGHT_HANDLER_PID" 2>/dev/null
   return 0
 }
 
@@ -949,12 +970,12 @@ settle_own_claims_on_shutdown() {
     claim_settled=1
     handler_rc=""; timed_out=0
     if inflight_handler_outcome "$filename"; then
-      handler_rc="$INFLIGHT_HANDLER_RC"; timed_out="$INFLIGHT_HANDLER_TIMED_OUT"
+      timed_out="${INFLIGHT_HANDLER_OUTCOME%%:*}"; handler_rc="${INFLIGHT_HANDLER_OUTCOME#*:}"
       # Same bar as the live path: a `done` the stage writer cannot record fails the task.
       if [ "$timed_out" -ne 1 ] && [ "$handler_rc" -eq 0 ]; then
         if record_worker_done "$filename" done "$WORKSPACE_DIR"; then
           echo "watch-tasks-stream: task handler for $filename had already finished; settling its claim as done" >&2
-          release_task_claim "$filename" || true
+          release_task_claim "$filename" || echo "watch-tasks-stream: could not release the settled claim for $filename; leaving it, not handing the task on" >&2
           continue
         fi
         handler_rc=1
@@ -969,8 +990,8 @@ settle_own_claims_on_shutdown() {
     case $verdict in
       0)
         if [ "$timed_out" -eq 1 ]; then
-          echo "watch-tasks-stream: task handler for $filename still running at shutdown after ${SUTANDO_SETTLE_GRACE}s; publishing safe terminal failure rather than assuming core may inherit it" >&2
-          publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
+          echo "watch-tasks-stream: handler timed out for $filename after ${SUTANDO_HANDLER_RUN_TIMEOUT}s before shutdown; publishing safe terminal failure rather than assuming core may inherit it" >&2
+          publish_terminal_failure "$filename" "timed out" "$task_path" || claim_settled=0
         elif [ "${handler_rc:-}" = 4 ]; then
           echo "watch-tasks-stream: required Team handler failed for $filename (exit 4) at shutdown; publishing safe terminal failure" >&2
           publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
