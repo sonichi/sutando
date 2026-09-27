@@ -46,6 +46,12 @@ def load(d):
         try:
             import yaml
             ents = yaml.safe_load(ep.read_text()).get("entities") or []
+        except ImportError:
+            # Silently empty entities reads as "no entities", which is a different
+            # fact from "this interpreter cannot parse them".
+            print(f"warning: PyYAML missing under {sys.executable} — {ep.name} not read",
+                  file=sys.stderr)
+            ents = []
         except Exception:
             ents = []
     return q, ents

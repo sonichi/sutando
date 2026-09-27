@@ -5,7 +5,9 @@ Every case here is a store that existed on a real host on 2026-08-28 and
 broke a prior revision: wrapped {quick_lookup:}, flat {people:}, MALFORMED
 yaml, roster-only, and a multi-host merge leaving one person under two keys.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -74,12 +76,17 @@ class StoreShapes(unittest.TestCase):
     def test_missing_pyyaml_degrades_to_roster(self):
         # An interpreter without PyYAML is the same degradation as an unparseable
         # file; before the guard the ImportError escaped and lookup.py crashed.
+        # BOTH stores are written: each has its own import, so a fixture with only
+        # quick-lookup.yaml leaves the entities.yaml half unpinned (caught in review).
         with tempfile.TemporaryDirectory() as t:
             d = store(t, "people:\n    - id: present\n", roster=ROSTER)
+            (d / "entities.yaml").write_text("entities:\n  - entity_id: present\n")
             saved = sys.modules.get("yaml", "absent")
             sys.modules["yaml"] = None      # makes `import yaml` raise ImportError
+            err = io.StringIO()
             try:
-                q, ents = lk.load(d)        # must not raise
+                with contextlib.redirect_stderr(err):
+                    q, ents = lk.load(d)    # must not raise
             finally:
                 if saved == "absent":
                     del sys.modules["yaml"]
@@ -87,6 +94,11 @@ class StoreShapes(unittest.TestCase):
                     sys.modules["yaml"] = saved
             self.assertEqual(q, {})
             self.assertEqual(ents, [])
+            # One warning per store, so neither degradation is silent.
+            warned = err.getvalue()
+            self.assertIn("quick-lookup.yaml" if "quick-lookup" in warned else "PyYAML missing",
+                          warned, warned)
+            self.assertIn("entities.yaml", warned, warned)
             rows = lk.load_roster(d)
             hits = lk.match(rows, "john-the-dev")
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
