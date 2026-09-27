@@ -66,10 +66,10 @@ def test_the_mention_is_what_reaches_the_person():
 
 
 def test_every_surface_the_client_knows_is_summonable_and_nothing_else():
-    for kind in ("markdown", "board", "kanban"):
+    for kind in ("markdown", "board", "kanban", "html", "sheet", "db"):
         _b, e = room_collab.summon_content(ROOM, WHO, kind)
         assert e[room_collab.SUMMON_KEY]["kind"] == kind
-    for bad in ("presentation", "doc", "whiteboard", "", "MARKDOWN"):
+    for bad in ("presentation", "doc", "whiteboard", "database", "", "MARKDOWN"):
         try:
             room_collab.summon_content(ROOM, WHO, bad)
         except RoomDocError:
@@ -149,6 +149,41 @@ def test_the_verb_takes_the_arguments_the_skill_documents():
     # --kind is global, so a board summon reads the same flag every verb does
     c = room_collab.build_parser().parse_args(["--kind", "board", "summon", ROOM, WHO])
     assert c.kind == "board"
+
+
+def test_a_page_summon_reads_the_page_title_and_survives_when_it_cannot():
+    import asyncio
+    import contextlib
+    import room_collab_client
+
+    class Main:
+        pages = [{"id": "ut9pkft9", "title": "Product-roadmap"}]
+
+    opened = []
+
+    @contextlib.asynccontextmanager
+    async def fake_open(url, room, token, *, kind="markdown", insecure=False):
+        opened.append(kind)
+        yield Main()
+
+    real = room_collab_client.open_room_collab
+    args = room_collab.build_parser().parse_args(
+        ["--url", "https://h", "--token", "t", "--kind", "markdown-ut9pkft9", "summon", ROOM, WHO])
+    try:
+        room_collab_client.open_room_collab = fake_open
+        assert asyncio.run(room_collab.summon_page_title(args)) == "Product-roadmap"
+        assert opened == ["markdown"], "the title is read from the Doc's own page list"
+
+        @contextlib.asynccontextmanager
+        async def broken(*_a, **_k):
+            raise ConnectionError("offline")
+            yield  # pragma: no cover
+        room_collab_client.open_room_collab = broken
+        assert asyncio.run(room_collab.summon_page_title(args)) is None
+    finally:
+        room_collab_client.open_room_collab = real
+    assert room_collab.build_parser().parse_args(
+        ["summon", ROOM, WHO, "--page-title", "Plan"]).page_title == "Plan"
 
 
 for _name, _fn in sorted((k, v) for k, v in list(globals().items()) if k.startswith("test_")):

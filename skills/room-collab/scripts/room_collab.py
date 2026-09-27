@@ -41,8 +41,9 @@ SUMMON_CONTEXT_MAX = 400
 # a summon naming "qingyun" would post a message that renders as plain prose.
 MXID_RE = re.compile(r"^@[^\s:]+:\S+$")
 # The surface as the summon's prose names it; the marker carries `kind` verbatim.
+SUMMON_PAGE_TITLE_MAX = 80
 SUMMON_SURFACE = {"markdown": "Doc", "board": "whiteboard", "kanban": "kanban board",
-                  "html": "HTML page", "sheet": "sheet"}
+                  "html": "HTML page", "sheet": "sheet", "db": "database"}
 # The client refuses a longer selection rather than truncating the quote it verifies by.
 QUOTE_MAX = 2000
 
@@ -219,6 +220,29 @@ def _refusal(exc) -> str:
     if exc.code == 403:
         return "not a member, or the token was rejected"
     return "the service did not answer it"
+
+
+def readme_access(url: str, room: str, token: str, opener=None) -> dict:
+    """Whether the server locks the room's README, and whether this caller may edit it.
+    A server that predates the lock does not name `readme_editor`: then anyone can
+    write the README, so its Rules are only information."""
+    root = url.rstrip("/")
+    for tail in ("/api/v1/room-collab", "/api/v1/room-doc"):
+        if root.endswith(tail):
+            root = root[: -len(tail)]
+    endpoint = f"{root}/api/v1/rooms/{urllib.parse.quote(room, safe='')}/room-collab/authz"
+    req = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {token}",
+                                                    "User-Agent": USER_AGENT})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RoomDocError(f"readme access refused ({exc.code}) at {endpoint}: "
+                           + _refusal(exc)) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RoomDocError(f"readme access unreachable at {endpoint}: {exc}") from exc
+    locked = isinstance(body, dict) and "readme_editor" in body
+    return {"locked": locked, "may_edit": (not locked) or body.get("readme_editor") is True}
 
 
 def presence_summary(url: str, room: str, token: str, opener=None) -> dict:
@@ -683,6 +707,47 @@ def presence_name(name: "str | None", user_id: "str | None") -> "str | None":
     return None
 
 
+README_BRIEF_LINES = 12
+BRIEF_SECTIONS = ("current focus", "rules")
+
+
+def readme_brief(text: str) -> list[str]:
+    """The few README lines a summoned agent needs before anything else: the room's name,
+    its one-line purpose, the Context line, and the Current focus and Rules items.
+    Empty unless the text is shaped like a room README, so no other document is quoted."""
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    if not any(ln.lower().startswith("**context:**") for ln in lines):
+        return []
+    out: list[str] = []
+    section = None
+    for ln in lines:
+        if not ln or (ln.startswith("*") and ln.endswith("*") and not ln.startswith("**")):
+            continue
+        if ln.startswith("## "):
+            section = ln[3:].strip().lower()
+            if section in BRIEF_SECTIONS:
+                out.append(ln[3:].strip() + ":")
+            continue
+        if ln.startswith("# ") or section is None or section in BRIEF_SECTIONS:
+            out.append(ln.lstrip("# ").strip())
+    return out[:README_BRIEF_LINES]
+
+
+async def print_readme_brief(url: str, room: str, token: str, insecure: bool = False) -> None:
+    """Print the room's README brief once, as `README<TAB>line` lines. A courtesy:
+    an empty, missing or unreadable README prints nothing and never stops the caller."""
+    from room_collab_client import open_room_collab
+    from room_collab_protocol import README_KIND
+    try:
+        async with open_room_collab(url, room, token, kind=README_KIND, insecure=insecure) as doc:
+            await doc.settle(0.5)
+            brief = readme_brief(doc.text)
+    except Exception:  # noqa: BLE001 - see docstring: the brief never blocks a watch
+        return
+    for ln in brief:
+        print(f"README\t{ln}", flush=True)
+
+
 async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     """Hold the surface open and print one line per event that concerns
     `--for`, as it lands. Comes back from a service restart with the last
@@ -696,6 +761,8 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
     failures = 0
     print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
           f"reporting after {args.settle}s of quiet", flush=True)
+    if getattr(args, "readme_brief", True) and args.kind != "readme":
+        await print_readme_brief(url, args.room, token, args.insecure)
     while True:
         try:
             async with open_room_collab(url, args.room, token, kind=args.kind,
@@ -722,6 +789,36 @@ async def watch(args: argparse.Namespace, token: str, url: str) -> int:
                    f"status={exc.status}" if exc.status else "no answer")
             print(f"RECONNECTING\t{why} attempt={failures} in {wait}s", flush=True)
             await asyncio.sleep(wait)
+
+
+def emit_snapshot(args: argparse.Namespace, content: dict) -> int:
+    """A surface's current content as a self-describing JSON file (or stdout)."""
+    body = {"room": args.room, "surface": args.kind,
+            "taken_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **content}
+    data = json.dumps(body, ensure_ascii=False, indent=2)
+    if args.out:
+        remember(Path(args.out), data)
+        print(json.dumps({"snapshot": args.out, "surface": args.kind,
+                          "items": len(content.get("elements", [])) if "elements" in content
+                          else len(content.get("text", ""))}))
+    else:
+        print(data)
+    return 0
+
+
+def load_snapshot(args: argparse.Namespace) -> dict:
+    """A snapshot for THIS room and surface; anything else is refused, since
+    restoring another room's board onto this one is almost always a mistake."""
+    try:
+        body = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RoomDocError(f"cannot read snapshot {args.file}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise RoomDocError(f"{args.file} is not a room-collab snapshot")
+    if body.get("room") != args.room or body.get("surface") != args.kind:
+        raise RoomDocError(f"{args.file} is a snapshot of {body.get('room')} ({body.get('surface')}), "
+                           f"not {args.room} ({args.kind})")
+    return body
 
 
 def page_family(args: argparse.Namespace) -> str:
@@ -830,12 +927,15 @@ async def run(args: argparse.Namespace) -> int:
     # of them must not need pycrdt installed.
     from room_collab_client import open_room_collab
 
-    from room_collab_board import BOARD_KIND, place_clear, stale_writes
+    from room_collab_board import BOARD_KIND, place_clear, restore_plan, stale_writes
     from room_kanban import KANBAN_KIND
     if args.command == "summon":
         # No document connection: a summon is a room message, and its context is
         # what the caller states rather than a passage this command verifies.
-        body, extra = summon_content(args.room, args.invitee, args.kind, args.context)
+        title = args.page_title
+        if title is None and main_kind(args.kind) not in (None, args.kind):
+            title = await summon_page_title(args)
+        body, extra = summon_content(args.room, args.invitee, args.kind, args.context, title)
         if args.dry_run:
             print(json.dumps({"room": args.room, "body": body, "extra_content": extra},
                              ensure_ascii=False, indent=2))
@@ -861,6 +961,9 @@ async def run(args: argparse.Namespace) -> int:
         return 0
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "readme-access":
+        print(json.dumps(readme_access(url, args.room, token)))
+        return 0
     if args.command == "presence":
         # No socket: opening one would put this agent in the count it asks for.
         print(render_presence(args.room, presence_summary(url, args.room, token), args.json))
@@ -907,6 +1010,8 @@ async def run(args: argparse.Namespace) -> int:
             await doc.set_presence(args.name, user_id=args.user_id)
 
         if args.kind == KANBAN_KIND:
+            if args.command in ("snapshot", "restore"):
+                raise RoomDocError(f"{args.command} does not cover the kanban yet: use --kind board or the default document.")
             return await kanban(doc, args)
         if args.kind == "sheet":
             return await sheet(doc, args)
@@ -952,6 +1057,18 @@ async def run(args: argparse.Namespace) -> int:
             if args.command == "peers":
                 print(render("peers", peers=doc.peers, as_json=args.json))
                 return 0
+            if args.command == "snapshot":
+                return emit_snapshot(args, {"elements": doc.elements})
+            if args.command == "restore":
+                backup = load_snapshot(args)
+                plan = restore_plan(backup.get("elements") or [], {e.get("id"): e for e in doc.elements}.get)
+                if args.apply and plan:
+                    await doc.put_elements(plan)
+                    await doc.settle(args.settle)
+                print(json.dumps({"restore": "applied" if args.apply else "dry run",
+                                  "would_write" if not args.apply else "written": len(plan),
+                                  "ids": [e["id"] for e in plan][:50]}, ensure_ascii=False))
+                return 0
             written = None
             if args.command == "draw":
                 elements = parse_elements(args.elements)
@@ -984,6 +1101,22 @@ async def run(args: argparse.Namespace) -> int:
         if args.command in ("draw", "erase"):
             raise RoomDocError(
                 f"{args.command!r} needs the board: pass --kind {BOARD_KIND}.")
+        if args.command == "snapshot":
+            return emit_snapshot(args, {"text": doc.text})
+        if args.command == "restore":
+            want = load_snapshot(args).get("text")
+            if not isinstance(want, str):
+                raise RoomDocError("the snapshot holds no document text")
+            change = want != doc.text
+            if args.apply and change:
+                if doc.text:
+                    await doc.replace(doc.text, want)
+                else:
+                    await doc.append(want)
+                await doc.settle(args.settle)
+            print(json.dumps({"restore": "applied" if args.apply else "dry run",
+                              "text_differs": change, "chars_now": len(doc.text), "chars_in_snapshot": len(want)}))
+            return 0
         if args.command == "templates":
             return await templates(doc, args, url)
         if args.command == "highlight":
@@ -1095,8 +1228,22 @@ def reply_content(message: str, mentions: list[str] | None = None) -> str:
     return lead + " " + text if lead else text
 
 
+async def summon_page_title(args: argparse.Namespace) -> str | None:
+    """The title of the page a summon names, from its family's page list; None when it cannot be read,
+    so a summon still goes out without one."""
+    from room_collab_client import open_room_collab
+    try:
+        token, url = resolve_token(args.token), resolve_url(args.url)
+        async with open_room_collab(url, args.room, token, kind=main_kind(args.kind),
+                                    insecure=args.insecure) as doc:
+            page = args.kind.rsplit("-", 1)[1]
+            return next((p["title"] for p in doc.pages if p["id"] == page), None)
+    except Exception:  # noqa: BLE001 — a title is a courtesy; the summon is the point
+        return None
+
+
 def summon_content(room: str, invitee: str, kind: str,
-                   context: str | None = None) -> tuple[str, dict]:
+                   context: str | None = None, page_title: str | None = None) -> tuple[str, dict]:
     """The room message a summon is: prose any client shows, and the marker the
     collab client renders as the summon card.
 
@@ -1108,19 +1255,24 @@ def summon_content(room: str, invitee: str, kind: str,
     if not MXID_RE.match(who):
         raise RoomDocError(f"a summon needs the mxid of whoever is called, like "
                            f"@name:server — got {invitee!r}")
-    # A page's summon calls to its surface: the client opens surfaces, not pages.
-    kind = main_kind(kind) or kind
-    where = SUMMON_SURFACE.get(kind)
+    # A page keeps its own kind: the client's card names the page and its Join opens it.
+    family = main_kind(kind) or kind
+    where = SUMMON_SURFACE.get(family)
     if where is None:
         raise RoomDocError(f"{kind!r} is not a surface to summon anyone to; "
                            f"use one of {', '.join(sorted(SUMMON_SURFACE))}")
+    on_page = kind != family
+    title = " ".join((page_title or "").split())[:SUMMON_PAGE_TITLE_MAX]
     quoted = " ".join((context or "").split())[:SUMMON_CONTEXT_MAX]
-    body = f"{who} — you're needed in this room's {where}."
+    place = f'"{title or "a page"}" in this room\'s {where}' if on_page else f"this room's {where}"
+    body = f"{who} — you're needed in {place}."
     if quoted:
         body += f"\n\n> {quoted}"
-    marker = {"room_id": room, "kind": kind, "invitee": who, "v": 3}
+    marker = {"room_id": room, "kind": kind if on_page else family, "invitee": who, "v": 3}
     if quoted:
         marker["context"] = quoted
+    if on_page and title:
+        marker["page_title"] = title
     return body, {SUMMON_KEY: marker, "m.mentions": {"user_ids": [who]}}
 
 
@@ -1228,7 +1380,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="workspace root for what you last read (default: the repo's resolver)")
     for name, help_text in (("read", "print the document"), ("peers", "who is present"),
                             ("doctor", "check deps, credential, URL and connection, step by step"),
-                            ("presence", "who is in each of the room's surfaces, without opening any")):
+                            ("presence", "who is in each of the room's surfaces, without opening any"),
+                            ("readme-access", "is the README locked, and may this agent edit it")):
         s = sub.add_parser(name, help=help_text)
         if name == "read":
             s.add_argument("--delta", action="store_true",
@@ -1280,6 +1433,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "localpart and --name. Add the display name a summon shows for you.")
     s.add_argument("--max-reconnects", type=int, default=20,
                    help="give up after this many consecutive failed reconnects")
+    s.add_argument("--no-readme-brief", dest="readme_brief", action="store_false",
+                   help="skip the room README's few opening lines printed at the start")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")
@@ -1415,6 +1570,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "stated by you, not checked against the document")
     s.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="print the room message the summon would be and post nothing")
+    s.add_argument("--page-title", dest="page_title", default=None,
+                   help="with --kind markdown-<id> or html-<id>: the page's title for the card "
+                        "(read from the page list when left out)")
+
+    s = sub.add_parser("snapshot", help="save a surface's current content as JSON (board or document)")
+    s.add_argument("room")
+    s.add_argument("--out", help="file to write (default: print to stdout)")
+
+    s = sub.add_parser("restore", help="bring a surface back from a snapshot; a dry run unless --apply")
+    s.add_argument("room")
+    s.add_argument("file", help="a file written by `snapshot` for this room and surface")
+    s.add_argument("--apply", action="store_true",
+                   help="write it: board elements missing or older than the snapshot; the document text")
 
     s = sub.add_parser("draw", help="write elements to the board (needs --kind board)")
     s.add_argument("room")

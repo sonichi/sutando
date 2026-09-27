@@ -22,6 +22,15 @@ The room sees nothing about connecting, only your reply once the request is done
 
 Every request gets exactly one answer: the steps below check for a wait before answering.
 
+**Calendar, contacts and reminders: the connector first, the native Mac apps never on your own.**
+Order: (1) the Station connector (`composio_find {"apps": ["google calendar"]}` → `composio_exec`,
+toolkit `googlecalendar`); (2) if it is not connected, the owner's own tools when they are in your
+tool list (`mcp__claude_ai_Google_Calendar__*`); (3) otherwise the Connect card below, or ask the
+owner. Never fall back to the macOS Calendar, Reminders or Contacts app by yourself — it raises a
+permission prompt on the owner's screen (the `native-pim-guard` hook denies the command). Only when
+the owner asked for the local app: `skills/macos-tools` scripts with `--owner-asked`. Once the owner
+denied that permission, never re-prompt.
+
 ## Tools
 
 - `mcp__sutando-station__composio_find` `{query?, apps?: [names], toolkit?, limit?}` returns JSON
@@ -178,6 +187,13 @@ It is read from the task's words and a 30-second cache of the owner's connection
 - Anything else (`mentions=` with `connected=unknown`, an app the request needs that the line does
   not name, a `needs_connect=none`, no line at all): call `composio_find` **once**, with `apps`
   naming every app the request needs and `query` set to the request.
+- `prefer_skill=<skill> for <app>`: a local skill owns that app's job end to end with the owner's own
+  API key from the vault (Smartlead → `campaign-runner`: attach mailboxes, upload leads, write the
+  sequence, preflight, launch). `installed`: invoke that skill and never `composio_exec` the bare
+  toolkit for campaign, sequence, mailbox or lead-upload work — the bare Smartlead connector only
+  creates, reads and deletes a campaign shell, which is what left the owner doing the rest by hand.
+  `not installed`: offer to install it (`marketplace` skill, `install <skill>`), then continue with
+  it; no Connect card for that app.
 
 For each app the request needs:
 
@@ -433,6 +449,11 @@ and wait for their OK. A tool activated mid-conversation is usable at once throu
 - Never disconnect an app, and never switch one without the owner's card tap. Change which of two
   accounts is the default only when the owner asks for that (`set-default`, Step 3b2); never on your
   own, and never to make one call easier (a call that means the other account passes `account`).
+- A Google Doc is edited in place, never rewritten from memory: read it first
+  (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`), then insert / replace-text actions for the change.
+  `GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the whole document and is denied without a read from
+  the last 15 minutes (`hooks/gdocs-write-guard.py`, which also keeps each read as a snapshot under
+  `<workspace>/data/gdocs-backups/`); it is for a full rewrite the owner asked for, and you say so.
 - One card per request, listing every app it needs.
 - Data read from the owner's connected accounts or device (mail, calendar events, contacts, message
   history, files from Drive/Dropbox/Notion, credentials, health or financial records) only in a room

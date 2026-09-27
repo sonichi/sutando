@@ -655,21 +655,48 @@ def _vault_remote_url(vault: "dict | None" = None) -> str:
 # Checks
 # ---------------------------------------------------------------------------
 
-def twilio_configured(env_content: str) -> bool:
-    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+# Everything conversation-server.ts exits without (its own startup check).
+TWILIO_SERVER_VARS = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+
+
+def _dotenv_active_value(env_content: str, var: str) -> str:
+    """The value of an ACTIVE `var=` line in .env text; '' when the line is
+    absent, commented out, or has nothing after the `=`."""
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(var + "="):
+            value = stripped.split("=", 1)[1].strip()
+            if value:
+                return value
+    return ""
+
+
+def twilio_configured(env_content: str, vault_get=None) -> bool:
+    """True when every credential the phone server refuses to start without
+    (TWILIO_SERVER_VARS) resolves: an ACTIVE line with a value in .env, or the
+    Keychain vault (`vault set …`) for each one.
 
     A plain substring test also matched the commented placeholder shipped in
     the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
     never configured Twilio still ran the conversation-server + tunnel
     checks — and startup.sh's matching gate kept a public ngrok tunnel open
-    to a port with nothing behind it (caught 2026-07-02). startup.sh's
-    phone block carries the anchored-grep equivalent of this test.
+    to a port with nothing behind it (caught 2026-07-02). Asking for the SID
+    alone reopened the same hole from the other side: the documented setup
+    vaults the SID + token first and writes TWILIO_PHONE_NUMBER only at
+    `twilio-setup.py buy`, and in that gap the server exits at once while the
+    check reported it down on every run (review of #4666). startup.sh's phone
+    block (`twilio_creds_present`) answers the same question through the
+    channel-token resolver with the anchored test as its grep fallback;
+    tests/health-check-twilio-gate.test.py drives both. `vault_get` is the
+    test seam for the vault tier (None reads the real Keychain).
     """
-    for line in env_content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
-            return True
-    return False
+    for var in TWILIO_SERVER_VARS:
+        if _dotenv_active_value(env_content, var):
+            continue
+        if token_from_vault(var, vault_get=vault_get):
+            continue
+        return False
+    return True
 
 
 def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
@@ -855,7 +882,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -863,7 +891,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
@@ -9179,9 +9207,11 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh --role session --inbox "
+                          "restart via Monitor (timeout_ms 1800000, re-armed on its expiry notice): "
+                          "bash src/watch-tasks-stream.sh --role session --inbox "
                           "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
-                          "($SUTANDO_TASKS_DIR as the inbox when set)"}
+                          "($SUTANDO_TASKS_DIR as the inbox when set); until then the standby "
+                          "supervisor announces tasks through the pane after its 45 s grace"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []

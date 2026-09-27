@@ -64,6 +64,10 @@ from, or the DM when that is where it was asked.
   (no real people's faces, no copyrighted characters)."
 - `no_image`: "Gemini answered with text instead of an image: <message>. Want me to try a more
   concrete description?"
+- `quota`: "I can't generate images with the current Gemini key: Google says it has no image quota
+  (a free-tier key has 0 image requests per day). Enable billing on that key's Google Cloud project,
+  or switch to the managed key in Agent settings → Agent → Gemini API." Say which key it was when
+  the message names it; never retry a quota error.
 - `api_error`: "Image generation failed on Google's side: <message>. I can try once more in a moment."
 - `sdk_missing` (video only): "I can't generate videos on this install: the google-genai package
   is not installed. Run `pip3 install google-genai` on this machine, or I can make an image instead."

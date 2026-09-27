@@ -54,8 +54,8 @@ def manager_for(workspace):
 
 def seat_label(workspace, worker_id) -> str:
     row = sup.supervised_workers(workspace).get(worker_id) or {}
-    label = row.get("label") or worker_id
-    return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id[:8]})"
+    label = sup.pr.display_label(row, worker_id)
+    return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id})"
 
 
 def worker_runtime(workspace, worker_id) -> str | None:

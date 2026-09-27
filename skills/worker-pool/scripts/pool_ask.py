@@ -71,11 +71,13 @@ def who(workspace, *, runner=None) -> list:
         for t in (target if isinstance(target, list) else [target]):
             rooms.setdefault(t, []).append(room)
     obs = sup.observe(workspace, time.time(), **({"runner": runner} if runner else {}))
-    out = [{"id": pr.CORE, "label": "core", "rooms": rooms.get(pr.CORE, []),
+    out = [{"id": pr.CORE, "label": "core", "display_label": "core",
+            "rooms": rooms.get(pr.CORE, []),
             "alive": None, "me": whoami() == pr.CORE}]
     for wid, row in sorted(workers.items()):
         o = obs.get(wid)
         out.append({"id": wid, "label": (row or {}).get("label") or wid,
+                    "display_label": pr.display_label(row, wid),
                     "state": (row or {}).get("state"),
                     "rooms": sorted(rooms.get(wid, [])),
                     "alive": None if o is None else o.session_alive,
@@ -89,7 +91,10 @@ def resolve(workspace, name: str) -> str:
     roster = pr.load_roster(workspace)
     if roster is None:
         raise ValueError("no roster: this host has no pool to ask")
-    rid = pr.resolve_label(roster, name)
+    try:
+        rid = pr.resolve_label(roster, name)
+    except pr.AmbiguousWorkerName as e:
+        raise ValueError(str(e)) from e
     if pr.unknown_targets(roster, [rid]):
         raise ValueError(f"no such recipient: {name!r}")
     return rid
@@ -189,7 +194,10 @@ def main(argv=None) -> int:
                 for r in rows:
                     alive = {True: "alive", False: "DEAD", None: "?"}[r["alive"]]
                     me = "  (you)" if r["me"] else ""
-                    print(f"{r['label']:24} {r['id'][:8]:8} {alive:5} rooms={','.join(r['rooms']) or '-'}{me}")
+                    display = r.get("display_label") or r["label"]
+                    alias = f" alias={r['label']}" if r["label"] != display else ""
+                    name = "core" if r["id"] == pr.CORE else f"{display} ({r['id']})"
+                    print(f"{name} {alive} rooms={','.join(r['rooms']) or '-'}{alias}{me}")
             return 0
         if a.tier != "team" and a.relayed_from is None:
             p.error("--tier below team needs --relayed-from: whose content is it?")

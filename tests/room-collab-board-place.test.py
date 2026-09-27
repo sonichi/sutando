@@ -99,6 +99,37 @@ def test_a_partial_reassert_is_still_measured_against_others():
 
 # --- deleted elements are not obstacles; invalid ones are neither obstacles nor moved
 
+def test_writing_into_an_existing_frame_does_not_move_the_writes():
+    """The reported bug: rewriting a slide's text (a later session, the frame
+    untouched) pushed every text box below the frame, out of the slide."""
+    frame = el("f1", 0, 0, 1280, 720, type="frame")
+    text = el("t1", 100, 100, 400, 60, type="text", frameId="f1")
+    assert place_clear([text], [frame]) == [text], "its own frame is not an obstacle"
+
+
+def test_a_label_inside_its_own_container_does_not_move():
+    box_ = el("b1", 0, 0, 300, 200)
+    label = el("l1", 20, 20, 200, 40, type="text", containerId="b1")
+    assert place_clear([label], [box_]) == [label]
+
+
+def test_another_frame_is_still_an_obstacle():
+    """Control: only the element's OWN frame is exempt."""
+    mine, other = el("f1", 0, 2000, 1280, 720, type="frame"), el("f2", 0, 0, 1280, 720, type="frame")
+    text = el("t1", 100, 100, 400, 60, type="text", frameId="f1")
+    placed = place_clear([text], [mine, other])
+    assert placed[0]["y"] > 100, "text claiming frame f1 but landing on f2 must still move"
+
+
+def test_an_unrelated_shape_inside_the_frame_still_moves_the_batch():
+    """Control: exempting the frame does not exempt what someone else drew in it."""
+    frame = el("f1", 0, 0, 1280, 720, type="frame")
+    theirs = el("x1", 90, 90, 200, 100, frameId="f1")
+    text = el("t1", 100, 100, 400, 60, type="text", frameId="f1")
+    placed = place_clear([text], [frame, theirs])
+    assert placed[0]["y"] > 100, "a collision with a sibling is still a collision"
+
+
 def test_deleted_elements_do_not_occupy_space():
     existing = [el("gone", 0, 0, isDeleted=True)]
     asked = [el("q1", 0, 0)]

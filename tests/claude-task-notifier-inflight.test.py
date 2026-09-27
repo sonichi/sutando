@@ -68,10 +68,10 @@ class RePickTests(FakeTmuxHarness):
         self.write_task("task-dup.txt")
         first = self.run_event("task-dup.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-dup.txt"), 1)
         second = self.run_event("task-dup.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1,
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-dup.txt"), 1,
                          "the same task was typed a second time while its line was still in the pane")
         self.assertIn("awaiting its result", second.stderr)
         self.assertTrue((self.inflight_dir / "task-dup.txt").is_file(), "no in-flight marker after a confirmed submit")
@@ -105,7 +105,7 @@ class RePickTests(FakeTmuxHarness):
         t.join(timeout=5)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("staged but unsent; resuming", second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1, "a staged prompt was typed a second time")
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-swal.txt"), 1, "a staged prompt was typed a second time")
         self.assertGreater(self.sendkeys_log_text().count("ENTER"), enters, "the resume never pressed Enter")
 
     def test_a_restart_between_the_paste_and_the_enter_resumes_at_the_enter(self):
@@ -126,11 +126,11 @@ class RePickTests(FakeTmuxHarness):
         self.write_task("task-evict.txt")
         first = self.run_event("task-evict.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-evict.txt"), 1)
         self.pane_file.write_text("\n".join(f"⏺ output row {i}" for i in range(40)) + "\n" + IDLE_FOOTER + "\n")
         second = self.run_event("task-evict.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 1,
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-evict.txt"), 1,
                          "the prompt was typed again after history evicted it")
         self.assertIn("already submitted to this core", second.stderr)
 
@@ -145,7 +145,7 @@ class RePickTests(FakeTmuxHarness):
         second = self.run_event("task-inc.txt")
         t.join(timeout=5)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "a stale marker held the task after a core restart")
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-inc.txt"), 2, "a stale marker held the task after a core restart")
 
     def test_a_staged_prompt_two_pending_tasks_could_own_is_not_resumed(self):
         # `task-a b.txt` sits typed-unsent while `task-ab.txt` is also pending: the
@@ -183,7 +183,7 @@ class RePickTests(FakeTmuxHarness):
         second = self.run_event("task-race.txt")
         t.join(timeout=5)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "the new core never received the task")
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-race.txt"), 2, "the new core never received the task")
 
     def test_an_unreadable_incarnation_refuses_to_submit(self):
         # Empty identity would read as live forever; the paste never happens.
@@ -268,7 +268,7 @@ class RePickTests(FakeTmuxHarness):
         second = self.run_event("task-ab.txt")
         t.join(timeout=5)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("TYPE"), 2, "the second task was taken for the first")
+        self.assertEqual((lambda log: log.count("TYPE Sutando task ready: task-a b.txt") + log.count("TYPE Sutando task ready: task-ab.txt"))(self.sendkeys_log_text()), 2, "the second task was taken for the first")
 
 
 class MainLoopWiringTest(FakeTmuxHarness):
@@ -292,44 +292,11 @@ class MainLoopWiringTest(FakeTmuxHarness):
 
     def tearDown(self):
         """Every test in this class starts the real main loop, whose standby
-        watcher calls setsid() and so survives a killpg of the notifier."""
+        watcher calls setsid() and so survives a killpg of the notifier.
+        FakeTmuxHarness.addCleanup also reaps; this asserts none remain."""
         left = self._kill_strays()
         super().tearDown()
         self.assertEqual(left, [], "a fixture watcher or fswatch outlived the test")
-
-    def _strays(self):
-        """Pids still naming this fixture. `pgrep -f` matches the full argv;
-        macOS `ps -o command=` truncates it to the terminal width and would
-        silently report none."""
-        out = subprocess.run(["pgrep", "-f", Path(self.root).name],
-                             capture_output=True, text=True).stdout
-        me = os.getpid()
-        return [int(x) for x in out.split() if x.isdigit() and int(x) != me]
-
-    def _kill_strays(self, grace=5.0):
-        """Reap anything still naming this fixture, by process group."""
-        deadline = time.time() + grace
-        while time.time() < deadline:
-            pids = self._strays()
-            if not pids:
-                return []
-            for pid in pids:
-                for killer in (os.killpg, os.kill):
-                    try:
-                        killer(pid, signal.SIGTERM)
-                        break
-                    except (ProcessLookupError, PermissionError):
-                        continue
-            time.sleep(0.3)
-        for pid in self._strays():
-            for killer in (os.killpg, os.kill):
-                try:
-                    killer(pid, signal.SIGKILL)
-                    break
-                except (ProcessLookupError, PermissionError):
-                    continue
-        time.sleep(0.3)
-        return self._strays()
 
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:

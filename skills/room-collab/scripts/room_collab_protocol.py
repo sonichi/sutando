@@ -31,6 +31,9 @@ HTML_PAGE_KIND_RE = re.compile(r"html-([a-z0-9]{8})")
 HTML_PAGES_KEY = "pages"
 # The Doc's pages work the same way: `markdown-<id>`, listed in the main Doc's `pages` map.
 DOC_PAGE_KIND_RE = re.compile(r"markdown-([a-z0-9]{8})")
+# The room's README: a Doc text every room has, outside the `pages` map; the server lets
+# only admins (power level 100) and their agents write it.
+README_KIND = "readme"
 PAGES_KEY = HTML_PAGES_KEY
 PAGE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 PAGE_TITLE_MAX = 80
@@ -44,7 +47,8 @@ def is_html_kind(kind: str | None) -> bool:
 
 def is_markdown_kind(kind: str | None) -> bool:
     """The main Doc or one of its extra pages — the test everywhere `markdown` is special."""
-    return kind == DEFAULT_KIND or (isinstance(kind, str) and DOC_PAGE_KIND_RE.fullmatch(kind) is not None)
+    return kind in (DEFAULT_KIND, README_KIND) or (
+        isinstance(kind, str) and DOC_PAGE_KIND_RE.fullmatch(kind) is not None)
 
 
 def main_kind(kind: str | None) -> str | None:

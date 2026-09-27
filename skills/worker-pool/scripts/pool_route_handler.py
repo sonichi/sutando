@@ -88,8 +88,12 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
         return DECLINE, [], None
-    targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
-                             pr.requested_worker_of(task))
+    try:
+        targets = pr.targets_for(roster, task.get("channel_id") or task.get("source") or "",
+                                 pr.requested_worker_of(task))
+    except pr.AmbiguousWorkerName as e:
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], roster
     # One question only: is every target on the roster? Anything else -- no
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
@@ -161,6 +165,8 @@ def main(argv=None) -> int:
         return MUST_HANDLE
     if args.probe:
         return code
+    if code == MUST_HANDLE:
+        return MUST_HANDLE
     if code == DECLINE:
         return DECLINE
 

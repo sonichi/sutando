@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Rename a worker after creation: change its display label, keep its id.
+"""Change a worker's base routing label after creation; keep its id.
 
 A label was settable only at `create_worker --label`, so a worker created
 without one showed its 32-hex id in the picker and the desktop terminal tab
-for life. The roster is the one store of labels; `pool_roster.rename_worker`
-rewrites it under the roster lock and the compile republishes the
-advertisement. The tmux session name is derived from the id and stays.
+for life. `pool_roster.rename_worker` updates the base routing alias under the
+roster lock; any AG2 Space display-label override remains separate. The tmux
+session name is derived from the id and stays.
 
 Run: python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new name>" [--workspace W]
 """
@@ -30,7 +30,7 @@ REFUSED = 2
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="rename a worker (its label; the id stays)")
     ap.add_argument("--worker", required=True, help="the worker's id or current label")
-    ap.add_argument("--label", required=True, help="the new display name")
+    ap.add_argument("--label", required=True, help="the new base routing alias")
     ap.add_argument("--workspace", default=None)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)

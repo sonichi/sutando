@@ -11,8 +11,21 @@ connector tools, first:
 Not connected → follow the `connect-apps` skill: one Connect card (a message in the owner's DM; in a
 room with other people a private card under their message that only they see), the task closes, and
 the answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
-Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
-macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
+
+The order, always: (1) the Station connector above; (2) if it is not connected, the owner's own
+calendar tools when they are in your tool list (`mcp__claude_ai_Google_Calendar__*`, or `gws calendar`
+if installed); (3) otherwise ask the owner what to do. **Never open the native macOS Calendar,
+Reminders or Contacts app on your own** — an `osascript`/`open -a` against them raises a macOS
+permission prompt on the owner's screen (the `native-pim-guard` hook denies it). Only when the owner
+asked for the local app in this conversation: run the `skills/macos-tools` script with `--owner-asked`
+(raw commands need the `SUTANDO_ALLOW_NATIVE_PIM=1` prefix). The owner can allow the local apps for
+the host once with `python3 skills/macos-tools/scripts/native_pim_consent.py grant` in their own
+terminal (`revoke` / `status` too) — tell them the command, never run it yourself, and never write
+`state/native-pim-consent` (or delete a `*-automation-denied` marker) any other way: the hook denies
+`touch`, redirects, `python3 -c "…grant()"` and every other spelling. That flag and
+prefix are strings you write: they keep you from acting on your own initiative, they do not prove
+who asked, and on a non-owner task the hook and the scripts both refuse them (`hooks/README.md`). Once the owner denied
+the permission (`-1743`, stored in `state/<app>-automation-denied`), never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
 ```bash
 gws calendar +agenda --today            # fallback: today's events (table format by default)
@@ -59,8 +72,11 @@ Content here...
 
 **Email (Gmail, Outlook)** — the Station connector first: `composio_find` `{"apps": ["gmail"], "query": "<what
 you need>"}`, then `composio_exec` with the action it returns (search, read, draft, send). Not connected →
-the `connect-apps` skill, as for Calendar. Fallback only when the Station tools aren't available: the
-`gws-gmail` skill (OAuth, no app password needed):
+the `connect-apps` skill, as for Calendar; never ask the owner to generate an app password (connecting is
+one Connect card). **After a send, read it back**: fetch the sent message by id and confirm recipient and
+subject match what the owner approved before reporting it sent — that is the check the older draft/send
+mismatch incidents lacked. Fallback only when the Station tools aren't available: the
+`gws-gmail` skill (OAuth, no app password needed), and after that the app-password IMAP/SMTP path below:
 ```bash
 gws gmail +send --to "to@x.com" --subject "subj" --body "body"
 gws gmail +triage                               # unread inbox summary
@@ -72,11 +88,21 @@ gws gmail users messages list --params 'q=keyword'  # search
 
 **Finding a specific email** — when the obvious query fails, invoke `/email-find <description>`. Broad-before-narrow playbook (full-inbox scan → partner-domain fanout → thread re-walk) that refuses to give up after one or two failed queries. See `skills/email-find/SKILL.md` for the workflow and rules around subject-mismatch + `get_thread` truncation. Per-user partner-domain mappings live in your own memory (the skill describes the file format).
 
-**Contacts** — look up people by name or email:
+**Contacts** — look up people by name or email. The Station's People store and connectors come first
+(`people__list_people`, `composio_find {"apps": ["google contacts"]}`); the native macOS Contacts app
+only when the owner asked for it (`--owner-asked`; without it the script refuses, exit 2; a macOS
+denial exits 3 and is never retried):
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"   # find by name
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob" --owner-asked   # find by name
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
+The voice/phone `call_contact` inline tool ("call Mary", "find Bob's number") is the second native
+Contacts path: it runs in the voice process, which has no Station client, so it searches the local
+Contacts app only behind the host opt-in (`SUTANDO_ALLOW_NATIVE_PIM=1` in the server env, or the
+`native_pim_consent.py grant` marker); otherwise it answers with what the owner must do once, and a
+stored macOS denial makes it answer "denied" without opening the app. It asks `native_pim_consent.py
+check` / `report-error` for that verdict (one policy, no TypeScript copy); if that check cannot run,
+the app is not opened.
 
 **Google Contacts — writable in practice, but NOT via a contract Google supports.** The entry above
 is macOS Contacts and is lookup-only. It is not the only contacts path: on 2026-09-04 an agent that
@@ -154,12 +180,14 @@ OAuth1-only; `user-timeline` reads the same endpoint by handle over bearer, so i
 `timeline` cannot. Its `--limit` is 5..100 (`search`'s is 10..100 — different endpoints).
 Always confirm post content with user before publishing.
 
-**Reminders** — read/write macOS Reminders (to-do list):
+**Reminders** — read/write macOS Reminders (to-do list). Same rule as Calendar: a connected task app
+via the Station first (`composio_find {"apps": ["google tasks"]}`), the native app only when the owner
+asked for it (`--owner-asked`; without it the script refuses, exit 2; a macOS denial exits 3, no retry):
 ```bash
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py list             # incomplete reminders
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob"    # add reminder
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17"  # with due date
-python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob"  # mark done
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py list --owner-asked             # incomplete reminders
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob" --owner-asked    # add reminder
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17" --owner-asked  # with due date
+python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob" --owner-asked  # mark done
 ```
 Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
 
@@ -198,6 +226,18 @@ node src/browser.mjs "https://example.com" --headed           # watch automation
 node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+
+Claude Code's own `--chrome` browsing needs the **Claude in Chrome extension** installed
+in the person's Chrome (https://claude.ai/chrome); nothing can install it for them, and
+the desktop's setup card ("Let it see and act") shows whether it is there. Without it,
+fall back to `src/browser.mjs` or `skills/macos-use`.
+
+**Show browser steps as they happen.** For any task that browses on someone's behalf, post
+each step (one line + a screenshot of the page), and always a screenshot before a purchase,
+booking or submit: `skills/task-progress/scripts/step.py --message "…" --screenshot <path>`,
+the path being a picture the working session took of the live page (`--capture <url>` is a
+fresh load, never the approval shot). An owner errand and anything read from the owner's
+accounts go to the owner DM, not a shared room (details in `skills/task-progress/SKILL.md`).
 Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
 raise that command-level limit to at most 300,000 ms. Navigation uses the
 remaining command budget, and declared `wait:` actions must fit the budget or
@@ -229,6 +269,7 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Auto-summary when calls/meetings end
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
+- Setup from the chat: `skills/phone-conversation/scripts/twilio-setup.py status|numbers|buy|set-webhook` buys the number and points its webhook here; only the Twilio sign-up + card are manual (SKILL.md "Setup from the chat")
 
 **Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to AG2 Space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
 
@@ -269,7 +310,13 @@ Station); the owner does it from Agent settings → Runtime → Restart engine.
 
 **Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
 Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
-ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+ToolSearch is the fallback when the tool is not in your list). **Google Docs edits are partial by
+default**: read the document first (`GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT`; the read is kept as a snapshot
+under `<workspace>/data/gdocs-backups/<doc id>/`), then `GOOGLEDOCS_INSERT_TEXT_ACTION`,
+`GOOGLEDOCS_REPLACE_ALL_TEXT` or `GOOGLEDOCS_INSERT_TEXT_IN_TABLE_CELL` for the change.
+`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` replaces the ENTIRE document — a hook denies it without a read
+from the last 15 minutes (an owner's doc was wiped that way, 2026-09-20); use it only for a full rewrite
+the owner asked for, and say so. Connecting one is the `connect-apps`
 skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
 payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
 owner-only card and nothing is posted. Its helper:

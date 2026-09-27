@@ -117,6 +117,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
 - **`migration_safety_helpers.sh`** — shellcheck shell=bash PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
+- **`native-pim-consent.ts`** — Native PIM consent — the voice-process client of skills/macos-tools/scripts/native_pim_consent.py.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
@@ -221,6 +222,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
+- **`vault-secret.ts`** — Read a secret the owner stored with `vault set KEY …` from the Keychain item that src/vault_intercept.py writes (`security add-generic-password -a sutando -s KEY`).
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
 - **`vault_set_grammar.py`** — Pure, dependency-free `vault set KEY VALUE` grammar — regex + redact-only.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification
