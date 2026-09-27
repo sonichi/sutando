@@ -125,6 +125,18 @@ the same supervisor pid; the second handoff took 12 s.
   their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
   carries an explicit `--role` (`session` or `standby`) and `--inbox`, and the watcher enforces it.
 
+## Interrupted handlers and the next watcher (#4825)
+
+A watcher stopped while its task-event handler is in flight decides nothing at shutdown: it
+logs the claim it leaves and exits. Every watcher, before its startup sweep and again before
+each dispatch, retires claims whose owner is gone (`reconcile_dead_claims`: the pid must be
+alive, not a zombie, and carry the start time the claim recorded, read under `LC_ALL=C`; an
+unreadable `ps` keeps the claim and says so). The router's replay follows the delivery already
+committed for the task, under one per-task lock, and repairs a missing attribution; it refuses
+when two recipients hold the task or the record and the fact disagree. The transitions a kill
+can land in are exposed as `SUTANDO_WATCHER_TRANSITION_HOOK` (see the script header), which is
+how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts each one.
+
 ## Tests that pin this
 
 - `tests/watch-tasks-stream-role-session-kills-standby.test.sh`: the handoff contract with the real

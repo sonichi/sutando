@@ -6,9 +6,10 @@ calls — there is no daemon here, and there must not be one: a second process w
 re-watch `tasks/`, which the watcher already does across code hardened by many
 incidents.
 
-Its whole input is the roster and one task. Nothing else may be read, which is
-what makes a pass testable by replay: same roster, same task, same deliveries,
-with no clock, no directory listing and no liveness probe in the decision.
+Its whole input is the roster, one task, and the deliveries already made for
+that task (attribution, or a sentinel in any recipient folder), which is what
+makes a pass testable by replay: same roster, same task, same deliveries, with
+no clock and no liveness probe in the decision.
 
 The one thing it may NOT do is substitute one WORKER for another. A target not on
 the roster goes to the core, which is a recipient rather than a fallback.
@@ -16,6 +17,8 @@ recipient is how a task reaches someone the owner never addressed.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import sys
 from pathlib import Path
@@ -45,7 +48,55 @@ def order_candidates(tasks) -> list:
                        t.get("created_at") or "", t.get("id") or ""))
 
 
-def deliver_one(workspace, recipient: str, task_id: str) -> str:
+class ConflictingDelivery(RouterRefused):
+    """Two recipients hold the task, or the record names one and the fact another."""
+
+
+@contextlib.contextmanager
+def task_arbitration(workspace, task_id: str):
+    """One lock per TASK around the whole decision: find what is committed,
+    then attribute or create. Two passes racing the same task with different
+    bindings would otherwise each take a different folder lock and make twins."""
+    d = pa.attribution_dir(workspace)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / f".{task_id}.lock", "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def holders(workspace, task_id: str) -> list[str]:
+    """Every recipient folder holding a sentinel for `task_id`, under any suffix."""
+    root = pd.deliveries_dir(workspace, pr.CORE).parent
+    if not root.is_dir():
+        return []
+    return sorted(f.name for f in root.iterdir()
+                  if f.is_dir() and pd.find(workspace, f.name, task_id) is not None)
+
+
+def committed_recipient(workspace, task_id: str) -> str | None:
+    """The recipient a delivery for `task_id` already committed to, or None.
+
+    Attribution is the record; a sentinel in ANY recipient folder is the fact
+    behind it (a crash can leave the fact without the record). A replay must
+    follow this, never the current binding. Two holders, or a record naming
+    one recipient while the fact names another, is an anomaly: refused, so it
+    surfaces instead of being resolved by whichever pass runs next.
+    """
+    worker = pa.worker_for_task(workspace, task_id)
+    held = holders(workspace, task_id)
+    if len(held) > 1 or (worker is not None and held and held != [worker]):
+        raise ConflictingDelivery(
+            f"{task_id}: attribution={worker!r} sentinels in {held}; refusing to choose")
+    if worker is not None:
+        return worker
+    return held[0] if held else None
+
+
+def deliver_one(workspace, recipient: str, task_id: str,
+                _between_sentinel_and_attribution=None) -> str:
     """Create one sentinel. Returns 'delivered' | 'already' | 'no-payload'.
 
     Checks BOTH names: a sentinel already renamed to `.accepted` is work in
@@ -55,12 +106,16 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
     A sentinel names a payload; without one it names nothing, and its recipient
     can only delete it. An ARCHIVED payload is the dangerous case — that is
     finished work, and a sentinel would offer it again.
+
+    `_between_sentinel_and_attribution` is a test seam: the two writes are not
+    crash-atomic, so an existing sentinel is re-attributed on 'already'.
     """
     d = pd.deliveries_dir(workspace, recipient)
     # Check-of-both-names and create are ONE transition under the folder's lock:
     # an accept between them renames the pending name away and O_EXCL recreates it.
     with pd.arbitration(workspace, recipient):
         if pd.find(workspace, recipient, task_id) is not None:
+            _attribute(workspace, recipient, task_id)
             return "already"
         if not pd.payload_path(Path(workspace), task_id).is_file():
             return "no-payload"
@@ -68,12 +123,20 @@ def deliver_one(workspace, recipient: str, task_id: str) -> str:
             os.close(os.open(d / (task_id + pd.PENDING_SUFFIX),
                              os.O_CREAT | os.O_EXCL))
         except FileExistsError:
+            _attribute(workspace, recipient, task_id)
             return "already"
+        if _between_sentinel_and_attribution:
+            _between_sentinel_and_attribution()
         # Under the SAME lock as the sentinel: attribution and delivery are one
         # fact. Recording earlier attributed refusals that never delivered.
-        if recipient != pr.CORE:
-            pa.record(workspace, task_id, recipient)
+        _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _attribute(workspace, recipient: str, task_id: str) -> None:
+    """Idempotent: `record` is first-write-wins, and the core is never attributed."""
+    if recipient != pr.CORE:
+        pa.record(workspace, task_id, recipient)
 
 
 def route(workspace, task: dict, roster=None) -> dict:
@@ -91,23 +154,30 @@ def route(workspace, task: dict, roster=None) -> dict:
     if not task_id:
         raise RouterRefused("task has no id")
 
-    source = task.get("channel_id") or task.get("source") or ""
-    try:
-        targets = pr.targets_for(r, source, pr.requested_worker_of(task))
-    except pr.AmbiguousWorkerName as e:
-        raise RouterRefused(str(e)) from e
+    # The whole decision under one per-task lock: what is committed wins over
+    # the current binding, and only when nothing is may the binding create.
+    with task_arbitration(workspace, task_id):
+        committed = committed_recipient(workspace, task_id)
+        if committed is not None:
+            targets, unknown = [committed], []
+        else:
+            source = task.get("channel_id") or task.get("source") or ""
+            try:
+                targets = pr.targets_for(r, source, pr.requested_worker_of(task))
+            except pr.AmbiguousWorkerName as e:
+                raise RouterRefused(str(e)) from e
 
-    # A name not on the roster is not a worker: the core takes it. The core is
-    # a recipient, not a fallback, and no OTHER worker ever gets the task.
-    unknown = pr.unknown_targets(r, targets)
-    if unknown:
-        targets = [pr.CORE]
+            # A name not on the roster is not a worker: the core takes it. The core is
+            # a recipient, not a fallback, and no OTHER worker ever gets the task.
+            unknown = pr.unknown_targets(r, targets)
+            if unknown:
+                targets = [pr.CORE]
 
-    # Liveness is not consulted: a durable sentinel is found by a worker that starts later.
-    # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
-    buckets = {"delivered": [], "already": [], "no-payload": []}
-    for t in targets:
-        buckets[deliver_one(workspace, t, task_id)].append(t)
+        # Liveness is not consulted: a durable sentinel is found by a worker that starts later.
+        # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
+        buckets = {"delivered": [], "already": [], "no-payload": []}
+        for t in targets:
+            buckets[deliver_one(workspace, t, task_id)].append(t)
     return {"task_id": task_id, "version": r.get("version"),
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"],

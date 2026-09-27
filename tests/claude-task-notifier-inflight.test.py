@@ -465,7 +465,16 @@ class MainLoopWiringTest(FakeTmuxHarness):
         claims_dir = self.state_dir / "task-event-handler-claims"
         claims_dir.mkdir(parents=True, exist_ok=True)
         self.write_task("task-claimed.txt")
-        (claims_dir / "task-claimed.txt").write_text("claimed\n")
+        task = self.tasks_dir / "task-claimed.txt"
+        # A claim held by a LIVE watcher: the watcher retires a dead owner's claim
+        # before every dispatch, so a placeholder would be swept and typed.
+        holder = subprocess.Popen(["sleep", "100000"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        start = subprocess.run(["ps", "-o", "lstart=", "-p", str(holder.pid)], capture_output=True,
+                               text=True, env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        (claims_dir / "task-claimed.txt").write_text(
+            f"{holder.pid}\nlive-watcher\n{task}\nmust-handle\n{start}\n")
         proc = subprocess.Popen(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),

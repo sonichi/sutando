@@ -16,6 +16,12 @@
 # The agent reads the named files via the Read tool when notifications
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
+#
+# SUTANDO_WATCHER_TRANSITION_HOOK=<executable>: run synchronously at each
+# ownership transition of a handled task, as `<hook> <transition> <task file>`
+# with transition in before-claim | after-handler | after-done. A dependency
+# seam for observation and for tests that must interrupt a real transition;
+# its exit status is ignored and its stderr dropped.
 
 # fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
 # A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
@@ -409,21 +415,36 @@ retry_held_tasks_if_due() {
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
 # A pid alone can be recycled between a watcher's death and the next sweep;
-# the start time beside it tells the recycled process from the owner.
+# the start time beside it, read in one fixed locale, tells them apart.
 proc_start() {
-  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'
+}
+
+# A zombie answers kill -0 but will never act; ps reports it as Z.
+proc_is_zombie() {
+  case "$(LC_ALL=C ps -o stat= -p "$1" 2>/dev/null | sed 's/^ *//')" in Z*) return 0 ;; esac
+  return 1
 }
 
 claim_is_live() {
-  local claim="$1" owner_pid owner_start
+  local claim="$1" owner_pid owner_start live_start
   [ -f "$claim" ] || return 1
   owner_pid="$(sed -n '1p' "$claim" 2>/dev/null)"
   case "$owner_pid" in
     ""|*[!0-9]*) return 1 ;;
   esac
   kill -0 "$owner_pid" 2>/dev/null || return 1
+  proc_is_zombie "$owner_pid" && return 1
   owner_start="$(sed -n '5p' "$claim" 2>/dev/null)"
-  [ -z "$owner_start" ] || [ "$owner_start" = "$(proc_start "$owner_pid")" ]
+  [ -n "$owner_start" ] || return 0
+  live_start="$(proc_start "$owner_pid")"
+  if [ -z "$live_start" ]; then
+    # Unknown is not dead: keep the claim (a strand is recoverable, a concurrent
+    # handler is not) and say so; every later dispatch re-asks (reconcile_dead_claims).
+    echo "watch-tasks-stream: cannot read the start time of pid $owner_pid holding $(basename "$claim"); keeping the claim until ps answers" >&2
+    return 0
+  fi
+  [ "$owner_start" = "$live_start" ]
 }
 
 remove_claim() {
@@ -446,7 +467,14 @@ acquire_task_claim() {
   local filename="$1" task_path="$2" disposition="${3:-fallback}" claim temporary attempts=0
   claim="$CLAIMS_DIR/$filename"
   temporary="$CLAIMS_DIR/.claim-$WATCHER_ID-$filename"
-  printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" "$(proc_start "$$")" > "$temporary"
+  local own_start
+  own_start="$(proc_start "$$")"
+  if [ -z "$own_start" ]; then
+    # A claim without its owner's start time would read as pid-only forever.
+    echo "watch-tasks-stream: cannot read my own start time (ps); not claiming $filename this pass" >&2
+    return 1
+  fi
+  printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" "$own_start" > "$temporary"
   while [ "$attempts" -lt 3 ]; do
     # A hard link publishes the fully written claim atomically and fails if
     # another watcher already owns the destination; it never clobbers.
@@ -546,17 +574,45 @@ publish_terminal_failure() {
 #
 # Idempotent, so a handler declared later still works with no restart; only
 # the claim bookkeeping remains -- handler runs are synchronous, no queue.
+# Overlapping watchers preserve a live owner's claim. A dead owner's record is
+# quarantined before any dispatch: a stale claim makes both notifiers drop the task.
+# `redispatch`: a task freed mid-lifetime is dispatched again here, since no sweep follows.
+reconcile_dead_claims() {
+  local claim task_path freed=""
+  [ -d "$CLAIMS_DIR" ] || return 0
+  [ "${RECONCILING:-0}" -eq 0 ] || return 0
+  RECONCILING=1
+  shopt -s nullglob
+  for claim in "$CLAIMS_DIR"/task-*.txt; do
+    claim_is_live "$claim" && continue
+    task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
+    retire_stale_claim "$claim" && freed="$freed$task_path
+"
+  done
+  shopt -u nullglob
+  if [ "${1:-}" = "redispatch" ] && [ -n "$freed" ]; then
+    while IFS= read -r task_path; do
+      [ -n "$task_path" ] && [ -f "$task_path" ] && dispatch_task "$task_path"
+    done <<< "$freed"
+  fi
+  RECONCILING=0
+}
+
 prepare_handler_state() {
   [ -z "$HANDLER_STATE_READY" ] || return 0
   mkdir -p "$CLAIMS_DIR" "$FALLBACKS_DIR"
-  shopt -s nullglob
-  for claim in "$CLAIMS_DIR"/task-*.txt; do
-    # Overlapping watchers preserve a live owner's claim. A dead owner's
-    # record is atomically quarantined before the new sweep retries it.
-    claim_is_live "$claim" || retire_stale_claim "$claim" || true
-  done
-  shopt -u nullglob
+  reconcile_dead_claims
   HANDLER_STATE_READY=1
+}
+
+# Dependency seam at each ownership transition (see the header): the hook runs
+# synchronously with the transition's name, so a kill can land inside it.
+transition() {
+  [ -n "${SUTANDO_WATCHER_TRANSITION_HOOK:-}" ] || return 0
+  # Backgrounded and waited on, so a signal interrupts the wait (bash defers
+  # traps until a foreground child exits); cleanup's kill 0 ends the hook.
+  "$SUTANDO_WATCHER_TRANSITION_HOOK" "$1" "$2" 2>/dev/null &
+  wait "$!" 2>/dev/null || true
 }
 
 if [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ]; then
@@ -604,6 +660,7 @@ run_handler_now() {
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
+  transition before-claim "$filename"
   if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
     return 0
   fi
@@ -650,8 +707,10 @@ run_handler_now() {
       timed_out=1
       rm -f "$timeout_flag"
     fi
+    transition after-handler "$filename"
     if [ "$handler_rc" -eq 0 ]; then
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
+      transition after-done "$filename"
     fi
   fi
 
@@ -807,6 +866,7 @@ dispatch_task() {
   [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
 "
   read_handler_config_now
+  reconcile_dead_claims redispatch
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
     [ -n "$HELD_NAMES" ] || HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
     HELD_NAMES="$HELD_NAMES$filename
@@ -967,6 +1027,7 @@ trap 'cleanup; exit 0' HUP INT TERM
 # fallback receipt is emitted.
 startup_sweep() {
   local fn
+  reconcile_dead_claims
   while IFS= read -r fn; do
     dispatch_task "$TASKS_DIR/$fn"
   done < <(priority_sorted_tasks)

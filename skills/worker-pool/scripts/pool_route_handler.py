@@ -79,6 +79,15 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
+    # A replay follows the delivery already committed to a worker, whatever the
+    # bindings say now; the roster still decides for a task nobody holds yet.
+    try:
+        committed = rt.committed_recipient(workspace, task.get("id") or "")
+    except rt.ConflictingDelivery as e:
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if committed is not None and committed != pr.CORE:
+        return 0, [committed], None
     try:
         raw = pr._load_existing_roster_strict(workspace)
     except pr.RosterError:
