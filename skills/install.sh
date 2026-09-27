@@ -59,6 +59,10 @@ while IFS= read -r root; do
     elif [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
       rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
       echo "  ✓ $skill_name ($label, relinked — old symlink was broken)"
+    elif [ -L "$TARGET/$skill_name" ] && [ ! -f "$TARGET/$skill_name/SKILL.md" ]; then
+      # A removed skill can leave its folder behind (untracked files), so the old link still resolves.
+      rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
+      echo "  ✓ $skill_name ($label, relinked — old link pointed at a folder with no SKILL.md)"
     elif [ -e "$TARGET/$skill_name" ]; then
       echo "  ⚠ $skill_name ($label; target exists, skipping)"
     else

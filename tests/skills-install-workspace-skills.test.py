@@ -67,6 +67,18 @@ class WorkspaceSkillsAreLinked(unittest.TestCase):
         self.assertTrue((self.ccd / "skills" / "apartment-finder").is_symlink(), out)
         self.assertFalse((self.ccd / "skills" / "elsewhere-only").exists(), out)
 
+    def test_a_link_to_a_folder_left_without_skill_md_is_relinked(self):
+        # A removed skill can leave its folder behind with only untracked files in it.
+        husk = Path(self.tmp.name) / "old-checkout" / "skills" / "apartment-finder"
+        (husk / "__pycache__").mkdir(parents=True)
+        skills = self.ccd / "skills"
+        skills.mkdir(parents=True)
+        (skills / "apartment-finder").symlink_to(husk)
+        out = run_install(self.ccd, self.ws)
+        self.assertEqual(Path(os.readlink(skills / "apartment-finder")).resolve(),
+                         (self.ws / "skills" / "apartment-finder").resolve(), out)
+        self.assertIn("relinked — old link pointed at a folder with no SKILL.md", out)
+
     def test_no_workspace_skills_folder_is_fine(self):
         import shutil
         shutil.rmtree(self.ws / "skills")
