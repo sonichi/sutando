@@ -302,6 +302,10 @@ unset __my_kind __holders __hpid __hrole __hkids __k __kstart __hread __hsince _
 unset -f __holder_live __still_holder __abort_blind 2>/dev/null || true
 # Optional task handlers run synchronously, inline -- see run_handler_now().
 HANDLER_STATE_READY=""
+# The handler this watcher is waiting on right now, so a signal-time settle
+# can collect its exit status instead of guessing from the leftover claim.
+INFLIGHT_HANDLER_PID=""
+INFLIGHT_HANDLER_TASK=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
 FSWATCH_PID=""
@@ -634,8 +638,12 @@ run_handler_now() {
       kill -TERM "$handler_pid" 2>/dev/null; sleep 1
       kill -KILL "$handler_pid" 2>/dev/null ) &
     watchdog_pid=$!
+    INFLIGHT_HANDLER_PID="$handler_pid"
+    INFLIGHT_HANDLER_TASK="$filename"
     wait "$handler_pid" 2>/dev/null
     handler_rc=$?
+    INFLIGHT_HANDLER_PID=""
+    INFLIGHT_HANDLER_TASK=""
     kill -TERM "$watchdog_pid" 2>/dev/null
     wait "$watchdog_pid" 2>/dev/null
     if [ -f "$timeout_flag" ]; then
@@ -902,6 +910,17 @@ _tmux_wake() {
 #
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
 # to settle its own claim -- this settles directly from CLAIMS_DIR instead.
+# The signal cut run_handler_now()'s wait, not the handler: bash keeps a child's
+# status until it is waited for, and the run watchdog still bounds a live one.
+inflight_handler_finished() {
+  local filename="$1" rc
+  [ -n "$INFLIGHT_HANDLER_PID" ] && [ "$INFLIGHT_HANDLER_TASK" = "$filename" ] || return 1
+  wait "$INFLIGHT_HANDLER_PID" 2>/dev/null
+  rc=$?
+  INFLIGHT_HANDLER_PID=""; INFLIGHT_HANDLER_TASK=""
+  [ "$rc" -eq 0 ]
+}
+
 settle_own_claims_on_shutdown() {
   local claim filename task_path announce claim_settled verdict
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
@@ -913,6 +932,12 @@ settle_own_claims_on_shutdown() {
     [ -n "$task_path" ] || continue
     announce="$(task_announce "$task_path")"
     claim_settled=1
+    if inflight_handler_finished "$filename"; then
+      echo "watch-tasks-stream: task handler for $filename had already finished; settling its claim as done" >&2
+      record_worker_done "$filename" done "$WORKSPACE_DIR" || true
+      release_task_claim "$filename" || true
+      continue
+    fi
     claim_disposition "$filename"
     verdict=$?
     case $verdict in
