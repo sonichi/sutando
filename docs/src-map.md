@@ -182,6 +182,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
+- **`skill_roots.py`** — The ordered set of directories that hold skills, shared by every skill loader.
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.

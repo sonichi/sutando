@@ -30,31 +30,43 @@ for skill_dir in "$SKILLS_DIR"/*/; do
   fi
 done
 
-# The owner's own skills live in <workspace>/skills/, the folder that survives an engine
-# update (the engine tree is replaced). A shipped skill wins a name collision.
-WS="$(bash "$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-if [ -n "$WS" ] && [ -d "$WS/skills" ]; then
-  for skill_dir in "$WS"/skills/*/; do
+# Skills outside the engine tree (workspace, external plugin dirs, sibling checkouts), in skill-roots
+# order. A shipped skill wins a name collision; otherwise the first root holding the name does.
+CONFIG="$(cd "$SKILLS_DIR/.." && pwd)/scripts/sutando-config.sh"
+WS="$(bash "$CONFIG" workspace 2>/dev/null || true)"
+ROOTS=""
+[ -n "$WS" ] && ROOTS="$(bash "$CONFIG" skill-roots "$WS" 2>/dev/null || true)"
+CLAIMED=$'\n'
+while IFS= read -r root; do
+  [ -n "$root" ] || continue
+  [ "$(cd "$root" && pwd -P)" = "$(cd "$SKILLS_DIR" && pwd -P)" ] && continue
+  if [ "$root" = "$WS/skills" ]; then kind="workspace"; else kind="$root"; fi
+  for skill_dir in "$root"/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name=$(basename "$skill_dir")
     [ ! -f "$skill_dir/SKILL.md" ] && continue
     if [ -d "$SKILLS_DIR/$skill_name" ] && [ -f "$SKILLS_DIR/$skill_name/SKILL.md" ]; then
-      echo "  ⚠ $skill_name (workspace copy shadowed by the shipped skill of the same name — rename yours)"
+      echo "  ⚠ $skill_name ($kind copy shadowed by the shipped skill of the same name — rename yours)"
       continue
     fi
+    case "$CLAIMED" in *$'\n'"$skill_name"$'\n'*)
+      echo "  ⚠ $skill_name ($kind copy shadowed by an earlier skill root)"; continue ;;
+    esac
+    CLAIMED="$CLAIMED$skill_name"$'\n'
+    label="$kind skill"; [ "$kind" = "workspace" ] || label="skill from $kind"
     if [ -L "$TARGET/$skill_name" ] && [ "$(readlink "$TARGET/$skill_name")" = "${skill_dir%/}" ]; then
-      echo "  ↻ $skill_name (workspace skill, symlink exists)"
+      echo "  ↻ $skill_name ($label, symlink exists)"
     elif [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
       rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
-      echo "  ✓ $skill_name (workspace skill, relinked — old symlink was broken)"
+      echo "  ✓ $skill_name ($label, relinked — old symlink was broken)"
     elif [ -e "$TARGET/$skill_name" ]; then
-      echo "  ⚠ $skill_name (workspace skill; target exists, skipping)"
+      echo "  ⚠ $skill_name ($label; target exists, skipping)"
     else
       ln -s "${skill_dir%/}" "$TARGET/$skill_name"
-      echo "  ✓ $skill_name (workspace skill)"
+      echo "  ✓ $skill_name ($label)"
     fi
   done
-fi
+done <<< "$ROOTS"
 
 echo ""
 echo "Installed. Skills available in any Claude Code session."

@@ -82,6 +82,63 @@ def workspace_skills(mod):
                     os.environ[k] = v
 
 
+def outside_the_engine(mod):
+    """A skill in a sibling checkout's skills/ or an external plugin dir is supervised too;
+    the workspace comes first, and a shipped skill still wins."""
+    import tempfile
+    print("── sibling-checkout and external-dir skills ──")
+    keys = ("SUTANDO_EXTERNAL_PLUGIN_DIRS", "SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR", "WS_FIXTURE_PYTHON")
+    saved, saved_repo = {k: os.environ.get(k) for k in keys}, mod.REPO
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        engine, ws = tmp / "engine" / "sutando", tmp / "workspace"
+        sibling, external = tmp / "engine" / "neighbor" / "skills", tmp / "plugins" / "extra"
+        def put(base, dir_name, worker):
+            skill = base / dir_name
+            (skill / "scripts").mkdir(parents=True, exist_ok=True)
+            (skill / "scripts" / "loop.py").write_text("# a worker\n", encoding="utf-8")
+            (skill / "manifest.json").write_text(json.dumps({"supervised_worker": {
+                "name": worker, "script": "scripts/loop.py",
+                "interpreter": {"config": "WS_FIXTURE_PYTHON"}}}), encoding="utf-8")
+        (engine / "skills" / "shipped-fixture").mkdir(parents=True)
+        (ws / "skills").mkdir(parents=True)
+        put(sibling, "sibling-fixture", "sibling-worker")
+        put(sibling, "shipped-fixture", "sibling-shadow-worker")
+        put(ws / "skills", "both-places", "ws-first-worker")
+        put(sibling, "both-places", "sibling-second-worker")
+        put(external / "skills", "external-fixture", "external-worker")
+        mod.REPO = engine
+        os.environ.update(SUTANDO_EXTERNAL_PLUGIN_DIRS=str(external), WS_FIXTURE_PYTHON=sys.executable)
+        for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
+            os.environ.pop(k, None)
+        try:
+            order = [m.parent.name for m in mod._skill_manifests(workspace=ws)]
+            check("roots are scanned workspace, external dir, then sibling checkout",
+                  order == ["both-places", "external-fixture", "sibling-fixture"], str(order))
+            real = mod._skill_manifests
+            mod._skill_manifests = lambda: real(workspace=ws)
+            try:
+                specs, skipped = mod._skill_worker_specs()
+            finally:
+                mod._skill_manifests = real
+            names = {s.name for s in specs}
+            check("a sibling checkout's skill worker is supervised", "sibling-worker" in names, str(skipped))
+            check("an external plugin dir's skill worker is supervised", "external-worker" in names, str(skipped))
+            spec = find(specs, "sibling-worker")
+            check("...running the script inside the sibling skill", spec is not None and
+                  Path(spec.argv[1]) == (sibling / "sibling-fixture" / "scripts" / "loop.py").resolve())
+            check("a shipped skill folder shadows a sibling's", "sibling-shadow-worker" not in names)
+            check("the workspace copy wins over a sibling's", "ws-first-worker" in names
+                  and "sibling-second-worker" not in names, str(names))
+        finally:
+            mod.REPO = saved_repo
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def main() -> int:
     mod = load()
     check("core names no concrete skill",
@@ -179,6 +236,7 @@ def main() -> int:
             os.environ["SYNTHETIC_WORKER_PYTHON"] = keep
 
     workspace_skills(mod)
+    outside_the_engine(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0
