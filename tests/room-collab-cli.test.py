@@ -711,7 +711,7 @@ def test_the_comment_command_parses_its_flags():
 
 
 
-def test_readme_access_reads_the_lock_from_the_room_doc_authz():
+def test_readme_access_reads_the_lock_from_the_room_collab_authz():
     class _Resp:
         def __init__(self, body):
             self._body = body
