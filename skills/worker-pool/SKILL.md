@@ -93,9 +93,11 @@ tasks to its worker instead of answering them itself. If it was never
 published (a fresh install whose only registrations ever went through
 `bind_room()`, or one where the file was lost), every room pinned since then
 silently falls through to the core: the room still gets an answer, just from
-the wrong instance, and nothing errors. Check with:
+the wrong instance, and nothing errors. Check with (from the repo root, so
+the relative `sys.path` inserts resolve):
 
 ```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
 python3 -c "
 import sys; sys.path.insert(0, 'src')
 from util_paths import task_event_handler_config_path
@@ -107,9 +109,10 @@ print(task_event_handler_config_path('$WS/state').exists())
 `deliveries/<worker id>/` never gets a sentinel for that room's traffic) means
 routing has never actually reached the worker. Stopgap, safe to run any time —
 it is the exact call `register_worker()` makes, just without a registration
-attached:
+attached (also from the repo root):
 
 ```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
 python3 -c "
 import sys; sys.path.insert(0, 'skills/worker-pool/scripts')
 from pool_roster import publish_task_event_handler
