@@ -40,6 +40,48 @@ def find(specs, name):
     return next((s for s in specs if s.name == name), None)
 
 
+def workspace_skills(mod):
+    """A skill in <workspace>/skills/ is supervised like a shipped one; a shipped
+    skill of the same name wins, as in skills/install.sh."""
+    import tempfile
+    print("── a workspace skill ──")
+    saved = {k: os.environ.get(k) for k in ("SUTANDO_TEST_MODE", "SUTANDO_WORKSPACE", "WS_FIXTURE_PYTHON")}
+    with tempfile.TemporaryDirectory() as tmp:
+        ws, elsewhere = Path(tmp) / "workspace", Path(tmp) / "other-checkout" / "skills"
+        def put(dir_name, worker):
+            skill = elsewhere / dir_name
+            (skill / "scripts").mkdir(parents=True, exist_ok=True)
+            (skill / "scripts" / "loop.py").write_text("# a worker\n", encoding="utf-8")
+            (skill / "manifest.json").write_text(json.dumps({"supervised_worker": {
+                "name": worker, "script": "scripts/loop.py",
+                "interpreter": {"config": "WS_FIXTURE_PYTHON"}}}), encoding="utf-8")
+            (ws / "skills").mkdir(parents=True, exist_ok=True)
+            (ws / "skills" / dir_name).symlink_to(skill)
+        put("zz-ws-fixture-skill", "ws-fixture-worker")
+        shipped = next(p.parent.name for p in sorted((REPO / "skills").glob("*/manifest.json")))
+        put(shipped, "ws-shadow-worker")
+        os.environ.update(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws), WS_FIXTURE_PYTHON=sys.executable)
+        try:
+            specs, skipped = mod._skill_worker_specs()
+            spec = find(specs, "ws-fixture-worker")
+            check("a workspace skill's declared worker is supervised", spec is not None, str(skipped))
+            if spec is not None:
+                check("...running the script inside that skill (through its symlink)",
+                      Path(spec.argv[1]) == (elsewhere / "zz-ws-fixture-skill" / "scripts" / "loop.py").resolve())
+            check("a workspace skill named like a shipped skill is not supervised",
+                  find(specs, "ws-shadow-worker") is None)
+            os.environ.pop("WS_FIXTURE_PYTHON")
+            _, skipped = mod._skill_worker_specs()
+            check("an unconfigured workspace worker names its own manifest",
+                  any("ws-fixture-worker" in s and str(ws) in s for s in skipped), str(skipped))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def main() -> int:
     mod = load()
     check("core names no concrete skill",
@@ -135,6 +177,8 @@ def main() -> int:
         os.environ.pop("SYNTHETIC_WORKER_PYTHON", None)
         if keep is not None:
             os.environ["SYNTHETIC_WORKER_PYTHON"] = keep
+
+    workspace_skills(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0

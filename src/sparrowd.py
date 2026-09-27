@@ -24,6 +24,18 @@ import re  # noqa: E402
 _WORKER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
+def _skill_manifests(workspace=None) -> list:
+    """Shipped skills' manifests, then the workspace's own skills' (`<workspace>/skills/`).
+    A shipped skill wins a name collision, as in skills/install.sh."""
+    shipped = REPO / "skills"
+    found = sorted(shipped.glob("*/manifest.json"))
+    ws_skills = Path(workspace if workspace is not None else resolve_workspace()) / "skills"
+    if ws_skills.resolve() != shipped.resolve():
+        found += [m for m in sorted(ws_skills.glob("*/manifest.json"))
+                  if not (shipped / m.parent.name).is_dir()]
+    return found
+
+
 def _skill_worker_specs() -> "tuple[list, list[str]]":
     """Every installed skill that declares a `supervised_worker`, found by
     scanning manifests. Returns (specs, reasons-for-the-ones-skipped).
@@ -41,7 +53,7 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
     import json
 
     specs, skipped = [], []
-    for manifest in sorted((REPO / "skills").glob("*/manifest.json")):
+    for manifest in _skill_manifests():
         skill_dir = manifest.parent
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -77,7 +89,7 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             needs = interp.get("needs")
             specs_needs = f" (it needs {needs})" if isinstance(needs, str) and needs else ""
             skipped.append(f"{name}: no interpreter configured: set {key} in "
-                           f"skills/{skill_dir.name}/manifest.json{specs_needs}")
+                           f"{manifest}{specs_needs}")
             continue
         if not Path(py).is_file():
             skipped.append(f"{name}: configured interpreter does not exist: {py}")
