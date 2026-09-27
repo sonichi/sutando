@@ -19,6 +19,10 @@ ends with EXACTLY ONE delivery and a released claim:
   c/d. after delivery, before the done record / before the release -- the state
        a kill there leaves (sentinel present, claim naming a dead pid) is what
        the next watcher sees; it must say already and release, never re-deliver
+  e. a left-behind claim is now the normal path, so its pid may be recycled
+     before the next sweep: a claim naming a LIVE pid with the wrong start time
+     is retired and the task finished; the same pid with its true start time is
+     a live owner and the claim is preserved (the task is not re-run under it)
 
 On the parent commit arms b1/b2 fail: the first watcher's shutdown announces
 the task (`TASK_FILE:` on stdout), the duplicate this pins out.
@@ -268,17 +272,69 @@ def arm_after_delivery(sub: str, label: str) -> None:
         w2.stop()
 
 
+def proc_start(pid: int) -> str:
+    return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def arm_recycled_pid() -> None:
+    print("\narm e1: the left-behind claim names a pid that was recycled by another process")
+    w = Workspace()
+    w.mode("normal")
+    task = w.task("task-e.txt")
+    (w.deliv / "task-e.pending").touch()
+    holder = subprocess.Popen(["sleep", "100000"])       # a live pid that is NOT the owner
+    w.claims.mkdir(parents=True)
+    (w.claims / "task-e.txt").write_text(
+        f"{holder.pid}\nsome-dead-watcher\n{task}\nfallback\nSat Jan  1 00:00:00 2000\n")
+    w2 = Watcher(w)
+    try:
+        w2.start()
+        expect_settled(w, w2, "task-e.txt", want_delivered=0, want_already=1)
+    finally:
+        w2.stop()
+        holder.kill()
+        holder.wait()
+
+
+def arm_live_owner_preserved() -> None:
+    print("\narm e2: the claim names a live pid WITH its true start time — a live owner, left alone")
+    w = Workspace()
+    w.mode("normal")
+    task = w.task("task-f.txt")
+    holder = subprocess.Popen(["sleep", "100000"])
+    w.claims.mkdir(parents=True)
+    claim = w.claims / "task-f.txt"
+    claim.write_text(f"{holder.pid}\nsome-live-watcher\n{task}\nfallback\n{proc_start(holder.pid)}\n")
+    before = claim.read_text()
+    w2 = Watcher(w)
+    try:
+        w2.start()
+        time.sleep(4.0)      # long enough for the sweep to have run the handler if it were going to
+        check("the live owner's claim is preserved untouched",
+              claim.is_file() and claim.read_text() == before,
+              claim.read_text()[:80] if claim.is_file() else "retired")
+        check("and the handler is NOT run under another watcher's live claim", w.log() == [], str(w.log()))
+    finally:
+        w2.stop()
+        holder.kill()
+        holder.wait()
+
+
 def main() -> int:
     arm_before_probe()
     arm_during_routing("b1", "hang-before", want_delivered=1, want_already=0)
     arm_during_routing("b2", "hang-after", want_delivered=1, want_already=1)
     arm_after_delivery("c", "after delivery, before the done record")
     arm_after_delivery("d", "after the done record, before the release")
+    arm_recycled_pid()
+    arm_live_owner_preserved()
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
         return 1
     print("\nPASS — a kill at any phase ends with exactly one delivery, no announce, "
-          "no refusal, and a claim the next watcher retires and releases")
+          "no refusal, and a claim the next watcher retires and releases; a recycled "
+          "pid is told from a live owner by the start time")
     return 0
 
 

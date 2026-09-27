@@ -408,14 +408,22 @@ retry_held_tasks_if_due() {
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
+# A pid alone can be recycled between a watcher's death and the next sweep;
+# the start time beside it tells the recycled process from the owner.
+proc_start() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'
+}
+
 claim_is_live() {
-  local claim="$1" owner_pid
+  local claim="$1" owner_pid owner_start
   [ -f "$claim" ] || return 1
   owner_pid="$(sed -n '1p' "$claim" 2>/dev/null)"
   case "$owner_pid" in
     ""|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$owner_pid" 2>/dev/null
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  owner_start="$(sed -n '5p' "$claim" 2>/dev/null)"
+  [ -z "$owner_start" ] || [ "$owner_start" = "$(proc_start "$owner_pid")" ]
 }
 
 remove_claim() {
@@ -438,7 +446,7 @@ acquire_task_claim() {
   local filename="$1" task_path="$2" disposition="${3:-fallback}" claim temporary attempts=0
   claim="$CLAIMS_DIR/$filename"
   temporary="$CLAIMS_DIR/.claim-$WATCHER_ID-$filename"
-  printf '%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" > "$temporary"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" "$(proc_start "$$")" > "$temporary"
   while [ "$attempts" -lt 3 ]; do
     # A hard link publishes the fully written claim atomically and fails if
     # another watcher already owns the destination; it never clobbers.
