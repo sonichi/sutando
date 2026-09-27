@@ -9,7 +9,8 @@ current-track-archive.md beside it. Rotation reads the whole file and replaces i
 that read and that replace would be lost: both operations take the same
 cross-platform advisory lock on <file>.lock.
 
-    append(path, text)                -> None
+    append(path, text, keep_bytes, auto_rotate, pin) -> RotateResult | None
+                                              (None unless the write crossed keep_bytes)
     replace(path, text)               -> None   (create or rewrite the whole head)
     rotate(path, keep_bytes, pin) -> RotateResult(head, archived, oversized)
 
@@ -102,7 +103,7 @@ def append(path: Path, text: str, keep_bytes: int = DEFAULT_KEEP,
     with locked(path):
         with open(path, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
-        if not auto_rotate or _size(path.read_text(encoding="utf-8")) <= keep_bytes:
+        if not auto_rotate or path.stat().st_size <= keep_bytes:
             return None
         return _rotate_locked(path, keep_bytes, False, pin, None)
 
