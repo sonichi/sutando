@@ -57,14 +57,19 @@ else
 fi
 git checkout -q main
 
-# 4. detached HEAD (e.g. `git worktree add --detach` predecessor state) is
-#    exempt -- it is a read, not an authored branch.
+# 4. detached HEAD in the PRIMARY checkout is refused too -- a commit made
+#    there still leaves the primary on a new, unreviewed commit nothing
+#    points at, the same risk as a leftover feature branch (found in review
+#    of #4810: the original guard exempted `branch == HEAD` unconditionally).
 detached_sha="$(git rev-parse HEAD)"
 git checkout -q "$detached_sha"
 echo z > c.txt
 git add c.txt
-if git commit -q -m "detached HEAD" >/dev/null 2>&1; then ok "primary checkout, detached HEAD: commit allowed"
-else bad "primary checkout, detached HEAD: commit allowed"; fi
+if git commit -q -m "detached HEAD" >/dev/null 2>&1; then
+    bad "primary checkout, detached HEAD: commit refused"
+else
+    ok "primary checkout, detached HEAD: commit refused"
+fi
 git checkout -q main
 rm -f c.txt
 
@@ -78,6 +83,18 @@ if git commit -q -m "in a real worktree" >/dev/null 2>&1; then
     ok "real worktree on a feature branch: commit allowed"
 else
     bad "real worktree on a feature branch: commit allowed"
+fi
+
+# 6. a real worktree in detached HEAD is still exempt -- the git-dir check
+#    alone decides it, regardless of branch state.
+detached_wt_sha="$(git rev-parse HEAD)"
+git checkout -q "$detached_wt_sha"
+echo v > e.txt
+git add e.txt
+if git commit -q -m "in a real worktree, detached HEAD" >/dev/null 2>&1; then
+    ok "real worktree, detached HEAD: commit allowed"
+else
+    bad "real worktree, detached HEAD: commit allowed"
 fi
 
 if [ "$fails" -eq 0 ]; then echo "pre-commit-live-checkout-branch: all checks passed"; else echo "FAILED: $fails"; fi

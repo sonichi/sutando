@@ -56,15 +56,18 @@ fi
 # worktree, where feature branches are the whole point). A worktree's
 # git-dir path contains "/worktrees/"; the primary checkout's does not.
 # Bridges/core auto-restart onto the primary checkout, so a leftover feature
-# branch there ships stale/unreviewed code to the live runtime — this
-# recurred four times (2026-07-25, 08-06, 09-14, 09-26) before this guard.
+# branch OR a detached commit there ships stale/unreviewed code to the live
+# runtime — this recurred four times (2026-07-25, 08-06, 09-14, 09-26) before
+# this guard. Detached HEAD is not exempt: a commit made there still leaves
+# the primary on a new, unreviewed commit nothing points at (caught in review
+# of #4810 by Qingyun's Personal Codex).
 gitdir="$(git rev-parse --git-dir)"
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo)"
-if [[ "$gitdir" != */worktrees/* ]] && [[ -n "$branch" ]] && [[ "$branch" != "main" ]] && [[ "$branch" != "HEAD" ]]; then
-  printf '\n\033[31m✖ pre-commit refusing: committing to branch '"'"'%s'"'"' in the PRIMARY checkout.\033[0m\n\n' "$branch"
+if [[ "$gitdir" != */worktrees/* ]] && [[ -n "$branch" ]] && [[ "$branch" != "main" ]]; then
+  printf '\n\033[31m✖ pre-commit refusing: committing to '"'"'%s'"'"' in the PRIMARY checkout.\033[0m\n\n' "$branch"
   printf 'The primary checkout stays on main -- bridges/core auto-restart onto this\n'
-  printf 'tree, so a leftover feature branch here ships stale/unreviewed code (recurred\n'
-  printf '2026-07-25, 08-06, 09-14, 09-26).\n\n'
+  printf 'tree, so a leftover feature branch or a detached commit here ships\n'
+  printf 'stale/unreviewed code (recurred 2026-07-25, 08-06, 09-14, 09-26).\n\n'
   printf 'Author PRs in a worktree instead:\n'
   printf '  git worktree add ../wt-%s\n\n' "$branch"
   printf 'or (Claude Code sessions): the EnterWorktree tool.\n\n'
