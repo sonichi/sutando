@@ -167,8 +167,17 @@ class TestDoubleDelivery(Base):
         d = pd.deliveries_dir(self.ws, W1)
         d.mkdir(parents=True, exist_ok=True)
         os.close(os.open(d / "task-1.txt", os.O_CREAT | os.O_EXCL))
-        with patch.object(pd, "find", return_value=None):   # check misses it
+        # The anchored check (`find_in`) misses it, so the O_EXCL create must be
+        # what arbitrates: prove the create was attempted and lost.
+        real_open, opens = os.open, []
+
+        def counting_open(*a, **kw):
+            if a and isinstance(a[0], str) and a[0].startswith("task-1") and (a[1] & os.O_EXCL):
+                opens.append(a[0])
+            return real_open(*a, **kw)
+        with patch.object(pd, "find_in", return_value=None), patch.object(rt.os, "open", counting_open):
             got = rt.route(self.ws, self.task(), r)
+        self.assertEqual(opens, ["task-1.txt"], "the O_EXCL create never ran: the race was not reached")
         self.assertEqual(got["already"], [W1])
         self.assertEqual(got["delivered"], [])
 
