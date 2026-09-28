@@ -1215,6 +1215,74 @@ describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 		h.t.disconnect();
 	});
 
+	it('live, then backoff past the deadline: the attempt fails as upstream-lost, not unreachable', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'live' }));
+		s.binary(new ArrayBuffer(640));
+		s.message(frame({ upstream: 'backoff' }));
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Reconnecting to the model…');
+		await delay(50);
+		assert.equal(h.failures.length, 1, 'exactly one classified failure');
+		assert.equal(h.failures[0].kind, 'agent-failed');
+		assert.equal(h.failures[0].reason, 'upstream-lost');
+		assert.equal(h.failures[0].category, 'network');
+		assert.match(h.statuses[h.statuses.length - 1].detail ?? '', /lost the model/);
+		assert.doesNotMatch(h.failures[0].remediation, /Gemini key/, 'the key worked on this call');
+		assert.equal(s.readyState, 3, 'the socket was closed by the client');
+		await h.t.closeSettled();
+	});
+
+	it('live, backoff, live inside the deadline: no failure, and the next outage gets a fresh window', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'live' }));
+		s.binary(new ArrayBuffer(640));
+		s.message(frame({ upstream: 'backoff' }));
+		await delay(15);
+		s.message(frame({ upstream: 'live' }));
+		await delay(30);
+		assert.equal(h.failures.length, 0, 'a reconnect inside the window is not a failure');
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Live — speak now');
+		s.message(frame({ upstream: 'backoff' }));
+		await delay(15);
+		assert.equal(h.failures.length, 0, 'the second outage starts its own window');
+		await delay(30);
+		assert.equal(h.failures.length, 1);
+		assert.equal(h.failures[0].reason, 'upstream-lost');
+	});
+
+	it('the agent\'s redial frames do not restart the deadline', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'connecting' }));
+		for (let i = 0; i < 6; i += 1) {
+			await delay(10);
+			s.message(frame({ upstream: i % 2 ? 'connecting' : 'backoff' }));
+		}
+		// 60 ms of frames every 10 ms against a 30 ms window: failed by now, once.
+		assert.equal(h.failures.length, 1, 'one failure despite frames landing inside the window');
+		assert.equal(h.failures[0].reason, 'upstream-unreachable');
+	});
+
+	it('a Retry after upstream-lost starts a fresh attempt with its own deadline and reason', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'live' }));
+		s.binary(new ArrayBuffer(640));
+		s.message(frame({ upstream: 'backoff' }));
+		await delay(50);
+		assert.equal(h.failures.length, 1);
+		await h.t.closeSettled();
+		const s2 = await goLive(h);
+		s2.message(frame({ upstream: 'backoff' }));
+		await delay(15);
+		assert.equal(h.failures.length, 1, 'the new attempt is inside its own window');
+		await delay(30);
+		assert.equal(h.failures.length, 2);
+		assert.equal(h.failures[1].reason, 'upstream-unreachable', 'nothing was received on the new attempt');
+	});
+
 	it('a disconnect during backoff disarms the deadline: no late error after the user hung up', async () => {
 		const h = harness({ upstreamDeadlineMs: 30 });
 		const s = await goLive(h);
