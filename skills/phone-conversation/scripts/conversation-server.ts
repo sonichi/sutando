@@ -68,6 +68,7 @@ import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
+import { drainMayExit, healthPayload, isDrainBlocked, ngrokRespawnDelayMs } from './server-lifecycle.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -1276,17 +1277,34 @@ function killPortOccupant(port: number): void {
 // --- ngrok ---
 
 let ngrokProcess: ChildProcess | null = null;
+// Shutdown state: a SIGTERM with live calls drains instead of dropping them.
+const STARTED_AT = Date.now();
+let shuttingDown = false;
+let draining = false;
+let drainStartedAt = 0;
+let ngrokRespawns = 0;
 
 async function startNgrokCli(port: number): Promise<string> {
 	try { execSync('pkill -f "ngrok http"', { stdio: 'ignore' }); } catch {}
 	await new Promise(r => setTimeout(r, 500));
-	ngrokProcess = spawn('ngrok', ['http', String(port), '--log=stdout'], {
+	const proc = spawn('ngrok', ['http', String(port), '--log=stdout'], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 		env: { ...process.env, NGROK_AUTHTOKEN },
 	});
-	ngrokProcess.stderr?.on('data', (d: Buffer) => {
+	ngrokProcess = proc;
+	proc.stderr?.on('data', (d: Buffer) => {
 		const line = d.toString().trim();
 		if (line) console.error(`${ts()} [ngrok] ${line}`);
+	});
+	// The tunnel is supervised here, by the process that owns it: an ngrok that
+	// dies is respawned with backoff, and Twilio is re-pointed when the URL moved.
+	proc.on('exit', (code, signal) => {
+		if (shuttingDown || ngrokProcess !== proc) return;
+		ngrokProcess = null;
+		ngrokRespawns += 1;
+		const delay = ngrokRespawnDelayMs(ngrokRespawns);
+		console.error(`${ts()} [ngrok] exited (code=${code} signal=${signal}); respawn ${ngrokRespawns} in ${delay / 1000}s`);
+		setTimeout(() => { void respawnNgrok(port); }, delay).unref();
 	});
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
@@ -1299,6 +1317,51 @@ async function startNgrokCli(port: number): Promise<string> {
 		} catch {}
 	}
 	throw new Error('ngrok tunnel did not start within 15s');
+}
+
+async function respawnNgrok(port: number): Promise<void> {
+	if (shuttingDown) return;
+	try {
+		const url = await startNgrokCli(port);
+		ngrokRespawns = 0;
+		if (url !== WEBHOOK_BASE_URL) {
+			console.log(`${ts()} [ngrok] tunnel back at ${url} (was ${WEBHOOK_BASE_URL})`);
+			WEBHOOK_BASE_URL = url;
+			if (process.env.TWILIO_AUTO_WEBHOOK === '1') {
+				await syncTwilioWebhook({ sid: TWILIO_ACCOUNT_SID, token: TWILIO_AUTH_TOKEN, number: TWILIO_PHONE_NUMBER }, WEBHOOK_BASE_URL, {
+					log: (line) => console.log(`${ts()} ${line}`),
+					error: (line) => console.error(`${ts()} ${line}`),
+				});
+			}
+		} else {
+			console.log(`${ts()} [ngrok] tunnel back at ${url}`);
+		}
+	} catch (err) {
+		// startNgrokCli failing counts as another exit: the same backoff applies.
+		ngrokRespawns += 1;
+		const delay = ngrokRespawnDelayMs(ngrokRespawns);
+		console.error(`${ts()} [ngrok] respawn failed (${err instanceof Error ? err.message : String(err)}); retry in ${delay / 1000}s`);
+		setTimeout(() => { void respawnNgrok(port); }, delay).unref();
+	}
+}
+
+/** SIGTERM/SIGINT: exit at once when idle; with live calls, refuse new call work
+ *  (503) and exit when the last call ends or the drain cap elapses. Never mid-call. */
+function beginShutdown(signal: string): void {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	if (activeCalls.size === 0) { cleanupNgrok(); process.exit(0); }
+	draining = true;
+	drainStartedAt = Date.now();
+	console.log(`${ts()} [Server] ${signal} with ${activeCalls.size} live call(s): draining, new calls refused`);
+	const tick = setInterval(() => {
+		if (drainMayExit(activeCalls.size, drainStartedAt, Date.now())) {
+			clearInterval(tick);
+			console.log(`${ts()} [Server] drain complete (${activeCalls.size} call(s) left); exiting`);
+			cleanupNgrok();
+			process.exit(0);
+		}
+	}, 1000);
 }
 
 function cleanupNgrok(): void {
@@ -1353,9 +1416,14 @@ const server = createServer(async (req, res) => {
 		return;
 	}
 
+	if (isDrainBlocked(path, req.method, draining)) {
+		json(res, 503, { error: 'draining: the server is shutting down after its live calls end', activeCalls: activeCalls.size });
+		return;
+	}
+
 	try {
 		if (path === '/health' && req.method === 'GET') {
-			json(res, 200, { status: 'ok', activeCalls: activeCalls.size, webhookUrl: WEBHOOK_BASE_URL });
+			json(res, 200, { ...healthPayload({ activeCalls: activeCalls.size, webhookUrl: WEBHOOK_BASE_URL, startedAt: STARTED_AT, bundlePath: process.argv[1] ?? '' }), draining });
 
 		} else if (path === '/call' && req.method === 'POST') {
 			await waitForWebhook();
@@ -1908,9 +1976,9 @@ async function start(): Promise<void> {
 	}
 }
 
-process.on('SIGINT', () => { cleanupNgrok(); process.exit(0); });
-process.on('SIGTERM', () => { cleanupNgrok(); process.exit(0); });
-process.on('uncaughtException', (err) => { console.error(`${ts()} [FATAL]`, err); cleanupNgrok(); process.exit(1); });
-process.on('unhandledRejection', (err) => { console.error(`${ts()} [FATAL]`, err); cleanupNgrok(); process.exit(1); });
+process.on('SIGINT', () => beginShutdown('SIGINT'));
+process.on('SIGTERM', () => beginShutdown('SIGTERM'));
+process.on('uncaughtException', (err) => { console.error(`${ts()} [FATAL]`, err); shuttingDown = true; cleanupNgrok(); process.exit(1); });
+process.on('unhandledRejection', (err) => { console.error(`${ts()} [FATAL]`, err); shuttingDown = true; cleanupNgrok(); process.exit(1); });
 
 start().catch(err => { console.error('Fatal:', err); cleanupNgrok(); process.exit(1); });
