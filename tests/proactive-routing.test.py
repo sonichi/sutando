@@ -223,8 +223,9 @@ def test_slack_active_routes_to_slack():
 
 
 def test_claims_unless_routed_elsewhere_yields_only_to_another_bridge():
-    """The Slack bridge's untagged rule: no record, an unreadable one or a
-    non-bridge channel keeps the claim; a record naming another bridge yields."""
+    """The Slack bridge's untagged rule on a Slack-only install: no record, an
+    unreadable one or a non-bridge channel keeps the claim; a record naming
+    another bridge yields."""
     from proactive_routing import claims_unless_routed_elsewhere, proactive_filename
 
     def run(state):
@@ -239,6 +240,48 @@ def test_claims_unless_routed_elsewhere_yields_only_to_another_bridge():
     assert claims_unless_routed_elsewhere("proactive-1.txt", Path("/nonexistent/x.json"), "slack") is True
     assert claims_unless_routed_elsewhere(proactive_filename(1, "discord"), Path("/nonexistent/x.json"), "slack") is False
     assert claims_unless_routed_elsewhere(proactive_filename(1, "slack"), Path("/nonexistent/x.json"), "slack") is True
+
+
+def test_no_record_on_a_multi_bridge_install_keeps_the_discord_default():
+    """Yixuan: with no activity record, slack claiming AND discord's default
+    claiming made the destination whoever polled first. Beside another bridge,
+    slack yields to the deterministic default; alone, it claims."""
+    from proactive_routing import claims_unless_routed_elsewhere, other_bridges_configured
+    import tempfile
+
+    def run(state):
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", other_bridges_configured=True) is False
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", other_bridges_configured=False) is True
+        assert should_claim_proactive(state, "discord") is True, "the default still delivers it"
+    _with_state({"channel": "voice", "ts": 1}, run)
+    _with_state({"nope": 1}, run)
+    assert claims_unless_routed_elsewhere("proactive-1.txt", Path("/nonexistent/x.json"), "slack", other_bridges_configured=True) is False
+    # A recorded Slack activity still wins beside other bridges.
+    _with_state({"channel": "slack", "ts": 1}, lambda state: (
+        claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", other_bridges_configured=True) is True or (_ for _ in ()).throw(AssertionError("slack owner must win"))))
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        assert other_bridges_configured("slack", root) is False
+        (root / "slack").mkdir(); (root / "slack" / "access.json").write_text("{}")
+        assert other_bridges_configured("slack", root) is False, "slack's own dir does not count"
+        (root / "discord").mkdir(); (root / "discord" / ".env").write_text("x=1\n")
+        assert other_bridges_configured("slack", root) is True
+
+
+def test_a_slack_address_in_the_body_outranks_activity_routing():
+    """Rui: on main Slack delivered a body carrying a Slack channel address
+    whoever the owner was on; adding slack to BRIDGE_CHANNELS must not lose
+    that. Discord has the same override (discord-bridge _discord_claims)."""
+    from proactive_routing import claims_unless_routed_elsewhere
+    slack_body = "[channel: C0123456789]\nheads up\n"
+    discord_body = "[channel: 123456789012345678]\nheads up\n"
+
+    def run(state):
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", body=slack_body, other_bridges_configured=True) is True
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", body=discord_body, other_bridges_configured=True) is False
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack", body="plain\n", other_bridges_configured=True) is False
+    _with_state({"channel": "discord", "ts": 1}, run)
+    _with_state({"nope": 1}, run)
 
 
 def test_bridge_channels_set_is_documented():
@@ -269,6 +312,8 @@ def main():
     test_unrecognized_channel_defaults_to_discord()
     test_slack_active_routes_to_slack()
     test_claims_unless_routed_elsewhere_yields_only_to_another_bridge()
+    test_no_record_on_a_multi_bridge_install_keeps_the_discord_default()
+    test_a_slack_address_in_the_body_outranks_activity_routing()
     test_bridge_channels_set_is_documented()
     print("All proactive-routing tests passed.")
 

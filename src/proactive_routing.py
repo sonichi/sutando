@@ -145,22 +145,39 @@ def should_claim_proactive_file(name, state_file_path: Path,
     return should_claim_proactive(state_file_path, this_channel)
 
 
-def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: str) -> bool:
-    """A bridge's untagged claim that yields only to a RECORDED owner activity on
-    another bridge channel: with no record (or a non-bridge one) it claims as it
-    always did, so a single-channel install delivers before the owner ever spoke."""
+def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: str,
+                                   body=None, other_bridges_configured: bool = False) -> bool:
+    """A bridge's untagged claim. In order: a `.to-<channel>` tag names the bridge;
+    a body whose `[channel:]` address is this bridge's kind outranks activity
+    routing (Discord has the same override); a RECORDED owner activity on a
+    bridge channel routes there; with no record (or a non-bridge one) a lone
+    bridge claims, while on a multi-bridge install the deterministic default
+    (should_claim_proactive: discord) keeps the file."""
     dest = proactive_destination(name)
     if dest is not None:
         return dest == this_channel
+    if body is not None and body_target_channel(body) == this_channel:
+        return True
     try:
         with open(state_file_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         last = data.get("channel") if isinstance(data, dict) else None
     except (OSError, ValueError, AttributeError):
-        return True
+        last = None
     if isinstance(last, str) and last in BRIDGE_CHANNELS:
         return last == this_channel
-    return True
+    return not other_bridges_configured
+
+
+def other_bridges_configured(this_channel: str, channels_root) -> bool:
+    """Whether any OTHER bridge is installed under `channels_root` (a channel dir
+    carrying `.env` or `access.json`, health-check's own evidence)."""
+    root = Path(channels_root)
+    for channel in sorted(BRIDGE_CHANNELS - {this_channel}):
+        base = root / channel
+        if (base / ".env").exists() or (base / "access.json").exists():
+            return True
+    return False
 
 
 def fallback_claims_name(name, this_channel: str) -> bool:
