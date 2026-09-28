@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,73 @@ class TestReportFeedbackRedaction(unittest.TestCase):
 
         self.assertIn("key=<redacted>&alt=sse", redacted)
         self.assertNotIn("future-secret", redacted)
+
+
+class TestBuildVersions(unittest.TestCase):
+    def test_packaged_install_without_git(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine = Path(td)
+            repo = engine / "sutando"
+            repo.mkdir()
+            (engine / "build-info.json").write_text(json.dumps({
+                "sutando": {"version": "v0.8.1-3-gabc", "commit": "abc"},
+                "ag2space": {"version": "0.5.1", "commit": "def"},
+            }))
+            versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["sutando"]["commit"], "abc")
+            self.assertEqual(versions["ag2space"]["version"], "0.5.1")
+
+    def test_checkout_uses_own_commit_and_marks_local_edits(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", td, *args],
+                                               stderr=subprocess.DEVNULL, text=True).strip()
+            git("init")
+            (repo / "package.json").write_text('{"version":"0.1.0"}')
+            git("add", "package.json")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
+            git("tag", "v0.8.1")
+            (repo / "package.json").write_text('{"version":"0.1.1"}')
+            versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["sutando"]["commit"], git("rev-parse", "HEAD"))
+            self.assertEqual(versions["sutando"]["version"], "v0.8.1-dirty")
+            self.assertEqual(versions["ag2space"]["version"], "unknown")
+
+    def test_missing_or_malformed_metadata_does_not_prevent_reporting(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "sutando"
+            repo.mkdir()
+            for contents in ("{bad", '[]', '{"sutando":42,"ag2space":null}'):
+                (repo.parent / "build-info.json").write_text(contents)
+                versions = report_feedback.build_versions(repo)
+                self.assertEqual(versions["sutando"]["commit"], "unknown")
+                self.assertEqual(versions["ag2space"]["version"], "unknown")
+
+    def test_desktop_checkout_reports_host_version_and_separate_commits(self):
+        with tempfile.TemporaryDirectory() as td:
+            desktop = Path(td)
+            repo = desktop / "engine" / "sutando"
+            (repo / ".git").mkdir(parents=True)
+            (desktop / ".git").mkdir()
+            (desktop / "src-tauri").mkdir()
+            (desktop / "src-tauri" / "tauri.conf.json").write_text('{"version":"0.5.2"}')
+            def git(source, *args):
+                prefix = "sutando" if source == repo else "desktop"
+                return prefix + ("-sha" if args[0] == "rev-parse" else "-build")
+            with mock.patch.object(report_feedback, "_git", side_effect=git):
+                versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["ag2space"]["version"], "0.5.2")
+            self.assertEqual(versions["ag2space"]["commit"], "desktop-sha")
+            self.assertEqual(versions["sutando"]["commit"], "sutando-sha")
+
+    def test_git_failure_does_not_prevent_reporting(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".git").mkdir()
+            with mock.patch.object(subprocess, "check_output", side_effect=OSError("missing git")):
+                self.assertEqual(report_feedback.build_versions(repo)["sutando"]["commit"], "unknown")
 
 
 class TestReportFeedbackCloudAuth(unittest.TestCase):
@@ -294,7 +362,10 @@ class TestAskFirst(unittest.TestCase):
             posted.append((req.full_url, json.loads(req.data.decode()))); return _FakeResp()
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td, {"sendLogs": False})
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True})
+            incident_versions = {"sutando": {"version": "v1", "commit": "abc"},
+                                 "ag2space": {"version": "v2", "commit": "def"}}
+            with mock.patch.object(report_feedback, "build_versions", return_value=incident_versions):
+                did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
@@ -302,6 +373,7 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual(posted[0][0], "https://x/api/feedback")
             body = posted[0][1]
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
+            self.assertEqual(body["context"]["versions"], incident_versions)
             self.assertTrue(body["context"]["logs_opted_out"])
             self.assertEqual(report_feedback.list_drafts(ws), [])
 
@@ -954,6 +1026,9 @@ class TestMain(unittest.TestCase):
                 mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
             self._run(["--title", "hello", "--no-logs"])
         self.assertEqual(uo.call_count, 1)
+        ctx = json.loads(uo.call_args.args[0].data)["context"]
+        self.assertIn("sutando", ctx["versions"])
+        self.assertIn("ag2space", ctx["versions"])
 
     def _posted_context(self, argv, ws):
         seen = {}

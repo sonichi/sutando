@@ -29,6 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Optional
 
 # Cloud session lookup lives in src/cloud_auth.py; the names stay importable
 # here because tests and the redirect guard read them off this module.
@@ -75,6 +76,61 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+
+
+def _git(repo: Path, *args: str) -> Optional[str]:
+    # Without this guard git can walk up and report an unrelated parent repo.
+    if not (repo / ".git").exists():
+        return None
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL,
+            timeout=2, text=True,
+        ).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def build_versions(repo: Optional[Path] = None) -> dict:
+    """Identify this engine and its host, including installs without Git.
+
+    Packaged metadata is stamped by AG2Space's build script. Source checkouts
+    use their own Git identity; a standalone Sutando has no known AG2Space host.
+    """
+    repo = repo or Path(__file__).resolve().parents[2]
+    packaged = _read_json(repo.parent / "build-info.json")
+    versions = {}
+    desktop = repo.parent.parent
+    for name, source in (("sutando", repo), ("ag2space", desktop)):
+        info = packaged.get(name)
+        info = info if isinstance(info, dict) else {}
+        info = {k: v for k, v in info.items()
+                if k in ("version", "commit", "build") and isinstance(v, str) and v.strip()}
+        is_source = name == "sutando" or (
+            repo.parent.name == "engine" and
+            (desktop / "src-tauri" / "tauri.conf.json").is_file()
+        )
+        if is_source and (source / ".git").exists():
+            description = _git(source, "describe", "--tags", "--always", "--dirty")
+            version = (description if name == "sutando" else
+                       _read_json(source / "src-tauri" / "tauri.conf.json").get("version"))
+            info = {"version": version, "commit": _git(source, "rev-parse", "HEAD"),
+                    "build": description}
+        elif name == "sutando" and not info:
+            info = {"version": _read_json(repo / "package.json").get("version")}
+        versions[name] = {"version": info.get("version") or "unknown",
+                          "commit": info.get("commit") or "unknown"}
+        if info.get("build"):
+            versions[name]["build"] = info["build"]
+    return versions
 
 
 def _redact(text: str) -> str:
@@ -196,6 +252,7 @@ def _drafts_dir(ws: Path) -> Path:
 
 def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
     """Park a report the owner has not approved yet; returns the draft id."""
+    payload = {**payload, "versions": build_versions()}
     d = _drafts_dir(ws)
     d.mkdir(parents=True, exist_ok=True)
     draft_id = f"fb_{uuid.uuid4().hex[:10]}"
@@ -619,6 +676,9 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
                  "auto": bool(d.get("auto")), "owner_approved": owner_approved, "idempotency_key": draft_id}
+    ctx["versions"] = d.get("versions") or {
+        name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
+    }
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
@@ -752,6 +812,7 @@ def _main() -> None:
         sys.exit(2)
 
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version()}
+    ctx["versions"] = build_versions()
     if a.auto:
         ctx["auto"] = True
     if not a.no_logs and prefs["sendLogs"]:
