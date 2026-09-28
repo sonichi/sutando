@@ -232,31 +232,68 @@ export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
  *  verbatim input transcription (flushed before every tool call), `assistant` items
  *  the model's output; injected prompts arrive as `user` items starting `[System:`. */
 export type VoiceTurn = { role: string; content?: string | null };
-let _voiceTurns: (() => ReadonlyArray<VoiceTurn> | null | undefined) | null = null;
+/** What the provider hands back: the session's turns, and the input transcription the
+ *  runtime has buffered but not yet flushed into them (bodhi's TranscriptManager
+ *  inputBuffer): flushInput() runs before a tool is dispatched, but only over the
+ *  transcription that has ARRIVED, so a late chunk sits in that buffer during the call. */
+export type VoiceTurnsSnapshot = { items: ReadonlyArray<VoiceTurn> | null | undefined; pendingInput?: string | null };
+type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
+let _voiceTurns: VoiceTurnsProvider | null = null;
 
 /** Bind (or, with null, release) a reader of the live session's turns. A task written
  *  afterwards carries the owner's last spoken words verbatim, beside the model's own
  *  wording of the task (user feedback P1-29: a task's text described something its
  *  attached transcript never said; conversation.log is only written at turn end, after
  *  the tool ran, so the transcript block structurally lacked the utterance itself). */
-export function setVoiceTurnsProvider(fn: typeof _voiceTurns): void {
+export function setVoiceTurnsProvider(fn: VoiceTurnsProvider | null): void {
 	_voiceTurns = fn;
 }
 
-/** The last `count` real user utterances (newest last), or [] when no session is bound. */
+function _readSnapshot(): VoiceTurnsSnapshot | null {
+	let raw: ReturnType<VoiceTurnsProvider>;
+	try { raw = _voiceTurns?.(); } catch { return null; }
+	if (!raw) return null;
+	if (Array.isArray(raw)) return { items: raw };
+	const snap = raw as VoiceTurnsSnapshot;
+	return Array.isArray(snap.items) || snap.pendingInput ? snap : null;
+}
+
+/** The real user utterances of the CURRENT turn (newest last): user items after the last
+ *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
+ *  that triggered the call: a previous turn's words never stand in for this one's. */
 export function _spokenTurns(count = 2): string[] {
-	let items: ReadonlyArray<VoiceTurn> | null | undefined;
-	try { items = _voiceTurns?.(); } catch { return []; }
-	if (!Array.isArray(items)) return [];
+	const snap = _readSnapshot();
+	if (!snap) return [];
+	const items = Array.isArray(snap.items) ? snap.items : [];
 	const spoken: string[] = [];
 	for (let i = items.length - 1; i >= 0 && spoken.length < count; i--) {
 		const it = items[i];
-		if (!it || it.role !== 'user' || typeof it.content !== 'string') continue;
+		if (!it) continue;
+		if (it.role === 'assistant') break;   // the turn boundary: everything older is a previous turn
+		if (it.role !== 'user' || typeof it.content !== 'string') continue;
 		const text = it.content.trim();
 		if (!text || text.startsWith('[System:')) continue;
 		spoken.unshift(text);
 	}
-	return spoken;
+	const pending = typeof snap.pendingInput === 'string' ? snap.pendingInput.trim() : '';
+	if (pending && !spoken.includes(pending)) spoken.push(pending);
+	return spoken.slice(-count);
+}
+
+/** How long a task write waits for the current turn's transcription to land. */
+export const SPOKEN_WAIT_MS = 1500;
+const SPOKEN_POLL_MS = 100;
+
+/** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
+ *  when none has arrived yet (the runtime flushes only what it has when the tool fires). */
+export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))): Promise<string[]> {
+	if (!_voiceTurns) return [];
+	const deadline = Date.now() + maxMs;
+	for (;;) {
+		const spoken = _spokenTurns(count);
+		if (spoken.length > 0 || Date.now() >= deadline) return spoken;
+		await sleep(SPOKEN_POLL_MS);
+	}
 }
 
 export function getVoiceSessionOrigin(): VoiceSessionOrigin | null {
@@ -820,7 +857,7 @@ export const workTool: ToolDefinition = {
 		// wording against real speech instead of trusting it.
 		let spokenBlock = '';
 		try {
-			const spoken = _spokenTurns(2);
+			const spoken = await _awaitSpokenTurns(2);
 			if (spoken.length > 0) {
 				spokenBlock =
 					`\n\n--- spoken (the owner's last words, verbatim input transcription; the task line ` +

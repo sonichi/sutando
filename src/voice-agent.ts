@@ -1535,7 +1535,13 @@ async function main() {
 	// The bridge reads the live turns when the work tool runs, so a task carries the
 	// owner's verbatim words; conversation.log is only written at turn end (below).
 	// Session-scoped, not client-scoped: the next session's registration replaces it.
-	setVoiceTurnsProvider(() => session.conversationContext.items);
+	// Items plus the transcription still buffered by the runtime (bodhi flushes only
+	// what has arrived when a tool fires), so a late chunk is not read as last turn's.
+	setVoiceTurnsProvider(() => ({
+		items: session.conversationContext.items,
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		pendingInput: (session as any).transcriptManager?.inputBuffer as string | undefined,
+	}));
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		// If end_session fired this session, keep clearing items so
