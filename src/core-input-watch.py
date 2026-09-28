@@ -763,7 +763,9 @@ def main():
         # The Manager owns per-episode dedup; leaving the blocked set resolves
         # the card, so the owner sees it close without clicking anything.
         if a.chat_escalation:
-            verdict, idle_ticks = card_step(pane is not None, state, idle_ticks, a.stable)
+            # A blank capture is no evidence either: "" is what a capture of an
+            # emptied pane returns, and it must not resolve a card nobody answered.
+            verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))

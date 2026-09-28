@@ -37,6 +37,11 @@ class TestCardStep(unittest.TestCase):
 
     def test_the_loop_holds_cards_on_a_failed_capture(self):
         """One --once tick with tmux returning nothing: neither escalate nor resolve runs."""
+        for pane in (None, "", "   \n\n"):
+            with self.subTest(pane=repr(pane)):
+                self._tick_with_pane(pane)
+
+    def _tick_with_pane(self, pane):
         out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
 
         class _RH:
@@ -46,7 +51,7 @@ class TestCardStep(unittest.TestCase):
                 return {"health": "working"}
         calls = []
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--once", "--stable", "1"]
-        with patch.object(M, "capture", lambda s, sess: None), \
+        with patch.object(M, "capture", lambda s, sess: pane), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \
@@ -56,7 +61,7 @@ class TestCardStep(unittest.TestCase):
                 patch.object(M, "resolve_escalations", lambda *a, **k: calls.append("resolve")), \
                 patch.object(sys, "argv", argv):
             M.main()
-        self.assertEqual(calls, [], "a failed capture must neither raise nor resolve a card")
+        self.assertEqual(calls, [], f"a failed or blank capture ({pane!r}) must neither raise nor resolve a card")
 
 
 if __name__ == "__main__":
