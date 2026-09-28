@@ -281,23 +281,61 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
 IN_PROGRESS_MAX_AGE_S = 1800.0
 
 
+#: Row kinds the session's own activity hook writes while it works a task.
+_ENGAGED_KINDS = frozenset({"processing", "thinking", "working"})
+
+
+def engaged_at(workspace: Path, task_id: str) -> float | None:
+    """When the session last did real work on the task: the newest agent-activity row
+    naming it that came from the session's own hook (never the bus's TASK_STATUS rows,
+    which mark delivery, not work). None when no such row exists."""
+    newest = None
+    try:
+        with open(workspace / "state" / "agent-activity.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("projection") == "TASK_STATUS":
+                    continue
+                task = rec.get("task")
+                if not isinstance(task, dict) or task.get("id") != task_id:
+                    continue
+                if rec.get("kind") not in _ENGAGED_KINDS:
+                    continue
+                ts = rec.get("ts")
+                if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+                    newest = ts if newest is None else max(newest, ts)
+    except OSError:
+        return None
+    return newest
+
+
 def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_AGE_S,
                 now: float | None = None) -> bool:
-    """True when the snapshot says RUNNING and its activity stamp (last_activity_at, else
-    started_at) is within max_age of now. Anything else -- queued, waiting on a person,
-    terminal, stale, a future or non-finite stamp, no or unreadable snapshot -- is False."""
+    """True when the snapshot says RUNNING and the session has ENGAGED with the task within
+    max_age: a runtime event applied to the snapshot (seq > 0) or an agent-activity row from
+    the session's own hook naming the task. RUNNING alone is delivery (the watcher marks it
+    at hand-off), and a delivered task nobody answered must still block. Queued, waiting on
+    a person, terminal, stale, a future or non-finite stamp, no or unreadable snapshot: False."""
     try:
         d = json.loads(ActivityStore(workspace).path(task_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     if not isinstance(d, dict) or d.get("phase") != "RUNNING":
         return False
-    stamp = d.get("last_activity_at")
-    if stamp is None:
-        stamp = d.get("started_at")
-    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+    seq = d.get("seq")
+    stamps = []
+    if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+        stamps.append(d.get("last_activity_at"))
+    row_ts = engaged_at(workspace, task_id)
+    if row_ts is not None:
+        stamps.append(row_ts)
+    stamps = [x for x in stamps if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)]
+    if not stamps:
         return False
-    age = (time.time() if now is None else now) - float(stamp)
+    age = (time.time() if now is None else now) - float(max(stamps))
     return 0 <= age <= max_age
 
 

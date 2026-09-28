@@ -24,10 +24,9 @@
 # looped forever. The earlier rule read identity from the cwd's git repo instead,
 # which cannot tell a guest in the checkout from the core in the checkout.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+UNIDENTIFIED=""
 if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
-  echo "check-pending-tasks: guest session (no SUTANDO_CORE_SESSION=1 or SUTANDO_INSTANCE_ID); nothing to gate" >&2
-  echo '{}'
-  exit 0
+  UNIDENTIFIED=1
 fi
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
@@ -45,6 +44,25 @@ fi
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
+
+# An unmarked session is a guest only while a marked core is alive to own the
+# queue (a fresh state/cores/*.alive heartbeat); with none, it may BE the core,
+# launched by hand, so it is gated: the guest exit fails closed, never open.
+if [ -n "$UNIDENTIFIED" ]; then
+  CORE_ALIVE=""
+  if [ -n "$PYBIN" ]; then
+    CORE_ALIVE="$(SUTANDO_CORES_DIR="$WORKSPACE/state/cores" SUTANDO_ALIVE_MAX_AGE="${SUTANDO_STOP_HOOK_CORE_ALIVE_MAX_AGE:-90}" "$PYBIN" -c 'import glob, os, time
+d = os.environ["SUTANDO_CORES_DIR"]; cap = float(os.environ["SUTANDO_ALIVE_MAX_AGE"]); now = time.time()
+fresh = [p for p in glob.glob(os.path.join(d, "*.alive")) if -5 <= now - os.stat(p).st_mtime < cap]
+print("1" if fresh else "")' 2>/dev/null)" || CORE_ALIVE=""
+  fi
+  if [ -n "$CORE_ALIVE" ]; then
+    echo "check-pending-tasks: guest session (no SUTANDO_CORE_SESSION=1 or SUTANDO_INSTANCE_ID) beside a live marked core; nothing to gate" >&2
+    echo '{}'
+    exit 0
+  fi
+  echo "check-pending-tasks: unmarked session with no live marked core; gating it as the core (fail closed)" >&2
+fi
 
 # Claude Code's Stop input arrives as JSON on stdin; stop_hook_active is true when
 # this Stop already follows a block in this turn. Read ONCE, bounded to a second:

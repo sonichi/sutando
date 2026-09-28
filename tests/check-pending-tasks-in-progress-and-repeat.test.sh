@@ -46,6 +46,10 @@ record_delivery() { "$PYBIN" "$REPO/src/turn_ledger.py" --workspace "$TMPWS" no-
 run_hook() {  # $1 = stdin json (may be empty); prints stdout, stderr to $TMPWS/err
   printf '%s' "$1" | bash "$HOOK" 2>"$TMPWS/err"
 }
+engaged() {  # $1 task id, $2 age seconds ago: a row from the session's activity hook
+  mkdir -p "$WS/state"
+  printf '{"ts":%s,"line":"reading it","kind":"working","task":{"id":"%s"}}\n' "$(( $(date +%s) - $2 ))" "$1" >> "$WS/state/agent-activity.jsonl"
+}
 snapshot() {  # $1 task id, $2 phase, $3 age seconds ago (or "none"/"future"/"nan")
   local stamp
   case "$3" in
@@ -62,27 +66,45 @@ TASK="task-ip-hooktest-$$"
 printf 'id: %s\ntask: keep working\n' "$TASK" > "$WS/tasks/$TASK.txt"
 record_delivery
 
-echo "a task the core is working right now does not block:"
+echo "a task the core is working right now does not block, a merely delivered one does:"
 snapshot "$TASK" RUNNING 60
 OUT="$(run_hook '')"
-[ "$OUT" = "{}" ] && ok "RUNNING with fresh activity: the turn may end" || bad "RUNNING with fresh activity: the turn may end" "got: ${OUT:0:160}"
+case "$OUT" in *'"decision":"block"'*) ok "RUNNING but never engaged (delivered only): blocks -- delivery is not work" ;; *) bad "RUNNING but never engaged: blocks" "got: ${OUT:0:160}" ;; esac
+engaged "$TASK" 30
+OUT="$(run_hook '')"
+[ "$OUT" = "{}" ] && ok "RUNNING with a fresh activity row from the session: the turn may end" || bad "RUNNING with a fresh activity row: the turn may end" "got: ${OUT:0:160}"
+rm -f "$WS/state/agent-activity.jsonl"
+engaged "$TASK" 7200
 snapshot "$TASK" RUNNING 7200
 OUT="$(run_hook '')"
 case "$OUT" in *'"decision":"block"'*) ok "RUNNING but stale (2h): blocks -- an abandoned run is an orphan again" ;; *) bad "RUNNING but stale (2h): blocks" "got: ${OUT:0:160}" ;; esac
 record_delivery  # each {} that reaches the turn-ledger gate spends one recorded no-send
 OUT="$(SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE=10000 run_hook '')"
 [ "$OUT" = "{}" ] && ok "...within a raised SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE it is in progress" || bad "...within a raised max age it is in progress" "got: ${OUT:0:160}"
-for shape in "QUEUED 60" "WAITING 60" "RECEIVED 60" "COMPLETED 60" "RUNNING future" "RUNNING none"; do
+rm -f "$WS/state/agent-activity.jsonl"
+# The queue's own block, not the turn-ledger gate's: the reason names the queue.
+for shape in "QUEUED 60" "WAITING 60" "RECEIVED 60" "COMPLETED 60"; do
+  set -- $shape; snapshot "$TASK" "$1" "$2"; engaged "$TASK" 5
+  OUT="$(run_hook '')"
+  case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "$1 even with fresh engagement: blocks" ;; *) bad "$1 even with fresh engagement: blocks" "got: ${OUT:0:160}" ;; esac
+done
+rm -f "$WS/state/agent-activity.jsonl"
+for shape in "RUNNING future" "RUNNING none"; do
   set -- $shape; snapshot "$TASK" "$1" "$2"
   OUT="$(run_hook '')"
-  case "$OUT" in *'"decision":"block"'*) ok "$1 with stamp $2: blocks" ;; *) bad "$1 with stamp $2: blocks" "got: ${OUT:0:160}" ;; esac
+  case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "$1 with stamp $2 and no engagement: blocks" ;; *) bad "$1 with stamp $2 and no engagement: blocks" "got: ${OUT:0:160}" ;; esac
 done
-printf 'not json' > "$WS/state/activity/$TASK.json"
+snapshot "$TASK" RUNNING none; engaged "$TASK" 5; record_delivery
 OUT="$(run_hook '')"
-case "$OUT" in *'"decision":"block"'*) ok "a corrupt snapshot blocks (cannot prove progress)" ;; *) bad "a corrupt snapshot blocks" "got: ${OUT:0:160}" ;; esac
+[ "$OUT" = "{}" ] && ok "RUNNING with no stamps but a fresh engagement row: the row is the evidence" || bad "RUNNING with no stamps but a fresh engagement row: the row is the evidence" "got: ${OUT:0:160}"
+rm -f "$WS/state/agent-activity.jsonl"
+printf 'not json' > "$WS/state/activity/$TASK.json"; engaged "$TASK" 5
+OUT="$(run_hook '')"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "a corrupt snapshot blocks even with engagement (cannot prove progress)" ;; *) bad "a corrupt snapshot blocks" "got: ${OUT:0:160}" ;; esac
 rm -f "$WS/state/activity/$TASK.json"
 OUT="$(run_hook '')"
-case "$OUT" in *'"decision":"block"'*) ok "no snapshot at all blocks (the control)" ;; *) bad "no snapshot at all blocks" "got: ${OUT:0:160}" ;; esac
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "no snapshot at all blocks even with engagement (the control)" ;; *) bad "no snapshot at all blocks" "got: ${OUT:0:160}" ;; esac
+rm -f "$WS/state/agent-activity.jsonl"
 
 echo "the reason names the tasks and carries their bodies:"
 case "$OUT" in

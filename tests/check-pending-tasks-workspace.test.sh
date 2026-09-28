@@ -335,10 +335,30 @@ rm -rf "$REJ_CWD"
 # Stop on the live core's own queue and looped). Identity used to be read from
 # the cwd's git repo, which cannot tell a guest in the checkout from the core.
 printf 'id: probe\ntask: guest-probe\n' > "$WS/tasks/$PROBE"
+# 7a. No marked core alive: the unmarked session may BE the core (a hand launch),
+# so it is gated -- the guest exit fails closed (review of #4863).
+NOCORE_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>"$TMPWS/nocore.err")"
+case "$NOCORE_OUT" in
+  *'"decision":"block"'*) ok "an unmarked session with NO live marked core is gated as the core (fail closed)" ;;
+  *) bad "an unmarked session with NO live marked core is gated as the core (fail closed)" "got: ${NOCORE_OUT:0:120}" ;;
+esac
+grep -q "no live marked core" "$TMPWS/nocore.err" \
+  && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$TMPWS/nocore.err")"
+# 7b. A stale heartbeat is no core either.
+mkdir -p "$WS/state/cores"
+printf '{"pid":1,"socket":"/tmp/x.sock","session":"core"}\n' > "$WS/state/cores/thishost.alive"
+touch -t 202001010000 "$WS/state/cores/thishost.alive"
+STALE_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
+case "$STALE_OUT" in
+  *'"decision":"block"'*) ok "a stale state/cores/*.alive does not make the unmarked session a guest" ;;
+  *) bad "a stale state/cores/*.alive does not make the unmarked session a guest" "got: ${STALE_OUT:0:120}" ;;
+esac
+# 7c. A fresh heartbeat: a marked core owns the queue, so the unmarked session is a guest.
+touch "$WS/state/cores/thishost.alive"
 GUEST_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>"$TMPWS/guest.err")"
 case "$GUEST_OUT" in
-  '{}') ok "an unmarked session in the checkout is a guest: {} with the queue pending" ;;
-  *) bad "an unmarked session in the checkout is a guest: {} with the queue pending" "got: ${GUEST_OUT:0:120}" ;;
+  '{}') ok "an unmarked session beside a live marked core is a guest: {} with the queue pending" ;;
+  *) bad "an unmarked session beside a live marked core is a guest: {} with the queue pending" "got: ${GUEST_OUT:0:120}" ;;
 esac
 grep -q "guest session" "$TMPWS/guest.err" \
   && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$TMPWS/guest.err")"
@@ -413,6 +433,7 @@ printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n
   "$BUNDLE" "$TEST_PY" > "$BUNDLE/scripts/sutando-config.sh"
 chmod +x "$BUNDLE/scripts/sutando-config.sh"
 printf 'id: probe\ntask: bundle-probe\n' > "$BUNDLE/workspace/tasks/$PROBE"
+mkdir -p "$BUNDLE/workspace/state/cores" && printf '{"socket":"/tmp/x.sock"}\n' > "$BUNDLE/workspace/state/cores/thishost.alive"
 BUNDLE_CWD="$(mktemp -d)"
 B_CORE_OUT="$(cd "$BUNDLE_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
 case "$B_CORE_OUT" in
