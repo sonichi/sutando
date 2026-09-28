@@ -67,6 +67,48 @@ class TestKeyDerivation(unittest.TestCase):
             self.assertEqual(cloud_auth.read_keychain_auth(get=lambda k: "sutk_x"), ("https://sutando.ag2.space", "sutk_x"))
 
 
+class TestReadCloudAuthOrder(unittest.TestCase):
+    """P1-11: under the desktop host the Keychain session outranks a leftover
+    cloud-auth.json; elsewhere the file order is unchanged."""
+
+    def _ws(self, tmp, token="sutk_file"):
+        ws = Path(tmp) / "ws"
+        (ws / "state" / "auth").mkdir(parents=True)
+        (ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://sutando.ag2.space", "token": token}))
+        return ws
+
+    def test_file_wins_outside_the_desktop_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cloud_auth.os.environ, {}, clear=False), \
+                mock.patch.object(cloud_auth.Path, "home", return_value=Path(tmp) / "home"):
+            cloud_auth.os.environ.pop("SUTANDO_PACKAGED", None)
+            ws = self._ws(tmp)
+            keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_file")
+
+    def test_keychain_wins_under_the_desktop_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cloud_auth.os.environ, {"SUTANDO_PACKAGED": "1"}), \
+                mock.patch.object(cloud_auth.Path, "home", return_value=Path(tmp) / "home"):
+            ws = self._ws(tmp)
+            keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_keychain")
+            # No Keychain session: the file still serves, and it is not probed twice.
+            calls = []
+            def none():
+                calls.append(1)
+                return (None, None)
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none)[1], "sutk_file")
+            self.assertEqual(len(calls), 1)
+            # Signed out everywhere: nothing.
+            (ws / "state" / "auth" / "cloud-auth.json").unlink()
+            cloud_auth.os.environ.pop("SUTANDO_METERING_HEADERS", None)
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none), (None, None))
+
+
 class TestCloudRequest(unittest.TestCase):
     def test_refuses_untrusted_or_plaintext_hosts(self):
         for base in ("https://evil.example", "http://sutando.ag2.space", "https://u:p@sutando.ag2.space"):

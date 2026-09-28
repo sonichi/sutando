@@ -13,6 +13,10 @@ Lookup order (read_cloud_auth):
   2. The desktop host's Keychain session. The Tauri host stores the sutk_ ONLY
      there, under a key bound to the origin it was minted against
      (cloud_session.rs origin_key_suffix — mirrored byte-for-byte below).
+     Under the desktop host (SUTANDO_PACKAGED=1) the Keychain is probed FIRST:
+     it is the session the app is signed into, and a leftover cloud-auth.json
+     from another workspace or the Electron era made the engine act as a
+     different account than the one the app showed (user feedback P1-11).
   3. The metering env the supervisor injects for signed-in runs.
 
 cloud_request() is the one HTTP path: https only, host allowlisted, bearer
@@ -115,6 +119,12 @@ def read_keychain_auth(get: Callable[[str], str | None] = keychain_get):
     return None, None
 
 
+def keychain_first() -> bool:
+    """Under the desktop host (its supervisor sets SUTANDO_PACKAGED=1) the Keychain
+    session is the account the app shows; files are legacy readers there."""
+    return os.environ.get("SUTANDO_PACKAGED") == "1"
+
+
 def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
 
@@ -125,6 +135,13 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     desktop writes no auth file at all — its session lives in the Keychain,
     probed next. Falls back to the metering env the supervisor injects.
     """
+    read_keychain = keychain_auth or read_keychain_auth
+    # The desktop host owns the session: its Keychain outranks any file.
+    if keychain_first():
+        base, tok = read_keychain()
+        if tok:
+            return base, tok
+
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
     for p in (
@@ -146,9 +163,10 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
         except Exception:
             continue
 
-    base, tok = (keychain_auth or read_keychain_auth)()
-    if tok:
-        return base, tok
+    if not keychain_first():
+        base, tok = read_keychain()
+        if tok:
+            return base, tok
 
     hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
     if hdrs:
