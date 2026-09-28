@@ -46,6 +46,8 @@ def check(name, got, want):
 
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
+LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
     ("PANE_GATE", "gate"), ("PANE_LIMIT", "limit"), ("PANE_ABNORMAL", "abnormal"),
     ("PANE_WORKING", "working"), ("PANE_IDLE", "idle")))
@@ -68,7 +70,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -120,6 +122,32 @@ check("the sustain is not enough: the 90 s stale line must also pass", got, [N, 
 
 got, _ = run([obs(ABN, paused=True)] * 5)
 check("owner-paused outranks the wedge rung", got, [N] * 5)
+
+# --- an expired login: the CLI's own words, decided on the tick that reads them ------
+
+got, _ = run([obs(LOGGED_OUT, work=False)] * 4)
+check("a logged-out session owing nothing is carded at once, once per episode, never restarted",
+      got, [LOGIN, N, N, N])
+
+got, _ = run([obs(LOGGED_OUT)] * 3, ack=False)
+check("the login card is asked for again every tick until it exists", got, [LOGIN, LOGIN, LOGIN])
+
+got, _ = run([obs(LOGGED_OUT, work=False)] * 2, period=20.0)
+check("no stale line: a login banner is not a timing question", got, [LOGIN, N])
+
+got, st = run([obs(LOGGED_OUT, work=False)] * 2 + [obs(IDLE, work=False)])
+check("/login run: the idle pane clears the login episode",
+      (got, st.workers["w"].wedge_consecutive, st.workers["w"].wedge_escalated), ([LOGIN, N, N], 0, False))
+
+got, _ = run([obs(LOGGED_OUT, work=False)] * 2 + [obs(IDLE, work=False)] + [obs(LOGGED_OUT, work=False)])
+check("...and a second expiry is a new episode with its own card", got, [LOGIN, N, N, LOGIN])
+
+got, _ = run([obs(LOGGED_OUT, work=False, paused=True)] * 3)
+check("owner-paused outranks the login card", got, [N, N, N])
+
+unanswered = ps.Observation(beat=ps.LIVE, session_alive=None, pane=LOGGED_OUT)
+got, _ = run([unanswered] * 2)
+check("a pane under an UNANSWERED session probe is no evidence: no login card", got, [N, N])
 
 # The watcher rung still speaks when the pane is healthy.
 lost = ps.Observation(beat=ps.LIVE, session_alive=True, watcher_beat=ps.ABSENT,

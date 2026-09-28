@@ -8909,6 +8909,14 @@ def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
+def _watcher_role_and_inbox(argv: str, pid: "int | None" = None) -> tuple:
+    """(`--role`, `--inbox`) of a proven watcher, (None, None) when its operands
+    cannot be read. A sentinel proves a watcher holds the inbox; only the role
+    says whether the SESSION does, or merely the supervisor's standby."""
+    ops = watcher_identity.classify_argv(argv, pid, argv_vector=_proc_argv_vector).operands
+    return watcher_identity.watcher_role(ops), watcher_identity.watcher_inbox(ops)
+
+
 # Read from the module that defines the precedence; a copy here is how this
 # reader and `rundir.agent_id` come to disagree about the same process.
 
@@ -9216,6 +9224,7 @@ def check_task_watcher() -> dict:
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
     collided = []
+    live_argv = {}
     for sp in sentinels:
         try:
             spid = int(sp.read_text().strip())
@@ -9239,6 +9248,7 @@ def check_task_watcher() -> dict:
                 if spid in live:
                     collided.append((spid, live[spid], sp))
                 live[spid] = sp
+                live_argv[spid] = sargv
 
     if not live:
         # Aggregate EVERY record class before advising: a per-class early
@@ -9387,6 +9397,23 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # The standby stamps the same sentinel as the session watcher it stands in
+    # for, so a live sentinel proves an announcer, never that the session works.
+    standby_only = []
+    for _p in sorted(live):
+        _role, _inbox = _watcher_role_and_inbox(live_argv[_p], _p)
+        if _role == "standby":
+            standby_only.append(f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})")
+    if standby_only:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(standby_only)} sentinel(s) name only the STANDBY watcher: "
+                          f"{'; '.join(standby_only)}. No session-role watcher holds that "
+                          "inbox, so its session is not draining tasks itself — a worker "
+                          "whose turn ended logged out (\"Login expired · Please run /login\") "
+                          "never re-arms its Monitor, and the standby only announces through "
+                          "the pane. Degraded, not clear: run /login in that session if it "
+                          "asks, then re-arm via the Monitor tool: bash src/watch-tasks-stream.sh "
+                          "--role session --inbox <inbox>"}
     # A watcher holds its inbox whether or not anything consumes what it
     # announces; the reader is the only difference visible from outside.
     unread = []

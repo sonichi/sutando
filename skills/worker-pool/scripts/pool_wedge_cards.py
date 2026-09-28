@@ -137,18 +137,26 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
                      _jump(session)])
     else:
         abn = cw.frame_abnormal(text)
-        if abn is None:
+        if abn is None or (which == ps.CARD_LOGIN and pane != ps.PANE_LOGGED_OUT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         lines = cause_lines(text)
         via_proxy = runtime == "claude" and routed(socket, session) is True and (
             abn.retrying or any(n in _PROXY_CAUSES for n in abn.names))
         cause = ", ".join(abn.names)
-        body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
+        if which == ps.CARD_LOGIN:
+            body = [f"{seat} (tmux session {session}) is logged out and its pane shows:"]
+        else:
+            body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
         body += [f"  {ln}" for ln in lines] + ["", f"Cause: {cause}."]
         if via_proxy:
             body += ["", "This seat is routed through the credential proxy. Restarting the proxy "
                      f"(`{PROXY_REMEDY}`, as src/restart.sh does) can clear it."]
-        body += ["The worker's session is not restarted: a fresh session meets the same cause."]
+        if which == ps.CARD_LOGIN:
+            body += [f"Run /login in that session. Until then every task routed to {seat} waits: "
+                     "the worker's session is not restarted, a fresh session meets the same "
+                     "expired login."]
+        else:
+            body += ["The worker's session is not restarted: a fresh session meets the same cause."]
         subject.update(cause=list(abn.names), cause_lines=lines,
                        remedy=PROXY_REMEDY if via_proxy else None)
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]

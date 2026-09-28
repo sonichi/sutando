@@ -1138,6 +1138,9 @@ class LiveParkedBanner(unittest.TestCase):
         ("compacting", "Compacting conversation…"),
         ("needs-login", "Please log in to continue"),
         ("needs-login", "Session expired. Run /login"),
+        ("needs-login", "  ⎿  Login expired · Please run /login"),
+        ("needs-login", "OAuth access token has expired · Please run /login"),
+        ("needs-login", "Not logged in · Please run /login"),
         ("quota-limit", "You have hit your usage limit · resets 3pm"),
         ("out-of-credits", "Credit balance is too low"),
         ("awaiting-input", "Waiting for your approval"),
@@ -1150,6 +1153,9 @@ class LiveParkedBanner(unittest.TestCase):
         "the network error we saw yesterday was different",
         "I logged in to continue the review",
         "the usage limit is documented here",
+        "Login expired is what the banner said",
+        "not logged in yet, will retry",
+        "the OAuth access token has expired, so I ran /login and it worked fine",
     )
 
     def test_each_live_banner_is_found_with_its_family_and_name(self):

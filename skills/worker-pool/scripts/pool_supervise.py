@@ -126,7 +126,11 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
     verdict = pane_gate.classify_pane(text, adapter, workspace, socket, session)
     if verdict.state == "abnormal":
         abn = cw.frame_abnormal(text)
-        return ps.PANE_LIMIT if abn and abn.kind == "provider-limit" else ps.PANE_ABNORMAL
+        if abn and abn.kind == "provider-limit":
+            return ps.PANE_LIMIT
+        if abn and "needs-login" in abn.names:
+            return ps.PANE_LOGGED_OUT
+        return ps.PANE_ABNORMAL
     if verdict.state == "busy":
         return ps.PANE_WORKING if verdict.reason == "working" else ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
@@ -353,7 +357,10 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     if persist:
         save_state(workspace, new_state)
     asked = list(worker_ids or [])
+    # Reported on every tick, not only when a card decision is due: a dry run must
+    # show the finding after the real sweep already raised (and acknowledged) the card.
     return {"decisions": decisions,
+            "auth_expired": sorted(w for w, o in obs.items() if o.pane == ps.PANE_LOGGED_OUT),
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
@@ -394,6 +401,9 @@ def main(argv=None) -> int:
                   f"work={o['work_outstanding']} pane={o['pane']}")
         for wid in out["not_supervised"]:
             print(f"{wid[:8]}  not supervised (retired, or not a worker in the roster)")
+        for wid in out["auth_expired"]:
+            print(f"{wid[:8]}  login expired: the session is alive but cannot work until "
+                  f"/login is run in tmux session {wi.tmux_session_name(wid)}")
         if out["resumed"]:
             print("resumed: this sample was discarded as evidence (host slept)")
         if out["routing"]["alarm"]:

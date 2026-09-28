@@ -377,6 +377,60 @@ class ApplyingATick(Base):
         self.assertIs(after.session_alive, True, "the worker is not back after a 'recovered'")
 
 
+LOGIN_PANE = ("❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n"
+              "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+
+class TheSweepOnALoggedOutWorker(Base):
+    """The user's report (2026-09-29): `--sweep --dry-run` said "nothing" for four
+    workers whose panes read "Login expired · Please run /login". The session is
+    alive, so the death ladder is silent; the finding has to come from the pane."""
+
+    def setUp(self):
+        super().setUp()
+        sup.pr.register_worker(self.ws, self.wid, "alpha")
+        for name, value in (("probe_session", True), ("session_watcher_holds", False),
+                            ("observe_pane", (ps.PANE_LOGGED_OUT, "f1"))):
+            p = mock.patch.object(sup, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(rem.wc, "capture", return_value=LOGIN_PANE)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = rem.main(["--workspace", str(self.ws), "--repo", str(REPO), *argv])
+        return rc, json.loads(out.getvalue())
+
+    def test_a_dry_run_reports_the_login_card_it_would_raise(self):
+        rc, out = self._run("--sweep", "--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["decisions"][self.wid], ps.CARD_LOGIN)
+        self.assertEqual(out["auth_expired"], [self.wid])
+        self.assertEqual(out["cards"], {}, "a dry run raises nothing")
+        self.assertFalse(sup.state_path(self.ws).exists())
+
+    def test_the_real_run_cards_the_owner_and_restarts_nothing(self):
+        rc, out = self._run("--sweep")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["recoveries"], {}, "a logged-out session is never respawned")
+        self.assertEqual(out["escalations"], [])
+        self.assertEqual(out["cards"][self.wid]["outcome"], "carded")
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        req = rem.wc.manager_for(self.ws).get(out["cards"][self.wid]["hitl_id"])
+        self.assertIn("Login expired · Please run /login", req.message)
+        self.assertIn("Run /login", req.message)
+        self.assertEqual(req.subject["wedge"], ps.CARD_LOGIN)
+        self.assertNotIn(req.id, out["cards_closed"])
+        # Raised once: the next sweep still reports the finding, without a second card.
+        rc, again = self._run("--sweep")
+        self.assertEqual((rc, again["decisions"][self.wid], again["cards"], again["auth_expired"]),
+                         (0, ps.NOTHING, {}, [self.wid]))
+        self.assertEqual(len(rem.wc.manager_for(self.ws).active()), 1)
+
+
 class OneCopyOfEachModule(unittest.TestCase):
     def test_a_module_already_loaded_is_reused_not_loaded_twice(self):
         self.assertIs(rem._sibling("spawn_worker"), rem.sw,
