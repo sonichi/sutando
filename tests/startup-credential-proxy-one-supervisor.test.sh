@@ -20,6 +20,11 @@ if [ -z "$fn" ]; then
   echo "FAIL — start_credential_proxy() not found in src/startup.sh (renamed or removed?)"
   exit 1
 fi
+# The range ends at the first column-0 "}", so an inner one would cut the body short; a cut body fails to parse.
+if ! bash -n <(printf '%s\n' "$fn") 2>/dev/null || ! bash -c "$fn"$'\n'"declare -F start_credential_proxy >/dev/null"; then
+  echo "FAIL — start_credential_proxy() extracted from src/startup.sh is truncated or unparseable"
+  exit 1
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
