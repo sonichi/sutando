@@ -58,7 +58,9 @@ def run(real_run_rc: int, probe_rc: int = 0):
     out, t0 = [], time.time()
     try:
         os.set_blocking(p.stdout.fileno(), False)
-        while time.time() - t0 < 10:
+        # 25s: the old 10s window had zero margin over the handler's own 10s
+        # timeout budget under a loaded CI runner (#4855).
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = p.stdout.read()
@@ -133,7 +135,8 @@ def restart_witness():
     published = []
     try:
         os.set_blocking(second.stdout.fileno(), False)
-        while time.time() - t0 < 15:
+        # Same margin fix as run() above (#4855) -- 25s, not the expected cost.
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = second.stdout.read()
