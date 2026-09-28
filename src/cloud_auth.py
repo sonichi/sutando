@@ -14,10 +14,13 @@ Lookup order (read_cloud_auth):
      there, under a key bound to the origin it was minted against
      (cloud_session.rs origin_key_suffix — mirrored byte-for-byte below).
      Under the desktop host (SUTANDO_APP_SUPPORT in the core's environment, or
-     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is probed FIRST:
-     it is the session the app is signed into, and a leftover cloud-auth.json
-     from another workspace or the Electron era made the engine act as a
-     different account than the one the app showed (user feedback P1-11).
+     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is the ONLY record
+     consulted: it is the session the app is signed into, the host writes no
+     file, and a leftover cloud-auth.json from another workspace or the
+     Electron era can hold nothing but a stale bearer, which made the engine
+     act as a different account than the app showed, and keep acting as it
+     after a sign-out (user feedback P1-11). Signed out in the Keychain means
+     signed out; only the metering env (3) is still honoured there.
   3. The metering env the supervisor injects for signed-in runs.
 
 cloud_request() is the one HTTP path: https only, host allowlisted, bearer
@@ -142,11 +145,14 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     probed next. Falls back to the metering env the supervisor injects.
     """
     read_keychain = keychain_auth or read_keychain_auth
-    # The desktop host owns the session: its Keychain outranks any file.
+    # The desktop host owns the session: its Keychain is the ONLY source there.
+    # A file can hold nothing but a stale bearer under the host, so after a
+    # sign-out it would keep the engine acting as the leftover account.
     if keychain_first():
         base, tok = read_keychain()
         if tok:
             return base, tok
+        return _metering_env_auth()
 
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
@@ -169,11 +175,15 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
         except Exception:
             continue
 
-    if not keychain_first():
-        base, tok = read_keychain()
-        if tok:
-            return base, tok
+    base, tok = read_keychain()
+    if tok:
+        return base, tok
+    return _metering_env_auth()
 
+
+def _metering_env_auth():
+    """(apiBase, token) from the metering env the supervisor injects for a signed-in
+    run, else (None, None)."""
     hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
     if hdrs:
         try:

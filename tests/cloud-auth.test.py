@@ -114,17 +114,24 @@ class TestReadCloudAuthOrder(unittest.TestCase):
             ws = self._ws(tmp)
             keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
             self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_keychain")
-            # No Keychain session: the file still serves, and it is not probed twice.
+            # Signed out in the Keychain (no session, or the host's sign-out sentinel): the
+            # leftover file is NOT consulted -- it can only hold a stale bearer under the host.
             calls = []
             def none():
                 calls.append(1)
                 return (None, None)
-            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none)[1], "sutk_file")
-            self.assertEqual(len(calls), 1)
-            # Signed out everywhere: nothing.
-            (ws / "state" / "auth" / "cloud-auth.json").unlink()
             cloud_auth.os.environ.pop("SUTANDO_METERING_HEADERS", None)
             self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none), (None, None))
+            self.assertEqual(len(calls), 1)
+            signed_out = lambda: cloud_auth.read_keychain_auth(get=lambda k: cloud_auth.SIGNED_OUT_SENTINEL)  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=signed_out), (None, None))
+            self.assertTrue((ws / "state" / "auth" / "cloud-auth.json").exists(), "the file is left alone, just not read")
+            # The supervisor's metering env for a signed-in run is still honoured under the host.
+            with mock.patch.dict(cloud_auth.os.environ, {
+                "SUTANDO_METERING_HEADERS": json.dumps({"Authorization": "Bearer sutk_metering"}),
+                "SUTANDO_METERING_ENDPOINT": "https://sutando.ag2.space/api/usage/v2"}):
+                self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none),
+                                 ("https://sutando.ag2.space", "sutk_metering"))
 
 
 class TestCloudRequest(unittest.TestCase):
