@@ -308,6 +308,7 @@ test('refresh failures past the give-up threshold exit non-zero instead of retry
 	const exitCalls: number[] = [];
 	const proxyPort = await startProxy(await startUpstream(), {
 		exitProcess: (code) => { exitCalls.push(code); },
+		giveUpAfter: 6,
 	});
 
 	// Default give-up threshold is 6 consecutive failures. Drive 5 (no exit
@@ -333,6 +334,7 @@ test('a refresh success resets the failure count, so the give-up threshold never
 	const exitCalls: number[] = [];
 	const proxyPort = await startProxy(await startUpstream(), {
 		exitProcess: (code) => { exitCalls.push(code); },
+		giveUpAfter: 6,
 	});
 
 	// Fail 5 times (one short of the default threshold of 6)...
@@ -369,6 +371,7 @@ test('the give-up call itself still sets a backoff, so an immediate retry does n
 	const exitCalls: number[] = [];
 	const proxyPort = await startProxy(await startUpstream(), {
 		exitProcess: (code) => { exitCalls.push(code); },
+		giveUpAfter: 6,
 	});
 
 	for (let i = 0; i < 5; i++) {
@@ -390,13 +393,51 @@ test('the give-up call itself still sets a backoff, so an immediate retry does n
 
 // parseGiveUpAfter backs the SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER env var.
 // `Number(env) || 6` would silently coerce an explicit "0" to 6; this must
-// take 0 literally instead.
+// take 0 literally instead. `supervised` (second arg) sets the unset-env
+// default: 6 when something will restart the process, Infinity (never give
+// up) when nothing will -- see PROXY_IS_SUPERVISED in credential-proxy.ts.
 test('parseGiveUpAfter takes an explicit 0 literally instead of falling back to the default', () => {
-	assert.equal(parseGiveUpAfter(undefined), 6, 'unset env falls back to the default');
-	assert.equal(parseGiveUpAfter(''), 6, 'empty env falls back to the default');
-	assert.equal(parseGiveUpAfter('0'), 0, 'explicit 0 is taken literally, not silently coerced to 6');
-	assert.equal(parseGiveUpAfter('3'), 3, 'a valid positive override is honored');
-	assert.equal(parseGiveUpAfter('not-a-number'), 6, 'garbage input falls back to the default rather than producing NaN');
-	assert.equal(parseGiveUpAfter('-1'), 0, 'a negative value is clamped to 0, not left to silently behave like 0 unclamped');
-	assert.equal(parseGiveUpAfter('-100'), 0, 'clamping applies regardless of how negative');
+	assert.equal(parseGiveUpAfter(undefined, true), 6, 'unset env, supervised, falls back to the default');
+	assert.equal(parseGiveUpAfter('', true), 6, 'empty env, supervised, falls back to the default');
+	assert.equal(parseGiveUpAfter('0', true), 0, 'explicit 0 is taken literally, not silently coerced to 6');
+	assert.equal(parseGiveUpAfter('3', true), 3, 'a valid positive override is honored');
+	assert.equal(parseGiveUpAfter('not-a-number', true), 6, 'garbage input falls back to the default rather than producing NaN');
+	assert.equal(parseGiveUpAfter('-1', true), 0, 'a negative value is clamped to 0, not left to silently behave like 0 unclamped');
+	assert.equal(parseGiveUpAfter('-100', true), 0, 'clamping applies regardless of how negative');
+});
+
+// Unsupervised (no launchd job, the legacy run_node_service fallback with no
+// restart loop): giving up would turn a self-healing wedge into a permanent
+// outage, so the unset-env default is Infinity (never give up), not 6.
+test('parseGiveUpAfter defaults to Infinity when unsupervised, but an explicit override still applies', () => {
+	assert.equal(parseGiveUpAfter(undefined, false), Infinity, 'unset env, unsupervised, never gives up by default');
+	assert.equal(parseGiveUpAfter('', false), Infinity, 'empty env, unsupervised, same as unset');
+	assert.equal(parseGiveUpAfter('not-a-number', false), Infinity, 'garbage input falls back to the unsupervised default, not the supervised one');
+	assert.equal(parseGiveUpAfter('4', false), 4, 'an explicit override applies regardless of supervision -- a deliberate operator choice');
+	assert.equal(parseGiveUpAfter('0', false), 0, 'explicit 0 still means give up on the first failure, even unsupervised');
+	assert.equal(parseGiveUpAfter('-5', false), 0, 'negative clamping applies regardless of supervision');
+});
+
+// Integration-level: with the default (unsupervised) giveUpAfter, the proxy
+// must never exit no matter how many consecutive failures it sees -- the
+// legacy run_node_service fallback has no restart loop, so exiting would be
+// final, not a signal.
+test('unsupervised (the default giveUpAfter): never gives up, however many consecutive failures', async () => {
+	keychain = { service: 's', oauth: { accessToken: 'dead-stored-token-aaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
+	refreshResult = null;
+	upstreamHandler = (_req, res) => respond(res, 200, '{"ok":true}');
+	const exitCalls: number[] = [];
+	// No giveUpAfter override: exercises createProxyServer's own default,
+	// which is Infinity unless SUTANDO_PROXY_SUPERVISED=1 is set in the real
+	// process env (not set here, matching the legacy-fallback host shape).
+	const proxyPort = await startProxy(await startUpstream(), {
+		exitProcess: (code) => { exitCalls.push(code); },
+	});
+
+	for (let i = 0; i < 20; i++) {
+		await call(proxyPort, { authorization: 'Bearer client-token' });
+		now += 20 * 60 * 1000;
+	}
+	assert.equal(refreshCalls, 20);
+	assert.deepEqual(exitCalls, [], 'no give-up regardless of failure count when the default (unsupervised) threshold applies');
 });
