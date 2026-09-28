@@ -1157,6 +1157,52 @@ describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 		h.t.disconnect();
 	});
 
+	it('backoff that never turns live: the attempt fails with an actionable card at the deadline', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'backoff' }));
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Reconnecting to the model…');
+		assert.equal(h.failures.length, 0, 'no failure before the deadline');
+		await delay(50); // > upstreamDeadlineMs
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.match(h.statuses[h.statuses.length - 1].detail ?? '', /could not reach the model/);
+		assert.equal(h.failures.length, 1, 'exactly one classified failure');
+		assert.equal(h.failures[0].kind, 'agent-failed');
+		assert.equal(h.failures[0].reason, 'upstream-unreachable');
+		assert.equal(h.failures[0].category, 'network');
+		assert.match(h.failures[0].remediation, /Gemini key/);
+		assert.equal(s.readyState, 3, 'the socket was closed by the client');
+		await h.t.closeSettled(); // the self-inflicted close handshake completes
+		// Latched: a later frame changes nothing.
+		s.message(frame({ upstream: 'live' }));
+		assert.equal(h.statuses[h.statuses.length - 1].status, 'error');
+		assert.equal(h.failures.length, 1);
+	});
+
+	it('backoff followed by live inside the deadline: no failure, and the deadline is disarmed', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'connecting' }));
+		s.message(frame({ upstream: 'backoff' }));
+		await delay(10);
+		s.message(frame({ upstream: 'live' }));
+		await delay(40); // past where the deadline would have fired
+		assert.equal(h.failures.length, 0);
+		assert.ok(!h.statuses.some((x) => x.status === 'error'));
+		assert.equal(h.statuses[h.statuses.length - 1].detail, 'Live — speak now');
+		h.t.disconnect();
+	});
+
+	it('a disconnect during backoff disarms the deadline: no late error after the user hung up', async () => {
+		const h = harness({ upstreamDeadlineMs: 30 });
+		const s = await goLive(h);
+		s.message(frame({ upstream: 'backoff' }));
+		await h.t.disconnect();
+		await delay(50);
+		assert.equal(h.failures.length, 0);
+		assert.ok(!h.statuses.some((x) => x.status === 'error'));
+	});
+
 	it('upstream failed = terminal CLIENT transition: teardown, close, latched classified error, suppressed onclose', async () => {
 		const h = harness();
 		const s = await goLive(h);
