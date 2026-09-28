@@ -225,6 +225,14 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
                 self.assertIn("codex" if recorded else "unreadable", verdict)
                 run.assert_not_called()
 
+    def test_process_alive_answers_for_every_kill_outcome(self):
+        self.assertTrue(hc._process_alive(os.getpid()))
+        self.assertFalse(hc._process_alive(0))
+        self.assertFalse(hc._process_alive(-1))
+        for exc, expected in ((ProcessLookupError(), False), (PermissionError(), True), (OSError("odd"), False)):
+            with mock.patch.object(hc.os, "kill", side_effect=exc):
+                self.assertIs(hc._process_alive(4242), expected, type(exc).__name__)
+
     def test_fix_refuses_when_the_heartbeat_core_process_is_gone(self):
         """Rui: in the 60-90 s after the core dies its heartbeat is still fresh; the
         launcher would spawn a NEW core while the repair reported a preserved one."""
