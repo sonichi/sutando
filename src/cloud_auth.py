@@ -13,7 +13,8 @@ Lookup order (read_cloud_auth):
   2. The desktop host's Keychain session. The Tauri host stores the sutk_ ONLY
      there, under a key bound to the origin it was minted against
      (cloud_session.rs origin_key_suffix — mirrored byte-for-byte below).
-     Under the desktop host (SUTANDO_PACKAGED=1) the Keychain is probed FIRST:
+     Under the desktop host (SUTANDO_APP_SUPPORT in the core's environment, or
+     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is probed FIRST:
      it is the session the app is signed into, and a leftover cloud-auth.json
      from another workspace or the Electron era made the engine act as a
      different account than the one the app showed (user feedback P1-11).
@@ -120,9 +121,14 @@ def read_keychain_auth(get: Callable[[str], str | None] = keychain_get):
 
 
 def keychain_first() -> bool:
-    """Under the desktop host (its supervisor sets SUTANDO_PACKAGED=1) the Keychain
-    session is the account the app shows; files are legacy readers there."""
-    return os.environ.get("SUTANDO_PACKAGED") == "1"
+    """Under the desktop host the Keychain session is the account the app shows;
+    files are legacy readers there. The core's own environment carries
+    SUTANDO_APP_SUPPORT (the desktop launcher exports it to every engine process,
+    and channel_env_containment keys on the same variable); SUTANDO_PACKAGED=1
+    reaches only the sidecar, so it is accepted but never relied on."""
+    if os.environ.get("SUTANDO_PACKAGED") == "1":
+        return True
+    return bool((os.environ.get("SUTANDO_APP_SUPPORT") or "").strip())
 
 
 def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
