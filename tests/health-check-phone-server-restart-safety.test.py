@@ -84,11 +84,56 @@ class TestRestartSafety(unittest.TestCase):
                 self.assertEqual(argv[0], "node")
                 self.assertTrue(argv[1].endswith("dist/conversation-server.js"))
 
+    def test_fix_defers_with_live_calls_and_rechecks_before_the_kill(self):
+        mod = _load()
+        with mock.patch.object(mod, "_phone_server_active_calls", return_value=2), \
+                mock.patch.object(mod.subprocess, "Popen") as popen:
+            self.assertIn("deferred", mod.fix_conversation_server({"status": "stale"}))
+            popen.assert_not_called()
+        # Idle at the first look, a call starts before the kill: still deferred, nothing killed.
+        calls = iter([0, 1])
+        runs = []
+        with mock.patch.object(mod, "_phone_server_active_calls", lambda: next(calls)), \
+                mock.patch.object(mod, "_filter_pids_this_checkout", lambda pids: pids), \
+                mock.patch.object(mod.subprocess, "run", lambda argv, **kw: runs.append(argv) or subprocess.CompletedProcess(argv, 0, stdout="777\n", stderr="")), \
+                mock.patch.object(mod.subprocess, "Popen") as popen:
+            self.assertEqual(mod.fix_conversation_server({"status": "stale"}, settle_s=0), "a call started — deferred")
+            self.assertFalse(any(a[0] == "/bin/kill" for a in runs))
+            popen.assert_not_called()
+
+    def test_fix_kills_a_stale_idle_server_and_relaunches_the_bundle(self):
+        mod = _load()
+        runs = []
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(mod, "REPO_DIR", Path(td)), \
+                mock.patch.object(mod, "_phone_server_active_calls", return_value=0), \
+                mock.patch.object(mod, "_filter_pids_this_checkout", lambda pids: pids), \
+                mock.patch.object(mod.subprocess, "run", lambda argv, **kw: runs.append(argv) or subprocess.CompletedProcess(argv, 0, stdout="777\n888\n", stderr="")), \
+                mock.patch.object(mod.subprocess, "Popen") as popen, \
+                mock.patch("builtins.open", mock.mock_open()):
+            (Path(td) / "dist").mkdir()
+            (Path(td) / "dist" / "conversation-server.js").write_text("// bundle")
+            self.assertEqual(mod.fix_conversation_server({"status": "stale"}, settle_s=0), "restarted (stale code)")
+            killed = [a[1] for a in runs if a[0] == "/bin/kill"]
+            self.assertEqual(killed, ["777", "888"])
+            argv = popen.call_args[0][0]
+            self.assertEqual(argv[0], "node")
+            self.assertTrue(argv[1].endswith("dist/conversation-server.js"))
+        # A merely down server is relaunched without any kill.
+        runs.clear()
+        with mock.patch.object(mod, "_phone_server_active_calls", return_value=0), \
+                mock.patch.object(mod.subprocess, "run", lambda argv, **kw: runs.append(argv)), \
+                mock.patch.object(mod.subprocess, "Popen") as popen, \
+                mock.patch("builtins.open", mock.mock_open()):
+            self.assertEqual(mod.fix_conversation_server({"status": "warn"}), "restarted")
+            self.assertEqual(runs, [])
+            popen.assert_called_once()
+
     def test_the_conversation_server_check_names_the_artifact(self):
         src = (REPO / "src/health-check.py").read_text()
         i = src.index('mark_stale_if_outdated(\n                    c,\n                    REPO_DIR / "skills" / "phone-conversation"')
         self.assertIn('binary_path=REPO_DIR / "dist" / "conversation-server.js"', src[i:i + 400])
-        self.assertIn("stale but {_live} call(s) active", src, "the --fix path defers a stale server with live calls")
+        self.assertIn('print(f"  {c[\'name\']}: {fix_conversation_server(c)}")', src, "the --fix loop routes through fix_conversation_server")
 
 
 if __name__ == "__main__":

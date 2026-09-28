@@ -4611,6 +4611,38 @@ def _phone_server_launch_argv() -> list:
     return ["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"]
 
 
+def fix_conversation_server(c: dict, *, settle_s: float = 1.0) -> str:
+    """Restart the phone server, never mid-call: a stale server with live calls is
+    deferred (it drains on SIGTERM, but the owner's call comes first); a stale one
+    is killed only after a re-check right before the kill; the launch is the
+    bundled artifact when it exists."""
+    stale = c.get("status") == "stale"
+    live = _phone_server_active_calls()
+    if stale and live:
+        return f"stale but {live} call(s) active — deferred, run --fix again later"
+    if stale:
+        # Old PIDs first so the new process neither bind-fails nor lands beside a zombie.
+        try:
+            old_pids = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "conversation-server"],
+                capture_output=True, text=True
+            ).stdout.strip().split("\n")
+            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
+            if _phone_server_active_calls():
+                return "a call started — deferred"
+            for pid in old_pids:
+                if pid:
+                    subprocess.run(["/bin/kill", pid], check=False)
+            time.sleep(settle_s)
+        except Exception:
+            pass
+    subprocess.Popen(_phone_server_launch_argv(),
+                     cwd=str(REPO_DIR),
+                     stdout=open("/tmp/conversation-server.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    return "restarted (stale code)" if stale else "restarted"
+
+
 def _C_LOCALE_ENV() -> dict:
     """The environment for a `ps -o lstart` whose output is parsed in English."""
     return {**os.environ, "LC_ALL": "C"}
@@ -14950,36 +14982,7 @@ def main():
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    # Never restart mid-call: a stale server with live calls is
-                    # deferred (it drains on SIGTERM, but the owner's call comes first).
-                    _live = _phone_server_active_calls()
-                    if c["status"] == "stale" and _live:
-                        print(f"  {c['name']}: stale but {_live} call(s) active — deferred, run --fix again later")
-                        continue
-                    # If stale, kill old PIDs first so the new process doesn't
-                    # bind-fail or end up alongside a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", "conversation-server"],
-                                capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
-                            # Re-checked right before the kill: a call may have started.
-                            if _phone_server_active_calls():
-                                print(f"  {c['name']}: a call started — deferred")
-                                continue
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    subprocess.Popen(_phone_server_launch_argv(),
-                                     cwd=str(REPO_DIR),
-                                     stdout=open("/tmp/conversation-server.log", "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    print(f"  {c['name']}: {fix_conversation_server(c)}")
 
     # Screen-capture (:7845) is optional, so a down server is downgraded to
     # warn and never enters `issues` — the fix loop above can't reach it. An

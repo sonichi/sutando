@@ -16,13 +16,13 @@ describe('health', () => {
 		const dir = mkdtempSync(join(tmpdir(), 'phone-health-'));
 		const bundle = join(dir, 'conversation-server.js');
 		writeFileSync(bundle, '// bundle');
-		const h = healthPayload({ activeCalls: 2, webhookUrl: 'https://x.ngrok.app', startedAt: 123, bundlePath: bundle }) as Record<string, any>;
+		const h = healthPayload({ activeCalls: 2, webhookUrl: 'https://x.ngrok.app', startedAt: 123, bundlePath: bundle }) as { status: string; activeCalls: number; startedAt: number; bundle: { path: string; mtimeMs: number | null } };
 		assert.equal(h.status, 'ok');
 		assert.equal(h.activeCalls, 2);
 		assert.equal(h.startedAt, 123);
 		assert.equal(h.bundle.path, bundle);
 		assert.equal(typeof h.bundle.mtimeMs, 'number');
-		const missing = healthPayload({ activeCalls: 0, webhookUrl: '', startedAt: 1, bundlePath: join(dir, 'nope.js') }) as Record<string, any>;
+		const missing = healthPayload({ activeCalls: 0, webhookUrl: '', startedAt: 1, bundlePath: join(dir, 'nope.js') }) as { bundle: { mtimeMs: number | null } };
 		assert.equal(missing.bundle.mtimeMs, null);
 	});
 });
