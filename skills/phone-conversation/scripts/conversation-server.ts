@@ -1296,6 +1296,7 @@ async function startNgrokCli(port: number): Promise<string> {
 		env: { ...process.env, NGROK_AUTHTOKEN },
 	});
 	ngrokProcess = proc;
+	let exited = false;
 	proc.stderr?.on('data', (d: Buffer) => {
 		const line = d.toString().trim();
 		if (line) console.error(`${ts()} [ngrok] ${line}`);
@@ -1303,6 +1304,7 @@ async function startNgrokCli(port: number): Promise<string> {
 	// The tunnel is supervised here, by the process that owns it: an ngrok that
 	// dies is respawned with backoff, and Twilio is re-pointed when the URL moved.
 	proc.on('exit', (code, signal) => {
+		exited = true;
 		if (shuttingDown || ngrokProcess !== proc) return;
 		ngrokProcess = null;
 		const delay = ngrokScheduler.schedule();
@@ -1311,6 +1313,9 @@ async function startNgrokCli(port: number): Promise<string> {
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		await new Promise(r => setTimeout(r, 500));
+		// A child that already died has no tunnel to wait for; polling on would
+		// read a LATER attempt's tunnel as this one's.
+		if (exited) throw new Error('ngrok exited before its tunnel came up');
 		try {
 			const resp = await fetch('http://127.0.0.1:4040/api/tunnels');
 			const data = await resp.json() as { tunnels: Array<{ public_url: string; proto: string }> };

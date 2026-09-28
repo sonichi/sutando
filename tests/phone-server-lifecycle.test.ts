@@ -116,10 +116,11 @@ describe('the server wires the rules in (source guards)', () => {
 		assert.doesNotMatch(SRC, /process\.on\('SIGTERM', \(\) => \{ cleanupNgrok\(\); process\.exit\(0\); \}\)/);
 	});
 	it('a dead ngrok is respawned unless the server is shutting down, through the one scheduler', () => {
-		assert.match(SRC, /proc\.on\('exit', \(code, signal\) => \{\s*if \(shuttingDown \|\| ngrokProcess !== proc\) return;/);
+		assert.match(SRC, /proc\.on\('exit', \(code, signal\) => \{\s*exited = true;\s*if \(shuttingDown \|\| ngrokProcess !== proc\) return;/);
 		assert.equal((SRC.match(/ngrokScheduler\.schedule\(\)/g) ?? []).length, 2, 'the exit handler and the failed attempt both ask the one scheduler');
 		assert.doesNotMatch(SRC, /setTimeout\(\(\) => \{ void respawnNgrok/, 'no bare retry timer outside the scheduler');
 		assert.match(SRC, /ngrokScheduler\.reset\(\)/);
+		assert.match(SRC, /if \(exited\) throw new Error\('ngrok exited before its tunnel came up'\)/, 'a dead child ends its own poll, so it never claims a later attempt\'s tunnel');
 	});
 	it('new call work is refused while draining, before the handlers', () => {
 		assert.match(SRC, /if \(isDrainBlocked\(path, req\.method, draining\)\) \{\s*json\(res, 503/);
