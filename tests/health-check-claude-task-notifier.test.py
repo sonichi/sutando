@@ -223,10 +223,15 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
                 mock.patch.object(hc.subprocess, "run", side_effect=subprocess.TimeoutExpired("start-cli.sh", 120)):
             self.assertEqual(hc.fix_claude_task_notifier(), "not repaired — launcher failed (TimeoutExpired)")
         # The local core changed under the repair: the launcher's result is not ours to claim.
-        targets = iter([{"socket": "/tmp/test-sutando.sock", "session": "sutando-core"},
-                        {"socket": "/tmp/other.sock", "session": "sutando-core"}])
+        calls = []
+
+        def drifting_target(hb=None):
+            # The check itself resolves the target once more; only the post-launch read drifts.
+            calls.append(1)
+            sock = "/tmp/test-sutando.sock" if len(calls) < 3 else "/tmp/other.sock"
+            return {"socket": sock, "session": "sutando-core"}
         with mock.patch.object(hc, "_run_tmux", side_effect=gone), \
-                mock.patch.object(hc, "_local_claude_notifier_target", lambda hb=None: next(targets)), \
+                mock.patch.object(hc, "_local_claude_notifier_target", drifting_target), \
                 mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
                 mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertEqual(hc.fix_claude_task_notifier(), "not repaired — local Claude core changed during repair")
