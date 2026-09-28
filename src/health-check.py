@@ -10327,6 +10327,21 @@ def check_claude_task_notifier() -> dict:
     return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
 
 
+def _process_alive(pid: int) -> bool:
+    """Whether `pid` is a running process we may signal (kill -0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def fix_claude_task_notifier() -> str:
     """Notifier-only recovery for the Claude core, mirroring the Codex one: the
     canonical launcher, run without --restart, recreates a missing `<session>-watcher`
@@ -10340,6 +10355,15 @@ def fix_claude_task_notifier() -> str:
     target = _local_claude_notifier_target(heartbeat)
     if target is None:
         return "not repaired — the live Claude core session could not be verified"
+    # The shared launcher injects --restart when the session records another
+    # runtime, and spawns a new core when the heartbeat's process is gone.
+    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
+    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
+        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
+        return f"not repaired — the live core records a different runtime ({seen})"
+    core_pid = heartbeat.get("pid")
+    if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
+        return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
     if check_claude_task_notifier()["status"] == "ok":
         return "already healthy"
     launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"

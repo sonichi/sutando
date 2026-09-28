@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import tempfile
@@ -29,11 +30,13 @@ CODEX_NOTIFIER = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
 
 class FakeTmux:
     def __init__(self, *, core_exists: bool = True, panes=None,
-                 notifier_script: "str | None" = None) -> None:
+                 notifier_script: "str | None" = None, core_runtime: "str | None" = "claude") -> None:
         self.core_exists = core_exists
         self.panes = panes
         # What `show-environment` reports for SUTANDO_NOTIFIER_SCRIPT (None = unset).
         self.notifier_script = notifier_script
+        # What the core session records as SUTANDO_CORE_RUNTIME (None = unset).
+        self.core_runtime = core_runtime
         self.calls = []
 
     @staticmethod
@@ -51,6 +54,10 @@ class FakeTmux:
             if self.panes is None:
                 return self._result(args, 1)
             return self._result(args, 0, "".join(f"{d}\t{c}\n" for d, c in self.panes))
+        if args and args[0] == "show-environment" and args[-1] == "SUTANDO_CORE_RUNTIME":
+            if self.core_runtime is None:
+                return self._result(args, 1, "-SUTANDO_CORE_RUNTIME\n")
+            return self._result(args, 0, f"SUTANDO_CORE_RUNTIME={self.core_runtime}\n")
         if args and args[0] == "show-environment":
             if self.notifier_script is None:
                 return self._result(args, 1, "-SUTANDO_NOTIFIER_SCRIPT\n")
@@ -77,11 +84,12 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
             patch.stop()
         self.tmp.cleanup()
 
-    def write_local_core(self, *, socket="/tmp/test-sutando.sock", session="sutando-core") -> None:
+    def write_local_core(self, *, socket="/tmp/test-sutando.sock", session="sutando-core", pid=None) -> None:
         cores = self.state / "cores"
         cores.mkdir(exist_ok=True)
         (cores / "local-host.alive").write_text(
-            json.dumps({"socket": socket, "session": session, "last_beat_at": time.time()}))
+            json.dumps({"socket": socket, "session": session, "last_beat_at": time.time(),
+                        "pid": os.getpid() if pid is None else pid}))
 
     def test_runtime_not_claude_means_not_expected(self):
         with mock.patch.object(hc, "resolve_core_runtime", return_value="codex"):
@@ -201,6 +209,36 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
                 mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
                 mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertIn("not repaired — ", hc.fix_claude_task_notifier(), "a launcher that exits 0 but leaves no watcher is not a repair")
+
+    def test_fix_refuses_a_session_that_records_another_runtime(self):
+        """Review of #4872 (Yixuan, Rui): the shared launcher injects --restart when the
+        session records a different runtime, so a Codex core in the session would be
+        restarted by a repair that claims to preserve it. Refused before the launcher."""
+        self.write_local_core()
+        for recorded in ("codex", None):
+            with self.subTest(recorded=recorded):
+                tmux = FakeTmux(panes=None, core_runtime=recorded)
+                with mock.patch.object(hc, "_run_tmux", side_effect=tmux), \
+                        mock.patch.object(hc.subprocess, "run") as run:
+                    verdict = hc.fix_claude_task_notifier()
+                self.assertIn("records a different runtime", verdict)
+                self.assertIn("codex" if recorded else "unreadable", verdict)
+                run.assert_not_called()
+
+    def test_fix_refuses_when_the_heartbeat_core_process_is_gone(self):
+        """Rui: in the 60-90 s after the core dies its heartbeat is still fresh; the
+        launcher would spawn a NEW core while the repair reported a preserved one."""
+        self.write_local_core(pid=2_000_000_000)  # no such process
+        with mock.patch.object(hc, "_run_tmux", side_effect=FakeTmux(panes=None)), \
+                mock.patch.object(hc.subprocess, "run") as run:
+            verdict = hc.fix_claude_task_notifier()
+        self.assertIn("core process (pid 2000000000) is not running", verdict)
+        run.assert_not_called()
+        self.write_local_core(pid="not-a-pid")
+        with mock.patch.object(hc, "_run_tmux", side_effect=FakeTmux(panes=None)), \
+                mock.patch.object(hc.subprocess, "run") as run:
+            self.assertIn("is not running", hc.fix_claude_task_notifier())
+            run.assert_not_called()
 
     def test_fix_reports_every_way_the_launcher_path_can_fail(self):
         self.write_local_core()
