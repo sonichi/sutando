@@ -209,7 +209,8 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
         who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
         return (f"ℹ️ Fable weekly limit reached — {who} had a turn refused, so its monitor typed"
-                " `/model opus` and `continue`: it runs on Opus for the rest of this session."
+                " `/model opus`, then `continue` once the switch settled: it runs on Opus for the rest"
+                " of this session."
                 " /model in its terminal switches back; /usage-credits keeps Fable on credits.")
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
@@ -435,7 +436,8 @@ def resolve_active_target(activity_path):
 
 def relay_seat_notices(core_signal, state_file, **kw):
     """Soft notices from the pool seats' signals beside the core's. A seat's hard gates
-    already reach the owner as its own HITL card, so only what it answered itself is sent."""
+    already reach the owner as its own HITL card, so only what it answered itself is sent.
+    A sibling counts as a seat only when its signal names one (`--seat`), never by filename."""
     if os.path.basename(core_signal) != "core-supervisor.json":
         return []
     out = []
@@ -446,9 +448,8 @@ def relay_seat_notices(core_signal, state_file, **kw):
                 signal = json.load(f)
         except (OSError, ValueError):
             continue
-        if not isinstance(signal, dict) or not _soft_notice(signal):
+        if not isinstance(signal, dict) or not signal.get("seat") or not _soft_notice(signal):
             continue
-        signal.setdefault("seat", seat)
         msg = run_cycle(signal, f"{state_file}.{seat}" if state_file else "", **kw)
         if msg:
             out.append(("DRY-RUN " if kw.get("dry_run") else "escalated: ") + msg)

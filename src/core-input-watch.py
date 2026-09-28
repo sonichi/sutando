@@ -176,9 +176,14 @@ _AUTO_ANSWER = {
     # text, so Enter is that switch and spends nothing (owner 2026-09-02).
     "fable-limit": "Enter",
     # The same limit refused as a finished turn, with no dialog to focus: the switch is typed.
-    # `opus` is the CLI's alias for its current Opus; `continue` resumes the refused turn.
-    "fable-limit-refused": ("/model opus", "Enter", "continue", "Enter"),
+    # `opus` is the CLI's alias for its current Opus.
+    "fable-limit-refused": ("/model opus", "Enter"),
 }
+
+#: Typed only once a later tick reads the pane idle-ready again, so a picker or a slow
+#: switch never receives it; `continue` resumes the refused turn.
+_FOLLOW_UP = {"fable-limit-refused": ("continue", "Enter")}
+FOLLOW_UP_WINDOW_S = 120.0
 
 #: A typed answer re-arms only after this long: a switch that did not take would otherwise
 #: be refused again, re-detected and re-typed on every tick.
@@ -537,6 +542,16 @@ def send_keys(socket, session, key):
     return True
 
 
+def follow_up_step(pending, state, now):
+    """(key to send now or None, pending to keep). A follow-up waits for idle-ready and
+    is dropped unsent once FOLLOW_UP_WINDOW_S passes."""
+    if not pending or now - pending["at"] > FOLLOW_UP_WINDOW_S:
+        return None, None
+    if state == "idle-ready":
+        return pending["key"], None
+    return None, pending
+
+
 def answer_step(state, kind, prompt, answered_prompt, enabled=True):
     """The AUTO-ANSWER actor's pure half: the key to send now, or None.
 
@@ -763,6 +778,7 @@ def main():
     answered_prompt = None
     last_answered = None
     typed_at = {}
+    follow_up = None
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
@@ -793,6 +809,12 @@ def main():
             last_answered = {"kind": kind, "key": key, "at": time.time()}
             if isinstance(key, tuple):
                 typed_at[kind] = last_answered["at"]
+            if kind in _FOLLOW_UP:
+                follow_up = {"key": _FOLLOW_UP[kind], "at": last_answered["at"]}
+        elif follow_up:
+            then, follow_up = follow_up_step(follow_up, state, time.time())
+            if then:
+                send_keys(a.socket, a.session, then)
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 

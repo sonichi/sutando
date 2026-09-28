@@ -61,10 +61,10 @@ _FABLE_AUTO = {"state": "blocked-known", "detail": "at known gate: fable-limit",
                "kind": "fable-limit",
                "auto_answered": {"kind": "fable-limit", "key": "Enter", "at": 1788380000.0}}
 _FABLE_AUTO_LATER = dict(_IDLE, auto_answered=_FABLE_AUTO["auto_answered"])
-# A seat's monitor switched a turn refused at the Fable limit (typed `/model opus`, `continue`).
-_FABLE_REFUSED_AUTO = dict(_IDLE, auto_answered={"kind": "fable-limit-refused",
-                                                 "key": ["/model opus", "Enter", "continue", "Enter"],
-                                                 "at": 1788400000.0})
+# A seat's monitor switched a turn refused at the Fable limit (typed `/model opus`).
+_FABLE_REFUSED_AUTO = dict(_IDLE, seat="Pro-fast",
+                           auto_answered={"kind": "fable-limit-refused", "key": ["/model opus", "Enter"],
+                                          "at": 1788400000.0})
 _PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
@@ -172,7 +172,7 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("worker sutando-worker-d2571c90", msg)
         self.assertIn("/model opus", msg)
         self.assertNotIn("Agent needs you", msg)
-        self.assertIn("the core", compose_message(_FABLE_REFUSED_AUTO))
+        self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
 
     def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
         msg = compose_message(_FABLE_AUTO)
@@ -1079,8 +1079,8 @@ class TestSeatNotices(unittest.TestCase):
             second = self._run()
         finally:
             _mod._macos_notify = orig
-        self.assertIn("worker sutando-worker-ab", first)
-        self.assertNotIn("worker sutando-worker-ab", second)
+        self.assertIn("worker Pro-fast", first)
+        self.assertNotIn("worker Pro-fast", second)
         self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
 
     def test_a_seat_hard_gate_is_left_to_its_own_card(self):
@@ -1089,7 +1089,11 @@ class TestSeatNotices(unittest.TestCase):
 
     def test_no_seats_skips_them(self):
         self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
-        self.assertNotIn("sutando-worker-ab", self._run("--no-seats"))
+        self.assertNotIn("Pro-fast", self._run("--no-seats"))
+
+    def test_a_sibling_that_names_no_seat_is_not_a_seat(self):
+        self._seat("sutando-worker-ab", {k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"})
+        self.assertEqual(_mod.relay_seat_notices(self.core, self.state, dry_run=True), [])
 
     def test_a_seat_signal_given_as_signal_does_not_scan_siblings(self):
         self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)

@@ -210,7 +210,18 @@ class TestClassify(unittest.TestCase):
         st, _d, prompt, kind = compose_state(_FABLE_REFUSED_MONITOR, "idle", True)
         self.assertEqual((st, kind), ("blocked-known", "fable-limit-refused"))
         self.assertIn("reached your Fable limit", prompt)
-        self.assertEqual(auto_answer("fable-limit-refused"), ("/model opus", "Enter", "continue", "Enter"))
+        self.assertEqual(auto_answer("fable-limit-refused"), ("/model opus", "Enter"))
+
+    def test_continue_waits_for_the_switch_to_settle(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        # A picker or a still-running switch keeps it pending; idle-ready sends it once.
+        self.assertEqual(_mod.follow_up_step(pending, "blocked-human", 101.0), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "running", 101.0), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0), (("continue", "Enter"), None))
+        # Past the window it is dropped unsent, whatever the pane then reads.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0), (None, None))
 
     def test_the_refusal_wrapped_over_two_lines_is_still_seen(self):
         pane = _FABLE_REFUSED_MONITOR.replace(" or switch models", "\n  or switch models")
@@ -796,6 +807,11 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
             sent, payload = self._tick([])
         self.assertEqual(len(sent), 1)
         self.assertNotIn("auto_answered", payload)
+
+    def test_a_refused_turn_types_only_the_switch_on_its_tick(self):
+        sent, payload = self._tick([], pane=_FABLE_REFUSED_MONITOR)
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
+        self.assertEqual(payload["auto_answered"]["kind"], "fable-limit-refused")
 
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])
