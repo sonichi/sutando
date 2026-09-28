@@ -66,6 +66,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
 
 import argparse
 import hashlib
@@ -340,6 +341,12 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         if kind in _HUMAN_GATES:
             return "blocked-human", f"awaiting user: {kind}", excerpt, kind
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
+    # A refused login leaves no gate and the idle footer, and the shared health can read a
+    # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
+    expired = login_expired(pane) if pane else None
+    if expired:
+        return ("logged-out", "core not authenticated (login expired; no signed-in turn since)",
+                expired, "login")
     if base_health == "needs_login":
         return "logged-out", _BASE_TO_STATE["needs_login"][1], None, None
     # A refused turn leaves the core at its idle footer, which every branch below reads
@@ -582,21 +589,31 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None):
         return None
 
 
-def resolve_escalations(manager, session):
+def resolve_escalations(manager, session, pane=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
     Scoped by session: one worker recovering must not clear a sibling's card.
+    A signed-out card clears only on positive proof in `pane` that a turn ran
+    (worker_auth_state.authenticated_turn): a newer prompt, a spinner, an empty
+    capture or a health verdict read off another session's status file is not
+    "Sutando has continued its work" (user feedback 2026-09-29).
     """
     if manager is None:
         return []
     try:
-        mine = [r.id for r in manager.active()
-                if (r.subject or {}).get("source") == _TUI_SOURCE
-                and (r.subject or {}).get("session") == session]
-        for req_id in mine:
-            manager.resolve(req_id)   # returns blocked task ids, not a verdict
-        return mine
+        from hitl.manager import AUTH_KIND
+        signed_in = authenticated_turn(pane)
+        done = []
+        for r in manager.active():
+            subj = r.subject or {}
+            if subj.get("source") != _TUI_SOURCE or subj.get("session") != session:
+                continue
+            if r.kind == AUTH_KIND and not signed_in:
+                continue
+            manager.resolve(r.id)   # returns blocked task ids, not a verdict
+            done.append(r.id)
+        return done
     except Exception as exc:  # noqa: BLE001
         print(f"hitl resolve failed: {exc}", file=_sys.stderr)
         return []
@@ -755,7 +772,7 @@ def main():
                                   lambda k: send_keys(a.socket, a.session, k))
                 escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None)
             else:
-                resolve_escalations(hitl, a.session)
+                resolve_escalations(hitl, a.session, pane)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
