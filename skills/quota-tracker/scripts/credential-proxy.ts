@@ -66,6 +66,17 @@ const REFRESH_FAIL_BACKOFF_BASE_MS =
 const REFRESH_FAIL_BACKOFF_MAX_MS =
 	Number(process.env.SUTANDO_PROXY_REFRESH_BACKOFF_MAX_MS) || 15 * 60 * 1000; // 15 min
 
+// A wedge (refresh fails, process stays up and keeps serving 502s) never asks
+// a supervisor for help, because the process never exits. After this many
+// CONSECUTIVE failures (reset to 0 on any success — see runSingleFlightRefresh)
+// the proxy gives up and exits non-zero instead of retrying forever, so
+// whichever supervisor is watching (launchd, a process manager) gets a real
+// signal to act on. At the default backoff schedule this is ~35 min of
+// continuous failure before giving up — tolerant of a single OAuth-endpoint
+// blip, loud well before the multi-hour wedges this was written after.
+const REFRESH_GIVE_UP_AFTER =
+	Number(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER) || 6;
+
 // Pure: how long to wait before the next refresh attempt after `failCount`
 // consecutive failures. 0 failures → 0 (attempt immediately). Exponential
 // (BASE·2^(n-1)) capped at MAX.
@@ -366,6 +377,7 @@ export interface ProxyDeps {
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
 	idleTimeoutMs: number;
+	exitProcess: (code: number) => void;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -380,6 +392,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		recordCredentialState,
 		now: Date.now,
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+		exitProcess: (code) => process.exit(code),
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -408,6 +421,11 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
 				} else {
 					refreshFailCount += 1;
+					if (refreshFailCount >= REFRESH_GIVE_UP_AFTER) {
+						console.error(`${ts()} [Proxy] refresh failed ${refreshFailCount} consecutive times (give-up threshold ${REFRESH_GIVE_UP_AFTER}) — exiting so a supervisor can restart; serving 502s forever hides a wedge as "up"`);
+						deps.exitProcess(1);
+						return;
+					}
 					const backoff = nextRefreshBackoffMs(refreshFailCount);
 					nextRefreshAllowedAt = deps.now() + backoff;
 					console.error(`${ts()} [Proxy] refresh failed (failure ${refreshFailCount}, next attempt allowed in ${Math.round(backoff / 1000)}s)`);

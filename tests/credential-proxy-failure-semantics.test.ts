@@ -295,3 +295,64 @@ test('selectCred with no usable candidate falls back to the first present (degra
 test('selectCred with no candidates → null', () => {
 	assert.equal(selectCred([], now, null), null);
 });
+
+// A wedge (refresh fails, process stays up serving 502s forever) never asks a
+// supervisor for help because the process never exits. After the give-up
+// threshold's worth of CONSECUTIVE failures, the proxy must exit non-zero
+// instead of retrying forever -- exitProcess is injected so this is provable
+// without actually killing the test runner.
+test('refresh failures past the give-up threshold exit non-zero instead of retrying forever', async () => {
+	keychain = { service: 's', oauth: { accessToken: 'dead-stored-token-aaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
+	refreshResult = null; // every refresh attempt fails
+	upstreamHandler = (_req, res) => respond(res, 200, '{"ok":true}');
+	const exitCalls: number[] = [];
+	const proxyPort = await startProxy(await startUpstream(), {
+		exitProcess: (code) => { exitCalls.push(code); },
+	});
+
+	// Default give-up threshold is 6 consecutive failures. Drive 5 (no exit
+	// yet), jumping `now` well past each backoff window so the next call
+	// actually re-attempts rather than being suppressed by the cooldown.
+	for (let i = 0; i < 5; i++) {
+		await call(proxyPort, { authorization: 'Bearer client-token' });
+		now += 20 * 60 * 1000; // 20 min: comfortably past the 15 min backoff cap
+	}
+	assert.equal(refreshCalls, 5);
+	assert.deepEqual(exitCalls, [], 'must not give up before the threshold');
+
+	// The 6th consecutive failure crosses the threshold.
+	await call(proxyPort, { authorization: 'Bearer client-token' });
+	assert.equal(refreshCalls, 6);
+	assert.deepEqual(exitCalls, [1], 'gives up with a non-zero exit exactly at the threshold, not before or repeatedly after');
+});
+
+test('a refresh success resets the failure count, so the give-up threshold never fires on an intermittent blip', async () => {
+	keychain = { service: 's', oauth: { accessToken: 'dead-stored-token-aaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
+	refreshResult = null;
+	upstreamHandler = (_req, res) => respond(res, 200, '{"ok":true}');
+	const exitCalls: number[] = [];
+	const proxyPort = await startProxy(await startUpstream(), {
+		exitProcess: (code) => { exitCalls.push(code); },
+	});
+
+	// Fail 5 times (one short of the default threshold of 6)...
+	for (let i = 0; i < 5; i++) {
+		await call(proxyPort, { authorization: 'Bearer client-token' });
+		now += 20 * 60 * 1000;
+	}
+	// ...then a real success clears the counter...
+	refreshResult = { accessToken: 'refreshed-token-cccccccccccc', refreshToken: 'rt2', expiresAt: now + 8 * HOUR };
+	now += 20 * 60 * 1000;
+	await call(proxyPort, { authorization: 'Bearer client-token' });
+	assert.deepEqual(exitCalls, [], 'a success before the threshold must not have triggered a give-up');
+
+	// ...so a subsequent run of failures starts counting from zero again, not
+	// from where the first run left off.
+	keychain = { service: 's', oauth: { accessToken: 'refreshed-token-cccccccccccc', refreshToken: 'rt2', expiresAt: now - 1000 } };
+	refreshResult = null;
+	for (let i = 0; i < 5; i++) {
+		await call(proxyPort, { authorization: 'Bearer client-token' });
+		now += 20 * 60 * 1000;
+	}
+	assert.deepEqual(exitCalls, [], 'still short of a fresh 6-failure run after the reset');
+});
