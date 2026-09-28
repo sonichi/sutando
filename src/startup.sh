@@ -726,30 +726,49 @@ fi
 # 0. Credential proxy for quota tracking (port 7846).
 # Prefer the launchd-supervised job (KeepAlive + ThrottleInterval=10s) so the
 # proxy restarts on crash instead of leaving a proxy-routed core stranded on a
-# dead port (#1086 / #1291). The wrapper evicts any stale manual holder of 7846
-# before binding, so this composes with the legacy bare-& launch below. Falls
-# back to that legacy launch on older checkouts that lack the launchd template,
-# or if the install fails for any reason.
-_PROXY_LABEL="com.sutando.credential-proxy"
-_PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
-if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  # An already-loaded job may carry a plist generated before the current pins existed;
-  # the installer owns that comparison because it owns what the plist renders.
-  if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded, config current)"
-  else
-    echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
-    if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
-      # Wait for the supervised proxy to bind before the legacy-launch guard.
-      for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
-      echo "  ✓ credential proxy (launchd-supervised)"
+# dead port (#1086 / #1291). Once that job is loaded it is the ONLY supervisor:
+# a child of this tmux tree beside it races the wrapper for the port and dies
+# with the tree. The legacy bare-& launch below runs only when no launchd job
+# exists (older checkout without the template, or an install that refused).
+start_credential_proxy() {
+  local _PROXY_LABEL="com.sutando.credential-proxy"
+  local _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
+  local _PROXY_SERVICE _PROXY_SCRIPT _state _exit
+  _PROXY_SERVICE="gui/$(id -u)/$_PROXY_LABEL"
+  if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
+    # An already-loaded job may carry a plist generated before the current pins existed;
+    # the installer owns that comparison because it owns what the plist renders.
+    if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
+      echo "  ✓ credential proxy (launchd-supervised, already loaded, config current)"
     else
-      echo "  ⚠ launchd install failed — falling back to legacy launch"
+      echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
+      if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
+        echo "  ✓ credential proxy (launchd-supervised)"
+      else
+        echo "  ⚠ launchd install failed"
+      fi
     fi
   fi
-fi
-if ! lsof -i :7846 > /dev/null 2>&1; then
-  echo "  Starting credential proxy (port 7846)..."
+  if lsof -i :7846 > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (already running)"
+    export ANTHROPIC_BASE_URL=http://localhost:7846
+    return 0
+  fi
+  if launchctl print "$_PROXY_SERVICE" > /dev/null 2>&1; then
+    # launchd owns the port. Wait for its proxy to bind; if it does not, say which
+    # state the job is in and route seats directly rather than at a dead port.
+    for _ in $(seq 1 20); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
+    if lsof -i :7846 > /dev/null 2>&1; then
+      echo "  ✓ credential proxy (launchd-supervised)"
+      export ANTHROPIC_BASE_URL=http://localhost:7846
+      return 0
+    fi
+    _state="$(launchctl print "$_PROXY_SERVICE" 2>/dev/null | awk -F' = ' '$1 ~ /^[[:space:]]*state$/ {print $2; exit}')"
+    _exit="$(launchctl print "$_PROXY_SERVICE" 2>/dev/null | awk -F' = ' '$1 ~ /^[[:space:]]*last exit code$/ {print $2; exit}')"
+    echo "  ⚠ credential proxy: launchd job $_PROXY_LABEL is loaded but not serving :7846 (state=${_state:-unknown}, last exit=${_exit:-none}); NOT starting a second proxy under this session. Claude will connect directly. Recover with: launchctl kickstart -k $_PROXY_SERVICE  (log: $WORKSPACE/logs/credential-proxy.log)"
+    return 0
+  fi
+  echo "  Starting credential proxy (port 7846, no launchd job on this host)..."
   # Same dist-only contract as the wrapper and the installer: a bundled host
   # ships dist/ and has no quota-tracker skill dir, so resolving the TS source
   # here would hand run_node_service a path that does not exist and leave the
@@ -770,10 +789,8 @@ if ! lsof -i :7846 > /dev/null 2>&1; then
   else
     echo "  ⚠ credential proxy failed — Claude will connect directly (check /tmp/credential-proxy.log)"
   fi
-else
-  echo "  ✓ credential proxy (already running)"
-  export ANTHROPIC_BASE_URL=http://localhost:7846
-fi
+}
+start_credential_proxy
 
 # 0b. Local usage collector. Token/cost metrics are on by default so dashboard
 # usage panels work out of the box; plaintext prompt/tool hooks retain their
