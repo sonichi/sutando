@@ -1179,6 +1179,28 @@ describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 		assert.equal(h.failures.length, 1);
 	});
 
+	it('redial frames arriving faster than the deadline do not restart it (review of #4857)', async () => {
+		// The agent reports a new state on every retry (backoff 1, 2, 4, 8 s…); a
+		// per-frame clear made the card wait for one gap longer than the deadline.
+		const h = harness({ upstreamDeadlineMs: 60 });
+		const s = await goLive(h);
+		const t0 = Date.now();
+		let firedAt = 0;
+		let kind: 'backoff' | 'connecting' = 'backoff';
+		const feeder = setInterval(() => {
+			if (h.failures.length > 0) { if (!firedAt) firedAt = Date.now(); return; }
+			s.message(frame({ upstream: kind }));
+			kind = kind === 'backoff' ? 'connecting' : 'backoff';
+		}, 10);
+		s.message(frame({ upstream: 'backoff' }));
+		await delay(130);
+		clearInterval(feeder);
+		assert.equal(h.failures.length, 1, 'the deadline fired although no gap between frames reached it');
+		assert.equal(h.failures[0].reason, 'upstream-unreachable');
+		assert.ok(firedAt && firedAt - t0 < 115, `fired at +${firedAt ? firedAt - t0 : 'never'}ms, expected about the 60 ms deadline`);
+		await h.t.closeSettled();
+	});
+
 	it('backoff followed by live inside the deadline: no failure, and the deadline is disarmed', async () => {
 		const h = harness({ upstreamDeadlineMs: 30 });
 		const s = await goLive(h);

@@ -1352,7 +1352,10 @@ export class VoiceTransport {
     this.agentStateSeen = true;
     this.legacyServer = false;
     this.clearLegacyTimer();
-    this.clearUpstreamTimer();
+    // The deadline is NOT cleared here: the agent sends a fresh state on every
+    // redial (backoff 1, 2, 4, 8 s…), and a per-frame clear let the 30 s window
+    // restart each time, so the card fired only once a single gap reached 30 s.
+    // live and idle clear it below; connecting/backoff arm it once.
     const prev = this.lastUpstream;
     this.lastUpstream = frame.upstream;
     this.ev.onAgentState?.(frame);
