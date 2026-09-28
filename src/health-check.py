@@ -12441,9 +12441,9 @@ def proxy_liveness_status(proxy_check: dict) -> str:
 def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     """Escalate `check` to 'warn' when the proxy's own last-recorded credential
     state (quota-state.json, written by recordCredentialState()) is 'exhausted'
-    and predates its current process incarnation. Advisory: silent on any
-    read/parse failure, and never runs unless the caller's own gate already
-    proved the port is 'ok'/'stale'.
+    and was recorded by the current process (a record older than the process
+    start is ignored). Advisory: silent on any read/parse failure, and never
+    runs unless the caller's own gate already proved the port is 'ok'/'stale'.
     """
     if check["status"] not in ("ok", "stale"):
         return
