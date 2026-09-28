@@ -156,6 +156,57 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok", result)
         self.assertIn("sutando-core-watcher", result["detail"])
 
+    def test_fix_repairs_a_missing_watcher_through_the_launcher_and_preserves_the_core(self):
+        """P1-23: the standby notifier went missing and nothing under --fix brought it
+        back. The repair runs the canonical launcher (no --restart) for the live core's
+        socket/session and reports by re-probing, never by trusting the launcher."""
+        self.write_local_core(socket="/tmp/custom.sock", session="sutando-core")
+        tmux = FakeTmux(panes=None)  # the watcher session is gone
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"], seen["env"] = argv, kw.get("env", {})
+            tmux.panes = [("0", f"bash {shlex.quote(str(SUPERVISOR))}")]  # the launcher recreated it
+            tmux.notifier_script = str(CLAUDE_NOTIFIER)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux), \
+                mock.patch.object(hc, "_resolve_launch_env", return_value={"PATH": "/usr/bin"}), \
+                mock.patch.object(hc.subprocess, "run", fake_run):
+            self.assertEqual(hc.fix_claude_task_notifier(), "repaired managed notifier; live core session preserved")
+        self.assertTrue(str(seen["argv"][1]).endswith("src/agent/start-cli.sh"))
+        self.assertNotIn("--restart", seen["argv"])
+        self.assertEqual(seen["env"]["SUTANDO_CORE_RUNTIME"], "claude")
+        self.assertEqual(seen["env"]["SUTANDO_TMUX_SOCKET"], "/tmp/custom.sock")
+        self.assertEqual(seen["env"]["SUTANDO_TMUX_SESSION"], "sutando-core")
+
+    def test_fix_reports_what_it_could_not_repair(self):
+        with mock.patch.object(hc, "resolve_core_runtime", return_value="codex"), \
+                mock.patch.object(hc.subprocess, "run") as run:
+            self.assertIn("not selected", hc.fix_claude_task_notifier())
+            run.assert_not_called()
+        with mock.patch.object(hc.subprocess, "run") as run:
+            self.assertIn("no fresh local Claude core heartbeat", hc.fix_claude_task_notifier())
+            run.assert_not_called()
+        self.write_local_core()
+        healthy = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")], notifier_script=str(CLAUDE_NOTIFIER))
+        with mock.patch.object(hc, "_run_tmux", side_effect=healthy), mock.patch.object(hc.subprocess, "run") as run:
+            self.assertEqual(hc.fix_claude_task_notifier(), "already healthy")
+            run.assert_not_called()
+        gone = FakeTmux(panes=None)
+        with mock.patch.object(hc, "_run_tmux", side_effect=gone), \
+                mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
+                mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 3, "", "boom\n")):
+            self.assertEqual(hc.fix_claude_task_notifier(), "not repaired — launcher exited 3: boom")
+        with mock.patch.object(hc, "_run_tmux", side_effect=gone), \
+                mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
+                mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertIn("not repaired — ", hc.fix_claude_task_notifier(), "a launcher that exits 0 but leaves no watcher is not a repair")
+
+    def test_the_fix_loop_dispatches_the_claude_repair(self):
+        src = (REPO / "src" / "health-check.py").read_text()
+        self.assertIn('print(f"  claude-task-notifier: {fix_claude_task_notifier()}")', src)
+        self.assertIn("elif codex_notifier is None and claude_notifier is None:", src)
+
     def test_a_runtime_resolver_error_reads_as_not_selected(self):
         with mock.patch.object(hc, "resolve_core_runtime", side_effect=RuntimeError("no config")):
             self.assertFalse(hc._claude_runtime_selected())
