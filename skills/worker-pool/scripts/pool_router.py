@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -175,8 +176,18 @@ def deliver_one(workspace, recipient: str, task_id: str,
         if pd.find_in(dfd, task_id) is not None:
             _attribute(workspace, recipient, task_id)
             return "already"
-        if not pd.payload_path(Path(workspace), task_id).is_file():
-            return "no-payload"
+        src = pd.payload_path(Path(workspace), task_id)
+        if recipient == pr.CORE:
+            if not src.is_file():
+                return "no-payload"
+        else:
+            # The body lands beside the sentinel BEFORE the sentinel exists, so a
+            # sentinel never names nothing; a body from an earlier pass is the payload.
+            body = task_id + pd.BODY_SUFFIX
+            if pd.regular_file_state(body, dir_fd=dfd) != "regular":
+                if not src.is_file():
+                    return "no-payload"
+                _stage_body(src, body, dfd)
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -188,6 +199,32 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # fact. Recording earlier attributed refusals that never delivered.
         _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _stage_body(src: Path, name: str, dfd: int) -> None:
+    """The payload beside the sentinel: a link when the filesystem allows it, else a
+    copy through a temporary name. EEXIST is a prior pass that got this far."""
+    try:
+        os.link(str(src), name, dst_dir_fd=dfd)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+    tmp = f".{name}.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd)
+    with open(src, "rb") as fh, os.fdopen(fd, "wb") as out:
+        shutil.copyfileobj(fh, out)
+    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+def _retire_core_copy(workspace, task_id: str, targets: list) -> None:
+    """The move completes: once every recipient holds the body, tasks/ stops
+    listing the task, so no reader of the core's inbox adopts it."""
+    ws = Path(workspace)
+    if all(pd.is_regular_file(pd.body_path(ws, t, task_id)) for t in targets):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pd.payload_path(ws, task_id))
 
 
 def _attribute(workspace, recipient: str, task_id: str) -> None:
@@ -234,6 +271,8 @@ def route(workspace, task: dict, roster=None, _between_suffix_checks=None, _arbi
         buckets = {"delivered": [], "already": [], "no-payload": []}
         for t in targets:
             buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams)].append(t)
+        if targets and pr.CORE not in targets and not buckets["no-payload"]:
+            _retire_core_copy(workspace, task_id, targets)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"],

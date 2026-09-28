@@ -50,6 +50,8 @@ ACCEPTED_SUFFIX = ".accepted"
 # Sentinels written before the rename. Recognised so work already accepted under
 # the old name is never re-delivered; nothing writes this suffix.
 LEGACY_ACCEPTED_SUFFIX = ".claimed"
+BODY_SUFFIX = ".body"   # the delivered payload, beside the sentinel; never a sentinel
+
 # Not a sentinel: the regex below never matches it, so listings skip it.
 LOCK_NAME = ".lock"
 
@@ -92,6 +94,48 @@ def payload_path(workspace: Path, task_id: str) -> Path:
 
 def archived_payload(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
+
+
+def body_path(workspace: Path, recipient: str, task_id: str) -> Path:
+    """The payload as delivered: beside the recipient's sentinel, so ownership is
+    the directory and no reader of tasks/ sees a routed task."""
+    return deliveries_dir(workspace, recipient) / f"{task_id}{BODY_SUFFIX}"
+
+
+def payload_location(workspace: Path, task_id: str, recipient: str | None = None) -> Path | None:
+    """Where the task text is: the core's tasks/ copy, else the delivered body
+    (this recipient's, or any recipient's when none is named). None when gone."""
+    ws = Path(workspace)
+    p = payload_path(ws, task_id)
+    if p.is_file():
+        return p
+    if recipient:
+        folders = [deliveries_dir(ws, recipient)]
+    else:
+        try:
+            folders = sorted(d for d in (_root(ws) / "deliveries").iterdir() if d.is_dir())
+        except OSError:
+            folders = []
+    for d in folders:
+        b = d / f"{task_id}{BODY_SUFFIX}"
+        if is_regular_file(b):
+            return b
+    return None
+
+
+def _archive_body(ws: Path, recipient: str, task_id: str) -> None:
+    """A finished body leaves the folder for tasks/archive/, the one place history readers look."""
+    b = body_path(ws, recipient, task_id)
+    if not is_regular_file(b):
+        return
+    dst = archived_payload(ws, task_id)
+    if dst.exists():
+        with contextlib.suppress(FileNotFoundError):
+            b.unlink()
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.rename(b, dst)
 
 
 def results_dir(workspace) -> Path:
@@ -179,6 +223,11 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     # The live core owns the payload now; a sentinel left here reads `completed`
     # once it publishes, and `sweep` retires only on a flag.
     if not is_done_flag(done_flag(workspace, recipient, task_id)):
+        # The core owns the payload again: a body left here would be a task nobody
+        # lists, so it goes back to tasks/ unless a copy is already there.
+        body = task_id + BODY_SUFFIX
+        core_copy = payload_path(workspace, task_id)
+        restore = regular_file_state(core_copy) == "absent"
         # Decide under the lock accept/release rename under; the flag check above is
         # not synchronized with mark_done, and a flag landing late only retires a finish.
         with arbitration(workspace, recipient) as dfd:
@@ -186,6 +235,9 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
             if name is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(name, dir_fd=dfd)
+            if restore and regular_file_state(body, dir_fd=dfd) == "regular":
+                with contextlib.suppress(OSError):
+                    os.rename(body, str(core_copy), src_dir_fd=dfd)
     return pend
 
 
@@ -370,7 +422,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # verdict is what `sweep` deletes on, so a planted link would retire real work.
     has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
-    payload = payload_path(ws, task_id).is_file()
+    payload = payload_location(ws, task_id, recipient) is not None
 
     # The flag is terminal on its own: the bridge drains the result file on
     # delivery, so after a drain the flag is the only durable evidence left.
@@ -407,6 +459,7 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
             p.unlink()
             actions["stale"].append(task_id)
         elif state == "finished" and _nothing_can_re_queue(ws, task_id):
+            _archive_body(ws, recipient, task_id)
             p.unlink()
             actions["retired"].append(task_id)
         else:
@@ -462,8 +515,8 @@ def read_payload(workspace: Path, task_id: str) -> str | None:
     The bridges write header-format text, never JSON; a reader that wants
     fields parses it with local_task_protocol, not here.
     """
-    p = payload_path(Path(workspace), task_id)
-    if not p.is_file():
+    p = payload_location(Path(workspace), task_id)
+    if p is None:
         return None
     try:
         return p.read_text(encoding="utf-8", errors="replace")

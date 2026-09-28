@@ -32,6 +32,7 @@ import local_task_protocol as ltp  # noqa: E402
 import pool_roster as pr  # noqa: E402
 import worker_picker_commands as wpc  # noqa: E402
 
+import pool_delivery as pd
 import pool_router as rt  # noqa: E402
 import pool_advertise as pa
 import pool_routing_receipt as prr  # noqa: E402
@@ -41,14 +42,23 @@ MUST_HANDLE = 4
 PICKER_WIRE = "worker-picker"
 
 
-def read_task(task_file: str) -> dict:
+def read_task(task_file: str, workspace=None) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
     `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
     so a body cannot forge it. `channel_id`/`source` are read leniently: the gateway stamps them
     below `task:`, where the strict parse never looks.
+
+    A file the watcher saw may since have moved beside its recipient's sentinel
+    (a routed payload leaves tasks/); a replay then reads the same text there.
     """
-    text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    try:
+        text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        moved = pd.payload_location(Path(workspace), Path(task_file).stem) if workspace else None
+        if moved is None:
+            raise
+        text = moved.read_text(encoding="utf-8", errors="replace")
     task: dict = {"id": Path(task_file).stem}
     for line in text.splitlines():
         if line.startswith("task:"):
@@ -161,7 +171,7 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
-    task = read_task(args.task_file)
+    task = read_task(args.task_file, ws)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)

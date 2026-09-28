@@ -39,6 +39,11 @@ def resolve(entry: str, workspace=None) -> Path:
     ws, _recipient, task_id, _accepted = pd.parse_entry(entry, workspace)
     # abspath, NOT resolve(): resolving would follow a symlink at the payload
     # name, and the caller adopts the returned basename as the task's identity.
+    # The delivered body sits beside the sentinel; the tasks/ copy is the
+    # pre-move layout and the core's own tasks, and stays the fallback.
+    body = Path(os.path.abspath(Path(entry).with_name(task_id + pd.BODY_SUFFIX)))
+    if pd.regular_file_state(body) == "regular":
+        return body
     path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
     state = pd.regular_file_state(path)
     if state == "regular":

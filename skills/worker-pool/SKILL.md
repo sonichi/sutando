@@ -41,8 +41,9 @@ bind a room. An unbound worker can receive tasks addressed to its ID.
 Codex assigns new conversation IDs itself. Until its assigned ID is captured,
 the worker's `runtime_session_id` is `null`, `--resume` refuses, and recovery
 starts a fresh Codex conversation with the same worker ID and inbox. The
-notifier resolves delivery sentinels to payloads in shared `tasks/`, writes
-results to shared `results/`, and records the worker's done flag.
+notifier resolves delivery sentinels to their payloads (the `<task id>.body` the
+router wrote beside the sentinel), writes results to shared `results/`, and records
+the worker's done flag.
 If the worker dies mid-turn, recovery re-delivers the task in that fresh
 conversation without memory of any partial work from the previous turn.
 
@@ -136,11 +137,14 @@ and zero or more **workers**, each with its own tmux session, watcher and inbox
 what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
 the owner can see, and a reply is an ordinary result.
 
-**A worker's queue is its own inbox and nothing else.** `tasks/` holds every
-instance's payloads, the core's and every other worker's in flight; a task is yours
-only while its sentinel sits in `deliveries/<your id>/`. Never list `tasks/` to find
-work, and never answer a task file you found there: the result would be posted as a
-reply in a room bound to someone else. The watcher's `QUEUE: n pending after this`
+**A worker's queue is its own inbox and nothing else.** A task is yours only while
+its sentinel sits in `deliveries/<your id>/`; the router writes its text beside the
+sentinel as `<task id>.body` (body first, then the sentinel) and removes the `tasks/`
+copy once every recipient holds one, so `tasks/` lists the core's own work and
+nothing routed. Never list `tasks/` to find work, and never answer a task file you
+found there: the result would be posted as a reply in a room bound to someone else.
+A finished body is archived to `tasks/archive/` by the pool's own prune; a withdrawn
+hold (`clear_pending`) puts it back in `tasks/` for the core. The watcher's `QUEUE: n pending after this`
 counts your inbox, and that count is the only queue you have.
 
 ```
