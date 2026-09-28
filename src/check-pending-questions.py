@@ -102,9 +102,14 @@ _ORG_HEADING = re.compile(
 # CONTENT, not necessarily character 0. Anchoring at character 0 alone dropped
 # that form (caught by tests/morning-briefing-pending-extract.test.py). It stays
 # anchored otherwise: "render a [DONE] badge" has the bracket mid-sentence and is
-# still a live question.
+# still a live question. An unbracketed keyword immediately followed by a
+# YYYY-MM-DD timestamp is also a resolution stamp, not a live sentence.
 _INLINE_RESOLVED = re.compile(
-    r'^\s*(?:\d+[.)]\s*)?\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]',
+    r'^\s*(?:\d+[.)]\s*)?'
+    r'(?:'
+    r'\[\s*(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)(?:\s[^\]]*)?\]'
+    r'|(?:✅\s*)?(?:RESOLVED|DONE|ANSWERED)\s+\d{4}[-–]\d{2}[-–]\d{2}'
+    r')',
     re.IGNORECASE,
 )
 
