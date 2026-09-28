@@ -194,14 +194,30 @@ def test_github_commits_channel_defaults_to_discord():
 
 def test_unrecognized_channel_defaults_to_discord():
     """Generalization: an arbitrary non-bridge channel name (e.g.
-    `"slack"`, `"matrix"`, future channels not yet implemented) also
-    defaults to Discord rather than stranding the message. The pre-
-    fix behavior was strict equality which silently dropped the
-    proactive — exactly the bug @rickchen007 identified."""
+    `"matrix"`, future channels not yet implemented) also defaults to
+    Discord rather than stranding the message. The pre-fix behavior was
+    strict equality which silently dropped the proactive — exactly the
+    bug @rickchen007 identified."""
 
     def run(state):
         assert should_claim_proactive(state, "discord") is True
         assert should_claim_proactive(state, "telegram") is False
+        assert should_claim_proactive(state, "slack") is False
+
+    _with_state({"channel": "matrix", "ts": 1779339000}, run)
+
+
+def test_slack_active_routes_to_slack():
+    """User feedback P1-27: an owner whose last activity was on Slack had
+    every untagged proactive claimed by discord (the non-bridge default)
+    or by the AG2 Space gateway after its grace period, because slack was
+    a destination but not a BRIDGE_CHANNEL. Slack is the bridge now."""
+
+    def run(state):
+        assert should_claim_proactive(state, "slack") is True
+        assert should_claim_proactive(state, "discord") is False
+        assert should_claim_proactive(state, "telegram") is False
+        assert should_claim_proactive(state, "ag2space") is False
 
     _with_state({"channel": "slack", "ts": 1779339000}, run)
 
@@ -213,7 +229,7 @@ def test_bridge_channels_set_is_documented():
     Without this pin, the constant could silently widen and break the
     "non-bridge defaults to Discord" contract."""
     from proactive_routing import BRIDGE_CHANNELS
-    assert BRIDGE_CHANNELS == frozenset({"discord", "telegram", "ag2space"}), (
+    assert BRIDGE_CHANNELS == frozenset({"discord", "telegram", "ag2space", "slack"}), (
         f"BRIDGE_CHANNELS changed to {BRIDGE_CHANNELS!r}. If you added a "
         f"new bridge, add a corresponding routing test AND update this "
         f"assertion deliberately."
@@ -232,6 +248,7 @@ def main():
     test_voice_channel_defaults_to_discord()
     test_github_commits_channel_defaults_to_discord()
     test_unrecognized_channel_defaults_to_discord()
+    test_slack_active_routes_to_slack()
     test_bridge_channels_set_is_documented()
     print("All proactive-routing tests passed.")
 

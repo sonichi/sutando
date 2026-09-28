@@ -51,7 +51,12 @@ from pathlib import Path
 # `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
 # owner-DM drain); its owner-activity writer stamps that channel on
 # every owner message from the AG2 Space app.
-BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space"})
+# `slack` joined on 2026-09-28 (user feedback P1-27): it was a destination but
+# not a bridge channel, so an owner whose last activity was on Slack had their
+# untagged proactive files claimed by discord (the non-bridge default) or, past
+# the gateway's grace period, by the AG2 Space room -- an engine update silently
+# moved the owner's delivery channel.
+BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space", "slack"})
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -67,7 +72,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
         messages right now. The decision rule:
 
           1. State file says ``data["channel"]`` is a known BRIDGE
-             channel (discord / telegram / ag2space) → claim only when
+             channel (discord / telegram / ag2space / slack) → claim only when
              ``last_channel == this_channel``. This is the message-
              routing match — owner was last reading there, follow-up
              goes there.
@@ -109,9 +114,7 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
 # The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
 # Unlike the [channel:] BODY marker (room redirect), it selects WHICH BRIDGE.
 
-# Slack is deliberately a destination but NOT a BRIDGE_CHANNEL: it races
-# without activity routing — aimable, never the undestined-activity winner.
-PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS | {"slack"})
+PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS)
 
 _DESTINATION_RE = re.compile(r"\.to-([a-z0-9_-]+)\.txt\Z")
 
