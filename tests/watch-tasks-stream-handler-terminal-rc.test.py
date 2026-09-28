@@ -58,7 +58,8 @@ def run(real_run_rc: int, probe_rc: int = 0):
     out, t0 = [], time.time()
     try:
         os.set_blocking(p.stdout.fileno(), False)
-        while time.time() - t0 < 10:
+        # 25s: SUTANDO_HANDLER_RUN_TIMEOUT itself defaults to 10s, so 10s left no margin (#4855).
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = p.stdout.read()
@@ -133,7 +134,8 @@ def restart_witness():
     published = []
     try:
         os.set_blocking(second.stdout.fileno(), False)
-        while time.time() - t0 < 15:
+        # Same margin fix as run() above (#4855) -- 25s, not the expected cost.
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = second.stdout.read()
