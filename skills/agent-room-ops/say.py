@@ -38,23 +38,33 @@ def extra_content_problem(extra) -> str | None:
     if reserved:
         return (f"extra_content carries {', '.join(reserved)} at the top level; those belong to "
                 "the message, not its extra content. Pass only the extra_content object itself")
-    nested = _nested_card(extra, "extra_content")
+    nested = _misplaced_card(extra)
     if nested:
-        return (f"extra_content nests a space.ag2.* key at {nested}; a card must sit at the "
-                "top level of extra_content or no client renders it")
+        return (f"extra_content has a space.ag2.* key at {nested}, under a key that is not a "
+                "card; a card must sit at the top level of extra_content or no client renders it")
     return None
 
 
-def _nested_card(value, path: str) -> str | None:
+def _misplaced_card(extra: dict) -> str | None:
+    """Path of a space.ag2.* key under a top-level key that is not a card. A card's own
+    payload is never inspected: space.ag2.* sub-keys inside it are the card's business."""
+    for k, v in extra.items():
+        if isinstance(k, str) and k.startswith("space.ag2."):
+            continue
+        found = _first_card_key(v, f"extra_content[{json.dumps(k, ensure_ascii=False)}]")
+        if found:
+            return found
+    return None
+
+
+def _first_card_key(value, path: str) -> str | None:
     items = value.items() if isinstance(value, dict) else \
         enumerate(value) if isinstance(value, list) else ()
     for k, v in items:
         here = f"{path}[{json.dumps(k, ensure_ascii=False)}]"
-        if isinstance(v, dict):
-            inner = next((ik for ik in v if isinstance(ik, str) and ik.startswith("space.ag2.")), None)
-            if inner is not None:
-                return f"{here}[{json.dumps(inner, ensure_ascii=False)}]"
-        found = _nested_card(v, here)
+        if isinstance(k, str) and k.startswith("space.ag2."):
+            return here
+        found = _first_card_key(v, here)
         if found:
             return found
     return None

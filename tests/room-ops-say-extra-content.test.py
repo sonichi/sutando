@@ -142,6 +142,17 @@ class WrapperShapedExtraContentTests(unittest.TestCase):
         self.assertEqual((rc, res["ok"], sent), (1, False, []))
         self.assertIn(f'extra_content["payload"]["inner"]["{SUMMON}"]', res["reason"])
 
+    def test_a_card_whose_own_payload_has_space_ag2_sub_keys_is_sent(self):
+        card = {"space.ag2.foo": {"space.ag2.bar": {"v": 1}, "items": [{"space.ag2.baz": 2}]}}
+        rc, res, sent = self._cli({**card, "m.mentions": {"user_ids": ["@q:hs"]}})
+        self.assertEqual((rc, res["ok"]), (0, True), res["reason"])
+        self.assertEqual(sent[0]["extra_content"]["space.ag2.foo"], card["space.ag2.foo"])
+
+    def test_a_card_under_a_non_card_top_level_key_is_refused_at_any_depth(self):
+        rc, res, sent = self._cli({"items": [{"space.ag2.x": 1}]})
+        self.assertEqual((rc, res["ok"], sent), (1, False, []))
+        self.assertIn('extra_content["items"][0]["space.ag2.x"]', res["reason"])
+
     def test_the_library_call_refuses_the_same_before_the_network(self):
         with mock.patch.object(sy, "http_json", side_effect=AssertionError("network")):
             res = sy.say("hi", ROOM, HS, gate=None, extra_content={"body": "hi", "extra_content": CARD})
