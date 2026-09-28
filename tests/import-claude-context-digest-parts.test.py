@@ -122,6 +122,41 @@ class DigestParts(unittest.TestCase):
             r = json.loads(out.stdout)
             self.assertGreater(r["parts"], 1)
 
+    def test_main_digest_files_in_process_json_and_plain(self):
+        # In-process (coverage sees it): the --digest-files branch of main, both report shapes,
+        # with --results-dir given and defaulted to <workspace>/results.
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td) / "data"
+            (data / "staged").mkdir(parents=True)
+            (data / "staged" / "review.md").write_text(_big_review(), encoding="utf-8")
+            common = ["--digest-files", "--workspace", td, "--data-dir", str(data),
+                      "--memory-dir", str(Path(td) / "mem")]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = F.main(common + ["--json", "--results-dir", str(Path(td) / "r1")])
+            self.assertEqual(rc, 0)
+            r = json.loads(out.getvalue())
+            self.assertGreater(r["parts"], 1)
+            self.assertEqual(sorted(p.name for p in (Path(td) / "r1").iterdir()), r["files"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = F.main(common)
+            self.assertEqual(rc, 0)
+            line = out.getvalue()
+            self.assertRegex(line, r"^posted the digest as \d+ part\(s\) \(\d+ B\): proactive-")
+            self.assertTrue((Path(td) / "results").is_dir(), "defaults to <workspace>/results")
+
+    def test_digest_files_refuses_when_nothing_is_staged(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td) / "data"
+            (data / "staged").mkdir(parents=True)
+            with self.assertRaises(SystemExit) as cm:
+                F.write_digest_files(data_dir=data, results_dir=Path(td) / "results")
+            self.assertIn("nothing is staged", str(cm.exception))
+            self.assertFalse((Path(td) / "results").exists(), "nothing is written")
+
     def test_the_known_people_list_is_capped(self):
         cands = [({"name": f"P{i}"}, ["c1", "c2"], {"matched_on": "email"}) for i in range(80)]
         text = F._people_section(cands, [], 0, {}, True)
