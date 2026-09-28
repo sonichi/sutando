@@ -68,7 +68,7 @@ import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
-import { drainMayExit, healthPayload, isDrainBlocked, ngrokRespawnDelayMs } from './server-lifecycle.js';
+import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -1282,9 +1282,13 @@ const STARTED_AT = Date.now();
 let shuttingDown = false;
 let draining = false;
 let drainStartedAt = 0;
-let ngrokRespawns = 0;
+// One pending ngrok respawn at a time, whichever of the child's exit or the
+// attempt's own failure asks first.
+let ngrokPort = 0;
+const ngrokScheduler = new RespawnScheduler(() => { void respawnNgrok(ngrokPort); });
 
 async function startNgrokCli(port: number): Promise<string> {
+	ngrokPort = port;
 	try { execSync('pkill -f "ngrok http"', { stdio: 'ignore' }); } catch {}
 	await new Promise(r => setTimeout(r, 500));
 	const proc = spawn('ngrok', ['http', String(port), '--log=stdout'], {
@@ -1301,10 +1305,8 @@ async function startNgrokCli(port: number): Promise<string> {
 	proc.on('exit', (code, signal) => {
 		if (shuttingDown || ngrokProcess !== proc) return;
 		ngrokProcess = null;
-		ngrokRespawns += 1;
-		const delay = ngrokRespawnDelayMs(ngrokRespawns);
-		console.error(`${ts()} [ngrok] exited (code=${code} signal=${signal}); respawn ${ngrokRespawns} in ${delay / 1000}s`);
-		setTimeout(() => { void respawnNgrok(port); }, delay).unref();
+		const delay = ngrokScheduler.schedule();
+		if (delay >= 0) console.error(`${ts()} [ngrok] exited (code=${code} signal=${signal}); respawn ${ngrokScheduler.attempts} in ${delay / 1000}s`);
 	});
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
@@ -1323,7 +1325,7 @@ async function respawnNgrok(port: number): Promise<void> {
 	if (shuttingDown) return;
 	try {
 		const url = await startNgrokCli(port);
-		ngrokRespawns = 0;
+		ngrokScheduler.reset();
 		if (url !== WEBHOOK_BASE_URL) {
 			console.log(`${ts()} [ngrok] tunnel back at ${url} (was ${WEBHOOK_BASE_URL})`);
 			WEBHOOK_BASE_URL = url;
@@ -1337,11 +1339,9 @@ async function respawnNgrok(port: number): Promise<void> {
 			console.log(`${ts()} [ngrok] tunnel back at ${url}`);
 		}
 	} catch (err) {
-		// startNgrokCli failing counts as another exit: the same backoff applies.
-		ngrokRespawns += 1;
-		const delay = ngrokRespawnDelayMs(ngrokRespawns);
-		console.error(`${ts()} [ngrok] respawn failed (${err instanceof Error ? err.message : String(err)}); retry in ${delay / 1000}s`);
-		setTimeout(() => { void respawnNgrok(port); }, delay).unref();
+		// The same single schedule as the exit handler: whichever asked first owns the timer.
+		const delay = ngrokScheduler.schedule();
+		console.error(`${ts()} [ngrok] respawn failed (${err instanceof Error ? err.message : String(err)}); ${delay >= 0 ? `retry in ${delay / 1000}s` : 'retry already scheduled'}`);
 	}
 }
 

@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const { healthPayload, isDrainBlocked, drainMayExit, ngrokRespawnDelayMs, DRAIN_CAP_MS } =
+const { healthPayload, isDrainBlocked, drainMayExit, ngrokRespawnDelayMs, DRAIN_CAP_MS, RespawnScheduler } =
 	await import('../skills/phone-conversation/scripts/server-lifecycle.js');
 
 describe('health', () => {
@@ -56,6 +56,58 @@ describe('ngrok respawn backoff', () => {
 	});
 });
 
+describe('ngrok respawn scheduler', () => {
+	// Simulated clock: timers fire in order at their due time; a failed attempt reports
+	// itself twice, as the child's exit and the attempt's own error (the real shape).
+	function simulate(seconds: number, failEverything: boolean) {
+		let now = 0;
+		const queue: Array<{ at: number; fn: () => void; id: number }> = [];
+		let ids = 0;
+		const timers = {
+			set: (fn: () => void, ms: number) => { const id = ++ids; queue.push({ at: now + ms, fn, id }); return id as unknown as ReturnType<typeof setTimeout>; },
+			clear: (t: ReturnType<typeof setTimeout>) => { const i = queue.findIndex((q) => q.id === (t as unknown as number)); if (i >= 0) queue.splice(i, 1); },
+		};
+		const spawns: number[] = [];
+		let maxPending = 0;
+		const sched = new RespawnScheduler(() => {
+			spawns.push(now);
+			if (failEverything) { sched.schedule(); sched.schedule(); }  // exit + catch
+			else sched.reset();
+		}, ngrokRespawnDelayMs, timers);
+		sched.schedule(); sched.schedule();  // the first failure, reported twice
+		while (queue.length) {
+			queue.sort((a, b) => a.at - b.at);
+			const next = queue[0];
+			if (next.at > seconds * 1000) break;
+			queue.shift();
+			now = next.at;
+			next.fn();
+			maxPending = Math.max(maxPending, queue.length);
+		}
+		return { spawns, maxPending, attempts: sched.attempts };
+	}
+
+	it('a failure window of 400 s produces about ten spawns, never a timer per report', () => {
+		const { spawns, maxPending } = simulate(400, true);
+		assert.deepEqual(spawns, [2000, 6000, 14000, 30000, 62000, 122000, 182000, 242000, 302000, 362000]);
+		assert.equal(maxPending, 1, 'never more than one pending respawn');
+	});
+
+	it('a second request while one is pending is a no-op, and success starts the backoff over', () => {
+		const { spawns, attempts } = simulate(400, false);
+		assert.deepEqual(spawns, [2000], 'one attempt, it succeeded');
+		assert.equal(attempts, 0, 'reset after success');
+		const calls: number[] = [];
+		const s = new RespawnScheduler(() => calls.push(1), () => 5000, { set: (fn, ms) => setTimeout(fn, ms), clear: (t) => clearTimeout(t) });
+		assert.equal(s.schedule(), 5000);
+		assert.equal(s.schedule(), -1);
+		assert.equal(s.pending, true);
+		s.reset();
+		assert.equal(s.pending, false);
+		assert.equal(calls.length, 0, 'the cleared timer never fires');
+	});
+});
+
 describe('the server wires the rules in (source guards)', () => {
 	const SRC = readFileSync(new URL('../skills/phone-conversation/scripts/conversation-server.ts', import.meta.url), 'utf-8');
 	it('SIGTERM and SIGINT go through beginShutdown, never a bare exit', () => {
@@ -63,9 +115,11 @@ describe('the server wires the rules in (source guards)', () => {
 		assert.match(SRC, /process\.on\('SIGINT', \(\) => beginShutdown\('SIGINT'\)\)/);
 		assert.doesNotMatch(SRC, /process\.on\('SIGTERM', \(\) => \{ cleanupNgrok\(\); process\.exit\(0\); \}\)/);
 	});
-	it('a dead ngrok is respawned unless the server is shutting down', () => {
+	it('a dead ngrok is respawned unless the server is shutting down, through the one scheduler', () => {
 		assert.match(SRC, /proc\.on\('exit', \(code, signal\) => \{\s*if \(shuttingDown \|\| ngrokProcess !== proc\) return;/);
-		assert.match(SRC, /void respawnNgrok\(port\)/);
+		assert.equal((SRC.match(/ngrokScheduler\.schedule\(\)/g) ?? []).length, 2, 'the exit handler and the failed attempt both ask the one scheduler');
+		assert.doesNotMatch(SRC, /setTimeout\(\(\) => \{ void respawnNgrok/, 'no bare retry timer outside the scheduler');
+		assert.match(SRC, /ngrokScheduler\.reset\(\)/);
 	});
 	it('new call work is refused while draining, before the handlers', () => {
 		assert.match(SRC, /if \(isDrainBlocked\(path, req\.method, draining\)\) \{\s*json\(res, 503/);

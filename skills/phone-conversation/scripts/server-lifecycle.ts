@@ -34,3 +34,39 @@ export function drainMayExit(activeCalls: number, drainStartedAt: number, now: n
 export function ngrokRespawnDelayMs(attempt: number): number {
 	return Math.min(60_000, 2_000 * 2 ** Math.max(0, attempt - 1));
 }
+
+type TimerHandle = ReturnType<typeof setTimeout>;
+type Timers = { set: (fn: () => void, ms: number) => TimerHandle; clear: (t: TimerHandle) => void };
+const realTimers: Timers = {
+	set: (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
+	clear: (t) => clearTimeout(t),
+};
+
+/** ONE pending respawn at a time. A failed attempt reaches this from two places
+ *  (the child's exit and the attempt's own error); a second call while a timer is
+ *  pending is a no-op, so retries never multiply (review of #4869: two timers per
+ *  failure gave 134 spawns in 400 s instead of about 10). */
+export class RespawnScheduler {
+	private timer: TimerHandle | null = null;
+	attempts = 0;
+	constructor(
+		private readonly run: () => void,
+		private readonly delayFor: (attempt: number) => number = ngrokRespawnDelayMs,
+		private readonly timers: Timers = realTimers,
+	) {}
+	get pending(): boolean { return this.timer !== null; }
+	/** Schedule the next attempt; returns its delay, or -1 when one is already pending. */
+	schedule(): number {
+		if (this.timer) return -1;
+		this.attempts += 1;
+		const delay = this.delayFor(this.attempts);
+		this.timer = this.timers.set(() => { this.timer = null; this.run(); }, delay);
+		return delay;
+	}
+	/** A successful attempt: clear any pending timer and start the backoff over. */
+	reset(): void {
+		if (this.timer) this.timers.clear(this.timer);
+		this.timer = null;
+		this.attempts = 0;
+	}
+}
