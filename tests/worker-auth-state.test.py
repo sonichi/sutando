@@ -6,14 +6,17 @@ User feedback 2026-09-29: four workers on a six-seat pool host printed
 card was edited to "Resolved" within 30 s. The reading here is what the monitor
 and the pool sweep share: the latest refusal stands until positive proof of a
 signed-in turn follows it; a newer prompt, a spinner or an empty capture is not
-proof. Run: python3 tests/worker-auth-state.test.py
+proof. Which lines are the refusal is cli_wedge's needs-login grammar, read through
+it. Run: python3 tests/worker-auth-state.test.py
 """
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from worker_auth_state import auth_expired, authenticated_turn, login_expired  # noqa: E402
+from cli_wedge import live_banner_lines  # noqa: E402
+from worker_auth_state import (auth_expired, authenticated_turn, login_expired,  # noqa: E402
+                               login_refusal)
 
 FOOTER = ("────────\n❯ \n────────\n"
           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
@@ -26,12 +29,23 @@ class TheRefusalStands(unittest.TestCase):
     def test_the_clis_refusal_forms_are_read_at_line_start(self):
         for line in (EXPIRED, "Not logged in · Please run /login",
                      "OAuth access token has expired · Please run /login",
-                     "You are not logged in. Run /login", "not logged in",
-                     "Run /login first: not logged in"):
+                     "You are not logged in. Run /login", "Run /login first: not logged in"):
             pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + FOOTER
             self.assertEqual(login_expired(pane), line)
             self.assertTrue(auth_expired(pane))
             self.assertFalse(authenticated_turn(pane), line)
+
+    def test_the_grammar_is_cli_wedges_needs_login_family(self):
+        # One grammar, cli_wedge's: every line it names needs-login is a refusal here (the
+        # login menu included), and the bare three words with no /login token are prose.
+        for line in ("Select login method", "Session expired. Run /login",
+                     "Please log in to continue"):
+            self.assertEqual([n for _f, n, _l in live_banner_lines(line)], ["needs-login"], line)
+            self.assertTrue(login_refusal(line), line)
+            self.assertEqual(login_expired(f"❯ x\n  ⎿  {line}\n" + FOOTER), line)
+        self.assertEqual(live_banner_lines("not logged in"), [])
+        self.assertFalse(login_refusal("not logged in"))
+        self.assertIsNone(login_expired("❯ /startup\n  ⎿  not logged in\n✻ Worked for 0s\n" + FOOTER))
 
     def test_a_refusal_under_a_newer_typed_prompt_still_stands(self):
         # The P1-41 flip: the pool re-arms the seat by typing, so the refusal is no longer

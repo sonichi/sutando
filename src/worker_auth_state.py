@@ -10,7 +10,12 @@ signed out (user feedback 2026-09-29: on a six-worker pool host every "session
 expired" card read "Resolved — Sutando has continued its work" within 30 s of
 being raised, with all four workers still refusing every turn in 0 s).
 
-Only positive evidence on the pane clears the state:
+Which lines ARE that refusal is not decided here. The banner grammar is
+cli_wedge.py's `needs-login` live-banner family — the one grammar the seat
+monitor's pane gate and the pool sweep already read a pane through — so a new
+CLI wording is added there once. This module owns the reading over time: which
+refusal still stands, and what clears it. Only positive evidence on the pane
+clears the state:
 
 - `login_expired(pane)` is the latest login-refusal line when nothing after it
   shows the CLI signed in again, else None. The words inside a turn that ran (a
@@ -27,16 +32,14 @@ the pane, so that evidence belongs to the pool sweep, not to this reading.
 """
 from __future__ import annotations
 
+import os.path as _osp
 import re
+import sys as _sys
 from typing import List, Optional
 
-# The CLI's refusal forms at line start (decor stripped), or "not logged in" beside a /login
-# token anywhere on the line: the three common words alone are a tool's output, not a refusal.
-LOGIN_EXPIRED = re.compile(
-    r"^(?:login expired\b|(?:you(?:'re| are) )?not logged in\b|oauth access token has expired\b"
-    r"|please run /login\b|run /login\b)"
-    r"|\bplease run /login\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
-    re.I)
+_sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
+from cli_wedge import live_banner_lines  # noqa: E402 — the one banner grammar
+
 LOGGED_IN_AGAIN = re.compile(r"^login successful\b", re.I)
 # The completed-turn line ("✻ Worked for 0s", "✻ Cooked for 1m 3s · done 12:32 PM"); the
 # spinner reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
@@ -45,6 +48,13 @@ TURN_DONE = re.compile(
 _SHORT = re.compile(r"[01]s")
 _PROMPT = re.compile(r"^❯")
 _RAN = re.compile(r"^[●⏺]")
+
+
+def login_refusal(line: str) -> bool:
+    """Is this one line the CLI's login refusal? cli_wedge's needs-login family, judged
+    whole: the three common words without a /login token beside them are prose."""
+    return any(family == "parked" and name == "needs-login"
+               for family, name, _text in live_banner_lines(line))
 
 
 def _core(line: str) -> str:
@@ -83,7 +93,7 @@ def login_expired(pane: Optional[str]) -> Optional[str]:
     Latest refusal wins; it is void when it sits inside a turn that ran (a tool result
     quoting the words) or when anything after it shows the CLI signed in again."""
     lines = _lines(pane)
-    last = max((i for i, ln in enumerate(lines) if LOGIN_EXPIRED.search(ln)), default=None)
+    last = max((i for i, ln in enumerate(lines) if login_refusal(ln)), default=None)
     if last is None:
         return None
     if any(_RAN.match(ln) for ln in lines[_turn_start(lines, last) + 1:last]):

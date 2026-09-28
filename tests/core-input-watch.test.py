@@ -409,11 +409,16 @@ class TestRefusedTurn(unittest.TestCase):
 
     def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
         for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
-                     "not logged in", "Run /login first: not logged in"):
+                     "Run /login first: not logged in"):
             pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
             st, _d, prompt, kind = compose_state(pane, "idle", True)
             self.assertEqual((st, kind), ("logged-out", "login"), line)
             self.assertEqual(prompt, line)
+        # The bare three words with no /login token are not the signed-out state: the shared
+        # banner grammar (cli_wedge needs-login) keeps prose clean; the turn is still refused.
+        pane = "❯ /startup\n  ⎿  not logged in\n✻ Worked for 0s\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", "not logged in"))
 
     def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
         # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
