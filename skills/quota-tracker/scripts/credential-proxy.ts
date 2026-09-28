@@ -74,8 +74,14 @@ const REFRESH_FAIL_BACKOFF_MAX_MS =
 // signal to act on. At the default backoff schedule this is ~35 min of
 // continuous failure before giving up — tolerant of a single OAuth-endpoint
 // blip, loud well before the multi-hour wedges this was written after.
-const REFRESH_GIVE_UP_AFTER =
-	Number(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER) || 6;
+// `Number(env) || 6` would silently turn an explicit "0" into 6 (0 is falsy);
+// parse explicitly so 0 (give up on the very first failure) takes effect.
+export function parseGiveUpAfter(raw: string | undefined): number {
+	if (raw === undefined || raw === "") return 6;
+	const n = Number(raw);
+	return Number.isFinite(n) ? n : 6;
+}
+const REFRESH_GIVE_UP_AFTER = parseGiveUpAfter(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER);
 
 // Pure: how long to wait before the next refresh attempt after `failCount`
 // consecutive failures. 0 failures → 0 (attempt immediately). Exponential
@@ -421,13 +427,16 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
 				} else {
 					refreshFailCount += 1;
+					// Set the backoff before the give-up check: in production process.exit
+					// ends the process either way, but an injected exitProcess (tests) that
+					// doesn't exit must not leave the next request retrying with no backoff.
+					const backoff = nextRefreshBackoffMs(refreshFailCount);
+					nextRefreshAllowedAt = deps.now() + backoff;
 					if (refreshFailCount >= REFRESH_GIVE_UP_AFTER) {
 						console.error(`${ts()} [Proxy] refresh failed ${refreshFailCount} consecutive times (give-up threshold ${REFRESH_GIVE_UP_AFTER}) — exiting so a supervisor can restart; serving 502s forever hides a wedge as "up"`);
 						deps.exitProcess(1);
 						return;
 					}
-					const backoff = nextRefreshBackoffMs(refreshFailCount);
-					nextRefreshAllowedAt = deps.now() + backoff;
 					console.error(`${ts()} [Proxy] refresh failed (failure ${refreshFailCount}, next attempt allowed in ${Math.round(backoff / 1000)}s)`);
 				}
 			})().finally(() => { refreshInFlight = null; });

@@ -9,7 +9,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, selectCred, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { createProxyServer, selectCred, parseGiveUpAfter, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 type Cred = { accessToken: string; refreshToken?: string; expiresAt?: number };
 type Stored = { service: string; oauth: Cred } | null;
@@ -355,4 +355,46 @@ test('a refresh success resets the failure count, so the give-up threshold never
 		now += 20 * 60 * 1000;
 	}
 	assert.deepEqual(exitCalls, [], 'still short of a fresh 6-failure run after the reset');
+});
+
+// The give-up branch must set the backoff before calling exitProcess: in
+// production process.exit ends the process either way, but an injected
+// exitProcess (as every test here uses) does not exit, so a missing backoff
+// would let the very next call re-attempt the refresh immediately instead of
+// waiting out the cooldown.
+test('the give-up call itself still sets a backoff, so an immediate retry does not re-attempt refresh', async () => {
+	keychain = { service: 's', oauth: { accessToken: 'dead-stored-token-aaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
+	refreshResult = null;
+	upstreamHandler = (_req, res) => respond(res, 200, '{"ok":true}');
+	const exitCalls: number[] = [];
+	const proxyPort = await startProxy(await startUpstream(), {
+		exitProcess: (code) => { exitCalls.push(code); },
+	});
+
+	for (let i = 0; i < 5; i++) {
+		await call(proxyPort, { authorization: 'Bearer client-token' });
+		now += 20 * 60 * 1000;
+	}
+	// The 6th (give-up) call: no time advance afterward, so the next call below
+	// is at the SAME instant, inside whatever backoff window this one sets.
+	await call(proxyPort, { authorization: 'Bearer client-token' });
+	assert.deepEqual(exitCalls, [1], 'give-up threshold reached on the 6th failure');
+	assert.equal(refreshCalls, 6);
+
+	// No time advance: a real backoff window (>= 30s base) blocks a same-instant
+	// retry. Before the fix, nextRefreshAllowedAt was left at 0 by the give-up
+	// path, so this call would have re-attempted (refreshCalls -> 7).
+	await call(proxyPort, { authorization: 'Bearer client-token' });
+	assert.equal(refreshCalls, 6, 'no same-instant re-attempt after give-up: the backoff was set before exitProcess was called');
+});
+
+// parseGiveUpAfter backs the SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER env var.
+// `Number(env) || 6` would silently coerce an explicit "0" to 6; this must
+// take 0 literally instead.
+test('parseGiveUpAfter takes an explicit 0 literally instead of falling back to the default', () => {
+	assert.equal(parseGiveUpAfter(undefined), 6, 'unset env falls back to the default');
+	assert.equal(parseGiveUpAfter(''), 6, 'empty env falls back to the default');
+	assert.equal(parseGiveUpAfter('0'), 0, 'explicit 0 is taken literally, not silently coerced to 6');
+	assert.equal(parseGiveUpAfter('3'), 3, 'a valid positive override is honored');
+	assert.equal(parseGiveUpAfter('not-a-number'), 6, 'garbage input falls back to the default rather than producing NaN');
 });
