@@ -79,7 +79,11 @@ const REFRESH_FAIL_BACKOFF_MAX_MS =
 export function parseGiveUpAfter(raw: string | undefined): number {
 	if (raw === undefined || raw === "") return 6;
 	const n = Number(raw);
-	return Number.isFinite(n) ? n : 6;
+	if (!Number.isFinite(n)) return 6;
+	// A negative value would behave like 0 (refreshFailCount >= n is true
+	// immediately) but unintentionally, since nothing chose that -- clamp
+	// rather than let a typo silently double as "give up on the first failure".
+	return n < 0 ? 0 : n;
 }
 const REFRESH_GIVE_UP_AFTER = parseGiveUpAfter(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER);
 

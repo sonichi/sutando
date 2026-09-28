@@ -397,4 +397,6 @@ test('parseGiveUpAfter takes an explicit 0 literally instead of falling back to 
 	assert.equal(parseGiveUpAfter('0'), 0, 'explicit 0 is taken literally, not silently coerced to 6');
 	assert.equal(parseGiveUpAfter('3'), 3, 'a valid positive override is honored');
 	assert.equal(parseGiveUpAfter('not-a-number'), 6, 'garbage input falls back to the default rather than producing NaN');
+	assert.equal(parseGiveUpAfter('-1'), 0, 'a negative value is clamped to 0, not left to silently behave like 0 unclamped');
+	assert.equal(parseGiveUpAfter('-100'), 0, 'clamping applies regardless of how negative');
 });
