@@ -202,10 +202,55 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
                 mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertIn("not repaired — ", hc.fix_claude_task_notifier(), "a launcher that exits 0 but leaves no watcher is not a repair")
 
+    def test_fix_reports_every_way_the_launcher_path_can_fail(self):
+        self.write_local_core()
+        # The core session cannot be verified: nothing to repair against.
+        with mock.patch.object(hc, "_run_tmux", side_effect=FakeTmux(core_exists=False)), \
+                mock.patch.object(hc.subprocess, "run") as run:
+            self.assertIn("could not be verified", hc.fix_claude_task_notifier())
+            run.assert_not_called()
+        gone = FakeTmux(panes=None)
+        # The launcher is missing from this checkout.
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(hc, "REPO_DIR", Path(td)), \
+                mock.patch.object(hc, "_run_tmux", side_effect=gone), \
+                mock.patch.object(hc.subprocess, "run") as run:
+            self.assertIn("launcher is missing", hc.fix_claude_task_notifier())
+            run.assert_not_called()
+        # The launcher cannot be run at all.
+        with mock.patch.object(hc, "_run_tmux", side_effect=gone), \
+                mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
+                mock.patch.object(hc.subprocess, "run", side_effect=subprocess.TimeoutExpired("start-cli.sh", 120)):
+            self.assertEqual(hc.fix_claude_task_notifier(), "not repaired — launcher failed (TimeoutExpired)")
+        # The local core changed under the repair: the launcher's result is not ours to claim.
+        targets = iter([{"socket": "/tmp/test-sutando.sock", "session": "sutando-core"},
+                        {"socket": "/tmp/other.sock", "session": "sutando-core"}])
+        with mock.patch.object(hc, "_run_tmux", side_effect=gone), \
+                mock.patch.object(hc, "_local_claude_notifier_target", lambda hb=None: next(targets)), \
+                mock.patch.object(hc, "_resolve_launch_env", return_value={}), \
+                mock.patch.object(hc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertEqual(hc.fix_claude_task_notifier(), "not repaired — local Claude core changed during repair")
+
     def test_the_fix_loop_dispatches_the_claude_repair(self):
+        import io
+        from contextlib import redirect_stdout
         src = (REPO / "src" / "health-check.py").read_text()
-        self.assertIn('print(f"  claude-task-notifier: {fix_claude_task_notifier()}")', src)
         self.assertIn("elif codex_notifier is None and claude_notifier is None:", src)
+        checks = [{"name": "claude-task-notifier", "status": "warn",
+                   "detail": "managed tmux session 'sutando-core-watcher' is missing"}]
+        out = io.StringIO()
+        with mock.patch.object(hc.sys, "argv", ["health-check.py", "--fix"]), \
+                mock.patch.object(hc, "run_all_checks", return_value=checks), \
+                mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
+                mock.patch.object(hc, "fix_claude_task_notifier", return_value="repaired managed notifier; live core session preserved") as fix, \
+                mock.patch("time.sleep", lambda *_: None):
+            try:
+                with redirect_stdout(out):
+                    hc.main()
+            except SystemExit:
+                pass
+        self.assertIn("claude-task-notifier: repaired managed notifier; live core session preserved", out.getvalue())
+        fix.assert_called_once()
 
     def test_a_runtime_resolver_error_reads_as_not_selected(self):
         with mock.patch.object(hc, "resolve_core_runtime", side_effect=RuntimeError("no config")):
