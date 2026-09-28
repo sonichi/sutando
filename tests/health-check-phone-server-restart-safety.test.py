@@ -129,6 +129,40 @@ class TestRestartSafety(unittest.TestCase):
             self.assertEqual(runs, [])
             popen.assert_called_once()
 
+    def test_fix_still_relaunches_when_the_pid_sweep_fails(self):
+        # A sweep that cannot read the process table must not block the relaunch.
+        mod = _load()
+        with mock.patch.object(mod, "_phone_server_active_calls", return_value=0), \
+                mock.patch.object(mod, "_filter_pids_this_checkout", side_effect=OSError("no ps")), \
+                mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="777\n", stderr="")), \
+                mock.patch.object(mod.subprocess, "Popen") as popen, \
+                mock.patch("builtins.open", mock.mock_open()):
+            self.assertEqual(mod.fix_conversation_server({"status": "stale"}, settle_s=0), "restarted (stale code)")
+            popen.assert_called_once()
+
+    def test_main_fix_routes_a_stale_phone_server_through_the_repair(self):
+        import io
+        from contextlib import redirect_stdout
+        mod = _load()
+        checks = [{"name": "conversation-server", "status": "stale",
+                   "detail": "running, but the artifact it executes was rebuilt 40 min after the process started -- restart needed"}]
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(sys, "argv", ["health-check.py", "--fix"]), \
+                mock.patch.object(mod, "WORKSPACE_DIR", Path(td)), \
+                mock.patch.object(mod, "run_all_checks", return_value=checks), \
+                mock.patch.object(mod, "fix_down_bridges", return_value=[]), \
+                mock.patch.object(mod, "fix_conversation_server", return_value="restarted (stale code)") as fix, \
+                mock.patch.object(mod.subprocess, "Popen"), \
+                mock.patch("time.sleep", lambda *_: None):
+            try:
+                with redirect_stdout(out):
+                    mod.main()
+            except SystemExit:
+                pass
+        self.assertIn("conversation-server: restarted (stale code)", out.getvalue())
+        fix.assert_called_once_with(checks[0])
+
     def test_the_conversation_server_check_names_the_artifact(self):
         src = (REPO / "src/health-check.py").read_text()
         i = src.index('mark_stale_if_outdated(\n                    c,\n                    REPO_DIR / "skills" / "phone-conversation"')
