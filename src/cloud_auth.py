@@ -101,14 +101,22 @@ def keychain_get(key: str) -> str | None:
         return None
 
 
-def read_keychain_auth(get: Callable[[str], str | None] = keychain_get):
+def read_keychain_auth(get: Callable[[str], str | None] | None = None, *,
+                       signed_out_is_terminal: bool = False):
     """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
 
     No cross-origin fallback except the host's own retired-production
     carry-over, mirrored here. `get` is injectable so callers that wrap this
-    (report-feedback) keep their own patch points.
+    (report-feedback) keep their own patch points. With
+    `signed_out_is_terminal` (the desktop host), the host's sign-out marker on
+    the current origin ends the lookup: the retired-origin carry-over and the
+    bare pre-scoping key are older sessions, which is exactly what a sign-out
+    must not fall back to.
     """
+    get = get or keychain_get  # resolved at call time, so a patched reader is honoured
     origin = resolve_cloud_origin()
+    if signed_out_is_terminal and get(origin_vault_key(origin)) == SIGNED_OUT_SENTINEL:
+        return None, None
     candidates = [origin]
     if origin == DEFAULT_CLOUD_ORIGIN:
         candidates.extend(RETIRED_CLOUD_ORIGINS)
@@ -144,14 +152,17 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     desktop writes no auth file at all — its session lives in the Keychain,
     probed next. Falls back to the metering env the supervisor injects.
     """
-    read_keychain = keychain_auth or read_keychain_auth
     # The desktop host owns the session: its Keychain is the only source there
     # (a file can hold nothing but a stale bearer, wrong again after a sign-out).
     if keychain_first():
-        base, tok = read_keychain()
+        if keychain_auth is not None:
+            base, tok = keychain_auth()
+        else:
+            base, tok = read_keychain_auth(signed_out_is_terminal=True)
         if tok:
             return base, tok
         return _metering_env_auth()
+    read_keychain = keychain_auth or read_keychain_auth
 
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
