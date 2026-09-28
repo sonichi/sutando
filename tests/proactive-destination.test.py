@@ -126,6 +126,10 @@ def main() -> int:
         _sb.OWNER_ACTIVITY_FILE.write_text(_json.dumps({"channel": "discord", "ts": 1}))
         check("slack leaves undestined alone when the owner is on discord",
               _sb._slack_claims_name("proactive-1.txt") is False)
+        _sb.OWNER_ACTIVITY_FILE.write_text(_json.dumps({"channel": "voice", "ts": 1}))
+        check("a non-bridge activity does not route away from slack", _sb._slack_claims_name("proactive-1.txt"))
+        _sb.OWNER_ACTIVITY_FILE.unlink()
+        check("no activity record yet: slack claims as it always did", _sb._slack_claims_name("proactive-1.txt"))
         check("slack claims its own destination whoever the owner is on",
               _sb._slack_claims_name(proactive_filename(1, "slack")))
         check("slack claims its own destination",

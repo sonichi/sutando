@@ -222,6 +222,25 @@ def test_slack_active_routes_to_slack():
     _with_state({"channel": "slack", "ts": 1779339000}, run)
 
 
+def test_claims_unless_routed_elsewhere_yields_only_to_another_bridge():
+    """The Slack bridge's untagged rule: no record, an unreadable one or a
+    non-bridge channel keeps the claim; a record naming another bridge yields."""
+    from proactive_routing import claims_unless_routed_elsewhere, proactive_filename
+
+    def run(state):
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack") is True
+    _with_state({"channel": "slack", "ts": 1}, run)
+    _with_state({"channel": "voice", "ts": 1}, run)
+    _with_state({"nope": 1}, run)
+    def yields(state):
+        assert claims_unless_routed_elsewhere("proactive-1.txt", state, "slack") is False
+    _with_state({"channel": "discord", "ts": 1}, yields)
+    _with_state({"channel": "ag2space", "ts": 1}, yields)
+    assert claims_unless_routed_elsewhere("proactive-1.txt", Path("/nonexistent/x.json"), "slack") is True
+    assert claims_unless_routed_elsewhere(proactive_filename(1, "discord"), Path("/nonexistent/x.json"), "slack") is False
+    assert claims_unless_routed_elsewhere(proactive_filename(1, "slack"), Path("/nonexistent/x.json"), "slack") is True
+
+
 def test_bridge_channels_set_is_documented():
     """Pin the BRIDGE_CHANNELS constant: a future contributor adding
     a new bridge (e.g. matrix) must update both this constant AND
@@ -249,6 +268,7 @@ def main():
     test_github_commits_channel_defaults_to_discord()
     test_unrecognized_channel_defaults_to_discord()
     test_slack_active_routes_to_slack()
+    test_claims_unless_routed_elsewhere_yields_only_to_another_bridge()
     test_bridge_channels_set_is_documented()
     print("All proactive-routing tests passed.")
 

@@ -145,6 +145,24 @@ def should_claim_proactive_file(name, state_file_path: Path,
     return should_claim_proactive(state_file_path, this_channel)
 
 
+def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: str) -> bool:
+    """A bridge's untagged claim that yields only to a RECORDED owner activity on
+    another bridge channel: with no record (or a non-bridge one) it claims as it
+    always did, so a single-channel install delivers before the owner ever spoke."""
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    try:
+        with open(state_file_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        last = data.get("channel") if isinstance(data, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return True
+    if isinstance(last, str) and last in BRIDGE_CHANNELS:
+        return last == this_channel
+    return True
+
+
 def fallback_claims_name(name, this_channel: str) -> bool:
     """Per-file gate for a channel's catch-all fallback (no activity routing):
     a foreign or unknown .to-<channel> tag is never claimed — an explicit

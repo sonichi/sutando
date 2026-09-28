@@ -134,8 +134,8 @@ def drive_slack_watcher():
     # Spy on the SHARED owner symbol, not the adapter wrapper: this pins that
     # the watcher's decision actually delegates to proactive_routing.
     seen = {}
-    real = sb.should_claim_proactive_file
-    sb.should_claim_proactive_file = lambda n, st, ch: seen.setdefault((n, ch), real(n, st, ch))
+    real = sb.claims_unless_routed_elsewhere
+    sb.claims_unless_routed_elsewhere = lambda n, st, ch: seen.setdefault((n, ch), real(n, st, ch))
 
     def _sleep(_secs):
         raise _Sentinel()
@@ -149,7 +149,7 @@ def drive_slack_watcher():
         check("slack watcher: loop pass completed", True)
     finally:
         sb.time.sleep = orig_sleep
-        sb.should_claim_proactive_file = real
+        sb.claims_unless_routed_elsewhere = real
 
     check("slack watcher: shared routing owner consulted in-flow",
           seen.get(("proactive-9.to-discord.txt", "slack")) is False, str(seen))

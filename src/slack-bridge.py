@@ -64,14 +64,14 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, should_claim_proactive_file  # noqa: E402
+from proactive_routing import body_claimable_by, claims_unless_routed_elsewhere  # noqa: E402
 
 
 def _slack_claims_name(name: str) -> bool:
     """Filename-level claim decision — the policy lives in proactive_routing;
-    this adapter only binds its channel. A destination tag outranks activity
-    routing; an untagged file is Slack's when the owner was last active here."""
-    return should_claim_proactive_file(name, OWNER_ACTIVITY_FILE, "slack")
+    this adapter only binds its channel. A tag outranks; an untagged file is
+    Slack's unless the owner's last recorded activity names another bridge."""
+    return claims_unless_routed_elsewhere(name, OWNER_ACTIVITY_FILE, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
 
