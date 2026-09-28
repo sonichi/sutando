@@ -1395,10 +1395,8 @@ def main() -> int:
     check(not young.exists() and len(STATE["room_posts"]) == posts_b4_young + 1,
           "configured bridge with no trace yet: a file past the abandonment window is released")
 
-    # Slack is a bridge channel too (user feedback P1-27: an owner on Slack had
-    # every untagged proactive claimed by discord's default, then by this
-    # gateway past the grace). Owner on slack + a configured, recently alive
-    # slack bridge: the aged file stays Slack's.
+    # Slack is a bridge channel too (P1-27): owner on slack + a configured,
+    # recently alive slack bridge keeps its aged file out of this gateway.
     _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "slack", "summary": "hi"}))
     (_gate_cfg / "channels" / "slack").mkdir(parents=True, exist_ok=True)
     (_gate_cfg / "channels" / "slack" / "access.json").write_text('{"allowFrom": ["1"]}')

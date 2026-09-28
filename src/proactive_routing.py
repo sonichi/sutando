@@ -51,11 +51,8 @@ from pathlib import Path
 # `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
 # owner-DM drain); its owner-activity writer stamps that channel on
 # every owner message from the AG2 Space app.
-# `slack` joined on 2026-09-28 (user feedback P1-27): it was a destination but
-# not a bridge channel, so an owner whose last activity was on Slack had their
-# untagged proactive files claimed by discord (the non-bridge default) or, past
-# the gateway's grace period, by the AG2 Space room -- an engine update silently
-# moved the owner's delivery channel.
+# slack included (P1-27): as a destination-only channel, an owner last active on
+# Slack lost untagged proactive files to discord's default, then to AG2 Space.
 BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space", "slack"})
 
 
