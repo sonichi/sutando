@@ -20,10 +20,67 @@ M = u.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 
+class _Done(Exception):
+    pass
+
+
+_DIALOG_A = (
+    "Flicker-free output, mouse support and auto-copy are available.\n"
+    "❯ 1. Yes, try it\n"
+    "  2. Not now\n"
+    "Enter to confirm · Esc to cancel\n"
+)
+_DIALOG_B = _DIALOG_A.replace("❯ 1. Yes, try it\n  2. Not now", "  1. Yes, try it\n❯ 2. Not now")
+
+
 class TestCardStep(unittest.TestCase):
     def test_a_failed_capture_is_no_evidence(self):
         self.assertEqual(M.card_step(False, "blocked-human", 0, 2), ("hold", 0))
         self.assertEqual(M.card_step(False, "running", 1, 2), ("hold", 1), "the idle count is kept, not advanced")
+
+    def test_a_settling_prompt_holds(self):
+        # Review of #4868 (Rui): a blocked tick under the entry debounce was rewritten to
+        # "running" and counted as idle, so a re-rendering dialog lost its card.
+        self.assertEqual(M.card_step(True, "running", 1, 2, settling=True), ("hold", 1))
+        self.assertEqual(M.card_step(True, "running", 0, 1, settling=True), ("hold", 0))
+
+    def test_five_ticks_of_an_alternating_prompt_never_resolve(self):
+        """main() over five ticks whose dialog text alternates (a re-rendering dialog):
+        no tick may resolve the session's cards."""
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        panes = [_DIALOG_A, _DIALOG_B, _DIALOG_A, _DIALOG_B, _DIALOG_A]
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        calls = []
+        ticks = {"n": 0}
+
+        def capture(s, sess):
+            i = min(ticks["n"], len(panes) - 1)
+            return panes[i]
+
+        def sleep(_secs):
+            ticks["n"] += 1
+            if ticks["n"] >= len(panes):
+                raise _Done()
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--stable", "2", "--interval", "0"]
+        with patch.object(M, "capture", capture), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M, "_hitl_manager", lambda out_path: object()), \
+                patch.object(M, "escalate", lambda *a, **k: calls.append("escalate")), \
+                patch.object(M, "drive_escalations", lambda *a, **k: calls.append("drive")), \
+                patch.object(M, "resolve_escalations", lambda *a, **k: calls.append("resolve")), \
+                patch.object(M.time, "sleep", sleep), \
+                patch.object(sys, "argv", argv):
+            with self.assertRaises(_Done):
+                M.main()
+        self.assertEqual(ticks["n"], 5)
+        self.assertNotIn("resolve", calls, f"an alternating dialog resolved a card: {calls}")
 
     def test_blocked_escalates_and_resets_the_idle_count(self):
         self.assertEqual(M.card_step(True, "blocked-human", 1, 2), ("escalate", 0))

@@ -582,11 +582,12 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None):
         return None
 
 
-def card_step(pane_present, state, idle_ticks, stable):
+def card_step(pane_present, state, idle_ticks, stable, settling=False):
     """One tick's verdict for the session's cards: ("hold"|"escalate"|"resolve", idle_ticks).
-    A failed capture is no evidence (hold); leaving the blocked set resolves only after
-    `stable` consecutive ticks, the same debounce entering it needs (P1-24)."""
-    if not pane_present:
+    A failed capture is no evidence (hold); a prompt still settling (a dialog re-rendering
+    under the entry debounce) is blocked, not idle (hold); leaving the blocked set resolves
+    only after `stable` consecutive ticks, the same debounce entering it needs (P1-24)."""
+    if not pane_present or settling:
         return "hold", idle_ticks
     if state in _CHAT_ESCALATE_STATES:
         return "escalate", 0
@@ -732,10 +733,12 @@ def main():
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
+        settling = False
         if state in ("blocked-human", "blocked-known"):
             stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
             last_prompt = prompt
             if stable_prompt < a.stable:
+                settling = True
                 state, detail, prompt, kind = "running", "processing (prompt settling)", None, None
         else:
             stable_prompt = 0
@@ -765,7 +768,7 @@ def main():
         if a.chat_escalation:
             # A blank capture is no evidence either: "" is what a capture of an
             # emptied pane returns, and it must not resolve a card nobody answered.
-            verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable)
+            verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
