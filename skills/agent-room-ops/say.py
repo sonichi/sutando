@@ -38,6 +38,9 @@ def extra_content_problem(extra) -> str | None:
     if reserved:
         return (f"extra_content carries {', '.join(reserved)} at the top level; those belong to "
                 "the message, not its extra content. Pass only the extra_content object itself")
+    if "space.ag2." in extra:
+        return ('extra_content has the bare key "space.ag2."; a card key names its card, '
+                "like space.ag2.collab.doc.summon")
     nested = _misplaced_card(extra)
     if nested:
         return (f"extra_content has a space.ag2.* key at {nested}, under a key that is not a "
@@ -45,11 +48,16 @@ def extra_content_problem(extra) -> str | None:
     return None
 
 
+def is_card_key(key) -> bool:
+    """A space.ag2.* key that names something after the prefix."""
+    return isinstance(key, str) and key.startswith("space.ag2.") and len(key) > len("space.ag2.")
+
+
 def _misplaced_card(extra: dict) -> str | None:
-    """Path of a space.ag2.* key under a top-level key that is not a card. A card's own
-    payload is never inspected: space.ag2.* sub-keys inside it are the card's business."""
+    """Path of a space.ag2.* key under a top-level key that is not a card. A card (a named
+    space.ag2.* key whose value is an object) is never inspected: its sub-keys are its own."""
     for k, v in extra.items():
-        if isinstance(k, str) and k.startswith("space.ag2."):
+        if is_card_key(k) and isinstance(v, dict):
             continue
         found = _first_card_key(v, f"extra_content[{json.dumps(k, ensure_ascii=False)}]")
         if found:

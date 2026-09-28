@@ -148,6 +148,19 @@ class WrapperShapedExtraContentTests(unittest.TestCase):
         self.assertEqual((rc, res["ok"]), (0, True), res["reason"])
         self.assertEqual(sent[0]["extra_content"]["space.ag2.foo"], card["space.ag2.foo"])
 
+    def test_a_card_key_with_a_non_object_value_gets_the_nesting_check(self):
+        rc, res, sent = self._cli({"space.ag2.list": [{"space.ag2.x": 1}]})
+        self.assertEqual((rc, res["ok"], sent), (1, False, []))
+        self.assertIn('extra_content["space.ag2.list"][0]["space.ag2.x"]', res["reason"])
+        rc, res, _sent = self._cli({"space.ag2.flag": 1})
+        self.assertEqual((rc, res["ok"]), (0, True), res["reason"])
+
+    def test_the_bare_prefix_key_is_refused(self):
+        for value in ({"space.ag2.x": 1}, 1):
+            rc, res, sent = self._cli({"space.ag2.": value})
+            self.assertEqual((rc, res["ok"], sent), (1, False, []), value)
+            self.assertIn('bare key "space.ag2."', res["reason"])
+
     def test_a_card_under_a_non_card_top_level_key_is_refused_at_any_depth(self):
         rc, res, sent = self._cli({"items": [{"space.ag2.x": 1}]})
         self.assertEqual((rc, res["ok"], sent), (1, False, []))
