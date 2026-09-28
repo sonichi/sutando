@@ -26,6 +26,40 @@ def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
             "reason": reason, "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
 
 
+# Fields of the message itself: in extra_content they mean a whole wrapper was passed.
+RESERVED_EXTRA_KEYS = ("body", "msgtype", "room", "extra_content", "formatted_body", "format")
+
+
+def extra_content_problem(extra) -> str | None:
+    """Why `extra` cannot ride as extra_content, or None when it can."""
+    if not isinstance(extra, dict):
+        return "extra_content must be a JSON object"
+    reserved = [k for k in RESERVED_EXTRA_KEYS if k in extra]
+    if reserved:
+        return (f"extra_content carries {', '.join(reserved)} at the top level; those belong to "
+                "the message, not its extra content. Pass only the extra_content object itself")
+    nested = _nested_card(extra, "extra_content")
+    if nested:
+        return (f"extra_content nests a space.ag2.* key at {nested}; a card must sit at the "
+                "top level of extra_content or no client renders it")
+    return None
+
+
+def _nested_card(value, path: str) -> str | None:
+    items = value.items() if isinstance(value, dict) else \
+        enumerate(value) if isinstance(value, list) else ()
+    for k, v in items:
+        here = f"{path}[{json.dumps(k, ensure_ascii=False)}]"
+        if isinstance(v, dict):
+            inner = next((ik for ik in v if isinstance(ik, str) and ik.startswith("space.ag2.")), None)
+            if inner is not None:
+                return f"{here}[{json.dumps(inner, ensure_ascii=False)}]"
+        found = _nested_card(v, here)
+        if found:
+            return found
+    return None
+
+
 def _a2ui_card(raw):
     """Validated buttons card from SUTANDO_WORKER_A2UI (JSON). The client
     renders {type:"buttons"} and a tap sends the option's action as a message."""
@@ -59,6 +93,8 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     `extra_content` rides on the event beside the body: a protocol payload a
     client renders (a document comment's anchor, say). The gateway keeps only
     `space.ag2.*` keys, so a reserved Matrix key cannot be smuggled through it.
+    A wrapper-shaped or nested payload is refused here (extra_content_problem):
+    the gateway would drop it silently and the post would land as plain prose.
 
     Returns {ok, room_id, event_id, reason}. Refuses before any network call when
     the room is missing, the body is empty, or the client gate denies the room.
@@ -69,6 +105,11 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     # cheaper than asking a reader to interpret a blank line.
     if not message or not message.strip():
         return _result(False, room_id=room_id, reason="message required")
+
+    if extra_content is not None:
+        problem = extra_content_problem(extra_content)
+        if problem:
+            return _result(False, room_id=room_id, reason=problem)
 
     # Before the gate and the network: a bad event id is the caller's typo, and
     # posting it unrelated would cite the wrong message silently.

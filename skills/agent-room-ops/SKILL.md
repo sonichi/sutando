@@ -55,6 +55,12 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' $'> the quoted words
 #   --extra-content carries a protocol payload on the event beside the body, for a client
 #   that renders it (here: a document comment pinned to the quoted words — the room-collab
 #   skill's `comment` builds and posts this for you). Only space.ag2.* keys survive the gateway.
+#   Pass the extra_content OBJECT only. A wrapper ({room, body, extra_content}), a message field
+#   (body/msgtype/format/formatted_body) or a space.ag2.* card nested under another key is
+#   refused with ok:false and exit 1 — the gateway would drop it and the card would render as prose.
+python3 skills/agent-room-ops/room_ops.py capabilities
+#   -> {"ok":true,"commands":[...],"say":["--agent","--extra-content","--reply-to",...]}: which
+#   flags this copy supports, so a caller choosing between installed copies picks a capable one.
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
 #   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
 #   and the room gets `<mxid> — please review #149` with `mentions:[mxid]`. Two matches ->

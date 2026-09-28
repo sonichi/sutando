@@ -1585,9 +1585,12 @@ class CitationCLITests(EnvCase):
         self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
 
     def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        out = io.StringIO()
         with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
-            with self.assertRaises(SystemExit):
-                room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}
