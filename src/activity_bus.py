@@ -281,14 +281,16 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
 IN_PROGRESS_MAX_AGE_S = 1800.0
 
 
-#: Row kinds the session's own activity hook writes while it works a task.
-_ENGAGED_KINDS = frozenset({"processing", "thinking", "working"})
+#: The row kind that is real work on a task: a tool call the session's own activity
+#: hook attributed to it. Reading the task (processing) or thinking about it is not.
+_ENGAGED_KINDS = frozenset({"working"})
 
 
 def engaged_at(workspace: Path, task_id: str) -> float | None:
-    """When the session last did real work on the task: the newest agent-activity row
-    naming it that came from the session's own hook (never the bus's TASK_STATUS rows,
-    which mark delivery, not work). None when no such row exists."""
+    """When the session last did real work on the task: the newest `working` row naming
+    it from the session's own hook (never the bus's TASK_STATUS rows, which mark delivery,
+    and never a read or a thought: a task read and then dropped is still owed). None when
+    no such row exists."""
     newest = None
     try:
         with open(workspace / "state" / "agent-activity.jsonl", encoding="utf-8") as fh:

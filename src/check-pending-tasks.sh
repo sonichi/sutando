@@ -45,15 +45,30 @@ TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
 
-# An unmarked session is a guest only while a marked core is alive to own the
-# queue (a fresh state/cores/*.alive heartbeat); with none, it may BE the core,
-# launched by hand, so it is gated: the guest exit fails closed, never open.
+# An unmarked session is a guest only while a marked core is alive ON THIS HOST
+# to own the queue (a fresh state/cores/<host-label>.alive; the workspace syncs
+# other hosts' heartbeats too, and a peer's core cannot own this host's session).
+# With none, it may BE the core, launched by hand, so it is gated: fail closed.
 if [ -n "$UNIDENTIFIED" ]; then
   CORE_ALIVE=""
   if [ -n "$PYBIN" ]; then
-    CORE_ALIVE="$(SUTANDO_CORES_DIR="$WORKSPACE/state/cores" SUTANDO_ALIVE_MAX_AGE="${SUTANDO_STOP_HOOK_CORE_ALIVE_MAX_AGE:-90}" "$PYBIN" -c 'import glob, os, time
+    CORE_ALIVE="$(SUTANDO_SRC="$REPO_DIR/src" SUTANDO_CORES_DIR="$WORKSPACE/state/cores" SUTANDO_ALIVE_MAX_AGE="${SUTANDO_STOP_HOOK_CORE_ALIVE_MAX_AGE:-90}" "$PYBIN" -c 'import os, socket, sys, time
+sys.path.insert(0, os.environ["SUTANDO_SRC"])
+labels = {socket.gethostname().split(".")[0]}
+try:
+    from util_paths import _host_label
+    labels.add(_host_label())
+except Exception:
+    pass
 d = os.environ["SUTANDO_CORES_DIR"]; cap = float(os.environ["SUTANDO_ALIVE_MAX_AGE"]); now = time.time()
-fresh = [p for p in glob.glob(os.path.join(d, "*.alive")) if -5 <= now - os.stat(p).st_mtime < cap]
+fresh = []
+for label in labels:
+    p = os.path.join(d, f"{label}.alive")
+    try:
+        if -5 <= now - os.stat(p).st_mtime < cap:
+            fresh.append(p)
+    except OSError:
+        pass
 print("1" if fresh else "")' 2>/dev/null)" || CORE_ALIVE=""
   fi
   if [ -n "$CORE_ALIVE" ]; then

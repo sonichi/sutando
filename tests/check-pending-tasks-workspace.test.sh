@@ -344,17 +344,28 @@ case "$NOCORE_OUT" in
 esac
 grep -q "no live marked core" "$TMPWS/nocore.err" \
   && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$TMPWS/nocore.err")"
-# 7b. A stale heartbeat is no core either.
+# 7b. A stale heartbeat is no core either. The file is THIS host's, named the way
+# core_heartbeat.py names it (util_paths._host_label).
+HOST_LABEL="$("$TEST_PY" -c "import sys; sys.path.insert(0, '$REPO/src'); from util_paths import _host_label; print(_host_label())")"
+[ -n "$HOST_LABEL" ] || { bad "fixture: host label resolved" "empty"; HOST_LABEL="$(hostname -s)"; }
 mkdir -p "$WS/state/cores"
-printf '{"pid":1,"socket":"/tmp/x.sock","session":"core"}\n' > "$WS/state/cores/thishost.alive"
-touch -t 202001010000 "$WS/state/cores/thishost.alive"
+printf '{"pid":1,"socket":"/tmp/x.sock","session":"core"}\n' > "$WS/state/cores/$HOST_LABEL.alive"
+touch -t 202001010000 "$WS/state/cores/$HOST_LABEL.alive"
 STALE_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
 case "$STALE_OUT" in
-  *'"decision":"block"'*) ok "a stale state/cores/*.alive does not make the unmarked session a guest" ;;
-  *) bad "a stale state/cores/*.alive does not make the unmarked session a guest" "got: ${STALE_OUT:0:120}" ;;
+  *'"decision":"block"'*) ok "a stale state/cores/<host>.alive does not make the unmarked session a guest" ;;
+  *) bad "a stale state/cores/<host>.alive does not make the unmarked session a guest" "got: ${STALE_OUT:0:120}" ;;
 esac
-# 7c. A fresh heartbeat: a marked core owns the queue, so the unmarked session is a guest.
-touch "$WS/state/cores/thishost.alive"
+# 7b2. ANOTHER host's fresh heartbeat (the workspace syncs them) is not this host's core.
+printf '{"pid":1,"socket":"/tmp/peer.sock","session":"core"}\n' > "$WS/state/cores/some-other-host.alive"
+FOREIGN_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
+case "$FOREIGN_OUT" in
+  *'"decision":"block"'*) ok "a foreign host's live heartbeat does not make the unmarked session a guest" ;;
+  *) bad "a foreign host's live heartbeat does not make the unmarked session a guest" "got: ${FOREIGN_OUT:0:120}" ;;
+esac
+rm -f "$WS/state/cores/some-other-host.alive"
+# 7c. A fresh heartbeat of THIS host: a marked core owns the queue, so the unmarked session is a guest.
+touch "$WS/state/cores/$HOST_LABEL.alive"
 GUEST_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>"$TMPWS/guest.err")"
 case "$GUEST_OUT" in
   '{}') ok "an unmarked session beside a live marked core is a guest: {} with the queue pending" ;;
@@ -433,7 +444,7 @@ printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n
   "$BUNDLE" "$TEST_PY" > "$BUNDLE/scripts/sutando-config.sh"
 chmod +x "$BUNDLE/scripts/sutando-config.sh"
 printf 'id: probe\ntask: bundle-probe\n' > "$BUNDLE/workspace/tasks/$PROBE"
-mkdir -p "$BUNDLE/workspace/state/cores" && printf '{"socket":"/tmp/x.sock"}\n' > "$BUNDLE/workspace/state/cores/thishost.alive"
+mkdir -p "$BUNDLE/workspace/state/cores" && printf '{"socket":"/tmp/x.sock"}\n' > "$BUNDLE/workspace/state/cores/$HOST_LABEL.alive"
 BUNDLE_CWD="$(mktemp -d)"
 B_CORE_OUT="$(cd "$BUNDLE_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
 case "$B_CORE_OUT" in

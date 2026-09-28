@@ -70,9 +70,13 @@ echo "a task the core is working right now does not block, a merely delivered on
 snapshot "$TASK" RUNNING 60
 OUT="$(run_hook '')"
 case "$OUT" in *'"decision":"block"'*) ok "RUNNING but never engaged (delivered only): blocks -- delivery is not work" ;; *) bad "RUNNING but never engaged: blocks" "got: ${OUT:0:160}" ;; esac
+printf '{"ts":%s,"line":"reading it","kind":"processing","task":{"id":"%s"}}\n' "$(date +%s)" "$TASK" >> "$WS/state/agent-activity.jsonl"
+printf '{"ts":%s,"line":"hmm","kind":"thinking","task":{"id":"%s"}}\n' "$(date +%s)" "$TASK" >> "$WS/state/agent-activity.jsonl"
+OUT="$(run_hook '')"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "RUNNING, read and thought about but never worked on: still blocks" ;; *) bad "RUNNING, read and thought about but never worked on: still blocks" "got: ${OUT:0:160}" ;; esac
 engaged "$TASK" 30
 OUT="$(run_hook '')"
-[ "$OUT" = "{}" ] && ok "RUNNING with a fresh activity row from the session: the turn may end" || bad "RUNNING with a fresh activity row: the turn may end" "got: ${OUT:0:160}"
+[ "$OUT" = "{}" ] && ok "RUNNING with a fresh working row from the session: the turn may end" || bad "RUNNING with a fresh working row: the turn may end" "got: ${OUT:0:160}"
 rm -f "$WS/state/agent-activity.jsonl"
 engaged "$TASK" 7200
 snapshot "$TASK" RUNNING 7200

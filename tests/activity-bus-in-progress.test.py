@@ -49,11 +49,20 @@ class InProgress(unittest.TestCase):
         self.row(kind="processing", projection="TASK_STATUS")
         self.assertFalse(ab.in_progress(self.ws, "task-a", now=self.now))
 
-    def test_a_fresh_activity_row_from_the_session_hook_is_engagement(self):
+    def test_a_task_read_or_thought_about_but_never_worked_on_still_blocks(self):
+        # Review of #4863 (Rui): a read-then-drop must not pass. Only a tool call the hook
+        # attributed to the task (a `working` row) or a runtime event is work.
         self.snap(phase="RUNNING", started_at=self.now - 3000, last_activity_at=self.now - 60)
-        for kind in ("processing", "thinking", "working"):
-            self.row(kind=kind, ts=self.now - 30)
-            self.assertTrue(ab.in_progress(self.ws, "task-a", now=self.now), kind)
+        self.row(kind="processing", ts=self.now - 30)
+        self.row(kind="thinking", ts=self.now - 20)
+        self.assertFalse(ab.in_progress(self.ws, "task-a", now=self.now))
+        self.row(kind="working", ts=self.now - 10)
+        self.assertTrue(ab.in_progress(self.ws, "task-a", now=self.now))
+
+    def test_a_fresh_working_row_from_the_session_hook_is_engagement(self):
+        self.snap(phase="RUNNING", started_at=self.now - 3000, last_activity_at=self.now - 60)
+        self.row(kind="working", ts=self.now - 30)
+        self.assertTrue(ab.in_progress(self.ws, "task-a", now=self.now))
         self.row(task="task-b", ts=self.now - 1)
         self.assertFalse(ab.in_progress(self.ws, "task-b", now=self.now), "a row for a task with no RUNNING snapshot")
 
