@@ -313,20 +313,41 @@ const _pendingTasks = new Map<string, PendingTask>();
 /** Test-only: the pending map, to seed and inspect around _sweepTimeouts. */
 export const _pendingTasksForTest = _pendingTasks;
 
-// The scheduler's durable per-task lifecycle (src/activity_bus.py): phase leaves
-// QUEUED/RECEIVED when a watcher hands the task to the core. Only the macOS/Linux
-// watcher (task-emit.sh) writes it; the Windows dispatcher and other runtimes
-// never do, so "no snapshot" is not "still queued": it means the bridge cannot
-// see the pickup and must keep the submission clock (review of #4864).
-const UNSTARTED_PHASES = new Set(['RECEIVED', 'QUEUED']);
+// The scheduler's durable per-task lifecycle (src/activity_bus.py). The watcher
+// marks RUNNING at announce (task-emit.sh), which is delivery, not work: the core
+// may still be on the previous task. "Started" therefore means ENGAGED, the same
+// rule the Stop hook uses (#4863): a runtime event applied to the snapshot
+// (seq > 0) or a `working` row from the session's own activity hook naming the
+// task. A snapshot without engagement is still queued; no snapshot at all (a
+// runtime that never writes one) keeps the submission clock.
 export type TaskActivity = 'started' | 'queued' | 'none';
+const ENGAGED_ROW_KINDS = new Set(['working']);
+
+/** Whether the session's own activity hook recorded real work on the task. */
+export function _taskHasWorkingRow(taskId: string): boolean {
+	const log = join(REPO_DIR, 'state', 'agent-activity.jsonl');
+	if (!existsSync(log)) return false;
+	try {
+		for (const line of readFileSync(log, 'utf-8').split('\n')) {
+			if (!line.includes(taskId)) continue;
+			let rec: { projection?: unknown; kind?: unknown; task?: { id?: unknown } };
+			try { rec = JSON.parse(line); } catch { continue; }
+			if (!rec || rec.projection === 'TASK_STATUS' || rec.task?.id !== taskId) continue;
+			if (typeof rec.kind === 'string' && ENGAGED_ROW_KINDS.has(rec.kind)) return true;
+		}
+	} catch { /* unreadable log: no evidence */ }
+	return false;
+}
+
 export function _taskActivity(taskId: string): TaskActivity {
 	const snap = join(REPO_DIR, 'state', 'activity', `${taskId}.json`);
 	if (!existsSync(snap)) return 'none';
 	try {
-		const phase = (JSON.parse(readFileSync(snap, 'utf-8')) as { phase?: unknown }).phase;
-		if (typeof phase !== 'string') return 'none';
-		return UNSTARTED_PHASES.has(phase) ? 'queued' : 'started';
+		const d = JSON.parse(readFileSync(snap, 'utf-8')) as { phase?: unknown; seq?: unknown };
+		if (typeof d.phase !== 'string') return 'none';
+		if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(d.phase)) return 'started';
+		const eventApplied = typeof d.seq === 'number' && d.seq > 0;
+		return eventApplied || _taskHasWorkingRow(taskId) ? 'started' : 'queued';
 	} catch {
 		return 'none';
 	}

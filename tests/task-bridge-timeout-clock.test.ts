@@ -7,7 +7,7 @@
 // Run: npx tsx --test --test-force-exit tests/task-bridge-timeout-clock.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,7 +18,9 @@ mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 mkdirSync(join(TMP, 'state', 'activity'), { recursive: true });
 
-const { _sweepTimeouts, _pendingTasksForTest, _taskActivity, setTaskStatusCallback } = await import('../src/task-bridge.js');
+const { _sweepTimeouts, _pendingTasksForTest, _taskActivity, _taskHasWorkingRow, setTaskStatusCallback } = await import('../src/task-bridge.js');
+import { spawnSync } from 'node:child_process';
+const REPO = new URL('..', import.meta.url).pathname;
 
 const MIN = 60_000;
 const statuses: Array<{ taskId: string; status: string; text: string }> = [];
@@ -29,9 +31,24 @@ const onResult = (m: string) => { spoken.push(m); };
 function task(id: string, text = 'summarize the thread') {
 	writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: ${text}\n`);
 }
-function snapshot(id: string, phase: string) {
-	writeFileSync(join(TMP, 'state', 'activity', `${id}.json`), JSON.stringify({ task_id: id, phase }));
+function snapshot(id: string, phase: string, extra: Record<string, unknown> = {}) {
+	writeFileSync(join(TMP, 'state', 'activity', `${id}.json`), JSON.stringify({ task_id: id, phase, ...extra }));
 }
+function workingRow(id: string, kind = 'working', projection?: string) {
+	const rec: Record<string, unknown> = { ts: Date.now() / 1000, line: 'x', kind, task: { id } };
+	if (projection) rec.projection = projection;
+	writeFileSync(join(TMP, 'state', 'agent-activity.jsonl'), JSON.stringify(rec) + '\n', { flag: 'a' });
+}
+/** The watcher's own dispatch: task-emit.sh's emit_dispatch_task_file, which marks RUNNING at announce. */
+function dispatchLikeTheWatcher(id: string) {
+	const r = spawnSync('bash', ['-c', `source "$1"; emit_dispatch_task_file ${id}.txt`, '_', join(REPO, 'src', 'task-emit.sh')], {
+		env: { ...process.env, TASKS_DIR: join(TMP, 'tasks'), SUTANDO_TEST_MODE: '1', SUTANDO_WORKSPACE: TMP, SUTANDO_PY_BIN: 'python3' },
+		encoding: 'utf-8',
+	});
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, new RegExp(`^TASK_FILE: ${id}\\.txt`));
+}
+const until = async (cond: () => boolean, ms: number) => { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 100)); return cond(); };
 const archived = () => {
 	const root = join(TMP, 'tasks', 'archive');
 	if (!existsSync(root)) return [];
@@ -56,7 +73,7 @@ describe('the task timeout counts from pickup', () => {
 		assert.deepEqual(archived(), []);
 	});
 
-	it('the clock starts when the snapshot leaves QUEUED, and the task times out after its own timeout from there', () => {
+	it('the clock starts on ENGAGEMENT, not on the RUNNING the watcher writes at announce', () => {
 		reset();
 		task('task-r1');
 		const t0 = 1_000_000_000_000;
@@ -64,9 +81,17 @@ describe('the task timeout counts from pickup', () => {
 		snapshot('task-r1', 'QUEUED');
 		_sweepTimeouts(onResult, t0 + 20 * MIN);
 		assert.equal(_pendingTasksForTest.get('task-r1')?.startedAt, undefined, 'QUEUED is not started');
-		snapshot('task-r1', 'RUNNING');
+		snapshot('task-r1', 'RUNNING');   // announced: delivered, not worked
+		_sweepTimeouts(onResult, t0 + 20 * MIN + 30_000);
+		assert.equal(_pendingTasksForTest.get('task-r1')?.startedAt, undefined, 'RUNNING at announce is delivery, not engagement');
+		assert.equal(spoken.length, 0);
+		workingRow('task-r1', 'processing');           // the core read it: still not work
+		workingRow('task-r1', 'working', 'TASK_STATUS'); // the bus's own delivery row: not work
+		_sweepTimeouts(onResult, t0 + 20 * MIN + 40_000);
+		assert.equal(_pendingTasksForTest.get('task-r1')?.startedAt, undefined);
+		workingRow('task-r1');                         // a tool call on the task
 		_sweepTimeouts(onResult, t0 + 21 * MIN);
-		assert.equal(_pendingTasksForTest.get('task-r1')?.startedAt, t0 + 21 * MIN, 'pickup observed');
+		assert.equal(_pendingTasksForTest.get('task-r1')?.startedAt, t0 + 21 * MIN, 'engagement observed');
 		_sweepTimeouts(onResult, t0 + 25 * MIN);
 		assert.equal(spoken.length, 0, '4 minutes into a 5-minute task: not timed out (25 minutes since submission)');
 		_sweepTimeouts(onResult, t0 + 26 * MIN + 1);
@@ -77,13 +102,20 @@ describe('the task timeout counts from pickup', () => {
 		assert.deepEqual(archived(), ['task-r1.txt'], 'a started task that timed out is archived as before');
 	});
 
-	it('WAITING (blocked on a person) counts as started; no or unreadable snapshot is "none"', () => {
+	it('a runtime event on the snapshot is engagement; WAITING without one is not; no snapshot is "none"', () => {
 		reset();
 		task('task-w1');
-		snapshot('task-w1', 'WAITING');
+		snapshot('task-w1', 'WAITING', { seq: 3 });
 		assert.equal(_taskActivity('task-w1'), 'started');
+		snapshot('task-w1', 'WAITING');
+		assert.equal(_taskActivity('task-w1'), 'queued', 'a phase alone is not engagement');
+		snapshot('task-w1', 'RUNNING', { seq: 0 });
+		assert.equal(_taskActivity('task-w1'), 'queued');
+		snapshot('task-w1', 'COMPLETED');
+		assert.equal(_taskActivity('task-w1'), 'started', 'a terminal task is past pickup');
 		snapshot('task-w1', 'RECEIVED');
 		assert.equal(_taskActivity('task-w1'), 'queued');
+		assert.equal(_taskHasWorkingRow('task-w1'), false);
 		assert.equal(_taskActivity('task-none'), 'none', 'no snapshot: the pickup is invisible');
 		writeFileSync(join(TMP, 'state', 'activity', 'task-bad.json'), '{not json');
 		assert.equal(_taskActivity('task-bad'), 'none', 'unreadable: invisible');
@@ -137,6 +169,34 @@ describe('the task timeout counts from pickup', () => {
 		assert.equal(spoken.length, 0);
 		_sweepTimeouts(onResult, t0 + 121 * MIN);
 		assert.equal(spoken.length, 1);
+	});
+
+	it('driven by the watcher itself: a 5-minute task queued behind a long one is not timed out or archived', async () => {
+		// Review of #4864 (Rui): task-emit.sh marks RUNNING the moment it announces a
+		// task, so the second of two tasks is RUNNING while the core is still on the
+		// first. Its own timeout must not run until the core engages with it.
+		reset();
+		task('task-long', 'a long job');
+		task('task-short', 'quick question');
+		dispatchLikeTheWatcher('task-long');
+		dispatchLikeTheWatcher('task-short');
+		const snap = join(TMP, 'state', 'activity', 'task-short.json');
+		assert.ok(await until(() => existsSync(snap), 5000), 'the watcher wrote the activity snapshot');
+		assert.equal(JSON.parse(readFileSync(snap, 'utf-8')).phase, 'RUNNING', 'RUNNING at announce, as the watcher does');
+		assert.equal(_taskActivity('task-short'), 'queued', 'announced but not engaged');
+		const t0 = Date.now();
+		_pendingTasksForTest.set('task-short', { submittedAt: t0, timeoutMs: 5 * MIN, dmOnTimeout: false, taskText: 'quick question' });
+		_sweepTimeouts(onResult, t0);           // the sweep that saw the announce
+		_sweepTimeouts(onResult, t0 + 6 * MIN);
+		assert.equal(spoken.length, 0, 'no timeout while the core is still on the long task');
+		assert.ok(existsSync(join(TMP, 'tasks', 'task-short.txt')), 'the task file stays for the core');
+		assert.ok(!archived().includes('task-short.txt'));
+		workingRow('task-short');  // the core's activity hook attributes a tool call to it
+		_sweepTimeouts(onResult, t0 + 7 * MIN);
+		assert.equal(_pendingTasksForTest.get('task-short')?.startedAt, t0 + 7 * MIN, 'the clock starts at engagement');
+		_sweepTimeouts(onResult, t0 + 12 * MIN + 1);
+		assert.equal(spoken.length, 1);
+		assert.match(spoken[0], /timed out after 5 minutes/);
 	});
 
 	it('timeout 0 means no timeout, queued or running', () => {
