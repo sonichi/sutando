@@ -12439,25 +12439,11 @@ def proxy_liveness_status(proxy_check: dict) -> str:
 
 
 def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
-    """Escalate `check` to 'warn' when the proxy's OWN last-recorded credential
-    state says it could not get a usable token — the "listening but not
-    forwarding" wedge a bare TCP probe cannot see (2026-09-27 incident:
-    :7846 stayed open with every seat 502ing for 55min-2h before detection).
-
-    Reads `credential_state`/`credential_state_detail`/`credential_state_at`
-    from quota-state.json — written by credential-proxy.ts's
-    recordCredentialState() on every transition: 'ok' on each successful
-    per-request token injection, 'exhausted' when a request could not get a
-    usable credential. This makes the signal self-healing within one
-    successful request and current as of the last completed one; it does
-    NOT catch a background refresh failing before any request has arrived
-    (recordCredentialState is only called from the request path).
-
-    Called only while `check["status"]` is already 'ok' or 'stale' (the
-    caller's own gate): a proxy that isn't listening has no request path to
-    have recorded anything, so this must never be what marks it down.
-    Silent on any read failure — advisory, matching mark_stale_if_outdated's
-    "never take the health check down with it" rule for the same file.
+    """Escalate `check` to 'warn' when the proxy's own last-recorded credential
+    state (quota-state.json, written by recordCredentialState()) is 'exhausted'
+    and predates its current process incarnation. Advisory: silent on any
+    read/parse failure, and never runs unless the caller's own gate already
+    proved the port is 'ok'/'stale'.
     """
     if check["status"] not in ("ok", "stale"):
         return
@@ -12473,13 +12459,20 @@ def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
     detail = state.get("credential_state_detail") or "no detail recorded"
     at = state.get("credential_state_at")
     age = ""
+    at_ts = None
     if isinstance(at, str):
         from datetime import datetime as _dt  # local: not at module scope in this file
         try:
-            age_s = time.time() - _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            at_ts = _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age_s = time.time() - at_ts
             age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
         except ValueError:
             pass
+    # Written only on a transition, never reset at startup: a restart inherits
+    # a stale 'exhausted' record, which predates the process that would prove it.
+    starts, _ = _proc_lstarts("credential-proxy")
+    if at_ts is not None and starts and at_ts < max(starts):
+        return
     check["status"] = "warn"
     check["detail"] = (
         f"listening, but its own last-recorded credential state is 'exhausted'{age}: "

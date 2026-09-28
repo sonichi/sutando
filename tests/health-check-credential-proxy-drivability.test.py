@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for `_credential_proxy_wedge_from_quota_state` (`src/health-check.py`).
-
-The proxy's own liveness probe is TCP-listening only (`check_port(..., probe=False)`),
-so a proxy that is up but cannot get a usable credential -- every request 401s/502s --
-still reads as 'ok'. This is the 2026-09-27 incident (:7846 stayed open with every seat
-losing the API for 55min-2h before a human noticed). credential-proxy.ts already tracks
-this per-request (`recordCredentialState`, written to quota-state.json); this suite pins
-that health-check.py surfaces it, self-heals once the proxy reports 'ok' again, and stays
-silent when the file is absent, unreadable, or the port itself isn't listening.
+"""Tests for `_credential_proxy_wedge_from_quota_state` (`src/health-check.py`): pins
+that a listening-but-uncredentialed proxy escalates to 'warn', self-heals, ignores a
+record that predates a restart, and stays silent on a missing/unreadable file or a
+down port. See the PR body for the incident this closes.
 
 Run: python3 tests/health-check-credential-proxy-drivability.test.py
 Exit 0 on pass, 1 on fail.
@@ -50,9 +45,12 @@ class CredentialProxyDrivabilityTests(unittest.TestCase):
         path.write_text(json.dumps(fields))
         return path
 
-    def _check(self, status="ok"):
+    def _check(self, status="ok", proc_starts=()):
+        # Isolate from this host's real credential-proxy process (unpatched, the guard
+        # below would depend on whatever _proc_lstarts finds actually running here).
         check = {"status": status, "detail": "listening" if status != "down" else "not listening"}
-        hc._credential_proxy_wedge_from_quota_state(check)
+        with patch.object(hc, "_proc_lstarts", return_value=(list(proc_starts), {})):
+            hc._credential_proxy_wedge_from_quota_state(check)
         return check
 
     def test_exhausted_escalates_ok_to_warn(self):
@@ -113,6 +111,31 @@ class CredentialProxyDrivabilityTests(unittest.TestCase):
         check = self._check("ok")
         self.assertEqual(check["status"], "warn")
         self.assertNotIn("m ago)", check["detail"])
+
+    # ---- restart leaves a stale 'exhausted' the file never resets on its own ----
+    def test_exhausted_record_older_than_the_current_process_is_ignored(self):
+        recorded_at = time.time() - 3600
+        self._write_state(
+            credential_state="exhausted", credential_state_detail="x",
+            credential_state_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(recorded_at)))
+        check = self._check("ok", proc_starts=[recorded_at + 1800])
+        self.assertEqual(check["status"], "ok")
+
+    def test_exhausted_record_newer_than_the_process_still_warns(self):
+        proc_started = time.time() - 3600
+        self._write_state(
+            credential_state="exhausted", credential_state_detail="x",
+            credential_state_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(proc_started + 1800)))
+        check = self._check("ok", proc_starts=[proc_started])
+        self.assertEqual(check["status"], "warn")
+
+    def test_no_process_info_falls_back_to_warning(self):
+        # _proc_lstarts's probe-failure/no-match shapes both come back empty; without a
+        # process start to compare against, the pre-existing behavior (warn) applies.
+        self._write_state(credential_state="exhausted", credential_state_detail="x",
+                           credential_state_at="2026-09-27T19:30:00Z")
+        check = self._check("ok", proc_starts=[])
+        self.assertEqual(check["status"], "warn")
 
 
 if __name__ == "__main__":
