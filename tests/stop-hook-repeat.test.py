@@ -55,6 +55,17 @@ class Counter(unittest.TestCase):
         m.bump(self.state, "task-secret-name.txt")
         self.assertNotIn("secret", m.counter_path(self.state).read_text())
 
+    def test_a_failed_replace_unlinks_the_temp_file_and_raises(self):
+        # The write reached the temp file; the rename into place failed: nothing may be
+        # left behind and the failure surfaces (the hook then fails open).
+        import unittest.mock as um
+        m.bump(self.state, "x")
+        with um.patch.object(m.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                m.bump(self.state, "x")
+        self.assertFalse(list(self.state.glob(".*")), "temp file left behind")
+        self.assertEqual(m.bump(self.state, "x"), 2, "the persisted count survived the failed write")
+
     def test_bump_raises_when_the_dir_cannot_be_written(self):
         self.state.mkdir(parents=True)
         os.chmod(self.state, 0o500)
