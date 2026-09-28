@@ -175,7 +175,14 @@ _AUTO_ANSWER = {
     # Matched only with the caret ON "Switch to <fallback> and continue" under the Fable
     # text, so Enter is that switch and spends nothing (owner 2026-09-02).
     "fable-limit": "Enter",
+    # The same limit refused as a finished turn, with no dialog to focus: the switch is typed.
+    # `opus` is the CLI's alias for its current Opus; `continue` resumes the refused turn.
+    "fable-limit-refused": ("/model opus", "Enter", "continue", "Enter"),
 }
+
+#: A typed answer re-arms only after this long: a switch that did not take would otherwise
+#: be refused again, re-detected and re-typed on every tick.
+TYPED_ANSWER_COOLDOWN_S = 600.0
 
 
 def auto_answer(kind):
@@ -268,6 +275,41 @@ def _composer_text(pane: str) -> "str | None":
     return _pg_composer_text(pane)
 
 
+# The CLI's line when a turn is refused at the Fable weekly limit without its dialog.
+_FABLE_REFUSAL = re.compile(r"(?:You'?ve\s+)?reached your Fable limit\b.{0,120}?switch models with /model\.?\s*$", re.I | re.S)
+_TOOL_HEADER = re.compile(r"^\s*[⏺●]\s+[\w-]+\(")
+_AUTOCOMPACT = re.compile(r"^\s*\d+% until auto-compact\s*$")
+
+
+def fable_refusal(pane: str):
+    """The Fable-limit refusal line when it is the last thing the pane printed above an idle,
+    empty composer, else None. A worker's turns open on `⏺ Monitor event`, not on a `❯`
+    line, so `refused_turn`'s turn bounds never isolate it there. A tool's output that
+    quotes the line is excluded by its `⏺ Tool(` header."""
+    if not (_is_idle_ready(pane) and _composer_is_empty(pane)):
+        return None
+    lines = [ln for ln in pane.splitlines() if ln.strip()][-_TURN_WINDOW:]
+    prompt = next((i for i in range(len(lines) - 1, -1, -1) if _PROMPT_LINE.match(lines[i])), None)
+    if prompt is None:
+        return None
+    # The composer's top border may carry a session label (`──── sutando-core ──`).
+    body = [ln for ln in lines[:prompt] if not (ln.strip().startswith("─") or _AUTOCOMPACT.match(ln))]
+    if body and _TURN_DONE.match(body[-1]):
+        dur = _TURN_DONE.match(body[-1]).group("dur")
+        if dur and not _TURN_SHORT.fullmatch(dur):
+            return None
+        body.pop()
+    tail = body[-3:]
+    text = " ".join(ln.strip().lstrip("⎿⏺●").strip() for ln in tail)
+    m = _FABLE_REFUSAL.search(text)
+    if not m:
+        return None
+    header = next((ln for ln in reversed(body[:-len(tail)] + tail) if ln.strip()[:1] in "⏺●"), "")
+    if _TOOL_HEADER.match(header):
+        return None
+    return m.group(0).strip()
+
+
 def refused_turn(pane: str):
     """(kind, line) when the pane sits at the idle footer and the turn that ended there —
     the last completed one, with nothing newer below it — was refused: a short turn (≤1s
@@ -344,6 +386,9 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         return "logged-out", _BASE_TO_STATE["needs_login"][1], None, None
     # A refused turn leaves the core at its idle footer, which every branch below reads
     # as healthy; the refusal line is the only evidence and it is finished, not a gate.
+    fable = fable_refusal(pane) if pane else None
+    if fable:
+        return "blocked-known", "at known gate: fable-limit-refused", fable, "fable-limit-refused"
     refused = refused_turn(pane) if pane else None
     if refused:
         kind, line = refused
@@ -475,13 +520,21 @@ def capture(socket, session):
 
 
 def send_keys(socket, session, key):
-    """Type one key into the core pane. True only when tmux accepted it."""
-    try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
-                           capture_output=True, timeout=8)
-        return r.returncode == 0
-    except Exception:
-        return False
+    """Type one key, or a tuple of text and `Enter` steps, into the core pane. True only
+    when tmux accepted every step."""
+    steps = key if isinstance(key, tuple) else (key,)
+    for i, step in enumerate(steps):
+        literal = isinstance(key, tuple) and step != "Enter"
+        argv = ["tmux", "-S", socket, "send-keys", "-t", f"{session}:0"] + (["-l"] if literal else []) + [step]
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=8)
+        except Exception:
+            return False
+        if r.returncode != 0:
+            return False
+        if step == "Enter" and i < len(steps) - 1:
+            time.sleep(1.0)  # let the command settle before the next line is typed
+    return True
 
 
 def answer_step(state, kind, prompt, answered_prompt, enabled=True):
@@ -709,6 +762,7 @@ def main():
     last_prompt = None
     answered_prompt = None
     last_answered = None
+    typed_at = {}
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
@@ -732,9 +786,13 @@ def main():
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
+        if isinstance(key, tuple) and time.time() - typed_at.get(kind, 0.0) < TYPED_ANSWER_COOLDOWN_S:
+            key = None
         if key and send_keys(a.socket, a.session, key):
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
+            if isinstance(key, tuple):
+                typed_at[kind] = last_answered["at"]
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
@@ -742,6 +800,8 @@ def main():
         if sig != last_sig:
             payload = {"state": state, "detail": detail,
                        "prompt": prompt, "kind": kind, "session": a.session}
+            if a.seat:
+                payload["seat"] = a.seat
             if last_answered:
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
