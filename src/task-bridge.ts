@@ -314,17 +314,21 @@ const _pendingTasks = new Map<string, PendingTask>();
 export const _pendingTasksForTest = _pendingTasks;
 
 // The scheduler's durable per-task lifecycle (src/activity_bus.py): phase leaves
-// QUEUED/RECEIVED when a watcher hands the task to the core. Absent or
-// unreadable reads as "not started" — the bridge then waits the queue bound.
+// QUEUED/RECEIVED when a watcher hands the task to the core. Only the macOS/Linux
+// watcher (task-emit.sh) writes it; the Windows dispatcher and other runtimes
+// never do, so "no snapshot" is not "still queued": it means the bridge cannot
+// see the pickup and must keep the submission clock (review of #4864).
 const UNSTARTED_PHASES = new Set(['RECEIVED', 'QUEUED']);
-export function _taskHasStarted(taskId: string): boolean {
+export type TaskActivity = 'started' | 'queued' | 'none';
+export function _taskActivity(taskId: string): TaskActivity {
 	const snap = join(REPO_DIR, 'state', 'activity', `${taskId}.json`);
-	if (!existsSync(snap)) return false;
+	if (!existsSync(snap)) return 'none';
 	try {
 		const phase = (JSON.parse(readFileSync(snap, 'utf-8')) as { phase?: unknown }).phase;
-		return typeof phase === 'string' && !UNSTARTED_PHASES.has(phase);
+		if (typeof phase !== 'string') return 'none';
+		return UNSTARTED_PHASES.has(phase) ? 'queued' : 'started';
 	} catch {
-		return false;
+		return 'none';
 	}
 }
 
@@ -1151,8 +1155,12 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 		const { submittedAt, timeoutMs, dmOnTimeout } = pending;
 		// timeoutMs === 0 means "no timeout" — skip the check entirely.
 		if (timeoutMs === 0) continue;
-		if (pending.startedAt === undefined && _taskHasStarted(taskId)) pending.startedAt = now;
-		if (pending.startedAt === undefined) {
+		const activity = pending.startedAt === undefined ? _taskActivity(taskId) : 'started';
+		if (pending.startedAt === undefined && activity === 'started') pending.startedAt = now;
+		// No snapshot at all: a runtime that never writes one. The pickup is
+		// invisible, so the clock runs from submission as it always did.
+		const clockStart = pending.startedAt ?? (activity === 'none' ? submittedAt : undefined);
+		if (clockStart === undefined) {
 			// Still queued: its own timeout has not begun. A task nobody picks up
 			// within the queue bound is reported as unpicked and LEFT in tasks/,
 			// so a restarted engine still finds it.
@@ -1170,7 +1178,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			}
 			continue;
 		}
-		if (now - pending.startedAt > timeoutMs) {
+		if (now - clockStart > timeoutMs) {
 			_pendingTasks.delete(taskId);
 			// Read the task body (or a snippet of it) so the timeout message
 			// can identify which task timed out — the prior generic "[Task

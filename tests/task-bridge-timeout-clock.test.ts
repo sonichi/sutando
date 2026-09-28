@@ -18,7 +18,7 @@ mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 mkdirSync(join(TMP, 'state', 'activity'), { recursive: true });
 
-const { _sweepTimeouts, _pendingTasksForTest, _taskHasStarted, setTaskStatusCallback } = await import('../src/task-bridge.js');
+const { _sweepTimeouts, _pendingTasksForTest, _taskActivity, setTaskStatusCallback } = await import('../src/task-bridge.js');
 
 const MIN = 60_000;
 const statuses: Array<{ taskId: string; status: string; text: string }> = [];
@@ -45,6 +45,7 @@ describe('the task timeout counts from pickup', () => {
 	it('a queued task past its own timeout is neither timed out nor archived', () => {
 		reset();
 		task('task-q1');
+		snapshot('task-q1', 'QUEUED');
 		const t0 = 1_000_000_000_000;
 		_pendingTasksForTest.set('task-q1', { submittedAt: t0, timeoutMs: 5 * MIN, dmOnTimeout: false, taskText: 'x' });
 		_sweepTimeouts(onResult, t0 + 30 * MIN);
@@ -76,21 +77,42 @@ describe('the task timeout counts from pickup', () => {
 		assert.deepEqual(archived(), ['task-r1.txt'], 'a started task that timed out is archived as before');
 	});
 
-	it('WAITING (blocked on a person) counts as started too', () => {
+	it('WAITING (blocked on a person) counts as started; no or unreadable snapshot is "none"', () => {
 		reset();
 		task('task-w1');
 		snapshot('task-w1', 'WAITING');
-		assert.equal(_taskHasStarted('task-w1'), true);
-		assert.equal(_taskHasStarted('task-none'), false, 'no snapshot: not started');
+		assert.equal(_taskActivity('task-w1'), 'started');
+		snapshot('task-w1', 'RECEIVED');
+		assert.equal(_taskActivity('task-w1'), 'queued');
+		assert.equal(_taskActivity('task-none'), 'none', 'no snapshot: the pickup is invisible');
 		writeFileSync(join(TMP, 'state', 'activity', 'task-bad.json'), '{not json');
-		assert.equal(_taskHasStarted('task-bad'), false, 'unreadable: not started');
+		assert.equal(_taskActivity('task-bad'), 'none', 'unreadable: invisible');
 		writeFileSync(join(TMP, 'state', 'activity', 'task-odd.json'), JSON.stringify({ phase: 7 }));
-		assert.equal(_taskHasStarted('task-odd'), false);
+		assert.equal(_taskActivity('task-odd'), 'none');
+	});
+
+	it('a runtime that never writes a snapshot keeps the submission clock (review of #4864)', () => {
+		// The Windows dispatcher and other runtimes emit no activity; a picked-up
+		// task that hangs there must still time out on its own timeout, archived
+		// as before, never wait the queue bound and read as "never picked up".
+		reset();
+		task('task-n1', 'no activity here');
+		const t0 = 1_000_000_000_000;
+		_pendingTasksForTest.set('task-n1', { submittedAt: t0, timeoutMs: 5 * MIN, dmOnTimeout: false, taskText: 'x' });
+		_sweepTimeouts(onResult, t0 + 4 * MIN);
+		assert.equal(spoken.length, 0);
+		_sweepTimeouts(onResult, t0 + 5 * MIN + 1);
+		assert.equal(spoken.length, 1);
+		assert.match(spoken[0], /timed out after 5 minutes/);
+		assert.doesNotMatch(spoken[0], /has not been picked up/);
+		assert.ok(!_pendingTasksForTest.has('task-n1'));
+		assert.ok(archived().includes('task-n1.txt'), 'archived as before');
 	});
 
 	it('a task nobody picks up within the queue bound is reported as unpicked and left in tasks/', () => {
 		reset();
 		task('task-u1', 'draft the reply');
+		snapshot('task-u1', 'QUEUED');
 		const t0 = 1_000_000_000_000;
 		_pendingTasksForTest.set('task-u1', { submittedAt: t0, timeoutMs: 5 * MIN, dmOnTimeout: false, taskText: 'x' });
 		_sweepTimeouts(onResult, t0 + 59 * MIN);
@@ -108,6 +130,7 @@ describe('the task timeout counts from pickup', () => {
 	it('a longer per-task timeout also stretches the queue bound', () => {
 		reset();
 		task('task-l1');
+		snapshot('task-l1', 'QUEUED');
 		const t0 = 1_000_000_000_000;
 		_pendingTasksForTest.set('task-l1', { submittedAt: t0, timeoutMs: 120 * MIN, dmOnTimeout: false, taskText: 'x' });
 		_sweepTimeouts(onResult, t0 + 90 * MIN);
