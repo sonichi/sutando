@@ -1,33 +1,22 @@
 # CODEOWNERS -- sonichi/sutando
 #
 # Evidence-based, derived from the full git history (2,787 commits since the
-# first one on 2026-03-28 -- the repo is only 184 days (6.0 months) old, so a
-# 90-day lookback would miss roughly the first half of its life; full history
-# is used instead of the usual 90-day convention. Measured with
-# `git log origin/main --no-merges --format=%an -- <path> | sort | uniq -c`.
-# Full methodology, the areas considered and left out, and per-path commit
-# counts: the "Sutando codeowners" doc (ww room) and its Product-core copy.
+# first one on 2026-03-28 -- the repo is only 184 days old, so a 90-day
+# lookback would miss roughly half its life; full history is used instead.
+# Measured with `git log origin/main --no-merges --format=%an -- <path> |
+# sort | uniq -c`. Full methodology and the areas considered and left out:
+# the "Sutando codeowners" doc (ww room) and its Product-core copy.
 #
-# GOVERNANCE NOTE (added 2026-09-28, per keweichen's review): this main branch
-# ruleset requires code-owner review with no bypass. Because CODEOWNERS is
-# last-match-wins and several rules below name a single owner, that person is
-# indispensable for merging any PR touching their path -- if they're
-# unavailable, such a PR is blocked until someone with `*`-fallback access
-# (@sonichi or @qingyun-wu) lands a CODEOWNERS amendment adding a backup.
-# This is intentional, not an oversight: every singleton line below reflects a
-# real, uncontested sole leader (evidence-based, not invented), and adding a
-# second name with no real ownership signal would misrepresent who actually
-# owns the code. The recovery path if this bites: a PR to this file adding a
-# co-owner, approved by the `*` fallback.
+# GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
+# @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
+# singleton owner below is a hard block on their own PRs, and on anyone
+# else's if they're unavailable; recovery is a bypass merge by @sonichi or
+# @qingyun-wu, or a CODEOWNERS amendment adding a backup owner.
 
 # Repo-wide fallback: the project owner (@sonichi) and @qingyun-wu, who is
 # top-2 by commit volume in every top-level area checked (src, skills, docs,
 # tests, scripts, .github, hooks, packages); @sonichi is top-2 in 7 of 8 (3rd
-# in hooks/, behind @qingyun-wu and Rui Wang). Eight people have at least one
-# commit in every such area, but none rival this pair's combined volume or
-# ownership role -- corrected 2026-09-28: an earlier claim that only these two
-# were "present" everywhere was wrong (the real intersection is 8 people);
-# this is a volume-and-ownership rationale, not a presence one.
+# in hooks/, behind @qingyun-wu and Rui Wang).
 * @sonichi @qingyun-wu
 
 # Core: both dominant authors, and docs/architecture-boundaries.md already flags
@@ -38,15 +27,14 @@
 
 # Clear per-area leader over the full history (90-day leader in parentheses where it differs).
 /skills/agent-room-ops/    @qingyun-wu
-/skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits (re-measured 2026-09-28, per keweichen's review -- was stale at 29/16/2); Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi added 2026-09-28 (owner-assigned, in ww)
+/skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
 /skills/task-progress/     @qingyun-wu
 /skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun)
 /packages/                 @qingyun-wu
 
 # Susan: areas she leads or co-leads over the full history.
-# (no line for skills/discord-voice/ -- removed 2026-09-28, per keweichen's
-# review: the directory has zero currently-tracked files, same dead-path
-# reasoning as the room-collab exclusion note below.)
+# (no line for skills/discord-voice/ -- zero currently-tracked files, same
+# dead-path reasoning as the room-collab exclusion note below.)
 /skills/screen-companion/  @liususan091219                # Susan 6, Qingyun 4, James 3, Chi 2
 /skills/screen-record/     @liususan091219 @sonichi       # Susan 8, Chi 8
 /src/browser-tools.ts      @sonichi @liususan091219       # Chi 27, Susan 18
