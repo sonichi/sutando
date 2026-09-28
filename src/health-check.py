@@ -9412,8 +9412,8 @@ def check_task_watcher() -> dict:
                           "whose turn ended logged out (\"Login expired · Please run /login\") "
                           "never re-arms its Monitor, and the standby only announces through "
                           "the pane. Degraded, not clear: run /login in that session if it "
-                          "asks, then re-arm via the Monitor tool: bash src/watch-tasks-stream.sh "
-                          "--role session --inbox <inbox>"}
+                          "asks, then re-arm via the Monitor tool: "
+                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"}
     # A watcher holds its inbox whether or not anything consumes what it
     # announces; the reader is the only difference visible from outside.
     unread = []
