@@ -60,6 +60,8 @@ import turn_ledger  # noqa: E402
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 # The hook gates only the launcher-marked core (or an enrolled worker); this suite is the core.
 os.environ["SUTANDO_CORE_SESSION"] = "1"
+# A worker session exports SUTANDO_INSTANCE_ID; inherited here it would put the hook in worker mode.
+os.environ.pop("SUTANDO_INSTANCE_ID", None)
 
 
 def _load_sibling_stub():
