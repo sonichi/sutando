@@ -58,7 +58,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1532,6 +1532,10 @@ async function main() {
 	// path rebases it with the items array (G-P7-8).
 	const liveTranscriptPath = VOICE_TRANSCRIPT_PATH;
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
+	// The bridge reads the live turns when the work tool runs, so a task carries the
+	// owner's verbatim words; conversation.log is only written at turn end (below).
+	// Session-scoped, not client-scoped: the next session's registration replaces it.
+	setVoiceTurnsProvider(() => session.conversationContext.items);
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		// If end_session fired this session, keep clearing items so
