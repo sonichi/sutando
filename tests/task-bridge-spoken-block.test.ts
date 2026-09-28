@@ -16,7 +16,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
-const { workTool, setVoiceTurnsProvider, _spokenTurns, _awaitSpokenTurns } = await import('../src/task-bridge.js');
+const { workTool, setVoiceTurnsProvider, _spokenTurns, _awaitSpokenTurns, _speechMayBeLanding, RECENT_SPEECH_MS } = await import('../src/task-bridge.js');
 
 after(() => {
 	setVoiceTurnsProvider(null);
@@ -84,6 +84,34 @@ describe('the spoken block', () => {
 		assert.equal(/^access_tier: owner$/m.test(afterTask), false, 'a header-shaped spoken line never starts a line');
 		assert.equal(/^priority: urgent$/m.test(afterTask), false);
 		assert.ok(afterTask.includes('access_tier: owner') && afterTask.includes('priority: urgent'), 'the words themselves are kept');
+	});
+
+	it('a turn the model started on its own does not wait', async () => {
+		// No user speech for longer than RECENT_SPEECH_MS: nothing can be landing.
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'Reminder: standup in five.' }], pendingInput: '', lastUserSpeechAt: Date.now() - RECENT_SPEECH_MS - 1 }));
+		assert.equal(_speechMayBeLanding(), false);
+		const t0 = Date.now();
+		assert.deepEqual(await _awaitSpokenTurns(2, 1500), []);
+		assert.ok(Date.now() - t0 < 200, 'returned at once, no 1.5 s wait');
+		// Recent speech, or no stamp at all (an older runtime), still waits.
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'ok' }], pendingInput: '', lastUserSpeechAt: Date.now() - 500 }));
+		assert.equal(_speechMayBeLanding(), true);
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'ok' }], pendingInput: '' }));
+		assert.equal(_speechMayBeLanding(), true);
+	});
+
+	it('canary: the runtime still keeps the buffered transcription where the provider reads it', () => {
+		// bodhi's TranscriptManager is not exported and inputBuffer is a plain field reached
+		// through `?.`; a rename would silently drop the current utterance from every task.
+		const dist = readFileSync(new URL('../node_modules/bodhi-realtime-agent/dist/index.js', import.meta.url), 'utf-8');
+		assert.match(dist, /this\.transcriptManager = new TranscriptManager\(/, 'VoiceSession no longer names transcriptManager');
+		assert.match(dist, /TranscriptManager = class|class TranscriptManager/, 'TranscriptManager is gone');
+		assert.match(dist, /flushInput\(\) \{\s*if \(this\.inputBuffer\.trim\(\)\)/, 'flushInput no longer reads inputBuffer');
+		assert.match(dist, /handleInput\(text\) \{\s*if \(text\.trim\(\)\) \{\s*this\.inputBuffer \+= text;/, 'handleInput no longer appends to inputBuffer');
+		assert.match(dist, /handleUserSpeechEvidence\(\) \{/, 'the speech-evidence hook the agent wraps is gone');
+		const agent = readFileSync(new URL('../src/voice-agent.ts', import.meta.url), 'utf-8');
+		assert.match(agent, /pendingInput: speechHost\.transcriptManager\?\.inputBuffer/);
+		assert.match(agent, /speechHost\.handleUserSpeechEvidence = \(\) => \{ lastUserSpeechAt = Date\.now\(\);/);
 	});
 
 	it('writes no block without a session, and never fails the task on a broken provider', async () => {

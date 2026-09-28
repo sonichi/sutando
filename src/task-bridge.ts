@@ -236,7 +236,12 @@ export type VoiceTurn = { role: string; content?: string | null };
  *  runtime has buffered but not yet flushed into them (bodhi's TranscriptManager
  *  inputBuffer): flushInput() runs before a tool is dispatched, but only over the
  *  transcription that has ARRIVED, so a late chunk sits in that buffer during the call. */
-export type VoiceTurnsSnapshot = { items: ReadonlyArray<VoiceTurn> | null | undefined; pendingInput?: string | null };
+export type VoiceTurnsSnapshot = {
+	items: ReadonlyArray<VoiceTurn> | null | undefined;
+	pendingInput?: string | null;
+	/** When the runtime last saw the owner speak (ms epoch); undefined when unknown. */
+	lastUserSpeechAt?: number | null;
+};
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
 
@@ -255,7 +260,7 @@ function _readSnapshot(): VoiceTurnsSnapshot | null {
 	if (!raw) return null;
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
-	return Array.isArray(snap.items) || snap.pendingInput ? snap : null;
+	return Array.isArray(snap.items) || snap.pendingInput || typeof snap.lastUserSpeechAt === 'number' ? snap : null;
 }
 
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
@@ -283,16 +288,30 @@ export function _spokenTurns(count = 2): string[] {
 /** How long a task write waits for the current turn's transcription to land. */
 export const SPOKEN_WAIT_MS = 1500;
 const SPOKEN_POLL_MS = 100;
+/** Speech older than this before the call means the model started the turn itself. */
+export const RECENT_SPEECH_MS = 10_000;
+
+/** Whether waiting for a transcription makes sense: the owner spoke recently, or the
+ *  runtime cannot say. A model-initiated turn (no recent speech) has nothing to wait for. */
+export function _speechMayBeLanding(now = Date.now()): boolean {
+	const snap = _readSnapshot();
+	const at = snap?.lastUserSpeechAt;
+	if (typeof at !== 'number' || !Number.isFinite(at)) return true;
+	return now - at <= RECENT_SPEECH_MS;
+}
 
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
- *  when none has arrived yet (the runtime flushes only what it has when the tool fires). */
+ *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
+ *  no wait for a turn the model started on its own. */
 export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))): Promise<string[]> {
 	if (!_voiceTurns) return [];
+	const first = _spokenTurns(count);
+	if (first.length > 0 || !_speechMayBeLanding()) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
+		await sleep(SPOKEN_POLL_MS);
 		const spoken = _spokenTurns(count);
 		if (spoken.length > 0 || Date.now() >= deadline) return spoken;
-		await sleep(SPOKEN_POLL_MS);
 	}
 }
 

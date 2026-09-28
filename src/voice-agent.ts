@@ -1537,10 +1537,20 @@ async function main() {
 	// Session-scoped, not client-scoped: the next session's registration replaces it.
 	// Items plus the transcription still buffered by the runtime (bodhi flushes only
 	// what has arrived when a tool fires), so a late chunk is not read as last turn's.
+	// The runtime calls handleUserSpeechEvidence on every transcription chunk; the stamp
+	// tells the bridge whether a transcription may still be landing (no stamp within
+	// 10 s = the model started this turn itself, so the task write does not wait).
+	let lastUserSpeechAt: number | undefined;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const speechHost = session as any;
+	if (typeof speechHost.handleUserSpeechEvidence === 'function') {
+		const original = speechHost.handleUserSpeechEvidence.bind(session);
+		speechHost.handleUserSpeechEvidence = () => { lastUserSpeechAt = Date.now(); return original(); };
+	}
 	setVoiceTurnsProvider(() => ({
 		items: session.conversationContext.items,
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		pendingInput: (session as any).transcriptManager?.inputBuffer as string | undefined,
+		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
+		lastUserSpeechAt,
 	}));
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
