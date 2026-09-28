@@ -50,9 +50,6 @@ def run(real_run_rc: int, probe_rc: int = 0):
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
-    # Pinned (not the 10s production default) so the wait window below is a
-    # property of this test, per watch-tasks-stream-watchdog-trap-race.test.sh:54 (#4855).
-    env["SUTANDO_HANDLER_RUN_TIMEOUT"] = "1"
     # stderr is kept: a FAIL with nothing to read cannot be diagnosed (#4645).
     errf = open(tmp / "watcher.err", "w+")
     p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
@@ -61,7 +58,8 @@ def run(real_run_rc: int, probe_rc: int = 0):
     out, t0 = [], time.time()
     try:
         os.set_blocking(p.stdout.fileno(), False)
-        while time.time() - t0 < 8:
+        # 25s: SUTANDO_HANDLER_RUN_TIMEOUT itself defaults to 10s, so 10s left no margin (#4855).
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = p.stdout.read()
@@ -107,7 +105,6 @@ def restart_witness():
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
-    env["SUTANDO_HANDLER_RUN_TIMEOUT"] = "1"  # pinned, see run() above (#4855)
 
     def start(errf):
         return subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")],
@@ -137,7 +134,8 @@ def restart_witness():
     published = []
     try:
         os.set_blocking(second.stdout.fileno(), False)
-        while time.time() - t0 < 8:
+        # Same margin fix as run() above (#4855) -- 25s, not the expected cost.
+        while time.time() - t0 < 25:
             time.sleep(0.3)
             try:
                 c = second.stdout.read()
