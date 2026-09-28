@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -276,10 +277,51 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
                                queue=queue)
 
 
+#: How long a RUNNING task counts as "being worked" without a newer activity stamp.
+IN_PROGRESS_MAX_AGE_S = 1800.0
+
+
+def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_AGE_S,
+                now: float | None = None) -> bool:
+    """True when the snapshot says RUNNING and its activity stamp (last_activity_at, else
+    started_at) is within max_age of now. Anything else -- queued, waiting on a person,
+    terminal, stale, a future or non-finite stamp, no or unreadable snapshot -- is False."""
+    try:
+        d = json.loads(ActivityStore(workspace).path(task_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict) or d.get("phase") != "RUNNING":
+        return False
+    stamp = d.get("last_activity_at")
+    if stamp is None:
+        stamp = d.get("started_at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+        return False
+    age = (time.time() if now is None else now) - float(stamp)
+    return 0 <= age <= max_age
+
+
+def _in_progress_cli(args: list[str]) -> int:
+    """`in-progress <task_id> [--workspace W] [--max-age S]`: rc 0 when in progress, 1 when not,
+    2 on a usage error. Unlike the emitting commands this one is a query, so it answers by rc."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="activity_bus.py in-progress")
+    ap.add_argument("task_id"); ap.add_argument("--workspace"); ap.add_argument("--max-age", type=float, default=IN_PROGRESS_MAX_AGE_S)
+    try:
+        a = ap.parse_args(args)
+    except SystemExit:
+        return 2
+    ws = Path(a.workspace) if a.workspace else resolve_workspace()
+    return 0 if in_progress(ws, a.task_id, a.max_age) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """`transition <PHASE> (--task-file P | --task-id ID) [--reason R] [--into-task ID] [--worker W]`
     and `event <task_id> <kind> --session S --seq N [--text T]`. Exits 0 on every path: a caller in
     the delivery path must never fail because the card could not be updated."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "in-progress":
+        return _in_progress_cli(args[1:])
     import argparse
     ap = argparse.ArgumentParser(description="activity bus CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)

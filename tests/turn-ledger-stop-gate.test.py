@@ -58,6 +58,8 @@ import turn_ledger  # noqa: E402
 # Isolate from whatever session this process runs under; the two-session test
 # below sets its own per-call session ids explicitly instead.
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+# The hook gates only the launcher-marked core (or an enrolled worker); this suite is the core.
+os.environ["SUTANDO_CORE_SESSION"] = "1"
 
 
 def _load_sibling_stub():
@@ -322,7 +324,7 @@ def test_an_unanswered_task_still_blocks_with_the_task_reason() -> None:
         decision = _hook(ws)
         check("an unanswered task still blocks", _blocked(decision), repr(decision))
         check("and it is still the task reason",
-              decision["reason"] == "Unprocessed tasks in tasks/", repr(decision))
+              decision["reason"].startswith("Unprocessed tasks in tasks/: task-1.txt"), repr(decision))
         check("naming the task", "task-1.txt" in decision["additionalContext"],
               repr(decision)[:200])
 
