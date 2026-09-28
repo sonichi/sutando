@@ -145,9 +145,8 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     probed next. Falls back to the metering env the supervisor injects.
     """
     read_keychain = keychain_auth or read_keychain_auth
-    # The desktop host owns the session: its Keychain is the ONLY source there.
-    # A file can hold nothing but a stale bearer under the host, so after a
-    # sign-out it would keep the engine acting as the leftover account.
+    # The desktop host owns the session: its Keychain is the only source there
+    # (a file can hold nothing but a stale bearer, wrong again after a sign-out).
     if keychain_first():
         base, tok = read_keychain()
         if tok:

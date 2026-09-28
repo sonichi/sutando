@@ -114,8 +114,8 @@ class TestReadCloudAuthOrder(unittest.TestCase):
             ws = self._ws(tmp)
             keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
             self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_keychain")
-            # Signed out in the Keychain (no session, or the host's sign-out sentinel): the
-            # leftover file is NOT consulted -- it can only hold a stale bearer under the host.
+            # Signed out in the Keychain (no session, or the sign-out sentinel): the
+            # leftover file is not consulted; under the host it is only ever stale.
             calls = []
             def none():
                 calls.append(1)
