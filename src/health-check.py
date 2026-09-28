@@ -12438,6 +12438,55 @@ def proxy_liveness_status(proxy_check: dict) -> str:
     return proxy_check.get("status")
 
 
+def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
+    """Escalate `check` to 'warn' when the proxy's OWN last-recorded credential
+    state says it could not get a usable token — the "listening but not
+    forwarding" wedge a bare TCP probe cannot see (2026-09-27 incident:
+    :7846 stayed open with every seat 502ing for 55min-2h before detection).
+
+    Reads `credential_state`/`credential_state_detail`/`credential_state_at`
+    from quota-state.json — written by credential-proxy.ts's
+    recordCredentialState() on every transition: 'ok' on each successful
+    per-request token injection, 'exhausted' when a request could not get a
+    usable credential. This makes the signal self-healing within one
+    successful request and current as of the last completed one; it does
+    NOT catch a background refresh failing before any request has arrived
+    (recordCredentialState is only called from the request path).
+
+    Called only while `check["status"]` is already 'ok' or 'stale' (the
+    caller's own gate): a proxy that isn't listening has no request path to
+    have recorded anything, so this must never be what marks it down.
+    Silent on any read failure — advisory, matching mark_stale_if_outdated's
+    "never take the health check down with it" rule for the same file.
+    """
+    if check["status"] not in ("ok", "stale"):
+        return
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or state.get("credential_state") != "exhausted":
+        return
+    detail = state.get("credential_state_detail") or "no detail recorded"
+    at = state.get("credential_state_at")
+    age = ""
+    if isinstance(at, str):
+        from datetime import datetime as _dt  # local: not at module scope in this file
+        try:
+            age_s = time.time() - _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
+        except ValueError:
+            pass
+    check["status"] = "warn"
+    check["detail"] = (
+        f"listening, but its own last-recorded credential state is 'exhausted'{age}: "
+        f"{detail} — requests are likely 401ing/502ing despite the port being open"
+    )
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -12458,6 +12507,7 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+        _credential_proxy_wedge_from_quota_state(check)
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
