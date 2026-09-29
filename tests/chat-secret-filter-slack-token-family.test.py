@@ -98,8 +98,25 @@ class TestEveryTokenKindIsRedacted(unittest.TestCase):
         self.assertEqual(result.text, prose)
         self.assertNotIn("Slack Token", result.secret_types)
 
+    def test_a_sign_off_in_prose_is_not_a_token(self):
+        # Review of #4892: a tail of [A-Za-z0-9-]+ swallowed "xoxo-Sam" and
+        # reported it as a Slack token; every real kind has a digit after the dash.
+        prose = "thanks for the fix, hugs xoxo-Sam (cc xapp-Sam)"
+        result = filter_chat_secrets(prose)
+        self.assertEqual(result.text, prose)
+        self.assertNotIn("Slack Token", result.secret_types)
+        for kind in ("bot (xoxb-)", "rotated user (xoxe.xoxp-)", "app-level (xapp-)"):
+            with self.subTest(kind=kind):
+                self._assert_redacted_whole(kind, {**OLD_KINDS, **NEW_KINDS}[kind])
+
 
 class TestSecretScannerUsesTheSharedFamily(unittest.TestCase):
+    def test_a_sign_off_line_is_not_a_scanner_hit(self):
+        hits = secret_scanner.scan_secrets("xoxo-Sam")
+        self.assertNotIn("Slack Token", [h.secret_type for h in hits])
+        self.assertIsNone(secret_scanner._WHOLE_LINE_PATTERNS["Slack Token"].match("xoxo-Sam"))
+        self.assertEqual(secret_scanner.redact_secrets("hugs xoxo-Sam", hits), "hugs xoxo-Sam")
+
     def test_redacts_the_full_span_of_a_refresh_token(self):
         token = NEW_KINDS["refresh (xoxe-)"]
         hit = secret_scanner.SecretHit(secret_type="Slack Token", line_number=1)
@@ -139,6 +156,10 @@ class TestOneSharedDefinition(unittest.TestCase):
             report_feedback._redact("app token " + NEW_KINDS["app-level (xapp-)"]),
             "app token <redacted-token>",
         )
+
+    def test_report_feedback_leaves_a_sign_off_in_prose_alone(self):
+        report_feedback = _load_report_feedback()
+        self.assertEqual(report_feedback._redact("hugs xoxo-Sam"), "hugs xoxo-Sam")
 
     def test_no_other_reader_keeps_a_private_slack_rule(self):
         # Structural pin (REVIEW.md rule 17, second exception): two copies that

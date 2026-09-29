@@ -44,6 +44,10 @@ class TestReportFeedbackRedaction(unittest.TestCase):
         self.assertNotIn(token, redacted)
         self.assertIn("<redacted-token>", redacted)
 
+    def test_leaves_a_sign_off_in_prose_alone(self):
+        prose = "thanks for the report, hugs xoxo-Sam"
+        self.assertEqual(report_feedback._redact(prose), prose)
+
     def test_redacts_google_api_key(self):
         key = "AIza" + "Sy" + "A" * 33
         redacted = report_feedback._redact(f"google api key {key}")
