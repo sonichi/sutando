@@ -9062,6 +9062,23 @@ def extras_present(trees, live) -> bool:
     return any(not (members & tracked) for members in trees.values())
 
 
+def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
+    """The runtime whose notifier armed this watcher: the worker's roster row
+    (spawn_worker records it; a Claude core can host a Codex worker), else the core's."""
+    try:
+        rows = json.loads((WORKSPACE_DIR / "state" / "roster.json")
+                          .read_text(encoding="utf-8")).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        rows = {}
+    parts = set(Path(inbox).parts) if inbox else set()
+    for wid, row in rows.items():
+        if wid and (wid in sentinel.name or wid in parts):
+            if isinstance(row, dict) and row.get("runtime") in ("claude", "codex"):
+                return row["runtime"]
+            break
+    return "claude" if _claude_runtime_selected() else "other"
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -9399,11 +9416,20 @@ def check_task_watcher() -> dict:
                           "record; a live peer does not clear it"}
     # The standby stamps the same sentinel as the session watcher it stands in
     # for, so a live sentinel proves an announcer, never that the session works.
-    standby_only = []
+    standby_only, standby_note = [], []
     for _p in sorted(live):
         _role, _inbox = _watcher_role_and_inbox(live_argv[_p], _p)
-        if _role == "standby":
-            standby_only.append(f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})")
+        if _role != "standby":
+            continue
+        _entry = f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})"
+        # Only a Claude runtime runs Monitor; Codex's notifier always arms the
+        # standby (src/agent/codex/cli/start-cli.sh), so there it IS the delivery path.
+        _held_by = standby_only if _watcher_runtime(live[_p], _inbox) == "claude" else standby_note
+        _held_by.append(_entry)
+    standby_note = (f"; {len(standby_note)} sentinel(s) name the standby watcher, "
+                    f"the delivery path on a runtime that is not Claude (no session "
+                    f"watcher is expected there): {'; '.join(standby_note)}"
+                    if standby_note else "")
     if standby_only:
         return {"name": name, "status": "warn",
                 "detail": f"{len(standby_only)} sentinel(s) name only the STANDBY watcher: "
@@ -9413,7 +9439,8 @@ def check_task_watcher() -> dict:
                           "never re-arms its Monitor, and the standby only announces through "
                           "the pane. Degraded, not clear: run /login in that session if it "
                           "asks, then re-arm via the Monitor tool: "
-                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"}
+                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"
+                          f"{standby_note}"}
     # A watcher holds its inbox whether or not anything consumes what it
     # announces; the reader is the only difference visible from outside.
     unread = []
@@ -9429,9 +9456,11 @@ def check_task_watcher() -> dict:
                           "a session start will exit naming the holder, so clearing it "
                           "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
-        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+        return {"name": name, "status": "ok",
+                "detail": f"streaming watcher alive (pid {alive}){standby_note}"}
     return {"name": name, "status": "ok",
-            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
+            "detail": f"{len(live)} streaming watchers alive, one per instance "
+                      f"(pids {alive}){standby_note}"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
