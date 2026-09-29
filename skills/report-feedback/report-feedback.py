@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import cloud_auth  # noqa: E402
 from file_lock import locked_file  # noqa: E402
 from git_binary import git_argv  # noqa: E402
+from chat_secret_filter import SLACK_TOKEN_PATTERN  # noqa: E402
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
@@ -183,9 +184,12 @@ def _redact(text: str) -> str:
         r"\1\2\3<redacted>",
         text,
     )
-    # Common provider token formats (sk-..., xox*-..., xapp-..., ghp_..., github_pat_..., AIza...)
+    # Slack tokens come from the engine's one family definition, so a rotated
+    # xoxe.xoxp- or an xapp- token is scrubbed exactly as the bridges scrub it.
+    text = SLACK_TOKEN_PATTERN.sub("<redacted-token>", text)
+    # Other common provider token formats (sk-..., ghp_..., github_pat_..., AIza...)
     text = re.sub(
-        r"\b(sk|xox[a-z]|xapp|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_\-]{6,}",
+        r"\b(sk|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_\-]{6,}",
         "<redacted-token>",
         text,
     )
