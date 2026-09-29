@@ -100,8 +100,11 @@ class Watcher:
     """One watcher in its OWN session, so its `kill 0` cannot reach us."""
 
     def __init__(self, workspace: Path, bin_dir: Path, args=()):
+        # No fswatch relaunch: this test drives cleanup() through the EOF a
+        # killed fswatch leaves, so the first EOF must end the watcher.
         env = dict(os.environ,
                    SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1",
+                   SUTANDO_FSWATCH_RESTART_MAX="0",
                    PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH','')}")
         # ASSERT THE RESOLVED PATH BEFORE SPAWNING (@john-the-dev). The script
         # takes STATE_DIR from `sutando-config.sh workspace`, NOT from the

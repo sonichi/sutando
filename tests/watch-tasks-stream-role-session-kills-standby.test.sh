@@ -6,8 +6,13 @@
 #   (c) exactly one sentinel remains and it names the session watcher;
 #   (d) a session watcher whose fswatch dies before readiness leaves the
 #       standby, its sentinel and the supervisor untouched;
+#   (e0) a session watcher outlives its fswatch: the child is relaunched, the
+#       sentinel stands and no standby arms (an fswatch death used to end the
+#       watcher, and under the Monitor that read as "exit code 144");
 #   (e) a session watcher that dies after the handoff is replaced: the
-#       supervisor re-arms the pair within grace + poll (the gap is printed);
+#       supervisor logs the death and re-arms the pair within grace + poll
+#       (the gap is printed); (e2) the same for a death with no cleanup
+#       (SIGKILL), whose stale sentinel the standby overwrites;
 #   (f) a readiness probe that never comes back exits the session watcher,
 #       standby untouched;
 #   (g) an inbox named through a symlinked path with no workspace override
@@ -138,10 +143,27 @@ if [ "$fail" -eq 0 ]; then
     fail=1
   fi
 
-  # --- (e): post-takeover death restores coverage -----------------------------
+  # --- (e0): the session watcher outlives its fswatch ----------------------------
   fsw="$(pgrep -P "${ses_pid:-0}" -f fswatch | head -1)"
-  t_kill="$(now_ms)"
   [ -n "$fsw" ] && kill -9 "$fsw" 2>/dev/null
+  new_fsw=""
+  for i in $(seq 1 80); do
+    new_fsw="$(pgrep -P "${ses_pid:-0}" -f fswatch | head -1)"
+    [ -n "$new_fsw" ] && [ "$new_fsw" != "$fsw" ] && break
+    new_fsw=""
+    sleep 0.1
+  done
+  sleep "$GRACE"   # long enough for a supervisor that misread the death to arm
+  if alive "${ses_pid:-0}" && [ -n "$new_fsw" ] && [ "$(sentinel_pid)" = "${ses_pid:-}" ] && [ "$(sentinel_count)" = "1" ]; then
+    echo "  PASS (e0): the session watcher outlived its fswatch ($fsw -> $new_fsw); its sentinel stands and no standby armed"
+  else
+    echo "  FAIL (e0): after fswatch $fsw died: watcher-alive=$(alive "${ses_pid:-0}" && echo yes || echo no) new-fswatch='${new_fsw}' sentinel=$(sentinel_pid) count=$(sentinel_count); stderr: $(tail -2 "$WORK/ses.err" 2>/dev/null)"
+    fail=1
+  fi
+
+  # --- (e): the session watcher's own death restores coverage --------------------
+  t_kill="$(now_ms)"
+  kill -TERM "${ses_pid:-0}" 2>/dev/null
   new_standby=""
   for i in $(seq 1 400); do
     sp="$(sentinel_pid)"
@@ -151,13 +173,19 @@ if [ "$fail" -eq 0 ]; then
   if [ -n "$new_standby" ]; then
     gap=$(( $(now_ms) - t_kill ))
     if [ "$gap" -le $(( (GRACE + 3 * POLL + 5) * 1000 )) ]; then
-      echo "  PASS (e): after the session watcher's fswatch died, the supervisor re-armed a standby ($new_standby) in ${gap} ms (grace ${GRACE}s, poll ${POLL}s)"
+      echo "  PASS (e): after the session watcher was SIGTERMed, the supervisor re-armed a standby ($new_standby) in ${gap} ms (grace ${GRACE}s, poll ${POLL}s)"
     else
       echo "  FAIL (e): re-arm took ${gap} ms, more than grace + polls"
       fail=1
     fi
   else
     echo "  FAIL (e): no standby re-armed after the session watcher died"
+    fail=1
+  fi
+  if grep -q "the session watcher for .* is gone" "$WORK/sup.log" 2>/dev/null; then
+    echo "  PASS (e'): the supervisor logged the death and the clock its re-arm runs on"
+  else
+    echo "  FAIL (e'): no death line in the supervisor's log: $(tail -2 "$WORK/sup.log" 2>/dev/null)"
     fail=1
   fi
   tmux -S "$SOCK" kill-session -t ses >/dev/null 2>&1 || true
@@ -168,8 +196,39 @@ if [ "$fail" -eq 0 ]; then
     fail=1
   fi
 
-  # --- (d): fswatch dies before readiness --------------------------------------
+  # --- (e2): a death with no cleanup leaves a stale sentinel; the standby still comes
   standby_pid="$new_standby"
+  start_session_watcher ses2
+  ses2_pid=""
+  for i in $(seq 1 300); do
+    sp="$(sentinel_pid)"
+    if [ -n "$sp" ] && [ "$sp" != "$standby_pid" ] && alive "$sp" && ! alive "$standby_pid"; then ses2_pid="$sp"; break; fi
+    sleep 0.1
+  done
+  if [ -z "$ses2_pid" ]; then
+    echo "  FAIL (e2): setup -- a second session watcher never took the inbox over from standby $standby_pid"
+    fail=1
+  else
+    t_kill="$(now_ms)"
+    kill -9 "$ses2_pid" 2>/dev/null
+    new_standby=""
+    for i in $(seq 1 400); do
+      sp="$(sentinel_pid)"
+      if [ -n "$sp" ] && [ "$sp" != "$ses2_pid" ] && alive "$sp"; then new_standby="$sp"; break; fi
+      sleep 0.1
+    done
+    gap=$(( $(now_ms) - t_kill ))
+    if [ -n "$new_standby" ] && [ "$gap" -le $(( (GRACE + 3 * POLL + 5) * 1000 )) ] && [ "$(sentinel_count)" = "1" ]; then
+      echo "  PASS (e2): after the session watcher was SIGKILLed (stale sentinel $ses2_pid), a standby ($new_standby) overwrote it in ${gap} ms"
+    else
+      echo "  FAIL (e2): SIGKILLed session watcher $ses2_pid: standby='${new_standby}' after ${gap} ms, sentinel=$(sentinel_pid) count=$(sentinel_count)"
+      fail=1
+    fi
+    tmux -S "$SOCK" kill-session -t ses2 >/dev/null 2>&1 || true
+  fi
+
+  # --- (d): fswatch dies before readiness --------------------------------------
+  standby_pid="${new_standby:-$standby_pid}"
   start_session_watcher ses-die "$DIEBIN"
   gone=""
   for i in $(seq 1 100); do

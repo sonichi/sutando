@@ -219,13 +219,24 @@ if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null ||
 # never get a watcher at all -- so an unknown that persists for the whole grace
 # period arms, the same wait a clean "no" gets.
 unknown_since=""
+# The verdict of the previous poll: "yes" then anything else is a session watcher
+# that was ready and is GONE (it died, or its Monitor expired), which is the one
+# transition whose gap the session itself notices ("inbox holders: none" the moment
+# its Monitor reports the exit). It is logged once, with the clock the re-arm runs
+# on, so this log answers why the inbox was uncovered and for how long.
+prev_verdict=""
 while target_alive; do
   verdict="$(session_role_verdict)"
   if [ "$verdict" = "yes" ]; then
+    prev_verdict=yes
     unknown_since=""
     sleep "$ROLE_POLL"
     continue
   fi
+  if [ "$prev_verdict" = "yes" ]; then
+    echo "task-notifier-supervisor: the session watcher for ${TASKS_DIR:-this host} is gone (verdict $verdict); the standby arms after ${GRACE_PERIOD}s unless one returns" >&2
+  fi
+  prev_verdict="$verdict"
   if [ "$verdict" = "unknown" ]; then
     now="$(date +%s)"
     [ -n "$unknown_since" ] || unknown_since="$now"
