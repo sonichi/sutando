@@ -30,7 +30,14 @@ ARGUMENTS: $ARGUMENTS
 
 2. Pick one way to authenticate:
    - Google sign-in: run `agy` once interactively and follow the prompt.
-   - Gemini API key: write `{"modelProvider": "gemini"}` to `~/.gemini/antigravity-cli/settings.json`
+   - Gemini API key: set `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`,
+     merging it into any keys already there rather than overwriting the file:
+
+     ```bash
+     F=~/.gemini/antigravity-cli/settings.json; mkdir -p "${F%/*}"; [[ -s "$F" ]] || echo '{}' > "$F"
+     python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["modelProvider"]="gemini"; json.dump(d,open(p,"w"),indent=2)' "$F"
+     ```
+
      and have `GEMINI_API_KEY` in the environment `agy` runs in. Keep the key in the vault
      (`secret-vault.py env GEMINI_API_KEY -- ...`), never in a file.
 
@@ -55,8 +62,21 @@ to use the MCP tools by name:
 
 ```bash
 agy -p "Using the chrome-devtools MCP tools, open https://example.com and save a screenshot to /tmp/shot.png" \
-  --dangerously-skip-permissions --print-timeout 240s
+  --print-timeout 240s
 ```
+
+Headless `agy` cannot ask for permission, so it denies any tool not allowed in `settings.json`, and a
+denial ends the run with no output. Allow the browser tools and each site the run may open, in
+`permissions.allow` (merged into the file as in Setup):
+
+```json
+"permissions": { "allow": ["mcp(chrome-devtools/*)", "execute_url(example.com)"] }
+```
+
+Those two rules are enough to open a page and save a screenshot; shell commands stay denied.
+`--dangerously-skip-permissions` also works, but it lets `agy` run any shell command, write any file
+and use the network as you, while it reads untrusted web pages, so one hostile page can make it run
+a command. Use it only for a site you trust, and only when the narrow rules cannot do the job.
 
 ## When to Use
 
