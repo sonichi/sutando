@@ -31,12 +31,7 @@ _MARKERS = None
 
 
 def markers(src_dir: Path | None = None):
-    """`(dedup_holder_delivered, parse_markers)` from the repo's policy owner.
-
-    Raises ImportError rather than falling back: re-implementing the grammar is
-    how this drifted twice (a `[REPLIED]` holder read as delivered; chain-walking
-    that was more permissive than the bridge, which requeues instead of walking).
-    """
+    """Load the central marker policy; never fall back to a local interpretation."""
     global _MARKERS
     if _MARKERS is not None:
         return _MARKERS

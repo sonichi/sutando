@@ -378,7 +378,7 @@ def dedup_cross_sender_target(deduped_user_id, holder_task_text: str | None) -> 
 
 
 def dedup_holder_delivered(holder_result_text: str | None) -> bool:
-    """Accept a reply body or REPLIED's assertion of out-of-band delivery."""
+    """Accept reply bodies or REPLIED; empty and other skip results promise no answer."""
     if holder_result_text is None:
         return False
     body = holder_result_text.strip()
