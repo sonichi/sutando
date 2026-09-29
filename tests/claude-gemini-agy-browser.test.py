@@ -462,10 +462,31 @@ exit 1
             lsof_wrap.unlink()
             kill_profile(profile)
 
+        py_wrap = write_exec(bin_dir / "python3", f"""#!/bin/bash
+n=$(( $(cat "{tmp}/py.count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"{tmp}/py.count"
+[[ "$n" == "${{PY_FAIL_ON:-}}" ]] && exit 1
+exec "{sys.executable}" "$@"
+""")
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(env, "start", *args)
+            assert rc == 0, f"start failed: {out}"
+            (tmp / "py.count").unlink()
+            rc, out = run(dict(env, PY_FAIL_ON="3"), "stop", *args)
+            assert int((tmp / "py.count").read_text()) >= 3, "stop never re-read argv after signalling"
+            assert rc != 0 and "stopped" not in out, f"stop reported success after a failed argv read: {out}"
+        finally:
+            py_wrap.unlink()
+            kill_profile(profile)
+        for _ in range(20):
+            if not answers(port):
+                break
+            time.sleep(0.25)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 15/15 agy-browser.sh")
+    print("PASS 16/16 agy-browser.sh")
 
 
 if __name__ == "__main__":

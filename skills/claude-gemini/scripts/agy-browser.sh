@@ -100,19 +100,24 @@ ours() {
   owned="$(profile_pids)"
   for p in $listeners; do grep -qx "$p" <<<"$owned" || return 1; done
 }
-# TERM every process on the profile, then wait up to 5s for all of them to be gone.
+# TERM every process on the profile, then wait up to 5s for all of them to be gone. An argv read
+# that fails is not "none left", so it fails too.
 stop_profile() {
-  local pids; pids="$(profile_pids)"
+  local pids; pids="$(profile_pids)" || return 1
   [[ -n "$pids" ]] || return 0
   kill $pids 2>/dev/null || true
-  for _ in $(seq 1 25); do [[ -z "$(profile_pids)" ]] && return 0; sleep 0.2; done
+  for _ in $(seq 1 25); do
+    pids="$(profile_pids)" || return 1
+    [[ -z "$pids" ]] && return 0
+    sleep 0.2
+  done
   return 1
 }
 # Fail, first tearing down the Chrome this run launched, if any. start launches only on a profile
 # with no processes, so every process on it now came from this run.
 abort_start() {
   [[ -n "$launched" ]] || fail "$1"
-  stop_profile || fail "$1; the Chrome this run started on $PROFILE did not exit"
+  stop_profile || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
   fail "$1; stopped the Chrome this run started"
 }
 need_npx() { command -v npx >/dev/null 2>&1; }
@@ -192,6 +197,7 @@ case "$ACTION" in
   status)
     rc=0
     if ! cdp_up; then echo "browser: not listening on $CDP_URL"; rc=1
+    elif [[ -z "$LSOF" ]]; then echo "browser: lsof not found; cannot check who owns $CDP_URL"; rc=1
     elif ours; then echo "browser: listening on $CDP_URL"
     else echo "browser: $CDP_URL is held by a process not running on $PROFILE"; rc=1; fi
     case "$(mcp_state || echo failed)" in
@@ -211,7 +217,7 @@ case "$ACTION" in
     elif stop_profile; then
       echo "browser: stopped the Chrome on $PROFILE"
     else
-      fail "the Chrome on $PROFILE did not exit within 5s; still running: $(profile_pids | tr '\n' ' ')"
+      fail "the Chrome on $PROFILE did not exit within 5s, or its processes could not be read; still running: $(profile_pids | tr '\n' ' ')"
     fi
     ;;
   *) usage; exit 2 ;;
