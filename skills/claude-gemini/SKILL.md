@@ -56,7 +56,9 @@ bash "$SKILL_DIR/scripts/agy-browser.sh" status
 bash "$SKILL_DIR/scripts/agy-browser.sh" stop     # stops only that profile's Chrome
 ```
 
-`start` is safe to re-run and does nothing already done. The profile defaults to
+`start` is safe to re-run and does nothing already done. It uses a port only when the process
+listening on it (found with `lsof`) runs on the agy profile, so it never adopts the user's Chrome;
+`stop` waits for that profile's processes to exit and fails if they do not. The profile defaults to
 `~/.gemini/antigravity-browser-profile`; `--port`, `--profile` and `--chrome` override. Then ask `agy`
 to use the MCP tools by name:
 

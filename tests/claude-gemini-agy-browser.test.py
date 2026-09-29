@@ -8,13 +8,21 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
   4. A port answered by a Chrome on another profile (here a prefix-sharing `<profile>-extra`) is
      refused: start launches and registers nothing, status fails, stop leaves it running.
   5. A chrome-devtools entry on another URL (port 9222 vs 92222 style prefix) is never overwritten.
-  6. Without npx, start fails before launching Chrome; if `agy mcp add` fails, start stops the
-     Chrome it launched.
+  6. Without npx, start fails before launching Chrome, even with the MCP already registered, and
+     status fails; if `agy mcp add` fails, start stops every process on the profile it launched,
+     including a child a launcher wrapper forked before exiting.
   7. start refuses when agy is absent.
+  8. The port is owned only if its listener PID is on the profile: a foreign listener is refused even
+     while a non-listening process carries the profile and port argv, both before and after launch.
+  9. An MCP entry on another URL that appears during the launch wait stops the launched Chrome and
+     is not overwritten.
+ 10. stop waits for a slow-to-exit Chrome and fails when one ignores SIGTERM.
+ 11. A relative --profile is made absolute: stop from one cwd leaves another cwd's `profile` alone.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
 import os
+import signal
 import socket
 import sys
 import subprocess
@@ -28,10 +36,23 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "claude-gemini" / "scripts" / "agy-browser.sh"
 
 FAKE_CHROME = f"#!{sys.executable}\n" + """
-import http.server, os, sys
+import http.server, os, signal, sys, time
 port = int(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--remote-debugging-port=")))
 with open(os.environ["CHROME_LOG"], "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
+if os.environ.get("CHROME_MCP_WRITE"):
+    with open(os.environ["MCP_STATE"], "a") as f:
+        f.write(os.environ["CHROME_MCP_WRITE"] + "\\n")
+if os.environ.get("TERM_IGNORE"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get("TERM_DELAY"):
+    def slow_exit(*_):
+        time.sleep(float(os.environ["TERM_DELAY"]))
+        os._exit(0)
+    signal.signal(signal.SIGTERM, slow_exit)
+if os.environ.get("NOBIND"):
+    while True:
+        time.sleep(60)
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200 if self.path == "/json/version" else 404)
@@ -76,14 +97,36 @@ def answers(port: int) -> bool:
         return False
 
 
-def run(env: dict, *args: str) -> tuple[int, str]:
-    proc = subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
+def run(env: dict, *args: str, cwd=None) -> tuple[int, str]:
+    proc = subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60, cwd=cwd)
     return proc.returncode, proc.stdout + proc.stderr
+
+
+def profile_procs(profile) -> list[int]:
+    needle = f"--user-data-dir={profile} "
+    out = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
+    return [int(l.split()[0]) for l in out.splitlines() if needle in l + " "]
+
+
+def kill_profile(profile) -> None:
+    for pid in profile_procs(profile):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def wait_up(port: int, what: str) -> None:
+    for _ in range(40):
+        if answers(port):
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"{what} never came up")
 
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as d:
-        tmp = Path(d)
+        tmp = Path(d).resolve()
         bin_dir = tmp / "bin"
         write_exec(bin_dir / "agy", MOCK_AGY)
         write_exec(bin_dir / "npx", "#!/bin/bash\nexit 0\n")
@@ -158,7 +201,22 @@ def main() -> None:
                 time.sleep(0.25)
             assert rc != 0 and "not listening" in out, f"status should fail after stop: {out}"
         finally:
-            subprocess.run(["pkill", "-f", f"--user-data-dir={profile}"], capture_output=True)
+            kill_profile(profile)
+
+        try:
+            rc, out = run(dict(env, TERM_DELAY="1.5"), "start", *args)
+            assert rc == 0, f"start failed: {out}"
+            rc, out = run(env, "stop", *args)
+            assert rc == 0 and "stopped" in out, out
+            assert not profile_procs(profile), "stop reported stopped while the Chrome was still exiting"
+            assert not answers(port), "stop returned with CDP still up"
+            rc, out = run(dict(env, TERM_IGNORE="1"), "start", *args)
+            assert rc == 0, f"start failed: {out}"
+            rc, out = run(env, "stop", *args)
+            assert rc != 0 and "did not exit" in out and "stopped the" not in out, f"stop claimed success: {out}"
+            assert profile_procs(profile), "the TERM-ignoring Chrome is gone; the test proved nothing"
+        finally:
+            kill_profile(profile)
 
         foreign_profile = Path(f"{profile}-extra")
         foreign_port = free_port()
@@ -172,6 +230,14 @@ def main() -> None:
                     break
                 time.sleep(0.25)
             assert answers(foreign_port), "foreign fake Chrome never came up"
+            decoy = subprocess.Popen(
+                [str(chrome), f"--user-data-dir={profile}", f"--remote-debugging-port={foreign_port}"],
+                env=dict(env, NOBIND="1"))
+            for _ in range(40):
+                if profile_procs(profile):
+                    break
+                time.sleep(0.1)
+            assert profile_procs(profile), "decoy never started"
             (tmp / "mcp.state").write_text("")
             launches = (tmp / "chrome.log").read_text().splitlines()
             fargs = ["--port", str(foreign_port), "--profile", str(profile), "--chrome", str(chrome)]
@@ -182,12 +248,50 @@ def main() -> None:
             rc, out = run(env, "status", *fargs)
             assert rc != 0 and "held by a process not running on" in out, f"status accepted a foreign listener: {out}"
             rc, out = run(env, "stop", *fargs)
-            assert rc == 0 and "none running" in out, out
-            time.sleep(0.5)
+            assert rc == 0 and "stopped" in out and decoy.wait(timeout=5) is not None, out
             assert foreign.poll() is None and answers(foreign_port), "stop killed a Chrome on a different profile"
         finally:
+            decoy.kill()
+            decoy.wait()
             foreign.kill()
             foreign.wait()
+
+        hijack_pid = tmp / "hijack.pid"
+        hijack = write_exec(tmp / "hijack-chrome", f"""#!/bin/bash
+port=""; for a in "$@"; do [[ "$a" == --remote-debugging-port=* ]] && port="${{a#*=}}"; done
+"{chrome}" --user-data-dir="{tmp}/hijacker" --remote-debugging-port="$port" >/dev/null 2>&1 &
+echo $! >"{hijack_pid}"
+NOBIND=1 exec "{chrome}" "$@"
+""")
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(env, "start", "--port", str(port), "--profile", str(profile), "--chrome", str(hijack))
+            assert rc != 0 and "not using it" in out, f"start registered a listener it did not launch: {out}"
+            assert (tmp / "agy.log").read_text().splitlines() == added, "start registered the MCP against a hijacker"
+            assert not profile_procs(profile), "start left its launched process running after refusing"
+        finally:
+            kill_profile(profile)
+            if hijack_pid.exists():
+                try:
+                    os.kill(int(hijack_pid.read_text()), signal.SIGKILL)
+                except OSError:
+                    pass
+        for _ in range(20):
+            if not answers(port):
+                break
+            time.sleep(0.25)
+
+        other_url = f"http://127.0.0.1:{port}2"
+        other_entry = f"chrome-devtools  stdio  enabled  npx -y chrome-devtools-mcp@1.10.1 --browserUrl {other_url}"
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(dict(env, CHROME_MCP_WRITE=other_entry), "start", *args)
+            assert rc != 0 and "not overwriting" in out and "stopped the Chrome" in out, f"start overwrote a new entry: {out}"
+            assert (tmp / "agy.log").read_text().splitlines() == added, "start registered over an entry added mid-launch"
+            assert (tmp / "mcp.state").read_text().splitlines() == [other_entry], "the mid-launch entry was changed"
+            assert not profile_procs(profile) and not answers(port), "start left its Chrome running after refusing"
+        finally:
+            kill_profile(profile)
 
         prefix_url = f"http://127.0.0.1:{port}2"
         (tmp / "mcp.state").write_text(
@@ -206,6 +310,17 @@ def main() -> None:
         rc, out = run(env, "start", *args)
         assert rc != 0 and "npx not found" in out, f"start without npx should refuse: {out}"
         assert (tmp / "chrome.log").read_text().splitlines() == launches, "start launched Chrome without npx"
+        (tmp / "mcp.state").write_text(
+            f"chrome-devtools  stdio  enabled  npx -y chrome-devtools-mcp@1.10.1 --browserUrl http://127.0.0.1:{port}\n")
+        rc, out = run(env, "start", *args)
+        try:
+            assert rc != 0 and "npx not found" in out, f"pinned start without npx should refuse: {out}"
+            assert (tmp / "chrome.log").read_text().splitlines() == launches, "pinned start launched Chrome without npx"
+        finally:
+            kill_profile(profile)
+        rc, out = run(env, "status", *args)
+        assert rc != 0 and "npx not found" in out, f"status without npx should fail: {out}"
+        (tmp / "mcp.state").write_text("")
         write_exec(bin_dir / "npx", "#!/bin/bash\nexit 0\n")
 
         rc, out = run(dict(env, AGY_ADD_FAIL="1"), "start", *args)
@@ -218,12 +333,45 @@ def main() -> None:
                 time.sleep(0.25)
             assert not answers(port), "start left its Chrome running after mcp add failed"
         finally:
-            subprocess.run(["pkill", "-f", f"--user-data-dir={profile} "], capture_output=True)
+            kill_profile(profile)
+
+        handoff = write_exec(tmp / "handoff-chrome", f'#!/bin/bash\n"{chrome}" "$@" >/dev/null 2>&1 &\nexit 0\n')
+        launches = (tmp / "chrome.log").read_text().splitlines()
+        rc, out = run(dict(env, AGY_ADD_FAIL="1"), "start", "--port", str(port), "--profile", str(profile),
+                      "--chrome", str(handoff))
+        try:
+            assert rc != 0 and "mcp add failed" in out and "stopped the Chrome" in out, f"failed add not reported: {out}"
+            assert len((tmp / "chrome.log").read_text().splitlines()) == len(launches) + 1, "handoff Chrome not launched"
+            assert not profile_procs(profile) and not answers(port), "start left the handed-off Chrome running"
+        finally:
+            kill_profile(profile)
+
+        cwd_a, cwd_b = tmp / "cwd-a", tmp / "cwd-b"
+        port_a, port_b = free_port(), free_port()
+        env_a = dict(env, MCP_STATE=str(tmp / "mcp-a.state"))
+        env_b = dict(env, MCP_STATE=str(tmp / "mcp-b.state"))
+        for c in (cwd_a, cwd_b):
+            c.mkdir()
+        try:
+            rc, out = run(env_a, "start", "--port", str(port_a), "--profile", "profile", "--chrome", str(chrome), cwd=cwd_a)
+            assert rc == 0, f"relative start failed: {out}"
+            rc, out = run(env_b, "start", "--port", str(port_b), "--profile", "profile", "--chrome", str(chrome), cwd=cwd_b)
+            assert rc == 0, f"relative start failed: {out}"
+            launched = (tmp / "chrome.log").read_text().split()
+            for c in (cwd_a, cwd_b):
+                assert f"--user-data-dir={c / 'profile'}" in launched, f"{c} profile not made absolute: {launched}"
+            rc, out = run(env_a, "stop", "--port", str(port_a), "--profile", "profile", cwd=cwd_a)
+            assert rc == 0 and "stopped" in out, out
+            assert not profile_procs(cwd_a / "profile"), "stop left cwd-a's Chrome running"
+            assert profile_procs(cwd_b / "profile") and answers(port_b), "stop from cwd-a killed cwd-b's Chrome"
+        finally:
+            kill_profile(cwd_a / "profile")
+            kill_profile(cwd_b / "profile")
 
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 8/8 agy-browser.sh")
+    print("PASS 11/11 agy-browser.sh")
 
 
 if __name__ == "__main__":
