@@ -178,10 +178,8 @@ trap 'stop_child; exit 0' HUP INT TERM
 # watcher appeared and this notifier was stopped to yield to it (caller
 # returns to standby).
 run_notifier_once() {
-  # watch-tasks-stream.sh deliberately uses `kill 0` when its fswatch pipeline
-  # ends so no orphan child survives. Run the notifier in a separate process
-  # group; otherwise that cleanup signal also kills this supervisor and tmux
-  # removes the entire watcher session—the production failure fixed here.
+  # The notifier leads its own group, so stop_child's group signal ends the
+  # notifier's tree and never reaches this supervisor or the tmux session hosting it.
   "$PY" -c \
     'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
     "$NOTIFIER" &
@@ -219,11 +217,8 @@ if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null ||
 # never get a watcher at all -- so an unknown that persists for the whole grace
 # period arms, the same wait a clean "no" gets.
 unknown_since=""
-# The verdict of the previous poll: "yes" then anything else is a session watcher
-# that was ready and is GONE (it died, or its Monitor expired), which is the one
-# transition whose gap the session itself notices ("inbox holders: none" the moment
-# its Monitor reports the exit). It is logged once, with the clock the re-arm runs
-# on, so this log answers why the inbox was uncovered and for how long.
+# "yes" then anything else is a ready session watcher gone: logged once, with the
+# grace the re-arm waits, so this log says why and how long the inbox was uncovered.
 prev_verdict=""
 while target_alive; do
   verdict="$(session_role_verdict)"

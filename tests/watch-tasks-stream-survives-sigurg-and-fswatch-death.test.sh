@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# The session watcher outlives what used to end it mid-session (user feedback,
-# 2026-09: three announcements, then the Monitor reported it "exited with code
-# 144" with nothing on stderr, and the inbox went unwatched). The real
+# The session watcher outlives what used to end it mid-session. The real
 # watch-tasks-stream.sh, on a scratch inbox, hosted the way the Monitor hosts
 # it: a wrapper shell that LEADS the process group, the watcher a member of it.
 #   (a) SIGURG to the watcher and to its fswatch changes nothing: both stay, the
 #       next task is announced;
 #   (b) its fswatch dying is not its end: fswatch is relaunched (stderr says so,
 #       a new child appears) and the next task is still announced;
-#   (c) a held task's timed read that times out is not EOF (macOS's /bin/bash 3.2
-#       returns 1 for both): the watcher is still there once the timeout passed;
+#   (c) a held task's timed read that times out is not EOF on bash 3.2, whose
+#       `read -t` returns 1 for both: the watcher is still there once the timeout
+#       passed. The watcher runs under /bin/bash when that is 3.2 (macOS); with
+#       no bash 3.2 (c) is SKIPPED and (c') runs the same steps on this host's
+#       bash, where a timeout returns >128 and must not end the watcher either;
 #   (d) cleanup signals children, not a process group it does not lead: the
 #       wrapper survives the watcher's plain SIGTERM exit and records the real
 #       status, 0, never 144.
@@ -21,6 +22,11 @@ set -u -m
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
+# (c) needs bash 3.2's `read -t`: /bin/bash when that is 3.x, the interpreter the
+# notifier execs its standby under; PATH's bash (5 on Homebrew and CI) cannot show it.
+WATCHER_BASH=bash
+[ "$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" = 3 ] && WATCHER_BASH=/bin/bash
+WATCHER_BASH_VERSION="$("$WATCHER_BASH" -c 'echo "$BASH_VERSION"')"
 
 fail=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-urg.XXXXXX")"
@@ -36,7 +42,7 @@ export PATH="$STUBBIN:$PATH"
 WRAPPER="$WORK/wrapper.sh"
 cat > "$WRAPPER" <<EOS
 #!/bin/bash
-bash "$WATCHER" "$WORK/tasks" --role session --inbox "$WORK/tasks" > "$WORK/out.log" 2> "$WORK/err.log"
+"$WATCHER_BASH" "$WATCHER" "$WORK/tasks" --role session --inbox "$WORK/tasks" > "$WORK/out.log" 2> "$WORK/err.log"
 echo "watcher rc=\$?" > "$WORK/wrapper.rc"
 EOS
 
@@ -79,11 +85,17 @@ if [ "$fail" -eq 0 ] && [ "$(ps -o pgid= -p "$watcher_pid" | tr -d ' ')" != "$wr
   echo "  FAIL: setup -- the watcher ($watcher_pid) is not in the wrapper's group ($wrapper_pid), so this is not the Monitor's shape"
   fail=1
 fi
+if [ "$fail" -eq 0 ]; then
+  case "$(ps -o command= -p "$watcher_pid")" in
+    "$WATCHER_BASH $WATCHER "*) ;;
+    *) echo "  FAIL: setup -- the watcher is not running under $WATCHER_BASH: $(ps -o command= -p "$watcher_pid")"; fail=1 ;;
+  esac
+fi
 
 if [ "$fail" -eq 0 ]; then
   fsw="$(fswatch_of "$watcher_pid")"
   echo "task one" > "$WORK/tasks/task-1.txt"
-  announced task-1.txt 50 && echo "  PASS: setup -- task-1 announced by watcher $watcher_pid (fswatch $fsw)" \
+  announced task-1.txt 50 && echo "  PASS: setup -- task-1 announced by watcher $watcher_pid (fswatch $fsw) under $WATCHER_BASH $WATCHER_BASH_VERSION" \
     || { echo "  FAIL: setup -- task-1 never announced; stderr: $(tail -3 "$WORK/err.log")"; fail=1; }
 fi
 
@@ -121,9 +133,8 @@ fi
 
 if [ "$fail" -eq 0 ]; then
   # --- (c): a held task's timed read ---------------------------------------------
-  # A standing handler claim with no handler here holds the task: the loop's read
-  # is then timed (SUTANDO_HELD_RETRY_INTERVAL=2), and on bash 3.2 its timeout
-  # returns 1, which the old loop read as EOF and exited on.
+  # A standing claim with no handler here holds the task, so the loop's read is
+  # timed (SUTANDO_HELD_RETRY_INTERVAL=2); two timeouts pass before it is lifted.
   mkdir -p "$WORK/state/task-event-handler-claims"
   printf '1\nsomebody\n%s\nfallback\n\n' "$WORK/tasks/task-4.txt" > "$WORK/state/task-event-handler-claims/task-4.txt"
   echo "task four" > "$WORK/tasks/task-4.txt"
@@ -135,10 +146,17 @@ if [ "$fail" -eq 0 ]; then
   sleep 4   # two timeouts' worth
   rm -f "$WORK/state/task-event-handler-claims/task-4.txt"
   echo "task five" > "$WORK/tasks/task-5.txt"
-  if [ -n "$held" ] && alive "$watcher_pid" && announced task-5.txt 50; then
-    echo "  PASS (c): a held task's timed read timed out ($(bash --version | head -1 | sed 's/GNU bash, version //;s/ .*//')): the watcher stayed, task-5 announced"
+  ok=""
+  [ -n "$held" ] && alive "$watcher_pid" && announced task-5.txt 50 && ok=1
+  detail="held=${held:-0} watcher-alive=$(alive "$watcher_pid" && echo yes || echo no) announced=$(grep -c '^TASK_FILE: task-5.txt$' "$WORK/out.log" 2>/dev/null); wrapper: $(cat "$WORK/wrapper.rc" 2>/dev/null)"
+  case "$WATCHER_BASH_VERSION" in
+    3.*) check=c; timeout_status="1, as EOF's" ;;
+    *) echo "  SKIP (c): no bash 3.2 on this host"; check="c'"; timeout_status=">128" ;;
+  esac
+  if [ -n "$ok" ]; then
+    echo "  PASS ($check): under bash $WATCHER_BASH_VERSION a held task's read timed out (status $timeout_status): the watcher stayed, task-5 announced"
   else
-    echo "  FAIL (c): held=${held:-0} watcher-alive=$(alive "$watcher_pid" && echo yes || echo no) announced=$(grep -c '^TASK_FILE: task-5.txt$' "$WORK/out.log" 2>/dev/null); wrapper: $(cat "$WORK/wrapper.rc" 2>/dev/null)"
+    echo "  FAIL ($check): under bash $WATCHER_BASH_VERSION: $detail"
     fail=1
   fi
 fi
@@ -168,8 +186,8 @@ if [ "$fail" -eq 0 ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "PASSED: the session watcher survives SIGURG, an fswatch death and a bash-3.2 read timeout, and its exit is reported as its own"
+  echo "PASSED: the session watcher (bash $WATCHER_BASH_VERSION) survives SIGURG, an fswatch death and a held read's timeout, and its exit is reported as its own"
 else
-  echo "FAILED: the session watcher survives SIGURG, an fswatch death and a bash-3.2 read timeout, and its exit is reported as its own"
+  echo "FAILED: the session watcher (bash $WATCHER_BASH_VERSION) survives SIGURG, an fswatch death and a held read's timeout, and its exit is reported as its own"
 fi
 exit "$fail"
