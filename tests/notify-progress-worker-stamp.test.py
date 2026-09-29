@@ -83,15 +83,37 @@ class NotifyThreadRootTests(unittest.TestCase):
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
     def test_empty_thread_root_posts_unthreaded(self):
-        for empty in ("", "   "):
-            rc, sent = self._send(["--thread-root", empty])
-            self.assertEqual(rc, 0, empty)
-            self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+        rc, sent = self._send(["--thread-root", ""])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
     def test_malformed_thread_root_is_refused_without_posting(self):
-        rc, sent = self._send(["--thread-root", "root123"])
-        self.assertEqual(rc, 1)
-        self.assertEqual(sent, [])
+        for bad in ("root123", "   ", "$"):
+            rc, sent = self._send(["--thread-root", bad])
+            self.assertEqual(rc, 1, repr(bad))
+            self.assertEqual(sent, [], repr(bad))
+
+
+class EventIdParityTests(unittest.TestCase):
+    """notify.py keeps its own copy of the event-id check (agent-room-ops is optional),
+    so both copies must give the same answer for every non-empty input."""
+
+    CASES = ("$ok", " $ok ", "$", "root", "   ", "e$vt", "\t$x\n")
+
+    def test_notify_and_relations_agree(self):
+        sys.path.insert(0, str(_SCRIPTS.parents[1] / "agent-room-ops"))
+        import relations  # noqa: E402
+        for value in self.CASES:
+            try:
+                relations._event_id(value, "thread_root")
+                accepted_by_relations = True
+            except relations.RelationError:
+                accepted_by_relations = False
+            with mock.patch.object(notify, "_post", lambda *a: True), \
+                    mock.patch.dict(os.environ, _GW_ENV, clear=False):
+                accepted_by_notify = notify.send_remote_gateway(
+                    "local-ag2space", ROOM, "x", thread_root=value)
+            self.assertEqual(accepted_by_notify, accepted_by_relations, repr(value))
 
 
 if __name__ == "__main__":

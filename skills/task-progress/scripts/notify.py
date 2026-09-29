@@ -338,9 +338,11 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
                         thread_root: str | None = None) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
-    # An empty id (unset $thread_root expanded by the caller) posts unthreaded, not nothing.
-    thread_root = str(thread_root).strip() if thread_root is not None else ""
-    if thread_root:
+    # Only an empty id (unset $thread_root expanded by the caller) posts unthreaded;
+    # whitespace-only is refused, matching agent-room-ops relations._event_id.
+    raw = "" if thread_root is None else str(thread_root)
+    thread_root = raw.strip()
+    if raw:
         if not thread_root.startswith("$") or len(thread_root) < 2:
             print(f"[task-progress] thread_root must be a Matrix event id like $abc, "
                   f"got {thread_root!r}", file=sys.stderr)
