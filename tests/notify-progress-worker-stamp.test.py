@@ -82,6 +82,12 @@ class NotifyThreadRootTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
+    def test_empty_thread_root_posts_unthreaded(self):
+        for empty in ("", "   "):
+            rc, sent = self._send(["--thread-root", empty])
+            self.assertEqual(rc, 0, empty)
+            self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+
     def test_malformed_thread_root_is_refused_without_posting(self):
         rc, sent = self._send(["--thread-root", "root123"])
         self.assertEqual(rc, 1)
