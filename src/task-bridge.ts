@@ -229,8 +229,9 @@ export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
- *  verbatim input transcription (flushed before every tool call), `assistant` items
- *  the model's output; injected prompts arrive as `user` items starting `[System:`. */
+ *  verbatim input transcription (flushed before every tool call) or text typed into the
+ *  session, `assistant` items the model's output; injected prompts arrive as `user` items
+ *  starting `[System:`. */
 export type VoiceTurn = { role: string; content?: string | null };
 /** What the provider hands back: the session's turns, and the input transcription the
  *  runtime has buffered but not yet flushed into them (bodhi's TranscriptManager
@@ -263,6 +264,13 @@ function _readSnapshot(): VoiceTurnsSnapshot | null {
 	return Array.isArray(snap.items) || snap.pendingInput || typeof snap.lastUserSpeechAt === 'number' ? snap : null;
 }
 
+/** Longest single utterance the block carries; a longer one (a paste typed into the session) is cut. */
+export const SPOKEN_MAX_CHARS = 2000;
+const _capUtterance = (text: string): string =>
+	text.length > SPOKEN_MAX_CHARS ? `${text.slice(0, SPOKEN_MAX_CHARS)} [… ${text.length - SPOKEN_MAX_CHARS} more characters]` : text;
+/** User items that are the runtime's own markers, not the owner's words. */
+const _NOT_OWNER_WORDS = ['[System:', '[Uploaded file:'];
+
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
  *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
  *  that triggered the call: a previous turn's words never stand in for this one's. */
@@ -277,12 +285,12 @@ export function _spokenTurns(count = 2): string[] {
 		if (it.role === 'assistant') break;   // the turn boundary: everything older is a previous turn
 		if (it.role !== 'user' || typeof it.content !== 'string') continue;
 		const text = it.content.trim();
-		if (!text || text.startsWith('[System:')) continue;
+		if (!text || _NOT_OWNER_WORDS.some((m) => text.startsWith(m))) continue;
 		spoken.unshift(text);
 	}
 	const pending = typeof snap.pendingInput === 'string' ? snap.pendingInput.trim() : '';
 	if (pending && !spoken.includes(pending)) spoken.push(pending);
-	return spoken.slice(-count);
+	return spoken.slice(-count).map(_capUtterance);
 }
 
 /** How long a task write waits for the current turn's transcription to land. */
@@ -879,7 +887,7 @@ export const workTool: ToolDefinition = {
 			const spoken = await _awaitSpokenTurns(2);
 			if (spoken.length > 0) {
 				spokenBlock =
-					`\n\n--- spoken (the owner's last words, verbatim input transcription; the task line ` +
+					`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
 					`above is the voice model's wording of them — if it adds intent these words do not ` +
 					`carry, ask before acting) ---\n${confineUserContent(spoken.map((t) => `user: ${t}`).join('\n'))}\n`;
 			}

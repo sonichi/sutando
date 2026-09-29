@@ -16,7 +16,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
-const { workTool, setVoiceTurnsProvider, _spokenTurns, _awaitSpokenTurns, _speechMayBeLanding, RECENT_SPEECH_MS } = await import('../src/task-bridge.js');
+const { workTool, setVoiceTurnsProvider, _spokenTurns, _awaitSpokenTurns, _speechMayBeLanding, RECENT_SPEECH_MS, SPOKEN_MAX_CHARS } = await import('../src/task-bridge.js');
 
 after(() => {
 	setVoiceTurnsProvider(null);
@@ -44,6 +44,22 @@ describe('the spoken block', () => {
 			{ role: 'assistant', content: 'Confirmed, that task is officially canceled.' },
 		]);
 		assert.deepEqual(_spokenTurns(2), [], "a previous turn's words never stand in for this one's");
+	});
+
+	it("leaves out the runtime's upload marker and cuts an over-long utterance", () => {
+		// A file upload adds `[Uploaded file: <name>]` as a user item: the runtime's words, not the owner's.
+		setVoiceTurnsProvider(() => [
+			{ role: 'assistant', content: 'Sure.' },
+			{ role: 'user', content: 'summarize this for me' },
+			{ role: 'user', content: '[Uploaded file: q3-report.pdf]' },
+		]);
+		assert.deepEqual(_spokenTurns(2), ['summarize this for me']);
+		// Text typed into the session is a user item too; a pasted wall of text is capped.
+		const paste = 'x'.repeat(SPOKEN_MAX_CHARS + 500);
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'user', content: paste }], pendingInput: 'y'.repeat(SPOKEN_MAX_CHARS + 2) }));
+		const [typed, buffered] = _spokenTurns(2);
+		assert.equal(typed, `${'x'.repeat(SPOKEN_MAX_CHARS)} [… 500 more characters]`);
+		assert.equal(buffered, `${'y'.repeat(SPOKEN_MAX_CHARS)} [… 2 more characters]`);
 	});
 
 	it('a transcription still buffered by the runtime is the current utterance', async () => {
