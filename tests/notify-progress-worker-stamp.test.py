@@ -7,6 +7,8 @@ load-bearing, not cosmetic.
 
 Run: python3 tests/task-progress-notify-stamp.test.py
 """
+import contextlib
+import io
 import os
 import pathlib
 import sys
@@ -105,16 +107,21 @@ class EventIdParityTests(unittest.TestCase):
         import relations  # noqa: E402
         for value in self.CASES:
             try:
-                relations._event_id(value, "thread_root")
-                accepted_by_relations = True
+                expected = relations._event_id(value, "thread_root")
             except relations.RelationError:
-                accepted_by_relations = False
-            with mock.patch.object(notify, "_post", lambda *a: True), \
-                    mock.patch.dict(os.environ, _GW_ENV, clear=False):
-                accepted_by_notify = notify.send_remote_gateway(
-                    "local-ag2space", ROOM, "x", thread_root=value)
-            self.assertEqual(accepted_by_notify, accepted_by_relations, repr(value))
-
+                expected = None
+            sent, err = [], io.StringIO()
+            with mock.patch.object(notify, "_post", lambda url, payload, headers: sent.append(payload) or True), \
+                    mock.patch.dict(os.environ, _GW_ENV, clear=False), \
+                    contextlib.redirect_stderr(err):
+                ok = notify.send_remote_gateway("local-ag2space", ROOM, "x", thread_root=value)
+            if expected is None:
+                self.assertFalse(ok, repr(value))
+                self.assertEqual(sent, [], repr(value))
+                self.assertIn(repr(value), err.getvalue(), repr(value))
+            else:
+                self.assertTrue(ok, repr(value))
+                self.assertEqual(sent[0]["thread_root"], expected, repr(value))
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
