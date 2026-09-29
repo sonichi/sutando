@@ -373,6 +373,8 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual(posted[0][0], "https://x/api/feedback")
             body = posted[0][1]
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
+            self.assertIn("- Sutando: v1 (commit: abc)", body["body"])
+            self.assertIn("- AG2Space: v2 (commit: def)", body["body"])
             self.assertEqual(body["context"]["versions"], incident_versions)
             self.assertTrue(body["context"]["logs_opted_out"])
             self.assertEqual(report_feedback.list_drafts(ws), [])
@@ -1026,7 +1028,11 @@ class TestMain(unittest.TestCase):
                 mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
             self._run(["--title", "hello", "--no-logs"])
         self.assertEqual(uo.call_count, 1)
-        ctx = json.loads(uo.call_args.args[0].data)["context"]
+        payload = json.loads(uo.call_args.args[0].data)
+        self.assertIn("### Build versions", payload["body"])
+        self.assertIn("- Sutando:", payload["body"])
+        self.assertIn("- AG2Space:", payload["body"])
+        ctx = payload["context"]
         self.assertIn("sutando", ctx["versions"])
         self.assertIn("ag2space", ctx["versions"])
 

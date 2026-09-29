@@ -133,6 +133,18 @@ def build_versions(repo: Optional[Path] = None) -> dict:
     return versions
 
 
+def body_with_versions(body: str, versions: dict) -> str:
+    """Keep build identities visible to mirrors that only consume the body."""
+    lines = [body, "", "### Build versions"]
+    for key, label in (("sutando", "Sutando"), ("ag2space", "AG2Space")):
+        info = versions[key]
+        line = f"- {label}: {info['version']} (commit: {info['commit']})"
+        if info.get("build"):
+            line += f"; build: {info['build']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _redact(text: str) -> str:
     """Best-effort scrub of secrets/PII before a log excerpt leaves the machine.
 
@@ -691,7 +703,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
@@ -837,7 +849,7 @@ def _main() -> None:
         # rejects null (400 invalid_payload). Mirror the desktop form, which
         # sends the trimmed body (possibly ""). Fall back to the title so an
         # empty-body report still carries context.
-        "body": a.body.strip() or a.title.strip(),
+        "body": body_with_versions(a.body.strip() or a.title.strip(), ctx["versions"]),
         "context": ctx,
     }
     try:
