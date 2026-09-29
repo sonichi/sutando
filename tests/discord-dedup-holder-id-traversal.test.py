@@ -7,10 +7,23 @@ control. Removing the old adapter-specific lookup must retain traversal safety.
 from __future__ import annotations
 
 import pathlib
+import os
+import json
 import importlib.util
 from unittest.mock import patch
 import sys
 import tempfile
+import atexit
+import shutil
+from pathlib import Path
+
+_CFG = tempfile.mkdtemp(prefix="ccd-dedup-traversal-")
+atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_cfg = Path(_CFG) / "channels" / "discord"
+_cfg.mkdir(parents=True)
+(_cfg / "access.json").write_text(json.dumps({"allowFrom": []}))
+(_cfg / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -46,7 +59,7 @@ def main() -> int:
                  "ask-42", "sc-ask-7", "reco-skill-9"):
         check(valid_archive_lookup_id(good), f"2) gate accepts {good!r}")
 
-    # The wrapper harness isolates credentials and stubs provider clients.
+    # The wrapper harness also stubs provider clients before importing Discord.
     spec = importlib.util.spec_from_file_location(
         "_traversal_harness", REPO / "tests" / "bridge-dedup-wrappers.test.py")
     harness = importlib.util.module_from_spec(spec)
