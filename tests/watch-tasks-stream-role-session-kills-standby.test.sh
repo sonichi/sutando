@@ -60,18 +60,25 @@ chmod +x "$IDLEBIN/fswatch"
 
 sup_pid=""
 WORK2=""
+# Every kill below is gated on these: an empty pid means `pgrep -P 0`, which on Linux
+# lists init, and an empty pattern matches every process on the host.
+is_rig_supervisor() { case "$(ps -o command= -p "${1:-0}" 2>/dev/null)" in "bash $SUPERVISOR") return 0 ;; esac; return 1; }
+is_tag() { case "$1" in sut-handoff.??????|sut-handoff-link.??????) return 0 ;; esac; return 1; }
 # By pid and group, never by name: the supervisor stopped first so it re-arms nothing,
 # then the notifier's group, tmux, and each watcher a sentinel names, in its own group.
 stop_rig() {  # <supervisor pid> <tmux socket> <state dir> <tag: the work dir's basename>
-  local sup="" p g
-  ps -o command= -p "${1:-0}" 2>/dev/null | grep -qF "bash $SUPERVISOR" && sup="$1"
-  [ -z "$sup" ] || kill -STOP "$sup" 2>/dev/null
-  for p in $(pgrep -P "${sup:-0}" 2>/dev/null); do
-    kill -9 -- "-$p" 2>/dev/null || kill -9 "$p" 2>/dev/null || true
-  done
-  [ -z "$sup" ] || kill -9 "$sup" 2>/dev/null
+  local p g
+  is_tag "$4" || return 0
+  if is_rig_supervisor "$1"; then
+    kill -STOP "$1" 2>/dev/null
+    for p in $(pgrep -P "$1" 2>/dev/null); do
+      kill -9 -- "-$p" 2>/dev/null || kill -9 "$p" 2>/dev/null || true
+    done
+    kill -9 "$1" 2>/dev/null
+  fi
   tmux -S "$2" kill-server >/dev/null 2>&1 || true
   for p in $(cat "$3"/*.pid 2>/dev/null); do
+    case "$p" in ''|*[!0-9]*|0|1) continue ;; esac
     ps -o command= -p "$p" 2>/dev/null | grep -qF "$4" || continue
     pkill -9 -P "$p" 2>/dev/null
     g="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')"
@@ -80,6 +87,7 @@ stop_rig() {  # <supervisor pid> <tmux socket> <state dir> <tag: the work dir's 
 }
 rig_leftovers() {  # <tag>: what still names it after stop_rig, once exits have had 5 s to land
   local i left
+  is_tag "$1" || { echo "not a scratch-dir tag: '$1'"; return; }
   for i in $(seq 1 50); do
     left="$(pgrep -f "$1" 2>/dev/null | grep -vx "$$")"
     [ -z "$left" ] && return 0
@@ -89,6 +97,7 @@ rig_leftovers() {  # <tag>: what still names it after stop_rig, once exits have 
 }
 sweep() {  # <tag>: the last resort, anything whose command line names it
   local p
+  is_tag "$1" || return 0
   for p in $(pgrep -f "$1" 2>/dev/null); do [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null; done
 }
 cleanup_all() {
@@ -117,8 +126,9 @@ tmux -S "$SOCK" new-session -d -s target-watcher -c "$REPO" \
 rig_supervisor_pid() {  # <tmux socket>: the supervisor in that rig's own pane, no other
   local pane p
   pane="$(tmux -S "$1" display -p -t target-watcher '#{pane_pid}' 2>/dev/null)"
-  for p in ${pane:-} $(pgrep -P "${pane:-0}" 2>/dev/null); do
-    ps -o command= -p "$p" 2>/dev/null | grep -qF "bash $SUPERVISOR" && { echo "$p"; return; }
+  case "$pane" in ''|*[!0-9]*) return ;; esac
+  for p in "$pane" $(pgrep -P "$pane" 2>/dev/null); do
+    is_rig_supervisor "$p" && { echo "$p"; return; }
   done
 }
 sentinel_pid() { cat "$WORK"/state/*.pid 2>/dev/null | head -1; }
