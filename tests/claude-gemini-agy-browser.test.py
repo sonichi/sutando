@@ -232,7 +232,7 @@ def main() -> None:
             assert answers(foreign_port), "foreign fake Chrome never came up"
             decoy = subprocess.Popen(
                 [str(chrome), f"--user-data-dir={profile}", f"--remote-debugging-port={foreign_port}"],
-                env=dict(env, NOBIND="1"))
+                env=dict(env, NOBIND="1", CHROME_LOG=str(tmp / "decoy.log")))
             for _ in range(40):
                 if profile_procs(profile):
                     break
