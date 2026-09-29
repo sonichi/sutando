@@ -18,6 +18,12 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      is not overwritten.
  10. stop waits for a slow-to-exit Chrome and fails when one ignores SIGTERM.
  11. A relative --profile is made absolute: stop from one cwd leaves another cwd's `profile` alone.
+ 12. Ownership compares whole argv elements: a Chrome on `<profile> other` (a path with a space) is
+     neither adopted by start nor stopped by stop.
+ 13. start refuses a profile already running on another port, so a failed add cannot kill that Chrome.
+ 14. A failing `agy mcp list` stops start before launch, or after it with the launched Chrome stopped.
+ 15. The registry read is the last probe before `agy mcp add`: an entry on another URL written during
+     the final listener check is not overwritten.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -64,7 +70,11 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 """
 
 MOCK_AGY = """#!/bin/bash
-if [[ "$1 $2" == "mcp list" ]]; then cat "$MCP_STATE" 2>/dev/null; exit 0; fi
+if [[ "$1 $2" == "mcp list" ]]; then
+  n=$(( $(cat "$AGY_LIST_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$AGY_LIST_COUNT"
+  [[ "$n" == "${AGY_LIST_FAIL_ON:-}" ]] && exit 7
+  cat "$MCP_STATE" 2>/dev/null; exit 0
+fi
 if [[ "$1 $2" == "mcp add" ]]; then
   [[ -n "${AGY_ADD_FAIL:-}" ]] && exit 1
   printf '%s\\n' "$@" >>"$AGY_LOG"
@@ -140,6 +150,7 @@ def main() -> None:
             CHROME_LOG=str(tmp / "chrome.log"),
             AGY_LOG=str(tmp / "agy.log"),
             MCP_STATE=str(tmp / "mcp.state"),
+            AGY_LIST_COUNT=str(tmp / "agy-list.count"),
         )
         args = ["--port", str(port), "--profile", str(profile), "--chrome", str(chrome)]
         try:
@@ -368,10 +379,93 @@ NOBIND=1 exec "{chrome}" "$@"
             kill_profile(cwd_a / "profile")
             kill_profile(cwd_b / "profile")
 
+        spaced, spaced_port = tmp / "sp", free_port()
+        spaced_foreign = subprocess.Popen(
+            [str(chrome), f"--user-data-dir={tmp / 'sp other'}", f"--remote-debugging-port={spaced_port}"],
+            env=dict(env, CHROME_LOG=str(tmp / "spaced.log")))
+        try:
+            wait_up(spaced_port, "spaced-profile fake Chrome")
+            (tmp / "mcp.state").write_text("")
+            added = (tmp / "agy.log").read_text().splitlines()
+            sargs = ["--port", str(spaced_port), "--profile", str(spaced), "--chrome", str(chrome)]
+            rc, out = run(env, "start", *sargs)
+            assert rc != 0 and "not using it" in out, f"start adopted the Chrome on '<profile> other': {out}"
+            assert (tmp / "agy.log").read_text().splitlines() == added, "start registered a '<profile> other' Chrome"
+            rc, out = run(env, "stop", *sargs)
+            assert rc == 0 and "none running" in out, f"stop claimed the Chrome on '<profile> other': {out}"
+            assert spaced_foreign.poll() is None and answers(spaced_port), "stop killed the Chrome on '<profile> other'"
+        finally:
+            spaced_foreign.kill()
+            spaced_foreign.wait()
+
+        port_b = free_port()
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(env, "start", *args)
+            assert rc == 0, f"start failed: {out}"
+            (tmp / "mcp.state").write_text("")
+            launches = (tmp / "chrome.log").read_text().splitlines()
+            rc, out = run(dict(env, AGY_ADD_FAIL="1"), "start", "--port", str(port_b), "--profile", str(profile),
+                          "--chrome", str(chrome))
+            assert rc != 0 and "already in use" in out, f"start launched onto a busy profile: {out}"
+            assert (tmp / "chrome.log").read_text().splitlines() == launches, "start launched onto a busy profile"
+            assert answers(port) and profile_procs(profile), "a failed start killed the profile's existing Chrome"
+        finally:
+            kill_profile(profile)
+        for _ in range(20):
+            if not answers(port):
+                break
+            time.sleep(0.25)
+
+        (tmp / "mcp.state").write_text("")
+        (tmp / "agy-list.count").unlink(missing_ok=True)
+        launches = (tmp / "chrome.log").read_text().splitlines()
+        rc, out = run(dict(env, AGY_LIST_FAIL_ON="1"), "start", *args)
+        try:
+            assert rc != 0 and "mcp list' failed" in out, f"start ignored a failing mcp list: {out}"
+            assert (tmp / "chrome.log").read_text().splitlines() == launches, "start launched after mcp list failed"
+        finally:
+            kill_profile(profile)
+        (tmp / "agy-list.count").unlink()
+        rc, out = run(dict(env, AGY_LIST_FAIL_ON="2"), "start", *args)
+        try:
+            assert rc != 0 and "mcp list' failed" in out and "stopped the Chrome" in out, f"late mcp list failure: {out}"
+            assert len((tmp / "chrome.log").read_text().splitlines()) == len(launches) + 1, "Chrome was not launched"
+            assert not profile_procs(profile) and not answers(port), "start left its Chrome running after mcp list failed"
+        finally:
+            kill_profile(profile)
+        (tmp / "agy-list.count").unlink()
+        for _ in range(20):
+            if not answers(port):
+                break
+            time.sleep(0.25)
+
+        lsof_wrap = write_exec(bin_dir / "lsof", f"""#!/bin/bash
+n=$(( $(cat "{tmp}/lsof.count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"{tmp}/lsof.count"
+[[ "$n" == "${{LSOF_INSERT_ON:-}}" ]] && echo "{other_entry}" >>"$MCP_STATE"
+for c in /usr/sbin/lsof /usr/bin/lsof; do [[ -x "$c" ]] && exec "$c" "$@"; done
+exit 1
+""")
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(env, "start", *args)
+            assert rc == 0, f"start failed: {out}"
+            (tmp / "mcp.state").write_text("")
+            (tmp / "lsof.count").unlink()
+            added = (tmp / "agy.log").read_text().splitlines()
+            rc, out = run(dict(env, LSOF_INSERT_ON="2"), "start", *args)
+            assert (tmp / "lsof.count").read_text().strip() == "2", "the final listener check never ran"
+            assert rc != 0 and "not overwriting" in out, f"start overwrote an entry written before its add: {out}"
+            assert (tmp / "mcp.state").read_text().splitlines() == [other_entry], "the concurrent entry was replaced"
+            assert (tmp / "agy.log").read_text().splitlines() == added, "start registered over a concurrent entry"
+        finally:
+            lsof_wrap.unlink()
+            kill_profile(profile)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 11/11 agy-browser.sh")
+    print("PASS 15/15 agy-browser.sh")
 
 
 if __name__ == "__main__":
