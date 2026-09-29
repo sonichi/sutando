@@ -120,6 +120,23 @@ unset _args _consume_next
 # Section 1 — Bootstrap (paths, env, config)                                   #
 # --------------------------------------------------------------------------- #
 
+# Print form of a remote URL: `scheme://user[:pass]@host/...` -> `scheme://***@host/...`.
+# Display only; git operations keep the real value. scp-style `git@host:path` has no secret.
+_redact_url() {
+    local u="$1" scheme rest authority
+    case "$u" in
+        *://*) ;;
+        *) printf '%s' "$u"; return 0 ;;
+    esac
+    scheme="${u%%://*}"
+    rest="${u#*://}"
+    authority="${rest%%[/?#]*}"
+    case "$authority" in
+        *@*) printf '%s://***@%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}" ;;
+        *) printf '%s' "$u" ;;
+    esac
+}
+
 _self="${BASH_SOURCE[0]:-$0}"
 if command -v realpath >/dev/null 2>&1; then _self="$(realpath "$_self")"; fi
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
@@ -213,11 +230,11 @@ if [ -z "$VAULT_URL" ] \
     if [ -n "$_origin_url" ] && [ -z "$_wsid" ]; then
         VAULT_URL_DECLINED="$_origin_url"
         VAULT_URL_DECLINED_REASON="workspace has no .sutando-vault/ws-id to identify its vault branch"
-        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+        echo "sync-workspace: no vault URL configured, and this workspace has no .sutando-vault/ws-id to identify its vault branch; refusing to recover a URL from the workspace repo's origin ($(_redact_url "$_origin_url"))." >&2
     elif [ -n "$_origin_url" ] && [ "$_wsid_ok" != "1" ]; then
         VAULT_URL_DECLINED="$_origin_url"
         VAULT_URL_DECLINED_REASON="workspace ws-id is not a valid workspace id (expected six lowercase hex characters), so it identifies no vault branch"
-        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($_origin_url)." >&2
+        echo "sync-workspace: this workspace's .sutando-vault/ws-id is not a valid workspace id (expected six lowercase hex characters); refusing to recover a URL from the workspace repo's origin ($(_redact_url "$_origin_url"))." >&2
     elif [ -n "$_origin_url" ]; then
         # Unreachable is not the same answer as not-a-vault, and an operator
         # told the wrong one edits the wrong thing.
@@ -226,15 +243,15 @@ if [ -z "$VAULT_URL" ] \
         if [ "$_ls_rc" != "0" ]; then
             VAULT_URL_DECLINED="$_origin_url"
             VAULT_URL_DECLINED_REASON="unreachable this run, so it could not be confirmed either way"
-            echo "sync-workspace: could not reach the workspace repo's origin ($_origin_url) to confirm it is a vault; not recovering a URL from it this run." >&2
+            echo "sync-workspace: could not reach the workspace repo's origin ($(_redact_url "$_origin_url")) to confirm it is a vault; not recovering a URL from it this run." >&2
         elif [ -n "$_ls_out" ]; then
             VAULT_URL="$_origin_url"
             VAULT_URL_SOURCE="workspace repo origin, identity-verified (carries host/*/$_wsid)"
-            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($VAULT_URL). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
+            echo "sync-workspace: no vault URL configured; recovered it from the workspace repo's own origin ($(_redact_url "$VAULT_URL")). Restore vault.remote_url in sutando.config.local.json to silence this." >&2
         else
             VAULT_URL_DECLINED="$_origin_url"
             VAULT_URL_DECLINED_REASON="carries no host/*/$_wsid branch, so this workspace has never pushed to it"
-            echo "sync-workspace: the workspace repo's origin ($_origin_url) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
+            echo "sync-workspace: the workspace repo's origin ($(_redact_url "$_origin_url")) carries no host/*/$_wsid branch, so it is not a vault this workspace has pushed to; refusing to recover a vault URL from it." >&2
         fi
         unset _ls_rc _ls_out
     fi
@@ -953,7 +970,7 @@ _init_impl() {
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "DRY-RUN: would init workspace as git repo at $WORKSPACE_DIR" >&2
-        echo "DRY-RUN: would set git remote origin = $VAULT_URL" >&2
+        echo "DRY-RUN: would set git remote origin = $(_redact_url "$VAULT_URL")" >&2
         echo "DRY-RUN: would (re)generate .git/info/exclude" >&2
         echo "DRY-RUN: would stage + commit + push to refs/heads/host/$(_host_ws_segment)" >&2
         # Still call generate_exclude — its own dry-run logic will print the diff (no write)
@@ -993,14 +1010,14 @@ _init_impl() {
         local existing
         existing="$(git remote get-url origin)"
         if [ "$existing" != "$VAULT_URL" ]; then
-            log "_init_impl: changing remote origin from $existing to $VAULT_URL"
-            echo "sync-workspace: updating remote origin from $existing to $VAULT_URL" >&2
+            log "_init_impl: changing remote origin from $(_redact_url "$existing") to $(_redact_url "$VAULT_URL")"
+            echo "sync-workspace: updating remote origin from $(_redact_url "$existing") to $(_redact_url "$VAULT_URL")" >&2
             git remote set-url origin "$VAULT_URL"
         fi
     else
         git remote add origin "$VAULT_URL"
-        log "_init_impl: added remote origin $VAULT_URL"
-        echo "sync-workspace: added remote origin $VAULT_URL" >&2
+        log "_init_impl: added remote origin $(_redact_url "$VAULT_URL")"
+        echo "sync-workspace: added remote origin $(_redact_url "$VAULT_URL")" >&2
     fi
 
     # 3. Generate .git/info/exclude (refuses to overwrite an existing
@@ -1633,11 +1650,11 @@ cmd_status() {
     # A recovered URL and a configured one print identically without the source,
     # and a declined candidate reads as an <unset> naming nothing to go fix.
     if [ -n "$VAULT_URL" ]; then
-        echo "VAULT_URL:     $VAULT_URL${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
+        echo "VAULT_URL:     $(_redact_url "$VAULT_URL")${VAULT_URL_SOURCE:+  (source: $VAULT_URL_SOURCE)}"
     else
         echo "VAULT_URL:     <unset>"
         if [ -n "$VAULT_URL_DECLINED" ]; then
-            echo "               candidate NOT adopted: $VAULT_URL_DECLINED"
+            echo "               candidate NOT adopted: $(_redact_url "$VAULT_URL_DECLINED")"
             echo "               reason: $VAULT_URL_DECLINED_REASON"
         fi
     fi
@@ -1924,7 +1941,7 @@ Next steps (operator-supervised):
        ls $WORKSPACE_DIR/.claude-sutando/projects/${local_slug}/memory/ | head
        ls $WORKSPACE_DIR/skills/                   # shared canonical + salvaged host-only skills
        ls $WORKSPACE_DIR/hosts/                    # per-host: this host + peers (machine-<peer>/ minus skills/)
-  2. Confirm the first push landed in your $VAULT_URL repo (web UI).
+  2. Confirm the first push landed in your $(_redact_url "$VAULT_URL") repo (web UI).
   3. Run a normal sync to verify push + pull work end-to-end:
        bash scripts/sync-workspace.sh
   4. Once you're satisfied, you can delete the legacy clone:
