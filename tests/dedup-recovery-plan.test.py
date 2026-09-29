@@ -6,6 +6,7 @@ never answered; adapters keep only their routing and notification.
 """
 from __future__ import annotations
 
+import ast
 import sys
 import tempfile
 import unittest
@@ -67,6 +68,21 @@ class _Space:
 
 
 class PlanTest(unittest.TestCase):
+    def test_destination_provider_namespace(self):
+        for source, expected in (("telegram", "requeue"), ("discord", "honour"),
+                                 ("DISCORD", "honour")):
+            for count in (0, 1):
+                with self.subTest(source=source, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td); sp.holder("[REPLIED]")
+                    sp.orig(f"id: {TID}\nsource: discord\nchannel_id: 4242\nuser_id: 9001\n"
+                            f"dedup_requeue_count: {count}\ntask: answer here\n")
+                    (sp.tasks / f"{HOLDER}.txt").write_text(
+                        f"source: {source}\nchat_id: 4242\nuser_id: 9001\n")
+                    action, _ = plan_dedup_recovery(sp.results, sp.tasks, TID, HOLDER, "4242", NEW)
+                    self.assertEqual(action, "report" if count and expected == "requeue" else expected)
+                    self.assertEqual((sp.tasks / f"{NEW}.txt").exists(),
+                                     expected == "requeue" and count == 0)
+
     def test_holder_answered_is_honoured(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder("the full answer"); sp.orig()
@@ -295,6 +311,23 @@ class DelegationTest(unittest.TestCase):
                     "dedup_decision(", src,
                     f"{name}: calls dedup_decision directly — the plan owns that",
                 )
+
+    def test_adapters_do_not_import_or_call_private_policy(self):
+        forbidden = {"dedup_decision", "dedup_cross_channel_target", "dedup_cross_sender_target",
+                     "dedup_destination_mismatch", "dedup_requeue_count", "build_requeued_task"}
+        for name, path in CONSUMERS.items():
+            tree = ast.parse(path.read_text())
+            used = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    used.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        used.add(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        used.add(node.func.attr)
+            with self.subTest(consumer=name):
+                self.assertFalse(used & forbidden, f"{name} bypasses shared planner: {used & forbidden}")
 
     def test_result_lookup_is_not_reimplemented(self):
         """Live-then-archive is one policy: an archive-only copy reads a

@@ -79,6 +79,19 @@ class Problems(unittest.TestCase):
         return ds.dedup_problem(ws / "results", tid,
                                 (ws / "tasks") if with_tasks else None, src_dir=SRC)
 
+    def test_destination_provider_namespace(self):
+        for source in ("telegram", "discord", "DISCORD"):
+            with self.subTest(source=source):
+                ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                         tasks={"task-a.txt": "source: discord\nchannel_id: 4242\nuser_id: 9001\n",
+                                "task-b.txt": f"source: {source}\nchat_id: 4242\nuser_id: 9001\n"})
+                if source == "telegram":
+                    problem = self._p(ws)
+                    self.assertIsNotNone(problem)
+                    self.assertIn("CROSS-ROOM", problem)
+                else:
+                    self.assertIsNone(self._p(ws))
+
     def test_a_real_reply_is_clean(self):
         ws = _ws(results={"task-a.txt": "[deduped: task-b]\n", "task-b.txt": "the reply\n"})
         self.assertIsNone(self._p(ws))

@@ -123,6 +123,7 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
     it asked for rather than a silent all-clear.
     """
     delivered, _ = markers(src_dir)
+    from result_markers import dedup_destination_mismatch
     if text is None:
         text = read(result_path(results, task_id))
     if text is None:
@@ -143,8 +144,11 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
                 or task_field(tasks, task_id, "chat_id"))
         dest = (task_field(tasks, target, "channel_id")
                 or task_field(tasks, target, "chat_id"))
-        if room and dest and room != dest:
-            return f"CROSS-ROOM: deduped into {target}, whose reply goes to {dest}, not {room}"
+        source = task_field(tasks, task_id, "source")
+        holder_source = task_field(tasks, target, "source")
+        if dedup_destination_mismatch(room, dest, source, holder_source):
+            return (f"CROSS-ROOM: deduped into {target}, whose reply goes to "
+                    f"{holder_source or '?'}:{dest}, not {source or '?'}:{room}")
 
     target_path = result_path(results, target)
     holder = read(target_path)

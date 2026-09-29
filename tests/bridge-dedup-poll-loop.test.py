@@ -23,6 +23,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -179,7 +180,11 @@ class DiscordPollLoopTest(unittest.TestCase):
             def extra(tasks):
                 (tasks / f"{HOLDER}.txt").write_text(
                     f"id: {HOLDER}\nsource: discord\nchannel_id: 9999\ntask: other ask\n")
-            r = self._one_pass(td, "[REPLIED]", extra=extra)
+            with mock.patch.object(self.db, "plan_dedup_recovery",
+                                   wraps=self.db.plan_dedup_recovery) as planner:
+                r = self._one_pass(td, "[REPLIED]", extra=extra)
+            planner.assert_called_once()
+            self.assertIn(HOLDER, planner.call_args.args)
             requeued = [p for p in r["requeued"] if p.stem != HOLDER]
             self.assertEqual(len(requeued), 1,
                              f"cross-channel reject did not re-queue; log={r['log'][:300]}")

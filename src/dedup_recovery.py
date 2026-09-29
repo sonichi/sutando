@@ -24,6 +24,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
         dedup_decision,
         dedup_requeue_count,
         task_channel_id,
+        task_source,
         task_user_id,
     )
     from .task_archive import find_task_file
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
         dedup_decision,
         dedup_requeue_count,
         task_channel_id,
+        task_source,
         task_user_id,
     )
     from task_archive import find_task_file
@@ -115,7 +117,7 @@ def plan_dedup_recovery(
     holder_task = (_read(find_task_file(Path(tasks_dir), holder)
                          or find_archived_task(Path(tasks_dir), holder)) if holder else None)
     destination = asking_channel or task_channel_id(orig_text)
-    cross_channel = dedup_cross_channel_target(destination, holder_task)
+    cross_channel = dedup_cross_channel_target(destination, holder_task, task_source(orig_text))
     cross_sender = (dedup_cross_sender_target(task_user_id(orig_text), holder_task)
                     if decision == "honour" and orig_text else None)
     reason = "cross-channel" if cross_channel else "cross-sender" if cross_sender else "holder-empty"

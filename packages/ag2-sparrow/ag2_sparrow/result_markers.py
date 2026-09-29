@@ -307,6 +307,7 @@ def parse_markers(text: str) -> ParseResult:
 
 
 _TASK_CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)\s*$", re.MULTILINE)
+_TASK_SOURCE_RE = re.compile(r"^source:\s*(\S+)\s*$", re.MULTILINE)
 _TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
 
 
@@ -316,7 +317,26 @@ def task_channel_id(task_text: str | None) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
+def task_source(task_text: str | None) -> str | None:
+    """Provider namespace for task destinations; provider names are case-insensitive."""
+    match = _TASK_SOURCE_RE.search(task_text or "")
+    return match.group(1).casefold() if match else None
+
+
+def dedup_destination_mismatch(asking_channel, holder_channel,
+                               asking_source=None, holder_source=None) -> bool:
+    """Known destinations differ by room/chat ID OR by provider namespace.
+
+    Missing metadata keeps the existing unknown-route policy. Provider IDs
+    are not globally unique: Discord channel 4242 is not Telegram chat 4242.
+    """
+    if asking_source and holder_source and str(asking_source).casefold() != str(holder_source).casefold():
+        return True
+    return bool(asking_channel and holder_channel and str(asking_channel) != str(holder_channel))
+
+
+def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None,
+                               asking_source: str | None = None) -> str | None:
     """Channel-aware dedup support.
 
     A `[deduped: task-X]` result silently archives the deduped task and
@@ -326,18 +346,15 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     is left silent while the answer lands elsewhere (observed 2026-06-22: an
     owner question in #workspace-revamp folded into a #design holder).
 
-    Returns the holder's `channel_id` (or Telegram `chat_id`) when it is known
-    AND differs from the deduped task's own channel — a cross-channel dedup, which is INVALID
-    (dedup is per-channel only). The bridge rejects it and re-queues the
-    original task to be re-answered in its own channel. Returns None (→ keep
-    the silent-archive behavior) when the holder text is missing, has no
-    channel_id, or is the SAME channel (the common, correct intra-channel
-    consolidation case).
+    Returns the holder's destination (or provider if its room is unknown)
+    when known room IDs or known provider names differ. The bridge rejects
+    the fold and re-queues the original task to its own destination. Missing
+    dimensions do not establish a mismatch; unknown-route policy is separate.
     """
     holder_channel = task_channel_id(holder_task_text)
-    if holder_channel and deduped_channel_id is not None and str(deduped_channel_id):
-        if holder_channel != str(deduped_channel_id):
-            return holder_channel
+    if dedup_destination_mismatch(deduped_channel_id, holder_channel,
+                                  asking_source, task_source(holder_task_text)):
+        return holder_channel or task_source(holder_task_text)
     return None
 
 
