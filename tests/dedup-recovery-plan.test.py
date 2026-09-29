@@ -86,6 +86,41 @@ class PlanTest(unittest.TestCase):
                     self.assertEqual(sp.plan(), ("honour", None))
                     self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
 
+    def test_replied_destination_boundary(self):
+        for field, asking, other in (("channel_id", "C1", "C2"),
+                                      ("chat_id", "-1001", "-1002")):
+            for count in (0, 1):
+                for destination in (asking, other):
+                    with self.subTest(field=field, count=count, destination=destination):
+                        with tempfile.TemporaryDirectory() as td:
+                            sp = _Space(td)
+                            sp.holder("[REPLIED]")
+                            sp.orig(ORIG + f"{field}: {asking}\nuser_id: alice\n"
+                                    f"dedup_requeue_count: {count}\n")
+                            (sp.tasks / f"{HOLDER}.txt").write_text(
+                                f"id: {HOLDER}\n{field}: {destination}\nuser_id: alice\n")
+                            action, payload = plan_dedup_recovery(
+                                sp.results, sp.tasks, TID, HOLDER, asking, NEW)
+                            expected = "honour" if destination == asking else (
+                                "requeue" if count == 0 else "report")
+                            self.assertEqual(action, expected)
+                            new = sp.tasks / f"{NEW}.txt"
+                            self.assertEqual(new.exists(), expected == "requeue")
+                            if expected == "requeue":
+                                self.assertIn(f"{field}: {asking}", new.read_text())
+                                self.assertIn("DIFFERENT channel", new.read_text())
+                            elif expected == "report":
+                                self.assertIn("different room", payload)
+                                self.assertNotIn("delivered nothing", payload)
+
+    def test_destination_falls_back_to_task_when_route_map_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder("[REPLIED]")
+            sp.orig(ORIG + "channel_id: C1\nuser_id: alice\n")
+            (sp.tasks / f"{HOLDER}.txt").write_text("channel_id: C2\nuser_id: alice\n")
+            self.assertEqual(plan_dedup_recovery(
+                sp.results, sp.tasks, TID, HOLDER, "", NEW)[0], "requeue")
+
     def test_empty_holder_is_requeued_and_the_task_is_written(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder(""); sp.orig()

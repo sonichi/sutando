@@ -91,6 +91,12 @@ class Problems(unittest.TestCase):
         ws = _ws(results={"task-a.txt": "an ordinary reply\n"})
         self.assertIsNone(self._p(ws))
 
+    def test_telegram_cross_chat_replied_is_named(self):
+        ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                 tasks={"task-a.txt": "chat_id: -1001\nuser_id: alice\n",
+                        "task-b.txt": "chat_id: -1002\nuser_id: alice\n"})
+        self.assertIn("CROSS-ROOM", self._p(ws))
+
     def test_cross_room_is_named(self):
         """The failure that motivated sharing: the holder delivers correctly, in
         the wrong room, so the asking room hears nothing and nothing errors."""

@@ -179,7 +179,7 @@ class DiscordPollLoopTest(unittest.TestCase):
             def extra(tasks):
                 (tasks / f"{HOLDER}.txt").write_text(
                     f"id: {HOLDER}\nsource: discord\nchannel_id: 9999\ntask: other ask\n")
-            r = self._one_pass(td, "", extra=extra)
+            r = self._one_pass(td, "[REPLIED]", extra=extra)
             requeued = [p for p in r["requeued"] if p.stem != HOLDER]
             self.assertEqual(len(requeued), 1,
                              f"cross-channel reject did not re-queue; log={r['log'][:300]}")
@@ -187,8 +187,7 @@ class DiscordPollLoopTest(unittest.TestCase):
             self.assertIn(new_id, r["pending"], "re-ask unroutable")
             self.assertIsInstance(self.db.pending_admitted_ms.get(new_id), int,
                                   "re-ask has no admitted_at stamp — ager will orphan it")
-            self.assertIn("cross-channel reject", r["log"],
-                          "took the same-channel path — branch under test not driven")
+            self.assertIn("DIFFERENT channel", requeued[0].read_text())
 
     def test_holder_that_answered_is_left_alone(self):
         with tempfile.TemporaryDirectory() as td:

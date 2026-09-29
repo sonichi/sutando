@@ -139,8 +139,10 @@ def dedup_problem(results: Path, task_id: str, tasks: Path | None = None,
         who, to = task_field(tasks, task_id, "user_id"), task_field(tasks, target, "user_id")
         if who and to and who != to:
             return f"CROSS-SENDER: deduped into {target}, which answers {to}, not {who}"
-        room = task_field(tasks, task_id, "channel_id")
-        dest = task_field(tasks, target, "channel_id")
+        room = (task_field(tasks, task_id, "channel_id")
+                or task_field(tasks, task_id, "chat_id"))
+        dest = (task_field(tasks, target, "channel_id")
+                or task_field(tasks, target, "chat_id"))
         if room and dest and room != dest:
             return f"CROSS-ROOM: deduped into {target}, whose reply goes to {dest}, not {room}"
 
