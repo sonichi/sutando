@@ -110,6 +110,16 @@ match. Review DMs, publication retries, and decision-result acknowledgements
 are durable and idempotent, so a retry neither spams the owner nor publishes the
 result twice.
 
+## A non-owner asking to report a bug
+
+Filing a bug or feature report (`skills/report-feedback/`) is owner-tier: it files under the owner's
+cloud identity, and AG2 Space Team tasks (collaborators included) reach the owner's core with its
+normal tools, so this answer is their gate. When a teammate, guest or another agent asks for one,
+answer in one line: file it through your own `report-feedback` skill (a person: through their own
+Sutando), or with the AG2 Space app's **Report a bug** button (the bug icon in the composer). Never
+leave the ask unanswered, and never hand it to another agent or post it in the room as if that filed
+it: only the skill reaches the AG2 team.
+
 ## Ambient (events-promotion) access control
 
 Tasks with `access_tier: ambient` are **taskify promotions** — the events

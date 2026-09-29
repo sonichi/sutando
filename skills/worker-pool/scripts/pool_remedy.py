@@ -241,8 +241,9 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
     holds the inbox. A wedge card is raised and never acts on the session: only a
-    dead session is ever respawned. `escalate` is returned untouched, because
-    asking the owner is the core's, not a timer's."""
+    dead session is ever respawned, and a logged-out one is carded for its /login
+    because a fresh session meets the same expired login. `escalate` is returned
+    untouched, because asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
     cards = {}
@@ -250,7 +251,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN):
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
@@ -289,8 +290,10 @@ def main(argv=None) -> int:
         acted["escapes"] = wc.drive_escapes(a.workspace)
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear)
-    print(json.dumps({"decisions": tick["decisions"], **acted}, indent=2, sort_keys=True))
+        now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+    print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
+                      **acted}, indent=2, sort_keys=True))
     failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
     return 1 if failed else 0
 

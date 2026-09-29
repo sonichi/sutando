@@ -20,6 +20,8 @@ caps this file and refuses date stamps in it).
 2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `timeout_ms: 1800000`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Re-arm it on the expiry notice and on any notice that it exited early (on macOS Claude Code reports a
+   SIGTERM death as `exit code 144`); the inbox is unwatched until the standby's grace elapses.
    `Monitor` has no `persistent` option: it kills the command at `timeout_ms` (30 min is the maximum) and
    sends one expiry notice. On that notice, re-arm the watcher the same way (a start on a watched inbox
    exits 0); until you do, the external standby announces tasks through the pane after a 45 s grace.

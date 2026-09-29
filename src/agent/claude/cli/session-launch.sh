@@ -149,6 +149,13 @@ if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
+# Claude Code's "Flicker-free output" upsell shows until this counter reaches 3
+# (what "Not now" writes); a headless core cannot take the trial (P1-24).
+upsell_seeded = False
+if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
+    cfg["fullscreenUpsellSeenCount"] = 3
+    changed = True
+    upsell_seeded = True
 # Trust-seed for the explicitly-configured working dir. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
 # scoped config lacks it for a custom cwd, so a detached session would hang on
@@ -198,6 +205,8 @@ if changed:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    if upsell_seeded:
+        print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
     fi
   else

@@ -67,6 +67,66 @@ class TestKeyDerivation(unittest.TestCase):
             self.assertEqual(cloud_auth.read_keychain_auth(get=lambda k: "sutk_x"), ("https://sutando.ag2.space", "sutk_x"))
 
 
+class TestReadCloudAuthOrder(unittest.TestCase):
+    """P1-11: under the desktop host the Keychain session outranks a leftover
+    cloud-auth.json; elsewhere the file order is unchanged."""
+
+    def _ws(self, tmp, token="sutk_file"):
+        ws = Path(tmp) / "ws"
+        (ws / "state" / "auth").mkdir(parents=True)
+        (ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://sutando.ag2.space", "token": token}))
+        return ws
+
+    def test_file_wins_outside_the_desktop_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cloud_auth.os.environ, {}, clear=False), \
+                mock.patch.object(cloud_auth.Path, "home", return_value=Path(tmp) / "home"):
+            cloud_auth.os.environ.pop("SUTANDO_PACKAGED", None)
+            cloud_auth.os.environ.pop("SUTANDO_APP_SUPPORT", None)
+            ws = self._ws(tmp)
+            keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_file")
+
+    def test_the_switch_is_the_marker_the_packaged_core_actually_carries(self):
+        """Review of #4867 (Rui): SUTANDO_PACKAGED=1 reaches the sidecar only; the
+        core's environment on a packaged install carries SUTANDO_APP_SUPPORT
+        (verified with `ps eww` on the live core). The switch keys on that, the
+        same variable channel_env_containment already treats as the host marker."""
+        clean = {k: v for k, v in cloud_auth.os.environ.items() if k not in ("SUTANDO_PACKAGED", "SUTANDO_APP_SUPPORT")}
+        with mock.patch.dict(cloud_auth.os.environ, clean, clear=True):
+            self.assertFalse(cloud_auth.keychain_first())
+        with mock.patch.dict(cloud_auth.os.environ, {**clean, "SUTANDO_APP_SUPPORT": "/Users/x/Library/Application Support/space.ag2.app"}, clear=True):
+            self.assertTrue(cloud_auth.keychain_first())
+        with mock.patch.dict(cloud_auth.os.environ, {**clean, "SUTANDO_APP_SUPPORT": "  "}, clear=True):
+            self.assertFalse(cloud_auth.keychain_first(), "a blank-but-set value is not the host")
+        with mock.patch.dict(cloud_auth.os.environ, {**clean, "SUTANDO_PACKAGED": "1"}, clear=True):
+            self.assertTrue(cloud_auth.keychain_first(), "the sidecar's marker is still accepted")
+        src = (Path(cloud_auth.__file__).parent / "channel_env_containment.py").read_text()
+        self.assertIn('os.environ.get("SUTANDO_APP_SUPPORT")', src, "the two host markers must stay the same variable")
+
+    def test_keychain_wins_under_the_desktop_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cloud_auth.os.environ, {"SUTANDO_APP_SUPPORT": tmp}), \
+                mock.patch.object(cloud_auth.Path, "home", return_value=Path(tmp) / "home"):
+            ws = self._ws(tmp)
+            keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_keychain")
+            # No Keychain session: the file still serves, and it is not probed twice.
+            calls = []
+            def none():
+                calls.append(1)
+                return (None, None)
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none)[1], "sutk_file")
+            self.assertEqual(len(calls), 1)
+            # Signed out everywhere: nothing.
+            (ws / "state" / "auth" / "cloud-auth.json").unlink()
+            cloud_auth.os.environ.pop("SUTANDO_METERING_HEADERS", None)
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none), (None, None))
+
+
 class TestCloudRequest(unittest.TestCase):
     def test_refuses_untrusted_or_plaintext_hosts(self):
         for base in ("https://evil.example", "http://sutando.ag2.space", "https://u:p@sutando.ag2.space"):

@@ -126,16 +126,23 @@ def drive_slack_watcher():
     sb = _load("sbridge_dest_drive", REPO / "src" / "slack-bridge.py")
     td = Path(tempfile.mkdtemp(prefix="dest-drive-slack-"))
     (td / "proactive-9.to-discord.txt").write_text("plain body")
+    # Untagged, Slack-addressed body while the owner was last seen on Discord
+    # beside a configured Discord bridge: the address must outrank both.
+    (td / "proactive-10.txt").write_text("[channel: C0123456789]\naddressed body")
     sb.RESULTS_DIR = td
     sb.TASKS_DIR = Path(tempfile.mkdtemp(prefix="dest-drive-slack-tasks-"))
     sb.STATE_DIR = Path(tempfile.mkdtemp(prefix="dest-drive-slack-state-"))
+    sb.OWNER_ACTIVITY_FILE = sb.STATE_DIR / "owner-activity.json"
+    sb.OWNER_ACTIVITY_FILE.write_text('{"channel": "discord", "ts": 1}')
+    sb._other_bridges_configured = lambda: True
     sb.presenter_mode_active = lambda *_a, **_k: False
 
     # Spy on the SHARED owner symbol, not the adapter wrapper: this pins that
     # the watcher's decision actually delegates to proactive_routing.
     seen = {}
-    real = sb.fallback_claims_name
-    sb.fallback_claims_name = lambda n, ch: seen.setdefault((n, ch), real(n, ch))
+    real = sb.claims_unless_routed_elsewhere
+    sb.claims_unless_routed_elsewhere = lambda n, st, ch, **kw: seen.setdefault(
+        (n, ch), (real(n, st, ch, **kw), kw.get("body"), kw.get("other_bridges_configured")))[0]
 
     def _sleep(_secs):
         raise _Sentinel()
@@ -149,12 +156,17 @@ def drive_slack_watcher():
         check("slack watcher: loop pass completed", True)
     finally:
         sb.time.sleep = orig_sleep
-        sb.fallback_claims_name = real
+        sb.claims_unless_routed_elsewhere = real
 
     check("slack watcher: shared routing owner consulted in-flow",
-          seen.get(("proactive-9.to-discord.txt", "slack")) is False, str(seen))
+          (seen.get(("proactive-9.to-discord.txt", "slack")) or (None,))[0] is False, str(seen))
     check("slack watcher: foreign-destined file left unclaimed",
           (td / "proactive-9.to-discord.txt").exists())
+    decision, body, others = seen.get(("proactive-10.txt", "slack"), (None, None, None))
+    check("slack watcher: body peek and other-bridges flag reach the shared rule",
+          body is not None and "C0123456789" in body and others is True, str(seen))
+    check("slack watcher: Slack-addressed body outranks Discord activity in-flow",
+          decision is True, str(seen))
 
 
 def main() -> int:

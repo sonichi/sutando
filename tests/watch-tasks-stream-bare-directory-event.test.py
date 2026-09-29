@@ -65,9 +65,10 @@ class Harness:
         p.write_text(f"id: {name[:-4]}\naccess_tier: team\ntask: probe\n")
         return p
 
-    def start(self) -> None:
+    def start(self, **extra_env: str) -> None:
         env = dict(os.environ)
         env["PATH"] = f"{self.tmp/'bin'}:{env['PATH']}"
+        env.update(extra_env)
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
         for k in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR",
@@ -148,15 +149,21 @@ def test_file_event_dispatches_once_and_bare_directory_event_never_repeats_it():
         h.cleanup()
 
 
-def test_eof_from_fswatch_ends_the_watcher():
+def test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budget():
     h = Harness()
+    tail = ["pgrep", "-f", f"tail -n \\+1 -f {h.feed}"]
+    tails = lambda: set(subprocess.run(tail, capture_output=True, text=True).stdout.split())
     try:
-        h.start()
+        h.start(SUTANDO_FSWATCH_RESTART_MAX="1")
         time.sleep(1.0)
+        first = tails()
         # The stub tails the feed; killing it closes the FIFO's write end.
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
-        check("EOF on the event stream ends the watcher",
-              wait_for(lambda: h.proc.poll() is not None, timeout=10.0))
+        check("EOF on the event stream relaunches fswatch, the watcher stays",
+              wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=10.0))
+        subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
+        check("a second EOF past the relaunch budget ends the watcher, status 1",
+              wait_for(lambda: h.proc.poll() == 1, timeout=10.0), f"rc={h.proc.poll()}")
     finally:
         h.cleanup()
 
@@ -165,7 +172,7 @@ if __name__ == "__main__":
     for fn in (
         test_bare_directory_event_dispatches_nothing_after_startup_sweep,
         test_file_event_dispatches_once_and_bare_directory_event_never_repeats_it,
-        test_eof_from_fswatch_ends_the_watcher,
+        test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budget,
     ):
         print(fn.__name__)
         fn()
