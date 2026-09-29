@@ -22,7 +22,7 @@ _GW_ENV = {"REMOTE_TASK_URL": "https://gw.example", "REMOTE_TASK_TOKEN": "tok"}
 
 
 class NotifyWorkerStampTests(unittest.TestCase):
-    def _payload(self, extra_env):
+    def _payload(self, extra_env, **kw):
         sent = []
 
         def fake_post(url, payload, headers):
@@ -35,7 +35,7 @@ class NotifyWorkerStampTests(unittest.TestCase):
             for k in ("SUTANDO_WORKER_ID", "SUTANDO_CORE_ID"):
                 if k not in extra_env:
                     os.environ.pop(k, None)
-            ok = notify.send_remote_gateway("local-ag2space", ROOM, "on it")
+            ok = notify.send_remote_gateway("local-ag2space", ROOM, "on it", **kw)
         self.assertTrue(ok)
         self.assertEqual(len(sent), 1)
         return sent[0]["payload"]
@@ -52,6 +52,40 @@ class NotifyWorkerStampTests(unittest.TestCase):
         p = self._payload({})
         self.assertNotIn("extra_content", p)
         self.assertEqual(p["body"], "on it")
+
+
+class NotifyThreadRootTests(unittest.TestCase):
+    def _send(self, argv):
+        sent = []
+
+        def fake_post(url, payload, headers):
+            sent.append(payload)
+            return True
+
+        with mock.patch.object(notify, "_post", fake_post), \
+                mock.patch.dict(os.environ, _GW_ENV, clear=False), \
+                mock.patch.object(sys, "argv", ["notify.py", "--source", "local-ag2space",
+                                                "--channel-id", ROOM, "--message", "on it", *argv]):
+            for k in ("SUTANDO_WORKER_ID", "SUTANDO_CORE_ID", "SUTANDO_WORKER_SEAT"):
+                os.environ.pop(k, None)
+            rc = notify.main()
+        return rc, sent
+
+    def test_thread_root_flag_threads_the_message(self):
+        rc, sent = self._send(["--thread-root", "$root123"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
+                                 "thread_root": "$root123"}])
+
+    def test_no_flag_payload_is_unchanged(self):
+        rc, sent = self._send([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+
+    def test_malformed_thread_root_is_refused_without_posting(self):
+        rc, sent = self._send(["--thread-root", "root123"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

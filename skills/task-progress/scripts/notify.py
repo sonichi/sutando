@@ -334,9 +334,16 @@ def _gateway_headers(token: str) -> dict:
             "User-Agent": "sutando-task-progress/1.0"}
 
 
-def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
+def send_remote_gateway(source: str, channel_id: str, message: str,
+                        thread_root: str | None = None) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
+    if thread_root is not None:
+        thread_root = str(thread_root).strip()
+        if not thread_root.startswith("$") or len(thread_root) < 2:
+            print(f"[task-progress] thread_root must be a Matrix event id like $abc, "
+                  f"got {thread_root!r}", file=sys.stderr)
+            return False
     cfg = _gateway_config(source)
     if cfg is None:
         return False
@@ -349,6 +356,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     payload = {"op": "message", "room_id": channel_id, "body": message}
     if worker:
         payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
+    if thread_root:
+        payload["thread_root"] = thread_root
     return _post(f"{url}/v1/room", payload, _gateway_headers(token))
 
 
@@ -410,6 +419,8 @@ def main() -> int:
     parser.add_argument("--chat-id", help="Telegram chat ID (alias for --channel-id on telegram)")
     parser.add_argument("--thread-ts", default=None,
                         help="Slack thread timestamp for threaded replies")
+    parser.add_argument("--thread-root", default=None,
+                        help="Gateway sources (e.g. ag2space): thread event id ($...) to post in")
     parser.add_argument(
         "--no-validate-mentions",
         action="store_true",
@@ -447,7 +458,7 @@ def main() -> int:
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:
-        ok = send_remote_gateway(source, channel, message)
+        ok = send_remote_gateway(source, channel, message, thread_root=args.thread_root)
 
     return 0 if ok else 1
 

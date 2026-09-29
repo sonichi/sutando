@@ -91,6 +91,7 @@ For research tasks, be specific about what you're doing:
 ```
 
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
+For AG2 Space, pass the task's `thread_root:` via `--thread-root <event id>` to post the update in that thread.
 
 Mid-task checkpoint update:
 ```bash
