@@ -203,8 +203,8 @@ export SUTANDO_INSTANCE_ID="agy-task-notifier"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 "$NOTIFIER_PY" -c \
-  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1], sys.argv[2]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
+  'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role session --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
 while IFS= read -r event; do
