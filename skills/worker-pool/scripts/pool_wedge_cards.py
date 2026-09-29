@@ -137,18 +137,26 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
                      _jump(session)])
     else:
         abn = cw.frame_abnormal(text)
-        if abn is None:
+        if abn is None or (which == ps.CARD_LOGIN and pane != ps.PANE_LOGGED_OUT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         lines = cause_lines(text)
         via_proxy = runtime == "claude" and routed(socket, session) is True and (
             abn.retrying or any(n in _PROXY_CAUSES for n in abn.names))
         cause = ", ".join(abn.names)
-        body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
+        if which == ps.CARD_LOGIN:
+            body = [f"{seat} (tmux session {session}) is logged out and its pane shows:"]
+        else:
+            body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
         body += [f"  {ln}" for ln in lines] + ["", f"Cause: {cause}."]
         if via_proxy:
             body += ["", "This seat is routed through the credential proxy. Restarting the proxy "
                      f"(`{PROXY_REMEDY}`, as src/restart.sh does) can clear it."]
-        body += ["The worker's session is not restarted: a fresh session meets the same cause."]
+        if which == ps.CARD_LOGIN:
+            body += [f"Run /login in that session. Until then every task routed to {seat} waits: "
+                     "the worker's session is not restarted, a fresh session meets the same "
+                     "expired login."]
+        else:
+            body += ["The worker's session is not restarted: a fresh session meets the same cause."]
         subject.update(cause=list(abn.names), cause_lines=lines,
                        remedy=PROXY_REMEDY if via_proxy else None)
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]
@@ -205,16 +213,20 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None) -> list:
-    """Close the pending cards of seats that are no longer wedged; a pressed one is
-    left to `drive_escapes`, which refuses it once the frame has moved."""
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
+    """Close the pending cards of seats that are no longer wedged, and of seats still
+    wedged whose card is not the one their pane asks for now (`wedges`: worker ->
+    that card, None for a gate or limit); a pressed one is left to `drive_escapes`,
+    which refuses it once the frame has moved."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
+    wedges = wedges or {}
     closed = []
     for r in manager.active():
         subj = r.subject or {}
-        if (subj.get("source") == SOURCE and subj.get("worker_id") in worker_ids
-                and r.status != STATUS_IN_PROGRESS):
+        w = subj.get("worker_id")
+        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w])
+        if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
             manager.resolve(r.id)
             closed.append(r.id)
     return closed

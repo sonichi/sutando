@@ -4396,7 +4396,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                 # never its bytes.
                 _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
                           else f"<malformed, {len(_holder)} chars>")
-                _log(f"dedup {action} for {tid} (holder {_shown} delivered nothing)")
+                _log(f"dedup {action} for {tid} (holder {_shown} is not a valid delivery for this task)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)

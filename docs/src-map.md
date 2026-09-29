@@ -193,6 +193,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
+- **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
@@ -257,6 +258,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
+- **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
@@ -278,6 +280,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.
+
+## `src/agent/agy/`
+
+- **`onboarding_seed.py`** — Idempotently pre-seed agy's (Antigravity CLI) onboarding-complete cache.
+
+## `src/agent/agy/cli/`
+
+- **`start-cli.sh`** — Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
 
 ## `src/agent/claude/cli/`
 

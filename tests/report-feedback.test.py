@@ -44,6 +44,26 @@ class TestReportFeedbackRedaction(unittest.TestCase):
         self.assertNotIn(token, redacted)
         self.assertIn("<redacted-token>", redacted)
 
+    def _assert_scrubbed(self, value):
+        self.assertEqual(report_feedback._redact(f"excerpt {value} end"), "excerpt <redacted-token> end")
+
+    def test_redacts_slack_browser_session_token(self):
+        self._assert_scrubbed("xoxc-" + "1234567890-1234567890-1234567890123-" + "a0" * 16)
+
+    def test_redacts_slack_browser_cookie_token(self):
+        self._assert_scrubbed("xoxd-" + "1" + "A0" * 20)
+
+    def test_redacts_underscore_slack_lookalike(self):
+        self._assert_scrubbed("xoxb_" + "1234567890-abcdefghij")
+
+    def test_redacts_letter_first_slack_lookalike(self):
+        self._assert_scrubbed("xoxb-" + "AbCdEfGhIjKl")
+
+    def test_stays_broad_for_a_prose_shaped_slack_lookalike(self):
+        # The excerpt leaves the machine, so unlike the bridges' narrow family this
+        # scrub keeps the pre-#4892 broad rule and takes prose-shaped values too.
+        self._assert_scrubbed("xoxo-Samantha")
+
     def test_redacts_google_api_key(self):
         key = "AIza" + "Sy" + "A" * 33
         redacted = report_feedback._redact(f"google api key {key}")
@@ -1053,10 +1073,39 @@ class _FakeResp:
         return False
 
 
+class _FakeRespWithId(_FakeResp):
+    status = 201
+
+    def read(self):
+        return b'{"ok":true,"id":"0b9c7e1a-feedback"}'
+
+
 class TestMain(unittest.TestCase):
     def _run(self, argv):
         with mock.patch.object(sys, "argv", ["report-feedback.py", *argv]):
             report_feedback.main()
+
+    def test_a_filed_report_prints_the_reference_the_api_returned(self):
+        """The agent replies with this id; before, the answer's body was never read."""
+        out = io.StringIO()
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                contextlib.redirect_stdout(out):
+            self._run(["--title", "hello", "--no-logs"])
+        self.assertIn("OK: filed bug report (201). Reference: 0b9c7e1a-feedback.", out.getvalue())
+
+    def test_a_parked_draft_filed_later_prints_its_reference_too(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                    contextlib.redirect_stdout(out):
+                self._run(["--decide", did, "file"])
+        self.assertIn(f"from draft {did}. Reference: 0b9c7e1a-feedback.", out.getvalue())
 
     def test_blank_title_exits_1(self):
         with self.assertRaises(SystemExit) as cm:

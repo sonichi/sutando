@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""A dedup holder id is a lookup key, not a path — the bridge must gate it.
+"""Discord routes malformed holder ids through the shared recovery gate.
 
-The guard used to refuse `[deduped: <anything>]` on a guarded tier, so a
-sender-influenced holder id could never reach a filesystem lookup. Honouring
-suppression on every tier removes that accident, and the two consumers were
-NOT symmetric:
-
-    dedup_recovery -> find_result      -> valid_archive_lookup_id  GATED
-    discord-bridge -> find_task_file   -> tasks_dir / f"{id}.txt"  UNGATED
-
-so `[deduped: ../../secret]` resolved outside the tasks dir and the bridge read
-whatever it found. The gate is applied at the call site, and an id that fails it
-resolves to "holder not found" — which keeps the existing recovery path rather
-than silently archiving the asker's question.
-
-Run: python3 tests/discord-dedup-holder-id-traversal.test.py
-Exit: 0 on pass, 1 on fail.
+Drive its real wrapper with a lookup that raises if reached, plus a valid-id
+control. Removing the old adapter-specific lookup must retain traversal safety.
 """
 from __future__ import annotations
 
 import pathlib
-import re
+import os
+import json
+import importlib.util
+from unittest.mock import patch
 import sys
 import tempfile
+import atexit
+import shutil
+from pathlib import Path
+
+_CFG = tempfile.mkdtemp(prefix="ccd-dedup-traversal-")
+atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+_cfg = Path(_CFG) / "channels" / "discord"
+_cfg.mkdir(parents=True)
+(_cfg / "access.json").write_text(json.dumps({"allowFrom": []}))
+(_cfg / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -58,23 +59,26 @@ def main() -> int:
                  "ask-42", "sc-ask-7", "reco-skill-9"):
         check(valid_archive_lookup_id(good), f"2) gate accepts {good!r}")
 
-    # 3. The bridge applies it at the call site, and only around the lookup —
-    #    the recovery branch itself must still run for an unresolvable holder.
-    src = (REPO / "src" / "discord-bridge.py").read_text(encoding="utf-8")
-    # The branch condition deliberately does NOT test _skip.extra: an empty
-    # holder is a dedup marker too, and the shared plan answers it.
-    call = re.search(
-        r"if _skip\.value == \"deduped\":(.{0,700}?)_holder_text",
-        src, re.S)
-    check(call is not None, "3) the dedup branch is where it was")
-    if call:
-        block = call.group(1)
-        check("valid_archive_lookup_id(_skip.extra)" in block,
-              "3) the holder id is gated before find_task_file")
-        check("find_task_file(TASKS_DIR, _skip.extra)" in block,
-              "3) and the lookup still happens for a well-formed id")
-        check("else None" in block,
-              "3) a rejected id becomes 'holder not found', not a skipped branch")
+    # The wrapper harness also stubs provider clients before importing Discord.
+    spec = importlib.util.spec_from_file_location(
+        "_traversal_harness", REPO / "tests" / "bridge-dedup-wrappers.test.py")
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+    bridge = harness._load("traversal", "discord-bridge.py")
+    bridge.TASKS_DIR = root / "tasks"
+    bridge.RESULTS_DIR = root / "results"
+    bridge.RESULTS_DIR.mkdir()
+    from dedup_recovery import MALFORMED_TEMPLATE
+    for bad in ("../secret", "../../../etc/passwd", "..", ".", "a/b"):
+        with patch("dedup_recovery.find_task_file", side_effect=AssertionError("unsafe lookup")) as lookup:
+            action, body = bridge._dedup_recover("task-ask", bad, 4242)
+            check((action, body) == ("report", MALFORMED_TEMPLATE),
+                  f"3) Discord reports malformed holder {bad!r}")
+            check(lookup.call_count == 0, "3) malformed holder never reaches a task lookup")
+    (bridge.RESULTS_DIR / "task-holder.txt").write_text("[REPLIED]")
+    (bridge.TASKS_DIR / "task-holder.txt").write_text("channel_id: 4242\n")
+    check(bridge._dedup_recover("task-ask", "task-holder", 4242) == ("honour", None),
+          "3) valid same-room holder still reaches normal recovery")
 
     print()
     if FAILS:

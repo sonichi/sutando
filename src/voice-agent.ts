@@ -58,7 +58,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1532,6 +1532,26 @@ async function main() {
 	// path rebases it with the items array (G-P7-8).
 	const liveTranscriptPath = VOICE_TRANSCRIPT_PATH;
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
+	// The bridge reads the live turns when the work tool runs, so a task carries the
+	// owner's verbatim words; conversation.log is only written at turn end (below).
+	// Session-scoped, not client-scoped: the next session's registration replaces it.
+	// Items plus the transcription still buffered by the runtime (bodhi flushes only
+	// what has arrived when a tool fires), so a late chunk is not read as last turn's.
+	// The runtime calls handleUserSpeechEvidence on every transcription chunk; the stamp
+	// tells the bridge whether a transcription may still be landing (no stamp within
+	// 10 s = the model started this turn itself, so the task write does not wait).
+	let lastUserSpeechAt: number | undefined;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const speechHost = session as any;
+	if (typeof speechHost.handleUserSpeechEvidence === 'function') {
+		const original = speechHost.handleUserSpeechEvidence.bind(session);
+		speechHost.handleUserSpeechEvidence = () => { lastUserSpeechAt = Date.now(); return original(); };
+	}
+	setVoiceTurnsProvider(() => ({
+		items: session.conversationContext.items,
+		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
+		lastUserSpeechAt,
+	}));
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		// If end_session fired this session, keep clearing items so

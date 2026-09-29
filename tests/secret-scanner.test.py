@@ -119,6 +119,11 @@ class TestNoFalsePositive(unittest.TestCase):
     def test_prose_about_api_keys(self):
         self._assert_no_secret_hits("let me describe how API keys work in general")
 
+    def test_sign_off_is_not_a_slack_token(self):
+        # Every Slack token has a digit after the dash; a "xoxo-<name>" sign-off does not.
+        for line in ("xoxo-Sam", "thanks again, hugs xoxo-Sam"):
+            self._assert_no_secret_hits(line)
+
     def test_short_random_alphanumeric(self):
         # Not long enough to match any known secret format
         self._assert_no_secret_hits("user said abc123def456")

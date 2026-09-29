@@ -217,6 +217,7 @@ class Watcher:
         env["SUTANDO_STANDBY_STOP_TIMEOUT"] = "2"
         env["SUTANDO_HELD_RETRY_INTERVAL"] = "2"
         env["SUTANDO_WATCHER_START_LOCK_TIMEOUT_S"] = "3"   # the lock is held for a watcher's lifetime
+        env["SUTANDO_FSWATCH_RESTART_MAX"] = "0"   # arm k drives the exit through a killed fswatch's EOF
         self.proc = subprocess.Popen(
             ["bash", "src/watch-tasks-stream.sh", inbox, "--role", self.role, "--inbox", inbox],
             cwd=str(REPO), env=env, stdout=self.out.open("w"), stderr=self.err.open("w"),

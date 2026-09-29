@@ -353,12 +353,14 @@ class TestRefusedTurn(unittest.TestCase):
             self.assertIn("turn-rejected", detail)
 
     def test_a_bare_done_line_counts(self):
-        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py).
+        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py). A refused
+        # LOGIN is the signed-out state itself, whatever the shared health made of the pane.
         pane = ("❯ /startup\n  ⎿  OAuth access token has expired · Please run /login\n"
                 "✻ Worked for 0s\n" + _IDLE_FOOTER)
-        st, _d, prompt, kind = compose_state(pane, "idle", True)
-        self.assertEqual((st, kind), ("blocked-human", "turn-rejected"))
-        self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
+        for base in ("idle", "working", "unknown", "needs_login"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind), ("logged-out", "login"), base)
+            self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
 
     def test_a_successful_last_turn_stays_idle_ready(self):
         for base in ("idle", "unknown"):
@@ -407,11 +409,16 @@ class TestRefusedTurn(unittest.TestCase):
 
     def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
         for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
-                     "not logged in", "Run /login first: not logged in"):
+                     "Run /login first: not logged in"):
             pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
             st, _d, prompt, kind = compose_state(pane, "idle", True)
-            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), line)
+            self.assertEqual((st, kind), ("logged-out", "login"), line)
             self.assertEqual(prompt, line)
+        # The bare three words with no /login token are not the signed-out state: the shared
+        # banner grammar (cli_wedge needs-login) keeps prose clean; the turn is still refused.
+        pane = "❯ /startup\n  ⎿  not logged in\n✻ Worked for 0s\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", "not logged in"))
 
     def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
         # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
@@ -462,6 +469,61 @@ class TestRefusedTurn(unittest.TestCase):
     def test_a_refused_turn_is_never_auto_answered(self):
         self.assertIsNone(auto_answer("turn-rejected"))
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
+
+
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+
+
+class TestLoginExpiredStands(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): four workers on a six-seat pool host printed
+    "Login expired · Please run /login" in a 0 s turn, and every "session expired" card was
+    edited to Resolved within 30 s. The refusal was no longer the LAST completed turn (the
+    seat had been typed at again, or a turn was spinning), so `refused_turn` stood down and
+    the tick read idle-ready — and on a worker seat the shared health reads the CORE's fresh
+    status file and calls the pane's login marker a false positive. The pane's own refusal
+    is the signed-out state until the pane shows a turn that ran."""
+
+    def test_a_refused_login_under_a_newer_typed_prompt_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + _IDLE_FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        for base in ("idle", "working", "unknown"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED), base)
+
+    def test_a_refused_login_under_a_spinning_turn_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + "❯ try again\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_refused_login_repeated_by_a_re_armed_seat_is_one_episode(self):
+        # Two refusals, same line: the card's episode key is the line, so one card.
+        pane = _LOGIN_REFUSED + _LOGIN_REFUSED + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_signed_in_turn_after_the_refusal_is_idle_ready(self):
+        st, _d, prompt, kind = compose_state(_LOGIN_REFUSED + _STARTUP_OK_TURN + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("idle-ready", None, None))
+
+    def test_login_successful_after_the_refusal_is_idle_ready(self):
+        st, *_ = compose_state(_LOGIN_REFUSED + "  ⎿  Login successful\n" + _IDLE_FOOTER, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_credits_refusal_is_still_a_rejected_turn_not_a_login(self):
+        # Only the login family is the signed-out state; the spend/wait refusal keeps its kind.
+        st, _d, prompt, kind = compose_state(_REFUSED_TURNS + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", _REFUSAL_LINE))
+
+    def test_a_live_login_menu_still_outranks_the_refusal_in_scrollback(self):
+        st, _d, _p, kind = compose_state(_LOGIN_REFUSED + _LOGIN_MENU, "idle", True)
+        self.assertEqual((st, kind), ("blocked-human", "login"))
+
+    def test_the_words_inside_a_turn_that_ran_are_not_a_login_refusal(self):
+        pane = ("❯ check auth\n⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_LOGIN_EXPIRED}\n● The diagnostic was read successfully.\n"
+                "✻ Worked for 1s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
 
 
 class TestNovelPromptBesideAnOldFooter(unittest.TestCase):

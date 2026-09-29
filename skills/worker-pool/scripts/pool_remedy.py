@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -44,6 +45,76 @@ ps, wi = sup.ps, sup.wi
 RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
     "recovered", "already-running", "indeterminate", "paused", "no-recorded-session",
     "failed")
+SUSPENDED = "suspended"
+SUSPENDED_REL = Path("state") / "pool-suspended"
+
+
+def suspended_path(workspace) -> Path:
+    return Path(workspace) / SUSPENDED_REL
+
+
+def _marker(workspace) -> dict | None:
+    """The suspension record {reason, at, stopped}, or None when not suspended."""
+    try:
+        text = suspended_path(workspace).read_text().strip()
+    except OSError:
+        return None
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        rec = None
+    if not isinstance(rec, dict):
+        # A marker that isn't the record still suspends; it just names no workers.
+        return {"reason": text or SUSPENDED, "at": None, "stopped": []}
+    return rec
+
+
+def suspension(workspace) -> str | None:
+    """The recorded reason the pool is suspended, or None. Never expires: only
+    --resume lifts it."""
+    rec = _marker(workspace)
+    if rec is None:
+        return None
+    return f"{rec.get('reason') or SUSPENDED} {rec.get('at') or ''}".strip()
+
+
+def suspend(workspace, reason: str, now: float | None = None) -> str:
+    """Suspend, recording which workers the stop takes down: every supervised worker not
+    already in a death episode. Read from the ladder's own file, so no probe delays a quit."""
+    try:
+        state = sup.load_state(workspace)
+        in_episode = {w for w, e in state.workers.items() if e.consecutive or e.escalated}
+        stopped = sorted(w for w in sup.supervised_workers(workspace)
+                         if w not in in_episode and not sup.is_paused(workspace, w))
+    except Exception:  # noqa: BLE001 — an unreadable pool must never leave the stop unsuspended
+        stopped = []
+    path = suspended_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({"reason": reason, "at": int(now if now is not None else time.time()),
+                               "stopped": stopped}) + "\n")
+    os.replace(tmp, path)
+    return suspension(workspace)
+
+
+def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
+    """Lift a suspension and bring back, now, the workers the stop took down: a deliberate
+    quit is not a failure, so they skip the death ladder. A worker already dead or escalated
+    before the stop is left to its own ladder."""
+    rec = _marker(workspace)
+    was = suspension(workspace)
+    suspended_path(workspace).unlink(missing_ok=True)
+    restarted = {}
+    if rec is not None:
+        stopped = set(rec.get("stopped") or [])
+        obs = sup.observe(workspace, time.time(), runner=runner or subprocess.run)
+        dead = [w for w, o in obs.items()
+                if w in stopped and o.session_alive is False and not o.paused]
+        restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
+        state = sup.load_state(workspace)
+        sup.save_state(workspace, replace(state, workers={
+            w: e for w, e in state.workers.items() if w not in restarted}))
+    return {"was_suspended": was, "restarted": restarted}
 
 
 def _last_run(workspace, worker_id) -> dict:
@@ -241,16 +312,22 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
     holds the inbox. A wedge card is raised and never acts on the session: only a
-    dead session is ever respawned. `escalate` is returned untouched, because
-    asking the owner is the core's, not a timer's."""
+    dead session is ever respawned, and a logged-out one is carded for its /login
+    because a fresh session meets the same expired login. `escalate` is returned
+    untouched, because asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
     cards = {}
     for worker_id, decision in decisions.items():
+        # Re-read per action: an app quit can land mid-sweep, just before its tmux kill-server.
+        if decision != ps.ESCALATE and suspension(workspace):
+            if decision == ps.RECOVER:
+                done[worker_id] = {"worker_id": worker_id, "outcome": SUSPENDED}
+            continue
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN):
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
@@ -269,29 +346,46 @@ def main(argv=None) -> int:
     p.add_argument("--repo", required=True)
     p.add_argument("--recipient", help="check and remedy one worker")
     p.add_argument("--sweep", action="store_true", help="check and remedy the pool")
+    p.add_argument("--suspend", metavar="REASON",
+                   help="stop remedying until --resume (the app writes this on a real quit)")
+    p.add_argument("--resume", action="store_true",
+                   help="lift a suspension, restart the workers it left dead, then sweep")
     p.add_argument("--dry-run", action="store_true",
                    help="decide and report, but neither remedy nor advance the ladder")
     a = p.parse_args(argv)
-    if bool(a.recipient) == bool(a.sweep):
-        p.error("pass exactly one of --recipient or --sweep")
+    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume))) != 1:
+        p.error("pass exactly one of --recipient, --sweep, --suspend or --resume")
+    if a.suspend:
+        print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
+        return 0
     try:
+        resumed = resume(a.workspace, a.repo) if a.resume else None
+        held = suspension(a.workspace)
         tick = sup.tick(a.workspace, time.time(),
                         worker_ids=[a.recipient] if a.recipient else None,
-                        persist=not a.dry_run)
+                        persist=not a.dry_run and not held)
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    acted = ({"recoveries": {}, "rearms": {}, "cards": {}, "escalations": [], "dry_run": True}
-             if a.dry_run else apply(a.workspace, a.repo, tick["decisions"]))
-    if not a.dry_run:
+    idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
+    escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
+    acted = ({**idle, "dry_run": True} if a.dry_run
+             else {**idle, "escalations": escalations, "suspended": held} if held
+             else apply(a.workspace, a.repo, tick["decisions"]))
+    if resumed is not None:
+        acted["resume"] = resumed
+    if not a.dry_run and not held and not suspension(a.workspace):
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
         acted["escapes"] = wc.drive_escapes(a.workspace)
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear)
-    print(json.dumps({"decisions": tick["decisions"], **acted}, indent=2, sort_keys=True))
-    failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
+        now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+    print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
+                      **acted}, indent=2, sort_keys=True))
+    outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())
+    failed = [r for r in outcomes if r["outcome"] == FAILED]
     return 1 if failed else 0
 
 
