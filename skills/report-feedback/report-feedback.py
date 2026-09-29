@@ -36,6 +36,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import cloud_auth  # noqa: E402
 from file_lock import locked_file  # noqa: E402
+from git_binary import git_argv  # noqa: E402
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
@@ -84,7 +85,7 @@ def _git(repo: Path, *args: str) -> Optional[str]:
         return None
     try:
         return subprocess.check_output(
-            ["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL,
+            git_argv("-C", str(repo), *args), stderr=subprocess.DEVNULL,
             timeout=2, text=True,
         ).strip() or None
     except (OSError, subprocess.SubprocessError):
@@ -106,7 +107,7 @@ def build_versions(repo: Optional[Path] = None) -> dict:
     use their own Git identity; a standalone Sutando has no known AG2Space host.
     """
     repo = repo or Path(__file__).resolve().parents[2]
-    packaged = _read_json(repo.parent / "build-info.json")
+    packaged = _read_json(repo.parent / "build-info.json") if repo.parent.name == "engine" else {}
     versions = {}
     desktop = repo.parent.parent
     for name, source in (("sutando", repo), ("ag2space", desktop)):
@@ -137,8 +138,9 @@ def body_with_versions(body: str, versions: dict) -> str:
     """Keep build identities visible to mirrors that only consume the body."""
     lines = [body, "", "### Build versions"]
     for key, label in (("sutando", "Sutando"), ("ag2space", "AG2Space")):
-        info = versions[key]
-        line = f"- {label}: {info['version']} (commit: {info['commit']})"
+        info = versions.get(key, {})
+        info = info if isinstance(info, dict) else {}
+        line = f"- {label}: {info.get('version') or 'unknown'} (commit: {info.get('commit') or 'unknown'})"
         if info.get("build"):
             line += f"; build: {info['build']}"
         lines.append(line)

@@ -61,7 +61,8 @@ class TestReportFeedbackRedaction(unittest.TestCase):
 class TestBuildVersions(unittest.TestCase):
     def test_packaged_install_without_git(self):
         with tempfile.TemporaryDirectory() as td:
-            engine = Path(td)
+            engine = Path(td) / "engine"
+            engine.mkdir()
             repo = engine / "sutando"
             repo.mkdir()
             (engine / "build-info.json").write_text(json.dumps({
@@ -92,8 +93,8 @@ class TestBuildVersions(unittest.TestCase):
 
     def test_missing_or_malformed_metadata_does_not_prevent_reporting(self):
         with tempfile.TemporaryDirectory() as td:
-            repo = Path(td) / "sutando"
-            repo.mkdir()
+            repo = Path(td) / "engine" / "sutando"
+            repo.mkdir(parents=True)
             for contents in ("{bad", '[]', '{"sutando":42,"ag2space":null}'):
                 (repo.parent / "build-info.json").write_text(contents)
                 versions = report_feedback.build_versions(repo)
@@ -116,6 +117,38 @@ class TestBuildVersions(unittest.TestCase):
             self.assertEqual(versions["ag2space"]["version"], "0.5.2")
             self.assertEqual(versions["ag2space"]["commit"], "desktop-sha")
             self.assertEqual(versions["sutando"]["commit"], "sutando-sha")
+
+    def test_standalone_ignores_unrelated_neighbor_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "sutando"
+            repo.mkdir()
+            (repo.parent / "build-info.json").write_text(json.dumps({
+                "ag2space": {"version": "8.8.8", "commit": "foreign"},
+            }))
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["version"], "unknown")
+
+    def test_git_uses_resolver_and_skips_unavailable_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".git").mkdir()
+            with mock.patch.object(report_feedback, "git_argv", side_effect=OSError("no runnable git")), \
+                    mock.patch.object(subprocess, "check_output") as run:
+                self.assertIsNone(report_feedback._git(repo, "rev-parse", "HEAD"))
+                run.assert_not_called()
+            with mock.patch.object(report_feedback, "git_argv", return_value=["resolved-git", "arg"]), \
+                    mock.patch.object(subprocess, "check_output", return_value="abc") as run:
+                self.assertEqual(report_feedback._git(repo, "rev-parse", "HEAD"), "abc")
+                self.assertEqual(run.call_args.args[0], ["resolved-git", "arg"])
+
+    def test_git_never_inherits_a_parent_repository(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(subprocess, "check_output") as run:
+            self.assertIsNone(report_feedback._git(Path(td), "rev-parse", "HEAD"))
+            run.assert_not_called()
+
+    def test_body_tolerates_incomplete_old_draft_versions(self):
+        body = report_feedback.body_with_versions("details", {"sutando": {"version": "v1"}})
+        self.assertIn("Sutando: v1 (commit: unknown)", body)
+        self.assertIn("AG2Space: unknown (commit: unknown)", body)
 
     def test_git_failure_does_not_prevent_reporting(self):
         with tempfile.TemporaryDirectory() as td:
