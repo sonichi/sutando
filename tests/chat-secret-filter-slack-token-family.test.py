@@ -30,6 +30,8 @@ NEW_KINDS = {
     "legacy (xoxo-)": "xoxo-0000000000-0000000000-0000000000-" + HEX,
     "rotated user (xoxe.xoxp-)": "xoxe.xoxp-1-" + "A0" * 80,
     "rotated bot (xoxe.xoxb-)": "xoxe.xoxb-1-" + "A0" * 80,
+    "browser session (xoxc-)": "xoxc-0000000000-0000000000-0000000000000-" + "a0" * 32,
+    "browser cookie (xoxd-)": "xoxd-1" + "A0" * 40,
 }
 # Kinds the old rule already covered; kept so the family can never shrink.
 OLD_KINDS = {
@@ -76,6 +78,12 @@ class TestEveryTokenKindIsRedacted(unittest.TestCase):
 
     def test_rotated_bot_token_is_redacted_including_its_xoxe_prefix(self):
         self._assert_redacted_whole("rotated bot (xoxe.xoxb-)", NEW_KINDS["rotated bot (xoxe.xoxb-)"])
+
+    def test_browser_session_token_is_redacted(self):
+        self._assert_redacted_whole("browser session (xoxc-)", NEW_KINDS["browser session (xoxc-)"])
+
+    def test_browser_cookie_token_is_redacted(self):
+        self._assert_redacted_whole("browser cookie (xoxd-)", NEW_KINDS["browser cookie (xoxd-)"])
 
     def test_previously_covered_kinds_stay_covered(self):
         for kind, token in OLD_KINDS.items():
@@ -157,9 +165,12 @@ class TestOneSharedDefinition(unittest.TestCase):
             "app token <redacted-token>",
         )
 
-    def test_report_feedback_leaves_a_sign_off_in_prose_alone(self):
+    def test_report_feedback_stays_broad_beside_the_shared_family(self):
+        # The excerpt leaves the machine: report-feedback keeps its pre-#4892 broad
+        # rule beside the shared object and scrubs values the narrow family skips.
         report_feedback = _load_report_feedback()
-        self.assertEqual(report_feedback._redact("hugs xoxo-Sam"), "hugs xoxo-Sam")
+        self.assertEqual(report_feedback._redact("hugs xoxo-Samantha"), "hugs <redacted-token>")
+        self.assertEqual(report_feedback._redact("cookie xoxd-AbCdEfGhIjKl"), "cookie <redacted-token>")
 
     def test_no_other_reader_keeps_a_private_slack_rule(self):
         # Structural pin (REVIEW.md rule 17, second exception): two copies that
@@ -169,6 +180,10 @@ class TestOneSharedDefinition(unittest.TestCase):
             for path in (REPO / top).rglob("*.py"):
                 rel = path.relative_to(REPO).as_posix()
                 if rel == "src/chat_secret_filter.py" or "/tests/" in f"/{rel}":
+                    continue
+                # report-feedback applies the shared object first (pinned above) and
+                # keeps its broad backstop beside it: that excerpt leaves the machine.
+                if rel == "skills/report-feedback/report-feedback.py":
                     continue
                 for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
                     if PRIVATE_SLACK_RULE.search(line):

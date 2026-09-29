@@ -187,9 +187,10 @@ def _redact(text: str) -> str:
     # Slack tokens come from the engine's one family definition, so a rotated
     # xoxe.xoxp- or an xapp- token is scrubbed exactly as the bridges scrub it.
     text = SLACK_TOKEN_PATTERN.sub("<redacted-token>", text)
-    # Other common provider token formats (sk-..., ghp_..., github_pat_..., AIza...)
+    # Broad backstop kept from before the shared family: this excerpt leaves the
+    # machine, so underscore, letter-first and prose-shaped xox lookalikes go too.
     text = re.sub(
-        r"\b(sk|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_\-]{6,}",
+        r"\b(sk|xox[a-z]|xapp|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_\-]{6,}",
         "<redacted-token>",
         text,
     )

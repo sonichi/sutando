@@ -44,9 +44,25 @@ class TestReportFeedbackRedaction(unittest.TestCase):
         self.assertNotIn(token, redacted)
         self.assertIn("<redacted-token>", redacted)
 
-    def test_leaves_a_sign_off_in_prose_alone(self):
-        prose = "thanks for the report, hugs xoxo-Sam"
-        self.assertEqual(report_feedback._redact(prose), prose)
+    def _assert_scrubbed(self, value):
+        self.assertEqual(report_feedback._redact(f"excerpt {value} end"), "excerpt <redacted-token> end")
+
+    def test_redacts_slack_browser_session_token(self):
+        self._assert_scrubbed("xoxc-" + "1234567890-1234567890-1234567890123-" + "a0" * 16)
+
+    def test_redacts_slack_browser_cookie_token(self):
+        self._assert_scrubbed("xoxd-" + "1" + "A0" * 20)
+
+    def test_redacts_underscore_slack_lookalike(self):
+        self._assert_scrubbed("xoxb_" + "1234567890-abcdefghij")
+
+    def test_redacts_letter_first_slack_lookalike(self):
+        self._assert_scrubbed("xoxb-" + "AbCdEfGhIjKl")
+
+    def test_stays_broad_for_a_prose_shaped_slack_lookalike(self):
+        # The excerpt leaves the machine, so unlike the bridges' narrow family this
+        # scrub keeps the pre-#4892 broad rule and takes prose-shaped values too.
+        self._assert_scrubbed("xoxo-Samantha")
 
     def test_redacts_google_api_key(self):
         key = "AIza" + "Sy" + "A" * 33

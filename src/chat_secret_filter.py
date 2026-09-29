@@ -10,12 +10,13 @@ every other reader imports it (``secret_scanner`` for whole-secret redaction
 and the vault value classifier, the report-feedback log scrub). The family is
 wider than the bot/user tokens most scanners key on: ``xoxb-``/``xoxp-``/
 ``xoxa-``/``xoxs-``/``xoxo-`` bot, user, workspace, session and legacy tokens,
-``xoxe-`` refresh tokens, ``xoxr-`` config refresh tokens, the rotated
-``xoxe.xoxb-``/``xoxe.xoxp-`` access tokens, and ``xapp-`` app-level (Socket
-Mode) tokens. A private ``xox[abps]`` copy let a pasted app-level token reach a
-task file in plaintext while the bot token beside it was redacted (user
-feedback, P1-43). Every kind carries a digit right after its dash, so the
-family requires one: a ``xoxo-<name>`` sign-off in prose is left alone.
+``xoxc-``/``xoxd-`` browser session tokens, ``xoxe-`` refresh tokens, ``xoxr-``
+config refresh tokens, the rotated ``xoxe.xoxb-``/``xoxe.xoxp-`` access tokens,
+and ``xapp-`` app-level (Socket Mode) tokens. A private ``xox[abps]`` copy let
+a pasted app-level token reach a task file in plaintext while the bot token
+beside it was redacted (user feedback, P1-43). Every kind carries a digit
+right after its dash, so the family requires one: a ``xoxo-<name>`` sign-off
+in prose is left alone.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from typing import Iterable, Tuple
 
 
 SLACK_TOKEN_PATTERN = re.compile(
-    r"(?:xoxe\.)?xox[abeoprs]-\d[A-Za-z0-9-]*|xapp-\d[A-Za-z0-9-]*"
+    r"(?:xoxe\.)?xox[abcdeoprs]-\d[A-Za-z0-9-]*|xapp-\d[A-Za-z0-9-]*"
 )
 
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
