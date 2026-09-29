@@ -24,6 +24,13 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
  14. A failing `agy mcp list` stops start before launch, or after it with the launched Chrome stopped.
  15. The registry read is the last probe before `agy mcp add`: an entry on another URL written during
      the final listener check is not overwritten.
+ 16. stop fails, not "stopped", when an argv read after the signal fails.
+ 17. python3 comes from the repo resolver: $SUTANDO_PY wins over PATH, and on macOS without the
+     developer tools the system stub is never run.
+ 18. A Chrome another run starts on the profile between the busy check and the launch survives this
+     run's abort; only the process group this run launched is stopped.
+ 19. A second run reaching the registry while the first is inside its read-to-add window waits for
+     it, then sees the first entry and refuses instead of overwriting it.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -56,6 +63,9 @@ if os.environ.get("TERM_DELAY"):
         time.sleep(float(os.environ["TERM_DELAY"]))
         os._exit(0)
     signal.signal(signal.SIGTERM, slow_exit)
+if os.environ.get("READY_FILE"):
+    with open(os.environ["READY_FILE"], "w") as f:
+        f.write(str(os.getpid()))
 if os.environ.get("NOBIND"):
     while True:
         time.sleep(60)
@@ -73,7 +83,12 @@ MOCK_AGY = """#!/bin/bash
 if [[ "$1 $2" == "mcp list" ]]; then
   n=$(( $(cat "$AGY_LIST_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$AGY_LIST_COUNT"
   [[ "$n" == "${AGY_LIST_FAIL_ON:-}" ]] && exit 7
-  cat "$MCP_STATE" 2>/dev/null; exit 0
+  out="$(cat "$MCP_STATE" 2>/dev/null)"
+  if [[ "$n" == "${AGY_LIST_HOLD_ON:-}" ]]; then
+    : >"$HOLD_MARK"
+    for _ in $(seq 1 300); do [[ -f "$HOLD_RELEASE" ]] && break; sleep 0.1; done
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out"; exit 0
 fi
 if [[ "$1 $2" == "mcp add" ]]; then
   [[ -n "${AGY_ADD_FAIL:-}" ]] && exit 1
@@ -151,6 +166,7 @@ def main() -> None:
             AGY_LOG=str(tmp / "agy.log"),
             MCP_STATE=str(tmp / "mcp.state"),
             AGY_LIST_COUNT=str(tmp / "agy-list.count"),
+            SUTANDO_PY=sys.executable,
         )
         args = ["--port", str(port), "--profile", str(profile), "--chrome", str(chrome)]
         try:
@@ -469,10 +485,10 @@ exec "{sys.executable}" "$@"
 """)
         (tmp / "mcp.state").write_text("")
         try:
-            rc, out = run(env, "start", *args)
+            rc, out = run(dict(env, SUTANDO_PY=str(py_wrap)), "start", *args)
             assert rc == 0, f"start failed: {out}"
             (tmp / "py.count").unlink()
-            rc, out = run(dict(env, PY_FAIL_ON="3"), "stop", *args)
+            rc, out = run(dict(env, PY_FAIL_ON="3", SUTANDO_PY=str(py_wrap)), "stop", *args)
             assert int((tmp / "py.count").read_text()) >= 3, "stop never re-read argv after signalling"
             assert rc != 0 and "stopped" not in out, f"stop reported success after a failed argv read: {out}"
         finally:
@@ -483,10 +499,90 @@ exec "{sys.executable}" "$@"
                 break
             time.sleep(0.25)
 
+        log = tmp / "py-which.log"
+        sut_py = write_exec(tmp / "sut-py", f'#!/bin/bash\necho sutando >>"{log}"\nexec "{sys.executable}" "$@"\n')
+        path_py = write_exec(bin_dir / "python3", f'#!/bin/bash\necho path >>"{log}"\nexec "{sys.executable}" "$@"\n')
+        try:
+            run(dict(env, SUTANDO_PY=str(sut_py)), "stop", *args)
+            assert set(log.read_text().split()) == {"sutando"}, f"PATH python3 used over $SUTANDO_PY: {log.read_text()}"
+        finally:
+            path_py.unlink()
+        if sys.platform == "darwin":
+            no_clt = {k: v for k, v in env.items() if k != "SUTANDO_PY"}
+            xs = write_exec(bin_dir / "xcode-select", "#!/bin/bash\nexit 2\n")
+            try:
+                rc, out = run(no_clt, "status", *args)
+                assert rc != 0 and "no runnable python3" in out, f"the system python3 ran without developer tools: {out}"
+            finally:
+                xs.unlink()
+
+        ready = tmp / "rival.ready"
+        py_hook = write_exec(tmp / "py-hook", f"""#!/bin/bash
+n=$(( $(cat "{tmp}/hook.count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"{tmp}/hook.count"
+if [[ "$n" == "${{PY_HOOK_ON:-}}" ]]; then
+  NOBIND=1 READY_FILE="{ready}" "{sys.executable}" -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+    "{chrome}" --user-data-dir="{profile}" --remote-debugging-port=1 >/dev/null 2>&1 &
+  for _ in $(seq 1 100); do [[ -s "{ready}" ]] && break; sleep 0.05; done
+fi
+exec "{sys.executable}" "$@"
+""")
+        (tmp / "mcp.state").write_text("")
+        rc, out = run(dict(env, SUTANDO_PY=str(py_hook), PY_HOOK_ON="2", AGY_ADD_FAIL="1"), "start", *args)
+        try:
+            assert ready.read_text(), "the rival Chrome was never started between check and launch"
+            rival = int(ready.read_text())
+            assert rc != 0 and "stopped the Chrome this run started" in out, f"failed add not reported: {out}"
+            for _ in range(20):
+                if not answers(port):
+                    break
+                time.sleep(0.25)
+            assert not answers(port), "start left its own Chrome running"
+            assert rival in profile_procs(profile), "start's abort killed a Chrome another run started on the profile"
+        finally:
+            kill_profile(profile)
+
+        profile_b, port_b = tmp / "profile-b", free_port()
+        hold, release, b_err = tmp / "hold", tmp / "release", tmp / "b.out"
+        (tmp / "mcp.state").write_text("")
+        adds = len((tmp / "agy.log").read_text().splitlines())
+        run_a = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+            env, AGY_LIST_COUNT=str(tmp / "a.count"), AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold),
+            HOLD_RELEASE=str(release)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        run_b = None
+        try:
+            for _ in range(200):
+                if hold.exists():
+                    break
+                time.sleep(0.1)
+            assert hold.exists(), "the first run never reached its registry read"
+            with open(b_err, "w") as f:
+                run_b = subprocess.Popen(["bash", str(SCRIPT), "start", "--port", str(port_b), "--profile",
+                                          str(profile_b), "--chrome", str(chrome)],
+                                         env=dict(env, AGY_LIST_COUNT=str(tmp / "b.count")), stdout=f, stderr=f)
+                for _ in range(300):
+                    if run_b.poll() is not None or "waiting for another run" in b_err.read_text():
+                        break
+                    time.sleep(0.1)
+            release.touch()
+            out_a = run_a.communicate(timeout=60)[0]
+            rc_b, out_b = run_b.wait(timeout=60), b_err.read_text()
+            assert run_a.returncode == 0, f"the first run failed: {out_a}"
+            assert rc_b != 0 and "not overwriting" in out_b, f"the second run overwrote the first's entry: {out_b}"
+            entries = [l for l in (tmp / "mcp.state").read_text().splitlines() if l.startswith("chrome-devtools ")]
+            assert len(entries) == 1 and f"127.0.0.1:{port} " in entries[0] + " ", f"registry lost the first entry: {entries}"
+            assert len((tmp / "agy.log").read_text().splitlines()) == adds + 8, "the second run registered too"
+        finally:
+            release.touch()
+            for proc in (run_a, run_b):
+                if proc and proc.poll() is None:
+                    proc.kill()
+            kill_profile(profile)
+            kill_profile(profile_b)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 16/16 agy-browser.sh")
+    print("PASS 19/19 agy-browser.sh")
 
 
 if __name__ == "__main__":

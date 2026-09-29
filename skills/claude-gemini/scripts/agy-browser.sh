@@ -46,19 +46,32 @@ PROFILE="$(canon "$PROFILE")"
 
 AGY_BIN="$(command -v agy 2>/dev/null || true)"
 [[ -z "$AGY_BIN" && -x "$HOME/.local/bin/agy" ]] && AGY_BIN="$HOME/.local/bin/agy"
-PYTHON="$(command -v python3 2>/dev/null || true)"
+# The repo's resolver, never a bare `command -v python3`: on macOS that can be the CLT stub, whose
+# first run opens the install-tools dialog.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "$SELF_DIR/../../.." && pwd -P)"
+PYTHON=""
+if [[ -f "$REPO/scripts/python-binary.sh" ]]; then
+  . "$REPO/scripts/python-binary.sh"
+  PYTHON="$(resolve_python "$REPO")"
+elif [[ -n "${SUTANDO_PY:-}" && -x "$SUTANDO_PY" ]]; then
+  PYTHON="$SUTANDO_PY"
+fi
 LSOF="$(command -v lsof 2>/dev/null || true)"
 for c in /usr/sbin/lsof /usr/bin/lsof; do [[ -z "$LSOF" && -x "$c" ]] && LSOF="$c"; done
 CDP_URL="http://127.0.0.1:$PORT"
+LOCK="$HOME/.gemini/agy-browser.lock"
 MCP_PKG="chrome-devtools-mcp@1.10.1"
 
 cdp_up() { curl -fsS --max-time 2 "$CDP_URL/json/version" >/dev/null 2>&1; }
 # PIDs whose argv carries exactly one --user-data-dir, and it is this profile. Compared per argv
-# element, since ps joins argv with spaces and a profile path may itself contain one.
+# element, since ps joins argv with spaces and a profile path may itself contain one. With $1, only
+# those in process group $1.
 profile_pids() {
-  P="$PROFILE" "$PYTHON" - <<'PY'
+  P="$PROFILE" G="${1:-}" "$PYTHON" - <<'PY'
 import ctypes, os, struct, subprocess
 want = b"--user-data-dir=" + os.fsencode(os.environ["P"])
+group = int(os.environ["G"]) if os.environ["G"] else None
 def proc_argv(pid):
     with open(f"/proc/{pid}/cmdline", "rb") as f:
         return f.read().split(b"\0")[:-1]
@@ -85,6 +98,8 @@ else:
 for pid in pids:
     try:
         flags = [a for a in read(pid) if a.startswith(b"--user-data-dir=")]
+        if group is not None and os.getpgid(pid) != group:
+            continue
     except (OSError, ValueError, struct.error):
         continue
     if flags == [want]:
@@ -100,25 +115,39 @@ ours() {
   owned="$(profile_pids)"
   for p in $listeners; do grep -qx "$p" <<<"$owned" || return 1; done
 }
-# TERM every process on the profile, then wait up to 5s for all of them to be gone. An argv read
-# that fails is not "none left", so it fails too.
+# TERM every process on the profile (in process group $1, if given), then wait up to 5s for all of
+# them to be gone. An argv read that fails is not "none left", so it fails too.
 stop_profile() {
-  local pids; pids="$(profile_pids)" || return 1
+  local pids; pids="$(profile_pids "${1:-}")" || return 1
   [[ -n "$pids" ]] || return 0
   kill $pids 2>/dev/null || true
   for _ in $(seq 1 25); do
-    pids="$(profile_pids)" || return 1
+    pids="$(profile_pids "${1:-}")" || return 1
     [[ -z "$pids" ]] && return 0
     sleep 0.2
   done
   return 1
 }
-# Fail, first tearing down the Chrome this run launched, if any. start launches only on a profile
-# with no processes, so every process on it now came from this run.
+# Fail, first tearing down the Chrome this run launched, if any. Chrome is launched as its own
+# process group, so this reaches a child its launcher left behind but not another run's Chrome.
 abort_start() {
   [[ -n "$launched" ]] || fail "$1"
-  stop_profile || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
+  stop_profile "$launched" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
   fail "$1; stopped the Chrome this run started"
+}
+# Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
+# fd 9 holds the flock until exit; writers other than this script are not covered.
+take_lock() {
+  mkdir -p "$(dirname "$LOCK")" && exec 9>>"$LOCK" || return 1
+  "$PYTHON" - <<'PY'
+import fcntl, signal, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("agy-browser.sh: waiting for another run registering with agy", file=sys.stderr, flush=True)
+    signal.alarm(60)
+    fcntl.flock(9, fcntl.LOCK_EX)
+PY
 }
 need_npx() { command -v npx >/dev/null 2>&1; }
 NPX_MSG="npx not found; install Node.js to run chrome-devtools-mcp"
@@ -129,7 +158,7 @@ ELSEWHERE="agy's chrome-devtools server points at another browser URL; not overw
 # agy cannot list its servers.
 mcp_state() {
   [[ -n "$AGY_BIN" ]] || { echo none; return; }
-  local list; list="$("$AGY_BIN" mcp list 2>/dev/null)" || return 1
+  local list; list="$("$AGY_BIN" mcp list 9>&- 2>/dev/null)" || return 1
   printf '%s\n' "$list" | U=" --browserUrl $CDP_URL " K=" $MCP_PKG " awk '
     $1 != "chrome-devtools" { next }
     index($0 " ", ENVIRON["U"]) { s = index($0 " ", ENVIRON["K"]) ? "pinned" : "other"; next }
@@ -151,7 +180,7 @@ find_chrome() {
 }
 
 case "$ACTION" in start|status|stop)
-  [[ -n "$PYTHON" ]] || fail "python3 not found; it is needed to read process argv" ;;
+  [[ -n "$PYTHON" ]] || fail "no runnable python3 (set SUTANDO_PY, or install python3); it is needed to read process argv" ;;
 esac
 
 case "$ACTION" in
@@ -169,7 +198,8 @@ case "$ACTION" in
       busy="$(profile_pids)" || fail "could not read process argv"
       [[ -z "$busy" ]] || fail "$PROFILE is already in use (PIDs $(tr '\n' ' ' <<<"$busy" | sed 's/ $//')) but not listening on $CDP_URL; stop it first or pick another --profile."
       chrome="$(find_chrome)"
-      nohup "$chrome" --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
+      nohup "$PYTHON" -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+        "$chrome" --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
         --remote-debugging-address=127.0.0.1 --no-first-run --no-default-browser-check \
         --headless=new about:blank >/dev/null 2>&1 &
       launched=$!
@@ -179,14 +209,15 @@ case "$ACTION" in
       echo "browser: started on $CDP_URL (profile $PROFILE)"
     fi
     # Recheck both after the launch wait, the listener first so the registry read sits right
-    # before the add. agy has no compare-and-swap; the read after the add catches later writers.
+    # before the add. The read after the add catches writers outside the lock.
     ours || abort_start "$NOT_OURS"
+    take_lock || abort_start "could not lock $LOCK within 60s"
     state="$(mcp_state)" || abort_start "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && abort_start "$ELSEWHERE"
     if [[ "$state" == pinned ]]; then
       echo "mcp: chrome-devtools already registered"
     else
-      "$AGY_BIN" mcp add chrome-devtools npx -y "$MCP_PKG" --browserUrl "$CDP_URL" >/dev/null \
+      "$AGY_BIN" mcp add chrome-devtools npx -y "$MCP_PKG" --browserUrl "$CDP_URL" >/dev/null 9>&- \
         || abort_start "agy mcp add failed"
       after="$(mcp_state)" || abort_start "$LIST_FAILED"
       [[ "$after" == pinned ]] || abort_start "agy's chrome-devtools entry changed while registering (now: $after); check 'agy mcp list'"
