@@ -5,13 +5,11 @@ Mocks the agy/gemini binaries and verifies:
      --mode / --dangerously-skip-permissions flags.
   2. `agy` found only via the ~/.local/bin fallback (not on PATH, matching the
      cron/bridge shells named in skills/claude-router/SKILL.md) is still resolved
-     and invoked -- the fix for keweichen's PATH-resolution blocker on PR #4267.
+     and invoked.
   3. A gemini-only environment (no agy anywhere) still succeeds via the legacy
      gemini backend, using the parent commit's original argv mapping
      (--approval-mode passed straight through, --include-directories instead of
-     --add-dir) -- the fix for the backward-compat blocker on PR #4267. This is a
-     regression pin: it must fail against the pre-fix PR #4267 head, which hard-fails
-     any environment lacking agy.
+     --add-dir). A wrapper that requires agy fails this in any environment lacking it.
   4. An unknown --approval-mode is rejected regardless of backend.
   5. Prompt is required unless --check is used.
 
@@ -65,8 +63,8 @@ def test_agy_on_path(tmp: Path) -> None:
 
 
 def test_agy_local_bin_fallback(tmp: Path) -> None:
-    # agy is NOT on PATH -- only reachable via $HOME/.local/bin, the cron/bridge
-    # shape keweichen's review reproduced (skills/claude-router/SKILL.md:36).
+    # agy is NOT on PATH -- only reachable via $HOME/.local/bin, as in the
+    # cron/bridge shells (skills/claude-router/SKILL.md:36).
     home = tmp / "home_agy_fallback"
     make_mock(home / ".local" / "bin", "agy")
     mock_out = tmp / "agy_fallback.argv"
