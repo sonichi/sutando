@@ -128,7 +128,7 @@ stop_profile() {
   return 1
 }
 # Fail, first tearing down the Chrome this run launched, if any. The launcher reports its group
-# before it reads the cancel file, so wait for that report or its exit before $HS can be removed.
+# before it reads the cancel file, so wait for that report or its exit; on_exit decides about $HS.
 abort_start() {
   [[ -n "$launched" ]] || fail "$1"
   : >"$HS/cancel"
@@ -142,12 +142,21 @@ abort_start() {
   [[ -n "$pg" ]] || pg="$(cat "$HS/pgid" 2>/dev/null)" || true
   if [[ -z "$pg" ]]; then
     launcher_alive || fail "$1; Chrome's launcher exited without starting it"
-    trap - EXIT
     fail "$1; Chrome's launcher has not started it yet; it will read $HS/cancel and exit without starting it"
   fi
   kill -TERM -- "-$pg" 2>/dev/null || true
   stop_profile "$pg" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
+  settled=1; rm -rf "$HS"
   fail "$1; stopped the Chrome this run started"
+}
+# Every exit, signals included, that did not end in success cancels the launch. $HS is removed only
+# once the launcher is stopped or gone: before its report, the cancel file is what stops it.
+on_exit() {
+  [[ -n "${HS:-}" && -z "$settled" ]] || return 0
+  : >"$HS/cancel" 2>/dev/null || true
+  local pg; pg="$(cat "$HS/pgid" 2>/dev/null)" || true
+  if [[ -n "$pg" ]]; then kill -TERM -- "-$pg" 2>/dev/null || true; rm -rf "$HS"
+  elif [[ -n "${launcher:-}" ]] && ! launcher_alive; then rm -rf "$HS"; fi
 }
 launcher_alive() { local st; st="$(ps -o stat= -p "$launcher" 2>/dev/null)" && [[ "$st" != Z* ]]; }
 # Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
@@ -205,7 +214,7 @@ case "$ACTION" in
     [[ -n "$LSOF" ]] || fail "lsof not found; it is needed to check who owns $CDP_URL"
     state="$(mcp_state)" || fail "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && fail "$ELSEWHERE"
-    launched=""
+    launched="" settled="" HS=""
     if cdp_up; then
       ours || fail "$NOT_OURS"
       echo "browser: already listening on $CDP_URL"
@@ -214,7 +223,7 @@ case "$ACTION" in
       [[ -z "$busy" ]] || fail "$PROFILE is already in use (PIDs $(tr '\n' ' ' <<<"$busy" | sed 's/ $//')) but not listening on $CDP_URL; stop it first or pick another --profile."
       chrome="$(find_chrome)"
       HS="$(mktemp -d)" || fail "could not create a temporary directory"
-      trap 'rm -rf "$HS"' EXIT
+      trap on_exit EXIT
       nohup "$PYTHON" -c '
 import os, shutil, sys
 os.setsid()
@@ -243,16 +252,27 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
     state="$(mcp_state)" || abort_start "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && abort_start "$ELSEWHERE"
     ours || abort_start "$NOT_OURS"
+    added=""
     if [[ "$state" == pinned ]]; then
-      echo "mcp: chrome-devtools already registered"
+      msg="mcp: chrome-devtools already registered"
     else
       "$AGY_BIN" mcp add chrome-devtools npx -y "$MCP_PKG" --browserUrl "$CDP_URL" >/dev/null 9>&- \
         || abort_start "agy mcp add failed"
+      added=1
       after="$(mcp_state)" || abort_start "$LIST_FAILED"
       [[ "$after" == pinned ]] || abort_start "agy's chrome-devtools entry changed while registering (now: $after); check 'agy mcp list'"
-      if [[ "$state" == other ]]; then echo "mcp: chrome-devtools re-registered with $MCP_PKG"
-      else echo "mcp: chrome-devtools registered with agy"; fi
+      if [[ "$state" == other ]]; then msg="mcp: chrome-devtools re-registered with $MCP_PKG"
+      else msg="mcp: chrome-devtools registered with agy"; fi
     fi
+    # The add and the list after it can block too; a listener swapped meanwhile is never reported as ours.
+    if ! ours; then
+      [[ -z "$added" ]] || "$AGY_BIN" mcp remove chrome-devtools >/dev/null 2>&1 9>&- \
+        || abort_start "$NOT_OURS; could not remove the chrome-devtools entry this run added: run 'agy mcp remove chrome-devtools'"
+      abort_start "$NOT_OURS${added:+; removed the chrome-devtools entry this run added}"
+    fi
+    echo "$msg"
+    settled=1
+    if [[ -n "$HS" ]]; then rm -rf "$HS"; fi
     ;;
   status)
     rc=0

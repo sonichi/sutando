@@ -36,6 +36,10 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      reads it: start exits without removing it (a hooked rm would let the launcher's report land just
      before the removal), the launcher then exits without exec'ing Chrome and removes the directory.
  22. A listener swapped in while the registry read under the lock is blocked is refused, not registered.
+ 23. A listener swapped in while `agy mcp add`, or the list after it, is blocked fails start: the
+     entry this run added is removed and the foreign listener is left running.
+ 24. A start killed by SIGTERM after the launcher reported its group, but before start stopped that
+     group, still cancels the launch: no Chrome comes up and the handshake directory is removed.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -101,7 +105,16 @@ if [[ "$1 $2" == "mcp add" ]]; then
   printf '%s\\n' "$@" >>"$AGY_LOG"
   shift 2; name="$1"; shift
   grep -v "^$name " "$MCP_STATE" >"$MCP_STATE.new" 2>/dev/null; mv "$MCP_STATE.new" "$MCP_STATE"
-  echo "$name  stdio  enabled  $*" >>"$MCP_STATE"; exit 0
+  echo "$name  stdio  enabled  $*" >>"$MCP_STATE"
+  if [[ -n "${AGY_ADD_HOLD:-}" ]]; then
+    : >"$HOLD_MARK"
+    for _ in $(seq 1 300); do [[ -f "$HOLD_RELEASE" ]] && break; sleep 0.1; done
+  fi
+  exit 0
+fi
+if [[ "$1 $2" == "mcp remove" ]]; then
+  echo "remove $3" >>"$AGY_LOG"
+  grep -v "^$3 " "$MCP_STATE" >"$MCP_STATE.new" 2>/dev/null; mv "$MCP_STATE.new" "$MCP_STATE"; exit 0
 fi
 exit 1
 """
@@ -703,10 +716,113 @@ exec "{sys.executable}" "$@"
                 foreign.kill()
             kill_profile(profile)
 
+        for case, hold_env in (("add", {"AGY_ADD_HOLD": "1"}), ("post-add list", {"AGY_LIST_HOLD_ON": "3"})):
+            (tmp / "mcp.state").write_text("")
+            rc, out = run(env, "start", *args)
+            assert rc == 0, f"start before the {case} swap case failed: {out}"
+            (tmp / "mcp.state").write_text("")
+            hold, release, foreign, swapper = tmp / "add.hold", tmp / "add.release", None, None
+            hold.unlink(missing_ok=True)
+            release.unlink(missing_ok=True)
+            try:
+                swapper = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                    env, AGY_LIST_COUNT=str(tmp / f"{case}.count"), HOLD_MARK=str(hold),
+                    HOLD_RELEASE=str(release), **hold_env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for _ in range(200):
+                    if hold.exists() or swapper.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                assert hold.exists(), f"start never reached the held {case}"
+                kill_profile(profile)
+                for _ in range(40):
+                    if not answers(port):
+                        break
+                    time.sleep(0.25)
+                foreign = subprocess.Popen([str(chrome), f"--user-data-dir={tmp}/foreign", f"--remote-debugging-port={port}"], env=env)
+                wait_up(port, "the foreign listener")
+                release.touch()
+                out = swapper.communicate(timeout=60)[0]
+                assert swapper.returncode != 0 and "not running on" in out, f"a listener swapped during the {case} was reported as ours: {out}"
+                assert "removed the chrome-devtools entry" in out, f"the {case} swap did not report removing its entry: {out}"
+                assert f"127.0.0.1:{port}" not in (tmp / "mcp.state").read_text(), f"the listener swapped during the {case} stays registered"
+                assert foreign.poll() is None and answers(port), f"start's abort after the {case} killed the foreign listener"
+            finally:
+                release.touch()
+                if swapper and swapper.poll() is None:
+                    swapper.kill()
+                if foreign:
+                    foreign.kill()
+                kill_profile(profile)
+
+        for _ in range(40):
+            if not answers(port):
+                break
+            time.sleep(0.25)
+        launches = len((tmp / "chrome.log").read_text().splitlines())
+        marks = {k: tmp / f"sig.{k}" for k in ("go", "renamed", "blocked", "sent")}
+        cat_hook = write_exec(bin_dir / "cat", f"""#!/bin/bash
+if [[ "$1" == */pgid && ! -e "{marks['blocked']}" ]]; then
+  : >"{marks['go']}"
+  for _ in $(seq 1 100); do [[ -f "$1" ]] && break; sleep 0.1; done
+  : >"{marks['blocked']}"
+  for _ in $(seq 1 300); do sleep 0.1; done
+fi
+exec /bin/cat "$@"
+""")
+        sig_py = write_exec(tmp / "sig-py", f"""#!/bin/bash
+if [[ "$2" == *setsid* ]]; then
+  echo "$3" >"{tmp}/sig.hs"
+  exec "{sys.executable}" -c '
+import os, sys, time
+code, sys.argv = sys.argv[1], ["-c"] + sys.argv[2:]
+real = os.rename
+def rename(a, b):
+    for _ in range(600):
+        if os.path.exists("{marks['go']}"):
+            break
+        time.sleep(0.1)
+    real(a, b)
+    open("{marks['renamed']}", "w").close()
+    for _ in range(600):
+        if os.path.exists("{marks['sent']}"):
+            break
+        time.sleep(0.1)
+os.rename = rename
+exec(compile(code, "<launcher>", "exec"))' "$2" "${{@:3}}"
+fi
+exec "{sys.executable}" "$@"
+""")
+        (tmp / "mcp.state").write_text("")
+        starter = None
+        try:
+            starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(env, SUTANDO_PY=str(sig_py)),
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            for _ in range(400):
+                if marks["blocked"].exists() or starter.poll() is not None:
+                    break
+                time.sleep(0.1)
+            assert marks["blocked"].exists(), f"start never blocked reading the reported group: {starter.poll()}"
+            assert marks["renamed"].exists(), "the launcher had not reported its group before the signal"
+            os.killpg(starter.pid, signal.SIGTERM)
+            out = starter.communicate(timeout=30)[0]
+            marks["sent"].touch()
+            assert starter.returncode != 0, f"start killed by SIGTERM exited 0: {out}"
+            time.sleep(3)
+            assert not answers(port), "Chrome came up after start was killed mid-abort"
+            assert profile_procs(profile) == [], "a process on the profile outlived the killed start"
+            assert len((tmp / "chrome.log").read_text().splitlines()) == launches, "the launcher exec'd Chrome after start was killed"
+            assert not Path((tmp / "sig.hs").read_text().strip()).exists(), "the killed start left its handshake directory"
+        finally:
+            marks["sent"].touch()
+            cat_hook.unlink()
+            if starter and starter.poll() is None:
+                starter.kill()
+            kill_profile(profile)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 22/22 agy-browser.sh")
+    print("PASS 24/24 agy-browser.sh")
 
 
 if __name__ == "__main__":
