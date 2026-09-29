@@ -61,6 +61,10 @@ _FABLE_AUTO = {"state": "blocked-known", "detail": "at known gate: fable-limit",
                "kind": "fable-limit",
                "auto_answered": {"kind": "fable-limit", "key": "Enter", "at": 1788380000.0}}
 _FABLE_AUTO_LATER = dict(_IDLE, auto_answered=_FABLE_AUTO["auto_answered"])
+# A seat's monitor switched a turn refused at the Fable limit (typed `/model opus`).
+_FABLE_REFUSED_AUTO = dict(_IDLE, seat="Pro-fast",
+                           auto_answered={"kind": "fable-limit-refused", "key": ["/model opus", "Enter"],
+                                          "at": 1788400000.0})
 _PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
@@ -162,6 +166,14 @@ class TestShouldEscalate(unittest.TestCase):
 
 
 class TestComposeMessage(unittest.TestCase):
+    def test_a_refused_turn_switch_names_the_worker_and_the_switch(self):
+        self.assertTrue(should_escalate(_FABLE_REFUSED_AUTO, None)[0])
+        msg = compose_message(dict(_FABLE_REFUSED_AUTO, seat="sutando-worker-d2571c90"))
+        self.assertIn("worker sutando-worker-d2571c90", msg)
+        self.assertIn("/model opus", msg)
+        self.assertNotIn("Agent needs you", msg)
+        self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
+
     def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
         msg = compose_message(_FABLE_AUTO)
         self.assertIn("Fable weekly limit", msg)
@@ -1036,6 +1048,58 @@ class TestTargetIsRunnable(unittest.TestCase):
             msg = compose_message(_HUNG)
         self.assertIn("where the core is running", msg)
         self.assertNotIn("tmux -S", msg)
+
+
+class TestSeatNotices(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.core = os.path.join(self.d, "core-supervisor.json")
+        self.state = os.path.join(self.d, "relay.state")
+        with open(self.core, "w") as f:
+            json.dump(_IDLE, f)
+
+    def _seat(self, name, signal):
+        with open(os.path.join(self.d, f"core-supervisor.{name}.json"), "w") as f:
+            json.dump(signal, f)
+
+    def _run(self, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(["--signal", self.core, "--state-file", self.state, "--no-macos", *extra])
+        return out.getvalue()
+
+    def test_a_seat_soft_notice_is_relayed_once_under_its_own_state(self):
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        sent = []
+        orig = _mod._macos_notify
+        _mod._macos_notify = sent.append
+        try:
+            first = self._run()
+            second = self._run()
+        finally:
+            _mod._macos_notify = orig
+        self.assertIn("worker Pro-fast", first)
+        self.assertNotIn("worker Pro-fast", second)
+        self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
+
+    def test_a_seat_hard_gate_is_left_to_its_own_card(self):
+        self._seat("sutando-worker-ab", _LOGIN)
+        self.assertNotIn("sutando-worker-ab", self._run())
+
+    def test_no_seats_skips_them(self):
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        self.assertNotIn("Pro-fast", self._run("--no-seats"))
+
+    def test_a_sibling_that_names_no_seat_is_not_a_seat(self):
+        self._seat("sutando-worker-ab", {k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"})
+        self.assertEqual(_mod.relay_seat_notices(self.core, self.state, dry_run=True), [])
+
+    def test_a_seat_signal_given_as_signal_does_not_scan_siblings(self):
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        self._seat("sutando-worker-cd", _FABLE_REFUSED_AUTO)
+        self.assertEqual(_mod.relay_seat_notices(
+            os.path.join(self.d, "core-supervisor.sutando-worker-ab.json"), self.state, dry_run=True), [])
 
 
 if __name__ == "__main__":
