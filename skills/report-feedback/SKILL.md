@@ -1,11 +1,13 @@
 ---
 name: report-feedback
-description: File a bug report, feature request, or feedback about Sutando to the team from any surface (chat, Discord, Telegram, or a voice-delegated task) — or automatically (--auto) when the agent itself hits a Sutando/AG2 Space bug. Reuses the cloud /api/feedback API and auto-attaches diagnostic context. Use when the user says "report a bug", "something's broken, file it", "I have a feature request", etc.
+description: THE way a bug, feature request or feedback about Sutando, AG2 Space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/AG2 Space bug. Files through the cloud /api/feedback API with diagnostic context and replies with the reference id. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
 ---
 
 # Report Feedback
 
-When the user asks to **report a bug / issue / feature request / feedback about Sutando itself** — e.g. "report a bug", "something's broken, file it", "I have a feature request" — use this skill to file it.
+When the user asks to **report a bug / issue / feature request / feedback about Sutando, AG2 Space or the desktop app** — e.g. "report this bug", "report this issue", "report an issue", "file a bug", "log this bug", "submit feedback", "I have a feature request", "tell the team this is broken" — use this skill to file it, whether the ask comes in a DM, in a room or by voice. "Report this on the PR" or "report this to <someone>" asks for a PR comment or a message, not a report.
+
+**This is the only path that reaches the AG2 team.** The report goes skill → `/api/feedback` → Slack #product-feedback, a GitHub issue on sonichi/sutando and the master feedback DB. A message in a room or a DM, a hand-opened GitHub issue, or asking another agent (another Sutando included) to "add a row" or pass it on never gets there; do not do those instead of filing. After filing, reply with the reference id the script prints.
 
 It posts to the cloud `/api/feedback` route (the same one the desktop "Report an issue" form uses, which mirrors into GitHub issues) and auto-attaches diagnostic context (platform + a tail of recent workspace logs), so you don't need to gather logs yourself.
 
@@ -152,11 +154,15 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 - Every report includes Sutando and AG2Space version/commit identifiers in both structured context and a readable body section, even with `--no-logs`. Packaged apps use build-stamped metadata; source checkouts include the Git revision and tracked local-edit marker. Parked reports retain their incident-time versions across upgrades; older drafts and unavailable identifiers are explicitly `unknown`.
 
 - Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. For `--auto` reports, don't nag: mention it at most once.
-- On success it prints `OK: filed <kind> report`. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
+- On success it prints `OK: filed <kind> report (<status>). Reference: <id>.` (the id the feedback API returned; the line has no `Reference:` when the API named none). Tell the user it is filed and give the reference. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
 - Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
 
 ## Access tier
 
-**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Do not run it for non-owner (team/other) Discord, Slack, or Telegram tiers.
+**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
 
-Non-owner tasks never reach this skill: the bridges route team/other tiers to a sandboxed `codex exec --sandbox read-only` agent (see CLAUDE.md access-control), which has no cloud token and cannot execute this script — so a non-owner can't ship the owner's logs into an issue. Only `access_tier: owner` (or an unauthenticated local/voice owner task) is processed with full capabilities that can invoke this skill.
+Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
+
+### When a non-owner asks
+
+This applies to every task whose `access_tier` is not `owner`, a collaborator's included. A teammate, a guest or another agent asking you to report a bug cannot be filed under your owner's identity. Never stay silent and never hand it to another agent. Answer them in one line: file it through your own `report-feedback` skill (a person: through their own Sutando), or with the **Report a bug** button in the AG2 Space app (the bug icon in the composer), which files it under their own account. If your owner asks you to file it for them, it is the owner's report: file it as usual.

@@ -38,6 +38,8 @@ os.environ["SUTANDO_STOP_HOOK_WATCHER_GATE"] = "0"
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 HOOK = REPO / "src" / "check-pending-tasks.sh"
+# The hook gates only the launcher-marked core (or an enrolled worker); this suite is the core.
+os.environ["SUTANDO_CORE_SESSION"] = "1"
 RESOLVE = 'WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"'
 REPO_LINE = 'REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"'
 

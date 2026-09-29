@@ -1,12 +1,19 @@
 ---
 name: claude-gemini
-description: "Use the local Gemini CLI from Claude Code with the user's existing Gemini authentication or API configuration. Use for large-context repo scans, multimodal analysis, second-opinion planning, or structured Gemini runs in the current workspace."
+description: "Use the local Antigravity CLI (agy, Gemini-backed) from Claude Code with the user's existing Gemini authentication or API configuration. Use for large-context repo scans, multimodal analysis, second-opinion planning, or structured Gemini runs in the current workspace."
 user-invocable: true
 ---
 
 # Claude Gemini
 
-Delegate work from Claude Code to the local `gemini` CLI. This skill uses whatever authentication the Gemini CLI is already configured to use on this machine, including API key or signed-in CLI flows. It does not copy or export secrets.
+Delegate work from Claude Code to the local `agy` (Antigravity CLI) — Google folded the standalone
+`gemini` CLI this skill used to wrap into Antigravity CLI in 2026, so `agy` is what this skill drives
+now. This skill uses whatever authentication `agy` is already configured to use on this machine
+(Gemini API key or signed-in Google auth). It does not copy or export secrets. `agy`'s Gemini-API-key
+path needs BOTH `modelProvider: "gemini"` set in `~/.gemini/antigravity-cli/settings.json` AND the
+`GEMINI_API_KEY` env var — the env var alone does nothing; `gemini-run.sh --check` reports both.
+If `agy` isn't installed but the legacy `gemini` CLI still is, `gemini-run.sh` falls back to it
+automatically, so a gemini-only host keeps working.
 
 **Usage**: `/claude-gemini [prompt]`
 
@@ -38,8 +45,8 @@ bash "$SKILL_DIR/scripts/gemini-run.sh" --check
 # Read-only analysis
 bash "$SKILL_DIR/scripts/gemini-run.sh" -- "Trace how tasks flow from voice input to execution"
 
-# Explicit model selection
-bash "$SKILL_DIR/scripts/gemini-run.sh" --model gemini-2.5-pro -- "Review the repo structure and identify weak points"
+# Explicit model selection (see `agy models` for the current list)
+bash "$SKILL_DIR/scripts/gemini-run.sh" --model gemini-3.1-pro-high -- "Review the repo structure and identify weak points"
 
 # Machine-readable output
 bash "$SKILL_DIR/scripts/gemini-run.sh" --output-format json -- "Summarize risks in src/startup.sh"

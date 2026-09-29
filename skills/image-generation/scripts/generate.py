@@ -43,8 +43,8 @@ REFUSAL_REASONS = ("SAFETY", "IMAGE_SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", 
                    "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "IMAGE_OTHER")
 EXIT = {"ok": 0, "refused": 1, "no_image": 1, "api_error": 1, "quota": 1, "no_key": 2, "sdk_missing": 2, "bad_input": 2}
 REMEDY = {
-    "no_key": "Add a Gemini key in Agent settings → Agent → Gemini API, or ask again once your plan includes the managed key.",
-    "quota": "Google returned a quota error for the image model. A free-tier Gemini key has 0 image requests per day: enable billing on the key's Google Cloud project, or use the managed key (Agent settings → Agent → Gemini API).",
+    "no_key": "Add a Gemini API key in Agent settings → Agent → Gemini API (the managed voice credential is a Live-only token and cannot generate images).",
+    "quota": "Google returned a quota error for the image model. A free-tier Gemini key has 0 image requests per day: enable billing on the key's Google Cloud project.",
     "refused": "Reword the prompt: no real people's faces, no copyrighted characters, nothing explicit.",
     "no_image": "Try a more concrete prompt that describes a picture, or name the style and the subject.",
     "api_error": "Try again in a moment; if it keeps failing, check the key and the model name (IMAGE_MODEL).",

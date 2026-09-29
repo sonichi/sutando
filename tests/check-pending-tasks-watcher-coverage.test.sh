@@ -39,7 +39,8 @@ ledger_ok() { "$PY" "$REPO/src/turn_ledger.py" --workspace "$WS" no-send "covera
 run_hook() {  # $1 verdict, rest: extra env assignments
   local v="$1"; shift
   ledger_ok
-  (cd "$BUNDLE" && env -u CLAUDE_CODE_SESSION_ID -u SUTANDO_INSTANCE_ID -u SUTANDO_CORE_SESSION -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID STUB_VERDICT="$v" "$@" bash "$HOOK" 2>"$BUNDLE/err")
+  # The core is the launcher's marked session; a worker case passes its id on top.
+  (cd "$BUNDLE" && env -u CLAUDE_CODE_SESSION_ID -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID SUTANDO_CORE_SESSION=1 STUB_VERDICT="$v" "$@" bash "$HOOK" 2>"$BUNDLE/err")
 }
 counter_path() {  # the production module names the file, under the same env the hook saw
   (cd "$BUNDLE" && env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID "$@" "$PY" src/stop_hook_unwatched.py path --state "$WS/state")

@@ -28,6 +28,9 @@
 exec 9>&1
 
 set -u
+# Job-control noise (out-of-band socket data, a resized terminal) never ends this
+# watcher, whatever disposition a launcher left these signals at.
+trap '' URG WINCH
 
 # The handler records ownership before publishing; this wrapper passes its
 # resolved interpreter to the shared stage writer.
@@ -625,7 +628,7 @@ prepare_handler_state() {
 transition() {
   [ -n "${SUTANDO_WATCHER_TRANSITION_HOOK:-}" ] || return 0
   # Backgrounded and waited on, so a signal interrupts the wait (bash defers
-  # traps until a foreground child exits); cleanup's kill 0 ends the hook.
+  # traps until a foreground child exits); cleanup ends it with the other children.
   "$SUTANDO_WATCHER_TRANSITION_HOOK" "$1" "$2" 2>/dev/null &
   wait "$!" 2>/dev/null || true
 }
@@ -979,10 +982,8 @@ _tmux_wake() {
 # Clean up on exit:
 # - rm PID file (so the next session's PID-gate check sees "absent" rather
 #   than a stale entry that needs `kill -0` to disqualify).
-# - kill 0 → kill all processes in this process group, including the
-#   fswatch subprocess (Mode B fix — #1088). Without this, when the parent
-#   shell exits the watcher reparents to launchd (PPID=1) and runs
-#   indefinitely with no consumer, silently dropping every event.
+# - kill every child (and grandchild) by pid, and the process group only when
+#   this process leads it, so no fswatch outlives this watcher with no reader.
 # - `trap '' TERM HUP INT` right before kill 0: this process IS a member of
 #   its own process group, so `kill 0` re-delivers TERM/HUP/INT to itself —
 #   while already inside a trap handler for one of those same signals. On
@@ -1032,7 +1033,17 @@ cleanup() {
     rm -f "$WATCH_RUNTIME_DIR/events"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
   fi
-  kill -TERM 0 2>/dev/null || true
+  # A group this process does not lead is its launcher's (a wrapper shell waiting
+  # to report this exit), so only a group leader signals the whole group.
+  local _c _g
+  for _c in $(pgrep -P $$ 2>/dev/null); do
+    pkill -TERM -P "$_c" 2>/dev/null || true
+    kill -TERM "$_c" 2>/dev/null || true
+  done
+  _g="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  if [ "$_g" = "$$" ]; then
+    kill -TERM 0 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 # HUP/INT/TERM must explicitly exit after cleanup — a trap only overrides the
@@ -1094,24 +1105,63 @@ if [ -n "$HANDLER_CONFIG_DIR" ]; then
   mkdir -p "$HANDLER_CONFIG_DIR"
   fswatch_paths+=("$HANDLER_CONFIG_DIR")
 fi
-fswatch \
-  -l 0.5 \
-  --event Created \
-  --event Renamed \
-  --event Updated \
-  "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
-FSWATCH_PID=$!
-# The writer end opens only once a reader exists, so fswatch execs here, not at
-# the launch above; fd 3 stays open so the loop's own open can never be the last reader.
-exec 3< "$WATCH_RUNTIME_DIR/events"
-fswatch_alive=1
-for _ in 1 2 3 4 5; do
-  kill -0 "$FSWATCH_PID" 2>/dev/null || { fswatch_alive=0; break; }
-  sleep 0.1
-done
+# fswatch's open of the FIFO blocks until fd 3's reader exists, opened once and kept for
+# life (a relaunch writes at once). 0: still up half a second later; 1: it was not.
+FSWATCH_READER_OPEN=""
+FSWATCH_STARTED_AT=0
+launch_fswatch() {
+  fswatch \
+    -l 0.5 \
+    --event Created \
+    --event Renamed \
+    --event Updated \
+    "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  FSWATCH_PID=$!
+  FSWATCH_STARTED_AT="$(date +%s)"
+  if [ -z "$FSWATCH_READER_OPEN" ]; then
+    exec 3< "$WATCH_RUNTIME_DIR/events"
+    FSWATCH_READER_OPEN=1
+  fi
+  local _
+  for _ in 1 2 3 4 5; do
+    kill -0 "$FSWATCH_PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 0
+}
+# A dead fswatch is relaunched with backoff; a run lasting FSWATCH_RESTART_STABLE_S resets
+# the budget. 0: relaunched, or a failed relaunch the next EOF retries; 1: given up.
+FSWATCH_RESTART_MAX="${SUTANDO_FSWATCH_RESTART_MAX:-5}"
+FSWATCH_RESTART_STABLE_S="${SUTANDO_FSWATCH_RESTART_STABLE_S:-60}"
+FSWATCH_RESTARTS=0
+restart_fswatch() {
+  local frc delay _s
+  wait "$FSWATCH_PID" 2>/dev/null; frc=$?
+  [ $(( $(date +%s) - FSWATCH_STARTED_AT )) -lt "$FSWATCH_RESTART_STABLE_S" ] || FSWATCH_RESTARTS=0
+  if [ "$FSWATCH_RESTARTS" -ge "$FSWATCH_RESTART_MAX" ]; then
+    echo "watch-tasks-stream: fswatch (pid $FSWATCH_PID) exited with status $frc and would not stay up through $FSWATCH_RESTARTS relaunches; giving up on $TASKS_DIR_ABS" >&2
+    return 1
+  fi
+  FSWATCH_RESTARTS=$((FSWATCH_RESTARTS + 1))
+  delay=$(( 1 << (FSWATCH_RESTARTS - 1) ))
+  [ "$delay" -le 30 ] || delay=30
+  echo "watch-tasks-stream: fswatch (pid $FSWATCH_PID) exited with status $frc; restarting it in ${delay}s (relaunch $FSWATCH_RESTARTS of $FSWATCH_RESTART_MAX)" >&2
+  # Backgrounded and waited on, so a TERM during the backoff runs cleanup at
+  # once (bash defers traps until a foreground child exits).
+  sleep "$delay" & _s=$!
+  wait "$_s" 2>/dev/null || true
+  [ "${CLEANING_UP:-0}" -eq 0 ] || return 1
+  if ! launch_fswatch; then
+    echo "watch-tasks-stream: relaunched fswatch (pid $FSWATCH_PID) did not stay up" >&2
+    return 0
+  fi
+  echo "watch-tasks-stream: fswatch relaunched as pid $FSWATCH_PID; sweeping $TASKS_DIR_ABS for what arrived meanwhile" >&2
+  startup_sweep
+  return 0
+}
 # Exit before the sentinel stamp: a watcher that cannot serve the inbox leaves
 # whatever is serving it untouched.
-if [ "$fswatch_alive" -eq 0 ]; then
+if ! launch_fswatch; then
   echo "watch-tasks-stream: fswatch failed to start; no sentinel written and no standby touched" >&2
   exit 1
 fi
@@ -1206,16 +1256,15 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
-# readiness replay above, since a second open of the FIFO would race it for bytes.
-# While anything is held the read is timed, so a quiet inbox still reaches the
-# held retry: read returns >128 on the timeout and 1 on EOF, never the same.
+# While anything is held the read is timed, so a quiet inbox still reaches the held
+# retry. bash 3.2 returns 1 for a timeout as for EOF: only a dead writer means EOF.
 held_read_timeout() {
   local left
   [ -n "$HELD_NAMES" ] || { echo 0; return; }
   left=$(( HELD_RETRY_AT - $(date +%s) ))
   [ "$left" -gt 0 ] && echo "$left" || echo 1
 }
+# fd 3 is the one reader: a second open of the FIFO would race it for bytes.
 while :; do
   # A due deadline is served BEFORE the read, so `-t` is never 0 and the held
   # set and deadline are current when the timeout is computed.
@@ -1231,7 +1280,17 @@ while :; do
     handle_event "$path"
   elif [ "$rc" -gt 128 ]; then
     :   # the timeout: nothing arrived; the loop head serves the deadline
+  elif kill -0 "$FSWATCH_PID" 2>/dev/null && ! proc_is_zombie "$FSWATCH_PID"; then
+    # A live writer: bash 3.2's timeout. A writer mid-exit answers kill -0 too, so
+    # an untimed read pauses here rather than spinning until it is gone.
+    [ "$t" -gt 0 ] || sleep 0.1
   else
-    break   # EOF: fswatch is gone, held or not
+    # EOF: fswatch is gone. Relaunch it (restart_fswatch); only when it will not
+    # stay up does this loop end, and then the watcher says so and exits 1.
+    restart_fswatch || { FSWATCH_LOST=1; break; }
   fi
 done
+if [ "${FSWATCH_LOST:-}" = 1 ]; then
+  echo "watch-tasks-stream: leaving $TASKS_DIR_ABS unwatched: fswatch could not be kept running" >&2
+  exit 1
+fi

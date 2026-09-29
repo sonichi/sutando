@@ -14,7 +14,7 @@
  *  5. S3/R15 read side: opaque generations are REPORTED (managed `generation`
  *     field / SUTANDO_VOICE_CREDENTIAL_GENERATION), never minted; top-level
  *     `preferenceRevision`/`sessionRevision` are tolerated and ignored.
- *  6. 'gemini-image': slots text THEN voice per tier; a byok voice preference
+ *  6. 'gemini-image': env slots text THEN voice; the managed tier offers its TEXT slot only; a byok voice preference
  *     skips only the managed voice slot; a managed preference never blocks its
  *     env fallback; quarantine hides every managed entry.
  *
@@ -261,15 +261,22 @@ test('image: legacy env chain is TEXT key first, then VOICE key, then none', () 
 		{ key: '', source: 'none' });
 });
 
-test('image: managed TEXT beats managed VOICE and env; a voice-only managed install serves images', () => {
+test('image: managed TEXT beats env; the managed VOICE entry (a Live-only token) is never an image key', () => {
 	process.env.GEMINI_API_KEY = 'mk';
 	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS) }),
 		{ key: 'managed-t', source: 'managed' });
-	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }) }),
-		{ key: 'managed-v', source: 'managed' });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	process.env.GEMINI_VOICE_API_KEY = 'vk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: 'vk', source: 'env' });
+	delete process.env.GEMINI_VOICE_API_KEY;
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } }) }),
+		{ key: '', source: 'none' });
 });
 
-test('image: byok voice preference skips only the managed VOICE slot', () => {
+test('image: a byok voice preference changes nothing for the image walk', () => {
 	process.env.GEMINI_API_KEY = 'mk';
 	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged(BOTH_SLOTS, { voicePreference: 'byok' }) }),
 		{ key: 'managed-t', source: 'managed' });

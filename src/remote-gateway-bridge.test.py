@@ -1395,6 +1395,32 @@ def main() -> int:
     check(not young.exists() and len(STATE["room_posts"]) == posts_b4_young + 1,
           "configured bridge with no trace yet: a file past the abandonment window is released")
 
+    # Slack is a bridge channel too (P1-27): owner on slack + a configured,
+    # recently alive slack bridge keeps its aged file out of this gateway.
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "slack", "summary": "hi"}))
+    (_gate_cfg / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+    (_gate_cfg / "channels" / "slack" / "access.json").write_text('{"allowFrom": ["1"]}')
+    _slog = rtc.WS / "logs" / "slack-bridge.log"
+    _slog.write_text("alive\n")
+    slack_owned = rtc.RESULTS_DIR / "proactive-t11s.txt"
+    slack_owned.write_text("slack owner's nudge, bridge alive\n")
+    os.utime(slack_owned, (aged, aged))
+    posts_b4_slack = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(slack_owned.exists() and len(STATE["room_posts"]) == posts_b4_slack,
+          "owner-on-slack, slack bridge configured + alive: aged nudge is never stolen")
+    # ...and with no slack bridge on this host, the past-grace fallback delivers.
+    slack_owned.unlink()
+    _slog.unlink()
+    shutil.rmtree(_gate_cfg / "channels" / "slack")
+    unowned = rtc.RESULTS_DIR / "proactive-t11t.txt"
+    unowned.write_text("slack owner's nudge, no slack bridge here\n")
+    os.utime(unowned, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_slack + 1 and not unowned.exists(),
+          "owner-on-slack, no slack bridge configured: past-grace fallback delivers")
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
+
     # `.env`-only configuration counts too (health-check.py's own either/or).
     (_gate_cfg / "channels" / "telegram").mkdir(parents=True, exist_ok=True)
     (_gate_cfg / "channels" / "telegram" / ".env").write_text("TELEGRAM_BOT_TOKEN='x'\n")

@@ -33,14 +33,18 @@ FAST_SUSTAINED_TICKS = 2
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
-# A wedged live session's card: the cause named (abnormal text), or a frozen turn
-# offering an Escape the owner must press. Neither decision ends or types into a session.
-CARD_CAUSE, CARD_FROZEN = "card_cause", "card_frozen"
+# A wedged live session's card: the cause named (abnormal text), a frozen turn
+# offering an Escape, or an expired login. No card decision ends or types into a session.
+CARD_CAUSE, CARD_FROZEN, CARD_LOGIN = "card_cause", "card_frozen", "card_login"
+# The card each wedge kind asks for; "human" has none, it escalates.
+WEDGE_CARDS = {"abnormal": CARD_CAUSE, "stuck": CARD_FROZEN, "login": CARD_LOGIN}
 
 # The worker's pane, as the caller reads one capture. GATE and LIMIT wait on a
 # human (a dialog, a spend or wait decision), so they escalate as a gate does.
 PANE_IDLE, PANE_WORKING, PANE_GATE, PANE_LIMIT, PANE_ABNORMAL, PANE_UNKNOWN = (
     "idle", "working", "gate", "limit", "abnormal", "unknown")
+# The CLI's own "Login expired · Please run /login": alive, and able to do no work.
+PANE_LOGGED_OUT = "logged-out"
 _HUMAN_PANES = (PANE_GATE, PANE_LIMIT)
 
 
@@ -85,6 +89,8 @@ class WorkerEvidence:
     wedge_first_detected_at: float | None = None
     wedge_consecutive: int = 0
     wedge_escalated: bool = False
+    # The kind this tick's wedge reads as; `wedge_escalated` is about this kind only.
+    wedge_kind: str | None = None
     last_pane_id: str | None = None
 
 
@@ -126,11 +132,17 @@ def _is_watcher_loss(obs: Observation) -> bool:
 
 
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
-    """"human" (a gate or limit on screen), "abnormal" (cli_wedge text), "stuck"
-    (a turn whose raw frame has not changed since the last tick), else None.
-    Only a worker that owes work is wedged: an idle pane at rest is healthy, and
-    one that owes work but sits at its prompt is the watcher rung's case."""
-    if obs.session_alive is not True or obs.work_outstanding is not True:
+    """"login" (the session is logged out), "human" (a gate or limit on screen),
+    "abnormal" (cli_wedge text), "stuck" (a turn whose raw frame has not changed
+    since the last tick), else None. A logged-out session is wedged whether or
+    not it owes work: nothing routed to it can ever run. Otherwise only a worker
+    that owes work is wedged: an idle pane at rest is healthy, and one that owes
+    work but sits at its prompt is the watcher rung's case."""
+    if obs.session_alive is not True:
+        return None
+    if obs.pane == PANE_LOGGED_OUT:
+        return "login"
+    if obs.work_outstanding is not True:
         return None
     if obs.pane in _HUMAN_PANES:
         return "human"
@@ -143,33 +155,41 @@ def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
 
 def _cleared_wedge(ev: WorkerEvidence) -> WorkerEvidence:
     return replace(ev, wedge_first_detected_at=None, wedge_consecutive=0,
-                   wedge_escalated=False)
+                   wedge_escalated=False, wedge_kind=None)
 
 
 def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
                 sustained_ticks: int, detect_after_s: float) -> tuple[WorkerEvidence, str]:
     """Same sustain and stale line as death, and one decision per episode: a gate
     or limit escalates; abnormal text asks for a card naming its cause; a frozen
-    turn asks for a card offering Escape. No wedge kind restarts a session."""
+    turn asks for a card offering Escape; an expired login asks for a card on
+    the tick that reads it, since the banner is the CLI's own words and not a
+    timing question a sustain could answer. No wedge kind restarts a session.
+    The one decision is per (episode, kind): a pane that moves from one wedge
+    straight into another is owed the new kind's decision, since the card already
+    up names a condition the pane no longer shows."""
     kind = _wedge_kind(obs, ev)
     ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
         return _cleared_wedge(ev), NOTHING
+    if ev.wedge_escalated and ev.wedge_kind not in (None, kind):
+        ev = replace(ev, wedge_escalated=False)
     ev = replace(
         ev,
+        wedge_kind=kind,
         wedge_consecutive=ev.wedge_consecutive + 1,
         wedge_first_detected_at=(ev.wedge_first_detected_at
                                  if ev.wedge_first_detected_at is not None else now),
     )
     elapsed = now - ev.wedge_first_detected_at
-    if ev.wedge_consecutive < sustained_ticks or elapsed < detect_after_s:
+    if kind != "login" and (ev.wedge_consecutive < sustained_ticks or elapsed < detect_after_s):
         return ev, NOTHING
     if ev.wedge_escalated:
         return ev, NOTHING
     if kind == "human":
         return replace(ev, wedge_escalated=True), ESCALATE
     # A card decision repeats each tick until `acknowledge` records that it was raised.
-    return ev, CARD_CAUSE if kind == "abnormal" else CARD_FROZEN
+    return ev, WEDGE_CARDS[kind]
 
 
 def acknowledge(state: SupervisionState, worker_ids) -> SupervisionState:
