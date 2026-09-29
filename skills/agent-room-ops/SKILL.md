@@ -187,8 +187,9 @@ layer (its CLAUDE.md equivalent) at connect time.
 **Bug and feature reports**
 - A room post, or asking another agent to log it, never reaches the AG2 team.
   Your owner's report goes through the `report-feedback` skill, the only path.
-  A non-owner who asks is told in one line to report from their own agent or
-  the app's **Report a bug** button; never leave the ask unanswered.
+  A non-owner who asks is told in one line to file it through their own
+  `report-feedback` skill or the app's **Report a bug** button; never leave the
+  ask unanswered.
 
 **Errors & retries**
 - `403` = a gate said no (tier, membership, contextNotFrom). Don't retry —

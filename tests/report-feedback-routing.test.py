@@ -19,8 +19,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "skills" / "report-feedback" / "SKILL.md"
-TRIGGERS = ("report this", "report an issue", "report a bug", "file a bug", "log this bug",
-            "submit feedback", "feature request", "tell the team this is broken")
+TRIGGERS = ("report this bug", "report this issue", "report an issue", "report a bug", "file a bug",
+            "log this bug", "submit feedback", "feature request", "tell the team this is broken")
+# In a dev room these mean a PR comment or a message, not a feedback row.
+NOT_TRIGGERS = ("report this to teammate-a", "report this on the PR")
 RULE = ("Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop app, in a DM "
         "or a room, use the `report-feedback` skill, never a chat post or another agent; reply with the "
         "reference id it returns.")
@@ -36,11 +38,24 @@ def _description() -> str:
     return m.group(1)
 
 
+def _listed_triggers() -> list[str]:
+    m = re.search(r"Use when the owner says (.*?), in a DM, a room or by voice", _description())
+    assert m, "the description has no trigger list"
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
 class TheDescriptionFiresOnPlainAsks(unittest.TestCase):
     def test_every_plain_phrasing_is_a_trigger(self):
-        desc = _description().lower()
+        listed = [t.lower() for t in _listed_triggers()]
         for phrase in TRIGGERS:
-            self.assertIn(f'"{phrase}"', desc, f"trigger missing: {phrase!r}")
+            self.assertIn(phrase, listed, f"trigger missing: {phrase!r}")
+
+    def test_a_pr_comment_or_a_message_is_not_a_trigger(self):
+        listed = [t.lower() for t in _listed_triggers()]
+        self.assertNotIn("report this", listed)
+        for ask in NOT_TRIGGERS:
+            for trigger in listed:
+                self.assertFalse(ask.lower().startswith(trigger), f"{ask!r} would fire on {trigger!r}")
 
     def test_it_says_it_is_the_only_path_and_what_is_not_reporting(self):
         desc = _description()
@@ -53,8 +68,9 @@ class TheDescriptionFiresOnPlainAsks(unittest.TestCase):
     def test_an_ask_in_a_room_counts_and_a_non_owner_is_answered(self):
         desc = _description()
         self.assertIn("in a DM, a room or by voice", desc)
-        self.assertIn("A non-owner asking gets told to report from their own agent or the app's Report a "
-                      "bug button.", desc)
+        self.assertIn("A non-owner asking is told to file it through their own report-feedback skill or "
+                      "the app's Report a bug button.", desc)
+        self.assertNotIn("their own agent", desc)
 
     def test_it_fits_the_runtime_limit(self):
         self.assertLessEqual(len(_description()), 1024)
@@ -74,9 +90,18 @@ class TheSkillBody(unittest.TestCase):
         m = re.search(r"### When a non-owner asks (.*?)(?= ## | ### |\Z)", self.text)
         self.assertIsNotNone(m, "the non-owner section is missing")
         section = m.group(1)
-        for words in ("Never stay silent and never hand it to another agent.", "their own agent",
+        for words in ("This applies to every task whose `access_tier` is not `owner`, a collaborator's "
+                      "included.", "Never stay silent and never hand it to another agent.",
+                      "file it through your own `report-feedback` skill",
                       "**Report a bug** button in the AG2 Space app (the bug icon in the composer)"):
             self.assertIn(words, section)
+        self.assertNotIn("their own agent", section)
+
+    def test_the_access_tier_does_not_claim_collaborators_are_sandboxed(self):
+        self.assertNotIn("Non-owner tasks never reach this skill", self.text)
+        self.assertIn("AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's "
+                      "listed collaborators run in the owner's core with its normal tools", self.text)
+        self.assertIn("Nothing structural stops them from running this script", self.text)
 
     def test_the_success_line_documents_the_reference(self):
         self.assertIn("`OK: filed <kind> report (<status>). Reference: <id>.`", self.text)
@@ -102,7 +127,9 @@ class TheAccessPolicy(unittest.TestCase):
         text = _norm((REPO / "docs" / "access-control.md").read_text(encoding="utf-8"))
         self.assertIn("## A non-owner asking to report a bug", text)
         self.assertIn("never hand it to another agent", text)
+        self.assertIn("file it through your own `report-feedback` skill", text)
         self.assertIn("**Report a bug** button", text)
+        self.assertNotIn("their own agent", text)
 
 
 
@@ -112,7 +139,8 @@ class TheRoomConventions(unittest.TestCase):
         section = text[text.index("**Bug and feature reports**"):text.index("**Errors & retries**")]
         self.assertIn("never reaches the AG2 team", section)
         self.assertIn("the `report-feedback` skill, the only path", section)
-        self.assertIn("their own agent or the app's **Report a bug** button", section)
+        self.assertIn("file it through their own `report-feedback` skill or the app's **Report a bug** "
+                      "button", section)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
