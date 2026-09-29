@@ -103,8 +103,10 @@ describe('the spoken block', () => {
 	});
 
 	it('a turn the model started on its own does not wait', async () => {
-		// No user speech for longer than RECENT_SPEECH_MS: nothing can be landing.
-		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'Reminder: standup in five.' }], pendingInput: '', lastUserSpeechAt: Date.now() - RECENT_SPEECH_MS - 1 }));
+		// No user speech for longer than RECENT_SPEECH_MS: nothing can be landing. The stamp is fixed
+		// here, not read inside the provider, so a clock tick between the two reads cannot make it recent.
+		const quietSince = Date.now() - RECENT_SPEECH_MS - 1000;
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'Reminder: standup in five.' }], pendingInput: '', lastUserSpeechAt: quietSince }));
 		assert.equal(_speechMayBeLanding(), false);
 		const t0 = Date.now();
 		assert.deepEqual(await _awaitSpokenTurns(2, 1500), []);
