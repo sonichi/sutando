@@ -19,6 +19,45 @@ automatically, so a gemini-only host keeps working.
 
 ARGUMENTS: $ARGUMENTS
 
+## Setup
+
+1. Install the Antigravity app and CLI:
+
+   ```bash
+   brew install --cask antigravity
+   curl -fsSL https://antigravity.google/cli/install.sh | bash   # installs ~/.local/bin/agy
+   ```
+
+2. Pick one way to authenticate:
+   - Google sign-in: run `agy` once interactively and follow the prompt.
+   - Gemini API key: write `{"modelProvider": "gemini"}` to `~/.gemini/antigravity-cli/settings.json`
+     and have `GEMINI_API_KEY` in the environment `agy` runs in. Keep the key in the vault
+     (`secret-vault.py env GEMINI_API_KEY -- ...`), never in a file.
+
+3. Confirm: `bash "$SKILL_DIR/scripts/gemini-run.sh" --check`.
+
+## Browser
+
+`agy`'s browser tools need a Chrome that exposes the DevTools protocol. Its built-in `/browser`
+attaches to the user's running Chrome and offers to restart it — never accept that, since it holds
+the user's own tabs and sessions. Give `agy` a Chrome of its own instead:
+
+```bash
+bash "$SKILL_DIR/scripts/agy-browser.sh" start    # headless Chrome on its own profile, 127.0.0.1:9222,
+                                                  # and registers the chrome-devtools MCP server with agy
+bash "$SKILL_DIR/scripts/agy-browser.sh" status
+bash "$SKILL_DIR/scripts/agy-browser.sh" stop     # stops only that profile's Chrome
+```
+
+`start` is safe to re-run and does nothing already done. The profile defaults to
+`~/.gemini/antigravity-browser-profile`; `--port`, `--profile` and `--chrome` override. Then ask `agy`
+to use the MCP tools by name:
+
+```bash
+agy -p "Using the chrome-devtools MCP tools, open https://example.com and save a screenshot to /tmp/shot.png" \
+  --dangerously-skip-permissions --print-timeout 240s
+```
+
 ## When to Use
 
 - "Use Gemini on this repo"
