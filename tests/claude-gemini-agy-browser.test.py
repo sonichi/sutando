@@ -31,6 +31,11 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      run's abort; only the process group this run launched is stopped.
  19. A second run reaching the registry while the first is inside its read-to-add window waits for
      it, then sees the first entry and refuses instead of overwriting it.
+ 20. A listener swapped in while start waits for the lock is refused and left running.
+ 21. An abort before the launcher reports its group leaves the cancel file in place until the launcher
+     reads it: start exits without removing it (a hooked rm would let the launcher's report land just
+     before the removal), the launcher then exits without exec'ing Chrome and removes the directory.
+ 22. A listener swapped in while the registry read under the lock is blocked is refused, not registered.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -613,34 +618,95 @@ exec "{sys.executable}" "$@"
             kill_profile(profile)
 
         launches = len((tmp / "chrome.log").read_text().splitlines())
-        woke = tmp / "launch.woke"
-        slow_py = write_exec(tmp / "slow-py", f"""#!/bin/bash
+        release = tmp / "launch.release"
+        rm_hook = write_exec(bin_dir / "rm", f"""#!/bin/bash
+for a in "$@"; do
+  if [[ -d "$a" && -e "$a/pgid.tmp" ]]; then
+    : >"{tmp}/rm.called"
+    for _ in $(seq 1 100); do [[ -f "{tmp}/launch.renamed" ]] && break; sleep 0.1; done
+  fi
+done
+exec /bin/rm "$@"
+""")
+        held_py = write_exec(tmp / "held-py", f"""#!/bin/bash
 if [[ "$2" == *setsid* ]]; then
-  printf '%s\\0' "$@" >"{tmp}/launch.args"
-  exec "{sys.executable}" -c 'import os, sys, time; time.sleep(18); open(sys.argv[2], "w").close(); a = open(sys.argv[1], "rb").read().split(b"\\0")[:-1]; os.execv(sys.executable, [sys.executable] + a)' "{tmp}/launch.args" "{woke}"
+  exec "{sys.executable}" -c '
+import os, sys, time
+code, sys.argv = sys.argv[1], ["-c"] + sys.argv[2:]
+real = os.rename
+def rename(a, b):
+    for _ in range(600):
+        if os.path.exists("{tmp}/rm.called") or os.path.exists("{release}"):
+            break
+        time.sleep(0.1)
+    real(a, b)
+    open("{tmp}/launch.renamed", "w").close()
+    time.sleep(1)
+os.rename = rename
+exec(compile(code, "<launcher>", "exec"))' "$2" "${{@:3}}"
 fi
 exec "{sys.executable}" "$@"
 """)
         (tmp / "mcp.state").write_text("")
         try:
-            rc, out = run(dict(env, SUTANDO_PY=str(slow_py)), "start", *args)
-            assert rc != 0 and "had not started it yet" in out, f"abort before the launcher's setsid misreported: {out}"
-            for _ in range(60):
-                if woke.exists():
+            rc, out = run(dict(env, SUTANDO_PY=str(held_py)), "start", *args)
+            assert rc != 0 and "has not started it yet" in out, f"abort before the launcher's report misreported: {out}"
+            hs = Path(out.split("will read ", 1)[1].split("/cancel", 1)[0])
+            assert (hs / "cancel").exists(), f"the cancel file is gone before the launcher read it: {out}"
+            assert not (tmp / "rm.called").exists(), "start removed the cancel file before the launcher read it"
+            release.touch()
+            for _ in range(40):
+                if (tmp / "launch.renamed").exists() and not hs.exists():
                     break
                 time.sleep(0.25)
-            assert woke.exists(), "the delayed launcher never resumed"
+            assert (tmp / "launch.renamed").exists(), "the held launcher never resumed"
             time.sleep(2)
             assert not answers(port), "Chrome came up after start reported the abort"
             assert profile_procs(profile) == [], "a process on the profile outlived the abort"
             assert len((tmp / "chrome.log").read_text().splitlines()) == launches, "the cancelled launcher still exec'd Chrome"
+            assert not hs.exists(), "the launcher left its handshake directory after reading the cancel"
         finally:
+            rm_hook.unlink()
+            kill_profile(profile)
+
+        (tmp / "mcp.state").write_text("")
+        rc, out = run(env, "start", *args)
+        assert rc == 0, f"start before the registry-read swap case failed: {out}"
+        (tmp / "mcp.state").write_text("")
+        hold, release, foreign, swapper = tmp / "swap.hold", tmp / "swap.release", None, None
+        try:
+            swapper = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                env, AGY_LIST_COUNT=str(tmp / "swap.count"), AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold),
+                HOLD_RELEASE=str(release)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for _ in range(200):
+                if hold.exists():
+                    break
+                time.sleep(0.1)
+            assert hold.exists(), "start never reached its registry read under the lock"
+            kill_profile(profile)
+            for _ in range(40):
+                if not answers(port):
+                    break
+                time.sleep(0.25)
+            foreign = subprocess.Popen([str(chrome), f"--user-data-dir={tmp}/foreign", f"--remote-debugging-port={port}"], env=env)
+            wait_up(port, "the foreign listener")
+            release.touch()
+            out = swapper.communicate(timeout=60)[0]
+            assert swapper.returncode != 0 and "not running on" in out, f"a listener swapped during the registry read was registered: {out}"
+            assert f"127.0.0.1:{port}" not in (tmp / "mcp.state").read_text(), "the swapped listener was registered"
+            assert foreign.poll() is None and answers(port), "start's abort killed the foreign listener"
+        finally:
+            release.touch()
+            if swapper and swapper.poll() is None:
+                swapper.kill()
+            if foreign:
+                foreign.kill()
             kill_profile(profile)
 
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 21/21 agy-browser.sh")
+    print("PASS 22/22 agy-browser.sh")
 
 
 if __name__ == "__main__":

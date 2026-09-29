@@ -127,15 +127,29 @@ stop_profile() {
   done
   return 1
 }
-# Fail, first tearing down the Chrome this run launched, if any. Only the group the launcher reported
-# after its setsid is ours; before that report, the cancel file stops the launcher from exec'ing.
+# Fail, first tearing down the Chrome this run launched, if any. The launcher reports its group
+# before it reads the cancel file, so wait for that report or its exit before $HS can be removed.
 abort_start() {
   [[ -n "$launched" ]] || fail "$1"
   : >"$HS/cancel"
-  [[ -s "$HS/pgid" ]] || fail "$1; Chrome's launcher had not started it yet and will exit without starting it"
-  stop_profile "$(cat "$HS/pgid")" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
+  local pg=""
+  for _ in $(seq 1 50); do
+    pg="$(cat "$HS/pgid" 2>/dev/null)" || true
+    [[ -n "$pg" ]] && break
+    launcher_alive || break
+    sleep 0.1
+  done
+  [[ -n "$pg" ]] || pg="$(cat "$HS/pgid" 2>/dev/null)" || true
+  if [[ -z "$pg" ]]; then
+    launcher_alive || fail "$1; Chrome's launcher exited without starting it"
+    trap - EXIT
+    fail "$1; Chrome's launcher has not started it yet; it will read $HS/cancel and exit without starting it"
+  fi
+  kill -TERM -- "-$pg" 2>/dev/null || true
+  stop_profile "$pg" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
   fail "$1; stopped the Chrome this run started"
 }
+launcher_alive() { local st; st="$(ps -o stat= -p "$launcher" 2>/dev/null)" && [[ "$st" != Z* ]]; }
 # Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
 # fd 9 holds the flock until exit; writers other than this script are not covered.
 take_lock() {
@@ -202,30 +216,33 @@ case "$ACTION" in
       HS="$(mktemp -d)" || fail "could not create a temporary directory"
       trap 'rm -rf "$HS"' EXIT
       nohup "$PYTHON" -c '
-import os, sys
+import os, shutil, sys
 os.setsid()
 hs = sys.argv[1]
 with open(hs + "/pgid.tmp", "w") as f:
     f.write(str(os.getpid()))
 os.rename(hs + "/pgid.tmp", hs + "/pgid")
 if os.path.exists(hs + "/cancel"):
+    shutil.rmtree(hs, ignore_errors=True)
     sys.exit(1)
 os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
         "$chrome" --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
         --remote-debugging-address=127.0.0.1 --no-first-run --no-default-browser-check \
         --headless=new about:blank >/dev/null 2>&1 &
+      launcher=$!
       launched=1
       for _ in $(seq 1 30); do cdp_up && break; sleep 0.5; done
       cdp_up || abort_start "Chrome did not start listening on $CDP_URL within 15s"
       ours || abort_start "$NOT_OURS"
       echo "browser: started on $CDP_URL (profile $PROFILE)"
     fi
-    # Recheck both under the lock, which may have waited 60s: the listener, then the registry right
-    # before the add. The read after the add catches writers outside the lock.
+    # Recheck both under the lock, which may have waited 60s; the listener again after the registry
+    # read, which can block. The read after the add catches writers outside the lock.
     take_lock || abort_start "could not lock $LOCK within 60s"
     ours || abort_start "$NOT_OURS"
     state="$(mcp_state)" || abort_start "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && abort_start "$ELSEWHERE"
+    ours || abort_start "$NOT_OURS"
     if [[ "$state" == pinned ]]; then
       echo "mcp: chrome-devtools already registered"
     else
