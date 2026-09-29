@@ -60,14 +60,13 @@
 /skills/connect-apps/      @bassilkhilo-ag2      # 9 commits, sole contributor
 /skills/marketplace/       @bassilkhilo-ag2      # 4 commits, sole contributor
 
-# John Marshall (jsun-m): clear leader by commit count. Rui added as backup
-# co-owner on src/observability/ (owner-assigned) -- real 2nd place there
-# (3 vs 8). tests/observability/'s real 2nd is @qingyun-wu (2 vs 7) -- NOT
-# covered by the `*` fallback: this line is more specific and wins over it
-# (last-match-wins), so @jsun-m alone owns these files today. Whether to add
-# her here too is an open call, not yet made.
+# John Marshall (jsun-m): clear leader by commit count. Rui and Qingyun added
+# as backup co-owners (owner-assigned) -- real 2nd places (3 vs 8, 2 vs 7).
+# Neither line was covered by the `*` fallback: both come after it in the
+# file and win outright (last-match-wins is positional, not about
+# specificity) -- without these lines, @jsun-m alone would own both paths.
 /src/observability/        @jsun-m @john-the-dev # jsun-m 8, Rui 3, Susan/Qingyun/Mark/Chi 1 each
-/tests/observability/      @jsun-m               # jsun-m 7, Qingyun 2, Rui/Mark/Chi 1 each
+/tests/observability/      @jsun-m @qingyun-wu   # jsun-m 7, Qingyun 2, Rui/Mark/Chi 1 each
 
 # Mark: co-owner where he's clear 2nd place (added 2026-09-28, owner-assigned: 'add Mark for areas he's 2nd').
 /skills/call-diagnostics/  @liususan091219 @marklysze     # Susan 4, Mark 3, Qingyun 2
