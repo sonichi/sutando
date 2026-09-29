@@ -13,6 +13,7 @@ the surface that did not.
 Run: python3 tests/morning-briefing-health-truncation.test.py
 """
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -80,7 +81,9 @@ class _RR:
     returncode, stdout, stderr = 0, REM, ""
 
 
-with patch.object(subprocess, "run", return_value=_RR()):
+# The local Reminders read is the owner's opt-in; this case is about the count.
+with patch.dict(os.environ, {"MORNING_BRIEFING_CALENDAR_SOURCE": "macos"}), \
+     patch.object(subprocess, "run", return_value=_RR()):
     got_rem = mb.get_reminders()
 check(got_rem is not None and len(got_rem) == 8,
       f"get_reminders returns every item, not a capped 5 (got {got_rem and len(got_rem)})")

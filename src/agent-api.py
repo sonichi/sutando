@@ -11,6 +11,7 @@ Endpoints:
   GET  /tasks/history     — authenticated archive-backed task history
   POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
+  GET  /health            — per-agent health snapshot (?agent=all|core|workers|<id>&view=summary|full)
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
   POST /twilio/sms        — inbound SMS webhook (Twilio)
@@ -61,7 +62,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 
 
 def _safe_id(raw: str) -> str:
@@ -122,6 +123,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+import health_snapshot  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
@@ -990,6 +992,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/health":
+            query = parse_qs(urlparse(self.path).query)
+            agent = (query.get("agent") or ["all"])[0]
+            view = (query.get("view") or ["summary"])[0]
+            if view not in health_snapshot.VIEWS:
+                self.send_private_json(400, {"error": f"view must be one of {', '.join(health_snapshot.VIEWS)}"})
+                return
+            # `full` carries paths and account detail, so it gets the history routes' loopback gate.
+            if not (self.check_private_history_auth() if view == "full" else self.check_auth()):
+                return
+            self.send_private_json(200, health_snapshot.snapshot(WORKSPACE_DIR, agent=agent, view=view))
         elif path == "/tasks/history":
             if not self.check_private_history_auth():
                 return

@@ -25,6 +25,7 @@ unreadable status file yields `unknown`, never a crash. This is a read-only
 observer; it starts nothing and kills nothing.
 """
 import json
+import re
 import math
 import os
 import tempfile
@@ -508,11 +509,22 @@ def _pane_text():
     return out if rc == 0 else ""
 
 
+# Proof the CLI got past a login marker: a sign-in that succeeded, or a turn that did real
+# work (a refused turn finishes in 0-1 s, so a short one proves nothing).
+_LOGGED_IN_AGAIN = re.compile(r"^\s*(?:⎿\s*)?Login successful\b", re.I)
+_REAL_TURN = re.compile(r"^\s*✻\s+[A-Za-z]+\s+for\s+(?![01]s\b)\d+[hms]")
+
+
 def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
-    without a live tmux — this is the load-bearing 'stuck vs thinking' decision."""
-    low = pane_text.lower()
-    return any(m in low for m in _LOGIN_MARKERS)
+    without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
+    Only the latest marker counts, and only if nothing after it shows the CLI signed in."""
+    lines = pane_text.splitlines()
+    last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
+               default=None)
+    if last is None:
+        return False
+    return not any(_LOGGED_IN_AGAIN.match(ln) or _REAL_TURN.match(ln) for ln in lines[last + 1:])
 
 
 def _core_status(workspace):

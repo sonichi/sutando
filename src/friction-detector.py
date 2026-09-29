@@ -35,6 +35,7 @@ RESULTS_DIR = WORKSPACE / "results"
 # as the morning briefing's all-clear (#2528). Marked items are real report
 # lines, so `all_issues` is non-empty and the all-clear is withheld.
 UNCHECKED = "COULD NOT CHECK: "
+REMINDERS_OPT_IN_EXIT = 2  # reminders.py's "no owner consent" exit (native_pim_consent.EXIT_NO_CONSENT)
 
 # pending-questions.md is enumerated in full only while the list is short.
 # Past this it collapses to a count + the oldest few; see check_pending_questions.
@@ -235,10 +236,16 @@ def check_overdue_reminders():
         # Use sys.executable: friction-detector runs via cron (launchd-managed);
         # bare `python3` can resolve to a different interpreter on minimal PATH.
         # See feedback_subprocess_sys_executable.md.
+        # No --owner-asked here: this runs unattended, so only the owner's host
+        # opt-in (env or the consent marker, checked by reminders.py) lets it read.
         result = subprocess.run(
             [sys.executable, str(script), "list"],
             capture_output=True, text=True, timeout=10
         )
+        if result.returncode == REMINDERS_OPT_IN_EXIT:
+            print("  reminders probe off: local Reminders is opt-in (SUTANDO_ALLOW_NATIVE_PIM=1 "
+                  "or native_pim_consent.py grant)", file=sys.stderr)
+            return []
         if result.returncode != 0:
             return [UNCHECKED + f"overdue reminders (reminders.py exited "
                     f"{result.returncode})"]

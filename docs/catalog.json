@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-15"
+   "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -105,8 +105,8 @@
     "operators"
    ],
    "status": "active",
-   "canonical_for": "Codex core setup and rollback",
-   "last_verified": "2026-08-04"
+   "canonical_for": "Codex core setup, earned-reset policy, and rollback",
+   "last_verified": "2026-09-27"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -145,7 +145,18 @@
    ],
    "status": "draft",
    "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
-   "last_verified": "2026-08-02"
+   "last_verified": "2026-09-28"
+  },
+  "docs/health-snapshot.md": {
+   "title": "Health snapshot: GET /health",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the per-agent health snapshot served at GET /health: its sources, how each source's opinion is derived and combined, reasons, and blind spots",
+   "last_verified": "2026-09-28"
   },
   "docs/design-credential-capability-resolver.md": {
    "title": "Credential resolution by capability, not key (G8)",
@@ -236,7 +247,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-09-25"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -248,7 +259,7 @@
    ],
    "status": "canonical",
    "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-   "last_verified": "2026-08-04"
+   "last_verified": "2026-09-18"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
    "title": "Claude Code Hook Contract — v1",
@@ -299,7 +310,7 @@
    ],
    "status": "active",
    "canonical_for": "generated source-module inventory",
-   "last_verified": "2026-07-23"
+   "last_verified": "2026-09-18"
   },
   "docs/state-sync-allowlist.md": {
    "title": "State sync allowlist design",
@@ -472,7 +483,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-09-11"
+   "last_verified": "2026-09-25"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -483,6 +494,16 @@
    "status": "draft",
    "canonical_for": "the record behind the v1 worker-pool design: rejected alternatives, the failure model inherited from the #3860 draft, and the owner decisions it encodes",
    "last_verified": "2026-09-08"
+  },
+  "docs/task-watcher-hosting-modes.md": {
+   "title": "Task watcher hosting modes — session watcher, standby, supervisor",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
+   "last_verified": "2026-09-22"
   }
  }
 }

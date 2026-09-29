@@ -46,6 +46,22 @@ check "scutil exit-0 EMPTY falls back to hostname" "fallback" "$out"
 out="$(unset SUTANDO_HOST_LABEL SUTANDO_HOST_OVERRIDE; FAKE_RC=1 FAKE_HOSTNAME=slow.local _host)"
 check "scutil nonzero falls back to hostname" "slow" "$out"
 
+# The config-first branch. The five cases above are its negative control: with
+# SCRIPT_PARENT unset the function falls through, it does not abort under set -u.
+ROOT="$(mktemp -d)"; mkdir -p "$ROOT/scripts"
+cat > "$ROOT/scripts/sutando-config.sh" <<'EOF'
+#!/usr/bin/env bash
+[ "${1-}" = host-label ] && printf '  %s  \n' "${FAKE_CFG_LABEL-}"
+EOF
+chmod +x "$ROOT/scripts/sutando-config.sh"
+
+out="$(SCRIPT_PARENT="$ROOT" SUTANDO_HOST_LABEL=EnvLoses FAKE_CFG_LABEL=FromConfig FAKE_LHN=ShouldNotWin _host)"
+check "configured label wins over env and scutil (whitespace trimmed)" "FromConfig" "$out"
+
+out="$(SCRIPT_PARENT="$ROOT" SUTANDO_HOST_LABEL=Pinned FAKE_CFG_LABEL= FAKE_LHN=ShouldNotWin _host)"
+check "an empty configured label falls through to the env pin" "Pinned" "$out"
+
+rm -rf "$ROOT"
 rm -rf "$BIN"
-[ "$fail" -eq 0 ] && echo "PASS (5 cases)" || echo "FAILED"
+[ "$fail" -eq 0 ] && echo "PASS (7 cases)" || echo "FAILED"
 exit $fail

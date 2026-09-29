@@ -93,6 +93,26 @@ def test_boot_pushes_workers_and_a_card_carrying_them():
         print("PASS test_boot_pushes_workers_and_a_card_carrying_them")
 
 
+def test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known():
+    """Only the report carries per-worker state; the legacy snapshot shows a
+    retired worker to the broker as just another labelled id."""
+    W2 = "b" * 32
+    rec = _record()
+    rec["report"] = {"ts": 1, "roster_version": 3,
+                     "workers": [{"id": W1, "state": "live"},
+                                 {"id": W2, "state": "retired"}],
+                     "applied": {"labels": {W1: "reviewer"}, "bindings": {}}}
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        _advertise(m, rec)
+        calls = _capture(m)
+        assert m._maybe_push_workers_snapshot(m._advertisement_or_none()) is True
+        assert calls[0][1] == "/v1/workers"
+        assert calls[0][2] == rec["report"], calls[0][2]
+        print("PASS test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known")
+
+
 def test_a_missing_file_pushes_nothing_at_all():
     """Read-if-present: with no producer installed the bridge is a no-op, and
     in particular does not PUT a card whose absent `workers` clears the pool."""
@@ -779,6 +799,7 @@ def test_shutdown_holds_the_lock_until_no_publication_can_complete():
 
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
+    test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known()
     test_a_missing_file_pushes_nothing_at_all()
     test_malformed_json_pushes_nothing_and_keeps_the_prior_snapshot()
     test_a_deleted_file_after_a_good_push_changes_nothing()

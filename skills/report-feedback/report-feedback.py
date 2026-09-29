@@ -29,12 +29,14 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Optional
 
 # Cloud session lookup lives in src/cloud_auth.py; the names stay importable
 # here because tests and the redirect guard read them off this module.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import cloud_auth  # noqa: E402
 from file_lock import locked_file  # noqa: E402
+from git_binary import git_argv  # noqa: E402
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
@@ -75,6 +77,90 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+
+
+def _git(repo: Path, *args: str) -> Optional[str]:
+    # Without this guard git can walk up and report an unrelated parent repo.
+    if not (repo / ".git").exists():
+        return None
+    try:
+        return subprocess.check_output(
+            git_argv("-C", str(repo), *args), stderr=subprocess.DEVNULL,
+            timeout=2, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        ).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _commit(value) -> Optional[str]:
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+
+
+def build_versions(repo: Optional[Path] = None) -> dict:
+    """Report checkout identities and existing bundle provenance without guessing releases."""
+    repo = repo or Path(__file__).resolve().parents[2]
+    engine = repo.parent
+    desktop = engine.parent
+    hosted = engine.name == "engine"
+    manifest = _read_json(engine / "ENGINE_MANIFEST.json") if hosted else {}
+    bundled_sha = _commit(manifest.get("sha"))
+    host_sha = _commit(_read_text(engine / "build-id.txt")) if hosted else None
+    host_version = _read_text(engine / "ag2space-version.txt") if hosted else None
+    versions = {
+        "sutando": {"version": "unknown", "commit": bundled_sha or "unknown"},
+        "ag2space": {"version": host_version or "unknown", "commit": host_sha or "unknown"},
+    }
+    if bundled_sha:
+        versions["sutando"]["build"] = bundled_sha + ("-dirty" if manifest.get("dirty") is True else "")
+    for name, source in (("sutando", repo), ("ag2space", desktop)):
+        is_source = name == "sutando" or (hosted and (desktop / "src-tauri/tauri.conf.json").is_file())
+        if not is_source or not (source / ".git").exists():
+            continue
+        info = versions[name]
+        if info["commit"] != "unknown":
+            info["bundled_commit"] = info["commit"]
+            if info.get("build"):
+                info["bundled_build"] = info["build"]
+        description = _git(source, "describe", "--tags", "--always", "--dirty")
+        version = description if name == "sutando" else _read_json(source / "src-tauri/tauri.conf.json").get("version")
+        info.update(version=version if isinstance(version, str) and version else "unknown",
+                    commit=_git(source, "rev-parse", "HEAD") or "unknown")
+        info.pop("build", None)
+        if description:
+            info["build"] = description
+    return versions
+
+
+def body_with_versions(body: str, versions: dict) -> str:
+    """Keep build identities visible to mirrors that only consume the body."""
+    lines = [body, "", "### Build versions"]
+    for key, label in (("sutando", "Sutando"), ("ag2space", "AG2Space")):
+        info = versions.get(key, {})
+        info = info if isinstance(info, dict) else {}
+        line = f"- {label}: {info.get('version') or 'unknown'} (commit: {info.get('commit') or 'unknown'})"
+        if info.get("build"):
+            line += f"; build: {info['build']}"
+        if info.get("bundled_commit"):
+            line += f"; bundled commit: {info['bundled_commit']}"
+        if info.get("bundled_build"):
+            line += f"; bundled build: {info['bundled_build']}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _redact(text: str) -> str:
@@ -196,6 +282,7 @@ def _drafts_dir(ws: Path) -> Path:
 
 def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
     """Park a report the owner has not approved yet; returns the draft id."""
+    payload = {**payload, "versions": build_versions()}
     d = _drafts_dir(ws)
     d.mkdir(parents=True, exist_ok=True)
     draft_id = f"fb_{uuid.uuid4().hex[:10]}"
@@ -614,11 +701,14 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         return 3
     base, token = read_cloud_auth(ws)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
                  "auto": bool(d.get("auto")), "owner_approved": owner_approved, "idempotency_key": draft_id}
+    ctx["versions"] = d.get("versions") or {
+        name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
+    }
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
@@ -631,7 +721,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
@@ -748,10 +838,11 @@ def _main() -> None:
 
     base, token = read_cloud_auth(ws)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — ask the user to sign in (Settings → Sutando Cloud), then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)
 
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version()}
+    ctx["versions"] = build_versions()
     if a.auto:
         ctx["auto"] = True
     if not a.no_logs and prefs["sendLogs"]:
@@ -776,7 +867,7 @@ def _main() -> None:
         # rejects null (400 invalid_payload). Mirror the desktop form, which
         # sends the trimmed body (possibly ""). Fall back to the title so an
         # empty-body report still carries context.
-        "body": a.body.strip() or a.title.strip(),
+        "body": body_with_versions(a.body.strip() or a.title.strip(), ctx["versions"]),
         "context": ctx,
     }
     try:

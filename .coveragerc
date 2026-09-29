@@ -26,6 +26,10 @@ source =
 
 omit =
     tests/*
+    # A skill owns its own tests/; they EXECUTE (ci.yml's find roots) but they
+    # are assertions, not product — measuring them dilutes the diff gate.
+    skills/*/tests/*
+    skills/*/*/tests/*
     # These package files are byte-for-byte generated from canonical src/
     # modules; tests/ag2-sparrow-drift.test.py enforces the mapping.
     packages/ag2-sparrow/ag2_sparrow/task_archive.py

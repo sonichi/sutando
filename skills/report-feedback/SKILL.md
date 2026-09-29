@@ -149,6 +149,8 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 ## Behavior
 
+- Every report includes Sutando and AG2Space version/commit identifiers in both structured context and a readable body section, even with `--no-logs`. Packaged apps use build-stamped metadata; source checkouts include the Git revision and tracked local-edit marker. Parked reports retain their incident-time versions across upgrades; older drafts and unavailable identifiers are explicitly `unknown`.
+
 - Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. For `--auto` reports, don't nag: mention it at most once.
 - On success it prints `OK: filed <kind> report`. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
 - Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).

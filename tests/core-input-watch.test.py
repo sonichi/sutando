@@ -464,6 +464,193 @@ class TestRefusedTurn(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
 
 
+class TestNovelPromptBesideAnOldFooter(unittest.TestCase):
+    """An unforeseen confirmation rendered under an idle footer that is still
+    in the 14-line window. The footer vouches only for itself: the prompt is
+    live, so this is `unknown`, not idle, and never idle-ready."""
+
+    PANE = "\n".join([
+        "❯",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        "Overwrite the existing config file?",
+        "Enter to confirm · Esc to cancel",
+        "❯",
+    ])
+
+    def test_classify_surfaces_it_as_unknown(self):
+        kind, _ = _mod.classify(self.PANE)
+        self.assertEqual(kind, "unknown")
+
+    def test_it_is_not_idle_ready(self):
+        self.assertFalse(_mod._is_idle_ready(self.PANE))
+
+    def test_a_plain_idle_footer_is_still_idle(self):
+        self.assertIsNone(_mod.classify(_IDLE))
+        self.assertTrue(_mod._is_idle_ready(_IDLE))
+
+
+class TestComposerIsEmpty(unittest.TestCase):
+    """_composer_is_empty: distinct from _is_idle_ready -- an idle-ready
+    footer and an unsent owner draft in the composer are not mutually
+    exclusive (task-notifier.sh's typing-safety gate, #4307)."""
+
+    def test_empty_composer_is_empty(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE))
+
+    def test_a_draft_in_the_composer_is_not_empty(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertFalse(_mod._composer_is_empty(draft))
+
+    def test_no_prompt_line_at_all_fails_closed(self):
+        self.assertFalse(_mod._composer_is_empty("no prompt line here\njust text"))
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    # Verbatim `capture-pane -e` composer lines from Claude Code v2.1.276: the
+    # suggested reply is an SGR-2 span, the typed draft carries no escape at all.
+    GHOST = "\x1b[39m❯ \x1b[2myes\x1b[0m"
+    TYPED = "\x1b[39m❯ hello draft"
+
+    def test_dim_ghost_text_is_not_a_draft(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE.replace("❯ ", self.GHOST)))
+
+    def test_a_typed_draft_in_an_escaped_capture_is_not_empty(self):
+        self.assertFalse(_mod._composer_is_empty(_IDLE.replace("❯ ", self.TYPED)))
+
+    def test_typed_text_beside_a_dim_span_is_not_empty(self):
+        mixed = _IDLE.replace("❯ ", "\x1b[39m❯ hel\x1b[2mlo\x1b[0m")
+        self.assertFalse(_mod._composer_is_empty(mixed))
+
+    # A peer build dims with 256-colour grey and never emits SGR 2: its idle line is
+    # the grey glyph, a no-break space and a reset; a suggestion there would be grey text.
+    def test_grey_glyph_only_line_is_empty(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_grey_ghost_text_is_not_a_draft(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m\x1b[38;5;246myes\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_the_queued_messages_line_is_not_a_draft(self):
+        # After Enter on a running turn the composer shows this hint, not our text.
+        pane = _IDLE.replace("❯ ", "❯ Press up to edit queued messages")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_a_grey_colour_outside_the_ramp_is_not_dim(self):
+        pane = _IDLE.replace("❯ ", "\x1b[39m❯ \x1b[38;5;208mdraft\x1b[39m")
+        self.assertFalse(_mod._composer_is_empty(pane))
+
+
+class TestComposerText(unittest.TestCase):
+    """_composer_text: the composer's dewrapped content for EXACT-equality
+    staging checks (task-notifier.sh, #4307 round 3) -- distinct from
+    _composer_is_empty, which only asks whether it's blank."""
+
+    def test_empty_composer_returns_empty_string(self):
+        self.assertEqual(_mod._composer_text(_IDLE), "")
+
+    def test_single_line_draft_is_returned_verbatim(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertEqual(_mod._composer_text(draft), "owner draft")
+
+    def test_no_prompt_line_at_all_returns_none(self):
+        self.assertIsNone(_mod._composer_text("no prompt line here\njust text"))
+
+    def test_wrapped_rows_are_dewrapped_with_no_separator(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n" + "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_trailing_status_rows_are_stripped(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_a_trailing_row_that_only_resembles_a_gate_is_kept(self):
+        # A gate never coexists with an editable composer; a row below the
+        # marker matching gate wording is what the owner typed last.
+        pane = "❯ Sutando task ready: task-x.txt\npermission to continue\n"
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_resembling_ui_text_is_kept_as_typed_text(self):
+        # An owner row matching a gate signature ("permission to ...") inside the
+        # composer is typed text: it must survive so the mix compares unequal.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "permission to continue\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_matching_the_idle_footer_words_is_kept(self):
+        pane = ("❯ notes for agents in prod\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "notes for agents in prod")
+
+    def test_the_box_rule_between_composer_and_footer_is_stripped(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n──────────\n" + \
+               "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_an_owner_continuation_row_reading_for_agents_survives_the_footer_strip(self):
+        # Popping the real footer must not re-classify the row it exposes:
+        # "for agents" matches the idle regex but here it is what was typed.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_for_agents_row_survives_with_no_box_rule_between_it_and_the_footer(self):
+        # With nothing structural between them, popping the footer exposes the
+        # owner row directly; a strip that loops on the idle regex eats it.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_an_owner_row_of_box_characters_survives(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "────\n"
+                "more owner text\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txt────more owner text")
+
+    def test_interleaved_owner_text_survives_in_the_result(self):
+        # The exact-equality caller depends on this NOT silently dropping
+        # owner text -- a mix must compare unequal to the bare prompt.
+        pane = _IDLE.replace("❯ ", "❯ Sutando task ready: task-x.txt OWNERTEXT")
+        self.assertEqual(_mod._composer_text(pane),
+                          "Sutando task ready: task-x.txt OWNERTEXT")
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertEqual(_mod._composer_text(pane), "")
+
+    # Captured live from Claude Code v2.1.275 on an idle, never-typed-in pane:
+    # the empty composer renders a hint, and a plain capture loses its dimming.
+    LIVE_PLACEHOLDER_PANE = (
+        "                                            ● high · /effort\n"
+        "────────────────────────────────────────────────────────────────\n"
+        '❯ Try "refactor <filepath>"\n'
+        "────────────────────────────────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+    def test_live_placeholder_hint_is_an_empty_composer(self):
+        self.assertEqual(_mod._composer_text(self.LIVE_PLACEHOLDER_PANE), "")
+        self.assertTrue(_mod._composer_is_empty(self.LIVE_PLACEHOLDER_PANE))
+
+    def test_a_draft_that_starts_like_the_hint_is_still_a_draft(self):
+        pane = self.LIVE_PLACEHOLDER_PANE.replace('❯ Try "refactor <filepath>"',
+                                                  '❯ Try "refactor <filepath>" on main')
+        self.assertFalse(_mod._composer_is_empty(pane))
+        self.assertEqual(_mod._composer_text(pane), 'Try "refactor <filepath>" on main')
+
+
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 

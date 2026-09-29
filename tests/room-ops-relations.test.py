@@ -64,11 +64,14 @@ class RelationFieldsTests(unittest.TestCase):
         self.assertIn("reply_to", str(ctx.exception))
         self.assertIn("evt1", str(ctx.exception))
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to a citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_is_its_own_field_checked_like_a_citation(self):
+        # The gateway builds the m.thread relation from this id; a bad id is
+        # refused here rather than posted outside the thread.
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(unittest.TestCase):
@@ -86,7 +89,7 @@ class SayCitationTests(unittest.TestCase):
         self.assertEqual(calls[0]["body"], "hi")
         self.assertEqual(calls[0]["op"], "message")
 
-    def test_nothing_claims_thread_membership(self):
+    def test_a_citation_alone_claims_no_thread_membership(self):
         calls = []
         with _seam(sy, calls):
             sy.say("hi", ROOM, "@a:hs", reply_to=EV)

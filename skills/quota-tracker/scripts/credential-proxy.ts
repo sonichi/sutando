@@ -66,6 +66,41 @@ const REFRESH_FAIL_BACKOFF_BASE_MS =
 const REFRESH_FAIL_BACKOFF_MAX_MS =
 	Number(process.env.SUTANDO_PROXY_REFRESH_BACKOFF_MAX_MS) || 15 * 60 * 1000; // 15 min
 
+// A wedge (refresh fails, process stays up and keeps serving 502s) never asks
+// a supervisor for help, because the process never exits. After this many
+// CONSECUTIVE failures (reset to 0 on any success — see runSingleFlightRefresh)
+// the proxy gives up and exits non-zero instead of retrying forever, so
+// whichever supervisor is watching (launchd, a process manager) gets a real
+// signal to act on. At the default backoff schedule (30s · 2^(n-1), capped at
+// 15min) the waits before attempts 2..6 sum to 930s -- ~15.5 min of continuous
+// failure before giving up, not 35 (an earlier, uncorrected estimate) — and
+// that is a LOWER bound: a refresh is only attempted when a request arrives,
+// so an idle host takes longer to reach the threshold.
+//
+// Giving up is only safe where something restarts the process. Set by the
+// launchd wrapper (src/launchd/credential-proxy-wrapper.sh), never by the
+// legacy `run_node_service ... &` fallback in startup.sh, which has no
+// restart loop — there, exiting would turn a self-healing 502 wedge into a
+// permanent outage.
+const PROXY_IS_SUPERVISED = process.env.SUTANDO_PROXY_SUPERVISED === '1';
+
+// `Number(env) || 6` would silently turn an explicit "0" into 6 (0 is falsy);
+// parse explicitly so 0 (give up on the very first failure) takes effect.
+// Unset AND unsupervised defaults to Infinity (never give up) — see
+// PROXY_IS_SUPERVISED above; an explicit env override always applies
+// regardless of supervision, since that's a deliberate operator choice.
+export function parseGiveUpAfter(raw: string | undefined, supervised: boolean): number {
+	const unsupervisedDefault = supervised ? 6 : Infinity;
+	if (raw === undefined || raw === "") return unsupervisedDefault;
+	const n = Number(raw);
+	if (!Number.isFinite(n)) return unsupervisedDefault;
+	// A negative value would behave like 0 (refreshFailCount >= n is true
+	// immediately) but unintentionally, since nothing chose that -- clamp
+	// rather than let a typo silently double as "give up on the first failure".
+	return n < 0 ? 0 : n;
+}
+const REFRESH_GIVE_UP_AFTER = parseGiveUpAfter(process.env.SUTANDO_PROXY_REFRESH_GIVE_UP_AFTER, PROXY_IS_SUPERVISED);
+
 // Pure: how long to wait before the next refresh attempt after `failCount`
 // consecutive failures. 0 failures → 0 (attempt immediately). Exponential
 // (BASE·2^(n-1)) capped at MAX.
@@ -366,6 +401,12 @@ export interface ProxyDeps {
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
 	idleTimeoutMs: number;
+	exitProcess: (code: number) => void;
+	// Consecutive refresh-failure threshold before giving up (see
+	// parseGiveUpAfter). Injectable so tests can exercise the
+	// supervised/unsupervised default without process-env/import-order
+	// tricks; production always gets the env-derived value below.
+	giveUpAfter: number;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -380,6 +421,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		recordCredentialState,
 		now: Date.now,
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+		exitProcess: (code) => process.exit(code),
+		giveUpAfter: REFRESH_GIVE_UP_AFTER,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -408,8 +451,16 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					console.log(`${ts()} [Proxy] OAuth token refreshed (new expiry ${new Date(fresh.expiresAt ?? 0).toISOString()})`);
 				} else {
 					refreshFailCount += 1;
+					// Set the backoff before the give-up check: in production process.exit
+					// ends the process either way, but an injected exitProcess (tests) that
+					// doesn't exit must not leave the next request retrying with no backoff.
 					const backoff = nextRefreshBackoffMs(refreshFailCount);
 					nextRefreshAllowedAt = deps.now() + backoff;
+					if (refreshFailCount >= deps.giveUpAfter) {
+						console.error(`${ts()} [Proxy] refresh failed ${refreshFailCount} consecutive times (give-up threshold ${deps.giveUpAfter}) — exiting so a supervisor can restart; serving 502s forever hides a wedge as "up"`);
+						deps.exitProcess(1);
+						return;
+					}
 					console.error(`${ts()} [Proxy] refresh failed (failure ${refreshFailCount}, next attempt allowed in ${Math.round(backoff / 1000)}s)`);
 				}
 			})().finally(() => { refreshInFlight = null; });

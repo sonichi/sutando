@@ -194,6 +194,13 @@ def main(argv=None) -> int:
         return 1
 
     orphans = unrostered(workspace, roster.get("workers") or {})
+    remedy = made.get("remedy_timer") or {}
+    if (remedy.get("conflict") or
+            (remedy.get("ensured") is False and
+             remedy.get("why") not in ("already installed", "launchd is macOS-only"))):
+        print(f"create-worker: WARNING: worker {made['worker_id']} is routable, but "
+              f"unattended recovery is unavailable: {remedy.get('why', 'timer failure')}",
+              file=sys.stderr)
     if a.json:
         print(json.dumps({**made, "roster_version": roster["version"],
                           "room": a.room, "unrostered_records": orphans}, indent=2))

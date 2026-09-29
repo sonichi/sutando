@@ -53,6 +53,28 @@ WORKING_PANE = """\
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
 
+# 2b) An old marker left on screen after the CLI signed back in is not a logout.
+#     Captured 2026-09-28: a refused turn, a successful /login, then real work.
+RECOVERED_PANE = """\
+❯ /proactive-loop
+  ⎿  Not logged in · Please run /login
+✻ Crunched for 0s · done 12:05 PM · 1 monitor still running
+❯ /login
+  ⎿  Login interrupted
+❯ /login
+  ⎿  Login successful
+  Ran 3 shell commands
+⏺ This pass was quiet: no tasks are waiting.
+✻ Crunched for 41s · done 12:06 PM · 1 monitor still running
+"""
+check("needs_login: false once a later /login succeeded", rh.needs_login(RECOVERED_PANE) is False)
+check("needs_login: false once a later turn did real work",
+      rh.needs_login("  ⎿  Not logged in · Please run /login\n✻ Worked for 0s\n❯ hi\n✻ Cooked for 1m 3s · done\n") is False)
+check("needs_login: a 0-1 s turn after the marker is the refusal itself, still logged out",
+      rh.needs_login("  ⎿  Not logged in · Please run /login\n✻ Crunched for 0s · done 12:05 PM\n") is True)
+check("needs_login: a marker after the success line counts again",
+      rh.needs_login("  ⎿  Login successful\n✻ Worked for 20s\n  ⎿  Not logged in · Please run /login\n") is True)
+
 # 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
 #     import-time default reports a live core as offline. Prefer the recorded socket.
 _sock_tmp = tempfile.mkdtemp()

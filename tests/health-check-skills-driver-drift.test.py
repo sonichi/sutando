@@ -354,8 +354,17 @@ def main() -> int:
         ws, head = _mk_ws(td, log_lines=["placeholder"])
         sk = ws / "skill-repos" / "sutando-skills"
         full = _git(sk, "rev-parse", "HEAD")
-        (sk / "f.txt").write_text("second\n")
-        _git(sk, "add", "f.txt"); _git(sk, "commit", "-q", "-m", "second")
+        full2 = full
+        attempt = 0
+        # HEAD must NOT share the stamp's object-dir prefix, or this degrades to case n).
+        while full2[:2] == full[:2]:
+            attempt += 1
+            check(attempt <= 20, "o) fixture precondition: second commit's prefix diverges from the stamp's")
+            if attempt > 20:
+                break
+            (sk / "f.txt").write_text(f"second {attempt}\n")
+            _git(sk, "add", "f.txt"); _git(sk, "commit", "-q", "-m", f"second {attempt}")
+            full2 = _git(sk, "rev-parse", "HEAD")
         (ws / "state" / "content-driver.log").write_text(
             f"[v=e1e1f151715f@{full[:7]}] driver started\n")
         objdir = sk / ".git" / "objects" / full[:2]

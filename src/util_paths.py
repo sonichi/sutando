@@ -564,6 +564,14 @@ def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
     return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
 
 
+def composer_block_path(state_dir, instance=None, agent=None) -> Path:
+    """Where THIS instance counts composer-not-empty refusals; each instance
+    types into its own pane, so a shared count would page for another's."""
+    key = instance_scope_key(state_dir, instance, agent)
+    suffix = f"-{key}" if key else ""
+    return Path(state_dir) / f"task-notifier-composer-block{suffix}"
+
+
 def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     """Where THIS instance records "my optional handler declined this task".
 
@@ -573,6 +581,14 @@ def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     key = instance_scope_key(state_dir, instance, agent)
     base = Path(state_dir) / "task-event-handler-fallbacks"
     return base / key if key else base
+
+
+def task_event_handler_config_path(state_dir) -> Path:
+    """Where a skill declares core's task-event handler, e.g. via worker-pool's
+    register_worker(). Core-only: workers never read this (their own inbox is
+    already the routing decision), so it is not instance-scoped.
+    """
+    return Path(state_dir) / "task-event-handler.json"
 
 
 def watcher_sentinel_paths(state_dir) -> "list[Path]":
@@ -599,7 +615,12 @@ if __name__ == "__main__":
         print(watcher_sentinel_path(sys.argv[2]))
     elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
         print(handler_fallbacks_dir(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "task-event-handler-config-path":
+        print(task_event_handler_config_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "composer-block-path":
+        print(composer_block_path(sys.argv[2]))
     else:
-        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir} <state-dir>",
+        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir|"
+              "task-event-handler-config-path|composer-block-path} <state-dir>",
               file=sys.stderr)
         raise SystemExit(2)

@@ -310,6 +310,7 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
+from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
@@ -1348,6 +1349,9 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -2585,8 +2589,18 @@ def _push_pool_advertisement_now() -> None:
         record = _advertisement_or_none()
         _maybe_push_workers_snapshot(record)
         _maybe_push_agent_profile(record)
+        _maybe_pull_worker_labels(record)
     except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
         _log(f"pool advertisement push failed: {e}")
+
+
+def _workers_body(ad: dict) -> dict:
+    """The per-worker report when the record carries one: only it tells the broker
+    a worker is retired; the legacy snapshot has no per-worker state."""
+    rep = ad.get("report")
+    if isinstance(rep, dict) and isinstance(rep.get("workers"), list):
+        return rep
+    return ad["workers"]
 
 
 def _maybe_push_workers_snapshot(record) -> bool:
@@ -2607,7 +2621,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
     if identity == _workers_pushed_identity:
         return False
     try:
-        _req("POST", "/v1/workers", ad["workers"], timeout=15)
+        _req("POST", "/v1/workers", _workers_body(ad), timeout=15)
     except urllib.error.HTTPError as e:
         _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
         return False
@@ -2622,6 +2636,13 @@ def _maybe_push_workers_snapshot(record) -> bool:
 
 _profile_pushed_identity = ""
 _profile_push_retry_at = 0.0
+
+# The host injects this optional adapter before executing the standalone bridge.
+# AG2 Space owns overrides; the skill owns the roster.
+_WORKER_LABEL_APPLIER = globals().get("_SUTANDO_WORKER_LABEL_APPLIER")
+_PROFILE_LABEL_REFRESH_S = 60.0
+_profile_labels_checked_at = 0.0
+_profile_labels_retry_at = 0.0
 
 
 def _build_agent_profile(workers: "dict") -> "dict":
@@ -2681,6 +2702,91 @@ def _maybe_push_agent_profile(record) -> bool:
     return True
 
 
+def _maybe_pull_worker_labels(record) -> bool:
+    """Apply explicit owner label overrides after our profile is published."""
+    global _profile_labels_checked_at, _profile_labels_retry_at
+    if not callable(_WORKER_LABEL_APPLIER) or not _publication_permitted():
+        return False
+    now = time.time()
+    if now < max(_profile_labels_retry_at,
+                 _profile_labels_checked_at + _PROFILE_LABEL_REFRESH_S):
+        return False
+    mxid = _reenroll_identity()
+    identity, ad = record
+    if not mxid or ad is None or _profile_pushed_identity != f"{mxid}\n{identity}":
+        return False
+    path = f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile"
+    try:
+        profile = _req("GET", path, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_labels_retry_at = _defer_push("worker-label read", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label read failed, retrying in 5m: {e}")
+        return False
+
+    _profile_labels_checked_at = now
+    config = profile.get("config") if isinstance(profile, dict) else None
+    display = profile.get("display") if isinstance(profile, dict) else None
+    version = config.get("version") if isinstance(config, dict) else None
+    labels = display.get("worker_labels") if isinstance(display, dict) else None
+    if (not isinstance(profile, dict)
+            or type(profile.get("schema_version")) is not int
+            or profile.get("schema_version") != 1
+            or profile.get("mxid") != mxid or type(version) is not int
+            or version < 0 or not isinstance(labels, dict)
+            or len(labels) > 10000
+            or any(not isinstance(wid, str) or not _is_worker_id(wid)
+                   or not isinstance(label, str) or not label
+                   or label != label.strip() or len(label) > 120
+                   or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)
+                   for wid, label in labels.items())):
+        _profile_labels_retry_at = now + 300
+        _log("worker-label read returned an invalid profile; keeping local labels")
+        return False
+    if _reenroll_identity() != mxid:
+        return False
+    try:
+        result = _WORKER_LABEL_APPLIER(labels, version, mxid)
+    except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        return False
+    if isinstance(result, dict) and result.get("changed"):
+        _log(f"worker labels applied from owner profile config v{version}")
+    return True
+
+
+# The primary app checks every 30 minutes; the fallback checks every five.
+_HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
+def _reported_core_status() -> tuple[str | None, str | None]:
+    """Overlay independent diagnostics without exporting their private details."""
+    status, step = _read_core_status()
+    if status in ("error", "offline"):
+        return status, step
+    try:
+        report = json.loads((_STATE / "agent-health.json").read_text())
+    except FileNotFoundError:
+        return status, step
+    except Exception:
+        return "unknown", "Health check unavailable"
+    try:
+        ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
+        if (report.get("version") != 1 or type(ts) not in (int, float)
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or type(total) is not int or total <= 0
+                or type(failures) is not int or not 0 <= failures <= total):
+            return "unknown", "Health check unavailable"
+        if failures:
+            return "error", f"Health check: {failures} failing check(s)"
+    except Exception:
+        return "unknown", "Health check unavailable"
+    return status, step
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2691,7 +2797,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
-    _status, _step = _read_core_status()
+    _status, _step = _reported_core_status()
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3498,6 +3604,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3657,7 +3777,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3680,8 +3802,11 @@ def _post_proactive() -> None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3715,6 +3840,20 @@ def _post_proactive() -> None:
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -3960,50 +4099,182 @@ def _assigned_worker(task_id: str) -> str:
     return value if _is_worker_id(value) else ""
 
 
-def _result_worker(task_id: str) -> str:
-    """Attribution for one result: assignment truth first, completion residue
-    only as the migration fallback.
+# The core is a delivery recipient like any worker, but the router records
+# attribution only for workers — so a core sentinel with no record is normal.
+_CORE_RECIPIENT = "core"
+_DELIVERY_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
+def _delivery_recipient(task_id: str) -> tuple[str, bool]:
+    """`(recipient, blind)` — which worker this task was DELIVERED to, read
+    from the pool's delivery sentinel. Used ONLY to tell "this was a worker's
+    task" from "this was the core's" when attribution is missing — never as an
+    attribution source.
+
+    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted,claimed})
+    is owned by the pool's own delivery writer, an optional local skill this
+    standalone package cannot import or name; the test builds its fixtures
+    through that writer so a drift fails there instead of silently reading
+    nothing, and asserts this module's recipient/suffix constants still cover
+    what that writer produces.
+
+    The core NEVER counts as a claimant: the router writes a sentinel for every
+    recipient but records attribution only for workers, so "core sentinel, no
+    record" is the ordinary shape of a task the core answered itself, not an
+    invariant violation.
+
+    `blind` is the second outcome because a read failure and "never delivered"
+    are different facts that both have no recipient, and the caller WITHHOLDS on
+    one and sends on the other. Logging the difference was not enough: the send
+    decision could not see a log. An ABSENT tree is not blind — a host with no
+    pool has no deliveries dir, and that is knowledge, not failure.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return "", False
+    root = _STATE.parent / "deliveries"
+    try:
+        recipients = sorted(p.name for p in root.iterdir())
+    except FileNotFoundError:
+        return "", False
+    except OSError as exc:
+        _log(f"attribution: cannot read {root} ({type(exc).__name__}) - the "
+             f"delivery discriminator is BLIND for {task_id}, which is not the "
+             f"same as this task never having been delivered.")
+        return "", True
+    claimants = set()
+    for name in recipients:
+        if name == _CORE_RECIPIENT:
+            continue
+        for suffix in _DELIVERY_SUFFIXES:
+            try:
+                st = os.lstat(root / name / f"{task_id}{suffix}")
+            except (FileNotFoundError, NotADirectoryError):
+                # Reading through a stray file at the root raises
+                # NotADirectoryError: a non-recipient, not a read failure.
+                continue
+            except OSError as exc:
+                _log(f"attribution: cannot read delivery sentinel for "
+                     f"{task_id} under {name} ({type(exc).__name__}) - the "
+                     f"delivery discriminator is BLIND for this task, which is "
+                     f"not the same as it never having been delivered.")
+                return "", True
+            if not stat.S_ISREG(st.st_mode):
+                # Malformed, not unreadable: the writer would never make one,
+                # so this is refusal to believe it, not absence of a reading.
+                return "", False
+            claimants.add(name)
+            break
+    if len(claimants) == 1:
+        return claimants.pop(), False
+    if claimants:
+        # Sentinels under several recipients prove a worker owned this task
+        # without saying which, which is the refusal condition, not its absence.
+        _log(f"attribution: {task_id} has delivery sentinels under "
+             f"{len(claimants)} recipients ({', '.join(sorted(claimants))}) - "
+             f"ownership is AMBIGUOUS, so refusing rather than relaying a "
+             f"worker's reply as the core's own.")
+        return "", True
+    return "", False
+
+
+def _attribution(task_id: str) -> tuple[str, bool]:
+    """`(worker, refused)` for one result: assignment truth first, completion
+    residue only as the migration fallback.
 
     A task routed before assignment records existed has none, so residue still
     answers for it; once no such task is in flight the residue arm can go. A
     result with residue but no assignment record is precisely the anomaly the
     assignment store exists to surface — an author nobody recorded at routing
     time — so it is logged rather than passed over.
+
+    `refused` is the second outcome, and it is why this returns a pair: a
+    worker's result with no attribution and an ordinary core result BOTH have
+    no worker id, so a bare "" cannot tell a caller to withhold one and send
+    the other. Refused means the sentinel proves a worker owned the task while
+    nothing recorded who — publishing it would relay a worker's reply as the
+    core's own.
     """
     assigned = _assigned_worker(task_id)
     if assigned:
-        return assigned
+        return assigned, False
     residue = _worker_of(task_id)
     if residue:
         _log(f"attribution: {task_id} has no assignment record; using "
              f"completion residue ({residue}). Assignment-time recording "
              f"did not run for this task.")
-    return residue
+        return residue, False
+    # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
+    # so silence here would relay it as if the core had produced it.
+    delivered, blind = _delivery_recipient(task_id)
+    if blind:
+        # The evidence store is exactly what decides worker-vs-core here, so an
+        # unreadable one is not a licence to assume core and send.
+        _log(f"attribution: {task_id} cannot be classified - the delivery "
+             f"evidence is unreadable, so whether a worker owned this task is "
+             f"UNKNOWN. Withholding rather than assuming the core produced it.")
+        return "", True
+    if delivered:
+        _log(f"attribution: {task_id} was DELIVERED to {delivered} but has no "
+             f"assignment record and no completion residue - refusing to stamp "
+             f"rather than attribute it to the core. The record is written under "
+             f"the same lock as the sentinel, so this is an invariant violation.")
+        return "", True
+    return "", False
+
+
+def _result_worker(task_id: str) -> str:
+    """The worker id alone, for callers that only label and never withhold.
+    A refusal reads as "" here, so anything deciding whether to SEND must use
+    _attribution() instead."""
+    return _attribution(task_id)[0]
 
 
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-worker
-    done-flag. `task_id` is the result stem, which already carries the
-    `task-` prefix.
+    completion record. `task_id` is the result stem, prefix included.
 
     SUPERSEDED as the primary signal by _assigned_worker(): this infers the
     author from completion residue after the fact, which is exactly the
     fragility assignment-time provenance removes. Kept as the transition
     fallback in _result_worker() for tasks routed before that record existed.
 
-    Path convention (state/workers/<recipient>/done/<task_id>.flag) is owned
-    by the pool's own done_flag()/mark_done() writer, in an optional local
-    skill this standalone PyPI package cannot import or name (see
-    docs/architecture-boundaries.md, "Optional adapter capabilities"). Keep
-    the two in step by hand; tests/gateway-result-worker-attribution.test.py
-    builds its fixtures through that writer's own path function so a future
-    drift between the two fails a test instead of silently returning "".
+    The recipient grammar, the record layout, the stage order and the "is this
+    a record?" predicate all come from pool_record, which the pool's own
+    writer binds too — an optional local skill this standalone package can
+    neither import nor name (docs/architecture-boundaries.md, "Optional
+    adapter capabilities"). No second predicate lives here, so the reader
+    cannot accept state the writer would refuse.
+
+    FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
+    with another worker's identity — so anything unreadable, or any record the
+    writer's own predicate would reject, yields "". Entries PROVEN not to be
+    recipients are skipped instead: a stray file beside the recipient folders
+    is not an unreadable claimant, and must not suppress valid attribution.
+    `Path.glob` is deliberately not used: it reports an unreadable subtree as
+    absent, which would let one unreadable claimant hand the answer to another.
     """
+    root = pool_record.workers_root(_STATE)
     try:
-        hits = sorted((_STATE / "workers").glob(f"*/done/{task_id}.flag"))
-    except OSError:
+        recipients = pool_record.iter_recipients(root)
+    except FileNotFoundError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    except OSError:
+        return ""  # unreadable root: no reading, not "nobody claimed it"
+    claimants = set()
+    for name in recipients:
+        for stage in pool_record.STAGES:
+            try:
+                state = pool_record.read_record_state(
+                    pool_record.record_path(root, name, task_id, stage))
+            except OSError:
+                return ""  # unreadable claim tree: abstain, never fall through
+            if state is pool_record.RecordState.ABSENT:
+                continue
+            if state is not pool_record.RecordState.PRESENT:
+                return ""  # malformed record the writer would itself refuse
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -4019,9 +4290,21 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _result_worker(tid)
+    worker, refused = _attribution(tid)
+    if refused:
+        # ENFORCED, not just logged: this is a worker's reply that nothing
+        # recorded, so sending it would publish it as the core's own.
+        why = ("attribution refused: delivered to a worker but no assignment "
+               "record and no completion residue - withholding rather than "
+               "publishing an unattributed result as the core's own")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} - not published, not delivered")
+        return False
     if worker:
         doc["metadata"] = {"worker_id": worker}
+        _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
@@ -4339,6 +4622,17 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
             continue
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is not None:
+            try:
+                headers = local_task_protocol.parse_task_headers(
+                    task.read_text(encoding="utf-8", errors="replace")).headers
+            except OSError:
+                continue
+            # Cron completions belong to the local scheduler, not a gateway lease.
+            # Leave their delivery and retirement to the local consumers.
+            if headers.get("source") == "cron":
+                continue
         try:
             age = now - rfile.stat().st_mtime
         except OSError:
@@ -4364,7 +4658,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
-        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
             if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue
@@ -4601,7 +4894,9 @@ def main() -> None:
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
-        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
+        # A live bridge already polls this workspace: stand down. 75 tells a
+        # supervising wrapper not to relaunch; a plain exit would loop it.
+        sys.exit(75)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()

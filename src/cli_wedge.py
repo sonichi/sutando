@@ -121,7 +121,7 @@ ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     for name, rx in (
         ("quota-limit", r"(you('ve| have)? )?(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|(you('ve| have)? )?hit your\b.{0,24}\blimit\b|/?usage-credits\b"),
         ("out-of-credits", r"(you('re| are)? )?out of (usage )?credits?\b|credit balance (is )?(too )?low\b|insufficient credits?\b"),
-        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b"),
+        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|authentication (required|failed)\b|run /login\b|Select login method\b|Paste code here\b|Browser didn'?t open\b"),
         ("compacting", r"compact(ing|ion)\b"),
         ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
         # Parked ON an error, which is not a retry: nothing is being attempted.
@@ -159,7 +159,101 @@ def raw_state_id(frame: str) -> str:
 
 # Leading decoration before a banner: indent, spinner frames, box rules.
 # Excludes '>' '*' '-' '\u2022' \u2014 those double as markdown syntax in the agent's own prose.
-_BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u28c0-\u28ff]+")
+_BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u23bf\u28c0-\u28ff]+")
+
+# The CLI's own retry line, whole: an optional cause, one separator, the retry
+# clause, and nothing after it. Prose about a retry has words between or after.
+_RETRY_CAUSE = (r"(?:API ?Error|Connection (?:error|reset|refused)|Rate ?limit(?:ed)?(?: (?:reached|exceeded|hit))?|Overloaded"
+                r"|(?:Request )?timed out|5\d\d|429)")
+_CAUSE_DETAIL = r"(?:\s*\([^)]*\)|:\s*[^·\n]{0,160}?)?"
+LIVE_RETRY_BANNER = re.compile(
+    r"^(?:" + _RETRY_CAUSE + _CAUSE_DETAIL + r"[.:]?\s*(?:·\s*)?)?"
+    r"Retrying(?: in \d+(?:\.\d+)?\s*(?:s|secs?|seconds?))?\s*(?:\.{3}|…)?\s*(?:\(attempt \d+(?: of |/)\d+\))?\s*$"
+    r"|^Reconnecting(?:\.{3}|…)?\s*$",
+    re.IGNORECASE,
+)
+
+# The parked family as whole lines: the banner the CLI renders when it stops. An
+# API error carries a colon or parenthesis after the words; a sentence carries a word.
+LIVE_PARKED_BANNERS: tuple[tuple[str, re.Pattern], ...] = tuple(
+    (name, re.compile(rx, re.IGNORECASE))
+    for name, rx in (
+        ("quota-limit", r"^(?:you(?:'ve| have)? )?(?:hit|reached|exceeded) (?:your |the )?.{0,24}?(?:session|usage|weekly|daily|plan)? ?limit\b.{0,80}$|^(?:session|usage|weekly|daily|plan) limit (?:reached|exceeded|hit)\b.{0,80}$"),
+        ("out-of-credits", r"^(?:you(?:'re| are)? )?out of (?:usage )?credits?\b.{0,80}$|^credit balance (?:is )?(?:too )?low\b.{0,80}$|^insufficient credits?\b.{0,80}$"),
+        ("needs-login", r"^(?:please )?(?:log ?in|sign ?in) to continue\b.{0,40}$|^session expired\b.{0,40}$|^authentication (?:required|failed)\b.{0,40}$|^run /login\b.{0,40}$|^Select login method\b.{0,60}$|^Paste code here\b.{0,60}$|^Browser didn'?t open\b.{0,60}$"),
+        ("compacting", r"^compacting (?:conversation|context)\b.{0,40}$"),
+        ("awaiting-input", r"^(?:waiting|awaiting) for (?:your )?(?:input|approval|confirmation)\b.{0,40}$"),
+        ("api-error", r"^API ?Error(?::\s*\S.{0,200}|\s*\(.{0,200}\).{0,80})?\s*$|^(?:internal server error|bad gateway|service unavailable)\b.{0,80}$|^HTTP [45]\d\d\b.{0,80}$"),
+        ("network-error", r"^network error\b.{0,80}$|^fetch failed\b.{0,80}$|^could not reach\b.{0,80}$|^E(?:CONNREFUSED|NOTFOUND|HOSTUNREACH)\b.{0,80}$|^dns (?:lookup )?failed\b.{0,40}$"),
+    )
+)
+
+
+def live_banner_lines(text: str) -> list:
+    """(family, name, line) for each line that IS a live banner, decor stripped and
+    judged whole. Callers pass a capture with wrapped rows joined (tmux `-J`): a
+    soft-wrap boundary is not a line start, and a long banner is one line."""
+    hits = []
+    for ln in text.splitlines():
+        stripped = _BANNER_DECOR.sub("", ln).rstrip()
+        if not stripped:
+            continue
+        if LIVE_RETRY_BANNER.match(stripped):
+            hits.append(("retry", "retrying", stripped))
+            continue
+        for name, rx in LIVE_PARKED_BANNERS:
+            if rx.match(stripped):
+                hits.append(("parked", name, stripped))
+                break
+    return hits
+
+
+# The CLI's own "a turn is running" affordance. Motion is this module's axis, so
+# the single-frame form of it belongs beside the single-frame abnormal verdict.
+WORKING = re.compile(r"esc to interrupt", re.I)
+
+
+def frame_working(text: str) -> bool:
+    """Is this ONE capture a pane with a turn in flight? Complements classify()'s
+    frame-to-frame novelty, which needs two samples and cannot answer for one."""
+    return bool(WORKING.search(text))
+
+
+def live_retry_banner_lines(text: str) -> list:
+    """The retry family only, as lines."""
+    return [line for family, _, line in live_banner_lines(text) if family == "retry"]
+
+
+@dataclass(frozen=True)
+class FrameAbnormal:
+    kind: str          # provider-limit | retry-loop | abnormal
+    names: tuple       # "retry:retrying" plus each parked/abnormal family name
+    retrying: bool
+
+
+def frame_abnormal(text: str) -> Optional[FrameAbnormal]:
+    """One capture's abnormal verdict, ranked as `_classify_run` ranks a current
+    sample: provider-limit over retry over the rest. One frame has no recurrence,
+    so it reads the live (whole-line) detectors, never the searched RETRY_PATTERNS.
+    None means no abnormal text; motion, idleness and dialogs are the caller's."""
+    retrying = False
+    names: list = []
+    for family, name, _line in live_banner_lines(text):
+        if family == "retry":
+            retrying = True
+        elif name not in names:
+            names.append(name)
+    for name in matched_abnormal([text]):
+        if name not in names:
+            names.append(name)
+    if not retrying and not names:
+        return None
+    tagged = tuple((["retry:retrying"] if retrying else []) + names)
+    if any(n in PROVIDER_LIMIT_PATTERNS for n in names):
+        return FrameAbnormal("provider-limit", tagged, retrying)
+    if retrying and not names:
+        return FrameAbnormal("retry-loop", tagged, True)
+    return FrameAbnormal("abnormal", tagged, retrying)
 
 
 def matched_abnormal(frames: list) -> list:
@@ -359,11 +453,14 @@ def core_target(socket_path: str, session: str = DEFAULT_SESSION, tmux_bin: str 
 
 
 def capture_pane(socket_path: str, target: str, tmux_bin: str = "tmux",
-                 runner: Callable = subprocess.run, env: Optional[dict] = None) -> Optional[str]:
+                 runner: Callable = subprocess.run, env: Optional[dict] = None,
+                 escapes: bool = False) -> Optional[str]:
     """One pane frame, or None when tmux cannot be read (absent = no reading).
-    The one capture implementation: health-check and the CLI both call this."""
+    The one capture implementation: health-check and the CLI both call this.
+    escapes=True keeps SGR attributes (-e) for a runtime whose empty composer is a DIM hint."""
+    flags = ["-e", "-p"] if escapes else ["-p"]
     try:
-        proc = runner([tmux_bin, "-S", socket_path, "capture-pane", "-p", "-t", target],
+        proc = runner([tmux_bin, "-S", socket_path, "capture-pane", *flags, "-t", target],
                       capture_output=True, text=True, timeout=10, env=env)
     except Exception:  # noqa: BLE001 — a failed probe is an absent reading, never a verdict
         return None

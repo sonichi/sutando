@@ -45,6 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
 import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
+import { attachCookieForensics } from './cookie-forensics.mjs';
 import { waitForProfileExit } from './profile-lock-wait.mjs';
 import { readLanding, landingExit } from './landing-check.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
@@ -352,6 +353,11 @@ const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
   ignoreDefaultArgs: ['--use-mock-keychain'],
 });
 
+// Records what clears auth_token/ct0 and which response carried it. Never logs
+// a cookie value; failures here are swallowed so they cannot break a publish.
+const _forensicsLog = `${PROFILE_DIR}/../x-cookie-forensics.log`;
+const _snapshot = attachCookieForensics(ctx, _forensicsLog);
+
 /** Signed-in iff the home compose box exists (not redirected to /login). */
 async function isSignedIn(page) {
   await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -369,6 +375,7 @@ try {
     const shot = `${SHOT_DIR}/x-check-${Date.now()}.png`;
     await page.screenshot({ path: shot });
     console.log(JSON.stringify({ signedIn: ok, profile: PROFILE_DIR, screenshot: shot }));
+    await _snapshot('check');
     process.exit(ok ? 0 : 2);
   }
 
@@ -419,6 +426,7 @@ try {
     } else {
       console.log(JSON.stringify({ posted: true, url: decision.url, text: finalText, composer_matched: true }));
     }
+    await _snapshot(decision.posted ? 'posted' : 'post-failed');
     process.exit(landingExit(decision));
   }
 } catch (err) {

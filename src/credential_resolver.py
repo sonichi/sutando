@@ -7,8 +7,8 @@ languages. The shared test vectors (``tests/credential-resolver.test.py`` mirror
 ``tests/credential-resolver.test.ts`` one-for-one) are what keep a latent defect
 from surviving in only one twin (the policy-twin lesson from #2516).
 
-Consumers ask for a CAPABILITY ('gemini-voice', 'gemini-text') and the resolver
-decides which credential satisfies it, walking tiers in order:
+Consumers ask for a CAPABILITY ('gemini-voice', 'gemini-text', 'gemini-image')
+and the resolver decides which credential satisfies it, walking tiers in order:
 
   1. managed — desktop/AU-provisioned ``<workspace>/state/auth/managed-credentials.json``
                (per-host durable install state, same never-wiped contract as
@@ -42,6 +42,13 @@ injection/``requires`` gate, ``startup-runtime.sh``'s shell gate,
 ``voicePreference`` scopes the VOICE capability; 'gemini-text' resolution is
 preference-independent but still honors the quarantine marker.
 
+'gemini-image' (the image-generation skill) walks the slots text THEN voice in
+each tier: any Gemini key generates images, and a managed-key install holds
+only the voice entry. It is not a voice surface, so a 'managed' preference
+never blocks its env fallback; a 'byok' preference skips only the managed
+VOICE slot (the owner chose their own key for voice, so that managed entry is
+not theirs to spend), and quarantine hides every managed entry as always.
+
 Managed-file schema (version 1):
   {"version": 1,
    "capabilities": {"gemini-voice": {"key": "...", "generation": "cg1-..."?}, ...},
@@ -65,7 +72,7 @@ from typing import NamedTuple, Optional, Union
 from workspace_default import resolve_workspace
 
 # Literal capability names (kept as plain strings for py3.8+ compatibility).
-Capability = str  # 'gemini-voice' | 'gemini-text'
+Capability = str  # 'gemini-voice' | 'gemini-text' | 'gemini-image'
 CredentialSource = str  # 'managed' | 'env' | 'none'
 VoicePreference = str  # 'managed' | 'byok'
 
@@ -89,6 +96,7 @@ class _ManagedFile(NamedTuple):
 _CAPABILITY_FALLBACKS = {
     "gemini-voice": ["gemini-voice", "gemini-text"],
     "gemini-text": ["gemini-text"],
+    "gemini-image": ["gemini-text", "gemini-voice"],
 }
 
 # Env-var names per capability slot, in existing-chain order.
@@ -147,6 +155,9 @@ def resolve_credential(
     preference = managed.voice_preference if capability == "gemini-voice" else None
     if preference != "byok" and not managed.quarantined:
         for slot in slots:
+            # The managed voice entry is not the image capability's to spend under a byok voice preference.
+            if capability == "gemini-image" and slot == "gemini-voice" and managed.voice_preference == "byok":
+                continue
             entry = managed.caps.get(slot)
             key = entry.get("key") if isinstance(entry, dict) else None
             if isinstance(key, str) and key:

@@ -485,12 +485,8 @@ def render_skill_prelude(
             "confidence is exactly the signal that fails. The only exception is a "
             'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
         _step += 1
-        _skill.append(
-            f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
-            f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a` then python3 "
-            f"skills/task-progress/scripts/notify.py --source {_cdir_q} "
-            f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
-        _step += 1
+        # No notify step here: the broker's delivery status already shows
+        # pickup and working, so no notify message is sent.
     _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
     return _skill
 

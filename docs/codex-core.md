@@ -66,6 +66,51 @@ The Codex implementation:
   to update when Codex is selected;
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## Automatic earned resets
+
+On macOS, launching a Codex core or Codex worker installs a five-minute
+LaunchAgent for its configured `CODEX_HOME`. It reads the live Codex App Server
+quota and automatically redeems one available earned reset only when the Codex
+weekly window reports at least 99.9% used and its next reset is at least 24
+hours away. One timer serves sessions that share a Codex home. The job runs
+without an active agent session and checks the account again before spending
+a credit. API-key-only accounts and accounts without earned reset credits are
+left alone.
+
+The Codex CLI must return `workspaceRouting.chatgptAccountId` from
+`account/read` so Sutando can tie redemption state to the authenticated
+account. This works with Codex CLI 0.157.0; 0.154.0 does not return that field.
+When it is missing, the timer reports `unsupported-codex-cli` and skips
+redemption without spending a credit. The timer keeps the stable Codex and
+Python executable paths, so CLI and package-manager updates can replace their
+symlink targets without waiting for another core or worker launch.
+
+The CLI currently reports `usedPercent` as a whole number. In practice the
+99.9% rule fires when it reports **100% used**; Sutando cannot detect exactly
+0.1% remaining until the API returns finer precision. A successful redemption
+is followed by a fresh quota read, and the timer keeps the same idempotency key
+when retrying an uncertain request.
+
+The redemption state is shared by Codex cores and workers in one Sutando
+workspace, including sessions with different Codex homes. Separate Sutando
+workspaces logged into the same ChatGPT account do not share that state; run
+automatic redemption from only one of those workspaces.
+
+This feature is enabled by the proactive-loop skill's
+`SUTANDO_CODEX_AUTO_RESET_ENABLED=1` manifest setting. Set
+`SUTANDO_CODEX_AUTO_RESET_ENABLED=0` in the launcher's environment to disable
+redemption; restart the Codex core or worker so the timer captures the change.
+An installed timer then wakes but exits without requesting a reset. An unset
+value preserves a prior explicit disable; set `SUTANDO_CODEX_AUTO_RESET_ENABLED=1`
+and restart to re-enable it. Check the timer
+with:
+
+```bash
+python3 skills/proactive-loop/scripts/codex-auto-reset-timer.py status \
+  --workspace "$(bash scripts/sutando-config.sh workspace)" \
+  --codex-home "$(bash scripts/sutando-config.sh core-config-dir-value codex)"
+```
+
 `SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses either runtime's early authentication
 check for one startup. The runtime launcher still performs its own defensive
 authentication check before replacing the core session.

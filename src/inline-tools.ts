@@ -25,6 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -733,17 +734,13 @@ export const cancelTaskTool: ToolDefinition = {
 			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
 			// in practice but defence-in-depth). task: field is placed LAST so a
 			// forged line in the body cannot shadow the real source/access_tier above it.
+			// Same header writer as the work tool, so the confirmation follows the session's origin.
 			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
-			const cancelBody = [
-				`id: task-${cancelTs}`,
-				`timestamp: ${new Date().toISOString()}`,
-				`source: voice`,
-				`channel_id: local-voice`,
-				`user_id: voice-local`,
-				`access_tier: owner`,
-				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
-				``,
-			].join('\n');
+			const cancelOrigin = getVoiceSessionOrigin();
+			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
+			const cancelBody =
+				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', cancelOrigin) +
+				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 
 			// Also unlink the original task file if it's still present — prevents
@@ -813,14 +810,28 @@ export const getCurrentTimeTool: ToolDefinition = {
 	},
 };
 
+// The pending queue's fresh snapshot (src/task_queue.py write_snapshot):
+// {ts, depth, pending}. Older than 10 minutes, or absent, is unknown — a
+// stale depth is worse than none. Exported for the test.
+export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.now() / 1000)): number | null {
+	try {
+		const p = statusReadPath('task-queue.json', workspaceDir);
+		if (!existsSync(p)) return null;
+		const q = JSON.parse(readFileSync(p, 'utf-8')) as { ts?: number; depth?: number };
+		if (typeof q.ts !== 'number' || nowSec - q.ts > 600 || typeof q.depth !== 'number') return null;
+		return q.depth;
+	} catch { return null; }
+}
+
 // Get what the core agent (Claude Code proactive-loop) is currently doing.
 // Lets voice-agent Gemini answer "what are you working on?" truthfully
-// instead of guessing. Reads core-status.json written by the core agent.
+// instead of guessing. Reads core-status.json written by the core agent, and
+// the queue depth from state/task-queue.json.
 export const getCoreStatusTool: ToolDefinition = {
 	name: 'get_core_status',
 	description:
-		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
-		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
+		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
 		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
 		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
 		'a fallback when unsure what the user wants; fire nothing instead.',
@@ -832,8 +843,10 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
+			const queued = readQueueDepth(WORKSPACE_DIR);
+			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
 			if (!existsSync(corePath)) {
-				return { status: 'idle', description: 'Core agent is not currently running.' };
+				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -844,10 +857,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).`,
+					queued,
+					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', description: 'Core agent is idle right now.' };
+			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
@@ -1265,10 +1279,11 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 // OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
 // session so the skill registers session handlers without importing core.
-export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
-import type { SkillSetup } from './skill-setup-runner.js';
+export type { SkillSetupCtx, SkillSetup, VoiceSurfaceContribution, VoiceSurfaceHook } from './skill-setup-runner.js';
+import { collectVoiceSurface } from './skill-setup-runner.js';
+import type { SkillSetup, VoiceSurfaceHook } from './skill-setup-runner.js';
 
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[]; voiceSurfaces: VoiceSurfaceHook[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1303,6 +1318,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
 	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
 	const setups = new Map<string, SkillSetup>();
+	const voiceSurfaces = new Map<string, VoiceSurfaceHook>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1344,6 +1360,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
 					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
 				}
+				if (typeof mod.voiceSurface === 'function') voiceSurfaces.set(manifest.name || dirName, mod.voiceSurface as VoiceSurfaceHook);
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1362,7 +1379,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	};
 	// One authoritative line for what actually got registered, after dedupe.
 	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()], voiceSurfaces: [...voiceSurfaces.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1383,6 +1400,8 @@ export const envDependentToolNames: ReadonlySet<string> = new Set([
 // voice-agent invokes each once per session with {session, injectText}.
 // Empty when no skill exports setup().
 export const personalSkillSetups: SkillSetup[] = personalTools.setups;
+// Voice-session-only tools, prompt rules and context lines from skills' voiceSurface().
+export const personalVoiceSurface = collectVoiceSurface(personalTools.voiceSurfaces);
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

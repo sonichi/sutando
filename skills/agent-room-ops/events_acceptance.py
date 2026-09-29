@@ -58,11 +58,7 @@ from ag2_sparrow.event_consumer import (  # noqa: E402
 ALL_TYPES = MEANINGFUL_TYPES | {"room.state_changed"}
 
 # React-mode reaction key. 👀 = "the agent OBSERVED this event" — the owner's
-# finalized convention (👀 observed / 🫡 task-acknowledged). This was held as 🔭
-# earlier ONLY to dodge a collision: the task-intake ack was also 👀 back then.
-# That collision is gone — the broker now emits 🫡 for task intake server-side
-# (ag2space-backend#188, deployed), so 👀 is free to mean observation. A glance
-# still separates the two states, now via the owner's chosen glyphs.
+# finalized convention (👀 observed / 🫡 task-acknowledged), distinct glyphs.
 OBSERVE_REACTION = "\U0001F440"  # 👀
 
 class EventAccumulator:

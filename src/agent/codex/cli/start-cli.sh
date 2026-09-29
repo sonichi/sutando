@@ -2,15 +2,22 @@
 # Persistent Codex CLI implementation of the Sutando core.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# Pure bash, no external dirname: this is the launcher's own first line, run
+# before anything has confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../../../.." && pwd)"
+unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
-# This runtime has no worker mode: everything below is the canonical core's
-# ceremony, so an instance launch is refused before the first step of it.
+# This entry point only launches the canonical core. A Codex pool worker uses
+# the pool's runtime launcher instead.
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  echo "start-cli: SUTANDO_INSTANCE_ID is set; launch Codex workers through the pool launcher." >&2
   exit 2
 fi
 
@@ -160,6 +167,9 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
+if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
+fi
 
 CODEX_ARGS=(
   -C "$WORKING_DIR"
@@ -188,11 +198,16 @@ ensure_task_notifier() {
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
+  # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
+  # itself and fswatches it for changes, so the launcher forwards only a genuine
+  # operator pin (if one is already set) and nothing computed.
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -215,6 +230,12 @@ ensure_task_notifier() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  # Standby/grace-period knobs: unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
@@ -321,6 +342,22 @@ ensure_codex_scheduler() {
   fi
 }
 
+ensure_codex_auto_reset_timer() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local ws timer py
+  timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+  [ -f "$timer" ] || return 0
+  py="$(heartbeat_python)"
+  if [ -z "$py" ]; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer: no runnable Python" >&2
+    return 0
+  fi
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
+  fi
+}
+
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
 # every launcher invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
@@ -328,9 +365,10 @@ ensure_codex_scheduler() {
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
+resolve_heartbeat_python
 ensure_durable_schedules
 ensure_codex_scheduler
-resolve_heartbeat_python
+ensure_codex_auto_reset_timer
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
