@@ -217,6 +217,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
+- **`tmux_pane_lock.py`** — Take the per-pane writer lock that every automated pane writer holds.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.

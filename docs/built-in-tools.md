@@ -394,6 +394,7 @@ sonnet", "change the model", and the question "which model are you on" / "what m
 bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
 bash scripts/switch-model.sh fable --dry-run        # prints what it would do, changes nothing
 bash scripts/switch-model.sh opus --confirm         # a warm core asks to confirm; this answers it (owner instruction)
+bash scripts/switch-model.sh gpt-5.6-luna --effort medium   # Codex core: a gpt-* id, optional reasoning level
 ```
 
 **Report the script's `switched:` line verbatim** (`switched: model=<x> (was <y>); accepted by the
@@ -403,12 +404,14 @@ no file means no switch was recorded from here, so say the model is the runtime'
 than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
 place to point an owner who wants to switch by hand.
 
-Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
-to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
-A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
-dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
-`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
-pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+Types `/model <name>` (Claude) or the bare `/model` (Codex, then drives its model and reasoning
+pickers by digit) into the live `sutando-core` pane through the shared sender, waits for the CLI to
+accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
+A warm Claude core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise
+the dialog is cancelled. Refuses when the input box carries text. It never writes `settings.json` or
+`config.toml`: the CLI's own `/model` persists the choice. Exit 2 = name refused; 3 = no live pane;
+4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen;
+9 = the Codex picker does not offer that id.
 The capability lives in `skills/model-switch/`.
 
 ## Check quota

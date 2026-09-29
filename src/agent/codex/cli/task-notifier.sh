@@ -24,6 +24,7 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+. "$REPO/scripts/tmux-pane-lock.bash"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"
@@ -225,6 +226,19 @@ wait_for_composer() {
 # the second half, so a swallowed paste read as instant success and the
 # notifier slept out its completion timeout on a task Codex never received.
 deliver_prompt() {
+  local filename="$1" prompt="$2" rc=0
+  # One writer owns the pane from the paste through the confirmed submit: a key typed
+  # between them lands in this composer, or drives another writer's open picker.
+  if ! pane_lock_take "$TMUX_SOCKET" "$SESSION" 8; then
+    log_notifier "could not take the pane lock for $SESSION; NOT typing $filename"
+    return 1
+  fi
+  deliver_prompt_locked "$filename" "$prompt"; rc=$?
+  pane_lock_release 8
+  return "$rc"
+}
+
+deliver_prompt_locked() {
   local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state stage_checks
   # Verification is ADVISORY only when the pane hands us NO information at all --
   # a harness or Codex build we cannot read, where wait_for_composer's own poll
