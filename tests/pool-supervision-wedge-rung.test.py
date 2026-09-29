@@ -149,6 +149,29 @@ unanswered = ps.Observation(beat=ps.LIVE, session_alive=None, pane=LOGGED_OUT)
 got, _ = run([unanswered] * 2)
 check("a pane under an UNANSWERED session probe is no evidence: no login card", got, [N, N])
 
+# --- one decision per (episode, kind): a pane that moves straight into another wedge ---
+
+got, st = run([obs(LOGGED_OUT, work=False), obs(ABN), obs(ABN), obs(ABN)])
+check("an acknowledged login card does not silence the abnormal text that follows it",
+      (got, getattr(st.workers["w"], "wedge_kind", None)), ([LOGIN, N, CAUSE, N], "abnormal"))
+
+got, _ = run([obs(LOGGED_OUT, work=False), obs(LIMIT), obs(LIMIT), obs(LIMIT)])
+check("...nor a limit that follows it: that escalates at the episode's sustain", got, [LOGIN, N, E, N])
+
+got, _ = run([obs(ABN)] * 3 + [obs(LOGGED_OUT)] * 2)
+check("an expiry after an acknowledged cause card is carded on the tick that reads it",
+      got, [N, N, CAUSE, LOGIN, N])
+
+got, _ = run([obs(LOGGED_OUT, work=False)] * 2 + [obs(ABN)] * 2 + [obs(LOGGED_OUT, work=False)])
+check("returning to a kind already carded in the episode is a change of kind too",
+      got, [LOGIN, N, CAUSE, N, LOGIN])
+
+legacy = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
+    wedge_first_detected_at=400.0, wedge_consecutive=3, wedge_escalated=True)})
+_, d = ps.evaluate(legacy, {"w": obs(ABN)}, 1300.0)
+check("a state file from before the kind was kept: the raised card stays the episode's one",
+      d["w"], N)
+
 # The watcher rung still speaks when the pane is healthy.
 lost = ps.Observation(beat=ps.LIVE, session_alive=True, watcher_beat=ps.ABSENT,
                       watcher_held=False)

@@ -448,7 +448,7 @@ class TheCommandLine(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
                          {"decisions", "observations", "resumed", "not_supervised", "routing",
-                          "wedged", "auth_expired"})
+                          "wedged", "wedge_kinds", "auth_expired"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
@@ -515,6 +515,7 @@ class ALoggedOutWorker(Base):
         self.assertEqual(out["auth_expired"], [wid])
         self.assertEqual(out["observations"][wid]["pane"], ps.PANE_LOGGED_OUT)
         self.assertEqual(out["wedged"], [wid])
+        self.assertEqual(out["wedge_kinds"], {wid: "login"}, "what the stale-card sweep reads")
 
     def test_the_finding_outlives_the_card_decision(self):
         wid = make_worker(self.ws)

@@ -9416,10 +9416,14 @@ def check_task_watcher() -> dict:
                           "record; a live peer does not clear it"}
     # The standby stamps the same sentinel as the session watcher it stands in
     # for, so a live sentinel proves an announcer, never that the session works.
+    _roles = {_p: _watcher_role_and_inbox(live_argv[_p], _p) for _p in live}
+    # Per resolved inbox: a standby beside a live session watcher of it is the handoff.
+    _held = {watcher_identity.canonical_inbox(_i) for _r, _i in _roles.values()
+             if _r == "session" and _i}
     standby_only, standby_note = [], []
     for _p in sorted(live):
-        _role, _inbox = _watcher_role_and_inbox(live_argv[_p], _p)
-        if _role != "standby":
+        _role, _inbox = _roles[_p]
+        if _role != "standby" or watcher_identity.canonical_inbox(_inbox) in _held:
             continue
         _entry = f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})"
         # Only a Claude runtime runs Monitor; Codex's notifier always arms the

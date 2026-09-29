@@ -290,7 +290,8 @@ def main(argv=None) -> int:
         acted["escapes"] = wc.drive_escapes(a.workspace)
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear)
+        now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]

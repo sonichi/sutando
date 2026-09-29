@@ -126,6 +126,43 @@ class OnAClaudeCore(unittest.TestCase):
 
 
 
+class GroupedByInbox(unittest.TestCase):
+    """A standby is a gap only for an inbox no live session-role watcher holds. Two
+    sentinels can name watchers of one inbox (each is keyed by its process's own
+    (agent, instance), and the standby and the session inherit different envs)."""
+
+    def test_a_standby_beside_a_session_watcher_of_the_same_inbox_is_ok(self):
+        out = run({f"watch-tasks-stream-{WID}.pid": 4242, "watch-tasks-stream-agent~a1b2.pid": 100},
+                  {4242: vector("standby"), 100: vector("session")})
+        self.assertEqual(out["status"], "ok", out)
+        self.assertNotIn("STANDBY", out["detail"])
+
+    def test_one_inbox_spelled_with_a_trailing_slash_or_through_a_symlink_is_one_inbox(self):
+        with tempfile.TemporaryDirectory() as td:
+            real = Path(td) / "deliveries"
+            real.mkdir()
+            link = Path(td) / "via-link"
+            link.symlink_to(real)
+            for standby_at, session_at in ((str(link), str(real) + "/"),
+                                           (str(real) + "//", str(link))):
+                out = run({f"watch-tasks-stream-{WID}.pid": 4242, "watch-tasks-stream.pid": 100},
+                          {4242: vector("standby", standby_at), 100: vector("session", session_at)})
+                self.assertEqual(out["status"], "ok", (standby_at, session_at, out))
+
+    def test_a_session_watcher_of_another_inbox_does_not_cover_the_standby(self):
+        out = run({f"watch-tasks-stream-{WID}.pid": 4242, "watch-tasks-stream.pid": 100},
+                  {4242: vector("standby"), 100: vector("session", INBOX + "-other")})
+        self.assertEqual(out["status"], "warn", out)
+        self.assertIn(f"watch-tasks-stream-{WID}.pid -> pid 4242", out["detail"])
+
+    def test_a_second_standby_or_an_unread_vector_on_the_same_inbox_covers_nothing(self):
+        for other, unreadable in ((vector("standby"), ()), (vector("session"), (100,))):
+            out = run({f"watch-tasks-stream-{WID}.pid": 4242, "watch-tasks-stream.pid": 100},
+                      {4242: vector("standby"), 100: other}, unreadable=unreadable)
+            self.assertEqual(out["status"], "warn", (other, unreadable, out))
+            self.assertIn("name only the STANDBY watcher", out["detail"])
+
+
 class OnACodexCore(unittest.TestCase):
     """A Codex core cannot run Monitor: its notifier arms the standby on every start,
     so the standby is the normal delivery path and the warning must not fire."""

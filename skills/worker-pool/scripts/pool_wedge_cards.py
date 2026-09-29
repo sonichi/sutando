@@ -213,16 +213,20 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None) -> list:
-    """Close the pending cards of seats that are no longer wedged; a pressed one is
-    left to `drive_escapes`, which refuses it once the frame has moved."""
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
+    """Close the pending cards of seats that are no longer wedged, and of seats still
+    wedged whose card is not the one their pane asks for now (`wedges`: worker ->
+    that card, None for a gate or limit); a pressed one is left to `drive_escapes`,
+    which refuses it once the frame has moved."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
+    wedges = wedges or {}
     closed = []
     for r in manager.active():
         subj = r.subject or {}
-        if (subj.get("source") == SOURCE and subj.get("worker_id") in worker_ids
-                and r.status != STATUS_IN_PROGRESS):
+        w = subj.get("worker_id")
+        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w])
+        if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
             manager.resolve(r.id)
             closed.append(r.id)
     return closed

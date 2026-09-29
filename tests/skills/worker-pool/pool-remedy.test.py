@@ -18,6 +18,7 @@ import plistlib
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -379,6 +380,8 @@ class ApplyingATick(Base):
 
 LOGIN_PANE = ("❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n"
               "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+API_PANE = ("  ⎿  API Error: 500 internal server error\n❯ \n"
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
 
 
 class TheSweepOnALoggedOutWorker(Base):
@@ -429,6 +432,31 @@ class TheSweepOnALoggedOutWorker(Base):
         self.assertEqual((rc, again["decisions"][self.wid], again["cards"], again["auth_expired"]),
                          (0, ps.NOTHING, {}, [self.wid]))
         self.assertEqual(len(rem.wc.manager_for(self.ws).active()), 1)
+
+    def test_a_pane_that_moves_on_to_another_wedge_retires_the_login_card(self):
+        """One decision per (episode, kind): the acknowledged login card neither
+        silences the API error that follows it nor stays up once the pane stops
+        showing the expired login."""
+        clock = [5000.0]
+        with mock.patch.object(rem, "time", types.SimpleNamespace(time=lambda: clock[0])):
+            _, first = self._run("--sweep")
+            login_id = first["cards"][self.wid]["hitl_id"]
+            with mock.patch.object(sup, "observe_pane", return_value=(ps.PANE_ABNORMAL, "f2")), \
+                    mock.patch.object(sup, "work_outstanding", return_value=True), \
+                    mock.patch.object(rem.wc, "capture", return_value=API_PANE), \
+                    mock.patch.object(rem.wc.qa, "seat_env_base_url",
+                                      return_value=rem.wc.qa.SeatEnv(False, None)):
+                clock[0] += 300.0
+                _, second = self._run("--sweep")
+                clock[0] += 300.0
+                _, third = self._run("--sweep")
+        self.assertEqual((second["decisions"][self.wid], second["cards_closed"]),
+                         (ps.NOTHING, [login_id]), "the stale login card is retired at once")
+        self.assertEqual((third["decisions"][self.wid], third["cards"][self.wid]["outcome"]),
+                         (ps.CARD_CAUSE, "carded"))
+        active = rem.wc.manager_for(self.ws).active()
+        self.assertEqual([r.subject["wedge"] for r in active], [ps.CARD_CAUSE])
+        self.assertIn("API Error: 500", active[0].message)
 
 
 class OneCopyOfEachModule(unittest.TestCase):

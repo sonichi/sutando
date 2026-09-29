@@ -251,6 +251,17 @@ class LoginCard(unittest.TestCase):
         _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
         self.assertIn("owes work", req.message)
 
+    def test_a_seat_still_wedged_on_another_kind_retires_the_login_card(self):
+        _, _, req = card(self.ws, LOGIN, PANES["logged-out"])
+        m = manager(self.ws)
+        kept = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: LOGIN})
+        self.assertEqual(kept, [], "the pane still shows the expired login")
+        for now_asks in (CAUSE, None):     # abnormal text, or a gate/limit that escalates
+            _, _, again = card(self.ws, LOGIN, PANES["logged-out"])
+            self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
+                                                wedges={WID: now_asks}), [again.id], now_asks)
+        self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
+
 
 class CodexCards(unittest.TestCase):
     def setUp(self):
