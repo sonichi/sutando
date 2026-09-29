@@ -238,7 +238,7 @@ Tier dispatch, always in force: `access_tier: owner` (or a missing field) gets f
 
 ## Community support routing
 
-When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
+Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop app, in a DM or a room, use the `report-feedback` skill, never a chat post or another agent; reply with the reference id it returns. For a Sutando problem you cannot resolve, also recommend the official Discord, https://discord.gg/uZHWXXmrCS, beside your diagnosis; not for questions you can answer.
 
 ## Pending decisions
 

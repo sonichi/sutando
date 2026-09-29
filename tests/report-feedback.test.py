@@ -1053,10 +1053,39 @@ class _FakeResp:
         return False
 
 
+class _FakeRespWithId(_FakeResp):
+    status = 201
+
+    def read(self):
+        return b'{"ok":true,"id":"0b9c7e1a-feedback"}'
+
+
 class TestMain(unittest.TestCase):
     def _run(self, argv):
         with mock.patch.object(sys, "argv", ["report-feedback.py", *argv]):
             report_feedback.main()
+
+    def test_a_filed_report_prints_the_reference_the_api_returned(self):
+        """The agent replies with this id; before, the answer's body was never read."""
+        out = io.StringIO()
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                contextlib.redirect_stdout(out):
+            self._run(["--title", "hello", "--no-logs"])
+        self.assertIn("OK: filed bug report (201). Reference: 0b9c7e1a-feedback.", out.getvalue())
+
+    def test_a_parked_draft_filed_later_prints_its_reference_too(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                    contextlib.redirect_stdout(out):
+                self._run(["--decide", did, "file"])
+        self.assertIn(f"from draft {did}. Reference: 0b9c7e1a-feedback.", out.getvalue())
 
     def test_blank_title_exits_1(self):
         with self.assertRaises(SystemExit) as cm:

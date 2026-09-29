@@ -626,8 +626,23 @@ def logs_excerpt(ws: Path):
         return None, []
 
 
-def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
-    """POST the report, following one 307/308 hop itself.
+def reference_id(resp) -> str | None:
+    """The report's id from the feedback API's `{"ok": true, "id": ...}` answer, or None:
+    a 2xx whose body is unreadable or names no id is still a filed report."""
+    try:
+        ref = json.loads(resp.read() or b"{}").get("id")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return ref if isinstance(ref, str) and ref else None
+
+
+def reference_note(receipt: dict) -> str:
+    return f" Reference: {receipt['id']}." if receipt.get("id") else ""
+
+
+def post_feedback(url: str, payload: dict, token: str, _hops: int = 0,
+                  receipt: dict | None = None) -> int:
+    """POST the report, following one 307/308 hop itself; `receipt` gets the report's `id`.
 
     urllib only auto-follows 307/308 for GET/HEAD — for POST it raises instead,
     so a cloud host that redirects (sutando.ag2.ai -> .space) makes every report
@@ -645,6 +660,8 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
+            if receipt is not None:
+                receipt["id"] = reference_id(r)
             return r.status
     except urllib.error.HTTPError as e:
         if e.code not in (307, 308) or _hops >= 2:
@@ -669,7 +686,7 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
             raise RuntimeError(
                 f"refusing to forward credentials over {split.scheme or 'no'} scheme to {host!r}"
             ) from e
-        return post_feedback(nxt, payload, token, _hops + 1)
+        return post_feedback(nxt, payload, token, _hops + 1, receipt)
 
 
 def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved: bool = True) -> int:
@@ -723,8 +740,9 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         ctx["logs_opted_out"] = True
     payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
+    receipt: dict = {}
     try:
-        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token, receipt=receipt)
     except urllib.error.HTTPError as e:
         if 400 <= e.code < 500:
             unmark_posting(ws, draft_id)  # a client error proves no write: the draft is a draft again
@@ -738,7 +756,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")
         return 1
     mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
-    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
+    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.{reference_note(receipt)}")
     return 0
 
 
@@ -870,11 +888,12 @@ def _main() -> None:
         "body": body_with_versions(a.body.strip() or a.title.strip(), ctx["versions"]),
         "context": ctx,
     }
+    receipt: dict = {}
     try:
-        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token, receipt=receipt)
         if a.auto:
             record_auto_report(ws, a.title)
-        print(f"OK: filed {a.kind} report ({status}).")
+        print(f"OK: filed {a.kind} report ({status}).{reference_note(receipt)}")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         sys.exit(1)
