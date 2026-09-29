@@ -166,7 +166,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
-- **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
+- **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent (and, separately, a pool worker) to (re-)run its own startup bootstrap at the start of every session, including post-compaction restarts.
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
