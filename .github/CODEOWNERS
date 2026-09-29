@@ -62,7 +62,8 @@
 
 # John Marshall (jsun-m): clear leader by commit count. Rui added as backup
 # co-owner on src/observability/ (owner-assigned) -- real 2nd place there
-# (3 vs 8), not close enough on tests/observability/ (a 3-way tie at 1).
+# (3 vs 8). tests/observability/'s real 2nd is @qingyun-wu (2 vs 7), already
+# named on the `*` fallback above -- redundant to repeat here, not absent.
 /src/observability/        @jsun-m @john-the-dev # jsun-m 8, Rui 3, Susan/Qingyun/Mark/Chi 1 each
 /tests/observability/      @jsun-m               # jsun-m 7, Qingyun 2, Rui/Mark/Chi 1 each
 
