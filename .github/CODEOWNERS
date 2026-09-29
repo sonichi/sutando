@@ -62,9 +62,9 @@
 
 # John Marshall (jsun-m): clear leader by commit count. Rui and Qingyun added
 # as backup co-owners (owner-assigned) -- real 2nd places (3 vs 8, 2 vs 7).
-# Neither line was covered by the `*` fallback: both come after it in the
-# file and win outright (last-match-wins is positional, not about
-# specificity) -- without these lines, @jsun-m alone would own both paths.
+# These lines override `* @sonichi @qingyun-wu` above (last match wins,
+# positionally -- not about pattern specificity), so the owners listed here
+# are the only owners of these two paths.
 /src/observability/        @jsun-m @john-the-dev # jsun-m 8, Rui 3, Susan/Qingyun/Mark/Chi 1 each
 /tests/observability/      @jsun-m @qingyun-wu   # jsun-m 7, Qingyun 2, Rui/Mark/Chi 1 each
 
