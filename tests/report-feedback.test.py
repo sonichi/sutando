@@ -65,13 +65,22 @@ class TestBuildVersions(unittest.TestCase):
             engine.mkdir()
             repo = engine / "sutando"
             repo.mkdir()
-            (engine / "build-info.json").write_text(json.dumps({
-                "sutando": {"version": "v0.8.1-3-gabc", "commit": "abc"},
-                "ag2space": {"version": "0.5.1", "commit": "def"},
+            (repo / "package.json").write_text('{"version":"0.1.0"}')
+            (engine / "ENGINE_MANIFEST.json").write_text(json.dumps({
+                "sha": "a" * 40, "dirty": True, "builder": "private-host", "branch": "private-branch",
             }))
+            (engine / "build-id.txt").write_text("b" * 40 + "\n")
             versions = report_feedback.build_versions(repo)
-            self.assertEqual(versions["sutando"]["commit"], "abc")
-            self.assertEqual(versions["ag2space"]["version"], "0.5.1")
+            self.assertEqual(versions["sutando"]["commit"], "a" * 40)
+            self.assertEqual(versions["sutando"]["version"], "unknown")
+            self.assertEqual(versions["sutando"]["build"], "a" * 40 + "-dirty")
+            self.assertEqual(versions["ag2space"]["commit"], "b" * 40)
+            self.assertEqual(versions["ag2space"]["version"], "unknown")
+            self.assertNotIn("private", json.dumps(versions))
+            (engine / "ag2space-version.txt").write_text("0.6.19\n")
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["version"], "0.6.19")
+            (engine / "build-id.txt").write_text("dev-1234")
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["commit"], "unknown")
 
     def test_checkout_uses_own_commit_and_marks_local_edits(self):
         with tempfile.TemporaryDirectory() as td:
@@ -95,8 +104,8 @@ class TestBuildVersions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "engine" / "sutando"
             repo.mkdir(parents=True)
-            for contents in ("{bad", '[]', '{"sutando":42,"ag2space":null}'):
-                (repo.parent / "build-info.json").write_text(contents)
+            for contents in ("{bad", '[]', '{"sha":42,"dirty":null}'):
+                (repo.parent / "ENGINE_MANIFEST.json").write_text(contents)
                 versions = report_feedback.build_versions(repo)
                 self.assertEqual(versions["sutando"]["commit"], "unknown")
                 self.assertEqual(versions["ag2space"]["version"], "unknown")
@@ -109,6 +118,7 @@ class TestBuildVersions(unittest.TestCase):
             (desktop / ".git").mkdir()
             (desktop / "src-tauri").mkdir()
             (desktop / "src-tauri" / "tauri.conf.json").write_text('{"version":"0.5.2"}')
+            (repo.parent / "ENGINE_MANIFEST.json").write_text(json.dumps({"sha": "a" * 40, "dirty": True}))
             def git(source, *args):
                 prefix = "sutando" if source == repo else "desktop"
                 return prefix + ("-sha" if args[0] == "rev-parse" else "-build")
@@ -117,12 +127,14 @@ class TestBuildVersions(unittest.TestCase):
             self.assertEqual(versions["ag2space"]["version"], "0.5.2")
             self.assertEqual(versions["ag2space"]["commit"], "desktop-sha")
             self.assertEqual(versions["sutando"]["commit"], "sutando-sha")
+            self.assertEqual(versions["sutando"]["bundled_commit"], "a" * 40)
+            self.assertIn("bundled build: " + "a" * 40 + "-dirty", report_feedback.body_with_versions("", versions))
 
     def test_standalone_ignores_unrelated_neighbor_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "sutando"
             repo.mkdir()
-            (repo.parent / "build-info.json").write_text(json.dumps({
+            (repo.parent / "ENGINE_MANIFEST.json").write_text(json.dumps({
                 "ag2space": {"version": "8.8.8", "commit": "foreign"},
             }))
             self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["version"], "unknown")
@@ -139,6 +151,7 @@ class TestBuildVersions(unittest.TestCase):
                     mock.patch.object(subprocess, "check_output", return_value="abc") as run:
                 self.assertEqual(report_feedback._git(repo, "rev-parse", "HEAD"), "abc")
                 self.assertEqual(run.call_args.args[0], ["resolved-git", "arg"])
+                self.assertEqual(run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
 
     def test_git_never_inherits_a_parent_repository(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(subprocess, "check_output") as run:

@@ -86,7 +86,7 @@ def _git(repo: Path, *args: str) -> Optional[str]:
     try:
         return subprocess.check_output(
             git_argv("-C", str(repo), *args), stderr=subprocess.DEVNULL,
-            timeout=2, text=True,
+            timeout=2, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         ).strip() or None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -100,37 +100,49 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
-def build_versions(repo: Optional[Path] = None) -> dict:
-    """Identify this engine and its host, including installs without Git.
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text().strip() or None
+    except (OSError, ValueError):
+        return None
 
-    Packaged metadata is stamped by AG2Space's build script. Source checkouts
-    use their own Git identity; a standalone Sutando has no known AG2Space host.
-    """
+
+def _commit(value) -> Optional[str]:
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+
+
+def build_versions(repo: Optional[Path] = None) -> dict:
+    """Report checkout identities and existing bundle provenance without guessing releases."""
     repo = repo or Path(__file__).resolve().parents[2]
-    packaged = _read_json(repo.parent / "build-info.json") if repo.parent.name == "engine" else {}
-    versions = {}
-    desktop = repo.parent.parent
+    engine = repo.parent
+    desktop = engine.parent
+    hosted = engine.name == "engine"
+    manifest = _read_json(engine / "ENGINE_MANIFEST.json") if hosted else {}
+    bundled_sha = _commit(manifest.get("sha"))
+    host_sha = _commit(_read_text(engine / "build-id.txt")) if hosted else None
+    host_version = _read_text(engine / "ag2space-version.txt") if hosted else None
+    versions = {
+        "sutando": {"version": "unknown", "commit": bundled_sha or "unknown"},
+        "ag2space": {"version": host_version or "unknown", "commit": host_sha or "unknown"},
+    }
+    if bundled_sha:
+        versions["sutando"]["build"] = bundled_sha + ("-dirty" if manifest.get("dirty") is True else "")
     for name, source in (("sutando", repo), ("ag2space", desktop)):
-        info = packaged.get(name)
-        info = info if isinstance(info, dict) else {}
-        info = {k: v for k, v in info.items()
-                if k in ("version", "commit", "build") and isinstance(v, str) and v.strip()}
-        is_source = name == "sutando" or (
-            repo.parent.name == "engine" and
-            (desktop / "src-tauri" / "tauri.conf.json").is_file()
-        )
-        if is_source and (source / ".git").exists():
-            description = _git(source, "describe", "--tags", "--always", "--dirty")
-            version = (description if name == "sutando" else
-                       _read_json(source / "src-tauri" / "tauri.conf.json").get("version"))
-            info = {"version": version, "commit": _git(source, "rev-parse", "HEAD"),
-                    "build": description}
-        elif name == "sutando" and not info:
-            info = {"version": _read_json(repo / "package.json").get("version")}
-        versions[name] = {"version": info.get("version") or "unknown",
-                          "commit": info.get("commit") or "unknown"}
-        if info.get("build"):
-            versions[name]["build"] = info["build"]
+        is_source = name == "sutando" or (hosted and (desktop / "src-tauri/tauri.conf.json").is_file())
+        if not is_source or not (source / ".git").exists():
+            continue
+        info = versions[name]
+        if info["commit"] != "unknown":
+            info["bundled_commit"] = info["commit"]
+            if info.get("build"):
+                info["bundled_build"] = info["build"]
+        description = _git(source, "describe", "--tags", "--always", "--dirty")
+        version = description if name == "sutando" else _read_json(source / "src-tauri/tauri.conf.json").get("version")
+        info.update(version=version if isinstance(version, str) and version else "unknown",
+                    commit=_git(source, "rev-parse", "HEAD") or "unknown")
+        info.pop("build", None)
+        if description:
+            info["build"] = description
     return versions
 
 
@@ -143,6 +155,10 @@ def body_with_versions(body: str, versions: dict) -> str:
         line = f"- {label}: {info.get('version') or 'unknown'} (commit: {info.get('commit') or 'unknown'})"
         if info.get("build"):
             line += f"; build: {info['build']}"
+        if info.get("bundled_commit"):
+            line += f"; bundled commit: {info['bundled_commit']}"
+        if info.get("bundled_build"):
+            line += f"; bundled build: {info['bundled_build']}"
         lines.append(line)
     return "\n".join(lines)
 
