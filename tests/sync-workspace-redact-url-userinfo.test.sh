@@ -29,7 +29,7 @@ WSID="ab12cd"
 echo "_redact_url (unit):"
 
 # The helper is exercised as the script defines it, not as a copy in this test.
-helper="$(awk '/^_redact_url\(\) \{/,/^\}/' "$SYNC")"
+helper="$(awk '/^_redact_url(_text)?\(\) \{/,/^\}/' "$SYNC")"
 if [ -z "$helper" ]; then
     bad "sync-workspace.sh defines _redact_url" "no definition found in $SYNC"
 else

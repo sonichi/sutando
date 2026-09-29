@@ -120,21 +120,20 @@ unset _args _consume_next
 # Section 1 — Bootstrap (paths, env, config)                                   #
 # --------------------------------------------------------------------------- #
 
-# Print form of a remote URL: `scheme://user[:pass]@host/...` -> `scheme://***@host/...`.
-# Display only; git operations keep the real value. scp-style `git@host:path` has no secret.
+# Rewrites every `scheme://user[:pass]@` in stdin, URLs embedded in free text included, to
+# `scheme://***@`. Display only; git operations keep the real value. scp-style `git@host:path` has no secret.
+_redact_url_text() {
+    LC_ALL=C sed -E "s|([A-Za-z][A-Za-z0-9+.-]*://)[^/?#[:space:]'\"]*@|\\1***@|g"
+}
 _redact_url() {
-    local u="$1" scheme rest authority
-    case "$u" in
-        *://*) ;;
-        *) printf '%s' "$u"; return 0 ;;
-    esac
-    scheme="${u%%://*}"
-    rest="${u#*://}"
-    authority="${rest%%[/?#]*}"
-    case "$authority" in
-        *@*) printf '%s://***@%s%s' "$scheme" "${authority##*@}" "${rest#"$authority"}" ;;
-        *) printf '%s' "$u" ;;
-    esac
+    printf '%s\n' "$1" | _redact_url_text
+}
+# Appends the command's stdout+stderr to $LOG with credentials redacted; under pipefail the
+# pipeline's status is the command's own, so callers' `if`/`|| rc=$?` see git's exit code.
+_log_cmd() {
+    local _rc=0
+    "$@" 2>&1 | _redact_url_text >>"$LOG" || _rc=$?
+    return "$_rc"
 }
 
 _self="${BASH_SOURCE[0]:-$0}"
@@ -1065,7 +1064,7 @@ _init_impl() {
 
         local host_ws_seg
         host_ws_seg="$(_host_ws_segment)"
-        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+        if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
             log "_init_impl: pushed to origin host/${host_ws_seg}"
             echo "sync-workspace: initialized + pushed to host/${host_ws_seg}"
         else
@@ -1142,7 +1141,7 @@ _migrate_flat_branch() {
             # (ancestor check above), so the brief window where the vault has
             # neither ref is safe: the push below re-establishes it immediately,
             # and on failure the content stays local for the next sync to re-push.
-            git push origin --delete "$flat_branch" >>"$LOG" 2>&1 \
+            _log_cmd git push origin --delete "$flat_branch" \
                 || log "_migrate_flat_branch: remote delete of $flat_branch failed (already gone?)"
             # Drop the local remote-tracking ref so it neither D/F-conflicts with
             # the nested tracking ref on the next fetch nor gets merged as a bogus
@@ -1153,7 +1152,7 @@ _migrate_flat_branch() {
             # clean tree (nothing-to-commit gate), so on a no-change pass the
             # nested branch would never land.
             local _mp_rc=0
-            git push origin "refs/heads/${wsid_branch}:refs/heads/${wsid_branch}" >>"$LOG" 2>&1 || _mp_rc=$?
+            _log_cmd git push origin "refs/heads/${wsid_branch}:refs/heads/${wsid_branch}" || _mp_rc=$?
             if [ "$_mp_rc" -eq 0 ]; then
                 log "_migrate_flat_branch: retired remote flat $flat_branch, pushed $wsid_branch"
             else
@@ -1330,9 +1329,9 @@ _pull_only_impl() {
     # --prune: without it, a peer's branch rename (e.g. the #1459 flat →
     # nested wsId migration) leaves a stale local remote-tracking ref that
     # D/F-conflicts every subsequent fetch ("cannot lock ref") — wedging
-    # this host permanently while the error is swallowed by the tee below.
+    # this host permanently while the error is swallowed into the log below.
     # Bit for 6 days on Qingyuns-MBP 2026-06-05..11.
-    git fetch --all --prune --quiet 2>&1 | tee -a "$LOG" >/dev/null
+    _log_cmd git fetch --all --prune --quiet
 
     # Retire any pre-#1459 flat `host/<host>` branch before the checkout below,
     # which would otherwise D/F-conflict with the nested wsId ref.
@@ -1543,7 +1542,7 @@ _push_only_impl() {
         fi
         # ls-remote succeeded but the host branch is missing or behind HEAD →
         # the local commit was never (fully) pushed. Push it now.
-        if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+        if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
             log "_push_only_impl: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
             echo "sync-workspace: pushed previously-unpushed commit(s) to host/${host_ws_seg}"
             return 0
@@ -1586,7 +1585,7 @@ _push_only_impl() {
 
     local host_ws_seg
     host_ws_seg="$(_host_ws_segment)"
-    if git push origin "HEAD:refs/heads/host/${host_ws_seg}" 2>&1 | tee -a "$LOG" >/dev/null; then
+    if _log_cmd git push origin "HEAD:refs/heads/host/${host_ws_seg}"; then
         log "_push_only_impl: pushed to origin host/${host_ws_seg}"
         echo "sync-workspace: pushed to host/${host_ws_seg}"
         return 0
