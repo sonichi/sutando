@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cli_wedge import live_banner_lines  # noqa: E402
 from worker_auth_state import (auth_expired, authenticated_turn, login_expired,  # noqa: E402
-                               login_refusal)
+                               login_refusal, signed_in_since)
 
 FOOTER = ("────────\n❯ \n────────\n"
           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
@@ -104,6 +104,31 @@ class TheRefusalIsCleared(unittest.TestCase):
     def test_a_short_turn_that_ran_is_proof(self):
         # One second, but the agent called a tool in it: not a refusal's shape.
         pane = REFUSED + "❯ hi\n⏺ Bash(true)\n  ⎿  (no output)\n✻ Worked for 1s\n" + FOOTER
+        self.assertIsNone(login_expired(pane))
+        self.assertTrue(authenticated_turn(pane))
+
+
+class TheClearingRuleIsShared(unittest.TestCase):
+    # signed_in_since is what runtime-health's needs_login reads below its own marker
+    # line, so the rule is pinned here once, on the text that follows a refusal.
+    def test_what_clears(self):
+        for tail in ("❯ go\n⏺ Bash(ls)\n", "❯ go\n● Done.\n", "❯ /login\n  ⎿  Login successful\n",
+                     "❯ hi\n✻ Cooked for 1m 3s · done 1:00 PM\n", "✻ Worked for 0s\n❯ hi\n✻ Worked for 12s\n"):
+            self.assertTrue(signed_in_since(tail + FOOTER), tail)
+            self.assertIsNone(login_expired(REFUSED + tail + FOOTER), tail)
+
+    def test_what_does_not(self):
+        for tail in ("", "✻ Worked for 0s\n", "❯ try again\n", "❯ try again\n✻ Perambulating… (1m 46s)\n",
+                     "❯ hi\n  ⎿  Unknown slash command: /hi\n✻ Cooked for 1s · done 1:00 PM\n"):
+            self.assertFalse(signed_in_since(tail + FOOTER), tail)
+            self.assertEqual(login_expired(REFUSED + tail + FOOTER), EXPIRED, tail)
+        for empty in (None, "", "  \n"):
+            self.assertFalse(signed_in_since(empty))
+
+    def test_a_slow_refusal_is_read_as_a_turn_that_ran(self):
+        # Accepted edge: the refusal's own done line is the only duration the pane
+        # offers, so a refusal that took longer than 1 s (network latency) reads as work.
+        pane = f"❯ /startup\n  ⎿  {EXPIRED}\n✻ Worked for 2s\n" + FOOTER
         self.assertIsNone(login_expired(pane))
         self.assertTrue(authenticated_turn(pane))
 

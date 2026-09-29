@@ -597,7 +597,7 @@ def resolve_escalations(manager, session, pane=None):
     A signed-out card clears only on positive proof in `pane` that a turn ran
     (worker_auth_state.authenticated_turn): a newer prompt, a spinner, an empty
     capture or a health verdict read off another session's status file is not
-    "Sutando has continued its work" (user feedback 2026-09-29).
+    "Sutando has continued its work".
     """
     if manager is None:
         return []

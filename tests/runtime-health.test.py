@@ -23,6 +23,8 @@ _spec = importlib.util.spec_from_file_location(
 )
 rh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rh)
+sys.path.insert(0, os.path.join(REPO, "src"))
+import worker_auth_state as was  # noqa: E402
 
 fails = 0
 
@@ -74,6 +76,35 @@ check("needs_login: a 0-1 s turn after the marker is the refusal itself, still l
       rh.needs_login("  ⎿  Not logged in · Please run /login\n✻ Crunched for 0s · done 12:05 PM\n") is True)
 check("needs_login: a marker after the success line counts again",
       rh.needs_login("  ⎿  Login successful\n✻ Worked for 20s\n  ⎿  Not logged in · Please run /login\n") is True)
+
+# 2c) "Signed in after the marker" is worker_auth_state's reading, not a copy here:
+#     a refusal then a tool call or the agent's own line is signed in for both readers.
+_REFUSED_THEN_TOOL = "❯ /startup\n  ⎿  Login expired · Please run /login\n✻ Worked for 0s\n❯ go\n⏺ Bash(ls)\n"
+check("needs_login: false once a tool call ran after the marker",
+      rh.needs_login(_REFUSED_THEN_TOOL) is False)
+check("needs_login: false once the agent answered after the marker",
+      rh.needs_login("  ⎿  Login expired · Please run /login\n❯ go\n● Done.\n") is False)
+check("needs_login: reads through worker_auth_state.signed_in_since",
+      rh.signed_in_since is was.signed_in_since and not hasattr(rh, "_LOGGED_IN_AGAIN")
+      and not hasattr(rh, "_REAL_TURN"))
+_FOOTER = "────────\n❯ \n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+_REFUSED = "❯ /startup\n  ⎿  Login expired · Please run /login\n✻ Worked for 0s\n"
+for _name, _pane in (
+        ("refusal alone", _REFUSED + _FOOTER),
+        ("refusal under a newer typed prompt", _REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1)),
+        ("refusal under a spinner", _REFUSED + "❯ try again\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _FOOTER),
+        ("refusal then a tool call", _REFUSED_THEN_TOOL + _FOOTER),
+        ("refusal then the agent's line", _REFUSED + "❯ go\n● Hello.\n" + _FOOTER),
+        ("refusal then Login successful", _REFUSED + "❯ /login\n  ⎿  Login successful\n" + _FOOTER),
+        ("refusal then a turn that outran it", _REFUSED + "❯ hi\n✻ Cooked for 1m 3s · done 1:00 PM\n" + _FOOTER),
+        ("refusal then another 0 s turn", _REFUSED + "❯ hi\n  ⎿  Unknown slash command: /hi\n✻ Worked for 0s\n" + _FOOTER),
+        ("a refusal after Login successful", "  ⎿  Login successful\n✻ Worked for 20s\n" + _REFUSED + _FOOTER),
+        ("the recovered pane", RECOVERED_PANE),
+        ("no marker at all", WORKING_PANE)):
+    # Agreement holds wherever the marker line is one both readers name (the CLI's own
+    # `… /login` line); runtime-health's extra markers (keychain, API key) are its own.
+    check(f"needs_login agrees with worker_auth_state.auth_expired: {_name}",
+          rh.needs_login(_pane) is was.auth_expired(_pane))
 
 # 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
 #     import-time default reports a live core as offline. Prefer the recorded socket.

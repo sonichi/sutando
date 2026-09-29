@@ -6,9 +6,7 @@ line ("Login expired · Please run /login", "Not logged in · Please run /login"
 "OAuth access token has expired · Please run /login"), ends the turn in 0-1 s and
 returns to its idle footer. No gate is on screen, so a monitor that reads "idle
 footer, no gate" as recovery closes the owner's card while the seat is still
-signed out (user feedback 2026-09-29: on a six-worker pool host every "session
-expired" card read "Resolved — Sutando has continued its work" within 30 s of
-being raised, with all four workers still refusing every turn in 0 s).
+signed out.
 
 Which lines ARE that refusal is not decided here. The banner grammar is
 cli_wedge.py's `needs-login` live-banner family — the one grammar the seat
@@ -24,11 +22,16 @@ clears the state:
   holds a completed turn that did work, or the CLI's "Login successful" line.
   A newer typed prompt, a spinner or an empty capture prove nothing.
 
-The proofs are the two runtime-health.py's `needs_login` already trusts: "Login
-successful", or a completed turn that ran (a refused turn finishes in 0-1 s with
-nothing but its `⎿` line; a real one runs longer, or shows the agent's `●` output
-or a `⏺` tool call). A watcher re-arm or a task-status row is not readable from
-the pane, so that evidence belongs to the pool sweep, not to this reading.
+- `signed_in_since(text)` is the clearing rule on its own: does `text`, the pane
+  below a login marker, show "Login successful", the agent's `●` output, a `⏺`
+  tool call, or a completed turn that outran a refusal (one finishes in 0-1 s
+  with nothing but its `⎿` line)? runtime-health.py's `needs_login` finds its
+  marker line with its own, broader marker set and reads "signed in after it"
+  through this function, so the Console strip and the seat monitor never
+  disagree about one pane.
+
+A watcher re-arm or a task-status row is not readable from the pane, so that
+evidence belongs to the pool sweep, not to this reading.
 """
 from __future__ import annotations
 
@@ -85,6 +88,12 @@ def _signed_in_after(lines: List[str], idx: int) -> bool:
         if TURN_DONE.match(lines[j]) and _real_turn(lines, j):
             return True
     return False
+
+
+def signed_in_since(text: Optional[str]) -> bool:
+    """Does `text`, the pane below a login marker, show the CLI signed in again?
+    "Login successful", a `●`/`⏺` line or a completed turn that did work; nothing else."""
+    return _signed_in_after(_lines(text), -1)
 
 
 def login_expired(pane: Optional[str]) -> Optional[str]:

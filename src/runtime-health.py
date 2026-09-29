@@ -25,7 +25,6 @@ unreadable status file yields `unknown`, never a crash. This is a read-only
 observer; it starts nothing and kills nothing.
 """
 import json
-import re
 import math
 import os
 import tempfile
@@ -36,6 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -509,22 +509,19 @@ def _pane_text():
     return out if rc == 0 else ""
 
 
-# Proof the CLI got past a login marker: a sign-in that succeeded, or a turn that did real
-# work (a refused turn finishes in 0-1 s, so a short one proves nothing).
-_LOGGED_IN_AGAIN = re.compile(r"^\s*(?:⎿\s*)?Login successful\b", re.I)
-_REAL_TURN = re.compile(r"^\s*✻\s+[A-Za-z]+\s+for\s+(?![01]s\b)\d+[hms]")
-
-
 def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
-    Only the latest marker counts, and only if nothing after it shows the CLI signed in."""
+    Only the latest marker counts, and only while nothing after it shows the CLI
+    signed in again. The marker set is this module's (broad on purpose, above); the
+    "signed in after it" reading is worker_auth_state's, the one the seat monitor
+    uses, so both readers give one answer for one pane."""
     lines = pane_text.splitlines()
     last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
                default=None)
     if last is None:
         return False
-    return not any(_LOGGED_IN_AGAIN.match(ln) or _REAL_TURN.match(ln) for ln in lines[last + 1:])
+    return not signed_in_since("\n".join(lines[last + 1:]))
 
 
 def _core_status(workspace):
