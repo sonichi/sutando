@@ -178,6 +178,8 @@ NPX_MSG="npx not found; install Node.js to run chrome-devtools-mcp"
 NOT_OURS="$CDP_URL is answered by a process not running on $PROFILE (possibly your own Chrome); not using it. Pick another --port."
 LIST_FAILED="'agy mcp list' failed; cannot tell what chrome-devtools points at"
 ELSEWHERE="agy's chrome-devtools server points at another browser URL; not overwriting it. Remove it with 'agy mcp remove chrome-devtools' or pass that --port."
+# agy mcp list omits env and headers, so an overwritten entry cannot be put back.
+UNPINNED="agy's chrome-devtools server uses a package other than $MCP_PKG; not overwriting it. Remove it with 'agy mcp remove chrome-devtools', then run start."
 # Prints pinned, other (this URL, another package), elsewhere (another URL) or none; fails when
 # agy cannot list its servers.
 mcp_state() {
@@ -214,6 +216,7 @@ case "$ACTION" in
     [[ -n "$LSOF" ]] || fail "lsof not found; it is needed to check who owns $CDP_URL"
     state="$(mcp_state)" || fail "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && fail "$ELSEWHERE"
+    [[ "$state" == other ]] && fail "$UNPINNED"
     launched="" settled="" HS=""
     if cdp_up; then
       ours || fail "$NOT_OURS"
@@ -251,6 +254,7 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
     ours || abort_start "$NOT_OURS"
     state="$(mcp_state)" || abort_start "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && abort_start "$ELSEWHERE"
+    [[ "$state" == other ]] && abort_start "$UNPINNED"
     ours || abort_start "$NOT_OURS"
     added=""
     if [[ "$state" == pinned ]]; then
@@ -261,8 +265,7 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
       added=1
       after="$(mcp_state)" || abort_start "$LIST_FAILED"
       [[ "$after" == pinned ]] || abort_start "agy's chrome-devtools entry changed while registering (now: $after); check 'agy mcp list'"
-      if [[ "$state" == other ]]; then msg="mcp: chrome-devtools re-registered with $MCP_PKG"
-      else msg="mcp: chrome-devtools registered with agy"; fi
+      msg="mcp: chrome-devtools registered with agy"
     fi
     # The add and the list after it can block too; a listener swapped meanwhile is never reported as ours.
     if ! ours; then
@@ -282,7 +285,7 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
     else echo "browser: $CDP_URL is held by a process not running on $PROFILE"; rc=1; fi
     case "$(mcp_state || echo failed)" in
       pinned) echo "mcp: chrome-devtools registered" ;;
-      other) echo "mcp: chrome-devtools registered with a package other than $MCP_PKG; run start to re-register"; rc=1 ;;
+      other) echo "mcp: chrome-devtools registered with a package other than $MCP_PKG; remove it with 'agy mcp remove chrome-devtools', then run start"; rc=1 ;;
       elsewhere) echo "mcp: chrome-devtools points at another browser URL, not $CDP_URL"; rc=1 ;;
       failed) echo "mcp: $LIST_FAILED"; rc=1 ;;
       *) echo "mcp: chrome-devtools not registered"; rc=1 ;;

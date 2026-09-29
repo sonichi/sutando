@@ -7,7 +7,8 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
   3. status succeeds while running; stop ends only the profile's Chrome; status then fails.
   4. A port answered by a Chrome on another profile (here a prefix-sharing `<profile>-extra`) is
      refused: start launches and registers nothing, status fails, stop leaves it running.
-  5. A chrome-devtools entry on another URL (port 9222 vs 92222 style prefix) is never overwritten.
+  5. A chrome-devtools entry on another URL (port 9222 vs 92222 style prefix) is never overwritten,
+     nor is one on this URL with another package: agy cannot list its env, so it could not be restored.
   6. Without npx, start fails before launching Chrome, even with the MCP already registered, and
      status fails; if `agy mcp add` fails, start stops every process on the profile it launched,
      including a child a launcher wrapper forked before exiting.
@@ -211,14 +212,20 @@ def main() -> None:
                 f"chrome-devtools  stdio  enabled  npx -y chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:{port}\n")
             rc, out = run(env, "status", *args)
             assert rc != 0 and "package other than" in out, f"status accepted an unpinned registration: {out}"
+            unpinned = (tmp / "mcp.state").read_text()
             rc, out = run(env, "start", *args)
-            assert rc == 0 and "re-registered with chrome-devtools-mcp@1.10.1" in out, f"start kept an unpinned registration: {out}"
-            assert (tmp / "agy.log").read_text().splitlines() == added * 2, "re-registration did not use the pinned package"
+            assert rc != 0 and "not overwriting it" in out, f"start overwrote an unpinned registration: {out}"
+            assert (tmp / "mcp.state").read_text() == unpinned, "start changed the user's unpinned entry"
+            assert (tmp / "agy.log").read_text().splitlines() == added, "start ran agy mcp add over an unpinned entry"
+            (tmp / "mcp.state").write_text("")
+            rc, out = run(env, "start", *args)
+            assert rc == 0 and "registered with agy" in out, f"start after removal did not register: {out}"
+            assert (tmp / "agy.log").read_text().splitlines() == added * 2, "registration did not use the pinned package"
             added = (tmp / "agy.log").read_text().splitlines()
             entries = [l for l in (tmp / "mcp.state").read_text().splitlines() if l.startswith("chrome-devtools ")]
-            assert len(entries) == 1, f"re-registration left {len(entries)} entries: {entries}"
+            assert len(entries) == 1, f"registration left {len(entries)} entries: {entries}"
             rc, out = run(env, "status", *args)
-            assert rc == 0, f"status should succeed after re-registration: {out}"
+            assert rc == 0, f"status should succeed after registration: {out}"
             saved = (tmp / "mcp.state").read_text()
             (tmp / "mcp.state").write_text("")
             rc, out = run(env, "status", *args)
