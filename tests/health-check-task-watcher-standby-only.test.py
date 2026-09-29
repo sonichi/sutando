@@ -215,7 +215,7 @@ class TheWatchersOwnRuntime(unittest.TestCase):
         self.assertEqual(out["status"], "warn", out)
         self.assertIn(f"name only the STANDBY watcher: watch-tasks-stream-{WID}.pid -> pid 4242 (",
                       out["detail"])
-        self.assertIn(f"1 sentinel(s) name the standby watcher, the delivery path", out["detail"])
+        self.assertIn("1 sentinel(s) name the standby watcher, the delivery path", out["detail"])
         self.assertIn(f"watch-tasks-stream-{other}.pid -> pid 4343", out["detail"])
 
 
