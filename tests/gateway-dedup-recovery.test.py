@@ -101,6 +101,16 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
         self.assertEqual(r["requeued"], [], "honoured dedup should not re-ask")
         self.assertNotIn(TID, r["inflight"])
 
+    def test_replied_holder_closes_lease_without_warning_or_reask(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                r = self._run("[REPLIED]", orig=ORIG + f"dedup_requeue_count: {count}\n")
+                self.assertEqual(r["requeued"], [])
+                self.assertEqual(len(r["posts"]), 1)
+                self.assertEqual(r["posts"][0]["payload"]["body"], DEDUP)
+                self.assertEqual(r["posts"][0]["payload"]["id"], self.gw._broker_tid(TID))
+                self.assertNotIn(TID, r["inflight"])
+
     def test_empty_holder_is_re_asked(self):
         r = self._run("")
         self.assertEqual(len(r["requeued"]), 1, "the question was not re-asked")

@@ -73,6 +73,19 @@ class PlanTest(unittest.TestCase):
             self.assertEqual(sp.plan(), ("honour", None))
             self.assertFalse((sp.tasks / f"{NEW}.txt").exists(), "honour must not re-ask")
 
+    def test_replied_holder_is_honoured_in_live_and_archive_layouts(self):
+        for layout in ("live", "flat", "month"):
+            for count in (0, 1):
+                with self.subTest(layout=layout, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td)
+                    sp.orig(ORIG + f"dedup_requeue_count: {count}\n")
+                    if layout == "live":
+                        (sp.results / f"{HOLDER}.txt").write_text("[REPLIED]")
+                    else:
+                        sp.holder("[REPLIED]", month=layout == "month")
+                    self.assertEqual(sp.plan(), ("honour", None))
+                    self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
+
     def test_empty_holder_is_requeued_and_the_task_is_written(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder(""); sp.orig()

@@ -83,6 +83,10 @@ class Problems(unittest.TestCase):
         ws = _ws(results={"task-a.txt": "[deduped: task-b]\n", "task-b.txt": "the reply\n"})
         self.assertIsNone(self._p(ws))
 
+    def test_replied_holder_is_clean(self):
+        ws = _ws(results={"task-a.txt": "[deduped: task-b]\n", "task-b.txt": "[REPLIED]\n"})
+        self.assertIsNone(self._p(ws))
+
     def test_a_non_dedup_result_is_clean(self):
         ws = _ws(results={"task-a.txt": "an ordinary reply\n"})
         self.assertIsNone(self._p(ws))
