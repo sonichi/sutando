@@ -345,7 +345,7 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
     if raw:
         if not thread_root.startswith("$") or len(thread_root) < 2:
             print(f"[task-progress] thread_root must be a Matrix event id like $abc, "
-                  f"got {thread_root!r}", file=sys.stderr)
+                  f"got {raw!r}", file=sys.stderr)
             return False
     cfg = _gateway_config(source)
     if cfg is None:
