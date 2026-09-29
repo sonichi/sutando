@@ -10,9 +10,11 @@
 # GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
 # @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
 # singleton owner below is a hard block on their own PRs, and on anyone
-# else's if they're unavailable; the decided recovery path is a bypass merge
-# by @sonichi or @qingyun-wu -- not a backup owner added to the line, so this
-# file keeps naming only real, evidence-based leaders.
+# else's if they're unavailable; the default recovery path is a bypass merge
+# by @sonichi or @qingyun-wu. A second name is added to a line only where
+# there's real, evidence-based signal for it (a genuine 2nd-place contributor,
+# same bar as every other line here) -- never invented purely to dodge the
+# self-approval/availability gate.
 #
 # ROLLOUT: GitHub evaluates CODEOWNERS from the base branch, so once this
 # merges the gate applies to every open PR into main -- including ones opened
