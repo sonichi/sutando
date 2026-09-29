@@ -866,51 +866,6 @@ export const workTool: ToolDefinition = {
 		}
 
 		const taskId = `task-${Date.now()}`;
-		const timestamp = new Date().toISOString();
-		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-		// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
-		// possibly multi-line) task body can't forge header fields. Same
-		// shape as agent-api.py's /task endpoint after PR #982; consumers
-		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
-		// the first `task:` line.
-		// Attach a short window of recent conversation AFTER the `task:` line so
-		// the core can self-correct a misheard/garbled transcript (per Chi: "the
-		// voice agent may mishear and pass the wrong transcripts"). It lands in
-		// the task BODY (everything after `task:`), so it cannot forge header
-		// fields — consumers stop scanning headers at the first `task:` line.
-		// Best-effort: empty string if no log/session yet.
-		// The owner's own words first: what was actually said, verbatim from the
-		// session's input transcription, so the core can judge the model's `task:`
-		// wording against real speech instead of trusting it.
-		let spokenBlock = '';
-		try {
-			const spoken = await _awaitSpokenTurns(2);
-			if (spoken.length > 0) {
-				spokenBlock =
-					`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
-					`above is the voice model's wording of them — if it adds intent these words do not ` +
-					`carry, ask before acting) ---\n${confineUserContent(spoken.map((t) => `user: ${t}`).join('\n'))}\n`;
-			}
-		} catch { /* best effort */ }
-		let contextBlock = '';
-		try {
-			const recent = getRecentConversation(4);
-			if (recent) {
-				contextBlock =
-					`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
-					`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
-					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
-			}
-		} catch { /* best effort — never block delegation on context attach */ }
-		// An origin-bound session addresses the task to its origin and adds the adapter's
-		// guidance line; without one the task keeps `channel_id: local-voice`.
-		const origin = _voiceSessionOrigin;
-		const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
-		_rememberTaskOrigin(taskId, origin);
-		const content =
-			buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
-			`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
-		await _delegation.submitTask(taskId, content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
 		// hallucinates a giant value.
@@ -919,11 +874,65 @@ export const workTool: ToolDefinition = {
 			if (timeout_minutes === 0) timeoutMs = 0;
 			else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
 		}
+		// Reserved before the first await: an identical call during the spoken-turn wait
+		// must meet this entry in the dedup check above, not write a second task file.
+		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+		_pendingTasks.set(taskId, pendingEntry());
+		try {
+			const timestamp = new Date().toISOString();
+			const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+			// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
+			// possibly multi-line) task body can't forge header fields. Same
+			// shape as agent-api.py's /task endpoint after PR #982; consumers
+			// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
+			// the first `task:` line.
+			// Attach a short window of recent conversation AFTER the `task:` line so
+			// the core can self-correct a misheard/garbled transcript (per Chi: "the
+			// voice agent may mishear and pass the wrong transcripts"). It lands in
+			// the task BODY (everything after `task:`), so it cannot forge header
+			// fields — consumers stop scanning headers at the first `task:` line.
+			// Best-effort: empty string if no log/session yet.
+			// The owner's own words first: what was actually said, verbatim from the
+			// session's input transcription, so the core can judge the model's `task:`
+			// wording against real speech instead of trusting it.
+			let spokenBlock = '';
+			try {
+				const spoken = await _awaitSpokenTurns(2);
+				if (spoken.length > 0) {
+					spokenBlock =
+						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
+						`above is the voice model's wording of them — if it adds intent these words do not ` +
+						`carry, ask before acting) ---\n${confineUserContent(spoken.map((t) => `user: ${t}`).join('\n'))}\n`;
+				}
+			} catch { /* best effort */ }
+			let contextBlock = '';
+			try {
+				const recent = getRecentConversation(4);
+				if (recent) {
+					contextBlock =
+						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+						`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
+						`confirm before acting) ---\n${confineUserContent(recent)}\n`;
+				}
+			} catch { /* best effort — never block delegation on context attach */ }
+			// An origin-bound session addresses the task to its origin and adds the adapter's
+			// guidance line; without one the task keeps `channel_id: local-voice`.
+			const origin = _voiceSessionOrigin;
+			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
+			_rememberTaskOrigin(taskId, origin);
+			const content =
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
+			await _delegation.submitTask(taskId, content);
+		} catch (err) {
+			_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry
+			throw err;
+		}
 		// Default FALSE (Susan PR #578 silent-timeout contract restored after
 		// Chi's 2026-05-03 06:00 override was reverted at 06:47 — the always-on
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
-		_pendingTasks.set(taskId, { submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+		_pendingTasks.set(taskId, pendingEntry());
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);

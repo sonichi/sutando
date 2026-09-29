@@ -6,7 +6,7 @@
 // Run: npx tsx --test --test-force-exit tests/task-bridge-spoken-block.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -130,6 +130,38 @@ describe('the spoken block', () => {
 		const agent = readFileSync(new URL('../src/voice-agent.ts', import.meta.url), 'utf-8');
 		assert.match(agent, /pendingInput: speechHost\.transcriptManager\?\.inputBuffer/);
 		assert.match(agent, /speechHost\.handleUserSpeechEvidence = \(\) => \{ lastUserSpeechAt = Date\.now\(\);/);
+	});
+
+	it('an identical call during the spoken-turn wait is a duplicate, not a second task file', async () => {
+		// The wait opens: no utterance of the current turn has landed and the owner spoke just now,
+		// so the first call waits the full cap. The second, 300 ms in, must meet its reservation.
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'On it.' }], pendingInput: '', lastUserSpeechAt: Date.now() }));
+		const text = 'rebuild the release notes for the desktop app';
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const call = () => (workTool.execute as any)({ task: text }, null) as Promise<{ status: string; taskId: string }>;
+		const first = call();
+		await new Promise((r) => setTimeout(r, 300));
+		const second = await call();
+		const one = await first;
+		const files = readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt') && taskFile(f.slice(0, -4)).includes(`task: ${text}`));
+		assert.deepEqual({ statuses: [one.status, second.status], taskFiles: files.length }, { statuses: ['pending', 'duplicate'], taskFiles: 1 });
+		assert.equal(second.taskId, one.taskId);
+		assert.deepEqual(files, [`${one.taskId}.txt`]);
+	});
+
+	it('a task that could not be written releases its reservation, so a retry is not a duplicate', async () => {
+		setVoiceTurnsProvider(null);
+		const text = 'retry after the inbox refused the write';
+		chmodSync(join(TMP, 'tasks'), 0o500);
+		try {
+			await assert.rejects(delegate(text));
+		} finally {
+			chmodSync(join(TMP, 'tasks'), 0o700);
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const retry = (await (workTool.execute as any)({ task: text }, null)) as { status: string; taskId: string };
+		assert.equal(retry.status, 'pending');
+		assert.ok(taskFile(retry.taskId).includes(`task: ${text}`));
 	});
 
 	it('writes no block without a session, and never fails the task on a broken provider', async () => {
