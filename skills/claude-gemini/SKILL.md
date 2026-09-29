@@ -35,7 +35,7 @@ ARGUMENTS: $ARGUMENTS
 
      ```bash
      F=~/.gemini/antigravity-cli/settings.json; mkdir -p "${F%/*}"; [[ -s "$F" ]] || echo '{}' > "$F"
-     python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["modelProvider"]="gemini"; json.dump(d,open(p,"w"),indent=2)' "$F"
+     "$(bash "$SKILL_DIR/../../scripts/sutando-config.sh" python-bin)" -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["modelProvider"]="gemini"; json.dump(d,open(p,"w"),indent=2)' "$F"
      ```
 
      and have `GEMINI_API_KEY` in the environment `agy` runs in. Keep the key in the vault

@@ -64,9 +64,8 @@ LOCK="$HOME/.gemini/agy-browser.lock"
 MCP_PKG="chrome-devtools-mcp@1.10.1"
 
 cdp_up() { curl -fsS --max-time 2 "$CDP_URL/json/version" >/dev/null 2>&1; }
-# PIDs whose argv carries exactly one --user-data-dir, and it is this profile. Compared per argv
-# element, since ps joins argv with spaces and a profile path may itself contain one. With $1, only
-# those in process group $1.
+# PIDs whose argv holds exactly one --user-data-dir, this profile, compared per argv element since
+# a profile path may contain a space. With $1, only those in process group $1.
 profile_pids() {
   P="$PROFILE" G="${1:-}" "$PYTHON" - <<'PY'
 import ctypes, os, struct, subprocess
@@ -128,11 +127,13 @@ stop_profile() {
   done
   return 1
 }
-# Fail, first tearing down the Chrome this run launched, if any. Chrome is launched as its own
-# process group, so this reaches a child its launcher left behind but not another run's Chrome.
+# Fail, first tearing down the Chrome this run launched, if any. Only the group the launcher reported
+# after its setsid is ours; before that report, the cancel file stops the launcher from exec'ing.
 abort_start() {
   [[ -n "$launched" ]] || fail "$1"
-  stop_profile "$launched" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
+  : >"$HS/cancel"
+  [[ -s "$HS/pgid" ]] || fail "$1; Chrome's launcher had not started it yet and will exit without starting it"
+  stop_profile "$(cat "$HS/pgid")" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
   fail "$1; stopped the Chrome this run started"
 }
 # Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
@@ -198,20 +199,31 @@ case "$ACTION" in
       busy="$(profile_pids)" || fail "could not read process argv"
       [[ -z "$busy" ]] || fail "$PROFILE is already in use (PIDs $(tr '\n' ' ' <<<"$busy" | sed 's/ $//')) but not listening on $CDP_URL; stop it first or pick another --profile."
       chrome="$(find_chrome)"
-      nohup "$PYTHON" -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+      HS="$(mktemp -d)" || fail "could not create a temporary directory"
+      trap 'rm -rf "$HS"' EXIT
+      nohup "$PYTHON" -c '
+import os, sys
+os.setsid()
+hs = sys.argv[1]
+with open(hs + "/pgid.tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.rename(hs + "/pgid.tmp", hs + "/pgid")
+if os.path.exists(hs + "/cancel"):
+    sys.exit(1)
+os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
         "$chrome" --user-data-dir="$PROFILE" --remote-debugging-port="$PORT" \
         --remote-debugging-address=127.0.0.1 --no-first-run --no-default-browser-check \
         --headless=new about:blank >/dev/null 2>&1 &
-      launched=$!
+      launched=1
       for _ in $(seq 1 30); do cdp_up && break; sleep 0.5; done
       cdp_up || abort_start "Chrome did not start listening on $CDP_URL within 15s"
       ours || abort_start "$NOT_OURS"
       echo "browser: started on $CDP_URL (profile $PROFILE)"
     fi
-    # Recheck both after the launch wait, the listener first so the registry read sits right
+    # Recheck both under the lock, which may have waited 60s: the listener, then the registry right
     # before the add. The read after the add catches writers outside the lock.
-    ours || abort_start "$NOT_OURS"
     take_lock || abort_start "could not lock $LOCK within 60s"
+    ours || abort_start "$NOT_OURS"
     state="$(mcp_state)" || abort_start "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && abort_start "$ELSEWHERE"
     if [[ "$state" == pinned ]]; then

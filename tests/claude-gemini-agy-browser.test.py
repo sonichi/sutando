@@ -34,6 +34,7 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
+import fcntl
 import os
 import signal
 import socket
@@ -579,10 +580,67 @@ exec "{sys.executable}" "$@"
             kill_profile(profile)
             kill_profile(profile_b)
 
+        kill_profile(profile)
+        (tmp / "mcp.state").write_text("")
+        rc, out = run(env, "start", *args)
+        assert rc == 0, f"start before the lock-wait case failed: {out}"
+        (tmp / "mcp.state").write_text("")
+        lock_out, foreign = tmp / "lock.out", None
+        try:
+            with open(tmp / "home" / ".gemini" / "agy-browser.lock", "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                with open(lock_out, "w") as f:
+                    waiter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=env, stdout=f, stderr=f)
+                for _ in range(300):
+                    if waiter.poll() is not None or "waiting for another run" in lock_out.read_text():
+                        break
+                    time.sleep(0.1)
+                assert "waiting for another run" in lock_out.read_text(), f"start never waited on the lock: {lock_out.read_text()}"
+                kill_profile(profile)
+                for _ in range(40):
+                    if not answers(port):
+                        break
+                    time.sleep(0.25)
+                foreign = subprocess.Popen([str(chrome), f"--user-data-dir={tmp}/foreign", f"--remote-debugging-port={port}"], env=env)
+                wait_up(port, "the foreign listener")
+            rc, out = waiter.wait(timeout=60), lock_out.read_text()
+            assert rc != 0 and "not running on" in out, f"a listener swapped during the lock wait was registered: {out}"
+            assert f"127.0.0.1:{port}" not in (tmp / "mcp.state").read_text(), "the swapped listener was registered"
+            assert foreign.poll() is None and answers(port), "start's abort killed the foreign listener"
+        finally:
+            if foreign:
+                foreign.kill()
+            kill_profile(profile)
+
+        launches = len((tmp / "chrome.log").read_text().splitlines())
+        woke = tmp / "launch.woke"
+        slow_py = write_exec(tmp / "slow-py", f"""#!/bin/bash
+if [[ "$2" == *setsid* ]]; then
+  printf '%s\\0' "$@" >"{tmp}/launch.args"
+  exec "{sys.executable}" -c 'import os, sys, time; time.sleep(18); open(sys.argv[2], "w").close(); a = open(sys.argv[1], "rb").read().split(b"\\0")[:-1]; os.execv(sys.executable, [sys.executable] + a)' "{tmp}/launch.args" "{woke}"
+fi
+exec "{sys.executable}" "$@"
+""")
+        (tmp / "mcp.state").write_text("")
+        try:
+            rc, out = run(dict(env, SUTANDO_PY=str(slow_py)), "start", *args)
+            assert rc != 0 and "had not started it yet" in out, f"abort before the launcher's setsid misreported: {out}"
+            for _ in range(60):
+                if woke.exists():
+                    break
+                time.sleep(0.25)
+            assert woke.exists(), "the delayed launcher never resumed"
+            time.sleep(2)
+            assert not answers(port), "Chrome came up after start reported the abort"
+            assert profile_procs(profile) == [], "a process on the profile outlived the abort"
+            assert len((tmp / "chrome.log").read_text().splitlines()) == launches, "the cancelled launcher still exec'd Chrome"
+        finally:
+            kill_profile(profile)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 19/19 agy-browser.sh")
+    print("PASS 21/21 agy-browser.sh")
 
 
 if __name__ == "__main__":
