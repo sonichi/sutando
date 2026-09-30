@@ -236,9 +236,14 @@ class NotifierDependencyGateTest(unittest.TestCase):
         rpath.write_text(make_receipt(nonce))
         if receipt_age:
             os.utime(rpath, (time.time() - receipt_age, time.time() - receipt_age))
+        # The predicate the launcher polls, asked directly on the planted content: this is the
+        # parse/match verdict itself, independent of when the owner's exit cleans the path up.
+        probe = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--launch-ready", nonce],
+                               env=self._env(path), capture_output=True, text=True, timeout=30)
+        self.assertEqual(probe.returncode == 0, expect_ready,
+                         f"--launch-ready decided {probe.returncode} on the planted receipt: {probe.stderr}")
         out = launcher.communicate(timeout=60)[0]
         self.assertEqual(launcher.returncode, 0, out)
-        self.assertTrue(rpath.exists(), "the planted receipt was swept before --launch-ready could parse it")
         if expect_ready:
             self.assertNotIn("did not report ready", out)
         else:
