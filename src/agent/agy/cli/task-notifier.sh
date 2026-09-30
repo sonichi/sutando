@@ -1,6 +1,7 @@
 #!/bin/bash
 # External task-file-injection notifier for the agy (Antigravity CLI) core.
-# agy notifies on subprocess completion only, not per-line, so it can't self-arm a never-exiting watcher — this injects tasks into the pane externally instead.
+# agy notifies on subprocess completion only, not per line, so it cannot self-arm
+# a never-exiting watcher; this injects each task into the pane from outside.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
@@ -22,9 +23,6 @@ elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   RESULTS_DIR="$(dirname "$TASKS_DIR")/results-agy"
 fi
-# agy publishes its result HERE (not the watcher, which only owns TASKS_DIR),
-# so an absent results dir must fail at startup, not deep inside a dispatch.
-mkdir -p "$RESULTS_DIR" || { echo "agy-task-notifier: cannot create results dir $RESULTS_DIR" >&2; exit 1; }
 POLL_INTERVAL="${SUTANDO_AGY_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_AGY_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -43,6 +41,19 @@ if [ -z "$NOTIFIER_PY" ]; then
   echo "agy-task-notifier: no runnable python3 — cannot resolve task priority" >&2
   exit 1
 fi
+
+if [ "${1:-}" = "--sentinel-path" ]; then
+  # The sentinel this notifier's own watcher stamps once ready; the launcher
+  # polls it, so the two must derive one path from one inbox and one identity.
+  . "$REPO/src/tasks-dir-resolve.sh"
+  SUTANDO_INSTANCE_ID="agy-task-notifier" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
+    watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
+  exit $?
+fi
+
+# agy publishes its result HERE (not the watcher, which only owns TASKS_DIR),
+# so an absent results dir must fail at startup, not deep inside a dispatch.
+mkdir -p "$RESULTS_DIR" || { echo "agy-task-notifier: cannot create results dir $RESULTS_DIR" >&2; exit 1; }
 
 watcher_pid=""
 event_dir=""
@@ -170,6 +181,8 @@ submit_task() {
     ""|*/*|*..*) return 0 ;;
   esac
   has_result "$filename" && return 0
+  # A file gone since its event (cancelled, archived) has nothing to dispatch.
+  [ -f "$TASKS_DIR/$filename" ] || { log_notifier "task file gone before dispatch: $filename"; return 0; }
   prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     log_notifier "no session $SESSION — dropping $filename"

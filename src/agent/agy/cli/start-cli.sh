@@ -65,19 +65,34 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION" -e "SUTANDO_INSTANCE_ID=agy-task-notifier")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=${SUTANDO_TASKS_DIR:-}")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=${SUTANDO_RESULTS_DIR:-}")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=${SUTANDO_WORKSPACE_DIR:-}")
+  # The sentinel name carries the actor identity too: bind it the same way, so
+  # the watcher stamps the path this launcher will poll.
+  for _v in SUTANDO_AGENT_ID AGENT_MXID AGENT_ID; do
+    NOTIFIER_ENV_ARGS+=(-e "$_v=${!_v:-}")
+  done
   if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
       "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
     echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
     return 0
   fi
-  # new-session rc=0 only means tmux accepted it; poll rather than trust a
-  # session that can still die on its first tick (e.g. a notifier crash).
-  for _ in $(seq 1 10); do
-    watcher_session_exists || break
+  # tmux accepting the session proves nothing: the watcher reports ready by
+  # stamping its sentinel with a live pid, or fails readiness and takes the session down.
+  local sentinel deadline _pid
+  sentinel="$(bash "$NOTIFIER" --sentinel-path 2>/dev/null)" || sentinel=""
+  deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! watcher_session_exists; then
+      echo "  ⚠ agy task notifier exited: its watcher did not report ready — tasks will not reach this session" >&2
+      return 0
+    fi
+    if [ -n "$sentinel" ] && _pid="$(cat "$sentinel" 2>/dev/null)" \
+       && [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      return 0
+    fi
     sleep 0.2
   done
-  watcher_session_exists \
-    || echo "  ⚠ agy task notifier exited immediately after starting — tasks will not reach this session" >&2
+  echo "  ⚠ agy task notifier's watcher did not report ready within $(( ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))s — tasks may not reach this session" >&2
 }
 
 attach_or_report_existing() {

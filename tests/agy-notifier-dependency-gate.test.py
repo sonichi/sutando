@@ -21,12 +21,15 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO / "src/agent/agy/cli/start-cli.sh"
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 
 def _tmux_available() -> bool:
@@ -56,20 +59,33 @@ class NotifierDependencyGateTest(unittest.TestCase):
         )
         path.chmod(0o755)
 
-    def _symlink_only(self, name, real_path):
-        """Symlink exactly one real binary into self.bin — used to keep tmux
-        reachable while excluding fswatch, which often lives in the SAME
-        directory (e.g. Homebrew's /opt/homebrew/bin on this host), so simply
-        adding that directory to PATH would defeat the exclusion."""
-        link = self.bin / name
-        link.symlink_to(real_path)
+    def _hermetic_path(self, exclude=()):
+        """A PATH whose only real directory is a mirror of every executable on
+        the host PATH minus `exclude`, so a tool cannot leak in from wherever a
+        given host or CI image happens to install it (Homebrew's bin, /usr/bin)."""
+        shadow = self.root / "shadow"
+        shadow.mkdir(exist_ok=True)
+        seen = set(exclude)
+        dirs = os.environ.get("PATH", "").split(os.pathsep) + ["/usr/bin", "/bin"]
+        for d in dirs:
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            for name in entries:
+                real = Path(d) / name
+                if name in seen or not os.access(real, os.X_OK) or real.is_dir():
+                    continue
+                seen.add(name)
+                (shadow / name).symlink_to(real)
+        return f"{self.bin}:{shadow}"
 
     def _kill_server(self):
         subprocess.run(["tmux", "-S", str(self.socket), "kill-server"],
                         capture_output=True, timeout=10)
 
-    def _env(self, path):
-        env = dict(os.environ)
+    def _env(self, path, extra=None):
+        env = clean_env()
         env.update({
             "PATH": path,
             "SUTANDO_AGY_TMUX_SOCKET": str(self.socket),
@@ -77,8 +93,11 @@ class NotifierDependencyGateTest(unittest.TestCase):
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.root / "onboarding.json"),
             "SUTANDO_TASKS_DIR": str(self.root / "tasks"),
             "SUTANDO_RESULTS_DIR": str(self.root / "results"),
+            "SUTANDO_WORKSPACE_DIR": str(self.root),
             "HOME": str(self.root),
         })
+        if extra:
+            env.update(extra)
         return env
 
     def _has_session(self, name):
@@ -88,20 +107,16 @@ class NotifierDependencyGateTest(unittest.TestCase):
         )
         return r.returncode == 0
 
-    def _run_launcher(self, path):
+    def _run_launcher(self, path, extra=None):
         return subprocess.run(
-            ["/bin/bash", str(LAUNCHER)], env=self._env(path), cwd=str(self.root),
-            capture_output=True, text=True, timeout=30,
+            ["/bin/bash", str(LAUNCHER)], env=self._env(path, extra), cwd=str(self.root),
+            capture_output=True, text=True, timeout=60,
         )
 
     def test_missing_fswatch_is_reported_and_no_watcher_is_left_running(self):
-        # tmux stays reachable via a direct symlink, not its real directory —
-        # fswatch often lives right beside it (e.g. /opt/homebrew/bin).
-        tmux_path = shutil.which("tmux")
-        if tmux_path is None:
-            self.skipTest("tmux not installed on this host")
-        self._symlink_only("tmux", tmux_path)
-        path = f"{self.bin}:/usr/bin:/bin"
+        # Mirror the host PATH minus fswatch: a CI image that installs it under
+        # /usr/bin must not turn this negative arm into a positive one.
+        path = self._hermetic_path(exclude={"fswatch"})
         result = self._run_launcher(path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("fswatch", (result.stdout + result.stderr).lower())
@@ -111,22 +126,31 @@ class NotifierDependencyGateTest(unittest.TestCase):
         )
 
     def test_present_fswatch_watcher_survives_the_liveness_check(self):
-        fswatch_path = shutil.which("fswatch")
-        if fswatch_path is None:
+        if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
-        # Symlink tmux in too, same as the negative arm — on a packaged host
-        # tmux is not guaranteed to live under /usr/bin or /bin either.
-        tmux_path = shutil.which("tmux")
-        if tmux_path is None:
-            self.skipTest("tmux not installed on this host")
-        self._symlink_only("tmux", tmux_path)
-        path = f"{self.bin}:{os.path.dirname(fswatch_path)}:/usr/bin:/bin"
+        path = self._hermetic_path()
         result = self._run_launcher(path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("fswatch not found", result.stdout + result.stderr)
+        self.assertNotIn("did not report ready", result.stdout + result.stderr)
         self.assertTrue(
             self._has_session(f"{self.session}-watcher"),
             "watcher session should be running and reported alive with fswatch present",
+        )
+
+    def test_installed_but_silent_fswatch_is_reported_not_claimed_ready(self):
+        # An fswatch that stays alive but never emits: the watcher fails its
+        # readiness round trip and the session dies later than a 2s poll sees.
+        fake = self.bin / "fswatch"
+        fake.write_text("#!/bin/bash\nexec sleep 300\n")
+        fake.chmod(0o755)
+        path = self._hermetic_path(exclude={"fswatch"})
+        result = self._run_launcher(path, {"SUTANDO_WATCHER_READY_TIMEOUT": "3"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("did not report ready", result.stdout + result.stderr)
+        self.assertFalse(
+            self._has_session(f"{self.session}-watcher"),
+            "a watcher that failed readiness must not be left as a live-looking session",
         )
 
 

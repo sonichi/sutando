@@ -25,6 +25,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -35,6 +36,8 @@ REPO = Path(os.environ.get(
 )).resolve()
 
 NOTIFIER = REPO / "src/agent/agy/cli/task-notifier.sh"
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 BUSY_MARKER = "esc to cancel"
 IDLE_MARKER = "? for shortcuts"
@@ -159,21 +162,47 @@ esac
         script.chmod(0o755)
 
     def _env(self, extra=None):
-        env = dict(os.environ)
+        # The real watcher reads SUTANDO_TMUX_SESSION and friends: a live
+        # worker's shell would point every test at its own core session.
+        env = clean_env()
         env.update({
             "PATH": f"{self.bin}:{env.get('PATH', '/usr/bin:/bin')}",
             "SUTANDO_AGY_TMUX_SOCKET": str(self.root / "fake.sock"),
             "SUTANDO_AGY_TMUX_SESSION": "sutando-agy-test",
             "SUTANDO_TASKS_DIR": str(self.tasks_dir),
             "SUTANDO_RESULTS_DIR": str(self.results_dir),
+            # The watcher stamps under this when set; an inherited live value
+            # would put every sentinel this harness looks for elsewhere.
+            "SUTANDO_WORKSPACE_DIR": str(self.tasks_dir.parent),
             "SUTANDO_AGY_NOTIFIER_POLL_INTERVAL": "0.1",
             "SUTANDO_AGY_NOTIFIER_CORE_READY_TIMEOUT": "5",
             "SUTANDO_AGY_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT": "1",
             "SUTANDO_AGY_NOTIFIER_COMPLETION_TIMEOUT": "8",
+            # No standby supervisor exists in this harness; the session-role
+            # watcher would otherwise wait its full handoff before sweeping.
+            "SUTANDO_STANDBY_STOP_TIMEOUT": "0",
         })
         if extra:
             env.update(extra)
         return env
+
+    def wait_for_watcher_ready(self, timeout=20):
+        """Block until the spawned session-role watcher has stamped a sentinel
+        naming a live pid -- its readiness contract -- so a task written next
+        is seen by fswatch or the startup sweep, never dropped between them."""
+        state_dir = self.tasks_dir.parent / "state"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for sentinel in state_dir.glob("watch-tasks-stream*.pid"):
+                try:
+                    pid = int(sentinel.read_text().strip() or "0")
+                    os.kill(pid, 0)
+                    return sentinel
+                except (ValueError, OSError):
+                    continue
+            time.sleep(0.1)
+        self.fail("the notifier's watcher never reported ready (no live sentinel under "
+                  f"{state_dir})")
 
     def write_task(self, name, body="task: say OK\n"):
         (self.tasks_dir / name).write_text(body)
@@ -419,7 +448,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             start_new_session=True,
         )
         try:
-            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.wait_for_watcher_ready()
             self.write_task("task-live.txt")
             deadline = time.time() + 20
             while time.time() < deadline:
@@ -464,7 +493,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             start_new_session=True,
         )
         try:
-            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.wait_for_watcher_ready()
             self.write_task("task-busy-recover.txt")
             # CORE_READY_TIMEOUT is 5s in this harness; outlive one full
             # timed-out idle-wait cycle while the pane stays busy throughout.
@@ -516,7 +545,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             start_new_session=True,
         )
         try:
-            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.wait_for_watcher_ready()
             self.write_task("task-race.txt")
             # Wait for the outer check's one capture-pane call, then flip busy
             # for the next one (deliver_prompt's inner check) -- deterministic.
@@ -703,7 +732,7 @@ class RestartHandoffTest(FakeTmuxHarness):
             self.skipTest("fswatch not installed on this host")
         gen1 = self._spawn()
         try:
-            time.sleep(1.5)  # let fswatch attach before the file appears
+            self.wait_for_watcher_ready()
             self.write_task("task-handoff.txt")
             deadline = time.time() + 15
             while time.time() < deadline:
@@ -834,6 +863,8 @@ esac
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "SUTANDO_AGY_TMUX_SOCKET": str(self.root / "fake.sock"),
             "SUTANDO_AGY_TMUX_SESSION": "sutando-agy-wiretest",
+            # The stub tmux never runs the notifier, so no sentinel can appear.
+            "SUTANDO_WATCHER_READY_TIMEOUT": "0",
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.root / "onboarding.json"),
             "SUTANDO_TASKS_DIR": str(self.root / "tasks"),
             "SUTANDO_RESULTS_DIR": str(self.root / "results"),
