@@ -107,6 +107,15 @@ class NotifierDependencyGateTest(unittest.TestCase):
         )
         return r.returncode == 0
 
+    def _assert_watcher_session_gone(self, why):
+        # The session dies when the watcher's own readiness timeout ends it; on a loaded host that
+        # can trail the launcher's return by a few seconds, so wait for it rather than sample once.
+        for _ in range(100):
+            if not self._has_session(f"{self.session}-watcher"):
+                return
+            time.sleep(0.1)
+        self.fail(why)
+
     def _run_launcher(self, path, extra=None):
         return subprocess.run(
             ["/bin/bash", str(LAUNCHER)], env=self._env(path, extra), cwd=str(self.root),
@@ -120,10 +129,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
         result = self._run_launcher(path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("fswatch", (result.stdout + result.stderr).lower())
-        self.assertFalse(
-            self._has_session(f"{self.session}-watcher"),
-            "no watcher session should be left running (or unreported-dead) without fswatch",
-        )
+        self._assert_watcher_session_gone("no watcher session should be left running (or unreported-dead) without fswatch")
 
     def test_present_fswatch_watcher_survives_the_liveness_check(self):
         if shutil.which("fswatch") is None:
@@ -148,10 +154,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
         result = self._run_launcher(path, {"SUTANDO_WATCHER_READY_TIMEOUT": "3"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("did not report ready", result.stdout + result.stderr)
-        self.assertFalse(
-            self._has_session(f"{self.session}-watcher"),
-            "a watcher that failed readiness must not be left as a live-looking session",
-        )
+        self._assert_watcher_session_gone("a watcher that failed readiness must not be left as a live-looking session")
 
 
     def _sentinel_path(self):
@@ -196,8 +199,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
         result = self._run_launcher(path, {"SUTANDO_WATCHER_READY_TIMEOUT": "3"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("did not report ready", result.stdout + result.stderr)
-        self.assertFalse(self._has_session(f"{self.session}-watcher"),
-                         "a watcher that never became ready was left as a live-looking session")
+        self._assert_watcher_session_gone("a watcher that never became ready was left as a live-looking session")
         return sentinel, rpath
 
     def _receipt(self, nonce, inbox=None, watcher=None, notifier=None):
@@ -275,9 +277,12 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self._launch_planting_receipt(lambda n: f"nonce={n}\n", expect_ready=False)
 
     def test_receipt_with_non_positive_owner_pids_is_not_readiness(self):
-        # kill(0, 0) and kill(-1, 0) succeed (a group, a set), so these must fail the parse, not the probe.
-        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=0, notifier=0), expect_ready=False)
-        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=-1, notifier=-1), expect_ready=False)
+        # kill(0, 0) and kill(-1, 0) succeed (a group, a set), so these must fail the parse, not the
+        # probe -- one field at a time, its sibling a live pid, so each half of the guard is the decider.
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=0), expect_ready=False)
+        self._launch_planting_receipt(lambda n: self._receipt(n, notifier=-1), expect_ready=False)
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=-1), expect_ready=False)
+        self._launch_planting_receipt(lambda n: self._receipt(n, notifier=0), expect_ready=False)
 
     def test_receipt_for_an_adjacent_inbox_is_not_readiness(self):
         self._launch_planting_receipt(lambda n: self._receipt(n, inbox=str(self.root / "tasks-other")), expect_ready=False)
