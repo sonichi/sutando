@@ -983,6 +983,8 @@ exec "{sys.executable}" "$@"
                 assert hold.exists(), f"{case}: start never reached the registry read: {starter.poll()}"
                 chrome_pids = profile_procs(profile)
                 assert answers(port) and chrome_pids, f"{case}: Chrome was not listening before the signal"
+                groups = subprocess.run(["/bin/ps", "-o", "pid=,pgid=,sid=,stat=", "-p", ",".join(map(str, chrome_pids + [starter.pid]))],
+                                        capture_output=True, text=True).stdout
                 if case == "reused":
                     pm["lstart"].touch()
                 if case == "revalidated":
@@ -994,8 +996,8 @@ exec "{sys.executable}" "$@"
                 assert starter.returncode != 0, f"{case}: start killed by SIGTERM exited 0: {out}"
                 hs_dir = Path((tmp / f"{case}.hs").read_text().strip())
                 state = (f"hs exists={hs_dir.exists()} pgid={(hs_dir / 'pgid').read_text() if (hs_dir / 'pgid').exists() else None!r} "
-                         f"profile procs before={chrome_pids} after={profile_procs(profile)} cdp={answers(port)}\n"
-                         + "".join((tmp / f"{case}.trace").read_text().splitlines(True)[-60:]))
+                         f"profile procs before={chrome_pids} after={profile_procs(profile)} cdp={answers(port)}\nstarter={starter.pid} groups before the signal:\n{groups}"
+                         + "".join([l for l in (tmp / f"{case}.trace").read_text().splitlines(True) if l.startswith("+")][-150:]))
                 assert "could not prove process group" in out, f"{case}: an unproved group was not reported: {out}\n{state}"
                 if case in ("reused", "revalidated", "unreadable"):
                     assert profile_procs(profile) == chrome_pids, f"{case}: a group whose leader changed identity was signalled: {out}"
