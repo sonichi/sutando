@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -63,8 +64,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
         """A PATH whose only real directory is a mirror of every executable on
         the host PATH minus `exclude`, so a tool cannot leak in from wherever a
         given host or CI image happens to install it (Homebrew's bin, /usr/bin)."""
-        shadow = self.root / "shadow"
-        shadow.mkdir(exist_ok=True)
+        shadow = Path(tempfile.mkdtemp(prefix="shadow-", dir=self.root))
         seen = set(exclude)
         dirs = os.environ.get("PATH", "").split(os.pathsep) + ["/usr/bin", "/bin"]
         for d in dirs:
@@ -152,6 +152,44 @@ class NotifierDependencyGateTest(unittest.TestCase):
             self._has_session(f"{self.session}-watcher"),
             "a watcher that failed readiness must not be left as a live-looking session",
         )
+
+
+    def _sentinel_path(self):
+        r = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--sentinel-path"],
+                           env=self._env(self._hermetic_path()), capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return Path(r.stdout.strip())
+
+    def _launch_with_silent_fswatch_and_preseeded_sentinel(self, payload):
+        # A crash-left sentinel with an old mtime; the watcher this launch starts never
+        # becomes ready (fswatch stays alive, emits nothing), so only the stale file speaks.
+        fake = self.bin / "fswatch"
+        fake.write_text("#!/bin/bash\nexec sleep 300\n")
+        fake.chmod(0o755)
+        sentinel = self._sentinel_path()
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(payload)
+        old = time.time() - 3600
+        os.utime(sentinel, (old, old))
+        result = self._run_launcher(self._hermetic_path(exclude={"fswatch"}),
+                                    {"SUTANDO_WATCHER_READY_TIMEOUT": "3"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("did not report ready", result.stdout + result.stderr)
+        self.assertFalse(self._has_session(f"{self.session}-watcher"),
+                         "a watcher that never became ready was left as a live-looking session")
+
+    def test_stale_sentinel_naming_a_live_unrelated_pid_is_not_readiness(self):
+        bystander = subprocess.Popen(["sleep", "120"])
+        self.addCleanup(bystander.kill)
+        self._launch_with_silent_fswatch_and_preseeded_sentinel(f"{bystander.pid}\n")
+
+    def test_stale_sentinel_naming_a_dead_pid_is_not_readiness(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self._launch_with_silent_fswatch_and_preseeded_sentinel(f"{gone.pid}\n")
+
+    def test_malformed_sentinel_payload_is_not_readiness(self):
+        self._launch_with_silent_fswatch_and_preseeded_sentinel("not-a-pid\n")
 
 
 if __name__ == "__main__":

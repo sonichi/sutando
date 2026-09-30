@@ -71,23 +71,22 @@ ensure_task_notifier() {
   for _v in SUTANDO_AGENT_ID AGENT_MXID AGENT_ID; do
     NOTIFIER_ENV_ARGS+=(-e "$_v=${!_v:-}")
   done
+  local launch_t0; launch_t0="$(date +%s)"
   if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
       "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
     echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
     return 0
   fi
-  # tmux accepting the session proves nothing: the watcher reports ready by
-  # stamping its sentinel with a live pid, or fails readiness and takes the session down.
-  local sentinel deadline _pid
-  sentinel="$(bash "$NOTIFIER" --sentinel-path 2>/dev/null)" || sentinel=""
+  # tmux accepting the session proves nothing: ready means the sentinel was stamped by
+  # THIS launch's watcher (the notifier's ownership witness), or the session is gone.
+  local deadline
   deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! watcher_session_exists; then
       echo "  ⚠ agy task notifier exited: its watcher did not report ready — tasks will not reach this session" >&2
       return 0
     fi
-    if [ -n "$sentinel" ] && _pid="$(cat "$sentinel" 2>/dev/null)" \
-       && [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+    if bash "$NOTIFIER" --sentinel-ready "$launch_t0" 2>/dev/null; then
       return 0
     fi
     sleep 0.2

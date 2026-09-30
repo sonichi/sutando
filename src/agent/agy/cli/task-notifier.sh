@@ -42,14 +42,43 @@ if [ -z "$NOTIFIER_PY" ]; then
   exit 1
 fi
 
-if [ "${1:-}" = "--sentinel-path" ]; then
+sentinel_path() {
   # The sentinel this notifier's own watcher stamps once ready; the launcher
   # polls it, so the two must derive one path from one inbox and one identity.
   . "$REPO/src/tasks-dir-resolve.sh"
   SUTANDO_INSTANCE_ID="agy-task-notifier" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
     watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
-  exit $?
-fi
+}
+case "${1:-}" in
+  --sentinel-path) sentinel_path; exit $? ;;
+  --sentinel-ready)
+    # Ready only when the sentinel was stamped after this launch began ($2, epoch) by a
+    # watcher on THIS inbox that started after it: a live pid alone can be a reused number.
+    [ -n "${2:-}" ] || { echo "agy-task-notifier: --sentinel-ready needs the launch epoch" >&2; exit 2; }
+    SENT="$(sentinel_path)" || exit 1
+    T0="$2" SENT="$SENT" INBOX="$TASKS_DIR" "$NOTIFIER_PY" - <<'PY'
+import os, subprocess, sys, time
+sent, t0, inbox = os.environ["SENT"], int(os.environ["T0"]), os.environ["INBOX"]
+try:
+    if os.stat(sent).st_mtime < t0:
+        sys.exit(1)
+    pid = int(open(sent).read().strip())
+except (OSError, ValueError):
+    sys.exit(1)
+if pid <= 0:
+    sys.exit(1)
+out = subprocess.run(["ps", "-o", "etime=,command=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+if not out:
+    sys.exit(1)
+etime, cmd = out.split(None, 1) if " " in out else (out, "")
+days, _, clock = etime.rpartition("-")
+parts = [int(x) for x in clock.split(":")]
+elapsed = int(days or 0) * 86400 + sum(v * m for v, m in zip(reversed(parts), (1, 60, 3600)))
+started_after_launch = elapsed <= int(time.time()) - t0 + 1
+sys.exit(0 if started_after_launch and "watch-tasks-stream.sh" in cmd and inbox in cmd else 1)
+PY
+    exit $? ;;
+esac
 
 # agy publishes its result HERE (not the watcher, which only owns TASKS_DIR),
 # so an absent results dir must fail at startup, not deep inside a dispatch.
