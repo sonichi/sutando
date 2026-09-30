@@ -50,6 +50,12 @@ Payload schema:
  "tmux_verified": true, "tmux_candidates": ["/opt/homebrew/bin/tmux"], "schema_version": 4}
 ```
 
+For an explicitly selected non-Claude runtime, `pid` comes only from the panes
+of the recorded socket and exact session; a same-named Claude process elsewhere
+cannot supply it. Claude and unknown-runtime resolution retain the existing
+name-identity fallback, which is not socket attestation. `heartbeat_pid` remains
+the writer's PID, separate from the core PID.
+
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
