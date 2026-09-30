@@ -149,7 +149,8 @@ def main():
     args = parser.parse_args()
     try:
         from workspace_default import resolve_workspace
-        identities = validate(args.directory, Path(__file__).resolve().parent.parent,
+        repo = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+        identities = validate(args.directory, repo,
                               resolve_workspace(), args.socket, args.session)
         fingerprint = hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
         if args.expected and args.expected != fingerprint:
