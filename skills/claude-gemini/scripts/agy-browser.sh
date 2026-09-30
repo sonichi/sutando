@@ -136,44 +136,74 @@ abort_start() {
   for _ in $(seq 1 50); do
     pg="$(cat "$HS/pgid" 2>/dev/null)" || true
     [[ -n "$pg" ]] && break
-    launcher_alive || break
+    [[ "$(launcher_state)" == dead ]] && break
     sleep 0.1
   done
   [[ -n "$pg" ]] || pg="$(cat "$HS/pgid" 2>/dev/null)" || true
   if [[ -z "$pg" ]]; then
-    launcher_alive || fail "$1; Chrome's launcher exited without starting it"
+    [[ "$(launcher_state)" == dead ]] && fail "$1; Chrome's launcher exited without starting it"
     fail "$1; Chrome's launcher has not started it yet; it will read $HS/cancel and exit without starting it"
   fi
+  group_owned "$pg" || { settled=1; fail "$1; $(unproved "$pg")"; }
   kill -TERM -- "-$pg" 2>/dev/null || true
   stop_profile "$pg" || fail "$1; the Chrome this run started on $PROFILE did not exit, or its processes could not be read"
   settled=1; rm -rf "$HS"
   fail "$1; stopped the Chrome this run started"
 }
 # Every exit, signals included, that did not end in success cancels the launch. $HS is removed only
-# once the launcher is seen gone: before its report, the cancel file is what stops it.
+# once the launcher is proved gone: before its report, the cancel file is what stops it.
 on_exit() {
   [[ -n "${HS:-}" && -z "$settled" ]] || return 0
   : >"$HS/cancel" 2>/dev/null || true
-  local pg; pg="$(cat "$HS/pgid" 2>/dev/null)" || true
+  local st="" pg rc
+  [[ -n "${launcher:-}" ]] && st="$(launcher_state)"
+  pg="$(cat "$HS/pgid" 2>/dev/null)" || true
   if [[ -n "$pg" ]]; then
-    if end_group "$pg"; then rm -rf "$HS"
+    rc=0; end_group "$pg" || rc=$?
+    if [[ $rc == 0 ]]; then rm -rf "$HS"
+    elif [[ $rc == 2 ]]; then echo "agy-browser.sh: $(unproved "$pg")" >&2
     else echo "agy-browser.sh: process group $pg (Chrome on $PROFILE) did not exit; kill it with 'kill -KILL -- -$pg'" >&2; fi
-  elif [[ -n "${launcher:-}" ]] && ! launcher_alive; then rm -rf "$HS"; fi
+  elif [[ "$st" == dead ]]; then rm -rf "$HS"; fi
 }
+unproved() { echo "could not prove process group $1 is still the Chrome this run started, so it was not signalled; $HS is kept"; }
 # True while any live (non-zombie) process is in group $1, or when ps cannot tell.
 group_alive() {
   local rows; rows="$(ps -Ao pgid=,stat= 2>/dev/null)" || return 0
   awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' <<<"$rows"
 }
-# TERM group $1, KILL it after 5s, and succeed only once no process in it is left.
+# True only while group $1 is provably this run's: the launcher's own group, led by the launcher
+# (same start time), or, once the leader is gone, with every live member running on $PROFILE.
+group_owned() {
+  [[ -n "${launcher:-}" && "$1" == "$launcher" ]] || return 1
+  local st rows members owned p
+  st="$(ps -o lstart= -p "$1" 2>/dev/null)" || st=""
+  if [[ -n "$st" ]]; then [[ -n "$LSTART" && "$st" == "$LSTART" ]]; return; fi
+  rows="$(ps -Ao pid=,pgid=,stat= 2>/dev/null)" || return 1
+  members="$(awk -v g="$1" '$2 == g && $3 !~ /^Z/ { print $1 }' <<<"$rows")"
+  owned="$(profile_pids "$1")" || return 1
+  for p in $members; do grep -qx "$p" <<<"$owned" || return 1; done
+}
+# TERM group $1, KILL it after 5s, revalidating ownership before each signal. Returns 0 once no
+# process in it is left, 2 when ownership could not be proved, 1 when it would not exit.
 end_group() {
+  group_alive "$1" || return 0
+  group_owned "$1" || return 2
   kill -TERM -- "-$1" 2>/dev/null || true
   for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
+  group_owned "$1" || return 2
   kill -KILL -- "-$1" 2>/dev/null || true
   for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
   return 1
 }
-launcher_alive() { local st; st="$(ps -o stat= -p "$launcher" 2>/dev/null)" && [[ "$st" != Z* ]]; }
+# Prints alive, dead or unknown. dead only once the launcher (this shell's child, so a failed
+# signal probe means it was reaped) is gone or a zombie; an unreadable ps is unknown, never dead.
+launcher_state() {
+  kill -0 "$launcher" 2>/dev/null || { echo dead; return; }
+  local st; st="$(ps -o stat= -p "$launcher" 2>/dev/null)" || st=""
+  if [[ -n "$st" ]]; then [[ "$st" == Z* ]] && echo dead || echo alive
+  elif kill -0 "$launcher" 2>/dev/null; then echo unknown
+  else echo dead; fi
+}
 # Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
 # fd 9 holds the flock until exit; writers other than this script are not covered.
 take_lock() {
@@ -232,7 +262,7 @@ case "$ACTION" in
     state="$(mcp_state)" || fail "$LIST_FAILED"
     [[ "$state" == elsewhere ]] && fail "$ELSEWHERE"
     [[ "$state" == other ]] && fail "$UNPINNED"
-    launched="" settled="" HS=""
+    launched="" settled="" HS="" LSTART=""
     if cdp_up; then
       ours || fail "$NOT_OURS"
       echo "browser: already listening on $CDP_URL"
@@ -257,6 +287,7 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
         --remote-debugging-address=127.0.0.1 --no-first-run --no-default-browser-check \
         --headless=new about:blank >/dev/null 2>&1 &
       launcher=$!
+      LSTART="$(ps -o lstart= -p "$launcher" 2>/dev/null)" || LSTART=""
       launched=1
       for _ in $(seq 1 30); do cdp_up && break; sleep 0.5; done
       cdp_up || abort_start "Chrome did not start listening on $CDP_URL within 15s"

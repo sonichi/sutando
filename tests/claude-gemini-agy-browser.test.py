@@ -44,6 +44,12 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      group, still cancels the launch: no Chrome comes up and the handshake directory is removed.
  25. A start killed by SIGTERM with a TERM-ignoring Chrome already listening leaves no process on the
      profile: the group is killed, and only then is the handshake directory removed.
+ 26. A launcher probe whose ps fails is unknown, never dead: a start killed while that probe fails
+     keeps the cancel file (a hooked rm would let the launcher's report land just before the removal),
+     so the launcher never exec's Chrome.
+ 27. Ownership of the reported group is revalidated before every signal: a group whose leader's start
+     time changed (a reused PGID), or one that is not the launcher's own, is never signalled; start
+     reports it and keeps the handshake directory.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -865,10 +871,132 @@ exec "{sys.executable}" "$@"
                 starter.kill()
             kill_profile(profile)
 
+        (tmp / "mcp.state").write_text("")
+        pm = {k: tmp / f"probe.{k}" for k in ("fail", "go", "renamed", "release", "lstart")}
+        ps_hook = write_exec(bin_dir / "ps", f"""#!/bin/bash
+[[ -e "{pm['fail']}" && "$*" == "-o stat= -p "* ]] && exit 1
+if [[ -e "{pm['lstart']}" && "$*" == "-o lstart= -p "* ]]; then echo "Thu Jan  1 00:00:00 1970"; exit 0; fi
+exec /bin/ps "$@"
+""")
+        probe_py = write_exec(tmp / "probe-py", f"""#!/bin/bash
+if [[ "$2" == *setsid* ]]; then
+  echo "$3" >"{tmp}/probe.hs"
+  exec "{sys.executable}" -c '
+import os, sys, time
+code, sys.argv = sys.argv[1], ["-c"] + sys.argv[2:]
+real = os.rename
+def rename(a, b):
+    for _ in range(600):
+        if os.path.exists("{pm['go']}"):
+            break
+        time.sleep(0.1)
+    real(a, b)
+    open("{pm['renamed']}", "w").close()
+    for _ in range(600):
+        if os.path.exists("{pm['release']}"):
+            break
+        time.sleep(0.1)
+os.rename = rename
+exec(compile(code, "<launcher>", "exec"))' "$2" "${{@:3}}"
+fi
+exec "{sys.executable}" "$@"
+""")
+        probe_rm = write_exec(bin_dir / "rm", f"""#!/bin/bash
+for a in "$@"; do
+  if [[ -e "{pm['fail']}" && -d "$a" && -e "$a/cancel" ]]; then
+    : >"{pm['go']}"
+    for _ in $(seq 1 100); do [[ -f "{pm['renamed']}" ]] && break; sleep 0.1; done
+  fi
+done
+exec /bin/rm "$@"
+""")
+        launches, starter = len((tmp / "chrome.log").read_text().splitlines()), None
+        try:
+            starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(env, SUTANDO_PY=str(probe_py)),
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            for _ in range(100):
+                if (tmp / "probe.hs").exists() or starter.poll() is not None:
+                    break
+                time.sleep(0.1)
+            assert (tmp / "probe.hs").exists(), f"the launcher never started: {starter.poll()}"
+            time.sleep(0.5)
+            pm["fail"].touch()
+            os.killpg(starter.pid, signal.SIGTERM)
+            out = starter.communicate(timeout=60)[0]
+            pm["go"].touch()
+            pm["release"].touch()
+            assert starter.returncode != 0, f"start killed by SIGTERM exited 0: {out}"
+            for _ in range(40):
+                if pm["renamed"].exists():
+                    break
+                time.sleep(0.25)
+            assert pm["renamed"].exists(), f"the held launcher never resumed: {out}"
+            time.sleep(3)
+            assert not answers(port), f"Chrome came up after a failed launcher probe: {out}"
+            assert profile_procs(profile) == [], "a process on the profile outlived the failed launcher probe"
+            assert len((tmp / "chrome.log").read_text().splitlines()) == launches, "the launcher exec'd Chrome after a failed probe removed its cancel file"
+        finally:
+            pm["release"].touch()
+            pm["fail"].unlink(missing_ok=True)
+            probe_rm.unlink()
+            if starter and starter.poll() is None:
+                starter.kill()
+            kill_profile(profile)
+
+        foreign = subprocess.Popen(["sleep", "120"], start_new_session=True)
+        for case, extra in (("reused", {}), ("foreign", {"FOREIGN": str(foreign.pid)})):
+            (tmp / "mcp.state").write_text("")
+            hold, release, starter = tmp / f"{case}.hold", tmp / f"{case}.release", None
+            wrap = write_exec(tmp / f"{case}-py", f"""#!/bin/bash
+if [[ "$2" == *setsid* ]]; then
+  echo "$3" >"{tmp}/{case}.hs"
+  [[ -n "${{FOREIGN:-}}" ]] && exec "{sys.executable}" -c '
+import os, sys
+code, sys.argv = sys.argv[1], ["-c"] + sys.argv[2:]
+real = os.rename
+def rename(a, b):
+    real(a, b)
+    open(b, "w").write(os.environ["FOREIGN"])
+os.rename = rename
+exec(compile(code, "<launcher>", "exec"))' "$2" "${{@:3}}"
+fi
+exec "{sys.executable}" "$@"
+""")
+            try:
+                starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                    env, SUTANDO_PY=str(wrap), AGY_LIST_COUNT=str(tmp / f"{case}.count"),
+                    AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold), HOLD_RELEASE=str(release), **extra),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                for _ in range(300):
+                    if hold.exists() or starter.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                assert hold.exists(), f"{case}: start never reached the registry read: {starter.poll()}"
+                chrome_pids = profile_procs(profile)
+                assert answers(port) and chrome_pids, f"{case}: Chrome was not listening before the signal"
+                if case == "reused":
+                    pm["lstart"].touch()
+                os.killpg(starter.pid, signal.SIGTERM)
+                out = starter.communicate(timeout=60)[0]
+                assert starter.returncode != 0, f"{case}: start killed by SIGTERM exited 0: {out}"
+                assert "could not prove process group" in out, f"{case}: an unproved group was not reported: {out}"
+                if case == "reused":
+                    assert profile_procs(profile) == chrome_pids, f"{case}: a group whose leader changed identity was signalled: {out}"
+                assert foreign.poll() is None, f"{case}: start signalled a foreign process group: {out}"
+                assert Path((tmp / f"{case}.hs").read_text().strip()).exists(), f"{case}: the handshake was removed without proving ownership"
+            finally:
+                release.touch()
+                pm["lstart"].unlink(missing_ok=True)
+                if starter and starter.poll() is None:
+                    starter.kill()
+                kill_profile(profile)
+        foreign.kill()
+        ps_hook.unlink()
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 25/25 agy-browser.sh")
+    print("PASS 27/27 agy-browser.sh")
 
 
 if __name__ == "__main__":
