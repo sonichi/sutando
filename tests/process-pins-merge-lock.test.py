@@ -107,11 +107,9 @@ class MergeTransaction(unittest.TestCase):
         path.write_text(json.dumps({"pins": pins}, indent=1))
         os.utime(path, ns=(mtime_ns, mtime_ns))
 
-    def _merge(self, env=None, expect_sha=None):
+    def _merge(self, env=None):
         argv = [sys.executable, str(REPO / "src" / "process_pins.py"), "merge",
-                "--into", str(self.dst), "--newer", str(self.src), "--older", str(self.dst)]
-        if expect_sha:
-            argv += ["--expect-dst-sha256", expect_sha]
+                "--into", str(self.dst), "--incoming", str(self.src)]
         return subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
 
     def test_arm_during_merge_survives(self):
@@ -150,16 +148,16 @@ class MergeTransaction(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertEqual(self.dst.read_bytes(), before, "a refused merge must not touch the destination")
 
-    def test_moved_destination_outranks_the_callers_ordering(self):
-        """The caller measured dst before a concurrent write; the token no longer
-        matches, so dst is taken whole and the src becomes the older side."""
+    def test_moved_destination_outranks_a_stale_pre_lock_read(self):
+        """dst moves after a caller might have read its mtime, before the merge
+        actually runs; ordering is decided fresh under the lock, so the move wins
+        without needing a caller-supplied token at all."""
         base = time.time_ns() - 10 ** 12
         self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "dest-old")], base)
-        token = pp._sha256(self.dst)
         self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "src-version")], base + 10 ** 9)
-        # dst moves after the caller's measurement: same identity, new content
+        # dst moves after a hypothetical caller-side read: same identity, new content
         self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "dest-moved")], base + 2 * 10 ** 9)
-        r = self._merge(expect_sha=token)
+        r = self._merge()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([p["reason"] for p in pp.load_pins(self.dst)], ["dest-moved"])
 
@@ -227,7 +225,7 @@ class InProcess(unittest.TestCase):
         base = time.time_ns() - 10 ** 12
         self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "old")], base)
         self._write(self.src, [_pin("telegram-bridge", self.me, self.my_lstart, "newer")], base + 5 * 10 ** 9)
-        kept, dropped, total, newer_is_dst = pp.merge_into(self.dst, self.src, self.dst)
+        kept, dropped, total, newer_is_dst = pp.merge_into(self.dst, self.src)
         self.assertEqual((kept, dropped, total, newer_is_dst), (1, 0, 2, False))
         self.assertEqual(self.dst.stat().st_mtime_ns, base + 5 * 10 ** 9)
 
@@ -235,7 +233,7 @@ class InProcess(unittest.TestCase):
         base = time.time_ns() - 10 ** 12
         self._write(self.dst, [_pin("discord-bridge", 1, "Thu Jan  1 00:00:00 2026", "dead-old")], base)
         self._write(self.src, [_pin("telegram-bridge", self.me, self.my_lstart, "newer")], base + 10 ** 9)
-        kept, dropped, total, newer_is_dst = pp.merge_into(self.dst, self.src, self.dst)
+        kept, dropped, total, newer_is_dst = pp.merge_into(self.dst, self.src)
         self.assertEqual(kept, 0); self.assertFalse(newer_is_dst)
         self.assertEqual(self.dst.read_bytes(), self.src.read_bytes())
         # and the reciprocal: destination newer, the older source pin dead
@@ -243,7 +241,7 @@ class InProcess(unittest.TestCase):
         self._write(self.src, [_pin("telegram-bridge", 1, "Thu Jan  1 00:00:00 2026", "dead")], base + 10 ** 9)
         self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "dest-new")], base + 2 * 10 ** 9)
         before = self.dst.read_bytes()
-        kept, _, _, newer_is_dst = pp.merge_into(self.dst, self.dst, self.src)
+        kept, _, _, newer_is_dst = pp.merge_into(self.dst, self.src)
         self.assertTrue(newer_is_dst); self.assertEqual(self.dst.read_bytes(), before)
 
     def test_merge_into_refusals(self):
@@ -251,24 +249,37 @@ class InProcess(unittest.TestCase):
         self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "a", "2027-01-01T00:00:00Z")], base)
         self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "b")], base)
         with self.assertRaises(ValueError):          # exact tie, different bytes
-            pp.merge_into(self.dst, self.src, self.dst)
+            pp.merge_into(self.dst, self.src)
         self.dst.write_text('{"pins": "no"}')
         with self.assertRaises(ValueError):          # malformed destination
-            pp.merge_into(self.dst, self.src, self.dst)
+            pp.merge_into(self.dst, self.src)
         many = [_pin("s", 100 + i, f"l{i}", f"p{i}") for i in range(pp.MAX_PINS + 1)]
         self._write(self.dst, [], base); self._write(self.src, many, base + 10 ** 9)
         with self.assertRaises(ValueError):          # over the bound
-            pp.merge_into(self.dst, self.src, self.dst)
+            pp.merge_into(self.dst, self.src)
 
-    def test_merge_into_token_mismatch_makes_destination_newest(self):
+    def test_stale_pre_lock_ordering_no_longer_loses_a_fresh_arm(self):
+        """keweichen's review of #3356, reproduced 2026-09-30: a caller that reads
+        dst's mtime, THEN separately reads its hash to detect drift, has a gap
+        between those two reads. An arm landing in that gap changes dst's bytes
+        (visible to the hash read) without invalidating the mtime-based ordering
+        decision already made — so a same-identity legacy record from the OTHER
+        snapshot silently wins over the fresh arm (measured: kept=0, a 2099-expiry
+        arm lost to a 2028-expiry legacy record). merge_into() no longer takes a
+        pre-decided ordering or a hash token at all: it reads both files' mtimes
+        itself, once, under the lock — so this whole race is structurally gone."""
         base = time.time_ns() - 10 ** 12
-        self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "dest-old")], base)
-        token = pp._sha256(self.dst)
-        self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "src")], base + 10 ** 9)
-        self._write(self.dst, [_pin("discord-bridge", self.me, self.my_lstart, "dest-moved")], base + 2 * 10 ** 9)
-        _, _, _, newer_is_dst = pp.merge_into(self.dst, self.src, self.dst, expect_dst_sha256=token)
+        # A legacy record at this identity, in what a stale ordering would have
+        # called "newer" (src) — it must NOT be allowed to beat a fresher dst.
+        self._write(self.src, [_pin("svc", 1, "L1", "legacy-winner-at-ordering", "2028-01-01T00:00:00Z")],
+                    base + 5 * 10 ** 9)
+        # dst is armed AFTER src was written (a real arm_pin() call, not a raw write,
+        # so this exercises the same lock merge_into() itself takes).
+        pp.arm_pin(self.dst, "svc", "1", "L1", "fresh-arm-before-sha", FUTURE)
+        kept, dropped, total, newer_is_dst = pp.merge_into(self.dst, self.src)
+        reasons = [p["reason"] for p in pp.load_pins(self.dst)]
+        self.assertEqual(reasons, ["fresh-arm-before-sha"], reasons)
         self.assertTrue(newer_is_dst)
-        self.assertEqual([p["reason"] for p in pp.load_pins(self.dst)], ["dest-moved"])
 
     def test_cli_in_process(self):
         import contextlib
@@ -278,12 +289,12 @@ class InProcess(unittest.TestCase):
         self._write(self.src, [_pin("telegram-bridge", self.me, self.my_lstart, "newer")], base + 10 ** 9)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = pp._cli(["merge", "--into", str(self.dst), "--newer", str(self.src), "--older", str(self.dst)])
+            rc = pp._cli(["merge", "--into", str(self.dst), "--incoming", str(self.src)])
         self.assertEqual(rc, 0); self.assertIn("kept=1", out.getvalue()); self.assertIn("newer=src", out.getvalue())
         self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "tie")], self.dst.stat().st_mtime_ns)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            rc = pp._cli(["merge", "--into", str(self.dst), "--newer", str(self.src), "--older", str(self.dst)])
+            rc = pp._cli(["merge", "--into", str(self.dst), "--incoming", str(self.src)])
         self.assertEqual(rc, 2); self.assertIn("merge refused", err.getvalue())
 
 

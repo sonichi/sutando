@@ -1329,27 +1329,22 @@ commit_one() {
                     echo "dest-newer"
                     return 0
                 fi
-                local src_mt dst_mt newer older
-                if ! src_mt="$(mtime_ns "$src_file")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for source $src_file — resolve by hand" >&2
-                    return 1
-                fi
-                if ! dst_mt="$(mtime_ns "$dst_path")"; then
-                    echo "AMBIGUOUS: $rel — mtime unavailable for destination $dst_path — resolve by hand" >&2
-                    return 1
-                fi
-                # A tie keeps the destination whole; the union still admits every
-                # live source pin, so no live veto is lost either way.
-                if [ "$src_mt" -gt "$dst_mt" ]; then newer="$src_file"; older="$dst_path"; else newer="$dst_path"; older="$src_file"; fi
-                local merge_out py_bin dst_sha
+                local merge_out merge_err py_bin
                 py_bin="$(require_python "$REPO_DIR" "merge process-pin snapshots")" || return 1
-                dst_sha="$(_sha256_of "$dst_path")" || dst_sha=""
-                # Ordering, strict loading, liveness, union and the write all run
-                # under the record lock in process_pins; exit 2 is an ambiguity.
-                if ! merge_out="$("$py_bin" "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --newer "$newer" --older "$older" ${dst_sha:+--expect-dst-sha256 "$dst_sha"})"; then
-                    echo "AMBIGUOUS: $rel — pin snapshots could not be merged — resolve by hand" >&2
+                # Ordering is decided by process_pins.py ITSELF, from a fresh stat of
+                # both files taken under the same record lock arm_pin()/release_pin()
+                # use — never here: a shell-side mtime-then-hash pre-decision has a
+                # gap between those two reads that a concurrent arm/release can land
+                # in unseen (see merge_into()'s docstring). Ordering, strict loading,
+                # liveness, union and the write all run under that one lock; exit 2
+                # is an ambiguity.
+                merge_err="$(mktemp)"
+                if ! merge_out="$("$py_bin" "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --incoming "$src_file" 2>"$merge_err")"; then
+                    echo "AMBIGUOUS: $rel — $(sed 's/^merge refused: //' "$merge_err")" >&2
+                    rm -f "$merge_err"
                     return 1
                 fi
+                rm -f "$merge_err"
                 case "$merge_out" in
                     *"kept=0 "*"newer=src")  echo "src-newer" ;;
                     *"kept=0 "*"newer=dst")  echo "dest-newer" ;;
