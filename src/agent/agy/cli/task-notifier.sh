@@ -49,33 +49,31 @@ sentinel_path() {
   SUTANDO_INSTANCE_ID="agy-task-notifier" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
     watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
 }
+receipt_path() { printf '%s.launch\n' "$(sentinel_path)"; }
 case "${1:-}" in
   --sentinel-path) sentinel_path; exit $? ;;
-  --sentinel-ready)
-    # Ready only when the sentinel was stamped after this launch began ($2, epoch) by a
-    # watcher on THIS inbox that started after it: a live pid alone can be a reused number.
-    [ -n "${2:-}" ] || { echo "agy-task-notifier: --sentinel-ready needs the launch epoch" >&2; exit 2; }
-    SENT="$(sentinel_path)" || exit 1
-    T0="$2" SENT="$SENT" INBOX="$TASKS_DIR" "$NOTIFIER_PY" - <<'PY'
-import os, subprocess, sys, time
-sent, t0, inbox = os.environ["SENT"], int(os.environ["T0"]), os.environ["INBOX"]
+  --launch-ready)
+    # Ready only for THIS launch: the receipt this notifier publishes once its own watcher
+    # child owns the ready sentinel must carry the launcher's nonce and this exact inbox.
+    [ -n "${2:-}" ] || { echo "agy-task-notifier: --launch-ready needs the launch nonce" >&2; exit 2; }
+    R="$(receipt_path)" || exit 1
+    NONCE="$2" RECEIPT="$R" INBOX="$TASKS_DIR" "$NOTIFIER_PY" - <<'PY'
+import os, sys
+want = {"nonce": os.environ["NONCE"], "inbox": os.environ["INBOX"]}
 try:
-    if os.stat(sent).st_mtime < t0:
+    got = dict(l.split("=", 1) for l in open(os.environ["RECEIPT"]).read().splitlines() if "=" in l)
+except OSError:
+    sys.exit(1)
+if any(got.get(k) != v for k, v in want.items()):
+    sys.exit(1)
+for k in ("watcher", "notifier"):
+    try:
+        os.kill(int(got[k]), 0)
+    except (KeyError, ValueError, ProcessLookupError):
         sys.exit(1)
-    pid = int(open(sent).read().strip())
-except (OSError, ValueError):
-    sys.exit(1)
-if pid <= 0:
-    sys.exit(1)
-out = subprocess.run(["ps", "-o", "etime=,command=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-if not out:
-    sys.exit(1)
-etime, cmd = out.split(None, 1) if " " in out else (out, "")
-days, _, clock = etime.rpartition("-")
-parts = [int(x) for x in clock.split(":")]
-elapsed = int(days or 0) * 86400 + sum(v * m for v, m in zip(reversed(parts), (1, 60, 3600)))
-started_after_launch = elapsed <= int(time.time()) - t0 + 1
-sys.exit(0 if started_after_launch and "watch-tasks-stream.sh" in cmd and inbox in cmd else 1)
+    except PermissionError:
+        pass
+sys.exit(0)
 PY
     exit $? ;;
 esac
@@ -95,6 +93,10 @@ stop_watcher() {
 }
 
 cleanup_notifier() {
+  # Owner-conditional: a later generation may have published its own receipt here by now.
+  if [ -n "${RECEIPT_FILE:-}" ] && grep -qx "nonce=$LAUNCH_NONCE" "$RECEIPT_FILE" 2>/dev/null; then
+    rm -f "$RECEIPT_FILE"
+  fi
   stop_watcher
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -248,8 +250,30 @@ mkfifo "$event_dir/events"
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role session --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
+# The watcher's open-for-write on the FIFO blocks until a reader exists: open it now, not at
+# the read loop, or the receipt wait below would hold the watcher before its first line.
+exec 3< "$event_dir/events"
 
-while IFS= read -r event; do
+# The receipt is the launcher's readiness signal: published only once the ready sentinel
+# names this notifier's own child, never inferred from a pid, an mtime or an argv shape.
+LAUNCH_NONCE="${SUTANDO_AGY_LAUNCH_NONCE:-}"
+RECEIPT_FILE=""
+if [ -n "$LAUNCH_NONCE" ]; then
+  SENTINEL_FILE="$(sentinel_path)" && RECEIPT_FILE="$(receipt_path)"
+  deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} + 5 ))
+  while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$watcher_pid" 2>/dev/null; do
+    if [ "$(cat "$SENTINEL_FILE" 2>/dev/null)" = "$watcher_pid" ]; then
+      tmp="$(mktemp "$RECEIPT_FILE.XXXXXX")" \
+        && printf 'nonce=%s\ninbox=%s\nwatcher=%s\nnotifier=%s\n' "$LAUNCH_NONCE" "$TASKS_DIR" "$watcher_pid" "$$" > "$tmp" \
+        && mv -f "$tmp" "$RECEIPT_FILE" \
+        || log_notifier "could not publish the launch receipt $RECEIPT_FILE"
+      break
+    fi
+    sleep 0.2
+  done
+fi
+
+while IFS= read -r event <&3; do
   case "$event" in
     "TASK_FILE: "*)
       next_pending_task >/dev/null || continue
@@ -266,4 +290,4 @@ while IFS= read -r event; do
       done
       ;;
   esac
-done < "$event_dir/events"
+done

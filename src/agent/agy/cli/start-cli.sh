@@ -71,14 +71,17 @@ ensure_task_notifier() {
   for _v in SUTANDO_AGENT_ID AGENT_MXID AGENT_ID; do
     NOTIFIER_ENV_ARGS+=(-e "$_v=${!_v:-}")
   done
-  local launch_t0; launch_t0="$(date +%s)"
+  # A fresh nonce per launch: the notifier publishes it in its receipt only once its own
+  # watcher child owns the ready sentinel, so no earlier generation can answer for this one.
+  local launch_nonce; launch_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_AGY_LAUNCH_NONCE=$launch_nonce")
   if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
       "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
     echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
     return 0
   fi
-  # tmux accepting the session proves nothing: ready means the sentinel was stamped by
-  # THIS launch's watcher (the notifier's ownership witness), or the session is gone.
+  # tmux accepting the session proves nothing: ready means the notifier published this
+  # launch's receipt (its watcher child owns the ready sentinel), or the session is gone.
   local deadline
   deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -86,7 +89,7 @@ ensure_task_notifier() {
       echo "  ⚠ agy task notifier exited: its watcher did not report ready — tasks will not reach this session" >&2
       return 0
     fi
-    if bash "$NOTIFIER" --sentinel-ready "$launch_t0" 2>/dev/null; then
+    if bash "$NOTIFIER" --launch-ready "$launch_nonce" 2>/dev/null; then
       return 0
     fi
     sleep 0.2
