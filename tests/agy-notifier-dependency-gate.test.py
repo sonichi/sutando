@@ -200,7 +200,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
                          "a watcher that never became ready was left as a live-looking session")
         return sentinel, rpath
 
-    def _receipt(self, nonce="deadbeef", inbox=None, watcher=None, notifier=None):
+    def _receipt(self, nonce, inbox=None, watcher=None, notifier=None):
         inbox = str(self.root / "tasks") if inbox is None else inbox
         watcher = self._bystander(argv_shape=True) if watcher is None else watcher
         notifier = self._bystander() if notifier is None else notifier
@@ -210,6 +210,46 @@ class NotifierDependencyGateTest(unittest.TestCase):
         gone = subprocess.Popen(["true"]); gone.wait()
         return gone.pid
 
+    def _live_nonce(self):
+        """The nonce of the launch in progress, read from its watcher session's environment."""
+        for _ in range(200):
+            r = subprocess.run(["tmux", "-S", str(self.socket), "show-environment", "-t", f"={self.session}-watcher",
+                                "SUTANDO_AGY_LAUNCH_NONCE"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and "=" in r.stdout:
+                return r.stdout.strip().split("=", 1)[1]
+            time.sleep(0.05)
+        self.fail("the watcher session never appeared with a launch nonce")
+
+    def _launch_planting_receipt(self, make_receipt, expect_ready, receipt_age=0.0):
+        # The receipt is planted under THIS launch's nonce while the launcher polls, so the
+        # launcher reaches its parse/match branch; the watcher itself never becomes ready.
+        fake = self.bin / "fswatch"
+        fake.write_text("#!/bin/bash\nexec sleep 300\n")
+        fake.chmod(0o755)
+        sentinel = self._sentinel_path()
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        path = self._hermetic_path(exclude={"fswatch"})
+        launcher = subprocess.Popen(["/bin/bash", str(LAUNCHER)], env=self._env(path, {"SUTANDO_WATCHER_READY_TIMEOUT": "3"}),
+                                    cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        nonce = self._live_nonce()
+        rpath = Path(f"{sentinel}.launch.{nonce}")
+        rpath.write_text(make_receipt(nonce))
+        if receipt_age:
+            os.utime(rpath, (time.time() - receipt_age, time.time() - receipt_age))
+        out = launcher.communicate(timeout=60)[0]
+        self.assertEqual(launcher.returncode, 0, out)
+        if expect_ready:
+            self.assertNotIn("did not report ready", out)
+        else:
+            self.assertIn("did not report ready", out)
+        subprocess.run(["tmux", "-S", str(self.socket), "kill-session", "-t", f"={self.session}-watcher"],
+                       capture_output=True, timeout=10)
+
+    def test_a_well_formed_receipt_under_the_live_nonce_is_accepted(self):
+        # Positive control for the planted-receipt cases: the launcher does reach and accept
+        # a matching receipt, so the refusals below are the parse/match branch, not a miss.
+        self._launch_planting_receipt(lambda n: self._receipt(n), expect_ready=True)
+
     def test_same_second_prior_generation_is_not_readiness(self):
         # A watcher-shaped process on this exact inbox, its pid in a sentinel dated into the
         # launch: only a receipt carrying THIS launch's nonce counts.
@@ -218,20 +258,18 @@ class NotifierDependencyGateTest(unittest.TestCase):
     def test_concurrent_foreign_generation_receipt_is_not_readiness(self):
         # Another launch's receipt: live pids, this inbox, a nonce this launcher never made.
         self._launch_not_ready(lambda: f"{self._bystander(argv_shape=True)}\n",
-                               make_receipt=lambda: self._receipt(nonce="0" * 32))
+                               make_receipt=lambda: self._receipt("0" * 32))
 
     def test_stale_receipt_with_dead_pids_is_not_readiness(self):
-        self._launch_not_ready(lambda: f"{self._bystander(argv_shape=True)}\n",
-                               make_receipt=lambda: self._receipt(watcher=self._dead_pid(), notifier=self._dead_pid()),
-                               receipt_age=3600)
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=self._dead_pid(), notifier=self._dead_pid()),
+                                      expect_ready=False, receipt_age=3600)
 
     def test_malformed_and_partial_receipts_are_not_readiness(self):
-        self._launch_not_ready(lambda: f"{self._bystander(argv_shape=True)}\n", make_receipt=lambda: "not a receipt\n")
-        self._launch_not_ready(lambda: f"{self._bystander(argv_shape=True)}\n", make_receipt=lambda: "nonce=\n")
+        self._launch_planting_receipt(lambda n: "not a receipt\n", expect_ready=False)
+        self._launch_planting_receipt(lambda n: f"nonce={n}\n", expect_ready=False)
 
     def test_receipt_for_an_adjacent_inbox_is_not_readiness(self):
-        self._launch_not_ready(lambda: f"{self._bystander(argv_shape=True)}\n",
-                               make_receipt=lambda: self._receipt(inbox=str(self.root / "tasks-other")))
+        self._launch_planting_receipt(lambda n: self._receipt(n, inbox=str(self.root / "tasks-other")), expect_ready=False)
 
     def test_stale_sentinel_naming_a_live_unrelated_pid_is_not_readiness(self):
         self._launch_not_ready(lambda: f"{self._bystander()}\n", sentinel_age=3600)
@@ -257,9 +295,11 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self.assertEqual(receipt["inbox"], str(self.root / "tasks"))
         self.assertEqual(len(receipt["nonce"]), 32)
         self.assertTrue(receipts[0].name.endswith(receipt["nonce"]), "the receipt path carries its own nonce")
+        self.assertEqual(Path(f"{sentinel}.token").read_text().strip(), receipt["nonce"],
+                         "the watcher's ready event must have written this launch's token")
         # A concurrent generation's receipt sits beside it; this owner's exit must not touch it.
         other = Path(f"{sentinel}.launch.{'b' * 32}")
-        other.write_text(self._receipt(nonce="b" * 32))
+        other.write_text(self._receipt("b" * 32))
         subprocess.run(["tmux", "-S", str(self.socket), "kill-session", "-t", f"={self.session}-watcher"],
                        capture_output=True, timeout=10)
         for _ in range(50):
@@ -269,9 +309,21 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self.assertFalse(receipts[0].exists(), "the owner's exit must remove its own receipt")
         self.assertTrue(other.exists(), "the owner's exit removed another generation's receipt")
 
-    def test_crash_left_sentinel_holding_the_reused_child_pid_is_not_readiness(self):
-        # After the fork, the sentinel holds exactly the child's pid but with a mtime from before
-        # the launch: a crash-left file whose number the OS reissued. Only a write after the fork counts.
+    def _watcher_root_pid(self, inbox):
+        """This launch's watcher: the matching row whose parent is not itself a match
+        (a $(...) subshell of the watcher carries the same argv)."""
+        rows = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        matches = {}
+        for row in rows.splitlines():
+            parts = row.split(None, 2)
+            if len(parts) == 3 and "watch-tasks-stream.sh" in parts[2] and f"--inbox {inbox}" in parts[2]:
+                matches[parts[0]] = parts[1]
+        roots = [pid for pid, ppid in matches.items() if ppid not in matches]
+        return roots[0] if len(roots) == 1 else None
+
+    def _reused_pid_sentinel_is_not_readiness(self, stamp_offset):
+        # After the fork the sentinel holds exactly the child's pid, dated before the launch
+        # (crash-left) or after it (clock stepped back): neither carries this launch's token.
         fake = self.bin / "fswatch"
         fake.write_text("#!/bin/bash\nexec sleep 300\n")
         fake.chmod(0o755)
@@ -283,22 +335,24 @@ class NotifierDependencyGateTest(unittest.TestCase):
                                     cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         child = None
         for _ in range(100):
-            rows = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
-            for row in rows.splitlines():
-                if "watch-tasks-stream.sh" in row and f"--inbox {inbox}" in row:
-                    child = row.split()[0]
+            child = self._watcher_root_pid(inbox)
             if child:
                 break
             time.sleep(0.05)
         self.assertIsNotNone(child, "this launch's watcher child never appeared")
         sentinel.write_text(f"{child}\n")
-        old = time.time() - 3600
-        os.utime(sentinel, (old, old))
+        os.utime(sentinel, (time.time() + stamp_offset, time.time() + stamp_offset))
         out = launcher.communicate(timeout=60)[0]
         self.assertEqual(launcher.returncode, 0, out)
         self.assertIn("did not report ready", out)
         self.assertEqual(list(sentinel.parent.glob(f"{sentinel.name}.launch.*")), [],
                          "a receipt was signed over a sentinel the child never wrote")
+
+    def test_crash_left_sentinel_holding_the_reused_child_pid_is_not_readiness(self):
+        self._reused_pid_sentinel_is_not_readiness(-3600)
+
+    def test_future_dated_sentinel_holding_the_reused_child_pid_is_not_readiness(self):
+        self._reused_pid_sentinel_is_not_readiness(+3600)
 
 if __name__ == "__main__":
     unittest.main()

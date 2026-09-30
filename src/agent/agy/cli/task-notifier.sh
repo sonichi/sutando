@@ -244,8 +244,10 @@ export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
 export SUTANDO_INSTANCE_ID="agy-task-notifier"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
-# Taken right before the fork: only a sentinel written after this instant can be the child's.
-FORK_NS="$("$NOTIFIER_PY" -c 'import time; print(time.time_ns())')"
+# The launch nonce rides the watcher's own ready event (<sentinel>.token), so readiness can
+# never be inferred from a pid or a timestamp that an earlier generation could also produce.
+LAUNCH_NONCE="${SUTANDO_AGY_LAUNCH_NONCE:-}"
+export SUTANDO_WATCHER_READY_TOKEN="$LAUNCH_NONCE"
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role session --inbox "$TASKS_DIR" > "$event_dir/events" &
@@ -256,31 +258,24 @@ exec 3< "$event_dir/events"
 
 # The receipt is the launcher's readiness signal: published only once the ready sentinel
 # names this notifier's own child, never inferred from a pid, an mtime or an argv shape.
-LAUNCH_NONCE="${SUTANDO_AGY_LAUNCH_NONCE:-}"
 RECEIPT_FILE=""
-# A sentinel is this child's only if it names the child AND was written after the fork: a
-# crash-left file can already hold the same number once the OS reuses the pid.
+# The child owns the sentinel only when it names the child AND the watcher's ready event wrote
+# this launch's nonce beside it; a crash-left or future-dated file has neither to offer.
 child_owns_sentinel() {
-  SENT="$1" PID="$2" NS="$3" "$NOTIFIER_PY" - <<'PY'
-import os, sys
-try:
-    st = os.stat(os.environ["SENT"]); body = open(os.environ["SENT"]).read().strip()
-except OSError:
-    sys.exit(1)
-sys.exit(0 if body == os.environ["PID"] and st.st_mtime_ns > int(os.environ["NS"]) else 1)
-PY
+  [ "$(cat "$1" 2>/dev/null)" = "$2" ] && [ "$(cat "$1.token" 2>/dev/null)" = "$3" ]
 }
 if [ -n "$LAUNCH_NONCE" ]; then
   SENTINEL_FILE="$(sentinel_path)" && RECEIPT_FILE="$(receipt_path "$LAUNCH_NONCE")"
   # Receipts of generations whose notifier is gone are dead files; a live pid keeps its file.
+  # Only complete names (32-hex nonce) are candidates: a temp file mid-publish is not.
   for r in "$SENTINEL_FILE".launch.*; do
-    [ -e "$r" ] || continue
+    [ -e "$r" ] && [[ "$r" =~ \.launch\.[0-9a-f]{32}$ ]] || continue
     n="$(sed -n 's/^notifier=//p' "$r" 2>/dev/null)"
     [ -n "$n" ] && kill -0 "$n" 2>/dev/null || rm -f "$r"
   done
   deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} + 5 ))
   while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$watcher_pid" 2>/dev/null; do
-    if child_owns_sentinel "$SENTINEL_FILE" "$watcher_pid" "$FORK_NS"; then
+    if child_owns_sentinel "$SENTINEL_FILE" "$watcher_pid" "$LAUNCH_NONCE"; then
       tmp="$(mktemp "$RECEIPT_FILE.XXXXXX")" \
         && printf 'nonce=%s\ninbox=%s\nwatcher=%s\nnotifier=%s\n' "$LAUNCH_NONCE" "$TASKS_DIR" "$watcher_pid" "$$" > "$tmp" \
         && mv -f "$tmp" "$RECEIPT_FILE" \
