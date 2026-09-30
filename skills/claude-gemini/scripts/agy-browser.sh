@@ -181,7 +181,8 @@ group_owned() {
   case "$(pid_state "$1")" in
     present)
       st="$(ps -o lstart= -p "$1" 2>/dev/null)" || return 1
-      [[ -n "$st" && -n "$LSTART" && "$st" == "$LSTART" ]]; return ;;
+      # A bare return in the EXIT trap would yield the status from before the trap, not this test's.
+      [[ -n "$st" && -n "$LSTART" && "$st" == "$LSTART" ]] && return 0; return 1 ;;
     absent) ;;
     *) return 1 ;;
   esac
