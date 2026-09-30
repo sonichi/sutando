@@ -969,10 +969,12 @@ exec(compile(code, "<launcher>", "exec"))' "$2" "${{@:3}}"
 fi
 exec "{sys.executable}" "$@"
 """)
+            trace = open(tmp / f"{case}.trace", "w")
             try:
-                starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                starter = subprocess.Popen(["bash", "-x", str(SCRIPT), "start", *args], env=dict(
                     env, SUTANDO_PY=str(wrap), AGY_LIST_COUNT=str(tmp / f"{case}.count"),
-                    AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold), HOLD_RELEASE=str(release), **extra),
+                    AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold), HOLD_RELEASE=str(release),
+                    BASH_XTRACEFD=str(trace.fileno()), **extra), pass_fds=(trace.fileno(),),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
                 for _ in range(300):
                     if hold.exists() or starter.poll() is not None:
@@ -992,7 +994,8 @@ exec "{sys.executable}" "$@"
                 assert starter.returncode != 0, f"{case}: start killed by SIGTERM exited 0: {out}"
                 hs_dir = Path((tmp / f"{case}.hs").read_text().strip())
                 state = (f"hs exists={hs_dir.exists()} pgid={(hs_dir / 'pgid').read_text() if (hs_dir / 'pgid').exists() else None!r} "
-                         f"profile procs before={chrome_pids} after={profile_procs(profile)} cdp={answers(port)}")
+                         f"profile procs before={chrome_pids} after={profile_procs(profile)} cdp={answers(port)}\n"
+                         + "".join((tmp / f"{case}.trace").read_text().splitlines(True)[-60:]))
                 assert "could not prove process group" in out, f"{case}: an unproved group was not reported: {out}\n{state}"
                 if case in ("reused", "revalidated", "unreadable"):
                     assert profile_procs(profile) == chrome_pids, f"{case}: a group whose leader changed identity was signalled: {out}"
@@ -1004,6 +1007,7 @@ exec "{sys.executable}" "$@"
                 pm["arm"].unlink(missing_ok=True)
                 pm["armed"].unlink(missing_ok=True)
                 pm["nolstart"].unlink(missing_ok=True)
+                trace.close()
                 if starter and starter.poll() is None:
                     starter.kill()
                 kill_profile(profile)
