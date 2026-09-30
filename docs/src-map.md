@@ -86,6 +86,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
+- **`external_core_helpers.py`** — Private startup receipts for externally managed core helpers; never manages processes.
 - **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.

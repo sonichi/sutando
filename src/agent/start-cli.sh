@@ -81,6 +81,13 @@ if [ ! -x "$launcher" ]; then
   exit 1
 fi
 
+for _arg in "$@"; do
+  if [ "${_arg%%=*}" = "--external-helpers" ] && [ "$runtime" != "codex" ]; then
+    echo "start-cli: --external-helpers is supported only for Codex" >&2
+    exit 2
+  fi
+done
+
 export SUTANDO_CORE_RUNTIME="$runtime"
 
 # A config switch may find the other runtime still occupying the canonical

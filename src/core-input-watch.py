@@ -720,7 +720,14 @@ def main():
                     help="write the supervisor state but never raise a card for a block")
     ap.add_argument("--seat", default="",
                     help="who this pane is, named on every card it raises (default: none)")
+    ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     a = ap.parse_args()
+    if a.helper_receipt_dir:
+        from external_core_helpers import publish
+        from workspace_default import resolve_workspace
+        publish(a.helper_receipt_dir, "monitor", __file__, resolve_workspace(),
+                a.socket, a.session, passive=not (a.once or a.auto_answer or a.chat_escalation),
+                output=a.out)
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
     # else a detached spawn without Homebrew on PATH reads a healthy core as crashed.
