@@ -872,9 +872,10 @@ exec "{sys.executable}" "$@"
             kill_profile(profile)
 
         (tmp / "mcp.state").write_text("")
-        pm = {k: tmp / f"probe.{k}" for k in ("fail", "go", "renamed", "release", "lstart", "arm", "armed", "nolstart")}
+        pm = {k: tmp / f"probe.{k}" for k in ("fail", "go", "renamed", "release", "lstart", "arm", "armed", "nolstart", "pstable")}
         ps_hook = write_exec(bin_dir / "ps", f"""#!/bin/bash
 [[ -e "{pm['fail']}" && "$*" == "-o stat= -p "* ]] && exit 1
+[[ -e "{pm['pstable']}" && "$*" == "-Ao pgid=,stat=" ]] && exit 1
 if [[ -e "{pm['lstart']}" && "$*" == "-o lstart= -p "* ]]; then echo "Thu Jan  1 00:00:00 1970"; exit 0; fi
 [[ -e "{pm['nolstart']}" && "$*" == "-o lstart= -p "* ]] && exit 1
 if [[ -e "{pm['arm']}" && "$*" == "-o lstart= -p "* ]]; then
@@ -1014,12 +1015,69 @@ exec "{sys.executable}" "$@"
                     starter.kill()
                 kill_profile(profile)
         foreign.kill()
+
+        # ps fails during the exit trap: the group is still signalled (lstart still proves it) but never
+        # proved gone, so the dir is kept; reading the failure as "gone" would skip the signal and remove it.
+        (tmp / "mcp.state").write_text("")
+        hold, release, starter = tmp / "pstable.hold", tmp / "pstable.release", None
+        wrap = write_exec(tmp / "pstable-py", f"""#!/bin/bash
+[[ "$2" == *setsid* ]] && echo "$3" >"{tmp}/pstable.hs"
+exec "{sys.executable}" "$@"
+""")
+        try:
+            starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                env, SUTANDO_PY=str(wrap), AGY_LIST_COUNT=str(tmp / "pstable.count"),
+                AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold), HOLD_RELEASE=str(release)),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            for _ in range(300):
+                if hold.exists() or starter.poll() is not None:
+                    break
+                time.sleep(0.1)
+            assert hold.exists(), f"pstable: start never reached the registry read: {starter.poll()}"
+            chrome_pids = profile_procs(profile)
+            assert answers(port) and chrome_pids, "pstable: Chrome was not listening before the signal"
+            pm["pstable"].touch()
+            os.killpg(starter.pid, signal.SIGTERM)
+            out = starter.communicate(timeout=60)[0]
+            assert starter.returncode != 0, f"pstable: start killed by SIGTERM exited 0: {out}"
+            hs_dir = Path((tmp / "pstable.hs").read_text().strip())
+            # TERM ends the fake Chrome; with the table unreadable the group is never proved gone, and a
+            # dead leader can no longer prove ownership before KILL, so the exit reports one or the other.
+            assert "could not prove process group" in out or "did not exit; kill it with" in out, \
+                f"pstable: an unreadable table was not reported: {out}"
+            assert hs_dir.exists(), "pstable: the handshake dir was removed although the group was never proved gone"
+            for _ in range(40):
+                if profile_procs(profile) == []:
+                    break
+                time.sleep(0.25)
+            assert profile_procs(profile) == [], f"pstable: the owned group was not signalled while ps failed: {out}"
+        finally:
+            release.touch()
+            pm["pstable"].unlink(missing_ok=True)
+            if starter and starter.poll() is None:
+                starter.kill()
+            kill_profile(profile)
         ps_hook.unlink()
+
+        # on_exit with no launcher forked: nothing will ever read the cancel file, so the dir goes
+        # silently. Once one exists, a dead launcher also removes the dir; a live one keeps it and says so.
+        funcs = tmp / "on_exit.sh"
+        subprocess.run(["bash", "-c", f"sed -n '/^on_exit()/,/^}}/p;/^unproved()/p;/^launcher_state()/,/^}}/p' {SCRIPT} >{funcs}"], check=True)
+        probe = ("set -u; source {funcs}; settled=''; PROFILE=p; HS=$(mktemp -d); " "{setup}"
+                 "on_exit 2>{tmp}/on_exit.err; rc=$?; {check}")
+        for name, setup, check in (
+                ("none", "", "[[ ! -d $HS ]] && [[ ! -s {tmp}/on_exit.err ]]"),
+                ("dead", "sleep 300 & launcher=$!; kill $launcher; wait $launcher 2>/dev/null; ", "[[ ! -d $HS ]]"),
+                ("forked", "sleep 300 & launcher=''; ", "[[ -e $HS/cancel ]] && grep -q 'has not reported' {tmp}/on_exit.err; r=$?; kill $! ; exit $r"),
+                ("alive", "sleep 300 & launcher=$!; ", "[[ -e $HS/cancel ]] && grep -q 'has not reported' {tmp}/on_exit.err; r=$?; kill $launcher; exit $r")):
+            r = subprocess.run(["bash", "-c", probe.format(funcs=funcs, setup=setup, check=check.format(tmp=tmp), tmp=tmp)],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, f"on_exit/{name}: {r.stdout}{r.stderr}{(tmp / 'on_exit.err').read_text()}"
 
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 27/27 agy-browser.sh")
+    print("PASS 29/29 agy-browser.sh")
 
 
 if __name__ == "__main__":
