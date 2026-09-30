@@ -1070,7 +1070,8 @@ exec "{sys.executable}" "$@"
                 ("dead", "sleep 300 & launcher=$!; kill $launcher; wait $launcher 2>/dev/null; ", "[[ ! -d $HS ]]"),
                 ("forked", "sleep 300 & launcher=''; ", "[[ -e $HS/cancel ]] && grep -q 'has not reported' {tmp}/on_exit.err; r=$?; kill $! ; exit $r"),
                 ("alive", "sleep 300 & launcher=$!; ", "[[ -e $HS/cancel ]] && grep -q 'has not reported' {tmp}/on_exit.err; r=$?; kill $launcher; exit $r")):
-            r = subprocess.run(["bash", "-c", probe.format(funcs=funcs, setup=setup, check=check.format(tmp=tmp), tmp=tmp)],
+            # The shipped interpreter, not PATH's: /bin/bash is 3.2 on macOS and is what #!/bin/bash runs.
+            r = subprocess.run(["/bin/bash", "-c", probe.format(funcs=funcs, setup=setup, check=check.format(tmp=tmp), tmp=tmp)],
                                capture_output=True, text=True)
             assert r.returncode == 0, f"on_exit/{name}: {r.stdout}{r.stderr}{(tmp / 'on_exit.err').read_text()}"
 

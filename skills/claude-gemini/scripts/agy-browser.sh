@@ -155,7 +155,8 @@ abort_start() {
 on_exit() {
   [[ -n "${HS:-}" && -z "$settled" ]] || return 0
   # $! is set at the fork, before $launcher is: empty means no launcher exists to read the cancel file.
-  launcher="${launcher:-${!:-}}"
+  # Read it with -u off: bash 3.2 rejects even ${!:-} while no job has ever been started.
+  set +u; launcher="${launcher:-$!}"; set -u
   [[ -n "$launcher" ]] || { rm -rf "$HS"; return 0; }
   : >"$HS/cancel" 2>/dev/null || true
   local st pg rc
