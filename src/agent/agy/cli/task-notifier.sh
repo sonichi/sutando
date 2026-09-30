@@ -68,8 +68,12 @@ except OSError:
 if any(got.get(k) != v for k, v in want.items()):
     sys.exit(1)
 for k in ("watcher", "notifier"):
+    # kill(0) and kill(-1) address groups, never one owner: only a positive pid is a pid here.
     try:
-        os.kill(int(got[k]), 0)
+        pid = int(got[k])
+        if pid <= 0:
+            sys.exit(1)
+        os.kill(pid, 0)
     except (KeyError, ValueError, ProcessLookupError):
         sys.exit(1)
     except PermissionError:

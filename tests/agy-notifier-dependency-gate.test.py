@@ -268,6 +268,11 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self._launch_planting_receipt(lambda n: "not a receipt\n", expect_ready=False)
         self._launch_planting_receipt(lambda n: f"nonce={n}\n", expect_ready=False)
 
+    def test_receipt_with_non_positive_owner_pids_is_not_readiness(self):
+        # kill(0, 0) and kill(-1, 0) succeed (a group, a set), so these must fail the parse, not the probe.
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=0, notifier=0), expect_ready=False)
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=-1, notifier=-1), expect_ready=False)
+
     def test_receipt_for_an_adjacent_inbox_is_not_readiness(self):
         self._launch_planting_receipt(lambda n: self._receipt(n, inbox=str(self.root / "tasks-other")), expect_ready=False)
 
