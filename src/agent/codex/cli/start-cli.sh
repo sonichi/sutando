@@ -26,9 +26,20 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
 
 EXTERNAL_HELPERS=""
+RECONCILE_SCHEDULES=1
 _LAUNCH_ARGS=()
 while [ "$#" -gt 0 ]; do
-  if [[ "$1" == --external-helpers=* ]]; then
+  if [[ "$1" == --no-schedule-reconcile=* ]]; then
+    echo "start-cli: --no-schedule-reconcile takes no value" >&2
+    exit 2
+  elif [ "$1" = "--no-schedule-reconcile" ]; then
+    if [ "$RECONCILE_SCHEDULES" = 0 ]; then
+      echo "start-cli: --no-schedule-reconcile may be specified only once" >&2
+      exit 2
+    fi
+    RECONCILE_SCHEDULES=0
+    shift
+  elif [[ "$1" == --external-helpers=* ]]; then
     echo "start-cli: use --external-helpers followed by its receipt directory" >&2
     exit 2
   elif [ "$1" = "--external-helpers" ]; then
@@ -400,16 +411,18 @@ ensure_codex_auto_reset_timer() {
 }
 
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
-# every launcher invocation, partitioned by reconcile_launchd.py's eligibility
+# each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
 # fixed crons.json entries onto the OS-backed cron-runner (skipping main-loop,
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
 resolve_heartbeat_python
-ensure_durable_schedules
-ensure_codex_scheduler
-ensure_codex_auto_reset_timer
+if [ "$RECONCILE_SCHEDULES" = 1 ]; then
+  ensure_durable_schedules
+  ensure_codex_scheduler
+  ensure_codex_auto_reset_timer
+fi
 
 check_external_helpers || exit 1
 

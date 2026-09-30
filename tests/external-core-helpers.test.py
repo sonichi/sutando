@@ -237,6 +237,36 @@ exit 0
             self.assertTrue(all(p.poll() is None for p in processes))
             self.assertEqual(self.global_logs(), logs)
 
+    def test_no_schedule_reconcile_keeps_real_helpers_and_skips_installers(self):
+        processes = self.pair()
+        identities = self.validate()
+        installer_log = self.base / "unexpected-installer.log"
+        scripts = [self.repo / "skills" / rel for rel in (
+            "schedule-crons/scripts/reconcile_launchd.py",
+            "schedule-crons/scripts/codex-scheduler.py",
+            "proactive-loop/scripts/codex-auto-reset-timer.py",
+        )]
+        uname = self.bin / "uname"
+        original = uname.read_bytes()
+        try:
+            uname.write_text('#!/bin/bash\nprintf "Darwin\\n"\n')
+            for script in scripts:
+                script.parent.mkdir(parents=True, exist_ok=True)
+                script.write_text("import os, pathlib\n"
+                                  "pathlib.Path(os.environ['TEST_INSTALLER_LOG']).touch()\n")
+            for extra in [(), ("--restart",)]:
+                result = self.launch(*extra, "--no-schedule-reconcile",
+                                     env={**self.env, "TEST_INSTALLER_LOG": str(installer_log)})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(self.core_mark.exists())
+                self.assertFalse(installer_log.exists())
+                self.assertEqual(self.validate(), identities)
+                self.assertTrue(all(p.poll() is None for p in processes))
+        finally:
+            uname.write_bytes(original)
+            for script in scripts:
+                script.unlink(missing_ok=True)
+
     def test_helper_exit_after_preflight_is_rejected_before_creating_core(self):
         for index in (0, 1):
             with self.subTest(helper=index):

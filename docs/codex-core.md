@@ -106,6 +106,25 @@ schedulers, earned-reset timers, authentication checks or the task notifier, and
 does not isolate the Codex application home. It must not be treated as a general
 sandbox or as permission to fabricate helper state.
 
+### Leave schedule provisioning to the caller
+
+An embedder can independently pass `--no-schedule-reconcile` to skip startup's
+durable-cron reconciliation, Codex scheduler installation and earned-reset timer
+installation for that invocation:
+
+```bash
+bash src/agent/start-cli.sh --runtime codex --external-helpers "$RECEIPTS" \
+  --no-schedule-reconcile
+```
+
+This does not stop, disable or rewrite existing jobs, change their configuration,
+or suppress tasks they already deliver. The caller owns schedule provisioning;
+pending schedules are not installed by this launch. Without the flag, all three
+startup reconciliation paths run as before. The flag is Codex-only, takes no value
+and is not persisted: pass it again on each invocation, including `--restart`.
+Authentication, helper checks, the notifier and core startup remain active.
+The flag does not isolate the Codex home or change helper ownership by itself.
+
 ## Automatic earned resets
 
 On macOS, launching a Codex core or Codex worker installs a five-minute

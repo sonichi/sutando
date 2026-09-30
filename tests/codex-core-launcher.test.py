@@ -387,6 +387,79 @@ exit 0
         self.assertEqual(json.loads(log.read_text())["enabled"], "0")
         self.assertIn("-e SUTANDO_CODEX_AUTO_RESET_ENABLED=0", self.log.read_text())
 
+    def _assert_no_schedule_reconcile(self, *args, env_extra=None,
+                                      launcher="src/agent/start-cli.sh"):
+        workspace = self.root / "workspace"
+        crons = workspace / "hosts" / "test-host" / "crons.json"
+        crons.parent.mkdir(parents=True)
+        crons.write_text(json.dumps([{"name": "digest", "cron": "2 6 * * *", "prompt": "run"}]))
+        before = crons.read_bytes()
+        timer = self.root / "skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+        timer.parent.mkdir(parents=True)
+        timer.write_text("import os, pathlib\npathlib.Path(os.environ['RESET_TIMER_LOG']).touch()\n")
+        self._write_exe("launchctl", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$LAUNCHCTL_LOG"
+if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
+''')
+        environment = {"SUTANDO_PY": sys.executable,
+                       "RESET_TIMER_LOG": str(Path(self.tmp.name) / "reset-timer.log"),
+                       "LAUNCHCTL_LOG": str(Path(self.tmp.name) / "launchctl.log")}
+        environment.update(env_extra or {})
+
+        result = self.run_launcher(*args, "--no-schedule-reconcile",
+                                   env_extra=environment, launcher=launcher)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(crons.read_bytes(), before)
+        self.assertFalse((workspace / "state/cron-runner-state.json").exists())
+        for name in ("scheduler.log", "install.log", "launchctl.log", "reset-timer.log"):
+            self.assertFalse((Path(self.tmp.name) / name).exists(), name)
+        calls = self._tmux_calls()
+        self.assertIn("new-session -d -s sutando-core-watcher", calls)
+        self.assertTrue((Path(self.tmp.name) / "heartbeat.log").exists())
+        return calls
+
+    def test_no_schedule_reconcile_preserves_core_and_notifier_start(self):
+        self.assertIn("new-session -d -s sutando-core ", self._assert_no_schedule_reconcile())
+
+    def test_no_schedule_reconcile_preserves_restart(self):
+        calls = self._assert_no_schedule_reconcile("--restart")
+        self.assertIn("kill-session -t =sutando-core", calls)
+        self.assertIn("new-session -d -s sutando-core ", calls)
+
+    def test_no_schedule_reconcile_preserves_existing_session(self):
+        calls = self._assert_no_schedule_reconcile(env_extra={"TMUX_ACTIVE_RUNTIME": "codex"})
+        self.assertNotIn("new-session -d -s sutando-core ", calls)
+        self.assertNotIn("kill-session", calls)
+
+    def test_direct_codex_launcher_honors_no_schedule_reconcile(self):
+        self._assert_no_schedule_reconcile(launcher="src/agent/codex/cli/start-cli.sh")
+
+    def test_no_schedule_reconcile_rejects_invalid_forms_before_core_mutation(self):
+        for args in (("--no-schedule-reconcile=1",),
+                     ("--no-schedule-reconcile", "--no-schedule-reconcile")):
+            with self.subTest(args=args):
+                result = self.run_launcher(*args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--no-schedule-reconcile", result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("new-session", calls)
+        self.assertNotIn("kill-session", calls)
+        for name in ("scheduler.log", "heartbeat.log", "monitor.log", "install.log"):
+            self.assertFalse((Path(self.tmp.name) / name).exists(), name)
+
+    def test_other_runtime_refuses_no_schedule_reconcile_before_delegation(self):
+        launcher = self.root / "src/agent/claude/cli/start-cli.sh"
+        launcher.parent.mkdir(parents=True)
+        marker = Path(self.tmp.name) / "claude-started"
+        launcher.write_text("#!/bin/bash\ntouch '" + str(marker) + "'\nexit 17\n")
+        launcher.chmod(0o755)
+        result = self.run_launcher("--runtime", "claude", "--no-schedule-reconcile")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("supported only for Codex", result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertNotIn("kill-session", self._tmux_calls())
+
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={
             "SUTANDO_CORE_MODEL": "gpt-test",

@@ -82,10 +82,14 @@ if [ ! -x "$launcher" ]; then
 fi
 
 for _arg in "$@"; do
-  if [ "${_arg%%=*}" = "--external-helpers" ] && [ "$runtime" != "codex" ]; then
-    echo "start-cli: --external-helpers is supported only for Codex" >&2
-    exit 2
-  fi
+  case "${_arg%%=*}" in
+    --external-helpers|--no-schedule-reconcile)
+      if [ "$runtime" != "codex" ]; then
+        echo "start-cli: ${_arg%%=*} is supported only for Codex" >&2
+        exit 2
+      fi
+      ;;
+  esac
 done
 
 export SUTANDO_CORE_RUNTIME="$runtime"
