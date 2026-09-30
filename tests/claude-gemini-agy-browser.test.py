@@ -37,10 +37,13 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      reads it: start exits without removing it (a hooked rm would let the launcher's report land just
      before the removal), the launcher then exits without exec'ing Chrome and removes the directory.
  22. A listener swapped in while the registry read under the lock is blocked is refused, not registered.
- 23. A listener swapped in while `agy mcp add`, or the list after it, is blocked fails start: the
-     entry this run added is removed and the foreign listener is left running.
+ 23. A listener swapped in while `agy mcp add`, or the list after it, is blocked fails start and the
+     foreign listener is left running. agy has no compare-and-remove, so no entry is removed: an
+     external `agy mcp add` landing in that window keeps its entry.
  24. A start killed by SIGTERM after the launcher reported its group, but before start stopped that
      group, still cancels the launch: no Chrome comes up and the handshake directory is removed.
+ 25. A start killed by SIGTERM with a TERM-ignoring Chrome already listening leaves no process on the
+     profile: the group is killed, and only then is the handshake directory removed.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -723,7 +726,10 @@ exec "{sys.executable}" "$@"
                 foreign.kill()
             kill_profile(profile)
 
-        for case, hold_env in (("add", {"AGY_ADD_HOLD": "1"}), ("post-add list", {"AGY_LIST_HOLD_ON": "3"})):
+        external = f"chrome-devtools  stdio  enabled  external-mcp --browserUrl http://127.0.0.1:{free_port()}"
+        for case, hold_env, writer in (("add", {"AGY_ADD_HOLD": "1"}, False),
+                                       ("post-add list", {"AGY_LIST_HOLD_ON": "3"}, False),
+                                       ("external add", {"AGY_LIST_HOLD_ON": "3"}, True)):
             (tmp / "mcp.state").write_text("")
             rc, out = run(env, "start", *args)
             assert rc == 0, f"start before the {case} swap case failed: {out}"
@@ -747,11 +753,15 @@ exec "{sys.executable}" "$@"
                     time.sleep(0.25)
                 foreign = subprocess.Popen([str(chrome), f"--user-data-dir={tmp}/foreign", f"--remote-debugging-port={port}"], env=env)
                 wait_up(port, "the foreign listener")
+                if writer:
+                    (tmp / "mcp.state").write_text(external + "\n")
                 release.touch()
                 out = swapper.communicate(timeout=60)[0]
                 assert swapper.returncode != 0 and "not running on" in out, f"a listener swapped during the {case} was reported as ours: {out}"
-                assert "removed the chrome-devtools entry" in out, f"the {case} swap did not report removing its entry: {out}"
-                assert f"127.0.0.1:{port}" not in (tmp / "mcp.state").read_text(), f"the listener swapped during the {case} stays registered"
+                assert "was left in place" in out, f"the {case} swap did not report the entry it left: {out}"
+                assert "remove" not in (tmp / "agy.log").read_text(), f"start removed an entry after the {case} swap"
+                if writer:
+                    assert (tmp / "mcp.state").read_text() == external + "\n", "start deleted the external writer's entry"
                 assert foreign.poll() is None and answers(port), f"start's abort after the {case} killed the foreign listener"
             finally:
                 release.touch()
@@ -826,10 +836,39 @@ exec "{sys.executable}" "$@"
                 starter.kill()
             kill_profile(profile)
 
+        (tmp / "mcp.state").write_text("")
+        hs_py = write_exec(tmp / "hs-py", f"""#!/bin/bash
+[[ "$2" == *setsid* ]] && echo "$3" >"{tmp}/ign.hs"
+exec "{sys.executable}" "$@"
+""")
+        hold, release, starter = tmp / "ign.hold", tmp / "ign.release", None
+        try:
+            starter = subprocess.Popen(["bash", str(SCRIPT), "start", *args], env=dict(
+                env, SUTANDO_PY=str(hs_py), TERM_IGNORE="1", AGY_LIST_COUNT=str(tmp / "ign.count"),
+                AGY_LIST_HOLD_ON="2", HOLD_MARK=str(hold), HOLD_RELEASE=str(release)),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            for _ in range(300):
+                if hold.exists() or starter.poll() is not None:
+                    break
+                time.sleep(0.1)
+            assert hold.exists(), f"start never reached the registry read under the lock: {starter.poll()}"
+            assert answers(port) and profile_procs(profile), "Chrome was not listening before the signal"
+            os.killpg(starter.pid, signal.SIGTERM)
+            out = starter.communicate(timeout=60)[0]
+            assert starter.returncode != 0, f"start killed by SIGTERM exited 0: {out}"
+            assert profile_procs(profile) == [], f"a TERM-ignoring Chrome outlived the killed start: {out}"
+            assert not answers(port), "CDP is still up after the killed start"
+            assert not Path((tmp / "ign.hs").read_text().strip()).exists(), "the killed start left its handshake directory"
+        finally:
+            release.touch()
+            if starter and starter.poll() is None:
+                starter.kill()
+            kill_profile(profile)
+
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 24/24 agy-browser.sh")
+    print("PASS 25/25 agy-browser.sh")
 
 
 if __name__ == "__main__":

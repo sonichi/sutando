@@ -150,13 +150,28 @@ abort_start() {
   fail "$1; stopped the Chrome this run started"
 }
 # Every exit, signals included, that did not end in success cancels the launch. $HS is removed only
-# once the launcher is stopped or gone: before its report, the cancel file is what stops it.
+# once the launcher is seen gone: before its report, the cancel file is what stops it.
 on_exit() {
   [[ -n "${HS:-}" && -z "$settled" ]] || return 0
   : >"$HS/cancel" 2>/dev/null || true
   local pg; pg="$(cat "$HS/pgid" 2>/dev/null)" || true
-  if [[ -n "$pg" ]]; then kill -TERM -- "-$pg" 2>/dev/null || true; rm -rf "$HS"
+  if [[ -n "$pg" ]]; then
+    if end_group "$pg"; then rm -rf "$HS"
+    else echo "agy-browser.sh: process group $pg (Chrome on $PROFILE) did not exit; kill it with 'kill -KILL -- -$pg'" >&2; fi
   elif [[ -n "${launcher:-}" ]] && ! launcher_alive; then rm -rf "$HS"; fi
+}
+# True while any live (non-zombie) process is in group $1, or when ps cannot tell.
+group_alive() {
+  local rows; rows="$(ps -Ao pgid=,stat= 2>/dev/null)" || return 0
+  awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' <<<"$rows"
+}
+# TERM group $1, KILL it after 5s, and succeed only once no process in it is left.
+end_group() {
+  kill -TERM -- "-$1" 2>/dev/null || true
+  for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
+  kill -KILL -- "-$1" 2>/dev/null || true
+  for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
+  return 1
 }
 launcher_alive() { local st; st="$(ps -o stat= -p "$launcher" 2>/dev/null)" && [[ "$st" != Z* ]]; }
 # Serialize the registry read-add-read across runs: 'agy mcp add' overwrites, with no compare-and-swap.
@@ -268,11 +283,8 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
       msg="mcp: chrome-devtools registered with agy"
     fi
     # The add and the list after it can block too; a listener swapped meanwhile is never reported as ours.
-    if ! ours; then
-      [[ -z "$added" ]] || "$AGY_BIN" mcp remove chrome-devtools >/dev/null 2>&1 9>&- \
-        || abort_start "$NOT_OURS; could not remove the chrome-devtools entry this run added: run 'agy mcp remove chrome-devtools'"
-      abort_start "$NOT_OURS${added:+; removed the chrome-devtools entry this run added}"
-    fi
+    # agy has no compare-and-remove, and the entry may already be another writer's, so it is left in place.
+    ours || abort_start "$NOT_OURS${added:+; the chrome-devtools entry this run added was left in place: check 'agy mcp list' and run 'agy mcp remove chrome-devtools' if it points at $CDP_URL}"
     echo "$msg"
     settled=1
     if [[ -n "$HS" ]]; then rm -rf "$HS"; fi
