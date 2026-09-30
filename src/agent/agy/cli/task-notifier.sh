@@ -49,14 +49,15 @@ sentinel_path() {
   SUTANDO_INSTANCE_ID="agy-task-notifier" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
     watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
 }
-receipt_path() { printf '%s.launch\n' "$(sentinel_path)"; }
+# One receipt file per launch, named by its nonce: no generation can read or remove another's.
+receipt_path() { printf '%s.launch.%s\n' "$(sentinel_path)" "$1"; }
 case "${1:-}" in
   --sentinel-path) sentinel_path; exit $? ;;
   --launch-ready)
     # Ready only for THIS launch: the receipt this notifier publishes once its own watcher
     # child owns the ready sentinel must carry the launcher's nonce and this exact inbox.
     [ -n "${2:-}" ] || { echo "agy-task-notifier: --launch-ready needs the launch nonce" >&2; exit 2; }
-    R="$(receipt_path)" || exit 1
+    R="$(receipt_path "$2")" || exit 1
     NONCE="$2" RECEIPT="$R" INBOX="$TASKS_DIR" "$NOTIFIER_PY" - <<'PY'
 import os, sys
 want = {"nonce": os.environ["NONCE"], "inbox": os.environ["INBOX"]}
@@ -93,10 +94,7 @@ stop_watcher() {
 }
 
 cleanup_notifier() {
-  # Owner-conditional: a later generation may have published its own receipt here by now.
-  if [ -n "${RECEIPT_FILE:-}" ] && grep -qx "nonce=$LAUNCH_NONCE" "$RECEIPT_FILE" 2>/dev/null; then
-    rm -f "$RECEIPT_FILE"
-  fi
+  [ -z "${RECEIPT_FILE:-}" ] || rm -f "$RECEIPT_FILE"
   stop_watcher
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -246,6 +244,8 @@ export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
 export SUTANDO_INSTANCE_ID="agy-task-notifier"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
+# Taken right before the fork: only a sentinel written after this instant can be the child's.
+FORK_NS="$("$NOTIFIER_PY" -c 'import time; print(time.time_ns())')"
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role session --inbox "$TASKS_DIR" > "$event_dir/events" &
@@ -258,11 +258,29 @@ exec 3< "$event_dir/events"
 # names this notifier's own child, never inferred from a pid, an mtime or an argv shape.
 LAUNCH_NONCE="${SUTANDO_AGY_LAUNCH_NONCE:-}"
 RECEIPT_FILE=""
+# A sentinel is this child's only if it names the child AND was written after the fork: a
+# crash-left file can already hold the same number once the OS reuses the pid.
+child_owns_sentinel() {
+  SENT="$1" PID="$2" NS="$3" "$NOTIFIER_PY" - <<'PY'
+import os, sys
+try:
+    st = os.stat(os.environ["SENT"]); body = open(os.environ["SENT"]).read().strip()
+except OSError:
+    sys.exit(1)
+sys.exit(0 if body == os.environ["PID"] and st.st_mtime_ns > int(os.environ["NS"]) else 1)
+PY
+}
 if [ -n "$LAUNCH_NONCE" ]; then
-  SENTINEL_FILE="$(sentinel_path)" && RECEIPT_FILE="$(receipt_path)"
+  SENTINEL_FILE="$(sentinel_path)" && RECEIPT_FILE="$(receipt_path "$LAUNCH_NONCE")"
+  # Receipts of generations whose notifier is gone are dead files; a live pid keeps its file.
+  for r in "$SENTINEL_FILE".launch.*; do
+    [ -e "$r" ] || continue
+    n="$(sed -n 's/^notifier=//p' "$r" 2>/dev/null)"
+    [ -n "$n" ] && kill -0 "$n" 2>/dev/null || rm -f "$r"
+  done
   deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} + 5 ))
   while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$watcher_pid" 2>/dev/null; do
-    if [ "$(cat "$SENTINEL_FILE" 2>/dev/null)" = "$watcher_pid" ]; then
+    if child_owns_sentinel "$SENTINEL_FILE" "$watcher_pid" "$FORK_NS"; then
       tmp="$(mktemp "$RECEIPT_FILE.XXXXXX")" \
         && printf 'nonce=%s\ninbox=%s\nwatcher=%s\nnotifier=%s\n' "$LAUNCH_NONCE" "$TASKS_DIR" "$watcher_pid" "$$" > "$tmp" \
         && mv -f "$tmp" "$RECEIPT_FILE" \

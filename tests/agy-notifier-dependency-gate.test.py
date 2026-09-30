@@ -182,9 +182,12 @@ class NotifierDependencyGateTest(unittest.TestCase):
         sentinel = self._sentinel_path()
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         path = self._hermetic_path(exclude={"fswatch"})  # built before the bystanders: it takes ~1s
-        rpath = Path(f"{sentinel}.launch")
+        rpath = None
         if make_receipt is not None:
-            rpath.write_text(make_receipt())
+            body = make_receipt()
+            nonce = next((l.split("=", 1)[1] for l in body.splitlines() if l.startswith("nonce=")), "x")
+            rpath = Path(f"{sentinel}.launch.{nonce or 'x'}")
+            rpath.write_text(body)
             if receipt_age:
                 os.utime(rpath, (time.time() - receipt_age, time.time() - receipt_age))
         sentinel.write_text(make_payload())
@@ -246,19 +249,56 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("did not report ready", result.stdout + result.stderr)
         sentinel = self._sentinel_path()
-        self.assertTrue(Path(f"{sentinel}.launch").exists(), "a ready launch must leave its receipt")
-        receipt = dict(l.split("=", 1) for l in Path(f"{sentinel}.launch").read_text().splitlines())
+        receipts = list(sentinel.parent.glob(f"{sentinel.name}.launch.*"))
+        self.assertEqual(len(receipts), 1, f"a ready launch must leave exactly its receipt: {receipts}")
+        receipt = dict(l.split("=", 1) for l in receipts[0].read_text().splitlines())
         self.assertEqual(receipt["watcher"], sentinel.read_text().strip(),
                          "the receipt must name the pid that owns the ready sentinel")
         self.assertEqual(receipt["inbox"], str(self.root / "tasks"))
         self.assertEqual(len(receipt["nonce"]), 32)
+        self.assertTrue(receipts[0].name.endswith(receipt["nonce"]), "the receipt path carries its own nonce")
+        # A concurrent generation's receipt sits beside it; this owner's exit must not touch it.
+        other = Path(f"{sentinel}.launch.{'b' * 32}")
+        other.write_text(self._receipt(nonce="b" * 32))
         subprocess.run(["tmux", "-S", str(self.socket), "kill-session", "-t", f"={self.session}-watcher"],
                        capture_output=True, timeout=10)
         for _ in range(50):
-            if not Path(f"{sentinel}.launch").exists():
+            if not receipts[0].exists():
                 break
             time.sleep(0.1)
-        self.assertFalse(Path(f"{sentinel}.launch").exists(), "the owner's exit must remove its own receipt")
+        self.assertFalse(receipts[0].exists(), "the owner's exit must remove its own receipt")
+        self.assertTrue(other.exists(), "the owner's exit removed another generation's receipt")
+
+    def test_crash_left_sentinel_holding_the_reused_child_pid_is_not_readiness(self):
+        # After the fork, the sentinel holds exactly the child's pid but with a mtime from before
+        # the launch: a crash-left file whose number the OS reissued. Only a write after the fork counts.
+        fake = self.bin / "fswatch"
+        fake.write_text("#!/bin/bash\nexec sleep 300\n")
+        fake.chmod(0o755)
+        sentinel = self._sentinel_path()
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        path = self._hermetic_path(exclude={"fswatch"})
+        inbox = str(self.root / "tasks")
+        launcher = subprocess.Popen(["/bin/bash", str(LAUNCHER)], env=self._env(path, {"SUTANDO_WATCHER_READY_TIMEOUT": "3"}),
+                                    cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        child = None
+        for _ in range(100):
+            rows = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
+            for row in rows.splitlines():
+                if "watch-tasks-stream.sh" in row and f"--inbox {inbox}" in row:
+                    child = row.split()[0]
+            if child:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(child, "this launch's watcher child never appeared")
+        sentinel.write_text(f"{child}\n")
+        old = time.time() - 3600
+        os.utime(sentinel, (old, old))
+        out = launcher.communicate(timeout=60)[0]
+        self.assertEqual(launcher.returncode, 0, out)
+        self.assertIn("did not report ready", out)
+        self.assertEqual(list(sentinel.parent.glob(f"{sentinel.name}.launch.*")), [],
+                         "a receipt was signed over a sentinel the child never wrote")
 
 if __name__ == "__main__":
     unittest.main()
