@@ -25,8 +25,8 @@ ARGUMENTS: $ARGUMENTS
 
    ```bash
    brew install --cask antigravity
-   curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh
-   less /tmp/agy-install.sh && bash /tmp/agy-install.sh              # installs ~/.local/bin/agy
+   f="$(mktemp)" && curl -fsSL https://antigravity.google/cli/install.sh -o "$f"
+   less "$f" && bash "$f"                                            # installs ~/.local/bin/agy
    ```
 
 2. Pick one way to authenticate:
@@ -58,7 +58,8 @@ bash "$SKILL_DIR/scripts/agy-browser.sh" stop     # stops only that profile's Ch
 ```
 
 The DevTools port has no authentication: any process on this machine can drive that Chrome through
-`127.0.0.1:9222`, which is why it is bound to loopback only and runs on its own profile.
+`127.0.0.1:9222` (or the `--port` you pass), which is why it is bound to loopback only and runs on
+its own profile.
 
 `start` is safe to re-run and does nothing already done. It uses a port only when the process
 listening on it (found with `lsof`) runs on the agy profile, so it never adopts the user's Chrome;
