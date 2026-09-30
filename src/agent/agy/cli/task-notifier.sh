@@ -273,7 +273,7 @@ if [ -n "$LAUNCH_NONCE" ]; then
   # Receipts of generations whose notifier is gone are dead files; a live pid keeps its file.
   # Only complete names (32-hex nonce) are candidates: a temp file mid-publish is not.
   for r in "$SENTINEL_FILE".launch.*; do
-    [ -e "$r" ] && [[ "$r" =~ \.launch\.[0-9a-f]{32}$ ]] || continue
+    [ -e "$r" ] && [[ "$r" =~ \.launch\.[0-9a-f]{32}$ ]] && [ "$r" != "$RECEIPT_FILE" ] || continue
     n="$(sed -n 's/^notifier=//p' "$r" 2>/dev/null)"
     [ -n "$n" ] && kill -0 "$n" 2>/dev/null || rm -f "$r"
   done

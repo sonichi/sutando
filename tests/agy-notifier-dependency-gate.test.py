@@ -238,6 +238,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
             os.utime(rpath, (time.time() - receipt_age, time.time() - receipt_age))
         out = launcher.communicate(timeout=60)[0]
         self.assertEqual(launcher.returncode, 0, out)
+        self.assertTrue(rpath.exists(), "the planted receipt was swept before --launch-ready could parse it")
         if expect_ready:
             self.assertNotIn("did not report ready", out)
         else:
