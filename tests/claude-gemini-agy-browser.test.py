@@ -872,10 +872,15 @@ exec "{sys.executable}" "$@"
             kill_profile(profile)
 
         (tmp / "mcp.state").write_text("")
-        pm = {k: tmp / f"probe.{k}" for k in ("fail", "go", "renamed", "release", "lstart")}
+        pm = {k: tmp / f"probe.{k}" for k in ("fail", "go", "renamed", "release", "lstart", "arm", "armed", "nolstart")}
         ps_hook = write_exec(bin_dir / "ps", f"""#!/bin/bash
 [[ -e "{pm['fail']}" && "$*" == "-o stat= -p "* ]] && exit 1
 if [[ -e "{pm['lstart']}" && "$*" == "-o lstart= -p "* ]]; then echo "Thu Jan  1 00:00:00 1970"; exit 0; fi
+[[ -e "{pm['nolstart']}" && "$*" == "-o lstart= -p "* ]] && exit 1
+if [[ -e "{pm['arm']}" && "$*" == "-o lstart= -p "* ]]; then
+  [[ -e "{pm['armed']}" ]] && {{ echo "Thu Jan  1 00:00:00 1970"; exit 0; }}
+  : >"{pm['armed']}"
+fi
 exec /bin/ps "$@"
 """)
         probe_py = write_exec(tmp / "probe-py", f"""#!/bin/bash
@@ -944,7 +949,9 @@ exec /bin/rm "$@"
             kill_profile(profile)
 
         foreign = subprocess.Popen(["sleep", "120"], start_new_session=True)
-        for case, extra in (("reused", {}), ("foreign", {"FOREIGN": str(foreign.pid)})):
+        # revalidated: the leader proves ownership before TERM, ignores it, then stops proving it before KILL.
+        for case, extra in (("reused", {}), ("foreign", {"FOREIGN": str(foreign.pid)}),
+                            ("revalidated", {"TERM_IGNORE": "1"}), ("unreadable", {})):
             (tmp / "mcp.state").write_text("")
             hold, release, starter = tmp / f"{case}.hold", tmp / f"{case}.release", None
             wrap = write_exec(tmp / f"{case}-py", f"""#!/bin/bash
@@ -976,17 +983,27 @@ exec "{sys.executable}" "$@"
                 assert answers(port) and chrome_pids, f"{case}: Chrome was not listening before the signal"
                 if case == "reused":
                     pm["lstart"].touch()
+                if case == "revalidated":
+                    pm["arm"].touch()
+                if case == "unreadable":
+                    pm["nolstart"].touch()
                 os.killpg(starter.pid, signal.SIGTERM)
                 out = starter.communicate(timeout=60)[0]
                 assert starter.returncode != 0, f"{case}: start killed by SIGTERM exited 0: {out}"
-                assert "could not prove process group" in out, f"{case}: an unproved group was not reported: {out}"
-                if case == "reused":
+                hs_dir = Path((tmp / f"{case}.hs").read_text().strip())
+                state = (f"hs exists={hs_dir.exists()} pgid={(hs_dir / 'pgid').read_text() if (hs_dir / 'pgid').exists() else None!r} "
+                         f"profile procs before={chrome_pids} after={profile_procs(profile)} cdp={answers(port)}")
+                assert "could not prove process group" in out, f"{case}: an unproved group was not reported: {out}\n{state}"
+                if case in ("reused", "revalidated", "unreadable"):
                     assert profile_procs(profile) == chrome_pids, f"{case}: a group whose leader changed identity was signalled: {out}"
                 assert foreign.poll() is None, f"{case}: start signalled a foreign process group: {out}"
                 assert Path((tmp / f"{case}.hs").read_text().strip()).exists(), f"{case}: the handshake was removed without proving ownership"
             finally:
                 release.touch()
                 pm["lstart"].unlink(missing_ok=True)
+                pm["arm"].unlink(missing_ok=True)
+                pm["armed"].unlink(missing_ok=True)
+                pm["nolstart"].unlink(missing_ok=True)
                 if starter and starter.poll() is None:
                     starter.kill()
                 kill_profile(profile)

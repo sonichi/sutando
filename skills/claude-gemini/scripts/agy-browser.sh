@@ -163,36 +163,58 @@ on_exit() {
     if [[ $rc == 0 ]]; then rm -rf "$HS"
     elif [[ $rc == 2 ]]; then echo "agy-browser.sh: $(unproved "$pg")" >&2
     else echo "agy-browser.sh: process group $pg (Chrome on $PROFILE) did not exit; kill it with 'kill -KILL -- -$pg'" >&2; fi
-  elif [[ "$st" == dead ]]; then rm -rf "$HS"; fi
+  elif [[ "$st" == dead ]]; then rm -rf "$HS"
+  else echo "agy-browser.sh: Chrome's launcher has not reported its process group; it will read $HS/cancel and exit without starting Chrome" >&2; fi
 }
 unproved() { echo "could not prove process group $1 is still the Chrome this run started, so it was not signalled; $HS is kept"; }
-# True while any live (non-zombie) process is in group $1, or when ps cannot tell.
-group_alive() {
-  local rows; rows="$(ps -Ao pgid=,stat= 2>/dev/null)" || return 0
-  awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' <<<"$rows"
+# True only when ps read the table and no live (non-zombie) process is left in group $1.
+group_gone() {
+  local rows; rows="$(ps -Ao pgid=,stat= 2>/dev/null)" || return 1
+  [[ -n "$rows" ]] || return 1
+  ! awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' <<<"$rows"
 }
 # True only while group $1 is provably this run's: the launcher's own group, led by the launcher
-# (same start time), or, once the leader is gone, with every live member running on $PROFILE.
+# (same start time), or, once the leader is proved gone, with every live member running on $PROFILE.
 group_owned() {
   [[ -n "${launcher:-}" && "$1" == "$launcher" ]] || return 1
   local st rows members owned p
-  st="$(ps -o lstart= -p "$1" 2>/dev/null)" || st=""
-  if [[ -n "$st" ]]; then [[ -n "$LSTART" && "$st" == "$LSTART" ]]; return; fi
+  case "$(pid_state "$1")" in
+    present)
+      st="$(ps -o lstart= -p "$1" 2>/dev/null)" || return 1
+      [[ -n "$st" && -n "$LSTART" && "$st" == "$LSTART" ]]; return ;;
+    absent) ;;
+    *) return 1 ;;
+  esac
   rows="$(ps -Ao pid=,pgid=,stat= 2>/dev/null)" || return 1
   members="$(awk -v g="$1" '$2 == g && $3 !~ /^Z/ { print $1 }' <<<"$rows")"
+  [[ -n "$members" ]] || return 1
   owned="$(profile_pids "$1")" || return 1
   for p in $members; do grep -qx "$p" <<<"$owned" || return 1; done
+}
+# Prints present, absent or unknown for pid $1; only ESRCH proves it absent.
+pid_state() {
+  "$PYTHON" - "$1" 2>/dev/null <<'PY' || echo unknown
+import os, sys
+try:
+    os.kill(int(sys.argv[1]), 0)
+except ProcessLookupError:
+    print("absent")
+except PermissionError:
+    print("present")
+else:
+    print("present")
+PY
 }
 # TERM group $1, KILL it after 5s, revalidating ownership before each signal. Returns 0 once no
 # process in it is left, 2 when ownership could not be proved, 1 when it would not exit.
 end_group() {
-  group_alive "$1" || return 0
+  group_gone "$1" && return 0
   group_owned "$1" || return 2
   kill -TERM -- "-$1" 2>/dev/null || true
-  for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
+  for _ in $(seq 1 25); do group_gone "$1" && return 0; sleep 0.2; done
   group_owned "$1" || return 2
   kill -KILL -- "-$1" 2>/dev/null || true
-  for _ in $(seq 1 25); do group_alive "$1" || return 0; sleep 0.2; done
+  for _ in $(seq 1 25); do group_gone "$1" && return 0; sleep 0.2; done
   return 1
 }
 # Prints alive, dead or unknown. dead only once the launcher (this shell's child, so a failed
@@ -288,6 +310,7 @@ os.execv(sys.argv[2], sys.argv[2:])' "$HS" \
         --headless=new about:blank >/dev/null 2>&1 &
       launcher=$!
       LSTART="$(ps -o lstart= -p "$launcher" 2>/dev/null)" || LSTART=""
+      [[ -n "$LSTART" ]] || echo "agy-browser.sh: could not read the launcher's start time; if this run fails, the Chrome it starts may be left running" >&2
       launched=1
       for _ in $(seq 1 30); do cdp_up && break; sleep 0.5; done
       cdp_up || abort_start "Chrome did not start listening on $CDP_URL within 15s"
