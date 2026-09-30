@@ -51,8 +51,20 @@ sentinel_path() {
 }
 # One receipt file per launch, named by its nonce: no generation can read or remove another's.
 receipt_path() { printf '%s.launch.%s\n' "$(sentinel_path)" "$1"; }
+# Remove receipts of generations whose notifier is gone; never this launch's own ($1 = its nonce).
+# Only complete names (32-hex nonce) are candidates: a temp file mid-publish is not.
+sweep_receipts() {
+  local own r n
+  own="$(receipt_path "$1")"
+  for r in "$(sentinel_path)".launch.*; do
+    [ -e "$r" ] && [[ "$r" =~ \.launch\.[0-9a-f]{32}$ ]] && [ "$r" != "$own" ] || continue
+    n="$(sed -n 's/^notifier=//p' "$r" 2>/dev/null)"
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] && kill -0 "$n" 2>/dev/null || rm -f "$r"
+  done
+}
 case "${1:-}" in
   --sentinel-path) sentinel_path; exit $? ;;
+  --sweep-receipts) [ -n "${2:-}" ] || { echo "agy-task-notifier: --sweep-receipts needs the launch nonce" >&2; exit 2; }; sweep_receipts "$2"; exit $? ;;
   --launch-ready)
     # Ready only for THIS launch: the receipt this notifier publishes once its own watcher
     # child owns the ready sentinel must carry the launcher's nonce and this exact inbox.
@@ -270,13 +282,7 @@ child_owns_sentinel() {
 }
 if [ -n "$LAUNCH_NONCE" ]; then
   SENTINEL_FILE="$(sentinel_path)" && RECEIPT_FILE="$(receipt_path "$LAUNCH_NONCE")"
-  # Receipts of generations whose notifier is gone are dead files; a live pid keeps its file.
-  # Only complete names (32-hex nonce) are candidates: a temp file mid-publish is not.
-  for r in "$SENTINEL_FILE".launch.*; do
-    [ -e "$r" ] && [[ "$r" =~ \.launch\.[0-9a-f]{32}$ ]] && [ "$r" != "$RECEIPT_FILE" ] || continue
-    n="$(sed -n 's/^notifier=//p' "$r" 2>/dev/null)"
-    [ -n "$n" ] && kill -0 "$n" 2>/dev/null || rm -f "$r"
-  done
+  sweep_receipts "$LAUNCH_NONCE"
   deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + ${SUTANDO_STANDBY_STOP_TIMEOUT:-15} + 5 ))
   while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$watcher_pid" 2>/dev/null; do
     if child_owns_sentinel "$SENTINEL_FILE" "$watcher_pid" "$LAUNCH_NONCE"; then

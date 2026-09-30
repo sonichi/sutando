@@ -370,5 +370,31 @@ class NotifierDependencyGateTest(unittest.TestCase):
     def test_future_dated_sentinel_holding_the_reused_child_pid_is_not_readiness(self):
         self._reused_pid_sentinel_is_not_readiness(+3600)
 
+    def test_the_sweep_keeps_this_launch_receipt_and_removes_dead_generations(self):
+        # The startup sweep, run on its own so the own receipt is provably present when it looks:
+        # the own file must survive, a dead generation's and a malformed-owner one must not.
+        sentinel = self._sentinel_path()
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        own_nonce, dead_nonce, zero_nonce, live_nonce = "a" * 32, "b" * 32, "c" * 32, "d" * 32
+        own = Path(f"{sentinel}.launch.{own_nonce}")
+        own.write_text(self._receipt(own_nonce, watcher=self._dead_pid(), notifier=self._dead_pid()))
+        dead = Path(f"{sentinel}.launch.{dead_nonce}")
+        dead.write_text(self._receipt(dead_nonce, watcher=self._dead_pid(), notifier=self._dead_pid()))
+        zero = Path(f"{sentinel}.launch.{zero_nonce}")
+        zero.write_text(self._receipt(zero_nonce, notifier=0))
+        live = Path(f"{sentinel}.launch.{live_nonce}")
+        live.write_text(self._receipt(live_nonce))
+        temp = Path(f"{sentinel}.launch.{dead_nonce}.XXXXXX")
+        temp.write_text("half-written\n")
+        r = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--sweep-receipts", own_nonce],
+                           env=self._env(self._hermetic_path()), capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(own.exists(), "the sweep removed this launch's own receipt")
+        self.assertFalse(dead.exists(), "a dead generation's receipt survived the sweep")
+        self.assertFalse(zero.exists(), "a receipt whose notifier is not a positive pid survived the sweep")
+        self.assertTrue(live.exists(), "a live generation's receipt was swept")
+        self.assertTrue(temp.exists(), "a temp file mid-publish was swept")
+
+
 if __name__ == "__main__":
     unittest.main()
