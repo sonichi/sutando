@@ -74,8 +74,9 @@ case "${1:-}" in
 import os, sys
 want = {"nonce": os.environ["NONCE"], "inbox": os.environ["INBOX"]}
 try:
-    got = dict(l.split("=", 1) for l in open(os.environ["RECEIPT"]).read().splitlines() if "=" in l)
-except OSError:
+    with open(os.environ["RECEIPT"], encoding="utf-8") as f:
+        got = dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+except (OSError, ValueError):
     sys.exit(1)
 if any(got.get(k) != v for k, v in want.items()):
     sys.exit(1)

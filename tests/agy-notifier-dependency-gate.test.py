@@ -238,12 +238,13 @@ class NotifierDependencyGateTest(unittest.TestCase):
         rpath.write_text(make_receipt(nonce))
         if receipt_age:
             os.utime(rpath, (time.time() - receipt_age, time.time() - receipt_age))
-        # The predicate the launcher polls, asked directly on the planted content: this is the
-        # parse/match verdict itself, independent of when the owner's exit cleans the path up.
+        # The predicate the launcher polls, asked directly on the planted content, in an env
+        # without the shell's Python warning knobs: the parse/match verdict and nothing else.
+        probe_env = {k: v for k, v in self._env(path).items()
+                     if k not in ("PYTHONWARNINGS", "PYTHONDEVMODE", "PYTHONWARNDEFAULTENCODING")}
         probe = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--launch-ready", nonce],
-                               env=self._env(path), capture_output=True, text=True, timeout=30)
-        # A refusal is exactly rc 1 and no crash; interpreter warnings an ambient PYTHON* knob
-        # turns on are not a crash, so the signal is a traceback, not silence.
+                               env=probe_env, capture_output=True, text=True, timeout=30)
+        # A refusal is exactly rc 1 and no crash: the signal is a traceback, not silence.
         self.assertEqual(probe.returncode, 0 if expect_ready else 1,
                          f"--launch-ready decided {probe.returncode} on the planted receipt: {probe.stderr}")
         self.assertNotIn("Traceback", probe.stderr, f"--launch-ready crashed: {probe.stderr}")
