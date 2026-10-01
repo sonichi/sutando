@@ -472,8 +472,8 @@ deliver_prompt_grown() {
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       composer_is_cut_prompt "$baseline_raw" "$prompt" \
         && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
-      # Our own earlier paste is not an owner draft; the next pick resumes or reports it.
-      composer_holds_prompt "$baseline_raw" "$prompt" || note_composer_block "$filename" "$incarnation"
+      # A retype finds our own paste (whole or cut at a chunk); the next pick counts what stays.
+      [ "$type_tries" -gt 0 ] || note_composer_block "$filename" "$incarnation"
       return 1
     fi
     clear_composer_block
@@ -711,6 +711,8 @@ submit_task_grown() {
     return 0
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
+    # Owner text and an unparsed row read alike here; neither delivers, so both count.
+    note_composer_block "$filename" "$incarnation"
     return 0
   else
     deliver_prompt "$filename" "$prompt" || return 0

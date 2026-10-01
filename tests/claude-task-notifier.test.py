@@ -865,12 +865,31 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertIn("did not stage; re-typing", log)
         self.assertIn("composer not empty for task-own.txt", log)
         self.assertFalse(self._block_path().exists(), "our own paste must not count as an owner block")
+        # Left in place, it blocks the next pick like any draft, and that pick counts it.
+        self.run_event("task-own.txt", timeout=8)
+        self.assertEqual(self._block_path().read_text().split()[0], "1")
+
+    def test_our_prompt_mixed_with_other_text_escalates_at_the_threshold(self):
+        # A mixed composer fails closed on every pick, whether the rest is owner text or an
+        # unparsed row; neither delivers, so the episode must count and reach the owner.
+        calls = self._osascript_stub()
+        self.write_task("task-mx.txt")
+        prompt = self.expected_prompt("task-mx.txt")
+        self.pane_file.write_text("❯ owner draft " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        for attempt in range(1, 5):
+            self.run_event("task-mx.txt", env_extra=env, timeout=8)
+            self.assertEqual(self._notifications(calls, 0 if attempt < 3 else 1), 0 if attempt < 3 else 1,
+                             f"attempt {attempt}: escalate at the 3rd refusal, never again")
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("composer holds task-mx.txt's prompt with other text", log)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertEqual(self._block_path().read_text().split()[0], "4")
 
     def test_a_resumed_submit_clears_the_block_record(self):
         # The owner cleared the draft and the staged prompt was sent: the episode is over.
         self.write_task("task-r.txt")
-        prompt = (f"Sutando task ready: task-r.txt. Read {self.tasks_dir}/task-r.txt, follow "
-                  f"CLAUDE.md, complete the task, and write the result to {self.results_dir}/task-r.txt.")
+        prompt = self.expected_prompt("task-r.txt")
         self.pane_file.write_text("❯ " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
         record = self._block_path()
         record.write_text("1 4242 - task-r.txt\n")
