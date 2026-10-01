@@ -242,10 +242,11 @@ class NotifierDependencyGateTest(unittest.TestCase):
         # parse/match verdict itself, independent of when the owner's exit cleans the path up.
         probe = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--launch-ready", nonce],
                                env=self._env(path), capture_output=True, text=True, timeout=30)
-        # A refusal is exactly rc 1 with nothing on stderr; a crash is not a refusal.
+        # A refusal is exactly rc 1 and no crash; interpreter warnings an ambient PYTHON* knob
+        # turns on are not a crash, so the signal is a traceback, not silence.
         self.assertEqual(probe.returncode, 0 if expect_ready else 1,
                          f"--launch-ready decided {probe.returncode} on the planted receipt: {probe.stderr}")
-        self.assertEqual(probe.stderr, "", f"--launch-ready wrote to stderr: {probe.stderr}")
+        self.assertNotIn("Traceback", probe.stderr, f"--launch-ready crashed: {probe.stderr}")
         out = launcher.communicate(timeout=60)[0]
         self.assertEqual(launcher.returncode, 0, out)
         if expect_ready:
@@ -285,6 +286,7 @@ class NotifierDependencyGateTest(unittest.TestCase):
         self._launch_planting_receipt(lambda n: self._receipt(n, notifier=-1), expect_ready=False)
         self._launch_planting_receipt(lambda n: self._receipt(n, watcher=-1), expect_ready=False)
         self._launch_planting_receipt(lambda n: self._receipt(n, notifier=0), expect_ready=False)
+        self._launch_planting_receipt(lambda n: self._receipt(n, watcher=10 ** 30), expect_ready=False)
 
     def test_receipt_for_an_adjacent_inbox_is_not_readiness(self):
         self._launch_planting_receipt(lambda n: self._receipt(n, inbox=str(self.root / "tasks-other")), expect_ready=False)

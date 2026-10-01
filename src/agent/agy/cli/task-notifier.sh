@@ -86,7 +86,7 @@ for k in ("watcher", "notifier"):
         if pid <= 0:
             sys.exit(1)
         os.kill(pid, 0)
-    except (KeyError, ValueError, ProcessLookupError):
+    except (KeyError, ValueError, OverflowError, ProcessLookupError):
         sys.exit(1)
     except PermissionError:
         pass
