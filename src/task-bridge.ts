@@ -735,8 +735,14 @@ export function _shouldFallthrough(file: string): boolean {
 	// Signal Room results belong to the room daemon's `/result` poll, not to
 	// voice. See SIGNAL_TASK_PREFIX and the dedicated branch in the watcher.
 	if (file.startsWith(SIGNAL_TASK_PREFIX)) return false;
+	// A `.to-<bridge>` proactive file is that bridge's to claim (proactive_routing's
+	// grammar); voice must neither speak it nor archive the bridge's only copy.
+	if (DESTINED_PROACTIVE_RE.test(file)) return false;
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
+
+/** Mirrors proactive_routing._DESTINATION_RE on a proactive-* name. */
+export const DESTINED_PROACTIVE_RE = /^proactive-.*\.to-[a-z0-9_-]+\.txt$/;
 
 
 
@@ -1411,6 +1417,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 
 			for (const file of files) {
 				if (_deliveredResults.has(file)) continue;
+				if (DESTINED_PROACTIVE_RE.test(file)) continue;
 				const path = join(RESULT_DIR, file);
 				// `[dm-only]` is a Discord-routing privacy marker (see
 				// src/result_markers.py) — on the Python bridge side it suppresses
