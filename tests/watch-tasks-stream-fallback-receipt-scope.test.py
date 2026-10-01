@@ -29,8 +29,8 @@ FAILURES: list[str] = []
 
 def run(watcher_instance, receipt_owner, want_state=False):
     """receipt_owner: None | 'default' | '<instance>' — whose receipt exists.
-    A worker's own inbox is <ws>/deliveries/<id> (#4502), never the bare
-    <ws>/tasks the core alone watches -- using the real shape is what makes
+    A worker's own inbox is <ws>/deliveries/<id>, never the bare <ws>/tasks
+    the core alone watches -- using the real shape is what makes
     watcher_instance a worker case rather than a foreign id on the core's own inbox."""
     tmp = Path(tempfile.mkdtemp(prefix="b4-"))
     ws = tmp / "ws"
