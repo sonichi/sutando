@@ -355,8 +355,7 @@ if block:
         shutil.rmtree(stale, ignore_errors=True)
 
         # --- 10. a ledger whose FIRST line is the divider ---------------------
-        # The old `head -1 | grep '^# [^ ]'` took `# Resolved` for a title and put
-        # the record under it, where no reader counts it.
+        # A title-line check that matches `# Resolved` files the record unread.
         pq2.write_text("# Resolved\n\n## [RESOLVED] old one\nanswered\n")
         e3 = dict(env); e3["_remedy"] = "remedy-divider-first"
         r7 = subprocess.run(["bash", "-c", "set -e\n" + block],
