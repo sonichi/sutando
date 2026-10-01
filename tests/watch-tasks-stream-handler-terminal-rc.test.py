@@ -35,6 +35,8 @@ REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 # A bound only: the normal cost of every wait below is a second or two.
 DEADLINE_S = 40.0
+# Read-only tail after a task is settled: an emit after the claim's release is a defect too.
+TAIL_S = 2.5
 HOOK = '#!/bin/sh\nprintf "%s %s %s\\n" "$(date +%s)" "$1" "$2" >> "$TRANSITIONS"\n'
 
 
@@ -127,7 +129,7 @@ class Watcher:
     def emitted(self) -> bool:
         return b"TASK_FILE" in self.out
 
-    def wait_until(self, pred, deadline: float = DEADLINE_S, step: float = 0.2) -> bool:
+    def wait_until(self, pred, deadline: float = DEADLINE_S, step: float = 0.1) -> bool:
         """Poll `pred` until it holds, the watcher exits, or `deadline` elapses."""
         started = time.time()
         end = started + deadline
@@ -146,6 +148,15 @@ class Watcher:
             if time.time() >= end:
                 return done("timeout", False)
             time.sleep(step)
+
+    def tail(self, since: float, seconds: float = TAIL_S, step: float = 0.1) -> None:
+        """Keep reading stdout until `seconds` after `since` (the task settled), so an
+        emit that lands after the claim's release is still caught; ends with the watcher."""
+        end = since + seconds
+        while time.time() < end and self.p.poll() is None:
+            time.sleep(step)
+            self.pump()
+        self.pump()
 
     def stop(self) -> None:
         try:
@@ -186,12 +197,18 @@ def check(name: str, cond: bool, detail: str = "") -> None:
             print(LAST_DIAG[0])
 
 
-def run(real_run_rc: int, settled, probe_rc: int = 0) -> tuple[bool, list[str]]:
-    """Drive the real watcher over one pre-existing task; `settled(ws, w)` is the
-    watcher-written observable that ends the scenario. Returns (emitted, published)."""
+def start(real_run_rc: int, probe_rc: int = 0):
+    """One pre-existing task under a real watcher; scenarios start together so
+    their tails overlap instead of adding up."""
     ws = Workspace("term-rc-", real_run_rc, probe_rc)
     ws.task("task-demo")
-    w = ws.start()
+    return ws, ws.start()
+
+
+def finish(ws: Workspace, w: Watcher, settled, tail: bool = True) -> tuple[bool, list[str], bool]:
+    """Wait for `settled(ws, w)`, the watcher-written observable that ends the
+    scenario. Returns (emitted, published, settled-as-named). An absence check
+    keeps reading for TAIL_S after the task settled."""
     # A claim released after the handler ran means the watcher is done with the
     # task whatever it decided: a wrong outcome is diagnosed now, not at the bound.
 
@@ -202,12 +219,16 @@ def run(real_run_rc: int, settled, probe_rc: int = 0) -> tuple[bool, list[str]]:
     # Let the watcher settle its own claim before it is stopped, so a normal
     # run leaves no in-flight claim behind to muddy the shutdown lines.
     w.wait_until(lambda: not ws.claimed("task-demo"), deadline=10.0)
+    settled_at = time.time()
+    reached = settled(ws, w)
+    if tail:
+        w.tail(settled_at)
     w.stop()
     LAST_DIAG[0] = w.diagnosis()
-    return w.emitted, ws.published()
+    return w.emitted, ws.published(), reached
 
 
-def restart_witness():
+def restart_witness(ws: Workspace, first: Watcher):
     """REVIEW.md 15 for this change: a watcher that is STOPPED and STARTED AGAIN
     takes one probe-0/rc-4 task through to a published terminal failure.
 
@@ -216,8 +237,6 @@ def restart_witness():
     boundary, not a harness standing in for it. Only the workspace and the
     fswatch trigger are synthetic.
     """
-    ws = Workspace("term-rc-restart-", real_run_rc=4)
-    first = ws.start()
     # Up means stamped: the sentinel names this pid only once fswatch is confirmed running.
     came_up = first.wait_until(lambda: str(first.p.pid) in ws.sentinel_pids())
     first_pid = first.p.pid
@@ -229,8 +248,10 @@ def restart_witness():
     # startup sweep; created later, the stub fswatch never fires and nothing runs.
     ws.task("task-restart")
     second = ws.start()
-    second.wait_until(lambda: ws.published() != [])
+    second.wait_until(lambda: ws.published() != []
+                      or (ws.reached("after-handler") and not ws.claimed("task-restart")))
     second.wait_until(lambda: not ws.claimed("task-restart"), deadline=10.0)
+    second.tail(time.time())
     second.stop()
     LAST_DIAG[0] = second.diagnosis()
     published = ws.published()
@@ -238,7 +259,10 @@ def restart_witness():
     return first_pid, second.p.pid, second.emitted, published, body
 
 
-emitted, published = run(real_run_rc=4, settled=lambda ws, w: ws.published() != [])
+must_handle, ordinary, success = start(4), start(1), start(0)
+restart_ws = Workspace("term-rc-restart-", real_run_rc=4)
+restart_first = restart_ws.start()
+emitted, published, _ = finish(*must_handle, settled=lambda ws, w: ws.published() != [])
 check("a must-handle result is NOT emitted to the live core", not emitted,
       "the task reached the unrestricted core despite the handler refusing it")
 check("a must-handle result publishes a terminal failure instead", published != [],
@@ -246,18 +270,20 @@ check("a must-handle result publishes a terminal failure instead", published != 
 
 # Control: treating EVERY failure as must-handle would pass the case above while
 # removing the fallback feature, so an ordinary rc=1 must still reach the core.
-emitted_one, _ = run(real_run_rc=1, settled=lambda ws, w: w.emitted)
+emitted_one, _, _ = finish(*ordinary, settled=lambda ws, w: w.emitted, tail=False)
 check("control: an ordinary failure still falls back to the core", emitted_one,
       "the fallback path was removed, not narrowed")
 
 # Control 2: success is not a failure. Without this the first check passes for a
 # watcher that never emits anything at all. A success is over once the watcher
 # has recorded `after-done` and released its claim.
-emitted_zero, _ = run(real_run_rc=0,
-                      settled=lambda ws, w: ws.reached("after-done") and not ws.claimed("task-demo"))
+emitted_zero, _, done_zero = finish(*success,
+                                    settled=lambda ws, w: ws.reached("after-done") and not ws.claimed("task-demo"))
+check("control: a successful run records after-done and releases its claim", done_zero,
+      "the success path did not complete, so 'emits nothing' would be vacuous")
 check("control: a successful run emits nothing and needs no failure", not emitted_zero)
 
-pid1, pid2, emitted_r, published_r, body_r = restart_witness()
+pid1, pid2, emitted_r, published_r, body_r = restart_witness(restart_ws, restart_first)
 print(f"\n  restart witness: watcher pid {pid1} stopped, pid {pid2} started; task arrived after the restart")
 print(f"    emitted to the live core: {emitted_r}")
 print(f"    published by the restarted watcher: {published_r}")
