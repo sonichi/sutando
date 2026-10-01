@@ -36,10 +36,12 @@ dup="$(sort "$WANT" | uniq -d)"
 stale="$(grep -vxF -f "$ALL" "$WANT" || true)"
 [ -z "$stale" ] || { printf 'listed in %s but not discovered:\n%s\n' "$LIST" "$stale" >&2; exit 3; }
 if [ "$MODE" = only ]; then
-  # No match at all is an empty leg, which the caller must not run as a pass.
-  grep -xF -f "$WANT" "$ALL" | grep -vxF -f "$SER" > "$OUT"
+  { grep -xF -f "$WANT" "$ALL" || true; } | { grep -vxF -f "$SER" || true; } > "$OUT"
+  # An empty leg must fail, not run nothing and pass.
+  [ -s "$OUT" ] || { echo "leg 6: the selector emitted no load-sensitive suites; the list must name at least one suite without \`serial\`, or leg 6 must be removed" >&2; exit 3; }
 elif [ "$MODE" = serial ]; then
-  grep -xF -f "$SER" "$ALL" > "$OUT"
+  grep -xF -f "$SER" "$ALL" > "$OUT" || true
+  [ -s "$OUT" ] || { echo "leg 7: the selector emitted no serial suites; the list must tag at least one suite serial, or leg 7 must be removed" >&2; exit 3; }
 else
   grep -vxF -f "$WANT" "$ALL" > "$OUT" || true
 fi
