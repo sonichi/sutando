@@ -110,6 +110,40 @@ class OnboardingSeedTests(unittest.TestCase):
         leftovers = [p for p in Path(self.tmp.name).iterdir() if p.name != "onboarding.json"]
         self.assertEqual(leftovers, [], f"stray staging files left behind: {leftovers}")
 
+    def _run_writers_staged_then_renamed(self, writer, path, writers=8):
+        """Run `writer(path)` on `writers` threads, each held at the module's
+        os.replace until every writer has staged; return the raised exceptions.
+        Forcing that interleaving makes a shared staging name collide every run."""
+        staged = threading.Barrier(writers, timeout=30)
+        real_replace = os.replace
+
+        def gated_replace(src, dst):
+            staged.wait()
+            return real_replace(src, dst)
+
+        def _call(_):
+            try:
+                writer(path)
+                return None
+            except Exception as e:
+                return e
+
+        with unittest.mock.patch.object(self.seed.os, "replace", gated_replace):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=writers) as ex:
+                errors = list(ex.map(_call, range(writers)))
+        return [e for e in errors if e is not None]
+
+    def _naive_seed(self, p):
+        # The shared-`.tmp`-name writer seed() replaced; the mutation under control.
+        with open(p) as f:
+            data = json.load(f)
+        for field in self.seed.FIELDS:
+            data[field] = True
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, p)
+
     def test_concurrent_writers_do_not_collide_on_shared_staging_name(self):
         # 8-caller repro of the review's shared-`.tmp`-name collision; unique
         # per-writer staging (mkstemp) must make all 8 succeed.
@@ -119,59 +153,28 @@ class OnboardingSeedTests(unittest.TestCase):
             "unrelatedBigField": "x" * 500_000,
         }))
 
-        def _call(_):
-            try:
-                self.seed.seed(path)
-                return None
-            except Exception as e:
-                return repr(e)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            errors = list(ex.map(_call, range(8)))
-        failures = [e for e in errors if e is not None]
-        self.assertEqual(failures, [], f"concurrent seed() callers must not raise: {failures}")
+        failures = self._run_writers_staged_then_renamed(self.seed.seed, path)
+        self.assertEqual(failures, [], f"concurrent seed() callers must not raise: {failures!r}")
 
         data = json.loads(Path(path).read_text())
         self.assertEqual(len(data["unrelatedBigField"]), 500_000)
         for field in self.seed.FIELDS:
             self.assertIs(data[field], True, field)
+        leftovers = [p.name for p in Path(self.tmp.name).iterdir() if p.name != "onboarding.json"]
+        self.assertEqual(leftovers, [], f"stray staging files left behind: {leftovers}")
 
     def test_concurrency_test_would_catch_a_naive_non_atomic_writer(self):
-        # Mutation control: the naive shared-tmp-name writer this replaced
-        # must make the assertion above actually fail.
+        # Mutation control: the same harness, the naive writer in place of
+        # seed() — only the first rename can win, every other writer must fail.
         path = self._path("onboarding.json")
         Path(path).write_text(json.dumps({"consumerOnboardingComplete": False}))
-        writers = 8
-        # All writers finish staging before any renames, so the collision
-        # the shared name allows happens on every run, not only on a slow disk.
-        staged = threading.Barrier(writers, timeout=30)
 
-        def naive_seed(p):
-            with open(p) as f:
-                data = json.load(f)
-            for field in self.seed.FIELDS:
-                data[field] = True
-            tmp = p + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            staged.wait()
-            os.replace(tmp, p)
-
-        def _call(_):
-            try:
-                naive_seed(path)
-                return None
-            except Exception as e:
-                return e
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=writers) as ex:
-            errors = list(ex.map(_call, range(writers)))
-        failures = [e for e in errors if e is not None]
+        failures = self._run_writers_staged_then_renamed(self._naive_seed, path)
         self.assertEqual(
-            len(failures), writers - 1,
+            len(failures), 7,
             "mutation control: with one shared staging name only the first "
-            "rename can win; every other writer must fail — if it doesn't, "
-            f"this harness isn't discriminating atomic from non-atomic writers: {failures!r}",
+            "rename can win — if the others don't fail, this harness isn't "
+            f"discriminating atomic from non-atomic writers: {failures!r}",
         )
         for e in failures:
             self.assertIsInstance(e, FileNotFoundError, repr(e))
