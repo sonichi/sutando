@@ -530,6 +530,26 @@ open wins
 
 - **[pr-106, 2026-07-04]** merge #106?
 
+## ✅ RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE, nothing left to do
+
+## ✅ [RESOLVED 2026-06-28] PR #19 (sutando-meeting) MERGED
+
+## [RESOLVED] 2026-09-17T17:35Z — #101 MERGED
+
+**Status:** open
+
+## RESOLVED 2026-09-08T05:29Z — window granted, restart done
+
+- **[SELF-RESOLVED 2026-09-08T10:1xZ by measurement — no answer needed.]** The wall came down
+
+## #4358 — my diagnosis dispute RESOLVED in agreement; the only remaining gap is a fresh live witness, and it's the author's/your call to produce, not mine (updated 2026-09-17T16:57Z)
+
+## An old ask with an ISO stamp (2026-07-05T14:35:18Z)
+
+## RESOLVED? Should we revert #101
+
+asked 2026-09-20
+
 ## 2026-09-01 — answered already
 
 **Status:** answered
@@ -571,7 +591,8 @@ class TestMigrate(unittest.TestCase):
     def triage(self):
         cpq = self.m._reader()
         prs = self.m.GhPrs(runner=self.gh, sleep=self.slept.append, log=lambda *a, **k: None)
-        return self.m.triage(cpq.parse_waiting(FIXTURE), prs, self.NOW, 14, "sonichi/sutando")
+        return self.m.triage(cpq.parse_waiting(FIXTURE, keep_title_resolved=True), prs, self.NOW, 14,
+                             "sonichi/sutando", cpq.title_says_resolved)
 
     def test_each_entry_is_classified(self):
         got = {r["title"]: r["class"] for r in self.triage()}
@@ -585,7 +606,18 @@ class TestMigrate(unittest.TestCase):
             "2026-07-02 — Close issue #404 as won't fix?": "past-window",
             "2026-07-03 — Two PRs #105 and #101?": "live",
             "pr-106, 2026-07-04": "stale-merged-PR",
+            "✅ RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE, nothing left to do":
+                "self-resolved",
+            "✅ [RESOLVED 2026-06-28] PR #19 (sutando-meeting) MERGED": "self-resolved",
+            "[RESOLVED] 2026-09-17T17:35Z — #101 MERGED": "self-resolved",
+            "RESOLVED 2026-09-08T05:29Z — window granted, restart done": "self-resolved",
+            "SELF-RESOLVED 2026-09-08T10:1xZ by measurement — no answer needed.": "self-resolved",
+            "#4358 — my diagnosis dispute RESOLVED in agreement; the only remaining gap is a fresh live "
+            "witness, and it's the author's/your call to produce, not mine (updated 2026-09-17T16:57Z)": "live",
+            "RESOLVED? Should we revert #101": "live",
+            "An old ask with an ISO stamp (2026-07-05T14:35:18Z)": "past-window",
         })
+        self.assertNotIn(19, self.calls)  # a self-resolved title is decided before any PR lookup
 
     def test_a_403_backs_off_three_minutes_and_retries_and_states_are_cached(self):
         self.triage()
@@ -606,8 +638,10 @@ class TestMigrate(unittest.TestCase):
             rc = self.m.main(["--ledger", str(f), "--workspace", str(d), "--now", str(self.NOW)])
         text = out.getvalue()
         self.assertEqual(rc, 0)
-        self.assertIn("counts: live=3, stale-merged-PR=3, stale-closed-PR=1, past-window=2", text)
-        self.assertIn("rows it would create (3):", text)
+        self.assertIn("counts: self-resolved=5, live=5, stale-merged-PR=3, stale-closed-PR=1, past-window=3",
+                      text)
+        self.assertIn("rows it would create (5):", text)
+        self.assertIn("[past-window] 2026-07-01 — Rename the dock? — leave open in the file", text)
         self.assertRegex(text, r"Name=2026-09-28 — Merge #101 once CI is green\? \| Status=Open \| "
                                r"Priority=Medium \| Ask id=legacy-[0-9a-f]{12}")
         self.assertIn("dry run: nothing written", text)
@@ -619,19 +653,89 @@ class TestMigrate(unittest.TestCase):
         f.write_text(FIXTURE)
         db = pqs.RoomDbStore(InProcClient())
         done = self.m.apply(self.triage(), f, db)
-        self.assertEqual(len(db.open_entries()), 3)
+        self.assertEqual(len(db.open_entries()), 5)
         text = f.read_text()
         self.assertIn("**Status:** resolved — PR(s) sonichi/sutando#102 merged", text)
-        self.assertEqual(text.count("**Status:** moved — kept in the room database"), 3)
+        self.assertEqual(text.count("**Status:** resolved — its title says resolved"), 4)
+        self.assertNotIn("past its 14-day window", text)
+        self.assertIn("- **[SELF-RESOLVED 2026-09-08T10:1xZ", text)
+        self.assertEqual(text.count("**Status:** moved — kept in the room database"), 5)
         self.assertIn("- **[pr-106, 2026-07-04]** merge #106?", text)
         self.assertTrue(any("left for the owner [past-window]" in x for x in done))
         cpq = self.m._reader()
         self.assertEqual(sorted(q["title"] for q in cpq.parse_waiting(text)),
                          ["2026-07-01 — Rename the dock?", "2026-07-02 — Close issue #404 as won't fix?",
-                          "pr-106, 2026-07-04"])
+                          "An old ask with an ISO stamp (2026-07-05T14:35:18Z)", "pr-106, 2026-07-04"])
         again = self.m.apply(self.triage(), f, db)
-        self.assertEqual(len(db.open_entries()), 3)
+        self.assertEqual(len(db.open_entries()), 5)
         self.assertTrue(again)
+
+    def test_close_past_window_resolves_past_window_sections_only_when_asked(self):
+        d = Path(tempfile.mkdtemp())
+        f = d / "pending-questions.md"
+        f.write_text(FIXTURE)
+        self.m.apply(self.triage(), f, None, close_past_window=True)
+        text = f.read_text()
+        self.assertEqual(text.count("**Status:** resolved — past its 14-day window (closed in cleanup)"), 3)
+        cpq = self.m._reader()
+        waiting = {q["title"] for q in cpq.parse_waiting(text)}
+        self.assertFalse(waiting & {"2026-07-01 — Rename the dock?", "2026-07-02 — Close issue #404 as won't fix?"})
+        self.assertIn("- **[pr-106, 2026-07-04]** merge #106?", text)
+        lines = self.m.report(self.triage(), f, close_past_window=True)
+        self.assertIn("[past-window] 2026-07-01 — Rename the dock? — mark resolved in the file "
+                      "(past its 14-day window (closed in cleanup)); no row", "\n".join(lines))
+
+    def test_close_past_window_is_off_by_default_and_the_dry_run_still_writes_nothing(self):
+        d = Path(tempfile.mkdtemp())
+        f = d / "pending-questions.md"
+        f.write_text(FIXTURE)
+        real, out = self.m.GhPrs, io.StringIO()
+        with mock.patch.object(self.m, "GhPrs", lambda: real(self.gh, self.slept.append,
+                                                              lambda *a, **k: None)), \
+                contextlib.redirect_stdout(out):
+            self.m.main(["--ledger", str(f), "--now", str(self.NOW), "--close-past-window"])
+        self.assertIn("Rename the dock? — mark resolved in the file (past its 14-day window", out.getvalue())
+        self.assertEqual(f.read_text(), FIXTURE)
+
+
+class TestTitleSaysResolved(unittest.TestCase):
+    """One rule for the reader and the triage, over the shapes the ledger really uses."""
+
+    def setUp(self):
+        self.cpq = _cpq("/nonexistent", tempfile.mkdtemp())
+
+    RESOLVED = [
+        "✅ RESOLVED 2026-08-11 12:0xZ — ag2.space half DELIVERED (Sublist #21)",
+        "✅ [RESOLVED 2026-07-05] Presenter mode stuck active post-talk — CLEARED",
+        "SELF-RESOLVED 2026-07-31 07:2xZ by measurement — no answer needed",
+        "RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE",
+        "[RESOLVED — the PR MERGED] #2631 authorised restart",
+        "[RESOLVED] 2026-09-17T19:36Z — #4373 MERGED",
+        "2. [RESOLVED 2026-07-03] shipped already",
+    ]
+    LIVE = [
+        "#4358 — my diagnosis dispute RESOLVED in agreement; the only remaining gap is a fresh live witness",
+        "#3990 is now UN-DRAFTED and merge-ready — one click (2026-09-06)  — RESOLVED 2026-09-08T05:29Z: you said",
+        "RESOLVED? Should we revert #101",
+        "Resolved conflicts in the bridge — merge it?",
+        "Confirm whether the UI should render a [DONE] badge",
+        "RESOLVEDNESS of the queue — measure it?",
+    ]
+
+    def test_the_rule(self):
+        for t in self.RESOLVED:
+            self.assertTrue(self.cpq.title_says_resolved(t), t)
+        for t in self.LIVE:
+            self.assertFalse(self.cpq.title_says_resolved(t), t)
+
+    def test_the_reader_skips_them_in_sections_and_bullets_and_triage_can_keep_them(self):
+        text = "\n\n".join(f"## {t}\n\nbody" for t in self.RESOLVED + self.LIVE) + \
+            "\n\n- **[SELF-RESOLVED 14:52 PT — no longer urgent] Do bots have your authority?\n" \
+            "- **[RESOLVED 2026-08-18 — the duplicate-DM fix SHIPPED]** done\n- **[pr-7, 2026-09-01]** live?\n"
+        titles = [q["title"] for q in self.cpq.parse_waiting(text)]
+        self.assertEqual(titles, self.LIVE + ["pr-7, 2026-09-01"])
+        kept = self.cpq.parse_waiting(text, keep_title_resolved=True)
+        self.assertEqual(len(kept), len(self.RESOLVED) + len(self.LIVE) + 3)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ owner's "Pending questions" room database.
   python3 scripts/pending-questions-migrate.py [--dry-run]   # default: print only
   python3 scripts/pending-questions-migrate.py --apply       # after the owner reviewed a dry run
 
-Each waiting entry (the reminder's own reading of the file) is classified:
+Each open entry (the reminder's own reading of the file, plus the entries it
+already skips because their title says resolved) is classified, first match wins:
+  self-resolved     — the title leads with RESOLVED / SELF-RESOLVED (the reader's rule)
   live              — an open PR it names, or none and asked within --window-days
   stale-merged-PR   — every PR it names is closed and at least one merged
   stale-closed-PR   — every PR it names was closed unmerged
@@ -13,8 +15,9 @@ Each waiting entry (the reminder's own reading of the file) is classified:
 PR states come from `gh api repos/<repo>/pulls/<n>`; a 403 backs off 3 minutes
 and retries. The dry run prints the proposed action per entry and the rows it
 would create; it writes nothing. --apply creates the live rows (ask id
-`legacy-<hash>`, idempotent) and marks stale `## ` entries resolved in the file;
-past-window entries and bullet entries are listed for the owner, never changed.
+`legacy-<hash>`, idempotent) and marks self-resolved and stale `## ` entries
+resolved in the file; past-window `## ` entries too with --close-past-window.
+Bullet entries are listed for the owner, never changed.
 """
 from __future__ import annotations
 
@@ -35,11 +38,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
 from pending_questions_store import row_body, row_id  # noqa: E402
 
-CLASSES = ("live", "stale-merged-PR", "stale-closed-PR", "past-window")
+CLASSES = ("self-resolved", "live", "stale-merged-PR", "stale-closed-PR", "past-window")
 BACKOFF_SEC = 180
 TRIES = 3
 _PR_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|(?<![\w/&])#(\d{2,6})\b")
-_DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)\b")
+_DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)(?!\d)")
 
 
 def _reader():
@@ -99,8 +102,14 @@ class GhPrs:
         return st
 
 
-def classify(q: dict, prs, now: float, window_days: float, repo: str) -> tuple:
+SELF_RESOLVED_WHY = "its title says resolved"
+PAST_WINDOW_WHY = "past its 14-day window (closed in cleanup)"
+
+
+def classify(q: dict, prs, now: float, window_days: float, repo: str, title_resolved=None) -> tuple:
     """(class, reason) for one waiting entry."""
+    if title_resolved is not None and title_resolved(q["title"]):
+        return "self-resolved", SELF_RESOLVED_WHY
     text = f"{q['title']}\n{q.get('body', '')}"
     refs = pr_refs(text, repo)
     states = {f"{r}#{n}": prs.state(r, n) for r, n in refs}
@@ -123,6 +132,7 @@ def legacy_ask_id(q: dict) -> str:
 
 
 ACTIONS = {
+    "self-resolved": "mark resolved in the file (its title says resolved); no row",
     "live": "create an Open row in the room database; mark the file entry moved",
     "stale-merged-PR": "mark resolved in the file (its PR merged); no row",
     "stale-closed-PR": "mark resolved in the file (its PR closed unmerged); no row",
@@ -130,20 +140,23 @@ ACTIONS = {
 }
 
 
-def triage(questions: list, prs, now: float, window_days: float, repo: str) -> list:
+def triage(questions: list, prs, now: float, window_days: float, repo: str, title_resolved=None) -> list:
     out = []
     for q in questions:
-        cls, why = classify(q, prs, now, window_days, repo)
+        cls, why = classify(q, prs, now, window_days, repo, title_resolved)
         out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q)})
     return out
 
 
-def report(rows: list, ledger_file: Path) -> list:
+def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> list:
     counts = {c: sum(r["class"] == c for r in rows) for c in CLASSES}
     lines = [f"ledger: {ledger_file}", f"waiting entries: {len(rows)}",
              "counts: " + ", ".join(f"{c}={n}" for c, n in counts.items()), ""]
     for r in rows:
-        lines.append(f"[{r['class']}] {r['title'][:100]} — {ACTIONS[r['class']]} ({r['why']})")
+        action = ACTIONS[r["class"]]
+        if r["class"] == "past-window" and close_past_window:
+            action = f"mark resolved in the file ({PAST_WINDOW_WHY}); no row"
+        lines.append(f"[{r['class']}] {r['title'][:100]} — {action} ({r['why']})")
     live = [r for r in rows if r["class"] == "live"]
     lines += ["", f"rows it would create ({len(live)}):"]
     for r in live:
@@ -166,18 +179,22 @@ def _set_section_status(text: str, title: str, status: str) -> str:
     return text[:end].rstrip("\n") + "\n\n" + line + "\n\n" + text[end:]
 
 
-def apply(rows: list, ledger_file: Path, store) -> list:
+def apply(rows: list, ledger_file: Path, store, close_past_window: bool = False) -> list:
     done = []
+    headings = ledger_file.read_text(encoding="utf-8") if ledger_file.exists() else ""
     for r in rows:
-        is_section = not r["body"].lstrip().startswith("- **[")
+        is_section = re.search(rf"^## {re.escape(r['title'])}[ \t]*$", headings, re.MULTILINE) is not None
         if r["class"] == "live" and store is not None:
             store.insert_raw(r["ask_id"], r["title"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
             err = ledger.update(ledger_file, lambda t, r=r: _set_section_status(
                 t, r["title"], f"moved — kept in the room database as row {row_id(r['ask_id'])}")) \
                 if is_section else "a bullet entry: resolve it in the file by hand"
             done.append(f"row {row_id(r['ask_id'])}{'; file: ' + err if err else ''}: {r['title'][:80]}")
-        elif r["class"].startswith("stale-") and is_section:
-            err = ledger.update(ledger_file, lambda t, r=r: _set_section_status(t, r["title"], f"resolved — {r['why']}"))
+        elif is_section and (r["class"].startswith("stale-") or r["class"] == "self-resolved"
+                             or (r["class"] == "past-window" and close_past_window)):
+            why = PAST_WINDOW_WHY if r["class"] == "past-window" else r["why"]
+            err = ledger.update(ledger_file, lambda t, r=r, why=why: _set_section_status(
+                t, r["title"], f"resolved — {why}"))
             done.append(f"{'FAILED ' + err if err else 'resolved'}: {r['title'][:80]}")
         else:
             done.append(f"left for the owner [{r['class']}]: {r['title'][:80]}")
@@ -193,6 +210,8 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace", type=Path, default=None)
     ap.add_argument("--repo", default="sonichi/sutando")
     ap.add_argument("--window-days", type=float, default=14.0)
+    ap.add_argument("--close-past-window", action="store_true",
+                    help="with --apply, also mark past-window `## ` entries resolved")
     ap.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -203,8 +222,9 @@ def main(argv=None) -> int:
         from util_paths import host_label  # noqa: PLC0415
         args.ledger = ledger_path(ws, host_label())
     text = args.ledger.read_text(encoding="utf-8") if args.ledger.exists() else ""
-    rows = triage(cpq.parse_waiting(text), GhPrs(), args.now or time.time(), args.window_days, args.repo)
-    print("\n".join(report(rows, args.ledger)))
+    rows = triage(cpq.parse_waiting(text, keep_title_resolved=True), GhPrs(), args.now or time.time(),
+                  args.window_days, args.repo, cpq.title_says_resolved)
+    print("\n".join(report(rows, args.ledger, args.close_past_window)))
     if not args.apply:
         print("\n(dry run: nothing written; --apply after the owner has reviewed this)")
         return 0
@@ -212,7 +232,7 @@ def main(argv=None) -> int:
     store, where = room_store(ws)
     if store is None:
         print(f"\nroom database unavailable ({where}); live rows are not created", file=sys.stderr)
-    print("\n" + "\n".join(apply(rows, args.ledger, store)))
+    print("\n" + "\n".join(apply(rows, args.ledger, store, args.close_past_window)))
     return 0
 
 
