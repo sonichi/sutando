@@ -62,6 +62,32 @@ class NarrowCaptureTests(FakeTmuxHarness):
 
 
 class RePickTests(FakeTmuxHarness):
+    _osascript_stub = _h.EventDispatchTests._osascript_stub
+    _notifications = _h.EventDispatchTests._notifications
+    _block_path = _h.EventDispatchTests._block_path
+
+    def test_a_marker_behind_a_mixed_composer_still_counts_and_never_waits(self):
+        # The marker is written before C-m; a swallowed Enter plus owner text leaves our
+        # prompt mixed in the composer, so the marker records an Enter that never landed.
+        calls = self._osascript_stub()
+        self.write_task("task-im.txt")
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        self.run_event("task-im.txt", timeout=30)
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1)
+        self.assertTrue((self.inflight_dir / "task-im.txt").exists(), "precondition: the marker was recorded")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3",
+               "SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}
+        for attempt in range(1, 4):
+            try:
+                self.run_event("task-im.txt", env_extra=env, timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail(f"pick {attempt} waited on the completion timeout behind a mixed composer")
+        self.assertEqual(self._notifications(calls, 1), 1, "escalate once, at the 3rd refusal")
+        self.assertEqual(self._block_path().read_text().split()[:3][0::2], ["3", "alerted"])
+        self.assertFalse((self.inflight_dir / "task-im.txt").exists(), "the unlanded Enter's marker is retired")
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1, "never Enter into owner text")
+
     def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
         # First pass types and submits; no result ever appears. The re-pick after
         # the completion timeout must see the line in the pane and wait, not queue it twice.
