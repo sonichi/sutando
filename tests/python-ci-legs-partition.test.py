@@ -154,6 +154,12 @@ def main() -> int:
                 fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
                              f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
 
+    # No `serial` tag left: leg 7 must stop with a reason, not run nothing.
+    untagged = real.replace(f"{serial[0]} serial", serial[0]) if serial else real
+    rc, files, _w, err, _r = run_legs(fx, untagged, 8, (7,))[7]
+    if rc != 3 or "leg 7: the selector emitted no serial suites" not in err:
+        fails.append(f"no `serial` suite: leg 7 exited {rc} without the empty-leg reason: {err.strip()!r}")
+
     td_obj.cleanup()
     for f in fails:
         print("  FAIL", f)
@@ -162,7 +168,7 @@ def main() -> int:
     print(f"PASS: ci.yml's seven legs run all {len(disc)} discovered suites exactly once "
           f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg 6 (heaviest first, two "
           f"workers), {len(serial)} `serial` alone in leg 7, on 2- and 8-core hosts; a stale, duplicate or "
-          "badly tagged list entry stops every leg with exit 3")
+          "badly tagged list entry stops every leg with exit 3; an untagged list stops leg 7 with its reason")
     return 0
 
 
