@@ -328,12 +328,16 @@ jobs:
           bash scripts/run-shell-suites.sh lanes
 
   shell-tail-tests:
-    name: shell tests (serial tail)
+    name: shell tests (serial tail ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # The process-table suites run one at a time in the checkout; on their own
-    # runner they no longer sit behind the typecheck job's lanes.
+    # The process-table suites run one at a time per runner: three runners, each
+    # a cost-balanced third of the tail, so the tail is no longer the longest job.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -341,7 +345,7 @@ jobs:
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
       - name: Run shell standalone tests (serial tail)
-        run: bash scripts/run-shell-suites.sh tail
+        run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
 
   python-standalone-tests:
     name: python standalone tests (${{ matrix.shard }}/5)
