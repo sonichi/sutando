@@ -69,6 +69,19 @@ def main() -> int:
         if r.returncode != 3 or "tests/sb.test.py" not in r.stderr:
             fails.append(f"a duplicate entry was accepted: rc={r.returncode} err={r.stderr.strip()!r}")
 
+        tagged = td / "tagged.txt"
+        tagged.write_text("tests/sb.test.py\ntests/sd.test.py serial\n")
+        o, sr, w = (select(m, tagged, disc) for m in ("only", "serial", "without"))
+        if (o.stdout.split(), sr.stdout.split()) != (["tests/sb.test.py"], ["tests/sd.test.py"]):
+            fails.append(f"serial tag: only={o.stdout.split()} serial={sr.stdout.split()}")
+        if sorted(o.stdout.split() + sr.stdout.split() + w.stdout.split()) != sorted(disc):
+            fails.append("only + serial + without is not the discovery list")
+        badtag = td / "badtag.txt"
+        badtag.write_text("tests/sb.test.py later\n")
+        r = select("only", badtag, disc)
+        if r.returncode != 3 or "later" not in r.stderr:
+            fails.append(f"an unknown tag was accepted: rc={r.returncode}")
+
         r = select("both", good, disc)
         if r.returncode == 0:
             fails.append("an unknown mode was accepted")
@@ -105,17 +118,18 @@ def main() -> int:
     # The committed list against the real discovery: every entry present, none twice.
     real = subprocess.run(["bash", str(DISCOVER)], cwd=str(REPO), capture_output=True, text=True)
     discovered = [p for p in real.stdout.splitlines() if p]
-    listed = [ln.strip() for ln in LIST.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    listed = [ln.split()[0] for ln in LIST.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
     r = select("only", LIST, discovered)
-    if r.returncode != 0:
-        fails.append(f"the committed list does not select cleanly: {r.stderr.strip()}")
-    elif sorted(r.stdout.split()) != sorted(listed):
-        fails.append(f"leg 6 would run {len(r.stdout.split())} suites for {len(listed)} listed")
+    ser = select("serial", LIST, discovered)
+    if r.returncode != 0 or ser.returncode != 0:
+        fails.append(f"the committed list does not select cleanly: {(r.stderr + ser.stderr).strip()}")
+    elif sorted(r.stdout.split() + ser.stdout.split()) != sorted(listed):
+        fails.append(f"legs 6-7 would run {len(r.stdout.split() + ser.stdout.split())} suites for {len(listed)} listed")
     rest = select("without", LIST, discovered)
     if set(rest.stdout.split()) & set(listed):
         fails.append("a listed suite is still in the shared legs")
-    if sorted(rest.stdout.split() + r.stdout.split()) != sorted(discovered):
-        fails.append("leg 6 + legs 1-5 is not the real discovery list")
+    if sorted(rest.stdout.split() + r.stdout.split() + ser.stdout.split()) != sorted(discovered):
+        fails.append("legs 6-7 + legs 1-5 is not the real discovery list")
 
     for f in fails:
         print("  FAIL", f)

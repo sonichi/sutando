@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Regression pin: the six python legs, as ci.yml's own step computes them, partition discovery.
+"""Regression pin: the seven python legs, as ci.yml's own step computes them, partition discovery.
 
-Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..6)
+Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..7)
 in a fixture that has every discovered path, the real selector, sharder, cost table and
 list, and a stub lane runner that records the file list and worker count it is handed.
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
-exactly one leg, the load-sensitive suites only in leg 6 (heaviest first, two workers),
-and legs 1-5 none of them; and a list with a stale or duplicate entry must stop every
+exactly one leg, the listed load-sensitive suites in leg 6 (heaviest first, two workers)
+except those tagged `serial`, which run alone in leg 7, and legs 1-5 none of them; and a list with a stale or duplicate entry must stop every
 leg with the selector's exit 3, so a leg that reads the list without the selector fails.
 
 Run: python3 tests/python-ci-legs-partition.test.py
@@ -66,7 +66,7 @@ def build_fixture(td: Path, discovered) -> Path:
     return fx
 
 
-def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=range(1, 7)):
+def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=range(1, 8)):
     body = step_body()
     (fx / LIST).write_text(list_text)
     getconf = fx.parent / "bin" / "getconf"
@@ -87,7 +87,10 @@ def main() -> int:
     fails = []
     disc = subprocess.run(["bash", str(REPO / "scripts" / "discover-python-tests.sh")], cwd=REPO,
                           capture_output=True, text=True, check=True).stdout.split()
-    listed = [ln.strip() for ln in (REPO / LIST).read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    rows = [ln.split() for ln in (REPO / LIST).read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    listed = [r[0] for r in rows]
+    serial = [r[0] for r in rows if r[1:] == ["serial"]]
+    paired = [f for f in listed if f not in serial]
     cost = {}
     for ln in (REPO / COSTS).read_text().splitlines():
         if ln and not ln.startswith("#"):
@@ -117,13 +120,17 @@ def main() -> int:
     shared = sorted(set(listed) & {f for s in range(1, 6) for f in legs[s][1]})
     if shared:
         fails.append(f"load-sensitive suite(s) in legs 1-5: {shared[:3]}")
-    leg6 = legs[6][1]
-    if sorted(leg6) != sorted(listed):
-        fails.append(f"leg 6 runs {len(leg6)} suites, not exactly the {len(listed)} listed")
+    leg6, leg7 = legs[6][1], legs[7][1]
+    if not serial:
+        fails.append("the list tags no suite `serial`, so leg 7 has nothing to run")
+    if sorted(leg6) != sorted(paired):
+        fails.append(f"leg 6 runs {len(leg6)} suites, not exactly the {len(paired)} listed without `serial`")
+    if sorted(leg7) != sorted(serial):
+        fails.append(f"leg 7 runs {leg7}, not exactly the `serial` suites {serial}")
     if [cost.get(f, 1) for f in leg6] != sorted((cost.get(f, 1) for f in leg6), reverse=True):
         fails.append("leg 6 is not ordered heaviest first")
-    # The step's rule: shared legs take the host's core count, leg 6 always two. Checked on
-    # a 2-core and an 8-core host so a valid 2-core value is never read as hardcoding.
+    # The step's rule: shared legs take the host's core count, leg 6 two, leg 7 one. Checked
+    # on a 2-core and an 8-core host so a valid 2-core value is never read as hardcoding.
     for nproc in (2, 8):
         got = legs if nproc == 8 else run_legs(fx, real, nproc)
         shared = {s: got[s][2] for s in range(1, 6)}
@@ -131,12 +138,15 @@ def main() -> int:
             fails.append(f"on a {nproc}-core host legs 1-5 run with {sorted(set(shared.values()))} workers, not {nproc}")
         if got[6][2] != "2":
             fails.append(f"on a {nproc}-core host leg 6 runs with {got[6][2]} workers, not 2")
+        if got[7][2] != "1":
+            fails.append(f"on a {nproc}-core host leg 7 runs with {got[7][2]} workers, not 1")
 
     # A list that only partitions correctly when it is valid proves nothing about who reads
     # it: a stale or duplicate entry must stop every leg with the selector's exit 3.
     drifted = {
         "stale entry": real.replace(listed[0], listed[0].replace(".test.py", "-renamed.test.py")),
         "duplicate entry": real + listed[0] + "\n",
+        "unknown tag": real + listed[0].replace(".test.py", "") + "-x.test.py later\n",
     }
     for what, text in drifted.items():
         for shard, (rc, files, _w, err, _r) in run_legs(fx, text).items():
@@ -149,9 +159,10 @@ def main() -> int:
         print("  FAIL", f)
     if fails:
         return 1
-    print(f"PASS: ci.yml's six legs run all {len(disc)} discovered suites exactly once "
-          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); the {len(listed)} listed only in leg 6, "
-          "heaviest first, two workers (2- and 8-core hosts); a stale or duplicate list entry stops every leg with exit 3")
+    print(f"PASS: ci.yml's seven legs run all {len(disc)} discovered suites exactly once "
+          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg 6 (heaviest first, two "
+          f"workers), {len(serial)} `serial` alone in leg 7, on 2- and 8-core hosts; a stale, duplicate or "
+          "badly tagged list entry stops every leg with exit 3")
     return 0
 
 

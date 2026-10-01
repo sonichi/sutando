@@ -3,7 +3,7 @@
 
 The selector writes a receipt (mode, list hash, output hash) when it selects, and the
 step's unconditional `verify` exits 4 unless the files about to run match that receipt.
-This runs ci.yml's real step for leg 1 (`without`) and leg 6 (`only`): with the real
+This runs ci.yml's real step for legs 1 (`without`), 6 (`only`) and 7 (`serial`): with the real
 selector each leg verifies and reaches the lane with its receipt; with a selector that
 drops its receipt, or whose output is altered after it is hashed, each leg must stop with
 exit 4 before the lane runs. A workflow that skips verification passes those spoiled
@@ -41,11 +41,12 @@ def main() -> int:
     disc = subprocess.run(["bash", str(REPO / "scripts" / "discover-python-tests.sh")], cwd=REPO,
                           capture_output=True, text=True, check=True).stdout.split()
     real = (REPO / legs_mod.LIST).read_text()
-    listed = [ln.strip() for ln in real.splitlines() if ln.strip() and not ln.startswith("#")]
+    listed = [ln.split()[0] for ln in real.splitlines() if ln.strip() and not ln.startswith("#")]
     with tempfile.TemporaryDirectory() as td:
         fx = legs_mod.build_fixture(Path(td), disc)
-        legs = legs_mod.run_legs(fx, real, 8, (1, 6))
-        for shard, receipt in ((1, "selector.without.receipt"), (6, "selector.only.receipt")):
+        legs = legs_mod.run_legs(fx, real, 8, (1, 6, 7))
+        for shard, receipt in ((1, "selector.without.receipt"), (6, "selector.only.receipt"),
+                               (7, "selector.serial.receipt")):
             rc, files, _w, err, receipts = legs[shard]
             if rc != 0 or files is None:
                 fails.append(f"real selector: leg {shard} did not reach the lane (rc={rc}): {err.strip()}")
@@ -55,9 +56,10 @@ def main() -> int:
         (fx / SEL).rename(fx / "scripts" / "select-real.sh")
         (fx / SEL).write_text(WRAPPER)
         import os
-        for spoil, extra_by_leg in (("drop", {1: "", 6: ""}),
-                                    ("extra", {1: listed[0], 6: next(f for f in disc if f not in listed)})):
-            for shard in (1, 6):
+        unlisted = next(f for f in disc if f not in listed)
+        for spoil, extra_by_leg in (("drop", {1: "", 6: "", 7: ""}),
+                                    ("extra", {1: listed[0], 6: unlisted, 7: unlisted})):
+            for shard in (1, 6, 7):
                 os.environ["SPOIL"], os.environ["EXTRA"] = spoil, extra_by_leg[shard]
                 rc, files, _w, err, _r = legs_mod.run_legs(fx, real, 8, (shard,))[shard]
                 if rc != 4 or files is not None:
@@ -73,8 +75,8 @@ def main() -> int:
         print("  FAIL", f)
     if fails:
         return 1
-    print("PASS: legs 1 and 6 run only selector-receipted lists; a missing receipt or an output "
-          "altered after selection stops either leg with exit 4 before the lane")
+    print("PASS: legs 1, 6 and 7 run only selector-receipted lists; a missing receipt or an output "
+          "altered after selection stops each leg with exit 4 before the lane")
     return 0
 
 

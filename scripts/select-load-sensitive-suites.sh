@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# usage: select-load-sensitive-suites.sh only|without <list> <receipt-dir> < discovered | verify only|without <list> <receipt-dir> <selected> <to-run>
-# Stale/duplicate entry: exit 3. Selecting writes a receipt; verify exits 4 unless <to-run> is what this script selected.
+# usage: select-load-sensitive-suites.sh only|serial|without <list> <receipt-dir> < discovered | verify <mode> <list> <receipt-dir> <selected> <to-run>
+# only = listed, serial = listed `serial`, without = the rest. Bad entry: exit 3; verify exits 4 unless <to-run> is what was selected.
 set -euo pipefail
 MODE="${1:-}"
-usage() { echo "usage: $0 only|without <list> <receipt-dir> < discovered | verify only|without <list> <receipt-dir> <selected> <to-run>" >&2; exit 2; }
+usage() { echo "usage: $0 only|serial|without <list> <receipt-dir> < discovered | verify only|serial|without <list> <receipt-dir> <selected> <to-run>" >&2; exit 2; }
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 
 if [ "$MODE" = verify ]; then
   [ "$#" -eq 6 ] || usage
   KIND="$2"; LIST="$3"; RCPT="$4/selector.$2.receipt"; SELECTED="$5"; RUN="$6"
-  case "$KIND" in only|without) ;; *) usage ;; esac
+  case "$KIND" in only|serial|without) ;; *) usage ;; esac
   fail() { echo "selector receipt check ($KIND): $*" >&2; exit 4; }
   [ -f "$RCPT" ] || fail "no receipt at $RCPT — the shared selector did not produce this leg's list"
   [ "$(sed -n 's/^list_sha256=//p' "$RCPT")" = "$(sha "$LIST")" ] || fail "$LIST changed after selection"
   [ "$(sed -n 's/^output_sha256=//p' "$RCPT")" = "$(sha "$SELECTED")" ] || fail "$SELECTED is not what the selector emitted"
-  if [ "$KIND" = only ]; then
+  if [ "$KIND" != without ]; then
     cmp -s <(sort "$SELECTED") <(sort "$RUN") || fail "$RUN is not exactly the selected suites"
   else
     extra="$(grep -vxF -f "$SELECTED" "$RUN" || true)"
@@ -24,17 +24,22 @@ if [ "$MODE" = verify ]; then
 fi
 
 LIST="${2:-}"; RDIR="${3:-}"
-case "$MODE" in only|without) [ -n "$LIST" ] && [ -d "$RDIR" ] ;; *) false ;; esac || usage
-ALL="$(mktemp)"; WANT="$(mktemp)"; OUT="$(mktemp)"; trap 'rm -f "$ALL" "$WANT" "$OUT"' EXIT
+case "$MODE" in only|serial|without) [ -n "$LIST" ] && [ -d "$RDIR" ] ;; *) false ;; esac || usage
+ALL="$(mktemp)"; WANT="$(mktemp)"; SER="$(mktemp)"; OUT="$(mktemp)"; trap 'rm -f "$ALL" "$WANT" "$SER" "$OUT"' EXIT
 cat > "$ALL"
-grep -vE '^(#|$)' "$LIST" > "$WANT" || true
+bad="$(grep -vE '^(#|$)' "$LIST" | awk 'NF > 2 || (NF == 2 && $2 != "serial")' || true)"
+[ -z "$bad" ] || { printf 'unknown tag in %s (only `serial` is allowed):\n%s\n' "$LIST" "$bad" >&2; exit 3; }
+grep -vE '^(#|$)' "$LIST" | awk '{print $1}' > "$WANT" || true
+grep -vE '^(#|$)' "$LIST" | awk '$2 == "serial" {print $1}' > "$SER" || true
 dup="$(sort "$WANT" | uniq -d)"
 [ -z "$dup" ] || { printf 'listed twice in %s:\n%s\n' "$LIST" "$dup" >&2; exit 3; }
 stale="$(grep -vxF -f "$ALL" "$WANT" || true)"
 [ -z "$stale" ] || { printf 'listed in %s but not discovered:\n%s\n' "$LIST" "$stale" >&2; exit 3; }
 if [ "$MODE" = only ]; then
   # No match at all is an empty leg, which the caller must not run as a pass.
-  grep -xF -f "$WANT" "$ALL" > "$OUT"
+  grep -xF -f "$WANT" "$ALL" | grep -vxF -f "$SER" > "$OUT"
+elif [ "$MODE" = serial ]; then
+  grep -xF -f "$SER" "$ALL" > "$OUT"
 else
   grep -vxF -f "$WANT" "$ALL" > "$OUT" || true
 fi
