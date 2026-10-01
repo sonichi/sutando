@@ -127,6 +127,13 @@ check("the gate no longer appends the question with `>>`",
       and '>> "$_pq"' not in body,
       "an EOF append lands below the divider and is never counted")
 
+# --- 1b. delegation: the gate writes only through the ledger's one writer ---
+check("the gate writes the ledger only via pending_questions_ledger.py",
+      'pending_questions_ledger.py" insert "$_pq"' in block
+      and not re.search(r'(>|mv -f [^\n]*|cp [^\n]*)\s*"\$_pq"\s*$', block, re.M)
+      and "mkdir \"$_lock\"" not in block and "rmdir" not in block,
+      "the gate is back to its own lock / read-modify-write on the ledger")
+
 if block:
     with tempfile.TemporaryDirectory() as td:
         pq = Path(td) / "pending-questions.md"
@@ -134,7 +141,7 @@ if block:
         before = waiting(pq)
 
         env = dict(os.environ)
-        env.update({"_ws": str(Path(td)), "_host": "TestHost",
+        env.update({"REPO": str(REPO), "_ws": str(Path(td)), "_host": "TestHost",
                     "_ts": "2026-08-02T13:30:00Z",
                     "_remedy": "run `claude login`"})
         (Path(td) / "hosts" / "TestHost").mkdir(parents=True)
@@ -346,6 +353,17 @@ if block:
               "reclamation checks above)" if _age is None
               else f"mtime age {_age:.0f}s")
         shutil.rmtree(stale, ignore_errors=True)
+
+        # --- 10. a ledger whose FIRST line is the divider ---------------------
+        # The old `head -1 | grep '^# [^ ]'` took `# Resolved` for a title and put
+        # the record under it, where no reader counts it.
+        pq2.write_text("# Resolved\n\n## [RESOLVED] old one\nanswered\n")
+        e3 = dict(env); e3["_remedy"] = "remedy-divider-first"
+        r7 = subprocess.run(["bash", "-c", "set -e\n" + block],
+                            capture_output=True, text=True, env=e3, timeout=60)
+        check("divider-first ledger: the boot-abort question is counted",
+              r7.returncode == 0 and waiting(pq2) == 1,
+              f"rc={r7.returncode} n={waiting(pq2)} head={pq2.read_text()[:80]!r}")
 
 print()
 if failures:

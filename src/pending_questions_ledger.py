@@ -1,10 +1,16 @@
 """The one writer contract for pending-questions.md: every mutation of the file
 goes through `update()` — one mkdir lock shared by all writers, a read-transform-
-replace under it, and a temp-file + rename that preserves the file's mode.
+replace under it, and a temp-file + rename that preserves the file's mode. A lock
+is removed only by the writer that took it; a held lock makes the write give up
+after LOCK_WAIT_SEC, untouched, with the manual remedy in the error.
 
 Writers: pending_questions_ask (insert + stamp), agent-api `/answer` (status
-rewrite), engine-conflict-resolve deliver.py (insert above the divider). Readers
-keep `pending_questions_md`; this module only places and replaces text.
+rewrite), engine-conflict-resolve deliver.py (insert above the divider),
+auth-preflight-gate.sh (insert, via this module's CLI). Readers keep
+`pending_questions_md`; this module only places and replaces text.
+
+CLI: `python3 pending_questions_ledger.py insert <file> [--where top|above-divider]`
+with the entry on stdin; exit 1 and the reason on stderr when it did not write.
 """
 from __future__ import annotations
 
@@ -18,8 +24,6 @@ from typing import Callable, Optional
 from pending_questions_md import DIVIDER_OR_DONE_RE, DIVIDER_RE, mask_markup
 
 LOCK_WAIT_SEC = 10
-# A ledger write takes milliseconds; a lock this old belongs to a dead writer.
-STALE_LOCK_SEC = 120
 NEW_FILE_MODE = 0o644
 _TITLE_RE = re.compile(r"^# \S")
 
@@ -39,14 +43,11 @@ def _acquire(lock: Path) -> Optional[str]:
             lock.mkdir()
             return None
         except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > STALE_LOCK_SEC:
-                    lock.rmdir()
-                    continue
-            except OSError:
-                pass
+            # Never reclaimed: rmdir names a path, so a stat-then-rmdir can delete
+            # a lock a new writer just took. A wedged lock is removed by hand.
             if time.monotonic() >= deadline:
-                return f"could not acquire {lock} within {LOCK_WAIT_SEC}s"
+                return (f"could not acquire {lock} within {LOCK_WAIT_SEC}s; the file is "
+                        f"untouched. If no writer is running the lock is stale: rmdir '{lock}'")
             time.sleep(0.05)
 
 
@@ -125,3 +126,26 @@ def stamp(pq: Path, token: str, replacement: str) -> Optional[str]:
             raise LedgerError(f"token {token!r} occurs {n} times, expected 1")
         return old.replace(token, replacement, 1)
     return update(pq, _do)
+
+
+def main(argv=None) -> int:
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser(description="Insert an entry into pending-questions.md.")
+    ap.add_argument("op", choices=("insert",))
+    ap.add_argument("file", type=Path)
+    ap.add_argument("--where", choices=("top", "above-divider"), default="top")
+    args = ap.parse_args(argv)
+    entry = sys.stdin.read()
+    if not entry.strip():
+        print("pending_questions_ledger: empty entry on stdin", file=sys.stderr)
+        return 1
+    err = insert_entry(args.file, entry if entry.endswith("\n") else entry + "\n", args.where)
+    if err:
+        print(f"pending_questions_ledger: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

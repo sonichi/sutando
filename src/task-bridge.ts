@@ -1417,7 +1417,6 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 
 			for (const file of files) {
 				if (_deliveredResults.has(file)) continue;
-				if (DESTINED_PROACTIVE_RE.test(file)) continue;
 				const path = join(RESULT_DIR, file);
 				// `[dm-only]` is a Discord-routing privacy marker (see
 				// src/result_markers.py) — on the Python bridge side it suppresses

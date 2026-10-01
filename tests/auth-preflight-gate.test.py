@@ -36,6 +36,8 @@ class TestAuthPreflightGate(unittest.TestCase):
         self.ws = self.tmp / "ws"
         (self.ws / "results").mkdir(parents=True)
         shutil.copy(GATE_SRC, self.repo / "src" / "auth-preflight-gate.sh")
+        for mod in ("pending_questions_ledger.py", "pending_questions_md.py"):
+            shutil.copy(REAL_REPO / "src" / mod, self.repo / "src" / mod)
         (self.repo / "scripts" / "sutando-config.sh").write_text(
             "#!/bin/bash\n"
             f'case "$1" in workspace) echo "{self.ws}";; host-label) echo testhost;; esac\n'

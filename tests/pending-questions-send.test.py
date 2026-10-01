@@ -363,12 +363,49 @@ class TestWritersShareOneContract(_Workspace):
         self.assertIn("pq_ledger.update(pq_file, _answer)", handler)
         self.assertNotIn("write_text(answer_pending_question", handler)
 
-    def test_a_stale_lock_from_a_dead_writer_is_reclaimed(self):
+    def test_a_lock_is_never_reclaimed_however_old(self):
+        self.pq.write_text("## a — x\n\nbody\n")
         lock = ledger.lock_path(self.pq)
         lock.mkdir()
-        old = time.time() - ledger.STALE_LOCK_SEC - 5
+        old = time.time() - 3600
         os.utime(lock, (old, old))
-        self.assertIsNone(ledger.insert_entry(self.pq, "## q — x\n\nbody\n\n"))
+        ledger.LOCK_WAIT_SEC = 0.3
+        try:
+            err = ledger.insert_entry(self.pq, "## q — x\n\nbody\n\n")
+        finally:
+            ledger.LOCK_WAIT_SEC = 10
+        self.assertIsNotNone(err, "the hour-old lock was reclaimed and the write went through")
+        self.assertIn("could not acquire", err)
+        self.assertIn(f"rmdir '{lock}'", err, "the refusal names the manual remedy")
+        self.assertTrue(lock.is_dir(), "an hour-old lock is still not removed")
+        self.assertEqual(self.pq.read_text(), "## a — x\n\nbody\n")
+        self.assertNotIn("STALE_LOCK_SEC", (REPO / "src" / "pending_questions_ledger.py").read_text())
+
+
+class TestLedgerCli(_Workspace):
+    def _cli(self, stdin, *args):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stderr(err):
+            rc = ledger.main(["insert", str(self.pq), *args])
+        return rc, err.getvalue()
+
+    def test_insert_from_stdin_lands_in_the_active_region(self):
+        self.pq.write_text("# Resolved\n\n## [RESOLVED] old\n")
+        rc, _ = self._cli("## [t] BOOT ABORTED\nbody")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.pq.read_text().startswith("## [t] BOOT ABORTED\nbody\n"))
+
+    def test_empty_stdin_and_a_held_lock_exit_1_with_the_reason(self):
+        self.assertEqual(self._cli("  \n")[0], 1)
+        ledger.lock_path(self.pq).mkdir()
+        ledger.LOCK_WAIT_SEC = 0.3
+        try:
+            rc, err = self._cli("## q — x\n", "--where", "above-divider")
+        finally:
+            ledger.LOCK_WAIT_SEC = 10
+            ledger.lock_path(self.pq).rmdir()
+        self.assertEqual(rc, 1)
+        self.assertIn("could not acquire", err)
 
 
 class TestFailOpen(_Workspace):
@@ -503,11 +540,18 @@ class TestReminder(_Workspace):
         self.assertTrue(any(f.name.startswith("proactive-pending-q-") for f in self._proactive()))
 
     def test_a_claimed_in_flight_file_is_not_yet_delivered(self):
-        pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
-        [f] = self._proactive()
-        f.rename(f.with_suffix(".sending"))
-        body = _cpq(self.pq).get_waiting_questions()[0]["body"]
-        self.assertFalse(pqa.asked_recently(body, self.ws / "results"))
+        for suffix in (".sending", f".sending.{os.getpid()}"):
+            with self.subTest(claim=suffix):
+                self._drain()
+                for f in (self.ws / "results").iterdir():
+                    f.unlink()
+                pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
+                f = next(p for p in self._proactive() if p.name.endswith(".txt"))
+                f.rename(f.with_suffix(suffix))
+                body = _cpq(self.pq).get_waiting_questions()[0]["body"]
+                self.assertFalse(pqa.asked_recently(body, self.ws / "results"),
+                                 f"a {suffix} claim is in flight, not drained")
+                self.pq.unlink()
 
     def test_drained_within_the_hour_is_skipped_and_due_after(self):
         now = time.time()

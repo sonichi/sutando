@@ -18,6 +18,7 @@ region, split the entry or become a drain action.
 """
 from __future__ import annotations
 
+import glob
 import os
 import re
 import secrets
@@ -98,11 +99,13 @@ def sent_at(body: str) -> Optional[float]:
 
 
 def drained(results_dir: Path, name: str) -> bool:
-    """A queued file some drain took: neither the file nor its `.sending` claim remains."""
+    """A queued file some drain took: neither the file nor any claim of it remains
+    (`.sending` from discord/telegram/slack, `.sending.<pid>` from ag2space)."""
     if not name.startswith("proactive-"):
         return False
     p = Path(results_dir) / name
-    return not p.exists() and not p.with_suffix(".sending").exists()
+    claims = Path(results_dir).glob(glob.escape(p.stem) + ".sending*")
+    return not p.exists() and next(claims, None) is None
 
 
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,

@@ -89,75 +89,11 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # edge cases #2419 catalogues (a quoted `# Resolved` in a comment, a fenced
   # block, an inline code span). A boot-abort question also belongs first.
   _pq="$_ws/hosts/$_host/pending-questions.md"
-  # Serialise the read-modify-write, and use PER-INVOCATION scratch names.
-  #
-  # The first cut of this used fixed `$_pq.new` / `$_pq.tmp` siblings. Two gates
-  # tripping for the same host at once clobber each other's scratch file: one
-  # boot-abort record is lost and one writer can fail while the other succeeds
-  # (reproduced in review at f4e17019 — rcs [1,0], reader saw 2 of 3). That
-  # regresses the durability of the `>>` path it replaces, in exactly the record
-  # that is meant to explain why startup aborted. Visibility is not worth losing
-  # an entry for.
-  #
-  # Serialise the read-modify-write with a `mkdir` lock, and FAIL CLOSED if we
-  # cannot get it. `mkdir` is the portable atomic test-and-set — `flock(1)` is
-  # not on stock macOS.
-  #
-  # The first cut proceeded WITHOUT the lock after a bounded wait, and cleaned up
-  # by unconditionally removing it. Review reproduced the result: 10 writers
-  # against a pre-existing lock, every one returning 0, 2 of 10 records surviving,
-  # and the foreign lock deleted. That is the same silent record-loss this whole
-  # change exists to close, re-entered through the escape hatch — availability
-  # bought with the durability that is the entire point. So:
-  #   * only the acquirer ever touches the file, and
-  #   * only the acquirer ever removes the lock.
-  # On timeout we leave the file and the foreign lock untouched and say so on
-  # stderr. Losing one duplicate record while a peer gate writes an equivalent
-  # one beats corrupting the file for everybody.
-  #
-  # There is deliberately NO stale-lock reclamation, and that is the second half
-  # of the same rule. This loop used to stat the lock and `rmdir` it once its
-  # mtime passed 30s, to stop a killed gate wedging later boots. `rmdir` names a
-  # PATH, not the directory you observed: if the owner releases and a new gate
-  # acquires between the `stat` and the `rmdir`, the reclaimer deletes the
-  # REPLACEMENT's lock and two writers enter the read-modify-write together —
-  # the classic ABA, and it loses exactly the boot-abort record this block
-  # exists to preserve. There is no identity to check either, since `mkdir`
-  # gives the acquirer no token the observer can compare against. A wedged lock
-  # costs one skipped record per boot and says so on stderr; the race costs a
-  # silently truncated file. Prefer the loud, bounded failure.
-  _lock="$_pq.lock"
-  _have_lock=0
-  _waited=0
-  while [ "$_waited" -lt 100 ]; do
-    if mkdir "$_lock" 2>/dev/null; then _have_lock=1; break; fi
-    _waited=$((_waited + 1))
-    sleep 0.1
-  done
-
-  if [ "$_have_lock" != "1" ]; then
-    echo "  auth-preflight-gate: could not acquire $_lock after ~10s; leaving pending-questions.md untouched (a concurrent gate holds it and is recording an equivalent abort). If no gate is running, this lock is stale — remove it by hand: rmdir '$_lock'" >&2
-  else
-    _new="$_pq.new.$$"
-    _tmp="$_pq.tmp.$$"
-    {
-      echo "## [$_ts] BOOT ABORTED — CLI login required ($_host)"
-      echo "auth-preflight-gate stopped startup before services launched."
-      echo "Remedy: $_remedy"
-      echo ""
-    } > "$_new"
-    if [ -f "$_pq" ]; then
-      if head -1 "$_pq" | grep -qE '^# [^ ]'; then
-        { head -1 "$_pq"; echo ""; cat "$_new"; tail -n +2 "$_pq"; } > "$_tmp"
-      else
-        { cat "$_new"; cat "$_pq"; } > "$_tmp"
-      fi
-      mv -f "$_tmp" "$_pq"
-    else
-      mv -f "$_new" "$_pq"
-    fi
-    rm -f "$_new" "$_tmp"
-    rmdir "$_lock" 2>/dev/null || true
+  # The ledger's one writer (src/pending_questions_ledger.py) locks, inserts and
+  # replaces atomically; it never removes a lock it did not take, and says so.
+  if ! printf '## [%s] BOOT ABORTED — CLI login required (%s)\nauth-preflight-gate stopped startup before services launched.\nRemedy: %s\n\n' \
+      "$_ts" "$_host" "$_remedy" | python3 "$REPO/src/pending_questions_ledger.py" insert "$_pq"; then
+    echo "  auth-preflight-gate: pending-questions.md left untouched (reason above)." >&2
   fi
   # --- end pending-question write (unique sentinel; tests extract to here) ---
   printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
