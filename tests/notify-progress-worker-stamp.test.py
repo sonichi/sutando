@@ -185,12 +185,22 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
-    def test_task_file_with_no_thread_root_falls_back_to_reply_to_event(self):
+    def test_no_thread_root_threads_under_source_message_id_not_reply_to_event(self):
+        # reply_to_event is the post the sender quoted (often someone else's);
+        # the asking message is source_message_id.
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                       "task: x\nreply_to_event: $replyevt\n")
+                       "source_message_id: $ask\nreply_to_event: $other\ntask: x\n")
         rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
-        self.assertEqual(sent[0]["thread_root"], "$replyevt")
+        self.assertEqual(sent[0]["thread_root"], "$ask")
+
+    def test_thread_root_wins_over_source_message_id(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\nreply_to_event: $other\ntask: x\n"
+                       "thread_root: $root\n")
+        rc, sent, _ = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["thread_root"], "$root")
 
     def test_missing_task_file_falls_back_to_explicit_flags_without_crashing(self):
         missing = os.path.join(tempfile.gettempdir(), "notify-does-not-exist-xyz.txt")
@@ -207,6 +217,23 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [])
         self.assertIn("no bridge", err)
+
+    def test_parser_unavailable_falls_back_to_explicit_flags(self):
+        # sys.modules[name] = None makes `from local_task_protocol import ...` raise ImportError.
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\ntask: x\n")
+        err = io.StringIO()
+        with mock.patch.dict(sys.modules, {"local_task_protocol": None}), \
+                contextlib.redirect_stderr(err):
+            derived = notify._derive_from_task_file(f)
+        self.assertEqual(derived, {})
+        self.assertIn("local_task_protocol unavailable", err.getvalue())
+
+    def test_task_file_with_source_but_no_channel_refuses_cleanly(self):
+        f = self._task("id: task-v\nsource: local-ag2space\ntask: x\n")
+        rc, sent, err = self._send(["--task-file", f])
+        self.assertEqual(rc, 1)
+        self.assertEqual(sent, [])
+        self.assertIn("--channel-id (or --chat-id) is required", err)
 
     def test_neither_task_file_nor_source_refuses_cleanly(self):
         rc, sent, err = self._send([])
