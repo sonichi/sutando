@@ -107,11 +107,11 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
    (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
-8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
-   placed by importance (only the top 5 render anywhere), and assert with the reader:
-   `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
-   position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
-   Then pivot; never block.
+8. **Ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]`
+   — never hand-edit the ledger. It inserts the entry at the top of the per-host `pending-questions.md`,
+   queues the question to the owner (the task's conversation only for an owner DM task, else his DM),
+   stamps `**Sent:** queued …` and fires the macOS notification. Read its output: a `FAILED` line is
+   not an ask. Then pivot; never block.
 9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
    "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).

@@ -15,7 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # lint-workspace-resolution: allow-repo-root
 from pending_questions_ask import ask_owner, report_lines  # noqa: E402
 
 

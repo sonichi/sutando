@@ -242,13 +242,11 @@ Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop
 
 ## Pending decisions
 
-When you need user input on a decision or are blocked:
-1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
-2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
-4. Continue working on other things — don't block
+When you need the owner's word on a decision or are blocked:
+1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records the question at the top of the **per-host** `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`; `personal_path("pending-questions.md")` and every reader resolve it), queues it as `results/proactive-*.txt` (the task's conversation only for an owner-tier task in the owner's DM; otherwise the owner's DM), stamps `**Sent:** queued …` on the entry, and fires the macOS notification last, naming the fix when refused. A file line alone is a dead drop.
+2. Continue working on other things — don't block.
 
-On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
+On each proactive loop pass, check that file for unanswered items; `check-pending-questions.py` re-raises them, skipping ones queued and drained within the hour.
 
 ## Task progress notifications
 
