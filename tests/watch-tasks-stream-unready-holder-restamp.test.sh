@@ -116,6 +116,20 @@ n="$(start_inst "$WS2" "$WS2/deliveries/w1" w1 owner2)"; PIDS+=("$n")
 for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 [ "$(cat "$WS2"/state/*+w1.pid 2>/dev/null)" = "$hw" ]; check "(d) the inbox's own identity re-stamps the holder's pid" $? "$(tail -2 "$WORK/owner2.err" | tr '\n' '|')"
 
+# (e) kewei's review (sutando#4976): the core's inbox is identified by REALPATH,
+# not basename -- a symlinked <ws3>/tasks -> physical-inbox must re-stamp exactly
+# like a physical .../tasks, even though basename(TASKS_DIR_ABS) is "physical-inbox".
+WS3="$WORK/ws3"; mkdir -p "$WS3/physical-inbox" "$WS3/state"
+ln -s "$WS3/physical-inbox" "$WS3/tasks"
+h3="$(start "$WS3" "$WS3/tasks" holder3)"; PIDS+=("$h3")
+ready "$WS3" "$h3"; check "(e setup) a session holder on a symlinked core inbox is ready" $? "$(tail -2 "$WORK/holder3.err" | tr '\n' '|')"
+SENT3="$(ls "$WS3"/state/*.pid | head -1)"
+rm -f "$SENT3"
+n="$(start "$WS3" "$WS3/tasks" eighth)"; PIDS+=("$n")
+for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
+! alive "$n"; check "(e) a new start on the symlinked inbox yields to the live holder (exits)" $?
+[ "$(cat "$SENT3" 2>/dev/null)" = "$h3" ]; check "(e) ...and re-stamps the sentinel with the holder's pid (realpath match, not basename)" $? "sentinel: $(cat "$SENT3" 2>/dev/null)"
+grep -q 're-stamped' "$WORK/eighth.err"; check "(e) ...and said so on stderr" $? "$(tail -2 "$WORK/eighth.err" | tr '\n' '|')"
 
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASS"; else echo "TESTS FAILED"; exit 1; fi

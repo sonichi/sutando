@@ -131,10 +131,17 @@ ws = tmp / "ws"
 (ws / "state").mkdir()
 log = tmp / "handler.log"
 handler = tmp / "handler.sh"
+# A bare "handle" in log would pass trivially once ANY earlier property wrote
+# it; record which task file was actually handled, so each property can assert its own.
 handler.write_text(
     '#!/bin/sh\n'
-    'for a in "$@"; do [ "$a" = "--probe" ] && { echo probe >> %s; exit 0; }; done\n'
-    'echo handle >> %s\nexit 0\n' % (log, log))
+    'task=""; prev=""\n'
+    'for a in "$@"; do\n'
+    '  [ "$prev" = "--task-file" ] && task="$a"\n'
+    '  [ "$a" = "--probe" ] && { echo probe >> %s; exit 0; }\n'
+    '  prev="$a"\n'
+    'done\n'
+    'echo "handle $(basename "$task")" >> %s\nexit 0\n' % (log, log))
 handler.chmod(0o755)
 
 cfg = ws / "state" / "task-event-handler.json"
@@ -149,11 +156,11 @@ out: list[str] = []
 try:
     wait_for_fswatch(p)
     write_task(ws / "tasks", "task-one.txt")
-    ok = wait_for(lambda: (read_available(p, out), log.exists() and "handle" in log.read_text())[1])
+    ok = wait_for(lambda: (read_available(p, out), log.exists() and "handle task-one.txt" in log.read_text())[1])
     LAST_STDERR[0] = snapshot_stderr(errf_path)
     check("(1) a foreign inherited SUTANDO_INSTANCE_ID on the core's own inbox is "
           "corrected: the already-present handler still runs",
-          ok and log.exists() and "handle" in log.read_text(),
+          ok and log.exists() and "handle task-one.txt" in log.read_text(),
           f"out={out} log={log.read_text() if log.exists() else None}")
     check("(2) the correction is logged to stderr",
           "set while serving the core's own canonical inbox" in LAST_STDERR[0],
@@ -179,13 +186,14 @@ out3: list[str] = []
 try:
     wait_for_fswatch(p3)
     write_task(ws / "tasks", "task-full-env.txt")
-    ok3 = wait_for(lambda: (read_available(p3, out3), log.exists() and "handle" in log.read_text())[1])
+    ok3 = wait_for(lambda: (read_available(p3, out3), log.exists() and "handle task-full-env.txt" in log.read_text())[1])
     LAST_STDERR[0] = snapshot_stderr(errf3_path)
     check("(3) a FULL inherited worker env (instance id + inbox kind/resolver/delivery "
           "script) on the core's own inbox is cleared, not just the instance id: "
-          "the handler still runs",
-          ok3 and log.exists() and "handle" in log.read_text(),
-          f"out={out3} stderr={LAST_STDERR[0]!r}")
+          "the handler still runs, naming THIS property's own task "
+          "(not property (1)'s stale log line)",
+          ok3 and log.exists() and "handle task-full-env.txt" in log.read_text(),
+          f"out={out3} log={log.read_text() if log.exists() else None} stderr={LAST_STDERR[0]!r}")
 finally:
     stop(p3)
     errf3.close()
