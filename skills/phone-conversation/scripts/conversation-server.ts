@@ -44,6 +44,7 @@
 
 // Load .env from the project root (3 levels up from this script), not cwd —
 // override: true ensures .env values win over stale shell env vars
+import { createPostParkRedialer, type RecoverySurface } from '../../../src/voice-upstream-recovery.js';
 import { config as _dotenvConfig } from 'dotenv';
 // fileURLToPath (as used below at _phoneSkillDir) instead of .pathname: URL.pathname
 // stays percent-encoded, so a spaced install path (".../Application Support/...")
@@ -933,21 +934,18 @@ async function createCallSession(params: {
 
 	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
 	// redials, holding greeting and injected context until the caller speaks again.
+	const redialAfterPark = createPostParkRedialer({
+		getSession: () => session as unknown as RecoverySurface,
+		isLive: () => !callSession.hangingUp && activeCalls.has(callSession.callSid),
+		origin: `Phone ${callSession.callSid}`,
+		hold: true,
+		onActivated: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
+		log: (msg) => console.log(`${ts()} ${msg}`),
+		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+	});
 	session.eventBus.subscribe('session.upstreamLost', (e) => {
 		console.log(`${ts()} [Phone] upstream lost: reason=${e.reason} code=${e.code ?? '-'} detail=${e.detail ?? '-'}`);
-		setTimeout(() => {
-			if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) return;
-			if (session.sessionManager.state !== 'UPSTREAM_LOST') return;
-			console.log(`${ts()} [Phone] recoverUpstream for ${callSession.callSid}`);
-			try {
-				session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: true })
-					.activated
-					.then(() => import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}))
-					.catch((err) => console.error(`${ts()} [Phone] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
-			} catch (err) {
-				console.error(`${ts()} [Phone] recoverUpstream threw:`, (err as Error)?.message ?? err);
-			}
-		}, 1500);
+		setTimeout(redialAfterPark, 1500);
 	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded

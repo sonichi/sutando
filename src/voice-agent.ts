@@ -100,7 +100,7 @@ import {
 import {
 	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
 } from './voice-redial-scheduler.js';
-import { redialUpstream, replaceHungDial, type RecoverySurface } from './voice-upstream-recovery.js';
+import { createUpstreamRedialer, onConnectingTick, type RecoverySurface } from './voice-upstream-recovery.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -957,17 +957,15 @@ async function main() {
 	let lastReconnectAt = 0;
 	// The one host-initiated dial (F5 timer and 30s tick): UPSTREAM_LOST redials only through
 	// recoverUpstream(); CLOSED keeps the legacy cast-call reconnect.
-	const triggerUpstreamRedial = (origin: string, reason: 'human-retry' | 'fatal-backoff-clear' = 'human-retry'): void => {
-		redialUpstream(sessionRef as RecoverySurface | null, {
-			origin, reason,
-			legacy: (dial) => {
-				legacyReconnectInFlight = true;
-				try { dial(); } finally { legacyReconnectInFlight = false; }
-			},
-			log: (msg) => console.log(`${ts()} ${msg}`),
-			error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-		});
-	};
+	const triggerUpstreamRedial = createUpstreamRedialer({
+		getSession: () => sessionRef as RecoverySurface | null,
+		legacy: (dial) => {
+			legacyReconnectInFlight = true;
+			try { dial(); } finally { legacyReconnectInFlight = false; }
+		},
+		log: (msg) => console.log(`${ts()} ${msg}`),
+		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+	});
 	const fireEventRedial = (): void => {
 		redialTimer = null;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2033,13 +2031,13 @@ async function main() {
 			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
 		});
 		connectingSince = tick.connectingSince;
-		if (tick.forceClose) {
-			const stuckFor = Math.round((Date.now() - connectingSince) / 1000);
-			if (replaceHungDial(session as unknown as RecoverySurface, stuckFor, {
-				log: (msg) => console.log(`${ts()} ${msg}`),
-				error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-			})) connectingSince = 0;
-		}
+		if (onConnectingTick({
+			forceClose: tick.forceClose,
+			session: session as unknown as RecoverySurface,
+			stuckForS: Math.round((Date.now() - connectingSince) / 1000),
+			log: (msg) => console.log(`${ts()} ${msg}`),
+			error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+		})) connectingSince = 0;
 		// Safety net behind the event-driven redial: the upstream is down and a client waits;
 		// tickMayDial defers to a pending scheduled dial so the tick cannot preempt the backoff.
 		if (isUpstreamDown(state) && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil

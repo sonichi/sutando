@@ -20,31 +20,47 @@ function canRecover(s: RecoverySurface): boolean {
 	return s.getRecoveryCapabilities?.()?.recoverUpstream === true && typeof s.recoverUpstream === 'function';
 }
 
-function recover(s: RecoverySurface, reason: RecoverUpstreamArgs['reason'], origin: string, out: RecoveryLog): void {
-	const r = s.recoverUpstream!({ reason, skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
-	r.activated.catch((err: unknown) => out.error(`[${origin}] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
+function recover(
+	s: RecoverySurface,
+	reason: RecoverUpstreamArgs['reason'],
+	origin: string,
+	out: RecoveryLog,
+	opts?: { hold?: boolean; onActivated?: () => void },
+): void {
+	const r = s.recoverUpstream!({ reason, skipContextInjection: false, holdSyntheticUntilFreshSpeech: opts?.hold ?? false });
+	r.activated
+		.then(() => opts?.onActivated?.())
+		.catch((err: unknown) => out.error(`[${origin}] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
 }
 
 /**
  * Redial a session whose upstream is down. UPSTREAM_LOST goes through recoverUpstream();
  * anything else runs `legacy`, which wraps the cast handleClientConnected() reconnect.
+ * Omitting `legacy` makes recoverUpstream the only path, leaving an unparked session alone.
  */
 export function redialUpstream(
 	s: RecoverySurface | null | undefined,
-	opts: { origin: string; reason: RecoverUpstreamArgs['reason']; legacy: (dial: () => void) => void } & RecoveryLog,
+	opts: {
+		origin: string;
+		reason: RecoverUpstreamArgs['reason'];
+		legacy?: (dial: () => void) => void;
+		hold?: boolean;
+		onActivated?: () => void;
+	} & RecoveryLog,
 ): 'recover' | 'legacy' | 'none' {
 	if (!s) return 'none';
 	if (String(s.sessionManager?.state ?? 'unknown') === 'UPSTREAM_LOST' && canRecover(s)) {
 		opts.log(`[${opts.origin}] recoverUpstream(${opts.reason}) from UPSTREAM_LOST`);
 		try {
-			recover(s, opts.reason, opts.origin, opts);
+			recover(s, opts.reason, opts.origin, opts, opts);
 		} catch (err) {
 			opts.error(`[${opts.origin}] recoverUpstream threw:`, (err as Error)?.message ?? err);
 		}
 		return 'recover';
 	}
+	if (!opts.legacy) return 'none';
 	try {
-		opts.legacy(() => s.handleClientConnected?.());
+		opts.legacy!(() => s.handleClientConnected?.());
 	} catch (err) {
 		opts.error(`[${opts.origin}] reconnect trigger failed:`, (err as Error)?.message ?? err);
 	}
@@ -75,4 +91,54 @@ export function replaceHungDial(s: RecoverySurface, stuckForS: number, out: Reco
 		out.error(`[Health] Could not force CLOSED (state=${String(s.sessionManager?.state)}):`, (err as Error)?.message ?? err);
 		return false;
 	}
+}
+
+/**
+ * The host's one dial decision, with the session lookup inside so a delegation test can drive it:
+ * a mutation that stops resolving the session fails here rather than passing unseen at a call site.
+ */
+export function createUpstreamRedialer(
+	deps: { getSession: () => RecoverySurface | null | undefined; legacy: (dial: () => void) => void } & RecoveryLog,
+): (origin: string, reason?: RecoverUpstreamArgs['reason']) => 'recover' | 'legacy' | 'none' {
+	return (origin, reason = 'human-retry') =>
+		redialUpstream(deps.getSession(), { origin, reason, legacy: deps.legacy, log: deps.log, error: deps.error });
+}
+
+/**
+ * The CONNECTING watchdog's decision. Returns whether the caller should clear its stuck-since clock;
+ * owning the `forceClose` branch here is what puts it under test.
+ */
+export function onConnectingTick(
+	args: { forceClose: boolean; session: RecoverySurface; stuckForS: number } & RecoveryLog,
+): boolean {
+	if (!args.forceClose) return false;
+	return replaceHungDial(args.session, args.stuckForS, args);
+}
+
+/**
+ * A pull-side adapter's redial after bodhi's own resumption retries are spent: recoverUpstream is the
+ * only path, and `isLive` gates it so a call that hung up or went away is never redialled.
+ */
+export function createPostParkRedialer(
+	deps: {
+		getSession: () => RecoverySurface | null | undefined;
+		isLive: () => boolean;
+		origin: string;
+		reason?: RecoverUpstreamArgs['reason'];
+		hold?: boolean;
+		onActivated?: () => void;
+	} & RecoveryLog,
+): () => 'recover' | 'none' | 'skipped' {
+	return () => {
+		if (!deps.isLive()) return 'skipped';
+		const path = redialUpstream(deps.getSession(), {
+			origin: deps.origin,
+			reason: deps.reason ?? 'human-retry',
+			hold: deps.hold,
+			onActivated: deps.onActivated,
+			log: deps.log,
+			error: deps.error,
+		});
+		return path === 'recover' ? 'recover' : 'none';
+	};
 }

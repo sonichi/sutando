@@ -119,9 +119,8 @@ describe('the spoken block', () => {
 	});
 
 	it('canary: the runtime still keeps the buffered transcription where the provider reads it', async () => {
-		// inputBuffer is a plain field reached through `?.`; a rename would silently drop the
-		// current utterance from every task. bodhi exports TranscriptManager, so assert the
-		// behaviour the provider relies on rather than the dist source text.
+		// inputBuffer is reached through `?.`, so a rename would silently drop the current utterance
+		// from every task; assert the exported TranscriptManager's behaviour, not the dist source.
 		const { TranscriptManager } = await import('bodhi-realtime-agent');
 		const sink = { sendToClient() {}, addUserMessage() {}, addAssistantMessage() {} };
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
