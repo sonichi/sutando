@@ -22,6 +22,7 @@ sonichi#4272 slice 2 PR body has the transcript.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -421,7 +422,7 @@ class EventDispatchTests(FakeTmuxHarness):
         # The pane skips permission prompts, so a name carrying a newline or a
         # shell metacharacter must never reach send-keys: refused, and logged.
         notifier_log = self.logs_dir / "agy-task-notifier.log"
-        for name in ("task-a.txt\nrm -rf x", "task-$(id).txt", "task-a;b.txt", "task a.txt",
+        for name in ("task-a\nrm -rf x.txt", "task-$(id).txt", "task-a;b.txt", "task a.txt",
                      "task-a.txt ", "task.TXT", "../task-a.txt"):
             with self.subTest(name=name):
                 self.sendkeys_log.write_text("")
@@ -501,6 +502,50 @@ class MainLoopWiringTest(FakeTmuxHarness):
             deadline = time.time() + 10
             while time.time() < deadline and proc.poll() is None:
                 time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
+    def test_an_older_refused_name_does_not_stall_the_newer_plain_task(self):
+        # The queue head is chosen by next-pending: a refused name sorting first
+        # must be skipped there, or every wake re-offers it and nothing behind it runs.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=self._env(),
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            self.wait_for_watcher_ready()
+            self.write_task("task-dc1~2.txt")
+            os.utime(self.tasks_dir / "task-dc1~2.txt", (1_600_000_000, 1_600_000_000))
+            self.write_task("task-plain.txt")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-plain.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail("the refused name at the queue head stalled the plain task behind it:\n"
+                          + self.sendkeys_log_text())
+            self.assertNotIn("task-dc1~2.txt", self.sendkeys_log_text())
+            self.write_result("task-plain.txt")
         finally:
             if proc.poll() is None:
                 try:
@@ -814,6 +859,17 @@ class RestartHandoffTest(FakeTmuxHarness):
                 + self.sendkeys_log_text())
         finally:
             self._terminate(gen2)
+
+
+class NameRuleIsSharedTest(unittest.TestCase):
+    """The notifier's backstop and the dispatch policy's `TASK_NAME_RE` are one rule:
+    a name one side refuses must be a name the other never offers."""
+
+    def test_backstop_regex_is_the_dispatch_policy_regex(self):
+        sys.path.insert(0, str(REPO / "src"))
+        from delivery.task_dispatch import TASK_NAME_RE
+        shell_rules = re.findall(r'\[\[ "\$filename" =~ (\S+) \]\]', NOTIFIER.read_text())
+        self.assertEqual(shell_rules, [TASK_NAME_RE.pattern])
 
 
 class StartCliNotifierWiringTest(unittest.TestCase):

@@ -137,7 +137,7 @@ has_result() {
 }
 
 next_pending_task() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR"
+  "$NOTIFIER_PY" "$DISPATCH_PY" next-pending "$TASKS_DIR" "$RESULTS_DIR" --typable
 }
 
 # agy's footer shows "esc to cancel" for any in-flight turn (tool or text)
