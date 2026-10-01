@@ -1,5 +1,6 @@
-# seconds  path — measured on ubuntu-latest, median of runs 36815474624 36837579759 36872037091
-# (2026-10-01), from the per-suite seconds CI prints. Regenerate: scripts/gen-suite-costs.sh <job-log> > tests/shell-suite-costs.txt
+# seconds  path — measured on ubuntu-latest: per-file median of the per-suite seconds CI
+# printed in 3 leg log(s) of run(s) 36815474624 36837579759 36872037091 (2026-10-01).
+# Regenerate: scripts/gen-suite-costs.sh -r '<run-ids>' <leg-logs>... > tests/<python|shell>-suite-costs.txt
 # A missing file counts as 1s; the table only steers balance, never which files run.
 1 tests/app-watcher-notifier-liveness.test.sh
 8 tests/channel-bridge-evict-isolation.test.sh

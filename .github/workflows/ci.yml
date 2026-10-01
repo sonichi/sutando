@@ -401,8 +401,8 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: |
-          # Records are collected per file and replayed SERIALLY in sorted
-          # order below, so `failed_files` keeps its order.
+          # Records are collected per file and replayed below in the leg's own
+          # order (heaviest first), so `failed_files` keeps that order.
           failed=0
           failed_files=()
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
