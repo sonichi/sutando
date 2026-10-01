@@ -21,11 +21,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "ask-owner.py"
 sys.path.insert(0, str(REPO / "src"))
-import pending_questions_ask as pqa  # noqa: E402
-import pending_questions_ledger as ledger  # noqa: E402
-from pending_questions_md import active_region  # noqa: E402
-from proactive_routing import proactive_destination  # noqa: E402
-from result_markers import parse_markers  # noqa: E402
+import pending_questions_ask as pqa
+import pending_questions_ledger as ledger
+from pending_questions_md import active_region
+from proactive_routing import proactive_destination
+from result_markers import parse_markers
 
 HOST = "test-host"
 
