@@ -26,7 +26,10 @@ ARGUMENTS: $ARGUMENTS
    ```bash
    brew install --cask antigravity
    f="$(mktemp)" && curl -fsSL https://antigravity.google/cli/install.sh -o "$f"
-   less "$f" && bash "$f"                                            # installs ~/.local/bin/agy
+   [ -t 0 ] && less "$f" || cat "$f"                               # review it first
+   read -r -p "Run the installer? [y/N] " a
+   [ "$a" = y ] && bash "$f"                                         # installs ~/.local/bin/agy
+   rm -f "$f"
    ```
 
 2. Pick one way to authenticate:
