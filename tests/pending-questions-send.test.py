@@ -10,6 +10,7 @@ import io
 import multiprocessing as mp
 import os
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "ask-owner.py"
@@ -65,10 +67,21 @@ class _Workspace(unittest.TestCase):
         p.chmod(p.stat().st_mode | stat.S_IEXEC)
 
     def _run(self, *args, path=None):
-        env = {**os.environ, "SUTANDO_HOST_LABEL": HOST,
-               "PATH": f"{self.bin}:/usr/bin:/bin" if path is None else str(path)}
-        return subprocess.run([sys.executable, str(CLI), *args, "--workspace", str(self.ws)],
-                              capture_output=True, text=True, env=env)
+        """The CLI in-process (runpy), so its lines and the helper's are measured."""
+        saved_argv, saved_path = sys.argv, os.environ.get("PATH", "")
+        sys.argv = [str(CLI), *args, "--workspace", str(self.ws)]
+        os.environ["PATH"] = f"{self.bin}:/usr/bin:/bin" if path is None else str(path)
+        out, err = io.StringIO(), io.StringIO()
+        rc = 0
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                runpy.run_path(str(CLI), run_name="__main__")
+        except SystemExit as e:
+            rc = e.code or 0
+        finally:
+            sys.argv = saved_argv
+            os.environ["PATH"] = saved_path
+        return subprocess.CompletedProcess(sys.argv, rc, out.getvalue(), err.getvalue())
 
     def _proactive(self):
         return sorted(p for p in (self.ws / "results").iterdir() if p.name.startswith("proactive-"))
@@ -394,6 +407,82 @@ class TestFailOpen(_Workspace):
         r = self._run("q?", "--urgency", "durable")
         self.assertNotIn("macos:", r.stdout)
         self.assertFalse(self.calls.exists())
+
+
+class TestEdges(_Workspace):
+    def test_empty_question_exits_2(self):
+        r = self._run("   ")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("the question is empty", r.stderr)
+        self.assertEqual(self._proactive(), [])
+
+    def test_a_ledger_insert_that_raises_still_queues(self):
+        with mock.patch.object(pqa.ledger, "insert_entry", side_effect=OSError("disk full")):
+            out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST)
+        self.assertEqual(out["ledger_error"], "OSError: disk full")
+        self.assertIsNotNone(out["proactive_file"])
+        self.assertIn("ledger: FAILED — OSError: disk full", pqa.report_lines(out))
+
+    def test_a_stamp_that_raises_is_reported(self):
+        with mock.patch.object(pqa.ledger, "stamp", side_effect=OSError("gone")):
+            out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST)
+        self.assertEqual(out["ledger_error"], "OSError: gone")
+
+    def test_a_publish_that_fails_mid_rename_leaves_no_temp(self):
+        res = self.ws / "results"
+        with mock.patch.object(pqa.os, "replace", side_effect=OSError("rename refused")):
+            with self.assertRaises(OSError):
+                pqa.write_proactive(res, "proactive-x.txt", "body")
+        self.assertEqual(list(res.iterdir()), [])
+
+    def test_a_ledger_replace_that_fails_keeps_the_old_file_and_no_temp(self):
+        self.pq.write_text("## a — x\n\nbody\n")
+        with mock.patch.object(ledger.os, "replace", side_effect=OSError("rename refused")):
+            with self.assertRaises(OSError):
+                ledger.insert_entry(self.pq, "## b — y\n\nbody\n\n")
+        self.assertEqual(self.pq.read_text(), "## a — x\n\nbody\n")
+        self.assertEqual(sorted(p.name for p in self.pq.parent.iterdir()), ["pending-questions.md"])
+
+    def test_osascript_timeout_names_the_fix(self):
+        with mock.patch.object(pqa.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("osascript", 15)):
+            ok, fix = pqa.notify_macos("q")
+        self.assertFalse(ok)
+        self.assertIn("did not return within 15s", fix)
+
+    def test_stamp_refuses_a_missing_or_repeated_token(self):
+        self.pq.write_text("**Sent:** (sending a)\n**Sent:** (sending a)\n")
+        self.assertIn("occurs 2 times", ledger.stamp(self.pq, "(sending a)", "x"))
+        self.assertIn("occurs 0 times", ledger.stamp(self.pq, "(sending b)", "x"))
+
+    def test_a_lock_dir_removed_by_someone_else_does_not_raise(self):
+        def _transform(old):
+            ledger.lock_path(self.pq).rmdir()
+            return old + "x\n"
+        self.assertIsNone(ledger.update(self.pq, _transform))
+
+    def test_above_divider_insert_on_a_file_with_no_trailing_newline(self):
+        self.pq.write_text("## a — x\n\nbody")
+        self.assertIsNone(ledger.insert_entry(self.pq, "## b — y\n\nbody\n", where="above-divider"))
+        self.assertEqual(self.pq.read_text(), "## a — x\n\nbody\n## b — y\n\nbody\n")
+
+    def test_a_non_proactive_name_is_never_drained(self):
+        self.assertFalse(pqa.drained(self.ws / "results", "task-1.txt"))
+
+    def test_host_label_is_the_per_host_segment(self):
+        import util_paths
+        self.assertEqual(util_paths.host_label(), HOST)
+
+    def test_engine_conflict_deliver_without_the_ledger_module_appends(self):
+        spec = importlib.util.spec_from_file_location(
+            "ecr_deliver2", REPO / "skills" / "engine-conflict-resolve" / "scripts" / "deliver.py")
+        sys.path.insert(0, str(REPO / "skills" / "engine-conflict-resolve" / "scripts"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        self.pq.write_text("## a — x\n")
+        with mock.patch.dict(sys.modules, {"pending_questions_ledger": None}):
+            m.write_pending_question(self.pq, "Engine conflict", "proposal")
+        self.assertIn("## Engine conflict", self.pq.read_text())
 
 
 class TestReminder(_Workspace):
