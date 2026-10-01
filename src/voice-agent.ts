@@ -88,7 +88,7 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, voiceMemoryProjectSlug } from './util_paths.js';
-import { nextConnectingTick } from './voice-connect-watchdog.js';
+import { connectingWatchdogTick } from './voice-connect-watchdog.js';
 import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
 import { WatchdogLedger } from './voice-watchdog-ledger.js';
 import { parseActiveSilenceMode, parseActiveSilenceTicks } from './voice-active-silence-watchdog.js';
@@ -100,7 +100,7 @@ import {
 import {
 	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
 } from './voice-redial-scheduler.js';
-import { createUpstreamRedialer, onConnectingTick, type RecoverySurface } from './voice-upstream-recovery.js';
+import { createUpstreamRedialer, type RecoverySurface } from './voice-upstream-recovery.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -2026,18 +2026,13 @@ async function main() {
 		}
 		// A hung connect never leaves CONNECTING, so the down-state guard below cannot see it; the clock
 		// keys on state, not attachment, so a panel reload cannot restart it (voice-connect-watchdog.ts).
-		const tick = nextConnectingTick({
+		connectingSince = connectingWatchdogTick({
 			connectingSince, state, clientConnected, now: Date.now(),
 			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
-		});
-		connectingSince = tick.connectingSince;
-		if (onConnectingTick({
-			forceClose: tick.forceClose,
 			session: session as unknown as RecoverySurface,
-			stuckForS: Math.round((Date.now() - connectingSince) / 1000),
 			log: (msg) => console.log(`${ts()} ${msg}`),
 			error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-		})) connectingSince = 0;
+		});
 		// Safety net behind the event-driven redial: the upstream is down and a client waits;
 		// tickMayDial defers to a pending scheduled dial so the tick cannot preempt the backoff.
 		if (isUpstreamDown(state) && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil

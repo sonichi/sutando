@@ -34,9 +34,8 @@ function recover(
 }
 
 /**
- * Redial a session whose upstream is down. UPSTREAM_LOST goes through recoverUpstream();
- * anything else runs `legacy`, which wraps the cast handleClientConnected() reconnect.
- * Omitting `legacy` makes recoverUpstream the only path, leaving an unparked session alone.
+ * Redial a down upstream: UPSTREAM_LOST via recoverUpstream(), anything else via `legacy`
+ * (the cast handleClientConnected() reconnect). Without `legacy`, an unparked session is left alone.
  */
 export function redialUpstream(
 	s: RecoverySurface | null | undefined,
@@ -60,7 +59,7 @@ export function redialUpstream(
 	}
 	if (!opts.legacy) return 'none';
 	try {
-		opts.legacy!(() => s.handleClientConnected?.());
+		opts.legacy(() => s.handleClientConnected?.());
 	} catch (err) {
 		opts.error(`[${opts.origin}] reconnect trigger failed:`, (err as Error)?.message ?? err);
 	}

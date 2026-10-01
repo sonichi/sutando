@@ -44,7 +44,6 @@
 
 // Load .env from the project root (3 levels up from this script), not cwd —
 // override: true ensures .env values win over stale shell env vars
-import { createPostParkRedialer, type RecoverySurface } from '../../../src/voice-upstream-recovery.js';
 import { config as _dotenvConfig } from 'dotenv';
 // fileURLToPath (as used below at _phoneSkillDir) instead of .pathname: URL.pathname
 // stays percent-encoded, so a spaced install path (".../Application Support/...")
@@ -70,6 +69,7 @@ import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '
 import { buildPhoneInstructions } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
+import { wirePhoneUpstreamRecovery, type PhoneRecoverySession } from './upstream-recovery-wiring.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -782,7 +782,7 @@ async function createCallSession(params: {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
 		// A lost upstream parks in UPSTREAM_LOST (CLOSED is terminal in 0.4); the
-		// session.upstreamLost handler below redials it with recoverUpstream().
+		// wirePhoneUpstreamRecovery below redials it with recoverUpstream().
 		upstreamLossPolicy: 'hold',
 		// Greet the caller once: a re-attach after a turn has completed is silent.
 		reattachGreeting: 'until-first-turn',
@@ -934,18 +934,13 @@ async function createCallSession(params: {
 
 	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
 	// redials, holding greeting and injected context until the caller speaks again.
-	const redialAfterPark = createPostParkRedialer({
-		getSession: () => session as unknown as RecoverySurface,
-		isLive: () => !callSession.hangingUp && activeCalls.has(callSession.callSid),
-		origin: `Phone ${callSession.callSid}`,
-		hold: true,
+	wirePhoneUpstreamRecovery({
+		session: session as unknown as PhoneRecoverySession,
+		callSession,
+		activeCalls,
 		onActivated: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
 		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-	});
-	session.eventBus.subscribe('session.upstreamLost', (e) => {
-		console.log(`${ts()} [Phone] upstream lost: reason=${e.reason} code=${e.code ?? '-'} detail=${e.detail ?? '-'}`);
-		setTimeout(redialAfterPark, 1500);
 	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded

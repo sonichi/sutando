@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { VoiceSession, type RecoverUpstreamArgs, type VoiceSessionConfig } from 'bodhi-realtime-agent';
 import {
 	createPostParkRedialer,
@@ -9,6 +11,7 @@ import {
 	replaceHungDial,
 	type RecoverySurface,
 } from '../src/voice-upstream-recovery.js';
+import { connectingWatchdogTick } from '../src/voice-connect-watchdog.js';
 
 const quiet = { log: () => {}, error: () => {} };
 
@@ -163,5 +166,63 @@ describe('host delegation', () => {
 		assert.equal(redial(), 'recover');
 		await new Promise((r) => setImmediate(r));
 		assert.equal(activated, 1);
+	});
+});
+
+describe('connectingWatchdogTick', () => {
+	const T = 120_000;
+	const at = (session: RecoverySurface, connectingSince: number, now: number, state = 'CONNECTING') =>
+		connectingWatchdogTick({
+			connectingSince, state, clientConnected: true, now, lastReconnectAt: 0, fatalBackoffUntil: 0,
+			session, thresholdMs: T, ...quiet,
+		});
+
+	it('starts the clock on the first CONNECTING tick without dialling', () => {
+		const { s, calls } = fake('CONNECTING');
+		assert.equal(at(s, 0, 5_000_000), 5_000_000);
+		assert.equal(calls.recover.length, 0);
+	});
+
+	it('keeps the clock and leaves the dial alone below the threshold', () => {
+		const { s, calls } = fake('CONNECTING');
+		assert.equal(at(s, 5_000_000, 5_000_000 + T), 5_000_000);
+		assert.equal(calls.recover.length, 0);
+	});
+
+	it('replaces a dial hung past the threshold and zeroes the clock', () => {
+		const { s, calls } = fake('CONNECTING');
+		assert.equal(at(s, 5_000_000, 5_000_000 + T + 1), 0);
+		assert.deepEqual(calls.recover, [{ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false }]);
+	});
+
+	it('keeps the clock armed when the replacement fails', () => {
+		const { s } = fake('CONNECTING');
+		s.recoverUpstream = () => { throw new Error('boom'); };
+		assert.equal(at(s, 5_000_000, 5_000_000 + T + 1), 5_000_000);
+	});
+
+	it('clears the clock once the session leaves CONNECTING', () => {
+		const { s, calls } = fake('ACTIVE');
+		assert.equal(at(s, 5_000_000, 5_000_000 + T + 1, 'ACTIVE'), 0);
+		assert.equal(calls.recover.length, 0);
+	});
+});
+
+// Structural delegation pin (REVIEW.md lesson 14): voice-agent.ts runs main() on import, so this checks
+// it hands its live session to the tested units above and keeps no private dial of its own.
+describe('voice-agent.ts delegates every upstream dial', () => {
+	const src = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
+
+	it('resolves the redialer session from the live sessionRef', () => {
+		assert.match(src, /^\tconst triggerUpstreamRedial = createUpstreamRedialer\(\{\n\t\tgetSession: \(\) => sessionRef as RecoverySurface \| null,\n/m);
+		assert.match(src, /^\tsessionRef = session;$/m);
+	});
+
+	it('runs the CONNECTING watchdog on the live session and keeps its clock', () => {
+		assert.match(src, /^\t\tconnectingSince = connectingWatchdogTick\(\{\n\t\t\tconnectingSince, state, clientConnected, now: Date\.now\(\),\n\t\t\tlastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,\n\t\t\tsession: session as unknown as RecoverySurface,\n/m);
+	});
+
+	it('keeps no private dial', () => {
+		assert.doesNotMatch(src, /\bonConnectingTick\(|\breplaceHungDial\(|\bredialUpstream\(|\.recoverUpstream\(|nextConnectingTick\(/);
 	});
 });
