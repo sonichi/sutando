@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Runs the discovered shell suites: `lanes` = the pool through parallel-suite-lane.sh,
-# `tail` = the process-table suites one at a time in the checkout, `all` = both.
-# `tail <shards> <shard>` runs one cost-balanced leg of the tail, still serially.
-# One copy, so two CI jobs cannot drift on the allowlist or the classifier.
+# usage: run-shell-suites.sh [lanes|all] | tail [<shards> <shard>] — lanes = the parallel pool, tail = the
+# process-table suites one at a time (one cost-balanced leg of them with <shards> <shard>); one copy for both jobs.
 set -euo pipefail
 PART="${1:-all}"
 usage() { echo "usage: $0 [lanes|all] | tail [<shards> <shard>]" >&2; exit 2; }

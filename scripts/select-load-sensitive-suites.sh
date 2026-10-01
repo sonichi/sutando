@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Splits the discovered suite list (stdin) against the load-sensitive list: `only`
-# prints the listed suites, `without` prints every other one. An entry discovery
-# does not have, or one listed twice, is an error: silently dropping it would send
-# that suite back to the shared legs, which is what the list exists to prevent.
-# usage: select-load-sensitive-suites.sh only|without <list> < discovered
+# usage: select-load-sensitive-suites.sh only|without <list> < discovered — the listed suites, or the rest.
+# An entry not discovered, or listed twice, exits 3: dropping it would send that suite back to the shared legs.
 set -euo pipefail
 MODE="${1:-}"; LIST="${2:-}"
 case "$MODE" in only|without) [ -n "$LIST" ] ;; *) false ;; esac || { echo "usage: $0 only|without <list> < discovered" >&2; exit 2; }

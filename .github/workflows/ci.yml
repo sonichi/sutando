@@ -416,7 +416,8 @@ jobs:
           # beside a CPU-heavy neighbour misses its own window); legs 1-5 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
           if [ "${SHARD:-1}" = 6 ]; then
-            bash scripts/select-load-sensitive-suites.sh only "$LIST" < "$RECDIR/all" > "$RECDIR/files"
+            bash scripts/select-load-sensitive-suites.sh only "$LIST" < "$RECDIR/all" > "$RECDIR/sensitive"
+            bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
             WORKERS=2
           else
             # The selector exits non-zero on a stale or duplicate entry, so a renamed

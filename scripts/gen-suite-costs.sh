@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Rebuilds a suite-cost table from CI job logs: every "→ <path> (<N>s)" line the
-# replay prints is a sample, and a file's cost is the median of its samples, so
-# several runs' leg logs give a steadier table than one run's.
 # usage: gen-suite-costs.sh [-r <run-ids>] <job-log>... > tests/<python|shell>-suite-costs.txt
+# Each "→ <path> (<N>s)" line is a sample; a file's cost is the median of its samples.
 set -euo pipefail
 RUNS="unknown"
 if [ "${1:-}" = "-r" ]; then RUNS="$2"; shift 2; fi

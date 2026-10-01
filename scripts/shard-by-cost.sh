@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Splits a file list (stdin) into <shards> legs by measured cost and prints leg
-# <shard>'s files, heaviest first: each file goes onto the lightest leg so far, and
-# the leg is printed in that order so lane workers claim the long suites before the
-# short ones. Every input file lands in exactly one leg; a file absent from the table costs 1.
-# usage: shard-by-cost.sh <shards> <shard> <cost-table> < files
+# usage: shard-by-cost.sh <shards> <shard> <cost-table> < files — prints that leg, heaviest first:
+# each file goes onto the lightest leg so far; every file lands in exactly one leg; unlisted costs 1.
 set -euo pipefail
 SHARDS="$1"; SHARD="$2"; TABLE="$3"
 [ "$SHARDS" -ge 1 ] && [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$SHARDS" ] || { echo "usage: $0 <shards> <shard> <cost-table>" >&2; exit 2; }
