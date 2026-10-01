@@ -7,7 +7,8 @@ list, and a stub lane runner that records the file list and worker count it is h
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
 exactly one leg, the load-sensitive suites only in leg 6 (heaviest first, two workers),
-and legs 1-5 none of them.
+and legs 1-5 none of them; and a list with a stale or duplicate entry must stop every
+leg with the selector's exit 3, so a leg that reads the list without the selector fails.
 
 Run: python3 tests/python-ci-legs-partition.test.py
 """
@@ -49,30 +50,33 @@ def step_body() -> str:
     return textwrap.dedent(m.group(1))
 
 
-def run_legs(discovered):
+def build_fixture(td: Path, discovered) -> Path:
+    fx = td / "repo"
+    for rel in discovered:
+        (fx / rel).parent.mkdir(parents=True, exist_ok=True)
+        (fx / rel).touch()
+    for rel in COPIED:
+        (fx / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO / rel, fx / rel)
+    (fx / "scripts" / "parallel-suite-lane.sh").write_text(LANE_STUB)
+    shim = td / "bin"
+    shim.mkdir()
+    (shim / "python3").write_text(PY_SHIM)
+    (shim / "python3").chmod(0o755)
+    return fx
+
+
+def run_legs(fx: Path, list_text: str):
     body = step_body()
+    (fx / LIST).write_text(list_text)
     legs = {}
-    with tempfile.TemporaryDirectory() as td:
-        fx = Path(td) / "repo"
-        for rel in discovered:
-            (fx / rel).parent.mkdir(parents=True, exist_ok=True)
-            (fx / rel).touch()
-        for rel in COPIED:
-            (fx / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(REPO / rel, fx / rel)
-        (fx / "scripts" / "parallel-suite-lane.sh").write_text(LANE_STUB)
-        shim = Path(td) / "bin"
-        shim.mkdir()
-        (shim / "python3").write_text(PY_SHIM)
-        (shim / "python3").chmod(0o755)
-        for shard in range(1, 7):
-            out = Path(td) / f"leg{shard}"
-            out.mkdir()
-            env = dict(os.environ, SHARD=str(shard), LEG_OUT=str(out), PATH=f"{shim}:{os.environ['PATH']}")
-            r = subprocess.run(["bash", "-e", "-c", body], cwd=fx, env=env, capture_output=True, text=True)
-            files = (out / "files").read_text().split() if (out / "files").exists() else None
-            workers = (out / "workers").read_text().strip() if (out / "workers").exists() else None
-            legs[shard] = (r.returncode, files, workers, r.stderr[-400:])
+    for shard in range(1, 7):
+        out = Path(tempfile.mkdtemp(dir=fx.parent))
+        env = dict(os.environ, SHARD=str(shard), LEG_OUT=str(out), PATH=f"{fx.parent / 'bin'}:{os.environ['PATH']}")
+        r = subprocess.run(["bash", "-e", "-c", body], cwd=fx, env=env, capture_output=True, text=True)
+        files = (out / "files").read_text().split() if (out / "files").exists() else None
+        workers = (out / "workers").read_text().strip() if (out / "workers").exists() else None
+        legs[shard] = (r.returncode, files, workers, r.stderr[-400:])
     return legs
 
 
@@ -87,11 +91,15 @@ def main() -> int:
             c, f = ln.split(maxsplit=1)
             cost[f] = max(int(c), 1)
 
-    legs = run_legs(disc)
+    td_obj = tempfile.TemporaryDirectory()
+    fx = build_fixture(Path(td_obj.name), disc)
+    real = (REPO / LIST).read_text()
+    legs = run_legs(fx, real)
     for shard, (rc, files, workers, err) in legs.items():
         if rc != 0 or files is None:
             fails.append(f"leg {shard}: the step did not reach the lane runner (rc={rc}): {err.strip()}")
     if fails:
+        td_obj.cleanup()
         for f in fails:
             print("  FAIL", f)
         return 1
@@ -116,13 +124,26 @@ def main() -> int:
     if any(legs[s][2] == "2" for s in range(1, 6)):
         fails.append("a shared leg was pinned to two workers")
 
+    # A list that only partitions correctly when it is valid proves nothing about who reads
+    # it: a stale or duplicate entry must stop every leg with the selector's exit 3.
+    drifted = {
+        "stale entry": real.replace(listed[0], listed[0].replace(".test.py", "-renamed.test.py")),
+        "duplicate entry": real + listed[0] + "\n",
+    }
+    for what, text in drifted.items():
+        for shard, (rc, files, _w, err) in run_legs(fx, text).items():
+            if rc != 3:
+                fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
+                             f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
+
+    td_obj.cleanup()
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
     print(f"PASS: ci.yml's six legs run all {len(disc)} discovered suites exactly once "
           f"({'/'.join(str(len(legs[s][1])) for s in legs)}); the {len(listed)} listed only in leg 6, "
-          "heaviest first, two workers")
+          "heaviest first, two workers; a stale or duplicate list entry stops every leg with exit 3")
     return 0
 
 
