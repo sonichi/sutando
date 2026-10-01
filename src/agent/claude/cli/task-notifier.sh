@@ -704,15 +704,17 @@ submit_task_grown() {
     fi
     log_notifier "prompt for $filename is staged but unsent; resuming its submission"
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
+  elif composer_holds_prompt "$raw" "$prompt"; then
+    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
+    # Precedes the marker: our prompt still in the composer means its Enter never landed.
+    "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
+    # Owner text and an unparsed row read alike here; neither delivers, so both count.
+    note_composer_block "$filename" "$incarnation"
+    return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
   elif composer_is_cut_prompt "$raw" "$prompt"; then
     log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); leaving it queued (failing closed, core may need attention)"
-    return 0
-  elif composer_holds_prompt "$raw" "$prompt"; then
-    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
-    # Owner text and an unparsed row read alike here; neither delivers, so both count.
-    note_composer_block "$filename" "$incarnation"
     return 0
   else
     deliver_prompt "$filename" "$prompt" || return 0
