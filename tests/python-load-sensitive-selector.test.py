@@ -23,9 +23,17 @@ DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
 LIST = REPO / "tests" / "python-load-sensitive-suites.txt"
 
 
+RECEIPTS = Path(tempfile.mkdtemp())
+
+
 def select(mode, listing, discovered):
-    return subprocess.run(["bash", str(SCRIPT), mode, str(listing)],
+    return subprocess.run(["bash", str(SCRIPT), mode, str(listing), str(RECEIPTS)],
                           input="".join(f"{f}\n" for f in discovered), capture_output=True, text=True)
+
+
+def verify(kind, listing, selected, run):
+    return subprocess.run(["bash", str(SCRIPT), "verify", kind, str(listing), str(RECEIPTS), str(selected), str(run)],
+                          capture_output=True, text=True)
 
 
 def main() -> int:
@@ -65,6 +73,35 @@ def main() -> int:
         if r.returncode == 0:
             fails.append("an unknown mode was accepted")
 
+        # verify: the receipt binds the run list to what the selector emitted for this list.
+        sel = td / "sel.txt"
+        sel.write_text(select("only", good, disc).stdout)
+        rev = td / "rev.txt"
+        rev.write_text("".join(reversed(sel.read_text().splitlines(keepends=True))))
+        r = verify("only", good, sel, rev)
+        if r.returncode != 0:
+            fails.append(f"verify rejected the selector's own output in another order: {r.stderr.strip()}")
+        cases = {
+            "receipt missing": lambda: (RECEIPTS / "selector.only.receipt").unlink(),
+            "selected list edited": lambda: sel.write_text(sel.read_text() + "tests/sa.test.py\n"),
+            "list edited after selection": lambda: good.write_text(good.read_text() + "# edited\n"),
+        }
+        for what, spoil in cases.items():
+            select("only", good, disc)
+            sel.write_text(select("only", good, disc).stdout)
+            spoil()
+            r = verify("only", good, sel, sel)
+            if r.returncode != 4 or "selector receipt check" not in r.stderr:
+                fails.append(f"verify, {what}: exited {r.returncode}, not 4: {r.stderr.strip()!r}")
+            good.write_text("# comment\n\ntests/sb.test.py\ntests/sd.test.py\n")
+        rest = td / "rest.txt"
+        rest.write_text(select("without", good, disc).stdout)
+        extra = td / "extra.txt"
+        extra.write_text(rest.read_text() + "tests/sb.test.py\n")
+        r = verify("without", good, rest, extra)
+        if r.returncode != 4:
+            fails.append(f"verify accepted a shared leg running a listed suite: exited {r.returncode}")
+
     # The committed list against the real discovery: every entry present, none twice.
     real = subprocess.run(["bash", str(DISCOVER)], cwd=str(REPO), capture_output=True, text=True)
     discovered = [p for p in real.stdout.splitlines() if p]
@@ -85,7 +122,7 @@ def main() -> int:
     if fails:
         return 1
     print(f"PASS: selector partitions ({len(listed)} listed of {len(discovered)} discovered), "
-          "fails loudly (exit 3) on a stale or duplicate entry")
+          "fails loudly (exit 3) on a stale or duplicate entry; verify (exit 4) binds a run list to its receipt")
     return 0
 
 

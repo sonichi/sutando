@@ -87,7 +87,9 @@ conversation, not an unappealable veto.
 
 `tests/python-load-sensitive-suites.txt` lists the suites CI keeps off the shared
 four-worker legs; `scripts/select-load-sensitive-suites.sh` is the only reader, and
-an entry that is not discovered or is listed twice fails the leg (exit 3).
+an entry that is not discovered or is listed twice fails the leg (exit 3). Selecting writes a
+receipt (mode, list hash, output hash), and every leg runs `select-load-sensitive-suites.sh verify`
+before its suites: no receipt, or a list changed after selection, fails the leg (exit 4).
 
 **Admission rule.** A `watch-tasks-stream-*` suite is added on cited evidence that it
 misses its own wait windows under load: either a CI run where it failed that way while
