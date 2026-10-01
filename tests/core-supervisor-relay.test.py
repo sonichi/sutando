@@ -1088,7 +1088,7 @@ class TestProgressRouteDelegation(unittest.TestCase):
         finally:
             _mod._channel_notify = orig_c
         self.assertEqual((rc, calls), (0, []))
-        self.assertIn("no delivery path", err.getvalue())
+        self.assertIn("no delivery path; macOS disabled, nothing to escalate to", err.getvalue())
 
 
 class TestNoRouteIsNeverDelivered(unittest.TestCase):
@@ -1193,6 +1193,78 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
                     patch.object(_mod, "_channel_notify", lambda m, s, c: False):
                 run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
             self.assertFalse(os.path.exists(sf))
+
+
+class TestMacosNotifyAdapter(unittest.TestCase):
+    """The real _macos_notify against a fake `osascript` on PATH: only an exit 0
+    is a delivery, and only a delivery may persist the debounce."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.bin, ignore_errors=True)
+        self.calls = os.path.join(self.bin, "calls")
+
+    def _fake(self, body, mode=0o755):
+        p = os.path.join(self.bin, "osascript")
+        with open(p, "w") as f:
+            f.write(f"#!/bin/sh\necho called >> {self.calls}\n{body}\n")
+        os.chmod(p, mode)
+
+    def _notify(self):
+        with patch.dict(os.environ, {"PATH": self.bin}):
+            return _mod._macos_notify("hello")
+
+    def _main_cycle(self, td):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        with patch.dict(os.environ, {"PATH": self.bin}), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state,
+                  "--notify-source", "voice", "--notify-channel", "local-voice"])
+        return os.path.exists(state), out.getvalue()
+
+    def _assert_undelivered_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            for _ in range(2):
+                persisted, out = self._main_cycle(td)
+                self.assertFalse(persisted)
+                self.assertIn("not delivered: no route and macOS notification failed", out)
+
+    def test_exit_0_is_delivered_and_debounces(self):
+        self._fake("exit 0")
+        self.assertIs(self._notify(), True)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        with tempfile.TemporaryDirectory() as td:
+            persisted, out = self._main_cycle(td)
+            self.assertTrue(persisted)
+            self.assertIn("escalated:", out)
+            self.assertIn("no escalation", self._main_cycle(td)[1])
+
+    def test_exit_1_is_not_delivered(self):
+        self._fake("exit 1")
+        self.assertIs(self._notify(), False)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        self._assert_undelivered_and_retries()
+
+    def test_missing_binary_is_not_delivered(self):
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_oserror_is_not_delivered(self):
+        self._fake("exit 0", mode=0o644)  # present but not executable: PermissionError
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_timeout_is_not_delivered(self):
+        import subprocess as _sp
+        self._fake("exit 0")
+        with patch.object(_mod.subprocess, "run",
+                          side_effect=_sp.TimeoutExpired("osascript", 8)):
+            self.assertIs(self._notify(), False)
+            self._assert_undelivered_and_retries()
 
 
 if __name__ == "__main__":

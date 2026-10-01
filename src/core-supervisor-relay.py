@@ -461,8 +461,10 @@ def main(argv=None):
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
     if source and channel and _delivery_route(source, channel) is None:
+        fallback = "macOS disabled, nothing to escalate to" if a.no_macos \
+            else "escalating by macOS notification only"
         print(f"--notify-source {source!r} / --notify-channel {channel!r} has no delivery "
-              "path; escalating by macOS notification only", file=sys.stderr)
+              f"path; {fallback}", file=sys.stderr)
         source = channel = ""
 
     try:
