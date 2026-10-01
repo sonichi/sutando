@@ -416,17 +416,21 @@ jobs:
           # beside a CPU-heavy neighbour misses its own window); legs 1-5 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
           if [ "${SHARD:-1}" = 6 ]; then
-            bash scripts/select-load-sensitive-suites.sh only "$LIST" < "$RECDIR/all" > "$RECDIR/sensitive"
+            bash scripts/select-load-sensitive-suites.sh only "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
+            KIND=only SELECTED="$RECDIR/sensitive"
             WORKERS=2
           else
             # The selector exits non-zero on a stale or duplicate entry, so a renamed
             # suite cannot slip back into the shared legs; no pipe, `-e` has no pipefail.
-            bash scripts/select-load-sensitive-suites.sh without "$LIST" < "$RECDIR/all" > "$RECDIR/rest"
+            bash scripts/select-load-sensitive-suites.sh without "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/rest"
             # Measured cost, heaviest first onto the lightest leg: every file lands in
             # exactly one leg, and the legs finish together instead of by line parity.
             bash scripts/shard-by-cost.sh 5 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
+            KIND=without SELECTED="$RECDIR/rest"
           fi
+          # Runs whatever the branches did: no receipt, or a list edited after selection, exits 4.
+          bash scripts/select-load-sensitive-suites.sh verify "$KIND" "$LIST" "$RECDIR" "$SELECTED" "$RECDIR/files"
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"

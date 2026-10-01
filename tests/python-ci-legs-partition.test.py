@@ -30,7 +30,7 @@ COPIED = ["scripts/discover-python-tests.sh", "scripts/select-load-sensitive-sui
 
 LANE_STUB = """#!/usr/bin/env bash
 # Records what the step hands the lane runner, and a passing record per file.
-cp "$2" "$LEG_OUT/files"; echo "$1" > "$LEG_OUT/workers"
+cp "$2" "$LEG_OUT/files"; echo "$1" > "$LEG_OUT/workers"; cp "$3"/selector.*.receipt "$LEG_OUT/" 2>/dev/null || true
 n=$(wc -l < "$2"); for i in $(seq 1 "$n"); do echo 0 > "$3/$i.rc"; echo 0 > "$3/$i.time"; : > "$3/$i.out"; done
 """
 PY_SHIM = """#!/usr/bin/env bash
@@ -66,17 +66,20 @@ def build_fixture(td: Path, discovered) -> Path:
     return fx
 
 
-def run_legs(fx: Path, list_text: str):
+def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=range(1, 7)):
     body = step_body()
     (fx / LIST).write_text(list_text)
+    getconf = fx.parent / "bin" / "getconf"
+    getconf.write_text(f"#!/usr/bin/env bash\necho {nproc}\n")
+    getconf.chmod(0o755)
     legs = {}
-    for shard in range(1, 7):
+    for shard in shards:
         out = Path(tempfile.mkdtemp(dir=fx.parent))
         env = dict(os.environ, SHARD=str(shard), LEG_OUT=str(out), PATH=f"{fx.parent / 'bin'}:{os.environ['PATH']}")
         r = subprocess.run(["bash", "-e", "-c", body], cwd=fx, env=env, capture_output=True, text=True)
         files = (out / "files").read_text().split() if (out / "files").exists() else None
         workers = (out / "workers").read_text().strip() if (out / "workers").exists() else None
-        legs[shard] = (r.returncode, files, workers, r.stderr[-400:])
+        legs[shard] = (r.returncode, files, workers, r.stderr[-400:], sorted(x.name for x in out.glob("selector.*.receipt")))
     return legs
 
 
@@ -94,8 +97,8 @@ def main() -> int:
     td_obj = tempfile.TemporaryDirectory()
     fx = build_fixture(Path(td_obj.name), disc)
     real = (REPO / LIST).read_text()
-    legs = run_legs(fx, real)
-    for shard, (rc, files, workers, err) in legs.items():
+    legs = run_legs(fx, real, 8)
+    for shard, (rc, files, workers, err, _r) in legs.items():
         if rc != 0 or files is None:
             fails.append(f"leg {shard}: the step did not reach the lane runner (rc={rc}): {err.strip()}")
     if fails:
@@ -119,10 +122,15 @@ def main() -> int:
         fails.append(f"leg 6 runs {len(leg6)} suites, not exactly the {len(listed)} listed")
     if [cost.get(f, 1) for f in leg6] != sorted((cost.get(f, 1) for f in leg6), reverse=True):
         fails.append("leg 6 is not ordered heaviest first")
-    if legs[6][2] != "2":
-        fails.append(f"leg 6 runs with {legs[6][2]} workers, not 2")
-    if any(legs[s][2] == "2" for s in range(1, 6)):
-        fails.append("a shared leg was pinned to two workers")
+    # The step's rule: shared legs take the host's core count, leg 6 always two. Checked on
+    # a 2-core and an 8-core host so a valid 2-core value is never read as hardcoding.
+    for nproc in (2, 8):
+        got = legs if nproc == 8 else run_legs(fx, real, nproc)
+        shared = {s: got[s][2] for s in range(1, 6)}
+        if set(shared.values()) != {str(nproc)}:
+            fails.append(f"on a {nproc}-core host legs 1-5 run with {sorted(set(shared.values()))} workers, not {nproc}")
+        if got[6][2] != "2":
+            fails.append(f"on a {nproc}-core host leg 6 runs with {got[6][2]} workers, not 2")
 
     # A list that only partitions correctly when it is valid proves nothing about who reads
     # it: a stale or duplicate entry must stop every leg with the selector's exit 3.
@@ -131,7 +139,7 @@ def main() -> int:
         "duplicate entry": real + listed[0] + "\n",
     }
     for what, text in drifted.items():
-        for shard, (rc, files, _w, err) in run_legs(fx, text).items():
+        for shard, (rc, files, _w, err, _r) in run_legs(fx, text).items():
             if rc != 3:
                 fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
                              f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
@@ -143,7 +151,7 @@ def main() -> int:
         return 1
     print(f"PASS: ci.yml's six legs run all {len(disc)} discovered suites exactly once "
           f"({'/'.join(str(len(legs[s][1])) for s in legs)}); the {len(listed)} listed only in leg 6, "
-          "heaviest first, two workers; a stale or duplicate list entry stops every leg with exit 3")
+          "heaviest first, two workers (2- and 8-core hosts); a stale or duplicate list entry stops every leg with exit 3")
     return 0
 
 
