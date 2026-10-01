@@ -412,17 +412,19 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Leg 6 is the listed load-sensitive suites on one worker (a timing suite
+          # Leg 6 runs the listed load-sensitive suites on one worker (a timing suite
           # beside a CPU-heavy neighbour misses its own window); legs 1-5 get the rest.
-          grep -vE '^(#|$)' tests/python-load-sensitive-suites.txt > "$RECDIR/sensitive"
+          LIST=tests/python-load-sensitive-suites.txt
           if [ "${SHARD:-1}" = 6 ]; then
-            grep -xF -f "$RECDIR/sensitive" "$RECDIR/all" > "$RECDIR/files" || true
+            bash scripts/select-load-sensitive-suites.sh only "$LIST" < "$RECDIR/all" > "$RECDIR/files"
             WORKERS=1
           else
+            # The selector exits non-zero on a stale or duplicate entry, so a renamed
+            # suite cannot slip back into the shared legs; no pipe, `-e` has no pipefail.
+            bash scripts/select-load-sensitive-suites.sh without "$LIST" < "$RECDIR/all" > "$RECDIR/rest"
             # Measured cost, heaviest first onto the lightest leg: every file lands in
             # exactly one leg, and the legs finish together instead of by line parity.
-            grep -vxF -f "$RECDIR/sensitive" "$RECDIR/all" \
-              | bash scripts/shard-by-cost.sh 5 "${SHARD:-1}" tests/python-suite-costs.txt > "$RECDIR/files"
+            bash scripts/shard-by-cost.sh 5 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
           fi
           # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
           # alike, letting one worker's failing rc be overwritten.
