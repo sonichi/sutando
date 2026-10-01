@@ -140,6 +140,17 @@ class StepTests(unittest.TestCase):
             self.assertIn("no delivery path", err)
         self.assertEqual(self.sent, [])
 
+    def test_step_routes_through_notifys_delivery_route(self):
+        # The verdict is notify's: a copied rule in step.py would ignore these patches.
+        with mock.patch.object(notify, "_delivery_route", lambda source, channel: None):
+            rc, err = self._run("--message", "Step")
+        self.assertEqual((rc, self.sent), (0, []))
+        self.assertIn("no delivery path", err)
+        with mock.patch.object(notify, "_delivery_route", lambda source, channel: "gateway"):
+            rc, _ = self._run("--message", "Step", source="runtime-api", channel="runtime-api")
+        self.assertEqual(rc, 0)
+        self.assertEqual([s["payload"]["room_id"] for s in self.sent], ["runtime-api"])
+
     def test_long_message_is_refused_before_anything_is_sent(self):
         rc, err = self._run("--message", "x" * 300, "--screenshot", self.png)
         self.assertEqual(rc, 1)

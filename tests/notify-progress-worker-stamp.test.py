@@ -358,6 +358,17 @@ class NotifyDeliveryRouteTests(unittest.TestCase):
             rc, calls = self._run(self.LOCAL["some-new-writer"], mode)
             self.assertEqual((rc, calls), (0, []), mode)
 
+    def test_malformed_room_ids_send_nothing(self):
+        # A gateway room id is strictly `!opaque:server`; anything looser is local.
+        for channel in ("!foo", "!room", "!room:", "!room:server extra", "!:server", "x!room:server"):
+            for mode in ("per-source-env", "global-gateway"):
+                with self.subTest(channel=channel, mode=mode):
+                    body = f"id: task-m\nsource: ag2space\nchannel_id: {channel}\ntask: x\n"
+                    rc, calls = self._run(body, mode)
+                    self.assertEqual((rc, calls), (0, []))
+            with self.subTest(channel=channel, verdict=True):
+                self.assertIsNone(notify._delivery_route("ag2space", channel))
+
     def test_each_bridge_task_sends_exactly_once(self):
         for mode in ("per-source-env", "global-gateway"):
             for name, (sender, body) in self.BRIDGES.items():
