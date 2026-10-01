@@ -373,15 +373,98 @@ exit 0
 
     def test_receipt_cannot_override_changed_live_policy_or_identity(self):
         processes = self.pair()
-        original = helpers.proc_argv_vector(processes[0].pid)
-        for altered in (original + ["--once"],
-                        [a for a in original if a != "--no-auto-answer"],
-                        ["changed" if a == self.session else a for a in original]):
-            with self.subTest(argv=altered), mock.patch.object(helpers, "proc_argv_vector", return_value=altered):
-                with self.assertRaises(ValueError): self.validate()
-        identity = helpers._process(processes[0].pid)
-        with mock.patch.object(helpers, "_process", side_effect=[identity, {**identity, "lstart": "changed"}]):
-            with self.assertRaises(ValueError): self.validate()
+        originals = {p.pid: helpers.proc_argv_vector(p.pid) for p in processes}
+        identities = self.validate()
+        for role, process in zip(helpers.SCRIPTS, processes):
+            original = originals[process.pid]
+            script = str(self.repo / "src" / helpers.SCRIPTS[role])
+            cases = [("other checkout", [str(self.base / helpers.SCRIPTS[role]) if a == script else a
+                                         for a in original], "selected checkout script"),
+                     ("receipt directory", [str(self.base) if a == str(self.receipts) else a
+                                            for a in original], "receipt invocation mismatch")]
+            cases += [(flag, original + [flag], "not continuous")
+                      for flag in ("--once", "--stop", "--mark-stopped")]
+            if role == "monitor":
+                cases += [(flag, [a for a in original if a != flag], "monitor is not passive")
+                          for flag in ("--no-auto-answer", "--no-chat-escalation")]
+                for flag in ("--socket", "--session", "--out"):
+                    altered = original.copy()
+                    altered[altered.index(flag) + 1] = str(self.base / "changed")
+                    cases.append((flag, altered, "monitor invocation configuration mismatch"))
+            for label, altered, reason in cases:
+                with self.subTest(role=role, field=label), mock.patch.object(
+                    helpers, "proc_argv_vector",
+                    side_effect=lambda pid: altered if pid == process.pid else originals[pid],
+                ):
+                    with self.assertRaisesRegex(ValueError, reason): self.validate()
+        self.assertEqual(self.validate(), identities)
+
+    def test_each_helper_identity_is_rechecked_after_its_argv(self):
+        processes = self.pair()
+        identities = {p.pid: helpers._process(p.pid) for p in processes}
+        read_argv = helpers.proc_argv_vector
+        for process in processes:
+            observed = set()
+
+            def argv(pid):
+                result = read_argv(pid)
+                observed.add(pid)
+                return result
+
+            def observe(pid):
+                identity = identities[pid]
+                return ({**identity, "lstart": "changed"}
+                        if pid == process.pid and pid in observed else identity)
+
+            with self.subTest(pid=process.pid), \
+                    mock.patch.object(helpers, "_process", side_effect=observe), \
+                    mock.patch.object(helpers, "proc_argv_vector", side_effect=argv):
+                with self.assertRaisesRegex(ValueError, "helper changed during validation"):
+                    self.validate()
+        self.assertEqual(self.validate(), {role: identities[p.pid]
+                                          for role, p in zip(helpers.SCRIPTS, processes)})
+
+    def test_separately_valid_roles_cannot_share_one_process(self):
+        processes = self.pair()
+        originals = [helpers.proc_argv_vector(p.pid) for p in processes]
+        file = self.receipts / "heartbeat.json"
+        record = json.loads(file.read_text())
+        file.write_text(json.dumps({**record, **helpers._process(processes[0].pid)}))
+        with mock.patch.object(helpers, "proc_argv_vector", side_effect=originals):
+            with self.assertRaisesRegex(ValueError, "helpers must be separate processes"):
+                self.validate()
+
+    def test_receipt_directory_must_resolve_below_workspace_state(self):
+        self.assertEqual(helpers._directory(self.receipts, self.workspace), self.receipts)
+        outside = self.base / "outside-state"
+        outside.mkdir(mode=0o700)
+        link = self.workspace / "state" / "outside-link"
+        link.symlink_to(outside, target_is_directory=True)
+        try:
+            for directory in (outside, link):
+                with self.subTest(directory=directory):
+                    with self.assertRaisesRegex(ValueError, "below workspace/state"):
+                        helpers._directory(directory, self.workspace)
+        finally:
+            link.unlink()
+            outside.rmdir()
+
+    def test_valid_json_receipt_still_requires_bounded_size_and_owner(self):
+        file = self.receipts / "monitor.json"
+        record = {"version": 1, "padding": ""}
+        file.write_text(json.dumps(record))
+        file.chmod(0o600)
+        self.assertEqual(helpers._read(file), record)
+        file.write_text(json.dumps({**record, "padding": "x" * 8192}))
+        with self.assertRaisesRegex(ValueError, "bounded owner-private file"):
+            helpers._read(file)
+        file.write_text(json.dumps(record))
+        foreign = list(file.stat())
+        foreign[4] = os.getuid() + 1
+        with mock.patch.object(helpers.os, "fstat", return_value=os.stat_result(foreign)):
+            with self.assertRaisesRegex(ValueError, "bounded owner-private file"):
+                helpers._read(file)
+        self.assertEqual(helpers._read(file), record)
 
     def test_helper_hooks_publish_actual_passive_arguments_before_work(self):
         import workspace_default
