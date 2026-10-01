@@ -417,6 +417,45 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sendkeys_log_text(), "")
 
+    def test_name_outside_the_plain_task_shape_is_refused_before_any_typing(self):
+        # The pane skips permission prompts, so a name carrying a newline or a
+        # shell metacharacter must never reach send-keys: refused, and logged.
+        notifier_log = self.logs_dir / "agy-task-notifier.log"
+        for name in ("task-a.txt\nrm -rf x", "task-$(id).txt", "task-a;b.txt", "task a.txt",
+                     "task-a.txt ", "task.TXT", "../task-a.txt"):
+            with self.subTest(name=name):
+                self.sendkeys_log.write_text("")
+                if notifier_log.exists():
+                    notifier_log.unlink()
+                try:
+                    self.write_task(name)
+                except OSError:
+                    pass  # a name the filesystem itself refuses still goes through --event
+                result = self.run_event(name, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.sendkeys_log_text(), "",
+                                  f"{name!r} must never be typed into the pane")
+                self.assertIn("refusing task name outside [A-Za-z0-9._-]+.txt", result.stderr)
+                self.assertIn("refusing task name outside [A-Za-z0-9._-]+.txt",
+                              notifier_log.read_text() if notifier_log.exists() else "")
+
+    def test_plain_task_name_control_still_reaches_the_pane(self):
+        self.write_task("task-abc.txt")
+        import threading
+        def _finish():
+            for _ in range(50):
+                if "ENTER" in self.sendkeys_log_text():
+                    self.write_result("task-abc.txt")
+                    return
+                time.sleep(0.1)
+        t = threading.Thread(target=_finish)
+        t.start()
+        result = self.run_event("task-abc.txt")
+        t.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TYPE Sutando task ready: task-abc.txt", self.sendkeys_log_text())
+        self.assertNotIn("refusing task name", result.stderr)
+
     def test_missing_results_dir_is_created_before_any_dispatch(self):
         # agy publishes results ITSELF (the watcher only mkdirs TASKS_DIR), so
         # a first-run RESULTS_DIR must exist before agy ever tries to write there.

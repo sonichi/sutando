@@ -223,9 +223,9 @@ deliver_prompt() {
 
 submit_task() {
   local filename="$1" prompt started
-  case "$filename" in
-    ""|*/*|*..*) return 0 ;;
-  esac
+  # The name is typed into a pane that skips permission prompts: only a plain
+  # task name is ever typed; anything else (newline, metacharacter) is refused.
+  [[ "$filename" =~ ^[A-Za-z0-9._-]+\.txt$ ]] || { log_notifier "refusing task name outside [A-Za-z0-9._-]+.txt: $(printf '%q' "$filename")"; return 0; }
   has_result "$filename" && return 0
   # A file gone since its event (cancelled, archived) has nothing to dispatch.
   [ -f "$TASKS_DIR/$filename" ] || { log_notifier "task file gone before dispatch: $filename"; return 0; }
