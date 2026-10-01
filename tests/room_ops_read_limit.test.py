@@ -250,6 +250,52 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertIn("before=", seen_urls[0])
 
 
+class NormalizeCommonsCommentTests(unittest.TestCase):
+    """A Commons comment's area and picture survive `_normalize`, plus one display line."""
+
+    CC = {"surface": "doc", "page": "markdown-abc", "kind": "doc",
+          "area": {"x": 1200, "y": 3400, "w": 2000, "h": 1500},
+          "image": "mxc://hs/pic1",
+          "image_info": {"mimetype": "image/png", "w": 640, "h": 480, "size": 12345},
+          "area_media": "mxc://hs/area1"}
+
+    def test_commons_comment_passes_through_with_a_line(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "look here",
+                              "commons_comment": self.CC}])
+        self.assertEqual(out[0]["commons_comment"], self.CC)
+        self.assertEqual(out[0]["commons_comment_line"],
+                         "[area 1200,3400 2000x1500 bp on doc; picture: mxc://hs/pic1]")
+        self.assertEqual(out[0]["body"], "look here")
+
+    def test_plain_message_grows_no_commons_keys(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "hi"}])
+        self.assertNotIn("commons_comment", out[0])
+        self.assertNotIn("commons_comment_line", out[0])
+
+    def test_malformed_view_is_kept_but_gets_no_line(self):
+        cc = {"area": {"x": "1", "y": 2, "w": 3, "h": 4}, "image": "https://evil"}
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
+                              "commons_comment": cc}])
+        self.assertEqual(out[0]["commons_comment"], cc)
+        self.assertNotIn("commons_comment_line", out[0])
+
+    def test_non_dict_value_is_dropped(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
+                              "commons_comment": "nope"}])
+        self.assertNotIn("commons_comment", out[0])
+
+    def test_read_room_surfaces_it_end_to_end(self):
+        ReadLimitCountsMessages.setUp(self)
+        self.addCleanup(ReadLimitCountsMessages.tearDown, self)
+        body = (200, json.dumps({"messages": [
+            {"sender": HS, "ts": 2, "body": "see area", "commons_comment": self.CC},
+            {"sender": HS, "ts": 1, "body": "plain"}]}).encode(), {})
+        with mock.patch.object(rd, "http_request", return_value=body):
+            res = rd.read_room(ROOM, HS, limit=2, gate=None)
+        self.assertIn("picture: mxc://hs/pic1", res["messages"][0]["commons_comment_line"])
+        self.assertNotIn("commons_comment", res["messages"][1])
+
+
 class NormalizeMediaRefTests(unittest.TestCase):
     """`media_ref` + `msgtype` are the only handle a reader has on a room attachment,
     so dropping them leaves it visible in `body` but unfetchable."""

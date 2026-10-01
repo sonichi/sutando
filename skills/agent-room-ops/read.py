@@ -106,6 +106,26 @@ def _redactor():
     return _REDACTOR
 
 
+def _int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _commons_comment_line(cc):
+    """One short line, e.g. `[area 1200,3400 2000x1500 bp on doc; picture: mxc://hs/id]`."""
+    parts = []
+    area = cc.get("area")
+    if isinstance(area, dict):
+        x, y, w, h = (_int(area.get(k)) for k in ("x", "y", "w", "h"))
+        if None not in (x, y, w, h):
+            where = cc.get("kind") if isinstance(cc.get("kind"), str) else None
+            parts.append("area %d,%d %dx%d bp%s" % (x, y, w, h,
+                                                     " on %s" % where[:40] if where else ""))
+    image = cc.get("image")
+    if isinstance(image, str) and image.startswith("mxc://") and len(image) <= 255:
+        parts.append("picture: %s" % image)
+    return "[%s]" % "; ".join(parts) if parts else None
+
+
 def _normalize(items):
     out = []
     redact = _redactor()
@@ -131,6 +151,13 @@ def _normalize(items):
             # arriving without msgtype must not grow an explicit null either.
             if (mt := m.get("msgtype")):
                 norm["msgtype"] = mt
+        # Server-validated but untrusted room data: passed through untouched, plus one
+        # display line so a reader sees the area and the picture it can `fetch`.
+        cc = m.get("commons_comment")
+        if isinstance(cc, dict):
+            norm["commons_comment"] = cc
+            if (line := _commons_comment_line(cc)):
+                norm["commons_comment_line"] = line
         out.append(norm)
     return out
 
