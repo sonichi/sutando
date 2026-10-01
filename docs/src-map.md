@@ -135,6 +135,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_ask.py`** — Ask the owner a pending question in a conversation he reads; the per-host pending-questions.md is the ledger of what was queued, not the channel.
 - **`pending_questions_ledger.py`** — The one writer contract for pending-questions.md: every mutation of the file goes through `update()` — one mkdir lock shared by all writers, a read-transform- replace under it, and a temp-file + rename that preserves the file's mode.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
+- **`pending_questions_store.py`** — Where an owner pending question is kept: one Question, two stores with one contract, and the fail-open policy between them.
 - **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.

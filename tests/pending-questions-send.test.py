@@ -454,14 +454,14 @@ class TestEdges(_Workspace):
         self.assertEqual(self._proactive(), [])
 
     def test_a_ledger_insert_that_raises_still_queues(self):
-        with mock.patch.object(pqa.ledger, "insert_entry", side_effect=OSError("disk full")):
+        with mock.patch.object(pqa.FileStore, "insert", side_effect=OSError("disk full")):
             out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST)
         self.assertEqual(out["ledger_error"], "OSError: disk full")
         self.assertIsNotNone(out["proactive_file"])
         self.assertIn("ledger: FAILED — OSError: disk full", pqa.report_lines(out))
 
     def test_a_stamp_that_raises_is_reported(self):
-        with mock.patch.object(pqa.ledger, "stamp", side_effect=OSError("gone")):
+        with mock.patch.object(pqa.FileStore, "stamp", side_effect=OSError("gone")):
             out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST)
         self.assertEqual(out["ledger_error"], "OSError: gone")
 
