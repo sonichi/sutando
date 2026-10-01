@@ -130,10 +130,8 @@ for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 [ "$(cat "$SENT3" 2>/dev/null)" = "$h3" ]; check "(e) ...and re-stamps the sentinel with the holder's pid (realpath match, not basename)" $? "sentinel: $(cat "$SENT3" 2>/dev/null)"
 grep -q 're-stamped' "$WORK/eighth.err"; check "(e) ...and said so on stderr" $? "$(tail -2 "$WORK/eighth.err" | tr '\n' '|')"
 
-# (f) a custom inbox + separate SUTANDO_WORKSPACE_DIR with no instance id is a
-# SUPPORTED core configuration (watch-tasks-stream-inbox-and-workspace-env.test.py);
-# the re-stamp arm must treat an empty id alone as "this seat is the core",
-# not require the inbox to equal <workspace>/tasks.
+# (f) a custom inbox + separate workspace with no instance id is a SUPPORTED
+# core config; the re-stamp arm must accept empty id alone, no inbox match.
 WS4="$WORK/ws4"; CUSTOM4="$WORK/custom-inbox-root/tasks"
 mkdir -p "$WS4/state" "$CUSTOM4"
 h4="$(start "$WS4" "$CUSTOM4" holder4)"; PIDS+=("$h4")
