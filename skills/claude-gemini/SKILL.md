@@ -26,8 +26,8 @@ ARGUMENTS: $ARGUMENTS
    ```bash
    brew install --cask antigravity
    f="$(mktemp)" && curl -fsSL https://antigravity.google/cli/install.sh -o "$f"
-   [ -t 0 ] && less "$f" || cat "$f"                               # review it first
-   read -r -p "Run the installer? [y/N] " a
+   if [ -t 0 ]; then less "$f"; else cat "$f"; fi                   # review it first
+   printf 'Run the installer? [y/N] '; read -r a
    [ "$a" = y ] && bash "$f"                                         # installs ~/.local/bin/agy
    rm -f "$f"
    ```
