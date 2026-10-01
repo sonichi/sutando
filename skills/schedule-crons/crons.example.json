@@ -12,7 +12,7 @@
   {
     "name": "pending-questions",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
+    "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py --store-adapter scripts/pending_questions_room_db.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."
   },
   {
     "name": "sync-workspace",

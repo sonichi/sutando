@@ -4,9 +4,12 @@
 Runs on cron — independent of the proactive loop.
 Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
+`--store-adapter <path>` injects a room-database adapter (its `room_store(workspace)`);
+its open rows are reminded alongside the file's waiting entries.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -23,6 +26,7 @@ from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
+from pending_questions_store import FileStore, resync  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -143,7 +147,11 @@ def get_waiting_questions():
     """
     if not PQ_FILE.exists():
         return []
-    content = PQ_FILE.read_text()
+    return parse_waiting(PQ_FILE.read_text())
+
+
+def parse_waiting(content):
+    """get_waiting_questions over a text already read; see its docstring."""
     # Only the active region counts. Resolved questions are kept below a
     # top-level "# Resolved" divider (audit trail), not deleted — without
     # this cut the heading-agnostic split below sweeps the whole file and
@@ -215,6 +223,43 @@ def get_waiting_questions():
             questions.append({"id": title[:40], "title": title,
                               "snippet": ask[:120], "body": body or title})
     return questions
+
+
+def load_store(adapter_path):
+    """(store | None, why) from an injected adapter file's `room_store(workspace)`."""
+    try:
+        spec = importlib.util.spec_from_file_location("pq_store_adapter", adapter_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.room_store(WORKSPACE)
+    except Exception as e:  # noqa: BLE001 — the file reminder runs without it
+        return None, f"adapter {adapter_path} failed to load ({type(e).__name__}: {e})"
+
+
+def store_questions(store):
+    """The store's open rows, shaped like get_waiting_questions' items."""
+    out = []
+    for e in store.open_entries():
+        lines = [ln.strip() for ln in e["body"].splitlines()
+                 if ln.strip() and not ln.lstrip().startswith(("#", "**Sent:**"))]
+        out.append({"id": e["title"][:40], "title": e["title"], "ask_id": e["ask_id"],
+                    "snippet": (lines[0] if lines else "")[:120], "body": e["body"]})
+    return out
+
+
+def gather(store=None):
+    """(waiting questions, notes): an injected store's open rows, after file entries
+    carrying an ask id are copied into it, then the file's waiting entries. A store
+    that fails leaves the file alone, and the note says so."""
+    notes, rows = [], []
+    if store is not None:
+        try:
+            _moved, errors = resync(FileStore(PQ_FILE), store)
+            notes += [f"resync: FAILED — {e}" for e in errors]
+            rows = store_questions(store)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"ROOM DATABASE READ FAILED ({type(e).__name__}: {e}); reminding from the file only")
+    return rows + get_waiting_questions(), notes
 
 
 def due_for_reminder(questions, now=None):
@@ -560,7 +605,14 @@ def zero_reason():
 
 def main():
     force = "--force" in sys.argv
-    questions = get_waiting_questions()
+    store = None
+    if "--store-adapter" in sys.argv[:-1]:
+        store, why = load_store(sys.argv[sys.argv.index("--store-adapter") + 1])
+        if store is None:
+            print(f"room database: not used ({why}); reminding from the file", file=sys.stderr)
+    questions, notes = gather(store)
+    for note in notes:
+        print(note, file=sys.stderr)
     if not questions:
         # Never return silently: see zero_reason.__doc__.
         print(zero_reason())

@@ -4,7 +4,7 @@ replace under it, and a temp-file + rename that preserves the file's mode. A loc
 is removed only by the writer that took it; a held lock makes the write give up
 after LOCK_WAIT_SEC, untouched, with the manual remedy in the error.
 
-Writers: pending_questions_ask (insert + stamp), agent-api `/answer` (status
+Writers: pending_questions_store.FileStore (insert, stamp, status), agent-api `/answer` (status
 rewrite), engine-conflict-resolve deliver.py (insert above the divider),
 auth-preflight-gate.sh (insert, via this module's CLI). Readers keep
 `pending_questions_md`; this module only places and replaces text.
@@ -105,17 +105,20 @@ def insert_point(text: str, where: str = "top") -> int:
     return 0
 
 
+def with_entry(old: str, entry: str, where: str = "top") -> str:
+    """`old` with `entry` (ending in a newline) placed at `insert_point`."""
+    at = insert_point(old, where)
+    head, tail = old[:at], old[at:]
+    if head and not head.endswith("\n"):
+        head += "\n"
+    if where == "top" and at > 0 and not head.endswith("\n\n"):
+        head += "\n"
+    return head + entry + tail.lstrip("\n") if where == "top" else head + entry + tail
+
+
 def insert_entry(pq: Path, entry: str, where: str = "top") -> Optional[str]:
     """Insert `entry` (ending in a newline) at `insert_point`."""
-    def _do(old: str) -> str:
-        at = insert_point(old, where)
-        head, tail = old[:at], old[at:]
-        if head and not head.endswith("\n"):
-            head += "\n"
-        if where == "top" and at > 0 and not head.endswith("\n\n"):
-            head += "\n"
-        return head + entry + tail.lstrip("\n") if where == "top" else head + entry + tail
-    return update(pq, _do)
+    return update(pq, lambda old: with_entry(old, entry, where))
 
 
 def stamp(pq: Path, token: str, replacement: str) -> Optional[str]:

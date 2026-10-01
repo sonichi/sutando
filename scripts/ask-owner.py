@@ -4,19 +4,33 @@
 Usage:
   python3 scripts/ask-owner.py "Merge #123 despite the absent CLA check?" \
       [--context "why it is blocked"] [--urgency live|durable] \
-      [--task-file <workspace>/tasks/task-<id>.txt]
+      [--task-file <workspace>/tasks/task-<id>.txt] \
+      [--default "merge it" --reason "CI is green" --option "Hold=wait for the CLA"] \
+      [--priority High|Medium|Low]
 
 With --task-file the question goes to that task's own conversation; without it,
 to the owner's DM on the bridge he was last active on. Always exits 0 after a
-non-empty question: every failure is printed, never raised, and the ledger
-entry in hosts/<host>/pending-questions.md stands either way.
+non-empty question: every failure is printed, never raised, and the entry
+stands either way. It is a row of the "Pending questions" database in the
+owner's DM room when the room-collab capability and that room both resolve
+(pending_questions_room_db.room_store); otherwise, or when that write fails
+(said loudly on stderr), it is in hosts/<host>/pending-questions.md.
 """
 import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # lint-workspace-resolution: allow-repo-root
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pending_questions_ask import ask_owner, report_lines  # noqa: E402
+from pending_questions_room_db import room_store  # noqa: E402
+
+
+def _option(text: str):
+    label, sep, consequence = text.partition("=")
+    if not sep or not label.strip():
+        raise argparse.ArgumentTypeError("an option is 'Label=what it does'")
+    return label.strip(), consequence.strip()
 
 
 def main() -> int:
@@ -27,14 +41,31 @@ def main() -> int:
                     help="live also fires the macOS notification; durable sends and records only")
     ap.add_argument("--task-file", default=None,
                     help="the task being worked: its source/channel is where the question goes")
+    ap.add_argument("--default", default=None, help="the action taken on Approve")
+    ap.add_argument("--reason", default=None, help="why that is the proposed default")
+    ap.add_argument("--option", action="append", type=_option, default=[],
+                    help="'Label=what it does', repeatable; Approve is always listed first")
+    ap.add_argument("--priority", choices=("High", "Medium", "Low"), default="Medium")
     ap.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
     if not args.question.strip():
         print("ask-owner: the question is empty", file=sys.stderr)
         return 2
+    if args.workspace:
+        ws = Path(args.workspace)
+    else:
+        from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
+        ws = resolve_workspace(migrate=False)
+    store, where = room_store(ws)
     out = ask_owner(args.question, context=args.context, urgency=args.urgency,
-                    task_file=args.task_file,
-                    workspace=Path(args.workspace) if args.workspace else None)
+                    task_file=args.task_file, workspace=ws, store=store,
+                    default_action=args.default, reason=args.reason, options=args.option,
+                    priority=args.priority)
+    if store is None:
+        print(f"room database: not used ({where}); the file is the ledger")
+    if out.get("db_error"):
+        print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is in "
+              f"{out['ledger']} instead", file=sys.stderr)
     print("\n".join(report_lines(out)))
     return 0
 

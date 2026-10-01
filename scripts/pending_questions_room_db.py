@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""The room-database adapter for owner pending questions.
+
+`room_store(workspace)` is the discovery, kept at this edge: the room-collab
+capability (the workspace's skill, else the repo's) and the owner's DM room and
+agent identity from the gateway's own reading (`state/owner-routing.json`, an
+`AG2SPACE_USER_ID` / `AG2_MATRIX_USER_ID` identity winning). It returns a
+pending_questions_store.RoomDbStore whose client runs this file's `serve`, or
+None and the reason when anything is missing.
+
+`serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
+one connection to the room's databases document, writing only the DATABASE.md
+shapes through the client's own put_database / put_row_body.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+sys.path.insert(0, str(REPO / "src"))
+from pending_questions_store import RoomDbStore, ScriptDbClient  # noqa: E402
+
+SKILL = "room-collab"
+CLIENT_MODULE = "room_collab_client.py"
+IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
+GAP = 1024
+SETTLE_SEC = 1.0
+# The documented room-surface link shape; `page` is the database id.
+LINK_TEMPLATE = "{origin}/#/room/{room}?surface=db&page={db}"
+
+
+def skill_scripts(workspace: Path) -> Optional[Path]:
+    for base in (Path(workspace) / "skills" / SKILL, REPO / "skills" / SKILL):
+        if (base / "scripts" / CLIENT_MODULE).is_file():
+            return base / "scripts"
+    return None
+
+
+def owner_routing(workspace: Path) -> dict:
+    try:
+        d = json.loads((Path(workspace) / "state" / "owner-routing.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def room_store(workspace: Path, environ=None, timeout: float = 90.0):
+    """(RoomDbStore, where) when the capability, the owner DM and an identity all
+    resolve; (None, why not) otherwise."""
+    env = os.environ if environ is None else environ
+    scripts = skill_scripts(workspace)
+    if scripts is None:
+        return None, f"no {SKILL} capability installed"
+    routing = owner_routing(workspace)
+    room = str(routing.get("owner_dm") or "").strip()
+    if not room:
+        return None, "no owner DM room known (state/owner-routing.json has no owner_dm)"
+    user = next((env[v].strip() for v in IDENTITY_VARS if (env.get(v) or "").strip()), "") \
+        or str(routing.get("identity") or "").strip()
+    if not user:
+        return None, "no agent identity to sign database writes with"
+    argv = [sys.executable, str(Path(__file__).resolve()), "serve", "--room", room,
+            "--user-id", user, "--skill-scripts", str(scripts)]
+    return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}"), room
+
+
+# ---- serve: one request against the databases document -------------------------
+
+def _key(*parts: str) -> str:
+    return "|".join(parts)
+
+
+def ensure_writes(maps: dict, schema: dict, by: str, now_ms: int) -> dict:
+    """The database from `schema` if it is missing, and any of its properties or
+    views that are missing; nothing that exists is rewritten."""
+    db, writes = schema["id"], {m: {} for m in ("dbs", "props", "views")}
+    if db not in (maps.get("dbs") or {}):
+        writes["dbs"][db] = {"name": schema["name"], "order": (len(maps.get("dbs") or {}) + 1) * GAP,
+                             "created": now_ms, "by": by}
+    for i, p in enumerate(schema["props"]):
+        k = _key(db, p["id"])
+        if k not in (maps.get("props") or {}):
+            writes["props"][k] = {**{x: y for x, y in p.items() if x != "id"}, "order": (i + 1) * GAP}
+    for i, v in enumerate(schema["views"]):
+        k = _key(db, v["id"])
+        if k not in (maps.get("views") or {}):
+            writes["views"][k] = {**{x: y for x, y in v.items() if x != "id"}, "order": (i + 1) * GAP}
+    return {m: w for m, w in writes.items() if w}
+
+
+def _cells(maps: dict, db: str, row: str) -> dict:
+    pre = _key(db, row) + "|"
+    return {k[len(pre):]: v.get("v") for k, v in (maps.get("cells") or {}).items()
+            if k.startswith(pre) and isinstance(v, dict)}
+
+
+def _row_json(doc, maps: dict, db: str, row: str) -> dict:
+    return {"id": row, "cells": _cells(maps, db, row), "body": doc.row_body(db, row) or ""}
+
+
+def _cell_writes(db: str, row: str, cells: dict, by: str, now_ms: int) -> dict:
+    return {_key(db, row, p): ({"v": v, "updated": now_ms, "by": by} if v not in (None, "", []) else None)
+            for p, v in cells.items()}
+
+
+async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None):
+    """Run one DbClient request on an open databases document."""
+    schema, op = req["schema"], req["op"]
+    db = schema["id"]
+    ensure = ensure_writes(doc.database, schema, by, now_ms)
+    if ensure:
+        await doc.put_database(ensure)
+    maps = doc.database
+    rows = maps.get("rows") or {}
+    if op == "rows":
+        mine = [k.split("|", 1)[1] for k in rows if k.startswith(db + "|")]
+        return [_row_json(doc, maps, db, r) for r in mine]
+    row = req["row"]
+    exists = _key(db, row) in rows
+    if op == "row":
+        return _row_json(doc, maps, db, row) if exists else None
+    if op == "add_row":
+        if not exists:
+            orders = [v.get("order") for k, v in rows.items() if k.startswith(db + "|") and isinstance(v, dict)
+                      and isinstance(v.get("order"), (int, float))]
+            await doc.put_database({"rows": {_key(db, row): {"order": (min(orders) - GAP) if orders else GAP,
+                                                             "created": now_ms, "by": by}},
+                                    "cells": _cell_writes(db, row, req["cells"], by, now_ms)})
+        if not exists or not (doc.row_body(db, row) or "").strip():
+            await doc.put_row_body(db, row, req["body"])
+        return {"created": not exists, "db": db, "row": row, "link": link}
+    if not exists:
+        raise LookupError(f"no row {row!r} in database {db!r}")
+    if op == "set_cells":
+        await doc.put_database({"cells": _cell_writes(db, row, req["cells"], by, now_ms)})
+        return None
+    if op == "set_body":
+        await doc.put_row_body(db, row, req["body"])
+        return None
+    raise ValueError(f"unknown op {op!r}")
+
+
+async def _serve(args, req: dict) -> object:
+    sys.path.insert(0, args.skill_scripts)
+    from room_collab import resolve_token, resolve_url  # noqa: PLC0415 — the injected capability
+    from room_collab_client import open_room_collab  # noqa: PLC0415
+    url, token = resolve_url(None), resolve_token(None)
+    link = LINK_TEMPLATE.format(origin=url.rstrip("/"), room=args.room, db=req["schema"]["id"])
+    async with open_room_collab(url, args.room, token, kind="db") as doc:
+        result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
+        await doc.settle(SETTLE_SEC)
+        return result
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Serve one pending-questions room-database request.")
+    ap.add_argument("command", choices=("serve",))
+    ap.add_argument("--room", required=True)
+    ap.add_argument("--user-id", required=True)
+    ap.add_argument("--skill-scripts", required=True)
+    args = ap.parse_args(argv)
+    try:
+        req = json.loads(sys.stdin.read())
+        result = asyncio.run(_serve(args, req))
+    except Exception as e:  # noqa: BLE001 — the caller falls back to the file on any failure
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        return 1
+    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
