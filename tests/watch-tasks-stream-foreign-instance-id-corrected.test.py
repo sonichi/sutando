@@ -48,14 +48,24 @@ def check(name, cond, detail=""):
                 print("    " + line)
 
 
-def start_watcher(inbox, errf, instance=None, role="standby"):
+def start_watcher(inbox, errf, instance=None, role="standby", extra_env=None, workspace=None):
+    # Pin workspace/tasks-dir env explicitly: dict(os.environ) can inherit a
+    # REAL SUTANDO_WORKSPACE_DIR from a live worker shell running this test.
+    ws = workspace if workspace else inbox.parent
     env = dict(os.environ)
-    env["SUTANDO_RESULTS_DIR"] = str(inbox.parent / "results")
+    env["SUTANDO_WORKSPACE_DIR"] = str(ws)
+    env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
+    env.pop("SUTANDO_TASKS_DIR", None)
     if instance:
         env["SUTANDO_INSTANCE_ID"] = instance
     else:
         env.pop("SUTANDO_INSTANCE_ID", None)
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+    for k in ("SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+              "SUTANDO_POOL_DELIVERY_SCRIPT"):
+        env.pop(k, None)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.Popen(
         ["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", role, "--inbox", str(inbox)],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=errf,
@@ -146,13 +156,78 @@ try:
           ok and log.exists() and "handle" in log.read_text(),
           f"out={out} log={log.read_text() if log.exists() else None}")
     check("(2) the correction is logged to stderr",
-          "set while serving the core's own inbox" in LAST_STDERR[0],
+          "set while serving the core's own canonical inbox" in LAST_STDERR[0],
           f"stderr={LAST_STDERR[0]!r}")
 finally:
     stop(p)
     errf.close()
 
-print(f"watch-tasks-stream-foreign-instance-id-corrected: {2 - len(FAILURES)}/2 passed")
+# (3) Blocker 1 (kewei): a REAL worker-shaped SUTANDO_INBOX_RESOLVER left set
+# rejects every plain task body, so the fix must clear the whole routing block.
+real_resolver = REPO / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"
+errf3_path = tmp / "watcher-full-env.err"
+errf3 = open(errf3_path, "w")
+p3 = start_watcher(
+    ws / "tasks", errf3, instance="d2571c90f75e4907af9f145b01b71c1f",
+    extra_env={
+        "SUTANDO_INBOX_KIND": "deliveries",
+        "SUTANDO_INBOX_RESOLVER": str(real_resolver),
+        "SUTANDO_INBOX_RESOLVER_TIMEOUT": "5",
+        "SUTANDO_POOL_DELIVERY_SCRIPT": str(REPO / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"),
+    })
+out3: list[str] = []
+try:
+    wait_for_fswatch(p3)
+    write_task(ws / "tasks", "task-full-env.txt")
+    ok3 = wait_for(lambda: (read_available(p3, out3), log.exists() and "handle" in log.read_text())[1])
+    LAST_STDERR[0] = snapshot_stderr(errf3_path)
+    check("(3) a FULL inherited worker env (instance id + inbox kind/resolver/delivery "
+          "script) on the core's own inbox is cleared, not just the instance id: "
+          "the handler still runs",
+          ok3 and log.exists() and "handle" in log.read_text(),
+          f"out={out3} stderr={LAST_STDERR[0]!r}")
+finally:
+    stop(p3)
+    errf3.close()
+
+# (4) Blocker 2 control: a worker inbox whose basename is "tasks" (would
+# false-match a basename-only check) must keep its identity.
+ws2 = tmp / "ws-named-tasks"
+worker_inbox_named_tasks = ws2 / "deliveries" / "tasks"
+worker_inbox_named_tasks.mkdir(parents=True)
+(ws2 / "results" / "archive").mkdir(parents=True)
+(ws2 / "state").mkdir()
+log2 = tmp / "handler2.log"
+handler2 = tmp / "handler2.sh"
+handler2.write_text('#!/bin/sh\necho handle >> %s\nexit 0\n' % log2)
+handler2.chmod(0o755)
+cfg2 = ws2 / "state" / "task-event-handler.json"
+cfg2.write_text(json.dumps({"handler": str(handler2)}))
+
+errf4_path = tmp / "watcher-named-tasks.err"
+errf4 = open(errf4_path, "w")
+p4 = start_watcher(worker_inbox_named_tasks, errf4,
+                    instance="d2571c90f75e4907af9f145b01b71c1f", workspace=ws2)
+out4: list[str] = []
+try:
+    wait_for_fswatch(p4)
+    write_task(worker_inbox_named_tasks, "task-worker.txt")
+    ok4 = wait_for(lambda: (read_available(p4, out4), any("TASK_FILE" in s for s in out4))[1])
+    LAST_STDERR[0] = snapshot_stderr(errf4_path)
+    check("(4) control: a worker inbox whose basename is 'tasks' (not <ws>/tasks by "
+          "realpath) keeps its identity -- the present handler config is NOT read "
+          "(a worker never consults it; same rule as "
+          "watch-tasks-stream-config-hot-reload.test.py property 3)",
+          ok4 and not (log2.exists() and "handle" in log2.read_text()),
+          f"out={out4} log2={log2.read_text() if log2.exists() else None} stderr={LAST_STDERR[0]!r}")
+    check("(4b) no foreign-identity correction is logged for the real worker inbox",
+          "set while serving the core's own canonical inbox" not in LAST_STDERR[0],
+          f"stderr={LAST_STDERR[0]!r}")
+finally:
+    stop(p4)
+    errf4.close()
+
+print(f"watch-tasks-stream-foreign-instance-id-corrected: {5 - len(FAILURES)}/5 passed")
 for f in FAILURES:
     print(f"  FAILED: {f}")
 sys.exit(1 if FAILURES else 0)
