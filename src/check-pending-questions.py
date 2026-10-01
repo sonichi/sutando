@@ -114,7 +114,16 @@ _INLINE_RESOLVED = re.compile(
 )
 
 
-def section_is_waiting(title: str, body: str) -> bool:
+# The ledger's own resolved shapes: RESOLVED / SELF-RESOLVED as the title's leading word,
+# after an optional enumeration, ✅ or `[`; prose like "dispute RESOLVED in agreement" is not one.
+_TITLE_RESOLVED = re.compile(r'^\s*(?:\d+[.)]\s*)?(?:✅\s*)?\[?\s*(?:✅\s*)?(?:SELF-)?RESOLVED(?=[\s\]—–:,]|$)')
+
+
+def title_says_resolved(title: str) -> bool:
+    return bool(_INLINE_RESOLVED.match(title) or _TITLE_RESOLVED.match(title))
+
+
+def section_is_waiting(title: str, body: str, keep_title_resolved: bool = False) -> bool:
     """One rule for "this entry still wants an answer", used on BOTH regions.
 
     `zero_reason()` asks it about the archive; a second rule there would let one
@@ -125,7 +134,7 @@ def section_is_waiting(title: str, body: str) -> bool:
     The section stayed on disk and readable while never being surfaced, which is
     the worst failure mode here.
     """
-    if not title or _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+    if not title or _ORG_HEADING.match(title) or (title_says_resolved(title) and not keep_title_resolved):
         return False
     status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
     if status_m:
@@ -150,8 +159,9 @@ def get_waiting_questions():
     return parse_waiting(PQ_FILE.read_text())
 
 
-def parse_waiting(content):
-    """get_waiting_questions over a text already read; see its docstring."""
+def parse_waiting(content, keep_title_resolved=False):
+    """get_waiting_questions over a text already read; see its docstring.
+    `keep_title_resolved` also returns entries whose title says resolved (for triage)."""
     # Only the active region counts. Resolved questions are kept below a
     # top-level "# Resolved" divider (audit trail), not deleted — without
     # this cut the heading-agnostic split below sweeps the whole file and
@@ -169,7 +179,7 @@ def parse_waiting(content):
         title = title_line.strip()
         if not title:
             continue
-        if not section_is_waiting(title, body):
+        if not section_is_waiting(title, body, keep_title_resolved):
             continue
         # Capture first non-empty, non-strikethrough, non-status-metadata body
         # line as a one-line action hint so notifications tell the user what
@@ -205,7 +215,7 @@ def parse_waiting(content):
     seen = {q["title"] for q in questions}
     for m in re.finditer(r'^\s*-\s+\*\*\[(.+?)\]', content, flags=re.MULTILINE):
         title = m.group(1).strip()
-        if title and title not in seen:
+        if title and title not in seen and (keep_title_resolved or not title_says_resolved(title)):
             seen.add(title)
             # `title` is only the BRACKETED LABEL, so bodying to it would leave the
             # rest of the bullet — where the actual ask lives — just as unsearchable
