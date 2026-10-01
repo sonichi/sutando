@@ -213,8 +213,7 @@ case "$__holders" in
         # An unready live holder is stamped by nobody else; only THIS SEAT's own
         # sentinel may be written, so the inbox must be this identity's own.
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
-           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
-                \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TASKS_DIR" \) ] \
+           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o -z "${SUTANDO_INSTANCE_ID:-}" ] \
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
            && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"

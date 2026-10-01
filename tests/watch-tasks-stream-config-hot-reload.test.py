@@ -42,7 +42,7 @@ def check(name, cond, detail=""):
 
 def start_watcher(ws, errf, instance=None, inbox=None):
     # `instance` and `inbox` are set together: a worker's own inbox is
-    # <ws>/deliveries/<id> (#4502), never the bare <ws>/tasks.
+    # <ws>/deliveries/<id>, never the bare <ws>/tasks.
     inbox = inbox or (ws / "tasks")
     env = dict(os.environ)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")

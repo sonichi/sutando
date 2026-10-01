@@ -10,18 +10,21 @@ dispatching anything -- the exact production incident of 2026-09-30 (pid 1184:
 argv correctly said `--role session --inbox <core's workspace>/tasks`, env
 said SUTANDO_INSTANCE_ID=<a different worker's id>).
 
-Two properties, against a live watcher and real fswatch:
+Five properties, against a live watcher and real fswatch:
 
 1. A foreign SUTANDO_INSTANCE_ID inherited while watching the core's own
    <ws>/tasks is corrected: the watcher still loads an already-present
    task-event-handler config and routes through it, exactly as an unset env
    would.
 2. The correction is visible: a stderr line names the mismatch.
-
-Control: the SAME setup with the real worker shape (<ws>/deliveries/<id>) is
-left alone -- the identity is not corrected away, so a worker's own inbox
-still never reads the config (pinned by
-tests/watch-tasks-stream-config-hot-reload.test.py property 3).
+3. The full inherited worker-routing env (not just the instance id) is
+   cleared: a real worker-shaped SUTANDO_INBOX_RESOLVER left set would
+   otherwise reject every plain task body on its own.
+4. Control: a worker inbox whose basename happens to be "tasks" (not the
+   canonical <ws>/tasks by realpath) keeps its identity -- the handler config
+   is correctly NOT read (pinned by
+   tests/watch-tasks-stream-config-hot-reload.test.py property 3).
+4b. No foreign-identity correction is logged for that real worker inbox.
 
 Run: python3 tests/watch-tasks-stream-foreign-instance-id-corrected.test.py
 """
@@ -148,7 +151,7 @@ cfg = ws / "state" / "task-event-handler.json"
 cfg.write_text(json.dumps({"handler": str(handler)}))
 
 # (1)+(2): the core's own <ws>/tasks, but SUTANDO_INSTANCE_ID carries a
-# foreign worker's id (the --force-restart-from-another-session incident).
+# foreign worker's id.
 errf_path = tmp / "watcher.err"
 errf = open(errf_path, "w")
 p = start_watcher(ws / "tasks", errf, instance="d2571c90f75e4907af9f145b01b71c1f")
@@ -169,8 +172,8 @@ finally:
     stop(p)
     errf.close()
 
-# (3) Blocker 1 (kewei): a REAL worker-shaped SUTANDO_INBOX_RESOLVER left set
-# rejects every plain task body, so the fix must clear the whole routing block.
+# (3) a REAL worker-shaped SUTANDO_INBOX_RESOLVER left set rejects every plain
+# task body, so the fix must clear the whole routing block, not just the id.
 real_resolver = REPO / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"
 errf3_path = tmp / "watcher-full-env.err"
 errf3 = open(errf3_path, "w")
@@ -198,8 +201,8 @@ finally:
     stop(p3)
     errf3.close()
 
-# (4) Blocker 2 control: a worker inbox whose basename is "tasks" (would
-# false-match a basename-only check) must keep its identity.
+# (4) control: a worker inbox whose basename is "tasks" (would false-match a
+# basename-only check) must keep its identity.
 ws2 = tmp / "ws-named-tasks"
 worker_inbox_named_tasks = ws2 / "deliveries" / "tasks"
 worker_inbox_named_tasks.mkdir(parents=True)
