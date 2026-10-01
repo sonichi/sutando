@@ -21,7 +21,9 @@ claim and result state, and its stderr.
 
 Run: python3 tests/watch-tasks-stream-handler-terminal-rc.test.py
 """
+import atexit
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,7 @@ class Workspace:
 
     def __init__(self, prefix: str, real_run_rc: int, probe_rc: int = 0) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix=prefix))
+        atexit.register(shutil.rmtree, self.tmp, True)
         self.ws = self.tmp / "ws"
         (self.ws / "tasks").mkdir(parents=True)
         (self.ws / "results" / "archive").mkdir(parents=True)
