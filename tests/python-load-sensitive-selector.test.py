@@ -7,11 +7,11 @@ everything else, so the two together are the discovery list; an entry that is
 not discovered (renamed, deleted, mistyped) or that is listed twice must exit
 non-zero and name it — a dropped entry would quietly return that suite to the
 shared four-worker legs. The committed list must select cleanly against the real
-discovery, so a rename fails here before it fails in CI.
+discovery, so a rename fails here before it fails in CI. That ci.yml actually routes
+each leg through it is pinned by running the step: tests/python-ci-legs-partition.test.py.
 
 Run: python3 tests/python-load-sensitive-selector.test.py
 """
-import re
 import subprocess
 import sys
 import tempfile
@@ -48,8 +48,8 @@ def main() -> int:
         stale.write_text("tests/sb.test.py\ntests/renamed.test.py\n")
         for mode in ("only", "without"):
             r = select(mode, stale, disc)
-            if r.returncode == 0:
-                fails.append(f"{mode}: a listed-but-undiscovered entry was silently dropped (rc 0)")
+            if r.returncode != 3:
+                fails.append(f"{mode}: a listed-but-undiscovered entry exited {r.returncode}, not 3")
             if "tests/renamed.test.py" not in r.stderr:
                 fails.append(f"{mode}: the stale entry was not named on stderr: {r.stderr.strip()!r}")
             if r.stdout.strip():
@@ -58,7 +58,7 @@ def main() -> int:
         dup = td / "dup.txt"
         dup.write_text("tests/sb.test.py\ntests/sd.test.py\ntests/sb.test.py\n")
         r = select("only", dup, disc)
-        if r.returncode == 0 or "tests/sb.test.py" not in r.stderr:
+        if r.returncode != 3 or "tests/sb.test.py" not in r.stderr:
             fails.append(f"a duplicate entry was accepted: rc={r.returncode} err={r.stderr.strip()!r}")
 
         r = select("both", good, disc)
@@ -80,29 +80,12 @@ def main() -> int:
     if sorted(rest.stdout.split() + r.stdout.split()) != sorted(discovered):
         fails.append("leg 6 + legs 1-5 is not the real discovery list")
 
-    # Leg 6 is the only leg that sets its own worker count: exactly two, and only there.
-    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text()
-    m = re.search(r'if \[ "\$\{SHARD:-1\}" = 6 \]; then\n(.*?)\n\s*else\n', ci, re.S)
-    if not m:
-        fails.append("ci.yml: no leg-6 branch found")
-    else:
-        branch = m.group(1)
-        if "select-load-sensitive-suites.sh only" not in branch:
-            fails.append("ci.yml: leg 6 does not take its files from the selector")
-        if not re.search(r"shard-by-cost\.sh 1 1 \S+ < \"\$RECDIR/sensitive\" > \"\$RECDIR/files\"", branch):
-            fails.append("ci.yml: leg 6 does not order its files through the sharder (heaviest first)")
-        set_to = re.findall(r"^\s*WORKERS=(\S+)\s*$", branch, re.M)
-        if set_to != ["2"]:
-            fails.append(f"ci.yml: leg 6 sets WORKERS to {set_to}, not exactly 2")
-    if len(re.findall(r"^\s*WORKERS=[0-9]", ci, re.M)) != 1:
-        fails.append("ci.yml: a fixed WORKERS count is set outside the leg-6 branch")
-
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
     print(f"PASS: selector partitions ({len(listed)} listed of {len(discovered)} discovered), "
-          "fails loudly on a stale or duplicate entry; leg 6 runs heaviest first with exactly two workers")
+          "fails loudly (exit 3) on a stale or duplicate entry")
     return 0
 
 
