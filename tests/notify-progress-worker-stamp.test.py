@@ -11,6 +11,7 @@ import contextlib
 import io
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -135,11 +136,16 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.addCleanup(os.unlink, f.name)
         return f.name
 
-    def _send(self, argv, env=None):
+    def _send(self, argv, env=None, channel_envs=()):
         sent = []
-        # No real channels/<source>/.env may decide routability.
+        # No real channels/<source>/.env may decide routability; fixtures only.
         cfg = tempfile.mkdtemp()
-        self.addCleanup(os.rmdir, cfg)
+        self.addCleanup(shutil.rmtree, cfg)
+        for name in channel_envs:
+            d = os.path.join(cfg, "channels", name)
+            os.makedirs(d)
+            with open(os.path.join(d, ".env"), "w") as fh:
+                fh.write("REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=tok\n")
 
         def fake_post(url, payload, headers):
             sent.append(payload)
@@ -237,6 +243,32 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         f = self._task("id: task-2\nsource: voice\ninteraction_type: realtime_audio\n"
                        f"channel_id: {ROOM}\ntask: room ask\n")
         rc, sent, _ = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+
+    def test_local_voice_task_sends_nothing_even_with_a_configured_voice_channel(self):
+        f = self._task("id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
+                       "channel_id: local-voice\ntask: private ask\n")
+        rc, sent, err = self._send(["--task-file", f], channel_envs=("voice",))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("no bridge", err)
+
+    def test_onboarding_wizard_import_task_sends_nothing(self):
+        # The legacy desktop import writer; it has no delivery path.
+        f = self._task("id: task-claude-import-1\nsource: chat\ninteraction_type: message\n"
+                       "channel_id: onboarding-wizard\nuser_id: onboarding-wizard\n"
+                       "access_tier: owner\npriority: low\ntask: Run the import\n")
+        for envs in ((), ("chat",)):
+            rc, sent, err = self._send(["--task-file", f], channel_envs=envs)
+            self.assertEqual(rc, 0, envs)
+            self.assertEqual(sent, [], envs)
+            self.assertIn("no bridge", err)
+
+    def test_docked_voice_task_posts_with_a_configured_voice_channel(self):
+        f = self._task("id: task-2\nsource: voice\ninteraction_type: realtime_audio\n"
+                       f"channel_id: {ROOM}\ntask: room ask\n")
+        rc, sent, _ = self._send(["--task-file", f], channel_envs=("voice",))
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 

@@ -418,17 +418,29 @@ def upload_room_media(source: str, channel_id: str, path: str,
 
 
 _BUILTIN_SENDERS = frozenset({"slack", "discord", "telegram"})
+# Writers with no room or chat behind them: terminal chat, and the legacy
+# onboarding-wizard import task. Their tasks are answered through results/ only.
+_LOCAL_ONLY_SOURCES = frozenset({"chat"})
+_LOCAL_ONLY_CHANNELS = frozenset({"onboarding-wizard"})
 
 
-def _has_sender(source: str, channel: "str | None") -> bool:
-    """Whether this script can route the source: a built-in sender, a per-source
-    channels/<source>/.env, or the gateway route given a channel that is not local-*."""
+def _is_local_only(source: str, channel: "str | None") -> bool:
+    if source in _LOCAL_ONLY_SOURCES:
+        return True
+    # Local writers stamp placeholder channels (local-voice, local-chat).
+    return bool(channel) and (channel.startswith("local-") or channel in _LOCAL_ONLY_CHANNELS)
+
+
+def _delivery_route(source: str, channel: "str | None") -> "str | None":
+    """'builtin', 'gateway', or None when the task has no delivery path.
+    The local verdict is decided first: no configured sender may override it."""
+    if _is_local_only(source, channel):
+        return None
     if source in _BUILTIN_SENDERS:
-        return True
+        return "builtin"
     if _SOURCE_SLUG_RE.match(source) and _channel_env_path(source).is_file():
-        return True
-    # Local writers stamp placeholder channels (local-voice, local-chat): no room behind them.
-    return bool(channel) and not channel.startswith("local-")
+        return "gateway"
+    return "gateway" if channel else None
 
 
 def _derive_from_task_file(path: str) -> dict:
@@ -505,7 +517,7 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    if not _has_sender(source, channel):
+    if _delivery_route(source, channel) is None:
         print(f"[task-progress] source {source!r} has no bridge; nothing to send",
               file=sys.stderr)
         return 0
