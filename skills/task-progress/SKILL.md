@@ -76,7 +76,7 @@ annoying than silence for 2 minutes on a research task.
 ## How to use
 
 **Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
-`--thread-root` (from `thread_root:`, else `reply_to_event:`) and `--thread-ts` (from Slack's
+`--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
 `reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
 extract or remember by hand — including the thread, the field most often dropped. A task whose
 source has no bridge (`chat`, `local`) sends nothing and exits 0. Call **immediately after
@@ -130,7 +130,7 @@ For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` t
 | ag2space  | `channel_id:`       | `--channel-id`  |
 
 Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`.
-Optional for AG2 Space threading: `thread_root:` (falls back to `reply_to_event:` if absent) → `--thread-root`.
+Optional for AG2 Space threading: `thread_root:` (falls back to `source_message_id:`, the asking message — never `reply_to_event:`, the post the sender quoted) → `--thread-root`.
 
 ### AG2 Space rooms
 

@@ -443,7 +443,8 @@ def _derive_from_task_file(path: str) -> dict:
         "source": headers.get("source"),
         "channel_id": headers.get("channel_id") or headers.get("source_room_id"),
         "chat_id": headers.get("chat_id"),
-        "thread_root": headers.get("thread_root") or headers.get("reply_to_event"),
+        # The asking message, never reply_to_event (the post the sender quoted).
+        "thread_root": headers.get("thread_root") or headers.get("source_message_id"),
         # The Slack bridge writes reply_thread_ts; thread_ts is the generic key.
         "thread_ts": headers.get("reply_thread_ts") or headers.get("thread_ts"),
     }
