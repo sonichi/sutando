@@ -132,6 +132,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
+- **`pending_questions_ask.py`** — Ask the owner a pending question in a conversation he reads; the per-host pending-questions.md is the ledger of what was sent, not the channel.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.

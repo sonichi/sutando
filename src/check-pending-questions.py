@@ -22,6 +22,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from pending_questions_ask import SENT_QUIET_SEC, recently_sent  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -214,6 +215,12 @@ def get_waiting_questions():
             questions.append({"id": title[:40], "title": title,
                               "snippet": ask[:120], "body": body or title})
     return questions
+
+
+def due_for_reminder(questions, now=None):
+    """The subset the reminder may raise: an entry ask-owner sent to the owner
+    within SENT_QUIET_SEC was just asked in his conversation, so it is not new."""
+    return [q for q in questions if not recently_sent(q.get("body", ""), now)]
 
 
 def _last_notify_state():
@@ -561,6 +568,14 @@ def main():
     if not force and presenter_mode_active(WORKSPACE):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
+
+    if not force:
+        due = due_for_reminder(questions)
+        if not due:
+            print(f"(sent) {len(questions)} pending questions — every one was sent to "
+                  f"the owner within the last {SENT_QUIET_SEC // 60} min; skipping")
+            return
+        questions = due
 
     if not force and not should_notify(notify_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")

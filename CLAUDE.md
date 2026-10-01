@@ -242,13 +242,11 @@ Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop
 
 ## Pending decisions
 
-When you need user input on a decision or are blocked:
-1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
-2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
-4. Continue working on other things — don't block
+When you need the owner's word on a decision or are blocked:
+1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records the question at the top of the **per-host** `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`, where `personal_path("pending-questions.md")` and every reader — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — resolve it), sends it to the task's conversation (no `--task-file`: the owner's DM on his last-active bridge, via `results/proactive-*.txt`), stamps the send on the entry's `**Sent:**` line, and fires the macOS notification last, naming the fix when refused. A file line alone is a dead drop.
+2. Continue working on other things — don't block.
 
-On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
+On each proactive loop pass, check that file for unanswered items; `check-pending-questions.py` re-raises them, skipping ones sent within the hour.
 
 ## Task progress notifications
 
