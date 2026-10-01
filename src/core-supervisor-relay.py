@@ -275,14 +275,16 @@ def compose_message(signal: dict, surface: str = "") -> str:
 
 
 # ---- emit adapters (best-effort; a failed channel never crashes the cycle) --- #
-def _macos_notify(message: str) -> None:  # pragma: no cover - external I/O (osascript)
+def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osascript)
+    """True only when osascript ran and exited 0."""
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["osascript", "-e",
              f'display notification {json.dumps(message)} with title "Sutando · Agent Shepherd"'],
             capture_output=True, timeout=8)
+        return r.returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
@@ -340,17 +342,14 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    if macos:
-        _macos_notify(msg)
-    # Debounce only when delivery actually landed. If a channel was selected but
-    # its send failed, do NOT persist the hash — re-escalate next cycle so a
-    # transient/misconfigured channel can't permanently swallow the alert (macOS
-    # alone must not suppress the real channel). macOS-only (no channel selected)
-    # still debounces — the local notification IS the delivery there.
-    channel_ok = True
+    macos_ok = bool(_macos_notify(msg)) if macos else False
+    # Debounce only on a confirmed delivery: the selected channel when there is
+    # one (macOS alone must not suppress it), else the macOS notification.
     if source and channel:
-        channel_ok = _channel_notify(msg, source, channel)
-    if channel_ok:
+        delivered = _channel_notify(msg, source, channel)
+    else:
+        delivered = macos_ok
+    if delivered:
         _save_last_hash(state_file, new_hash)
     return msg
 

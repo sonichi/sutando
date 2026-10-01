@@ -418,11 +418,12 @@ class TestRunCycleAndCli(unittest.TestCase):
     def test_real_cycle_persists_and_debounces(self):
         with tempfile.TemporaryDirectory() as td:
             sf = os.path.join(td, "state", "relay.state")
-            first = run_cycle(_LOGIN, sf, macos=False)  # no channel → macOS suppressed, still decides
-            self.assertIsNotNone(first)
-            self.assertTrue(os.path.exists(sf))
-            second = run_cycle(_LOGIN, sf, macos=False)  # same prompt → suppressed
-            self.assertIsNone(second)
+            with patch.object(_mod, "_macos_notify", lambda m: True):
+                first = run_cycle(_LOGIN, sf, macos=True)  # macOS delivered → debounce
+                self.assertIsNotNone(first)
+                self.assertTrue(os.path.exists(sf))
+                second = run_cycle(_LOGIN, sf, macos=True)  # same prompt → suppressed
+                self.assertIsNone(second)
 
     def test_relative_state_file_still_debounces(self):
         # Regression: a cwd-relative --state-file (e.g. "relay.state") has an empty
@@ -433,11 +434,12 @@ class TestRunCycleAndCli(unittest.TestCase):
             cwd = os.getcwd()
             os.chdir(td)
             try:
-                first = run_cycle(_LOGIN, "relay.state", macos=False)
-                self.assertIsNotNone(first)
-                self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
-                second = run_cycle(_LOGIN, "relay.state", macos=False)  # same prompt → suppressed
-                self.assertIsNone(second)
+                with patch.object(_mod, "_macos_notify", lambda m: True):
+                    first = run_cycle(_LOGIN, "relay.state", macos=True)
+                    self.assertIsNotNone(first)
+                    self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
+                    second = run_cycle(_LOGIN, "relay.state", macos=True)  # same prompt → suppressed
+                    self.assertIsNone(second)
             finally:
                 os.chdir(cwd)
 
@@ -479,7 +481,7 @@ class TestRunCycleAndCli(unittest.TestCase):
             with open(sig, "w") as f:
                 f.write('{"state": "blocked-human", "prompt": "Log')  # truncated
             sent = []
-            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m)):
+            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m) or True):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
@@ -1136,6 +1138,57 @@ class TestNoRouteIsNeverDelivered(unittest.TestCase):
                 self.assertFalse(os.path.exists(sf), "a no-route send must not debounce")
         finally:
             _mod._macos_notify = orig_m
+
+
+class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
+    """The hash persists only after a delivery landed somewhere; a cycle that
+    reached no one must retry on the next tick."""
+
+    def _cycle(self, td, *, no_macos, macos_ok=True, channel_ok=None):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        argv = ["--signal", sig, "--state-file", state,
+                "--notify-source", "voice", "--notify-channel", "local-voice"]
+        if no_macos:
+            argv.append("--no-macos")
+        calls = []
+        with patch.object(_mod, "_macos_notify", lambda m: calls.append("macos") or macos_ok), \
+                patch.object(_mod, "_channel_notify", lambda m, s, c: calls.append("chan") or channel_ok), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = main(argv)
+        return rc, calls, os.path.exists(state), out.getvalue()
+
+    def test_no_route_with_no_macos_persists_nothing_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertEqual((rc, calls, persisted), (0, [], False))
+            self.assertIn("escalated:", out)
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertIn("escalated:", out, "the next cycle must retry, not be suppressed")
+            self.assertFalse(persisted)
+
+    def test_no_route_with_a_failed_macos_notification_persists_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, _ = self._cycle(td, no_macos=False, macos_ok=False)
+            self.assertEqual((calls, persisted), (["macos"], False))
+
+    def test_no_route_with_macos_delivered_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, _ = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertEqual((calls, persisted), (["macos"], True))
+            _, _, _, out = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertIn("no escalation", out, "a delivered alert is debounced")
+
+    def test_a_failed_channel_is_not_rescued_by_macos(self):
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "s.state")
+            with patch.object(_mod, "_macos_notify", lambda m: True), \
+                    patch.object(_mod, "_channel_notify", lambda m, s, c: False):
+                run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
+            self.assertFalse(os.path.exists(sf))
 
 
 if __name__ == "__main__":
