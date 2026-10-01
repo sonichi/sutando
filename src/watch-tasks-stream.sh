@@ -110,6 +110,36 @@ fi
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
+# An explicitly-set SUTANDO_INSTANCE_ID while serving the core's OWN
+# canonical inbox is cleared, never left as the calling shell's inherited
+# env. "the core's own inbox" is exactly the signal the identity-match check
+# a few hundred lines below already uses for the same purpose (basename ==
+# "tasks") -- reused here rather than reinvented. A manual or --force-restart
+# invocation issued from INSIDE another instance's own session inherits that
+# instance's SUTANDO_INSTANCE_ID even when --inbox explicitly names the
+# core's own tasks/ dir, so the new process watches the right directory while
+# believing it is that OTHER worker's own inbox-watcher -- it never loads the
+# core's routing config (the task-event-handler gate below) and silently
+# stops dispatching anything it sees. Observed in production 2026-09-30: pid
+# 1184's argv correctly read `--role session --inbox <core's workspace>/tasks`,
+# but its env carried a different worker's SUTANDO_INSTANCE_ID, inherited
+# from the shell that force-restarted it -- routing stalled with no error,
+# because every check below was individually correct given its (wrong) input.
+# Deliberately narrow: this says NOTHING about a <ws>/deliveries/<id> inbox.
+# There, the identity-match check below already decides whether a starter
+# whose SUTANDO_INSTANCE_ID disagrees with the inbox may act on it (it must
+# yield) -- correcting the env to match the inbox there would make a wrong
+# starter's identity agree with the inbox by fiat, defeating that very check.
+# An UNSET SUTANDO_INSTANCE_ID is also never touched: a core explicitly
+# overridden onto a deliveries/-shaped inbox (several tests do this) has no
+# ambient identity to begin with, and inventing one from path shape alone
+# would be a new, unforced assumption -- this only clears a value that was
+# actually asserted and is actually wrong for the inbox being served.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$(basename "$TASKS_DIR_ABS")" = "tasks" ]; then
+  echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID set while serving the core's own inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
+  unset SUTANDO_INSTANCE_ID
+fi
+
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
