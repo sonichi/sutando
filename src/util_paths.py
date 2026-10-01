@@ -154,6 +154,11 @@ def _host_label() -> str:
     return socket.gethostname().split(".")[0]
 
 
+def host_label() -> str:
+    """Public name for the per-host segment (`hosts/<host>/`)."""
+    return _host_label()
+
+
 def _private_machine_dir() -> Path | None:
     root = _memory_dir_env()
     if not root:

@@ -105,21 +105,16 @@ def write_pending_question(path: Path, title: str, body: str) -> None:
         sys.path.insert(0, str(repo / "src"))
     section = "## %s\n- asked: %s\n- source: engine-conflict-resolve\n\n%s\n\n" % (
         title, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), body.rstrip())
-    text = path.read_text() if path.is_file() else ""
-    insert_at = len(text)
     try:
-        import pending_questions_md as pq
-        m = pq.DIVIDER_RE.search(pq.mask_markup(text))
-        if m:
-            insert_at = m.start()
-    except Exception:
-        pass  # divider location is best-effort; appending is still a valid file
-    if insert_at == len(text) and text and not text.endswith("\n"):
-        section = "\n" + section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text[:insert_at] + section + text[insert_at:])
-    os.replace(tmp, path)
+        import pending_questions_ledger as ledger
+    except ImportError:  # no repo src/: an EOF append is still a valid file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(section)
+        return
+    err = ledger.insert_entry(path, section, where="above-divider")
+    if err:
+        raise OSError(err)
 
 
 def main() -> None:

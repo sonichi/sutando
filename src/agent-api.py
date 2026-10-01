@@ -143,6 +143,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
+import pending_questions_ledger as pq_ledger  # noqa: E402
 import pending_questions_triage as pq_triage  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from task_body_guard import header_safe_value  # noqa: E402
@@ -1436,14 +1437,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
                 if pq_file.exists():
-                    content = pq_file.read_text()
-                    # Same parser the ids were minted by — see parse_pending_questions.
-                    match = next(
-                        (q for q in parse_pending_questions(content) if q["id"] == qid),
-                        None,
-                    )
+                    found = {}
+
+                    def _answer(content):
+                        # Same parser the ids were minted by — see parse_pending_questions.
+                        found["q"] = next(
+                            (q for q in parse_pending_questions(content) if q["id"] == qid), None)
+                        return answer_pending_question(content, found["q"], answer) if found["q"] else content
+
+                    lock_err = pq_ledger.update(pq_file, _answer)
+                    if lock_err:
+                        self.send_json(503, {"error": lock_err})
+                        return
+                    match = found.get("q")
                     if match:
-                        pq_file.write_text(answer_pending_question(content, match, answer))
                         ts = int(datetime.now().timestamp() * 1000)
                         safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
                         if safe_qid:
