@@ -35,6 +35,7 @@ from local_task_protocol import parse_task_headers_lenient
 from pending_questions_md import mask_markup
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
+from undelivered_quarantine import quarantine_dir
 from util_paths import host_label, personal_path
 
 # A question queued and drained this recently is not re-raised by the reminder.
@@ -99,13 +100,15 @@ def sent_at(body: str) -> Optional[float]:
 
 
 def drained(results_dir: Path, name: str) -> bool:
-    """A queued file some drain took: neither the file nor any claim of it remains
-    (`.sending` from discord/telegram/slack, `.sending.<pid>` from ag2space)."""
+    """A queued file some drain took: neither the file, any claim of it (`.sending`,
+    `.sending.<pid>`) nor a parked copy in the undelivered/ quarantine remains."""
     if not name.startswith("proactive-"):
         return False
     p = Path(results_dir) / name
-    claims = Path(results_dir).glob(glob.escape(p.stem) + ".sending*")
-    return not p.exists() and next(claims, None) is None
+    stem = glob.escape(p.stem)
+    left = [Path(results_dir).glob(stem + ".sending*"),
+            quarantine_dir(Path(results_dir)).glob(stem + "*")]
+    return not p.exists() and all(next(g, None) is None for g in left)
 
 
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,

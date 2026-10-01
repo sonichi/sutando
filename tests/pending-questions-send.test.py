@@ -510,19 +510,33 @@ class TestEdges(_Workspace):
         import util_paths
         self.assertEqual(util_paths.host_label(), HOST)
 
-    def test_engine_conflict_deliver_without_the_ledger_module_appends(self):
+    def test_engine_conflict_deliver_without_the_ledger_module_fails_loudly(self):
         spec = importlib.util.spec_from_file_location(
             "ecr_deliver2", REPO / "skills" / "engine-conflict-resolve" / "scripts" / "deliver.py")
         sys.path.insert(0, str(REPO / "skills" / "engine-conflict-resolve" / "scripts"))
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
-        self.pq.write_text("## a — x\n")
+        self.pq.write_text("# Resolved\n\n## [RESOLVED] old\n")
         with mock.patch.dict(sys.modules, {"pending_questions_ledger": None}):
-            m.write_pending_question(self.pq, "Engine conflict", "proposal")
-        self.assertIn("## Engine conflict", self.pq.read_text())
+            with self.assertRaisesRegex(OSError, "pending_questions_ledger unavailable"):
+                m.write_pending_question(self.pq, "Engine conflict", "proposal")
+        self.assertEqual(self.pq.read_text(), "# Resolved\n\n## [RESOLVED] old\n", "no direct write")
+        m.write_pending_question(self.pq, "Engine conflict", "proposal")
+        self.assertIn("## Engine conflict", active_region(self.pq.read_text()),
+                      "through the writer, a divider-first ledger keeps it active")
 
 
 class TestReminder(_Workspace):
+    def _park_terminal_failure(self, f):
+        """The production lifecycle: claim, then a terminal send failure parks it."""
+        from send_failure_policy import resolve_failed_send
+        claim = f.with_suffix(f".sending.{os.getpid()}")
+        f.rename(claim)
+        outcome = resolve_failed_send(claim, RuntimeError("terminal"), {}, progressed=True,
+                                      body=f, undelivered_dir=self.ws / "results" / "undelivered")
+        self.assertEqual(outcome, "parked")
+        self.assertFalse(f.exists() or claim.exists())
+
     def _main(self):
         cpq = _cpq(self.pq, self.ws)
         cpq.notify_macos = lambda count, titles: True
@@ -540,14 +554,17 @@ class TestReminder(_Workspace):
         self.assertTrue(any(f.name.startswith("proactive-pending-q-") for f in self._proactive()))
 
     def test_a_claimed_in_flight_file_is_not_yet_delivered(self):
-        for suffix in (".sending", f".sending.{os.getpid()}"):
+        for suffix in (".sending", f".sending.{os.getpid()}", "undelivered"):
             with self.subTest(claim=suffix):
                 self._drain()
                 for f in (self.ws / "results").iterdir():
                     f.unlink()
                 pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
                 f = next(p for p in self._proactive() if p.name.endswith(".txt"))
-                f.rename(f.with_suffix(suffix))
+                if suffix == "undelivered":
+                    self._park_terminal_failure(f)
+                else:
+                    f.rename(f.with_suffix(suffix))
                 body = _cpq(self.pq).get_waiting_questions()[0]["body"]
                 self.assertFalse(pqa.asked_recently(body, self.ws / "results"),
                                  f"a {suffix} claim is in flight, not drained")

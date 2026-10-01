@@ -107,11 +107,8 @@ def write_pending_question(path: Path, title: str, body: str) -> None:
         title, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), body.rstrip())
     try:
         import pending_questions_ledger as ledger
-    except ImportError:  # no repo src/: an EOF append is still a valid file
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(section)
-        return
+    except ImportError as e:  # the ledger has one writer; never a second, unlocked one
+        raise OSError(f"pending_questions_ledger unavailable ({e}); nothing written") from e
     err = ledger.insert_entry(path, section, where="above-divider")
     if err:
         raise OSError(err)
