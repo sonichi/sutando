@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -140,6 +141,10 @@ class OnboardingSeedTests(unittest.TestCase):
         # must make the assertion above actually fail.
         path = self._path("onboarding.json")
         Path(path).write_text(json.dumps({"consumerOnboardingComplete": False}))
+        writers = 8
+        # All writers finish staging before any renames, so the collision
+        # the shared name allows happens on every run, not only on a slow disk.
+        staged = threading.Barrier(writers, timeout=30)
 
         def naive_seed(p):
             with open(p) as f:
@@ -149,6 +154,7 @@ class OnboardingSeedTests(unittest.TestCase):
             tmp = p + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f)
+            staged.wait()
             os.replace(tmp, p)
 
         def _call(_):
@@ -156,17 +162,19 @@ class OnboardingSeedTests(unittest.TestCase):
                 naive_seed(path)
                 return None
             except Exception as e:
-                return repr(e)
+                return e
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            errors = list(ex.map(_call, range(8)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=writers) as ex:
+            errors = list(ex.map(_call, range(writers)))
         failures = [e for e in errors if e is not None]
-        self.assertTrue(
-            failures,
-            "mutation control: the naive shared-staging-name writer should "
-            "race and fail at least once — if it doesn't, this harness "
-            "isn't discriminating atomic from non-atomic writers",
+        self.assertEqual(
+            len(failures), writers - 1,
+            "mutation control: with one shared staging name only the first "
+            "rename can win; every other writer must fail — if it doesn't, "
+            f"this harness isn't discriminating atomic from non-atomic writers: {failures!r}",
         )
+        for e in failures:
+            self.assertIsInstance(e, FileNotFoundError, repr(e))
 
     def test_seed_preserves_existing_file_mode_under_broad_umask(self):
         # A restrictive pre-existing cache file must not be broadened by the
