@@ -12,6 +12,7 @@ import io
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -124,13 +125,15 @@ class EventIdParityTests(unittest.TestCase):
                 self.assertEqual(sent[0]["thread_root"], expected, repr(value))
 
 class NotifyTaskFileDeriveTests(unittest.TestCase):
-    """--task-file is the fix for a thread-root omission recurring even after the flag
-    existed (2026-10-01): derive source/channel/thread_root/thread_ts from the task file
-    itself, so there is nothing left for the caller to remember to pass by hand."""
+    """--task-file derives source/channel/thread from the task file's own headers;
+    an explicit flag, even an empty one, wins over what the file carries."""
 
-    def _write(self, tmp_path, body):
-        tmp_path.write_text(body)
-        return str(tmp_path)
+    def _task(self, body):
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        f.write(body)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
 
     def _send(self, argv, env=None):
         sent = []
@@ -140,6 +143,7 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
             return True
 
         with mock.patch.object(notify, "_post", fake_post), \
+                mock.patch.object(notify, "_token", lambda source, var: "tok"), \
                 mock.patch.dict(os.environ, {**_GW_ENV, **(env or {})}, clear=False), \
                 mock.patch.object(sys, "argv", ["notify.py", "--message", "on it", *argv]):
             for k in ("SUTANDO_WORKER_ID", "SUTANDO_CORE_ID", "SUTANDO_WORKER_SEAT"):
@@ -150,41 +154,59 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         return rc, sent, err.getvalue()
 
     def test_task_mid_file_derives_source_channel_and_thread_root(self):
-        # headers both before AND after `task:` -- the real shape of an ag2space DM
-        # envelope (thread_root follows task:), not the strict task-last form.
-        f = pathlib.Path("/tmp/notify-task-file-test-mid.txt")
-        self.addCleanup(f.unlink, missing_ok=True)
-        self._write(f, "id: task-x\nsource: local-ag2space\nchannel_id: !r:ag2.space\n"
+        # Headers both before AND after `task:` (ag2space DM envelope shape).
+        f = self._task("id: task-x\nsource: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "task: some owner message\nthread_root: $root123\n")
-        rc, sent, _ = self._send(["--task-file", str(f)])
+        rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
                                  "thread_root": "$root123"}])
 
+    def test_slack_task_derives_reply_thread_ts_into_thread_ts(self):
+        # The Slack bridge's header is reply_thread_ts, not thread_ts.
+        f = self._task("id: task-s\nsource: slack\nchannel_id: C0SLACK\n"
+                       "reply_thread_ts: 1700.0001\ntask: hi\n")
+        rc, sent, _ = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["channel"], "C0SLACK")
+        self.assertEqual(sent[0]["thread_ts"], "1700.0001")
+
     def test_explicit_flag_overrides_what_the_task_file_carries(self):
-        f = pathlib.Path("/tmp/notify-task-file-test-override.txt")
-        self.addCleanup(f.unlink, missing_ok=True)
-        self._write(f, "source: local-ag2space\nchannel_id: !r:ag2.space\n"
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "task: x\nthread_root: $fromfile\n")
-        rc, sent, _ = self._send(["--task-file", str(f), "--thread-root", "$explicit"])
+        rc, sent, _ = self._send(["--task-file", f, "--thread-root", "$explicit"])
         self.assertEqual(rc, 0)
         self.assertEqual(sent[0]["thread_root"], "$explicit")
 
+    def test_empty_explicit_thread_root_opts_out_of_the_file_thread(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "task: x\nthread_root: $fromfile\n")
+        rc, sent, _ = self._send(["--task-file", f, "--thread-root", ""])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+
     def test_task_file_with_no_thread_root_falls_back_to_reply_to_event(self):
-        f = pathlib.Path("/tmp/notify-task-file-test-replyto.txt")
-        self.addCleanup(f.unlink, missing_ok=True)
-        self._write(f, "source: local-ag2space\nchannel_id: !r:ag2.space\n"
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "task: x\nreply_to_event: $replyevt\n")
-        rc, sent, _ = self._send(["--task-file", str(f)])
+        rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
         self.assertEqual(sent[0]["thread_root"], "$replyevt")
 
     def test_missing_task_file_falls_back_to_explicit_flags_without_crashing(self):
-        rc, sent, err = self._send(["--task-file", "/tmp/does-not-exist-xyz.txt",
+        missing = os.path.join(tempfile.gettempdir(), "notify-does-not-exist-xyz.txt")
+        rc, sent, err = self._send(["--task-file", missing,
                                     "--source", "local-ag2space", "--channel-id", ROOM])
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
         self.assertIn("unreadable", err)
+
+    def test_chat_task_has_no_bridge_and_sends_nothing(self):
+        f = self._task("id: task-chat-1\nsource: chat\nchannel_id: local-chat\n"
+                       "access_tier: owner\ntask: do a thing\n")
+        rc, sent, err = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("no bridge", err)
 
     def test_neither_task_file_nor_source_refuses_cleanly(self):
         rc, sent, err = self._send([])

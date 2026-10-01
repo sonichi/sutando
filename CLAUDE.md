@@ -278,11 +278,7 @@ python3 skills/task-progress/scripts/notify.py \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-`--task-file` derives `source`, `channel_id`/`chat_id`, and the thread (`thread_root`, falling
-back to `reply_to_event`, or `thread_ts` for Slack) straight from that task file's own headers —
-nothing to read or pass by hand, including the thread, which is the field most often dropped by
-hand-extraction. Pass `--source`/`--channel-id`/etc. explicitly only when there is no task file
-to point at; any of them given alongside `--task-file` still overrides what the file carries.
+`--task-file` derives `source`, `channel_id`/`chat_id` and the thread (`thread_root`; Slack `reply_thread_ts`) from the task's headers; an explicit flag overrides it. Without a task file pass `--source <source> --channel-id <channel_id>` (`--chat-id` Telegram; `--thread-ts <reply_thread_ts>` Slack; `--thread-root '<thread_root>'` AG2 Space); an AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>`.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
 pending, the first line to that task's conversation names the position: one ahead, "Got it, right
