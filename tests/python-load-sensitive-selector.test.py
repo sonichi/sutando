@@ -11,6 +11,7 @@ discovery, so a rename fails here before it fails in CI.
 
 Run: python3 tests/python-load-sensitive-selector.test.py
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -79,12 +80,27 @@ def main() -> int:
     if sorted(rest.stdout.split() + r.stdout.split()) != sorted(discovered):
         fails.append("leg 6 + legs 1-5 is not the real discovery list")
 
+    # Leg 6 is the only leg that sets its own worker count: exactly two, and only there.
+    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+    m = re.search(r'if \[ "\$\{SHARD:-1\}" = 6 \]; then\n(.*?)\n\s*else\n', ci, re.S)
+    if not m:
+        fails.append("ci.yml: no leg-6 branch found")
+    else:
+        branch = m.group(1)
+        if "select-load-sensitive-suites.sh only" not in branch:
+            fails.append("ci.yml: leg 6 does not take its files from the selector")
+        set_to = re.findall(r"^\s*WORKERS=(\S+)\s*$", branch, re.M)
+        if set_to != ["2"]:
+            fails.append(f"ci.yml: leg 6 sets WORKERS to {set_to}, not exactly 2")
+    if len(re.findall(r"^\s*WORKERS=[0-9]", ci, re.M)) != 1:
+        fails.append("ci.yml: a fixed WORKERS count is set outside the leg-6 branch")
+
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
     print(f"PASS: selector partitions ({len(listed)} listed of {len(discovered)} discovered), "
-          "fails loudly on a stale or duplicate entry")
+          "fails loudly on a stale or duplicate entry; leg 6 runs with exactly two workers")
     return 0
 
 

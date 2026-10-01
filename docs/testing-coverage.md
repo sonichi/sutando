@@ -43,7 +43,7 @@ failure. The same content lands in the Actions job summary.
 
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
-as three matrix legs balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from a job log) and
+as six matrix legs: legs 1-5 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 6 the load-sensitive suites, two at a time. They
 upload their combined data as `coverage-data-<shard>`; the `coverage-gate`
 job (`needs:` that job, `pull_request` only — where fork PRs get a read-only
 token) downloads every leg, combines the fragments into one `.coverage` +
@@ -82,3 +82,23 @@ experimentation. CI always runs the default (95). If a specific PR
 legitimately cannot meet the bar (rare — e.g. a pure launchd-installer
 change), the owner can merge over a red gate; the gate is a required
 conversation, not an unappealable veto.
+
+### Load-sensitive suites (leg 6)
+
+`tests/python-load-sensitive-suites.txt` lists the suites CI keeps off the shared
+four-worker legs; `scripts/select-load-sensitive-suites.sh` is the only reader, and
+an entry that is not discovered or is listed twice fails the leg (exit 3).
+
+**Admission rule.** A `watch-tasks-stream-*` suite is added when it failed a CI run
+on a missed wait window while sharing a leg with heavier suites, cited by run id.
+A suite split out of an admitted one, sharing its harness, is admitted with it.
+Current entries and their evidence:
+
+| suite | evidence |
+|---|---|
+| bare-directory-event | CI runs 36881230233 and its predecessor, PR #5000 at 51dba11ab |
+| readiness-window-decision-instant | CI run 36888802147 attempt 2, PR #5000 at 7dee69d8c |
+| readiness-window-held-task-recovery, -unreadable-config | split with decision-instant from one suite (#4630), same harness |
+| config-hot-reload, inbox-and-workspace-env, malformed-roster-row, priority-sweep, sentinel-ownership | failed together under host load, issue #4862 (no CI run yet) |
+| handler-terminal-rc | the #4855 flake, same family |
+
