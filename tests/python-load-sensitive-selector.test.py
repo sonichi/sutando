@@ -89,6 +89,8 @@ def main() -> int:
         branch = m.group(1)
         if "select-load-sensitive-suites.sh only" not in branch:
             fails.append("ci.yml: leg 6 does not take its files from the selector")
+        if not re.search(r"shard-by-cost\.sh 1 1 \S+ < \"\$RECDIR/sensitive\" > \"\$RECDIR/files\"", branch):
+            fails.append("ci.yml: leg 6 does not order its files through the sharder (heaviest first)")
         set_to = re.findall(r"^\s*WORKERS=(\S+)\s*$", branch, re.M)
         if set_to != ["2"]:
             fails.append(f"ci.yml: leg 6 sets WORKERS to {set_to}, not exactly 2")
@@ -100,7 +102,7 @@ def main() -> int:
     if fails:
         return 1
     print(f"PASS: selector partitions ({len(listed)} listed of {len(discovered)} discovered), "
-          "fails loudly on a stale or duplicate entry; leg 6 runs with exactly two workers")
+          "fails loudly on a stale or duplicate entry; leg 6 runs heaviest first with exactly two workers")
     return 0
 
 
