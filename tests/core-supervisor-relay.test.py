@@ -34,6 +34,7 @@ main = _mod.main
 resolve_active_target = _mod.resolve_active_target
 
 import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
+import progress_route  # noqa: E402 — the shared route verdict the relay delegates to
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
@@ -1036,6 +1037,105 @@ class TestTargetIsRunnable(unittest.TestCase):
             msg = compose_message(_HUNG)
         self.assertIn("where the core is running", msg)
         self.assertNotIn("tmux -S", msg)
+
+
+class TestProgressRouteDelegation(unittest.TestCase):
+    """Routability is src/progress_route.py's verdict, the one notify.py applies;
+    a private copy in the relay would drift from it."""
+
+    def _reload(self):
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_route", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _activity(self, td, obj):
+        p = os.path.join(td, "last-owner-activity.json")
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        return p
+
+    def test_binds_the_shared_route_by_identity(self):
+        self.assertIs(_mod._delivery_route, progress_route.delivery_route)
+
+    def test_verdict_follows_the_shared_function(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._activity(td, {"channel": "discord", "channel_id": "42"})
+            with patch.object(progress_route, "delivery_route", return_value=None):
+                self.assertEqual(self._reload().resolve_active_target(p), ("", ""))
+            self.assertEqual(self._reload().resolve_active_target(p), ("discord", "42"))
+
+    def test_unimportable_route_fails_closed(self):
+        with patch.dict(sys.modules, {"progress_route": None}):
+            fn = _mod._load_progress_route()
+        self.assertIsNone(fn("discord", "42"))
+
+    def test_explicit_no_route_target_degrades_to_macos_only(self):
+        calls = []
+        orig_c = _mod._channel_notify
+        _mod._channel_notify = lambda m, s, c: calls.append((s, c)) or True
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sig = os.path.join(td, "core-supervisor.json")
+                with open(sig, "w") as f:
+                    json.dump(_LOGIN, f)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = main(["--signal", sig, "--notify-source", "voice",
+                               "--notify-channel", "local-voice", "--no-macos",
+                               "--state-file", os.path.join(td, "s.state")])
+        finally:
+            _mod._channel_notify = orig_c
+        self.assertEqual((rc, calls), (0, []))
+        self.assertIn("no delivery path", err.getvalue())
+
+
+class TestNoRouteIsNeverDelivered(unittest.TestCase):
+    """A configured custom source whose channel is no room id: notify.py sends
+    nothing, so the relay must neither select it nor debounce on it."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        os.makedirs(os.path.join(self.cfg, "channels", "dev-ag2space"))
+        with open(os.path.join(self.cfg, "channels", "dev-ag2space", ".env"), "w") as f:
+            f.write("REMOTE_TASK_URL=http://127.0.0.1:9\nREMOTE_TASK_TOKEN=x\n")
+        scripts = os.path.join(self.cfg, "skills", "task-progress", "scripts")
+        os.makedirs(scripts)
+        os.symlink(os.path.realpath(os.path.join(_HERE, "..", "skills", "task-progress",
+                                                 "scripts", "notify.py")),
+                   os.path.join(scripts, "notify.py"))
+        saved = {k: os.environ.get(k) for k in
+                 ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def test_relay_does_not_select_a_no_route_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "C0123"}, f)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
+    def test_a_no_route_send_does_not_debounce(self):
+        orig_m = _mod._macos_notify
+        _mod._macos_notify = lambda m: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "s.state")
+                self.assertFalse(_mod._channel_notify("x", "dev-ag2space", "C0123"))
+                run_cycle(_LOGIN, sf, macos=False, source="dev-ag2space", channel="C0123")
+                self.assertFalse(os.path.exists(sf), "a no-route send must not debounce")
+        finally:
+            _mod._macos_notify = orig_m
 
 
 if __name__ == "__main__":

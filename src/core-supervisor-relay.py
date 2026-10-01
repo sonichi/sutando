@@ -288,7 +288,7 @@ def _macos_notify(message: str) -> None:  # pragma: no cover - external I/O (osa
 def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
     """Route through the existing task-progress relay (notify.py). Returns True
     only when the send actually landed (notify.py exit 0), so the caller can
-    decide whether to debounce — a failed channel send must NOT suppress a retry."""
+    decide whether to debounce — a failed or no-route send must NOT suppress a retry."""
     notify = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", ""),
                           "skills", "task-progress", "scripts", "notify.py")
     if not os.path.isfile(notify):
@@ -355,14 +355,23 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     return msg
 
 
-# Surfaces task-progress notify.py can actually DELIVER to. Other values that
-# land in last-owner-activity.json ("voice", "github-commits", …) are activity
-# signals, not deliverable channels — never route an escalation to them.
-# Beyond the static set, any source with a configured channel dir
-# ($CLAUDE_CONFIG_DIR/channels/<source>/ containing a *.env) counts — that
-# mirrors notify.py's own resolution rule, so a NEW homeserver bridge (e.g.
-# "dev-ag2space") becomes routable by creating its config dir, no code change.
+# Routability is src/progress_route.py's verdict; beyond it a source must be
+# configured: these are, any other needs a contained channels/<source>/.env.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+
+def _load_progress_route():
+    """The shared route verdict, or a fail-closed stub that routes nothing."""
+    try:
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from progress_route import delivery_route  # type: ignore
+        return delivery_route
+    except Exception:
+        return lambda source, channel: None
+
+
+_delivery_route = _load_progress_route()
 
 # Must stay identical to notify.py's slug rule (sender/probe alignment): dots
 # only BETWEEN alphanumerics, so traversal shapes never reach the path probe.
@@ -388,7 +397,9 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _is_deliverable(source):
+def _is_deliverable(source, channel):
+    if not channel or _delivery_route(source, channel) is None:
+        return False
     if source in _DELIVERABLE_SURFACES:
         return True
     if not source or not _SOURCE_SLUG_RE.match(source):
@@ -422,7 +433,7 @@ def resolve_active_target(activity_path):
         return "", ""
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
-    if _is_deliverable(source) and channel:
+    if _is_deliverable(source, channel):
         return source, channel
     return "", ""
 
@@ -444,6 +455,10 @@ def main(argv=None):
     source, channel = a.notify_source, a.notify_channel
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
+    if source and channel and _delivery_route(source, channel) is None:
+        print(f"--notify-source {source!r} / --notify-channel {channel!r} has no delivery "
+              "path; escalating by macOS notification only", file=sys.stderr)
+        source = channel = ""
 
     try:
         with open(a.signal) as f:

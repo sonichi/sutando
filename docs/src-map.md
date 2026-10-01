@@ -142,6 +142,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.
+- **`progress_route.py`** — Where a task-progress update may be delivered: one provider-neutral verdict.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`prompt_excerpt.py`** — What the owner must read from a blocked terminal pane: the prompt minus the chrome around it.
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.

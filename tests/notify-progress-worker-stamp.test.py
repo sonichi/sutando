@@ -233,7 +233,7 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         f = self._task("id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
                        "media_form: live_stream\nchannel_id: local-voice\ntask: private ask\n")
         rc, sent, err = self._send(["--task-file", f])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, notify.NO_ROUTE_EXIT)
         self.assertEqual(sent, [])
         self.assertIn("no delivery path", err)
 
@@ -247,7 +247,7 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
     def test_unknown_source_without_a_room_sends_nothing(self):
         f = self._task("id: task-u\nsource: some-local-producer\nchannel_id: local-x\ntask: x\n")
         rc, sent, err = self._send(["--task-file", f])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, notify.NO_ROUTE_EXIT)
         self.assertEqual(sent, [])
         self.assertIn("no delivery path", err)
 
@@ -255,7 +255,7 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         f = self._task("id: task-chat-1\nsource: chat\nchannel_id: local-chat\n"
                        "access_tier: owner\ntask: do a thing\n")
         rc, sent, err = self._send(["--task-file", f])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, notify.NO_ROUTE_EXIT)
         self.assertEqual(sent, [])
         self.assertIn("no delivery path", err)
 
@@ -281,6 +281,22 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(sent, [])
         self.assertIn("--source is required", err)
+
+
+class SharedRouteDelegationTests(unittest.TestCase):
+    """notify.py applies src/progress_route.py's verdict; a private copy fails here."""
+
+    def test_binds_the_shared_route_by_identity(self):
+        import progress_route
+        self.assertIs(notify._delivery_route, progress_route.delivery_route)
+        self.assertIs(notify._no_route_message, progress_route.no_route_message)
+        self.assertEqual(notify.NO_ROUTE_EXIT, progress_route.NO_ROUTE_EXIT)
+
+    def test_unimportable_route_fails_closed(self):
+        with mock.patch.dict(sys.modules, {"progress_route": None}):
+            route, _, code = notify._load_progress_route()
+        self.assertIsNone(route("slack", "C1"))
+        self.assertNotEqual(code, 0)
 
 
 class NotifyDeliveryRouteTests(unittest.TestCase):
@@ -348,18 +364,18 @@ class NotifyDeliveryRouteTests(unittest.TestCase):
             for name, body in self.LOCAL.items():
                 with self.subTest(mode=mode, shape=name):
                     rc, calls = self._run(body, mode)
-                    self.assertEqual(rc, 0)
+                    self.assertEqual(rc, notify.NO_ROUTE_EXIT)
                     self.assertEqual(calls, [])
 
     def test_runtime_api_task_sends_nothing(self):
         for mode in ("per-source-env", "global-gateway"):
             rc, calls = self._run(self.LOCAL["runtime-api"], mode)
-            self.assertEqual((rc, calls), (0, []), mode)
+            self.assertEqual((rc, calls), (notify.NO_ROUTE_EXIT, []), mode)
 
     def test_unknown_source_sends_nothing(self):
         for mode in ("per-source-env", "global-gateway"):
             rc, calls = self._run(self.LOCAL["some-new-writer"], mode)
-            self.assertEqual((rc, calls), (0, []), mode)
+            self.assertEqual((rc, calls), (notify.NO_ROUTE_EXIT, []), mode)
 
     def test_malformed_room_ids_send_nothing(self):
         # A gateway room id is strictly `!opaque:server`; anything looser is local.
@@ -370,8 +386,13 @@ class NotifyDeliveryRouteTests(unittest.TestCase):
                 with self.subTest(channel=channel, mode=mode):
                     body = f"id: task-m\nsource: ag2space\nchannel_id: {channel}\ntask: x\n"
                     rc, calls = self._run(body, mode)
-                    self.assertEqual((rc, calls), (0, []))
+                    self.assertEqual((rc, calls), (notify.NO_ROUTE_EXIT, []))
             with self.subTest(channel=channel, verdict=True):
+                self.assertIsNone(notify._delivery_route("ag2space", channel))
+
+    def test_a_trailing_newline_is_not_a_room_id(self):
+        for channel in ("!r:ag2.space\n", "!" + _V12 + "\n"):
+            with self.subTest(channel=channel):
                 self.assertIsNone(notify._delivery_route("ag2space", channel))
 
     def test_room_v12_ids_without_a_server_send(self):

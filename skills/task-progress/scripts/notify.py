@@ -417,24 +417,21 @@ def upload_room_media(source: str, channel_id: str, path: str,
     return (True, "") if ok else (False, "upload failed")
 
 
-_BUILTIN_SENDERS = frozenset({"slack", "discord", "telegram"})
-# The gateway only posts into Matrix rooms: `!opaque:server`, or a room v12 id
-# (`!` + unpadded base64url SHA-256, 43 chars, no server). Provider labels vary.
-_GATEWAY_ROOM_RE = re.compile(r"^!(?:[^:\s]+:\S+|[A-Za-z0-9_-]{43})$")
+def _load_progress_route():
+    """The shared route verdict (src/progress_route.py), or a fail-closed stub:
+    an unimportable policy routes nothing rather than guessing."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        import progress_route  # type: ignore
+        return progress_route.delivery_route, progress_route.no_route_message, \
+            progress_route.NO_ROUTE_EXIT
+    except Exception:
+        return (lambda source, channel: None,
+                lambda source, channel: f"[task-progress] route policy unavailable; "
+                                        f"{source!r} / {channel!r} not sent", 3)
 
 
-def _delivery_route(source: str, channel: "str | None") -> "str | None":
-    """'builtin', 'gateway', or None. Local unless positively a delivering bridge
-    task: placeholder channels and unknown writers send nothing, whatever is configured."""
-    if source in _BUILTIN_SENDERS:
-        return "builtin"
-    if channel and _GATEWAY_ROOM_RE.match(channel):
-        return "gateway"
-    return None
-
-
-def _no_route_message(source: str, channel: "str | None") -> str:
-    return f"[task-progress] {source!r} / {channel!r} has no delivery path; nothing to send"
+_delivery_route, _no_route_message, NO_ROUTE_EXIT = _load_progress_route()
 
 
 def _derive_from_task_file(path: str) -> dict:
@@ -513,7 +510,7 @@ def main() -> int:
 
     if _delivery_route(source, channel) is None:
         print(_no_route_message(source, channel), file=sys.stderr)
-        return 0
+        return NO_ROUTE_EXIT
 
     if not channel:
         print("[task-progress] --channel-id (or --chat-id) is required "

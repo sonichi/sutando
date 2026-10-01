@@ -81,7 +81,7 @@ annoying than silence for 2 minutes on a research task.
 extract or remember by hand — including the thread, the field most often dropped. Only a
 delivering bridge task sends: `slack`/`discord`/`telegram`, or a gateway room id (`!room:server`, or a server-less room v12 id,
 e.g. AG2 Space or a docked voice task). Every other task — undocked `voice`, `chat`, `cron`,
-`runtime-api`, an unknown writer — sends nothing and exits 0, whatever channel config exists. Call
+`runtime-api`, an unknown writer — sends nothing and exits 3 (no delivery path; not a failure of the task), whatever channel config exists. The verdict is `src/progress_route.py`. Call
 **immediately after reading the task**:
 
 ```bash
@@ -226,5 +226,6 @@ For intentional plain-text handles that should not ping anyone, pass
 ## Fail-open
 
 A failed send (missing token, network error) prints a warning to stderr and exits 1.
+A task with no delivery path sends nothing and exits 3, so a caller never reads it as delivered.
 **Always continue working on the task regardless of exit code.** The notification is
 best-effort — task delivery via the result file is the authoritative path.
