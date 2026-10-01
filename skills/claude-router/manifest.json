@@ -1,10 +1,10 @@
 {
   "name": "claude-router",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Choose between the local Codex CLI, Gemini CLI, and Pi CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation.",
+  "description": "Choose between the local Codex CLI, Antigravity CLI (agy, Gemini-backed; the agy skill), and Pi CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

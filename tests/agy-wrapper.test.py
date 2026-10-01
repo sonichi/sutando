@@ -1,4 +1,4 @@
-"""Smoke test for skills/claude-gemini/scripts/gemini-run.sh.
+"""Smoke test for skills/agy/scripts/gemini-run.sh.
 
 Mocks the agy/gemini binaries and verifies:
   1. `agy` on PATH is used directly, with --approval-mode translated to agy's
@@ -13,7 +13,7 @@ Mocks the agy/gemini binaries and verifies:
   4. An unknown --approval-mode is rejected regardless of backend.
   5. Prompt is required unless --check is used.
 
-Run: python3 tests/claude-gemini-wrapper.test.py
+Run: python3 tests/agy-wrapper.test.py
 """
 import os
 import subprocess
@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "skills" / "claude-gemini" / "scripts" / "gemini-run.sh"
+SCRIPT = REPO / "skills" / "agy" / "scripts" / "gemini-run.sh"
 
 MOCK_BODY = "#!/bin/bash\nprintf '%s\\n' \"$@\" >\"$MOCK_OUT\"\n"
 
