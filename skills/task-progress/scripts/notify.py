@@ -418,29 +418,19 @@ def upload_room_media(source: str, channel_id: str, path: str,
 
 
 _BUILTIN_SENDERS = frozenset({"slack", "discord", "telegram"})
-# Writers with no room or chat behind them: terminal chat, and the legacy
-# onboarding-wizard import task. Their tasks are answered through results/ only.
-_LOCAL_ONLY_SOURCES = frozenset({"chat"})
-_LOCAL_ONLY_CHANNELS = frozenset({"onboarding-wizard"})
-
-
-def _is_local_only(source: str, channel: "str | None") -> bool:
-    if source in _LOCAL_ONLY_SOURCES:
-        return True
-    # Local writers stamp placeholder channels (local-voice, local-chat).
-    return bool(channel) and (channel.startswith("local-") or channel in _LOCAL_ONLY_CHANNELS)
+# The gateway only posts into Matrix rooms (`!opaque:server`); its provider
+# label is install-configured, so the room id is the positive evidence.
+_GATEWAY_ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
 
 
 def _delivery_route(source: str, channel: "str | None") -> "str | None":
-    """'builtin', 'gateway', or None when the task has no delivery path.
-    The local verdict is decided first: no configured sender may override it."""
-    if _is_local_only(source, channel):
-        return None
+    """'builtin', 'gateway', or None. Local unless positively a delivering bridge
+    task: placeholder channels and unknown writers send nothing, whatever is configured."""
     if source in _BUILTIN_SENDERS:
         return "builtin"
-    if _SOURCE_SLUG_RE.match(source) and _channel_env_path(source).is_file():
+    if channel and _GATEWAY_ROOM_RE.match(channel):
         return "gateway"
-    return "gateway" if channel else None
+    return None
 
 
 def _derive_from_task_file(path: str) -> dict:

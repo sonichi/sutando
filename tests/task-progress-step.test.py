@@ -131,6 +131,15 @@ class StepTests(unittest.TestCase):
                 self.assertIn("screenshot skipped", err)
                 self.assertIn(expect[name], err)
 
+    def test_a_local_or_unknown_writer_sends_no_step(self):
+        for source, channel in (("voice", "local-voice"), ("runtime-api", "runtime-api"),
+                                ("some-new-writer", "some-new-writer")):
+            rc, err = self._run("--message", "Step", "--screenshot", self.png,
+                                source=source, channel=channel)
+            self.assertEqual(rc, 0, source)
+            self.assertIn("no delivery path", err)
+        self.assertEqual(self.sent, [])
+
     def test_long_message_is_refused_before_anything_is_sent(self):
         rc, err = self._run("--message", "x" * 300, "--screenshot", self.png)
         self.assertEqual(rc, 1)

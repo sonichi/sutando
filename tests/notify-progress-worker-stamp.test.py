@@ -136,16 +136,11 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.addCleanup(os.unlink, f.name)
         return f.name
 
-    def _send(self, argv, env=None, channel_envs=()):
+    def _send(self, argv, env=None):
         sent = []
-        # No real channels/<source>/.env may decide routability; fixtures only.
+        # No real channels/<source>/.env may decide routability.
         cfg = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, cfg)
-        for name in channel_envs:
-            d = os.path.join(cfg, "channels", name)
-            os.makedirs(d)
-            with open(os.path.join(d, ".env"), "w") as fh:
-                fh.write("REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=tok\n")
+        self.addCleanup(os.rmdir, cfg)
 
         def fake_post(url, payload, headers):
             sent.append(payload)
@@ -246,32 +241,6 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
-    def test_local_voice_task_sends_nothing_even_with_a_configured_voice_channel(self):
-        f = self._task("id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
-                       "channel_id: local-voice\ntask: private ask\n")
-        rc, sent, err = self._send(["--task-file", f], channel_envs=("voice",))
-        self.assertEqual(rc, 0)
-        self.assertEqual(sent, [])
-        self.assertIn("no bridge", err)
-
-    def test_onboarding_wizard_import_task_sends_nothing(self):
-        # The legacy desktop import writer; it has no delivery path.
-        f = self._task("id: task-claude-import-1\nsource: chat\ninteraction_type: message\n"
-                       "channel_id: onboarding-wizard\nuser_id: onboarding-wizard\n"
-                       "access_tier: owner\npriority: low\ntask: Run the import\n")
-        for envs in ((), ("chat",)):
-            rc, sent, err = self._send(["--task-file", f], channel_envs=envs)
-            self.assertEqual(rc, 0, envs)
-            self.assertEqual(sent, [], envs)
-            self.assertIn("no bridge", err)
-
-    def test_docked_voice_task_posts_with_a_configured_voice_channel(self):
-        f = self._task("id: task-2\nsource: voice\ninteraction_type: realtime_audio\n"
-                       f"channel_id: {ROOM}\ntask: room ask\n")
-        rc, sent, _ = self._send(["--task-file", f], channel_envs=("voice",))
-        self.assertEqual(rc, 0)
-        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
-
     def test_unknown_source_without_a_room_sends_nothing(self):
         f = self._task("id: task-u\nsource: some-local-producer\nchannel_id: local-x\ntask: x\n")
         rc, sent, err = self._send(["--task-file", f])
@@ -309,6 +278,93 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(sent, [])
         self.assertIn("--source is required", err)
+
+
+class NotifyDeliveryRouteTests(unittest.TestCase):
+    """Only a delivering bridge task sends: a built-in source, or a gateway
+    room id. Every other writer is local and sends nothing in either config mode."""
+
+    LOCAL = {
+        "local-voice": "id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
+                       "channel_id: local-voice\ntask: private ask\n",
+        "onboarding-wizard": "id: task-claude-import-1\nsource: chat\ninteraction_type: message\n"
+                             "channel_id: onboarding-wizard\nuser_id: onboarding-wizard\n"
+                             "access_tier: owner\npriority: low\ntask: Run the import\n",
+        "runtime-api": "id: task-rtapi-1\ntimestamp: 2026-10-01T00:00:00Z\ntask: private ask\n"
+                       "source: runtime-api\nchannel_id: runtime-api\nuser_id: u\n"
+                       "access_tier: owner\npriority: normal\n",
+        "some-new-writer": "id: task-n\nsource: some-new-writer\nchannel_id: some-new-writer\n"
+                           "task: private ask\n",
+    }
+    BRIDGES = {
+        "docked-room": ("gateway", f"id: task-2\nsource: voice\nchannel_id: {ROOM}\ntask: room ask\n"),
+        "ag2space": ("gateway", f"id: task-a\nsource: ag2space\nchannel_id: {ROOM}\ntask: x\n"),
+        "local-ag2space": ("gateway", f"id: task-l\nsource: local-ag2space\nchannel_id: {ROOM}\ntask: x\n"),
+        "slack": ("slack", "id: task-s\nsource: slack\nchannel_id: C0SLACK\ntask: x\n"),
+        "discord": ("discord", "id: task-d\nsource: discord\nchannel_id: 1234567890\ntask: x\n"),
+        "telegram": ("telegram", "id: task-t\nsource: telegram\nchat_id: 42\ntask: x\n"),
+    }
+    SOURCES = ("voice", "chat", "runtime-api", "some-new-writer", "ag2space", "local-ag2space")
+
+    def _run(self, body, mode):
+        cfg = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cfg)
+        task = os.path.join(cfg, "task.txt")
+        with open(task, "w") as fh:
+            fh.write(body)
+        env = {"CLAUDE_CONFIG_DIR": cfg}
+        if mode == "per-source-env":
+            for name in self.SOURCES:
+                os.makedirs(os.path.join(cfg, "channels", name))
+                with open(os.path.join(cfg, "channels", name, ".env"), "w") as fh:
+                    fh.write("REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=tok\n")
+        else:
+            env.update(_GW_ENV)
+        calls = []
+
+        def rec(kind):
+            return lambda *a, **k: calls.append(kind) or True
+
+        with mock.patch.object(notify, "_post", rec("http")), \
+                mock.patch.object(notify, "send_slack", rec("slack")), \
+                mock.patch.object(notify, "send_discord", rec("discord")), \
+                mock.patch.object(notify, "send_telegram", rec("telegram")), \
+                mock.patch.object(notify, "send_remote_gateway", rec("gateway")), \
+                mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(sys, "argv", ["notify.py", "--message", "on it",
+                                                "--task-file", task]):
+            for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+                if mode == "per-source-env":
+                    os.environ.pop(k, None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = notify.main()
+        return rc, calls
+
+    def test_local_and_unknown_writers_send_nothing_in_either_config_mode(self):
+        for mode in ("per-source-env", "global-gateway"):
+            for name, body in self.LOCAL.items():
+                with self.subTest(mode=mode, shape=name):
+                    rc, calls = self._run(body, mode)
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(calls, [])
+
+    def test_runtime_api_task_sends_nothing(self):
+        for mode in ("per-source-env", "global-gateway"):
+            rc, calls = self._run(self.LOCAL["runtime-api"], mode)
+            self.assertEqual((rc, calls), (0, []), mode)
+
+    def test_unknown_source_sends_nothing(self):
+        for mode in ("per-source-env", "global-gateway"):
+            rc, calls = self._run(self.LOCAL["some-new-writer"], mode)
+            self.assertEqual((rc, calls), (0, []), mode)
+
+    def test_each_bridge_task_sends_exactly_once(self):
+        for mode in ("per-source-env", "global-gateway"):
+            for name, (sender, body) in self.BRIDGES.items():
+                with self.subTest(mode=mode, shape=name):
+                    rc, calls = self._run(body, mode)
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(calls, [sender])
 
 
 if __name__ == "__main__":
