@@ -104,9 +104,8 @@ export function noteLifecycle(
 	}
 }
 
-/** Session states in which the upstream is down and a host dial is the only
- *  way back: CLOSED (upstreamLossPolicy 'close', or an explicit close) and
- *  UPSTREAM_LOST (bodhi >= 0.4 parks there under upstreamLossPolicy 'hold'). */
+/** States where the upstream is down and only a host dial brings it back:
+ *  CLOSED, and UPSTREAM_LOST (where upstreamLossPolicy 'hold' parks). */
 export function isUpstreamDown(state: string): boolean {
 	return state === 'CLOSED' || state === 'UPSTREAM_LOST';
 }

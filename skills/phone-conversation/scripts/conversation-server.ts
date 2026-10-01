@@ -8,7 +8,7 @@
  * ## Audio chain (inbound — caller speaks)
  *
  *   Caller → Twilio → [mu-law 8kHz JSON WS] → Server (mulawTopcm16k)
- *     → [PCM 16kHz Buffer] → VoiceSession.handleAudioFromClient()
+ *     → [PCM 16kHz Buffer] → VoiceSession.feedAudioFromClient()
  *     → GeminiLiveTransport.sendAudio() → Gemini
  *
  * ## Audio chain (outbound — Gemini speaks)
@@ -277,7 +277,7 @@ function pcmToMulaw(sample: number): number {
 	return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
-// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.handleAudioFromClient()
+// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.feedAudioFromClient()
 function mulawTopcm16k(mulawBytes: Buffer): Buffer {
 	const numSamples = mulawBytes.length;
 	const out = Buffer.alloc(numSamples * 2 * 2);
@@ -706,7 +706,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 // --- Create VoiceSession for a call ---
 // Each Twilio call gets its own bodhi VoiceSession on a dynamic internal port.
 // Audio bypasses ClientTransport's WebSocket — we override handleAudioOutput()
-// and call handleAudioFromClient() directly for lower latency.
+// and call feedAudioFromClient() directly for lower latency.
 
 async function createCallSession(params: {
 	callSid: string;
@@ -780,6 +780,11 @@ async function createCallSession(params: {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
+		// A lost upstream parks in UPSTREAM_LOST (CLOSED is terminal in 0.4); the
+		// session.upstreamLost handler below redials it with recoverUpstream().
+		upstreamLossPolicy: 'hold',
+		// Greet the caller once: a re-attach after a turn has completed is silent.
+		reattachGreeting: 'until-first-turn',
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
@@ -843,8 +848,6 @@ async function createCallSession(params: {
 	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
-	let isReplaying = false; // suppress audio during reconnect replay
-	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
 	let _isRecordingMuted: (() => boolean) | null = null;
 	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
 
@@ -854,7 +857,7 @@ async function createCallSession(params: {
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying || _isRecordingMuted?.()) return;
+		if (_isRecordingMuted?.()) return;
 		const pcmBuf = Buffer.from(data, 'base64');
 		_teeAudio?.(pcmBuf);
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
@@ -879,12 +882,6 @@ async function createCallSession(params: {
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
-		// Detect end of reconnect replay: when items catch up to pre-disconnect count
-		if (isReplaying && items.length >= turnCountBeforeDisconnect) {
-			console.log(`${ts()} [Phone] replay complete (${items.length}/${turnCountBeforeDisconnect} turns) — unmuting`);
-			isReplaying = false;
-			import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-		}
 		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastTranscriptText = callSession.transcript.length > 0
@@ -931,53 +928,27 @@ async function createCallSession(params: {
 		}
 	});
 
-	// Trigger client connected (so VoiceSession sends greeting and starts Gemini)
-	sessionAny.handleClientConnected();
-	// Suppress greeting on reconnect — mute the first few seconds of audio after reconnect
-	let firstGreetingSent = false;
-	const origSendGreeting = sessionAny.sendGreeting?.bind(sessionAny);
-	if (origSendGreeting) {
-		sessionAny.sendGreeting = (...args: any[]) => {
-			if (firstGreetingSent) {
-				console.log(`${ts()} [Phone] suppressed reconnect greeting`);
-				return;
-			}
-			firstGreetingSent = true;
-			return origSendGreeting(...args);
-		};
-	}
+	// The Twilio stream is this session's client: attaching starts Gemini and greets once.
+	session.notifyClientConnected();
 
-	// Auto-reconnect when Gemini transport closes (e.g. 1008 crash).
-	// We bypass ClientTransport, so VoiceSession's built-in reconnect won't trigger.
-	// Override handleTransportClose (not transport.onClose) because transport.onClose
-	// gets re-bound when transport.connect() is called during reconnection.
-	const origHandleTransportClose = sessionAny.handleTransportClose.bind(sessionAny);
-	sessionAny.handleTransportClose = (code?: number, reason?: string) => {
-		console.log(`${ts()} [Phone] transport closed: code=${code} reason=${reason}`);
-		// Call original (transitions state to CLOSED)
-		origHandleTransportClose(code, reason);
-		// Trigger reconnect
-		if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-			setTimeout(() => {
-				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
-					isReplaying = true; // mute audio while Gemini replays history
-					turnCountBeforeDisconnect = session.conversationContext.items.length;
-					console.log(`${ts()} [Phone] replay suppression: ${turnCountBeforeDisconnect} turns to replay`);
-					sessionAny.handleClientConnected();
-					// Fallback: unmute after max(10s, 2s per turn) in case turn detection fails
-					const fallbackMs = Math.max(10000, turnCountBeforeDisconnect * 2000);
-					setTimeout(() => {
-						if (isReplaying) {
-							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
-							isReplaying = false;
-							import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-						}
-					}, fallbackMs);
-				}
-			}, 1500);
-		}
-	};
+	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
+	// redials, holding greeting and injected context until the caller speaks again.
+	session.eventBus.subscribe('session.upstreamLost', (e) => {
+		console.log(`${ts()} [Phone] upstream lost: reason=${e.reason} code=${e.code ?? '-'} detail=${e.detail ?? '-'}`);
+		setTimeout(() => {
+			if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) return;
+			if (session.sessionManager.state !== 'UPSTREAM_LOST') return;
+			console.log(`${ts()} [Phone] recoverUpstream for ${callSession.callSid}`);
+			try {
+				session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: true })
+					.activated
+					.then(() => import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}))
+					.catch((err) => console.error(`${ts()} [Phone] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
+			} catch (err) {
+				console.error(`${ts()} [Phone] recoverUpstream threw:`, (err as Error)?.message ?? err);
+			}
+		}, 1500);
+	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded
 	callSession.cleanupNarration = () => {
@@ -1862,10 +1833,10 @@ wss.on('connection', (ws: WebSocket) => {
 
 
 					try {
-						(callSession.voiceSession as any).handleAudioFromClient(pcm16k);
+						callSession.voiceSession.feedAudioFromClient(pcm16k);
 					} catch (e) {
 						if (mediaEventCount % 100 === 0) {
-							console.error(`${ts()} [WS] handleAudioFromClient error:`, e);
+							console.error(`${ts()} [WS] feedAudioFromClient error:`, e);
 						}
 					}
 					break;

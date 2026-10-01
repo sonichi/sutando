@@ -100,6 +100,7 @@ import {
 import {
 	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
 } from './voice-redial-scheduler.js';
+import { redialUpstream, replaceHungDial, type RecoverySurface } from './voice-upstream-recovery.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -954,33 +955,18 @@ async function main() {
 	let redialTimer: ReturnType<typeof setTimeout> | null = null;
 	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
 	let lastReconnectAt = 0;
-	// The one host-initiated dial (F5 timer and the 30s tick both land here).
-	// UPSTREAM_LOST (upstreamLossPolicy 'hold') is redialed only by
+	// The one host-initiated dial (F5 timer and 30s tick): UPSTREAM_LOST redials only through
 	// recoverUpstream(); CLOSED keeps the legacy cast-call reconnect.
 	const triggerUpstreamRedial = (origin: string, reason: 'human-retry' | 'fatal-backoff-clear' = 'human-retry'): void => {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const s = sessionRef as any;
-		if (!s) return;
-		const state = String(s.sessionManager?.state ?? 'unknown');
-		if (state === 'UPSTREAM_LOST' && s.getRecoveryCapabilities?.().recoverUpstream === true) {
-			console.log(`${ts()} [${origin}] recoverUpstream(${reason}) from UPSTREAM_LOST`);
-			try {
-				const r = s.recoverUpstream({ reason, skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
-				r.activated.catch((err: unknown) =>
-					console.error(`${ts()} [${origin}] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
-			} catch (err) {
-				console.error(`${ts()} [${origin}] recoverUpstream threw:`, (err as Error)?.message ?? err);
-			}
-			return;
-		}
-		try {
-			legacyReconnectInFlight = true;
-			s.handleClientConnected();
-		} catch (err) {
-			console.error(`${ts()} [${origin}] reconnect trigger failed:`, (err as Error)?.message ?? err);
-		} finally {
-			legacyReconnectInFlight = false;
-		}
+		redialUpstream(sessionRef as RecoverySurface | null, {
+			origin, reason,
+			legacy: (dial) => {
+				legacyReconnectInFlight = true;
+				try { dial(); } finally { legacyReconnectInFlight = false; }
+			},
+			log: (msg) => console.log(`${ts()} ${msg}`),
+			error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+		});
 	};
 	const fireEventRedial = (): void => {
 		redialTimer = null;
@@ -1928,11 +1914,8 @@ async function main() {
 			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
 			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
 		}
-		// upstreamLossPolicy 'hold': the failed first dial leaves the session
-		// parked in UPSTREAM_LOST with the WS listener up; a client attach or
-		// the redial paths above call recoverUpstream(). The stateChange
-		// subscription already published the parked state; this call carries
-		// the terminal classification (dedup makes a double call a no-op).
+		// A failed first dial leaves the session parked in UPSTREAM_LOST with the listener up; this
+		// call carries the terminal classification (dedup makes a repeat a no-op).
 		console.error(`${ts()} [Startup] session parked (state=${session.sessionManager.state}) — a client attach or the redial scheduler redials it`);
 		emitAgentState();
 	}
@@ -2043,14 +2026,8 @@ async function main() {
 			voiceFatalBackoffUntil = 0;
 			voiceRecoveryCoordinator?.handleFatalBackoffCleared();
 		}
-		// A connect that HANGS never returns to CLOSED, so the recovery guard below
-		// — which only fires from CLOSED — can never see it. Observed live: 23min
-		// in CONNECTING with a client attached, mic captured, nothing reaching the
-		// model. Force CLOSED so the next tick recovers; same transition the
-		// startup path already uses, and valid per bodhi's state table.
-		// The hang clock keys on STATE, not client attachment: a panel reload
-		// mid-hang must not restart the countdown (policy + tests live in
-		// voice-connect-watchdog.ts).
+		// A hung connect never leaves CONNECTING, so the down-state guard below cannot see it; the clock
+		// keys on state, not attachment, so a panel reload cannot restart it (voice-connect-watchdog.ts).
 		const tick = nextConnectingTick({
 			connectingSince, state, clientConnected, now: Date.now(),
 			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
@@ -2058,37 +2035,13 @@ async function main() {
 		connectingSince = tick.connectingSince;
 		if (tick.forceClose) {
 			const stuckFor = Math.round((Date.now() - connectingSince) / 1000);
-			if (session.getRecoveryCapabilities().recoverUpstream) {
-				// recoverUpstream() is allowed from CONNECTING: it abandons the hung dial
-				// and dials afresh without finalizing the session.
-				console.error(`${ts()} [Health] Stuck in CONNECTING for ${stuckFor}s — recoverUpstream() replaces the hung dial`);
-				try {
-					session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false })
-						.activated.catch((err) => console.error(`${ts()} [Health] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
-					connectingSince = 0;
-				} catch (err) {
-					// Clock stays armed: the throttles in shouldForceClosed bound retries.
-					console.error(`${ts()} [Health] recoverUpstream threw (state=${session.sessionManager.state}):`, (err as Error)?.message ?? err);
-				}
-			} else {
-				console.error(`${ts()} [Health] Stuck in CONNECTING for ${stuckFor}s — forcing CLOSED to recover`);
-				try {
-					session.sessionManager.transitionTo('CLOSED');
-					connectingSince = 0;
-				} catch (err) {
-					// Clock stays armed: the throttles in shouldForceClosed bound retries.
-					console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
-						(err as Error)?.message ?? err);
-				}
-			}
+			if (replaceHungDial(session as unknown as RecoverySurface, stuckFor, {
+				log: (msg) => console.log(`${ts()} ${msg}`),
+				error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+			})) connectingSince = 0;
 		}
-		// Recover when session is CLOSED and a client is waiting. handleClientConnected
-		// is bodhi's internal entry point for this exact scenario (CLOSED + client
-		// present → transition to CONNECTING, reconnect fire-and-forget).
-		// F5: this is now the SAFETY NET behind the event-driven redial —
-		// tickMayDial defers to a pending scheduled dial so the tick cannot
-		// preempt the backoff.
-		// TODO: drop the (session as any) cast once bodhi exposes a public API.
+		// Safety net behind the event-driven redial: the upstream is down and a client waits;
+		// tickMayDial defers to a pending scheduled dial so the tick cannot preempt the backoff.
 		if (isUpstreamDown(state) && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
 			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
 			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
