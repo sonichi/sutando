@@ -1,5 +1,6 @@
-# seconds  path — measured on ubuntu-latest, median of runs 36815474624 36837579759 36872037091
-# (2026-10-01), from the per-suite seconds CI prints. Regenerate: scripts/gen-suite-costs.sh <job-log> > tests/python-suite-costs.txt
+# seconds  path — measured on ubuntu-latest: per-file median of the per-suite seconds CI
+# printed in 15 leg log(s) of run(s) 36815474624 36837579759 36872037091 (2026-10-01).
+# Regenerate: scripts/gen-suite-costs.sh -r '<run-ids>' <leg-logs>... > tests/<python|shell>-suite-costs.txt
 # A missing file counts as 1s; the table only steers balance, never which files run.
 1 tests/a-fallback-hits-probe.test.py
 2 tests/access-mutate-cli-commands.test.py
@@ -310,6 +311,7 @@
 0 tests/eslint-workflow-scope-gate.test.py
 0 tests/events-plane-boundary.test.py
 1 tests/exists-is-not-readiness.test.py
+24 tests/external-core-helpers.test.py
 14 tests/file-lock.test.py
 2 tests/find-pids.test.py
 0 tests/friction-detector-every-check-is-registered.test.py
@@ -1043,6 +1045,7 @@
 4 tests/watch-tasks-stream-config-hot-reload.test.py
 8 tests/watch-tasks-stream-dead-worker-reap.test.py
 6 tests/watch-tasks-stream-fallback-receipt-scope.test.py
+3 tests/watch-tasks-stream-foreign-instance-id-corrected.test.py
 55 tests/watch-tasks-stream-handler-terminal-rc.test.py
 3 tests/watch-tasks-stream-inbox-and-workspace-env.test.py
 4 tests/watch-tasks-stream-interrupted-task-retry.test.py
