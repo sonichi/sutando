@@ -349,16 +349,16 @@ jobs:
         run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
 
   python-standalone-tests:
-    name: python standalone tests (${{ matrix.shard }}/6)
+    name: python standalone tests (${{ matrix.shard }}/7)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Legs 1-5 share the files by measured cost; leg 6 runs the load-sensitive
-    # suites alone, one at a time. The coverage-gate job combines every leg's data.
+    # Legs 1-5 share the files by measured cost; legs 6-7 run the load-sensitive
+    # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -413,14 +413,15 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Leg 6 runs the listed load-sensitive suites two at a time (a timing suite
-          # beside a CPU-heavy neighbour misses its own window); legs 1-5 get the rest.
+          # Legs 6-7 run the listed load-sensitive suites (a timing suite beside a CPU-heavy
+          # neighbour misses its own window); legs 1-5 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
-          if [ "${SHARD:-1}" = 6 ]; then
-            bash scripts/select-load-sensitive-suites.sh only "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
+          if [ "${SHARD:-1}" -ge 6 ]; then
+            # Leg 7 runs the list's `serial` suites alone, so they never share a runner's CPU.
+            KIND=only; WORKERS=2; [ "${SHARD:-1}" = 7 ] && { KIND=serial; WORKERS=1; }
+            bash scripts/select-load-sensitive-suites.sh "$KIND" "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
-            KIND=only SELECTED="$RECDIR/sensitive"
-            WORKERS=2
+            SELECTED="$RECDIR/sensitive"
           else
             # The selector exits non-zero on a stale or duplicate entry, so a renamed
             # suite cannot slip back into the shared legs; no pipe, `-e` has no pipefail.
