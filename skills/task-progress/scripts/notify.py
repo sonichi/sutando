@@ -418,9 +418,9 @@ def upload_room_media(source: str, channel_id: str, path: str,
 
 
 _BUILTIN_SENDERS = frozenset({"slack", "discord", "telegram"})
-# The gateway only posts into Matrix rooms (`!opaque:server`); its provider
-# label is install-configured, so the room id is the positive evidence.
-_GATEWAY_ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
+# The gateway only posts into Matrix rooms: `!opaque:server`, or a room v12 id
+# (`!` + unpadded base64url SHA-256, 43 chars, no server). Provider labels vary.
+_GATEWAY_ROOM_RE = re.compile(r"^!(?:[^:\s]+:\S+|[A-Za-z0-9_-]{43})$")
 
 
 def _delivery_route(source: str, channel: "str | None") -> "str | None":
@@ -431,6 +431,10 @@ def _delivery_route(source: str, channel: "str | None") -> "str | None":
     if channel and _GATEWAY_ROOM_RE.match(channel):
         return "gateway"
     return None
+
+
+def _no_route_message(source: str, channel: "str | None") -> str:
+    return f"[task-progress] {source!r} / {channel!r} has no delivery path; nothing to send"
 
 
 def _derive_from_task_file(path: str) -> dict:
@@ -508,8 +512,7 @@ def main() -> int:
         return 1
 
     if _delivery_route(source, channel) is None:
-        print(f"[task-progress] source {source!r} has no bridge; nothing to send",
-              file=sys.stderr)
+        print(_no_route_message(source, channel), file=sys.stderr)
         return 0
 
     if not channel:

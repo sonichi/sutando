@@ -106,8 +106,7 @@ def run(argv: "list[str] | None" = None) -> int:
         print("[task-progress] --channel-id (or --chat-id) is required", file=sys.stderr)
         return 1
     if notify._delivery_route(args.source, channel) is None:
-        print(f"[task-progress] {args.source!r} / {channel!r} has no delivery path; "
-              "nothing to send", file=sys.stderr)
+        print(notify._no_route_message(args.source, channel), file=sys.stderr)
         return 0
     err = notify._progress_message_error(args.message)
     if err:
