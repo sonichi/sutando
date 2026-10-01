@@ -1165,20 +1165,24 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rc, calls, persisted, out = self._cycle(td, no_macos=True)
             self.assertEqual((rc, calls, persisted), (0, [], False))
-            self.assertIn("escalated:", out)
+            self.assertIn("not delivered: no route and macOS disabled (will retry)", out)
+            self.assertNotIn("escalated:", out)
             rc, calls, persisted, out = self._cycle(td, no_macos=True)
-            self.assertIn("escalated:", out, "the next cycle must retry, not be suppressed")
+            self.assertIn("not delivered: no route and macOS disabled (will retry)", out,
+                          "the next cycle must retry, not be suppressed")
             self.assertFalse(persisted)
 
     def test_no_route_with_a_failed_macos_notification_persists_nothing(self):
         with tempfile.TemporaryDirectory() as td:
-            _, calls, persisted, _ = self._cycle(td, no_macos=False, macos_ok=False)
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=False)
             self.assertEqual((calls, persisted), (["macos"], False))
+            self.assertIn("not delivered: no route and macOS notification failed (will retry)", out)
 
     def test_no_route_with_macos_delivered_persists(self):
         with tempfile.TemporaryDirectory() as td:
-            _, calls, persisted, _ = self._cycle(td, no_macos=False, macos_ok=True)
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=True)
             self.assertEqual((calls, persisted), (["macos"], True))
+            self.assertIn("escalated:", out)
             _, _, _, out = self._cycle(td, no_macos=False, macos_ok=True)
             self.assertIn("no escalation", out, "a delivered alert is debounced")
 

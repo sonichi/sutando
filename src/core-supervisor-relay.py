@@ -334,8 +334,10 @@ def _save_last_hash(state_file, h):
         pass
 
 
-def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False):
-    """One escalation cycle. Returns the message emitted, or None if suppressed."""
+def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False,
+              outcome=None):
+    """One escalation cycle. Returns the message emitted, or None if suppressed.
+    `outcome`, when given, receives "undelivered": the reason nothing landed, or None."""
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
@@ -347,10 +349,14 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     # one (macOS alone must not suppress it), else the macOS notification.
     if source and channel:
         delivered = _channel_notify(msg, source, channel)
+        reason = "channel send failed"
     else:
         delivered = macos_ok
+        reason = "no route and macOS " + ("notification failed" if macos else "disabled")
     if delivered:
         _save_last_hash(state_file, new_hash)
+    if outcome is not None:
+        outcome["undelivered"] = None if delivered else reason
     return msg
 
 
@@ -469,8 +475,12 @@ def main(argv=None):
     if not isinstance(signal, dict):
         signal = dict(UNREADABLE_SIGNAL)
 
+    outcome = {}
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
-                    source=source, channel=channel, dry_run=a.dry_run)
+                    source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
+    if msg and outcome.get("undelivered"):
+        print(f"not delivered: {outcome['undelivered']} (will retry): {msg}")
+        return 0
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)
         return 0
