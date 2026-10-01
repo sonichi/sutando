@@ -242,8 +242,10 @@ class NotifierDependencyGateTest(unittest.TestCase):
         # parse/match verdict itself, independent of when the owner's exit cleans the path up.
         probe = subprocess.run(["/bin/bash", str(REPO / "src/agent/agy/cli/task-notifier.sh"), "--launch-ready", nonce],
                                env=self._env(path), capture_output=True, text=True, timeout=30)
-        self.assertEqual(probe.returncode == 0, expect_ready,
+        # A refusal is exactly rc 1 with nothing on stderr; a crash is not a refusal.
+        self.assertEqual(probe.returncode, 0 if expect_ready else 1,
                          f"--launch-ready decided {probe.returncode} on the planted receipt: {probe.stderr}")
+        self.assertEqual(probe.stderr, "", f"--launch-ready wrote to stderr: {probe.stderr}")
         out = launcher.communicate(timeout=60)[0]
         self.assertEqual(launcher.returncode, 0, out)
         if expect_ready:
