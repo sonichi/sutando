@@ -251,18 +251,22 @@ def restart_witness(ws: Workspace, first: Watcher):
     second.wait_until(lambda: ws.published() != []
                       or (ws.reached("after-handler") and not ws.claimed("task-restart")))
     second.wait_until(lambda: not ws.claimed("task-restart"), deadline=10.0)
+    settled_r = ws.reached("after-handler") and not ws.claimed("task-restart")
     second.tail(time.time())
     second.stop()
     LAST_DIAG[0] = second.diagnosis()
     published = ws.published()
     body = (ws.ws / "results" / published[0]).read_text(errors="replace")[:200] if published else ""
-    return first_pid, second.p.pid, second.emitted, published, body
+    return first_pid, second.p.pid, second.emitted, published, body, settled_r
 
 
 must_handle, ordinary, success = start(4), start(1), start(0)
 restart_ws = Workspace("term-rc-restart-", real_run_rc=4)
 restart_first = restart_ws.start()
-emitted, published, _ = finish(*must_handle, settled=lambda ws, w: ws.published() != [])
+emitted, published, settled_four = finish(
+    *must_handle, settled=lambda ws, w: ws.reached("after-handler") and not ws.claimed("task-demo"))
+check("a must-handle task settles: the handler ran and the claim was released", settled_four,
+      "the watcher never finished the task, so 'not emitted' would be vacuous")
 check("a must-handle result is NOT emitted to the live core", not emitted,
       "the task reached the unrestricted core despite the handler refusing it")
 check("a must-handle result publishes a terminal failure instead", published != [],
@@ -283,11 +287,12 @@ check("control: a successful run records after-done and releases its claim", don
       "the success path did not complete, so 'emits nothing' would be vacuous")
 check("control: a successful run emits nothing and needs no failure", not emitted_zero)
 
-pid1, pid2, emitted_r, published_r, body_r = restart_witness(restart_ws, restart_first)
+pid1, pid2, emitted_r, published_r, body_r, settled_r = restart_witness(restart_ws, restart_first)
 print(f"\n  restart witness: watcher pid {pid1} stopped, pid {pid2} started; task arrived after the restart")
 print(f"    emitted to the live core: {emitted_r}")
 print(f"    published by the restarted watcher: {published_r}")
 print(f"    result body: {body_r.strip()[:120]!r}")
+check("restart: the restarted watcher settles the task (handler ran, claim released)", settled_r)
 check("restart: the restarted watcher does NOT hand the task to the core", not emitted_r)
 check("restart: the restarted watcher publishes a terminal failure", published_r != [],
       "no result file, so the task is neither delivered nor failed")
