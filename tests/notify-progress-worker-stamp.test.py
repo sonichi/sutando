@@ -300,8 +300,8 @@ class SharedRouteDelegationTests(unittest.TestCase):
 
 
 class NotifyDeliveryRouteTests(unittest.TestCase):
-    """Only a delivering bridge task sends: a built-in source, or a gateway
-    room id. Every other writer is local and sends nothing in either config mode."""
+    """A built-in source sends; any other source, known or not, sends iff its channel
+    is a valid room id. Everything else sends nothing in either config mode."""
 
     LOCAL = {
         "local-voice": "id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
@@ -372,7 +372,13 @@ class NotifyDeliveryRouteTests(unittest.TestCase):
             rc, calls = self._run(self.LOCAL["runtime-api"], mode)
             self.assertEqual((rc, calls), (notify.NO_ROUTE_EXIT, []), mode)
 
-    def test_unknown_source_sends_nothing(self):
+    def test_unknown_source_with_a_room_id_sends(self):
+        # Accepted trade-off: routing keys on the room id, not the source label.
+        body = f"id: task-n\nsource: some-new-writer\nchannel_id: {ROOM}\ntask: x\n"
+        for mode in ("per-source-env", "global-gateway"):
+            self.assertEqual(self._run(body, mode), (0, ["gateway"]), mode)
+
+    def test_unknown_source_with_a_non_room_channel_sends_nothing(self):
         for mode in ("per-source-env", "global-gateway"):
             rc, calls = self._run(self.LOCAL["some-new-writer"], mode)
             self.assertEqual((rc, calls), (notify.NO_ROUTE_EXIT, []), mode)

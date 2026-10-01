@@ -2,9 +2,12 @@
 
 `delivery_route(source, channel)` returns "builtin" (Slack/Discord/Telegram),
 "gateway" (a Matrix room id the remote gateway posts into), or None when the
-task has no delivery path. Local unless positively a delivering bridge task:
-placeholder channels (local-voice, runtime-api, onboarding-wizard) and unknown
-writers get None whatever channel config exists. Callers: the task-progress
+task has no delivery path. The source decides only the built-in senders; any
+other source, known or not, routes to the gateway iff its channel is a valid
+Matrix room id (strict `!opaque:server`, or a v12 id). Everything else, e.g.
+local-voice, runtime-api, onboarding-wizard, gets None whatever config exists.
+Accepted trade-off: provider labels are install-configured, so a future writer
+carrying a real room id will send. Callers: the task-progress
 skill's notify.py and step.py, and core-supervisor-relay.py. A None verdict is
 never a delivery; senders exit NO_ROUTE_EXIT so a caller cannot read it as one.
 """

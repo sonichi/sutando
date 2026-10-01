@@ -78,11 +78,15 @@ annoying than silence for 2 minutes on a research task.
 **Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
 `--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
 `reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
-extract or remember by hand — including the thread, the field most often dropped. Only a
-delivering bridge task sends: `slack`/`discord`/`telegram`, or a gateway room id (`!room:server`, or a server-less room v12 id,
-e.g. AG2 Space or a docked voice task). Every other task — undocked `voice`, `chat`, `cron`,
-`runtime-api`, an unknown writer — sends nothing and exits 3 (no delivery path; not a failure of the task), whatever channel config exists. The verdict is `src/progress_route.py`. Call
-**immediately after reading the task**:
+extract or remember by hand — including the thread, the field most often dropped. A task
+sends when its source is `slack`/`discord`/`telegram`, or — for ANY other source, known or
+not — when its channel is a valid Matrix room id: strict `!opaque:server`, or a server-less
+room v12 id (e.g. AG2 Space, or a docked voice task). Everything else — undocked `voice`
+(`local-voice`), `chat`, `cron`, `runtime-api`, `onboarding-wizard`, any non-room channel —
+sends nothing and exits 3 (no delivery path; not a failure of the task), whatever channel
+config exists. Accepted trade-off: gateway provider labels are install-configured, so routing
+keys on the room id, not the source — a future writer that carries a real room id will send.
+The verdict is `src/progress_route.py`. Call **immediately after reading the task**:
 
 ```bash
 python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
