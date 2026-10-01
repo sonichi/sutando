@@ -118,18 +118,25 @@ describe('the spoken block', () => {
 		assert.equal(_speechMayBeLanding(), true);
 	});
 
-	it('canary: the runtime still keeps the buffered transcription where the provider reads it', () => {
-		// bodhi's TranscriptManager is not exported and inputBuffer is a plain field reached
-		// through `?.`; a rename would silently drop the current utterance from every task.
+	it('canary: the runtime still keeps the buffered transcription where the provider reads it', async () => {
+		// inputBuffer is a plain field reached through `?.`; a rename would silently drop the
+		// current utterance from every task. bodhi exports TranscriptManager, so assert the
+		// behaviour the provider relies on rather than the dist source text.
+		const { TranscriptManager } = await import('bodhi-realtime-agent');
+		const sink = { sendToClient() {}, addUserMessage() {}, addAssistantMessage() {} };
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const tm = new TranscriptManager(sink as any) as any;
+		tm.handleInput('investigate ');
+		tm.handleInput('the slow start');
+		assert.equal(tm.inputBuffer, 'investigate the slow start', 'handleInput no longer accumulates into inputBuffer');
+		tm.flushInput();
+		assert.equal(tm.inputBuffer, '', 'flushInput no longer drains inputBuffer');
 		const dist = readFileSync(new URL('../node_modules/bodhi-realtime-agent/dist/index.js', import.meta.url), 'utf-8');
 		assert.match(dist, /this\.transcriptManager = new TranscriptManager\(/, 'VoiceSession no longer names transcriptManager');
-		assert.match(dist, /TranscriptManager = class|class TranscriptManager/, 'TranscriptManager is gone');
-		assert.match(dist, /flushInput\(\) \{\s*if \(this\.inputBuffer\.trim\(\)\)/, 'flushInput no longer reads inputBuffer');
-		assert.match(dist, /handleInput\(text\) \{\s*if \(text\.trim\(\)\) \{\s*this\.inputBuffer \+= text;/, 'handleInput no longer appends to inputBuffer');
-		assert.match(dist, /handleUserSpeechEvidence\(\) \{/, 'the speech-evidence hook the agent wraps is gone');
+		assert.match(dist, /["']speech\.user_started["']/, 'the speech edge the agent stamps from is gone');
 		const agent = readFileSync(new URL('../src/voice-agent.ts', import.meta.url), 'utf-8');
 		assert.match(agent, /pendingInput: speechHost\.transcriptManager\?\.inputBuffer/);
-		assert.match(agent, /speechHost\.handleUserSpeechEvidence = \(\) => \{ lastUserSpeechAt = Date\.now\(\);/);
+		assert.match(agent, /subscribe\('speech\.user_started', \(\) => \{ lastUserSpeechAt = Date\.now\(\);/);
 	});
 
 	it('an identical call during the spoken-turn wait is a duplicate, not a second task file', async () => {

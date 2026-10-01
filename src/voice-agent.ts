@@ -98,7 +98,7 @@ import {
 	type RecoverySessionSurface,
 } from './voice-silence-recovery-coordinator.js';
 import {
-	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
+	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
 } from './voice-redial-scheduler.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
@@ -954,6 +954,34 @@ async function main() {
 	let redialTimer: ReturnType<typeof setTimeout> | null = null;
 	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
 	let lastReconnectAt = 0;
+	// The one host-initiated dial (F5 timer and the 30s tick both land here).
+	// UPSTREAM_LOST (upstreamLossPolicy 'hold') is redialed only by
+	// recoverUpstream(); CLOSED keeps the legacy cast-call reconnect.
+	const triggerUpstreamRedial = (origin: string, reason: 'human-retry' | 'fatal-backoff-clear' = 'human-retry'): void => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const s = sessionRef as any;
+		if (!s) return;
+		const state = String(s.sessionManager?.state ?? 'unknown');
+		if (state === 'UPSTREAM_LOST' && s.getRecoveryCapabilities?.().recoverUpstream === true) {
+			console.log(`${ts()} [${origin}] recoverUpstream(${reason}) from UPSTREAM_LOST`);
+			try {
+				const r = s.recoverUpstream({ reason, skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
+				r.activated.catch((err: unknown) =>
+					console.error(`${ts()} [${origin}] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
+			} catch (err) {
+				console.error(`${ts()} [${origin}] recoverUpstream threw:`, (err as Error)?.message ?? err);
+			}
+			return;
+		}
+		try {
+			legacyReconnectInFlight = true;
+			s.handleClientConnected();
+		} catch (err) {
+			console.error(`${ts()} [${origin}] reconnect trigger failed:`, (err as Error)?.message ?? err);
+		} finally {
+			legacyReconnectInFlight = false;
+		}
+	};
 	const fireEventRedial = (): void => {
 		redialTimer = null;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -966,7 +994,7 @@ async function main() {
 			// Blocked by the fatal gate alone → re-arm for when it lifts.
 			// Any other veto drops the dial: the next lifecycle event or the
 			// 30s tick takes over.
-			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'CLOSED' && clientConnected) {
+			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && isUpstreamDown(state) && clientConnected) {
 				armRedialTimer(voiceFatalBackoffUntil - now + 100);
 			}
 			return;
@@ -979,14 +1007,7 @@ async function main() {
 		redialState = noteDialed(redialState);
 		lastReconnectAt = now;
 		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
-		try {
-			legacyReconnectInFlight = true;
-			s.handleClientConnected();
-		} catch (err) {
-			console.error(`${ts()} [Redial] reconnect trigger failed:`, (err as Error)?.message ?? err);
-		} finally {
-			legacyReconnectInFlight = false;
-		}
+		triggerUpstreamRedial('Redial');
 	};
 	const armRedialTimer = (delayMs: number): void => {
 		if (redialTimer) clearTimeout(redialTimer);
@@ -1106,6 +1127,9 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// A lost upstream parks the session in UPSTREAM_LOST with the WS
+		// listener up; the redial paths below call recoverUpstream().
+		upstreamLossPolicy: 'hold',
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
@@ -1537,16 +1561,14 @@ async function main() {
 	// Session-scoped, not client-scoped: the next session's registration replaces it.
 	// Items plus the transcription still buffered by the runtime (bodhi flushes only
 	// what has arrived when a tool fires), so a late chunk is not read as last turn's.
-	// The runtime calls handleUserSpeechEvidence on every transcription chunk; the stamp
+	// The runtime publishes speech.user_started/ended for every utterance; the stamp
 	// tells the bridge whether a transcription may still be landing (no stamp within
 	// 10 s = the model started this turn itself, so the task write does not wait).
 	let lastUserSpeechAt: number | undefined;
+	session.eventBus.subscribe('speech.user_started', () => { lastUserSpeechAt = Date.now(); });
+	session.eventBus.subscribe('speech.user_ended', () => { lastUserSpeechAt = Date.now(); });
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
-	if (typeof speechHost.handleUserSpeechEvidence === 'function') {
-		const original = speechHost.handleUserSpeechEvidence.bind(session);
-		speechHost.handleUserSpeechEvidence = () => { lastUserSpeechAt = Date.now(); return original(); };
-	}
 	setVoiceTurnsProvider(() => ({
 		items: session.conversationContext.items,
 		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
@@ -1906,23 +1928,12 @@ async function main() {
 			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
 			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
 		}
-		// Force CLOSED so the health monitor's handleClientConnected path recovers.
-		// VoiceSession leaves state at CONNECTING after a failed start() and exposes
-		// no public reset API (reconnect()/disconnect() are on the internal transport,
-		// not on VoiceSession). CONNECTING→CLOSED is valid per bodhi's state table
-		// (index.js:1164). CREATED→CLOSED is also valid. If the state is already
-		// CLOSED or ACTIVE for some reason, transitionTo throws — log it so the
-		// mismatch is visible (the health monitor only recovers from CLOSED).
-		// TODO: drop the hack once bodhi exposes a public session.reset().
-		try {
-			session.sessionManager.transitionTo('CLOSED');
-		} catch (e) {
-			console.error(`${ts()} [Startup] Could not transition to CLOSED (state=${session.sessionManager.state}): ${(e as Error)?.message ?? e}`);
-		}
-		// Belt-and-braces: the transitionTo above already emits via the
-		// stateChange subscription; when it throws (state already CLOSED)
-		// this still publishes the terminal classification (dedup makes a
-		// double call a no-op).
+		// upstreamLossPolicy 'hold': the failed first dial leaves the session
+		// parked in UPSTREAM_LOST with the WS listener up; a client attach or
+		// the redial paths above call recoverUpstream(). The stateChange
+		// subscription already published the parked state; this call carries
+		// the terminal classification (dedup makes a double call a no-op).
+		console.error(`${ts()} [Startup] session parked (state=${session.sessionManager.state}) — a client attach or the redial scheduler redials it`);
 		emitAgentState();
 	}
 
@@ -2046,15 +2057,29 @@ async function main() {
 		});
 		connectingSince = tick.connectingSince;
 		if (tick.forceClose) {
-			console.error(`${ts()} [Health] Stuck in CONNECTING for `
-				+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
-			try {
-				session.sessionManager.transitionTo('CLOSED');
-				connectingSince = 0;
-			} catch (err) {
-				// Clock stays armed: the throttles in shouldForceClosed bound retries.
-				console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
-					(err as Error)?.message ?? err);
+			const stuckFor = Math.round((Date.now() - connectingSince) / 1000);
+			if (session.getRecoveryCapabilities().recoverUpstream) {
+				// recoverUpstream() is allowed from CONNECTING: it abandons the hung dial
+				// and dials afresh without finalizing the session.
+				console.error(`${ts()} [Health] Stuck in CONNECTING for ${stuckFor}s — recoverUpstream() replaces the hung dial`);
+				try {
+					session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false })
+						.activated.catch((err) => console.error(`${ts()} [Health] recoverUpstream did not activate:`, (err as Error)?.message ?? err));
+					connectingSince = 0;
+				} catch (err) {
+					// Clock stays armed: the throttles in shouldForceClosed bound retries.
+					console.error(`${ts()} [Health] recoverUpstream threw (state=${session.sessionManager.state}):`, (err as Error)?.message ?? err);
+				}
+			} else {
+				console.error(`${ts()} [Health] Stuck in CONNECTING for ${stuckFor}s — forcing CLOSED to recover`);
+				try {
+					session.sessionManager.transitionTo('CLOSED');
+					connectingSince = 0;
+				} catch (err) {
+					// Clock stays armed: the throttles in shouldForceClosed bound retries.
+					console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
+						(err as Error)?.message ?? err);
+				}
 			}
 		}
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
@@ -2064,20 +2089,13 @@ async function main() {
 		// tickMayDial defers to a pending scheduled dial so the tick cannot
 		// preempt the backoff.
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
+		if (isUpstreamDown(state) && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
 			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
 			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
 			lastReconnectAt = Date.now();
 			redialState = noteDialed(redialState);
-			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
-			try {
-				legacyReconnectInFlight = true;
-				(session as any).handleClientConnected();
-			} catch (err) {
-				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
-			} finally {
-				legacyReconnectInFlight = false;
-			}
+			console.log(`${ts()} [Health] Dead session (state=${state}) — triggering reconnect`);
+			triggerUpstreamRedial('Health');
 		}
 		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no
 		// effect on the guards above, ever, in this mode.
