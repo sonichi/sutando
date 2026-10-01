@@ -26,7 +26,8 @@ ARGUMENTS: $ARGUMENTS
    ```bash
    brew install --cask antigravity
    (
-     f="$(mktemp)"; trap 'rm -f "$f"' EXIT INT TERM HUP
+     f="$(mktemp)"; trap 'rm -f "$f"' EXIT
+     trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP   # a cancel ends the block
      if curl -fsSL https://antigravity.google/cli/install.sh -o "$f"; then
        if [ -t 0 ]; then less "$f"; else cat "$f"; fi                 # review it first
        printf 'Run the installer? [y/N] '; read -r a
