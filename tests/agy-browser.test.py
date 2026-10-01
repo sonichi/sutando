@@ -1,4 +1,4 @@
-"""Smoke test for skills/claude-gemini/scripts/agy-browser.sh.
+"""Smoke test for skills/agy/scripts/agy-browser.sh.
 
 A fake Chrome serves /json/version on a free port and a mock agy records its argv, then:
   1. start launches Chrome on the given profile and port, bound to 127.0.0.1 and headless,
@@ -51,7 +51,7 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
      time changed (a reused PGID), or one that is not the launcher's own, is never signalled; start
      reports it and keeps the handshake directory.
 
-Run: python3 tests/claude-gemini-agy-browser.test.py
+Run: python3 tests/agy-browser.test.py
 """
 import fcntl
 import os
@@ -66,7 +66,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "skills" / "claude-gemini" / "scripts" / "agy-browser.sh"
+SCRIPT = REPO / "skills" / "agy" / "scripts" / "agy-browser.sh"
 
 FAKE_CHROME = f"#!{sys.executable}\n" + """
 import http.server, os, signal, sys, time

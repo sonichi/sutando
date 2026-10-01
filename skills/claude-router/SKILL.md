@@ -1,12 +1,12 @@
 ---
 name: claude-router
-description: "Choose between the local Codex CLI, Gemini CLI, and Pi CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation."
+description: "Choose between the local Codex CLI, Antigravity CLI (agy, Gemini-backed; the agy skill), and Pi CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation."
 user-invocable: true
 ---
 
 # Claude Router
 
-Route a task from Claude Code to local `codex`, `gemini`, or `pi` using simple, explicit rules. This skill assumes the dedicated `claude-codex`, `claude-gemini`, and `claude-pi` skills are installed from this repo.
+Route a task from Claude Code to local `codex`, `gemini`, or `pi` using simple, explicit rules. This skill assumes the dedicated `claude-codex`, `agy`, and `claude-pi` skills are installed from this repo.
 
 **Usage**: `/claude-router [prompt]`
 
