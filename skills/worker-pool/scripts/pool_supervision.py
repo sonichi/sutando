@@ -206,6 +206,15 @@ def _cleared_session(ev: WorkerEvidence) -> WorkerEvidence:
                    recover_issued_at=None, escalated=False)
 
 
+def clear_death_ladder(state: SupervisionState, worker_ids) -> SupervisionState:
+    """Reset only the session (death) ladder of these workers; wedge and watcher evidence stand."""
+    workers = dict(state.workers)
+    for w in worker_ids:
+        if w in workers:
+            workers[w] = _cleared_session(workers[w])
+    return replace(state, workers=workers)
+
+
 def _cleared_watcher(ev: WorkerEvidence) -> WorkerEvidence:
     return replace(ev, watcher_first_detected_at=None, watcher_consecutive=0,
                    rearm_issued_at=None, watcher_escalated=False)

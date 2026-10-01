@@ -154,9 +154,13 @@ abort_start() {
 # once the launcher is proved gone: before its report, the cancel file is what stops it.
 on_exit() {
   [[ -n "${HS:-}" && -z "$settled" ]] || return 0
+  # $! is set at the fork, before $launcher is: empty means no launcher exists to read the cancel file.
+  # Read it with -u off: bash 3.2 rejects even ${!:-} while no job has ever been started.
+  set +u; launcher="${launcher:-$!}"; set -u
+  [[ -n "$launcher" ]] || { rm -rf "$HS"; return 0; }
   : >"$HS/cancel" 2>/dev/null || true
-  local st="" pg rc
-  [[ -n "${launcher:-}" ]] && st="$(launcher_state)"
+  local st pg rc
+  st="$(launcher_state)"
   pg="$(cat "$HS/pgid" 2>/dev/null)" || true
   if [[ -n "$pg" ]]; then
     rc=0; end_group "$pg" || rc=$?

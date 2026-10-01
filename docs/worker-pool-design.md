@@ -563,6 +563,29 @@ pool_remedy.py --workspace WS --repo REPO --resume             # lifts it, then 
 - The marker never expires; only `--resume` lifts it. health-check warns (`pool-suspended`) when it is still present while a core is running. It is separate from the owner's
   per-worker `paused` marker, which the host must not use.
 
+**Owner restart.** Once the ladder escalates, sweeps only report that worker. The owner brings
+it back with one command, which an app may put behind a button:
+
+```
+pool_remedy.py --workspace WS --repo REPO --restart <worker-id>
+```
+
+- The CLI has no authorisation gate of its own: the caller (the app's click) is the owner's
+  authorisation. It has no `--dry-run`.
+- It prints one JSON line, `{"worker_id", "result", "detail"}`, whatever happens. `result` is
+  `restarted`, `already-running`, `paused`, `suspended` or `failed`. It exits 0 except for
+  `failed` (1) and an invalid id (2). Every `failed` names why in `detail.why`.
+- It only (re)starts a dead session. A live worker is left alone, wedged or not: it answers
+  `already-running`, loses only its death ladder, and keeps its wedge and watcher ladders, so a
+  wedge card still stands. A paused worker and a suspended pool are not restarted.
+- `restarted` forgets that worker's whole ladder entry, since every rung was evidence about the
+  old session, and ensures its inbox supervisor and input watcher at once rather than on the
+  next sweep. A failure in that bookkeeping is reported in `detail.errors`, not raised.
+- It takes the same lock (`state/pool-remedy.lock`) as `--sweep`, `--recipient` and `--resume`
+  for its whole act-and-save, so a click and a sweep never recover the same worker or save over
+  each other's ladder. It waits up to 45 s for a sweep in progress, then answers `failed` with
+  `why: "pool busy…"`. `--suspend` never waits for it: a quit must not be delayed.
+
 ### Stage 1 — single-core delivery, no routing
 
 **No luggage.** New code on `main`, written to this document, against what `main`

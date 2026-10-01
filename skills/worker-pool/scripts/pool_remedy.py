@@ -11,6 +11,8 @@ the owner's decision and is not reachable from here.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -111,10 +113,95 @@ def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
         dead = [w for w, o in obs.items()
                 if w in stopped and o.session_alive is False and not o.paused]
         restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
-        state = sup.load_state(workspace)
-        sup.save_state(workspace, replace(state, workers={
-            w: e for w, e in state.workers.items() if w not in restarted}))
+        _reset_ladders(workspace, forget=restarted)
     return {"was_suspended": was, "restarted": restarted}
+
+
+LOCK_REL = Path("state") / "pool-remedy.lock"
+RESTART_LOCK_WAIT_S = 45.0
+
+
+class PoolBusy(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def pool_lock(workspace, timeout: float | None = None):
+    """Exclusive for one act-and-save (a sweep, a resume, a restart), so a click and a sweep
+    never recover the same worker or save over each other's ladder. None waits indefinitely."""
+    path = Path(workspace) / LOCK_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as fh:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | (0 if deadline is None else fcntl.LOCK_NB))
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PoolBusy(f"pool busy: another remedy held the lock for {timeout:g}s") from None
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _reset_ladders(workspace, *, forget=(), death_only=()) -> None:
+    """A new session makes all evidence about the old one stale (`forget`); a session that was
+    already alive keeps its wedge and watcher ladders and loses only its death ladder."""
+    state = sup.load_state(workspace)
+    state = ps.clear_death_ladder(state, [w for w in death_only if w not in forget])
+    sup.save_state(workspace, replace(state, workers={
+        w: e for w, e in state.workers.items() if w not in forget}))
+
+
+RESTART_RESULTS = {RECOVERED: "restarted", ALREADY_RUNNING: "already-running", PAUSED: "paused",
+                   SUSPENDED: "suspended"}
+
+
+FAILED_WHY = {NO_SESSION: "no recorded session to resume", INDETERMINATE: "tmux could not answer",
+              FAILED: "the spawn failed"}
+
+
+def restart(workspace, repo, worker_id, *, runner=None, spawn=None,
+            lock_timeout: float = RESTART_LOCK_WAIT_S) -> dict:
+    """The owner's restart of one dead worker, outside the death ladder. Idempotent: a live
+    worker, wedged or not, is left alone and keeps its wedge and watcher ladders."""
+    wi.worker_dir(workspace, worker_id)  # raises IdentityError for a malformed id
+    try:
+        with pool_lock(workspace, lock_timeout):
+            if suspension(workspace):
+                out = {"worker_id": worker_id, "outcome": SUSPENDED}
+            else:
+                out = recover(workspace, repo, worker_id, runner=runner, spawn=spawn)
+            result = RESTART_RESULTS.get(out["outcome"], "failed")
+            detail = {k: v for k, v in out.items() if k not in ("worker_id", "outcome")}
+            if result == "failed":
+                detail["outcome"] = out["outcome"]
+                detail.setdefault("why", FAILED_WHY.get(out["outcome"], out["outcome"]))
+            elif result in ("restarted", "already-running"):
+                _after_restart(workspace, repo, worker_id, result, detail, runner)
+    except PoolBusy as e:
+        result, detail = "failed", {"why": str(e)}
+    return {"worker_id": worker_id, "result": result, "detail": detail}
+
+
+def _after_restart(workspace, repo, worker_id, result, detail, runner) -> None:
+    """Bookkeeping after the session is up: a failure here is reported, never raised, since
+    the worker's state no longer depends on it and the next sweep repeats it."""
+    steps = (("ladder", lambda: _reset_ladders(
+                 workspace, **({"forget": [worker_id]} if result == "restarted" else {"death_only": [worker_id]}))),
+             ("supervisor", lambda: ensure_supervisor(workspace, repo, worker_id, runner=runner)["outcome"]),
+             ("input_watch", lambda: ensure_input_watch(workspace, repo, worker_id, runner=runner)["outcome"]))
+    for name, step in steps:
+        try:
+            value = step()
+        except Exception as e:  # noqa: BLE001 — the app's button reads one JSON line, never a traceback
+            detail.setdefault("errors", {})[name] = f"{type(e).__name__}: {e}"
+        else:
+            if value is not None:
+                detail[name] = value
 
 
 def _last_run(workspace, worker_id) -> dict:
@@ -350,14 +437,33 @@ def main(argv=None) -> int:
                    help="stop remedying until --resume (the app writes this on a real quit)")
     p.add_argument("--resume", action="store_true",
                    help="lift a suspension, restart the workers it left dead, then sweep")
+    p.add_argument("--restart", metavar="WORKER_ID",
+                   help="the owner's restart of one worker, outside the death ladder")
     p.add_argument("--dry-run", action="store_true",
                    help="decide and report, but neither remedy nor advance the ladder")
     a = p.parse_args(argv)
-    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume))) != 1:
-        p.error("pass exactly one of --recipient, --sweep, --suspend or --resume")
+    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume, a.restart is not None))) != 1:
+        p.error("pass exactly one of --recipient, --sweep, --suspend, --resume or --restart")
+    if a.restart is not None and a.dry_run:
+        p.error("--restart acts; it has no --dry-run")
+    if a.restart is not None:
+        rc = 0
+        try:
+            out = restart(a.workspace, a.repo, a.restart)
+        except (wi.IdentityError, ValueError) as e:
+            out, rc = {"worker_id": a.restart, "result": "failed", "detail": {"why": str(e)}}, 2
+        except Exception as e:  # noqa: BLE001 — the app's button reads one JSON line, never a traceback
+            out = {"worker_id": a.restart, "result": "failed", "detail": {"why": f"{type(e).__name__}: {e}"}}
+        print(json.dumps(out, sort_keys=True))
+        return rc or (1 if out["result"] == "failed" else 0)
     if a.suspend:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
+    with pool_lock(a.workspace):
+        return _sweep(a)
+
+
+def _sweep(a) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
