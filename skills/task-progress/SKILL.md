@@ -75,13 +75,16 @@ annoying than silence for 2 minutes on a research task.
 
 ## How to use
 
-Read the task file to get `source` and `channel_id` (or `chat_id` for Telegram), then call
-**immediately after reading the task**:
+**Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
+`--thread-root` and `--thread-ts` straight from that task file's own headers, so there is
+nothing left to extract or remember by hand — including the thread, which is the field
+most often dropped (a flag-based fix for this recurred, 2026-10-01, even after the flag
+had existed for days: a fix that depends on the caller remembering to pass something every
+time is not a fix). Call **immediately after reading the task**:
 
 ```bash
 python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
-  --source slack \
-  --channel-id D0B5L7X2TK2 \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "On it — looking into that now. Back in a minute."
 ```
 
@@ -90,18 +93,34 @@ For research tasks, be specific about what you're doing:
   --message "Researching Trigify setup time now — back in a minute."
 ```
 
-For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
-For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+Mid-task checkpoint update — same `--task-file`, new message:
+```bash
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
+  --message "Done with the research — writing up the summary now."
+```
 
-Mid-task checkpoint update:
+Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--thread-ts` given
+explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
+checkpoint unthreaded on purpose, pass `--thread-root ''`).
+
+### When there is no task file to point at
+
+Pass the fields by hand — same flags, same meaning:
+
 ```bash
 python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
-  --message "Done with the research — writing up the summary now."
+  --message "On it — looking into that now. Back in a minute."
 ```
 
+For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
+For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+
 ### Field mapping from task files
+
+(What `--task-file` derives automatically; use this table only when passing fields by hand.)
 
 | source    | field in task file  | CLI flag        |
 |-----------|---------------------|-----------------|
@@ -110,7 +129,8 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 | telegram  | `chat_id:`          | `--chat-id`     |
 | ag2space  | `channel_id:`       | `--channel-id`  |
 
-Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
+Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`.
+Optional for AG2 Space threading: `thread_root:` (falls back to `reply_to_event:` if absent) → `--thread-root`.
 
 ### AG2 Space rooms
 
@@ -119,7 +139,7 @@ The same script posts the update in that room:
 
 ```bash
 python3 skills/task-progress/scripts/notify.py \
-  --source ag2space --channel-id '!room:server' \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "Got it, 2 in line before this one."
 ```
 

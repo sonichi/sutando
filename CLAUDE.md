@@ -274,11 +274,15 @@ analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
 python3 skills/task-progress/scripts/notify.py \
-  --source <source> --channel-id <channel_id> \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). To thread it, add `--thread-ts <reply_thread_ts>` (Slack @mention) or `--thread-root '<thread_root>'` (AG2 Space). An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+`--task-file` derives `source`, `channel_id`/`chat_id`, and the thread (`thread_root`, falling
+back to `reply_to_event`, or `thread_ts` for Slack) straight from that task file's own headers —
+nothing to read or pass by hand, including the thread, which is the field most often dropped by
+hand-extraction. Pass `--source`/`--channel-id`/etc. explicitly only when there is no task file
+to point at; any of them given alongside `--task-file` still overrides what the file carries.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
 pending, the first line to that task's conversation names the position: one ahead, "Got it, right

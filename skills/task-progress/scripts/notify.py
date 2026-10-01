@@ -7,6 +7,17 @@ Usage:
     python3 notify.py --source discord --channel-id 1234567890 --message "Working on it..."
     python3 notify.py --source telegram --chat-id 123456789 --message "On it..."
     python3 notify.py --source <provider> --channel-id '!roomid:server' --message "On it..."
+    python3 notify.py --task-file "$WORKSPACE/tasks/task-123.txt" --message "On it..."
+
+The last form is preferred whenever a task file is in hand (it always is, while
+processing one): --source, --channel-id/--chat-id, --thread-root and --thread-ts
+are all read from the task file's own headers, so there is nothing left to
+remember to pass by hand for a threaded reply to land in-thread. Filed after a
+thread-root omission recurred (2026-10-01) despite the flag existing since
+#4901/#4900 -- a fix that depends on the caller remembering a flag every single
+time is not a fix. Any of --source/--channel-id/--chat-id/--thread-root/
+--thread-ts given explicitly ALONGSIDE --task-file still wins over what the
+file carries, so this is additive, not a breaking change to the old call shape.
 
 Any --source other than slack/discord/telegram is treated as a remote-gateway
 channel: the sender reads channels/<source>/.env (under $CLAUDE_CONFIG_DIR) for
@@ -413,11 +424,50 @@ def upload_room_media(source: str, channel_id: str, path: str,
     return (True, "") if ok else (False, "upload failed")
 
 
+def _derive_from_task_file(path: str) -> dict:
+    """The fields notify.py needs (source, channel_id, chat_id, thread_root,
+    thread_ts), read straight from a task file's own headers. Returns {} (and
+    prints a warning) if the file can't be read or parsed -- a bad --task-file
+    must never crash the progress ping, only fall back to whatever explicit
+    flags were also given."""
+    try:
+        text = Path(path).read_text()
+    except OSError as e:
+        print(f"[task-progress] --task-file unreadable ({e}); "
+              f"falling back to explicit flags only", file=sys.stderr)
+        return {}
+    try:
+        from local_task_protocol import parse_task_headers_lenient  # noqa: E402
+    except ImportError:
+        print("[task-progress] local_task_protocol unavailable; "
+              "falling back to explicit flags only", file=sys.stderr)
+        return {}
+    # Lenient: these task files are task-mid as often as task-last (e.g.
+    # thread_root after task: in ag2space DM envelopes), and this file is one the caller already trusts.
+    headers = parse_task_headers_lenient(text).headers
+    out = {
+        "source": headers.get("source"),
+        "channel_id": headers.get("channel_id") or headers.get("source_room_id"),
+        "chat_id": headers.get("chat_id"),
+        # reply_to_event is the next-best thread anchor when thread_root is absent.
+        "thread_root": headers.get("thread_root") or headers.get("reply_to_event"),
+        "thread_ts": headers.get("thread_ts"),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send a task-progress update to a channel.")
-    parser.add_argument("--source", required=True,
+    parser.add_argument("--task-file", default=None,
+                        help="Path to the task file being processed; derives --source, "
+                             "--channel-id/--chat-id, --thread-root and --thread-ts from its "
+                             "headers so none of them need to be passed (or remembered) by "
+                             "hand. Any of those flags given explicitly still overrides what "
+                             "the file carries.")
+    parser.add_argument("--source", default=None,
                         help="Channel source: slack / discord / telegram, or any "
-                             "gateway-bridged provider with a channels/<source>/.env")
+                             "gateway-bridged provider with a channels/<source>/.env. "
+                             "Required unless --task-file supplies one.")
     parser.add_argument("--channel-id", help="Slack / Discord channel ID")
     parser.add_argument("--chat-id", help="Telegram chat ID (alias for --channel-id on telegram)")
     parser.add_argument("--thread-ts", default=None,
@@ -432,12 +482,22 @@ def main() -> int:
     parser.add_argument("--message", required=True, help="Text to send")
     args = parser.parse_args()
 
-    source = args.source
+    derived = _derive_from_task_file(args.task_file) if args.task_file else {}
+
+    source = args.source or derived.get("source")
     message = args.message
-    channel = args.channel_id or args.chat_id
+    channel = args.channel_id or args.chat_id or derived.get("channel_id") or derived.get("chat_id")
+    thread_root = args.thread_root or derived.get("thread_root")
+    thread_ts = args.thread_ts or derived.get("thread_ts")
+
+    if not source:
+        print("[task-progress] --source is required (directly, or derivable from --task-file)",
+              file=sys.stderr)
+        return 1
 
     if not channel:
-        print("[task-progress] --channel-id (or --chat-id) is required", file=sys.stderr)
+        print("[task-progress] --channel-id (or --chat-id) is required "
+              "(directly, or derivable from --task-file)", file=sys.stderr)
         return 1
 
     validation_error = _progress_message_error(message)
@@ -451,7 +511,7 @@ def main() -> int:
         return 1
 
     if source == "slack":
-        ok = send_slack(channel, message, thread_ts=args.thread_ts)
+        ok = send_slack(channel, message, thread_ts=thread_ts)
     elif source == "discord":
         ok = send_discord(
             channel,
@@ -461,7 +521,7 @@ def main() -> int:
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:
-        ok = send_remote_gateway(source, channel, message, thread_root=args.thread_root)
+        ok = send_remote_gateway(source, channel, message, thread_root=thread_root)
 
     return 0 if ok else 1
 

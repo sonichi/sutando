@@ -123,5 +123,75 @@ class EventIdParityTests(unittest.TestCase):
                 self.assertTrue(ok, repr(value))
                 self.assertEqual(sent[0]["thread_root"], expected, repr(value))
 
+class NotifyTaskFileDeriveTests(unittest.TestCase):
+    """--task-file is the fix for a thread-root omission recurring even after the flag
+    existed (2026-10-01): derive source/channel/thread_root/thread_ts from the task file
+    itself, so there is nothing left for the caller to remember to pass by hand."""
+
+    def _write(self, tmp_path, body):
+        tmp_path.write_text(body)
+        return str(tmp_path)
+
+    def _send(self, argv, env=None):
+        sent = []
+
+        def fake_post(url, payload, headers):
+            sent.append(payload)
+            return True
+
+        with mock.patch.object(notify, "_post", fake_post), \
+                mock.patch.dict(os.environ, {**_GW_ENV, **(env or {})}, clear=False), \
+                mock.patch.object(sys, "argv", ["notify.py", "--message", "on it", *argv]):
+            for k in ("SUTANDO_WORKER_ID", "SUTANDO_CORE_ID", "SUTANDO_WORKER_SEAT"):
+                os.environ.pop(k, None)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = notify.main()
+        return rc, sent, err.getvalue()
+
+    def test_task_mid_file_derives_source_channel_and_thread_root(self):
+        # headers both before AND after `task:` -- the real shape of an ag2space DM
+        # envelope (thread_root follows task:), not the strict task-last form.
+        f = pathlib.Path("/tmp/notify-task-file-test-mid.txt")
+        self.addCleanup(f.unlink, missing_ok=True)
+        self._write(f, "id: task-x\nsource: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "task: some owner message\nthread_root: $root123\n")
+        rc, sent, _ = self._send(["--task-file", str(f)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
+                                 "thread_root": "$root123"}])
+
+    def test_explicit_flag_overrides_what_the_task_file_carries(self):
+        f = pathlib.Path("/tmp/notify-task-file-test-override.txt")
+        self.addCleanup(f.unlink, missing_ok=True)
+        self._write(f, "source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "task: x\nthread_root: $fromfile\n")
+        rc, sent, _ = self._send(["--task-file", str(f), "--thread-root", "$explicit"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["thread_root"], "$explicit")
+
+    def test_task_file_with_no_thread_root_falls_back_to_reply_to_event(self):
+        f = pathlib.Path("/tmp/notify-task-file-test-replyto.txt")
+        self.addCleanup(f.unlink, missing_ok=True)
+        self._write(f, "source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "task: x\nreply_to_event: $replyevt\n")
+        rc, sent, _ = self._send(["--task-file", str(f)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["thread_root"], "$replyevt")
+
+    def test_missing_task_file_falls_back_to_explicit_flags_without_crashing(self):
+        rc, sent, err = self._send(["--task-file", "/tmp/does-not-exist-xyz.txt",
+                                    "--source", "local-ag2space", "--channel-id", ROOM])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+        self.assertIn("unreadable", err)
+
+    def test_neither_task_file_nor_source_refuses_cleanly(self):
+        rc, sent, err = self._send([])
+        self.assertEqual(rc, 1)
+        self.assertEqual(sent, [])
+        self.assertIn("--source is required", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
