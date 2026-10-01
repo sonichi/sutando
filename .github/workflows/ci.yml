@@ -413,12 +413,12 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Leg 6 runs the listed load-sensitive suites on one worker (a timing suite
+          # Leg 6 runs the listed load-sensitive suites two at a time (a timing suite
           # beside a CPU-heavy neighbour misses its own window); legs 1-5 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
           if [ "${SHARD:-1}" = 6 ]; then
             bash scripts/select-load-sensitive-suites.sh only "$LIST" < "$RECDIR/all" > "$RECDIR/files"
-            WORKERS=1
+            WORKERS=2
           else
             # The selector exits non-zero on a stale or duplicate entry, so a renamed
             # suite cannot slip back into the shared legs; no pipe, `-e` has no pipefail.
