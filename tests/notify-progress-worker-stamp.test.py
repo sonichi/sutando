@@ -137,6 +137,9 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
 
     def _send(self, argv, env=None):
         sent = []
+        # No real channels/<source>/.env may decide routability.
+        cfg = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, cfg)
 
         def fake_post(url, payload, headers):
             sent.append(payload)
@@ -144,7 +147,8 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
 
         with mock.patch.object(notify, "_post", fake_post), \
                 mock.patch.object(notify, "_token", lambda source, var: "tok"), \
-                mock.patch.dict(os.environ, {**_GW_ENV, **(env or {})}, clear=False), \
+                mock.patch.dict(os.environ, {**_GW_ENV, "CLAUDE_CONFIG_DIR": cfg, **(env or {})},
+                                clear=False), \
                 mock.patch.object(sys, "argv", ["notify.py", "--message", "on it", *argv]):
             for k in ("SUTANDO_WORKER_ID", "SUTANDO_CORE_ID", "SUTANDO_WORKER_SEAT"):
                 os.environ.pop(k, None)
@@ -210,6 +214,39 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
         self.assertIn("unreadable", err)
 
+    def test_undecodable_task_file_fails_open_to_explicit_flags(self):
+        f = self._task("")
+        with open(f, "wb") as fh:
+            fh.write(b"source: local-ag2space\n\xff\xfe task: x\n")
+        rc, sent, err = self._send(["--task-file", f,
+                                    "--source", "local-ag2space", "--channel-id", ROOM])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+        self.assertIn("unreadable", err)
+
+    def test_local_voice_task_sends_nothing_to_the_gateway(self):
+        # The shape src/task-bridge.ts writes for an undocked voice task.
+        f = self._task("id: task-1\nsource: voice\ninteraction_type: realtime_audio\n"
+                       "media_form: live_stream\nchannel_id: local-voice\ntask: private ask\n")
+        rc, sent, err = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("no bridge", err)
+
+    def test_docked_voice_task_with_a_real_room_still_posts(self):
+        f = self._task("id: task-2\nsource: voice\ninteraction_type: realtime_audio\n"
+                       f"channel_id: {ROOM}\ntask: room ask\n")
+        rc, sent, _ = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
+
+    def test_unknown_source_without_a_room_sends_nothing(self):
+        f = self._task("id: task-u\nsource: some-local-producer\nchannel_id: local-x\ntask: x\n")
+        rc, sent, err = self._send(["--task-file", f])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("no bridge", err)
+
     def test_chat_task_has_no_bridge_and_sends_nothing(self):
         f = self._task("id: task-chat-1\nsource: chat\nchannel_id: local-chat\n"
                        "access_tier: owner\ntask: do a thing\n")
@@ -229,7 +266,7 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertIn("local_task_protocol unavailable", err.getvalue())
 
     def test_task_file_with_source_but_no_channel_refuses_cleanly(self):
-        f = self._task("id: task-v\nsource: local-ag2space\ntask: x\n")
+        f = self._task("id: task-v\nsource: slack\ntask: x\n")
         rc, sent, err = self._send(["--task-file", f])
         self.assertEqual(rc, 1)
         self.assertEqual(sent, [])

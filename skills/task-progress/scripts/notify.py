@@ -417,8 +417,18 @@ def upload_room_media(source: str, channel_id: str, path: str,
     return (True, "") if ok else (False, "upload failed")
 
 
-# Task sources with no outbound bridge: a progress ping has nowhere to land.
-_NO_BRIDGE_SOURCES = frozenset({"chat", "local"})
+_BUILTIN_SENDERS = frozenset({"slack", "discord", "telegram"})
+
+
+def _has_sender(source: str, channel: "str | None") -> bool:
+    """Whether this script can route the source: a built-in sender, a per-source
+    channels/<source>/.env, or the gateway route given a channel that is not local-*."""
+    if source in _BUILTIN_SENDERS:
+        return True
+    if _SOURCE_SLUG_RE.match(source) and _channel_env_path(source).is_file():
+        return True
+    # Local writers stamp placeholder channels (local-voice, local-chat): no room behind them.
+    return bool(channel) and not channel.startswith("local-")
 
 
 def _derive_from_task_file(path: str) -> dict:
@@ -426,7 +436,7 @@ def _derive_from_task_file(path: str) -> dict:
     {} (with a stderr note) when the file is unreadable: explicit flags still apply."""
     try:
         text = Path(path).read_text()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         print(f"[task-progress] --task-file unreadable ({e}); "
               f"falling back to explicit flags only", file=sys.stderr)
         return {}
@@ -495,7 +505,7 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    if source in _NO_BRIDGE_SOURCES:
+    if not _has_sender(source, channel):
         print(f"[task-progress] source {source!r} has no bridge; nothing to send",
               file=sys.stderr)
         return 0
