@@ -402,6 +402,17 @@ One honest limit: two live sessions on a machine can reach each other through th
 *runtime's* inter-session messaging. That carries no envelope, no attested submitter
 and no record, so it cannot place work — a debugging affordance, not a path.
 
+**The front door's actual command is `pool_ask.py`** (`skills/worker-pool/scripts/pool_ask.py`
+— see its skill's "Talking to the other instances" section). This is the only correct
+way to reach another instance (core or worker) sharing this host, including over a chat
+bridge: the core and every worker share one bot identity on AG2 Space/Discord, so a
+room post or @-mention from one is indistinguishable, bridge-side, from the sender's
+own output — it reaches no one and triggers nothing, however it is addressed. Measured
+2026-09-30: a core tried handing off a PR to a worker via an AG2 Space room post twice
+(a bare `say`, then an addressed one) and neither worked, for exactly this reason.
+`pool_ask.py --to <label|id|core> --ask "..."` writes a real task into the recipient's
+own inbox instead.
+
 ## Sets
 
 A declared set delivers to **every** member: one delivery each, ids from
