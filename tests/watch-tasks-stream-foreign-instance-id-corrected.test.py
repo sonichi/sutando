@@ -4,11 +4,9 @@ session inherits that instance's SUTANDO_INSTANCE_ID in its environment, even
 when --inbox explicitly names the CORE's own canonical <ws>/tasks. Before this
 fix, src/watch-tasks-stream.sh trusted that inherited env unconditionally: it
 watched the right directory but believed itself to be that other worker's own
-inbox-watcher (#4502's rule: a worker's own inbox IS the routing decision), so
-it never loaded the core's task-event-handler config and silently stopped
-dispatching anything -- the exact production incident of 2026-09-30 (pid 1184:
-argv correctly said `--role session --inbox <core's workspace>/tasks`, env
-said SUTANDO_INSTANCE_ID=<a different worker's id>).
+inbox-watcher (a worker's own inbox IS the routing decision), so it never
+loaded the core's task-event-handler config and silently stopped dispatching
+anything it saw.
 
 Five properties, against a live watcher and real fswatch:
 
