@@ -111,7 +111,8 @@ caps this file and refuses date stamps in it).
    — never hand-edit the ledger. It inserts the entry at the top of the per-host `pending-questions.md`,
    queues the question to the owner (the task's conversation only for an owner DM task, else his DM),
    stamps `**Sent:** queued …` and fires the macOS notification. Read its output: a `FAILED` line is
-   not an ask. Then pivot; never block.
+   not an ask; confirm the title with the reader, `src/check-pending-questions.py` `get_waiting_questions()`.
+   Then pivot; never block.
 9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
    "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).

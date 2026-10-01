@@ -99,6 +99,8 @@ def sent_at(body: str) -> Optional[float]:
 
 def drained(results_dir: Path, name: str) -> bool:
     """A queued file some drain took: neither the file nor its `.sending` claim remains."""
+    if not name.startswith("proactive-"):
+        return False
     p = Path(results_dir) / name
     return not p.exists() and not p.with_suffix(".sending").exists()
 
