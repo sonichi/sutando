@@ -1,0 +1,9 @@
+# Suites that time out under a busy host (issue #4862's family + the two that
+# failed beside heavy neighbours): CI runs them alone, one at a time, on their own leg.
+tests/watch-tasks-stream-bare-directory-event.test.py
+tests/watch-tasks-stream-config-hot-reload.test.py
+tests/watch-tasks-stream-handler-terminal-rc.test.py
+tests/watch-tasks-stream-inbox-and-workspace-env.test.py
+tests/watch-tasks-stream-malformed-roster-row.test.py
+tests/watch-tasks-stream-priority-sweep.test.py
+tests/watch-tasks-stream-sentinel-ownership.test.py
