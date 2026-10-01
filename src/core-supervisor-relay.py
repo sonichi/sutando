@@ -45,6 +45,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
@@ -357,7 +358,36 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
         _save_last_hash(state_file, new_hash)
     if outcome is not None:
         outcome["undelivered"] = None if delivered else reason
+        outcome["hash"] = new_hash
     return msg
+
+
+# Kept apart from the debounce state, which stays empty until a real delivery.
+UNDELIVERED_LOG_INTERVAL_S = 15 * 60
+
+
+def _should_log_undelivered(state_file, h):
+    """Once per signal hash, then at most every UNDELIVERED_LOG_INTERVAL_S."""
+    if not state_file:
+        return True
+    side = state_file + ".undelivered"
+    now = time.time()
+    try:
+        with open(side) as f:
+            d = json.load(f)
+        if (isinstance(d, dict) and d.get("hash") == h
+                and now - float(d.get("logged_at", 0)) < UNDELIVERED_LOG_INTERVAL_S):
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        tmp = side + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"hash": h, "logged_at": now}, f)
+        os.replace(tmp, side)
+    except OSError:  # pragma: no cover - best-effort log throttle
+        pass
+    return True
 
 
 # Routability is src/progress_route.py's verdict; beyond it a source must be
@@ -481,7 +511,8 @@ def main(argv=None):
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
     if msg and outcome.get("undelivered"):
-        print(f"not delivered: {outcome['undelivered']} (will retry): {msg}")
+        if _should_log_undelivered(a.state_file, outcome.get("hash")):
+            print(f"not delivered: {outcome['undelivered']} (will retry): {msg}")
         return 0
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)

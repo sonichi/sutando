@@ -1168,8 +1168,7 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
             self.assertIn("not delivered: no route and macOS disabled (will retry)", out)
             self.assertNotIn("escalated:", out)
             rc, calls, persisted, out = self._cycle(td, no_macos=True)
-            self.assertIn("not delivered: no route and macOS disabled (will retry)", out,
-                          "the next cycle must retry, not be suppressed")
+            self.assertNotIn("no escalation", out, "the next cycle must retry, not be suppressed")
             self.assertFalse(persisted)
 
     def test_no_route_with_a_failed_macos_notification_persists_nothing(self):
@@ -1228,10 +1227,12 @@ class TestMacosNotifyAdapter(unittest.TestCase):
 
     def _assert_undelivered_and_retries(self):
         with tempfile.TemporaryDirectory() as td:
-            for _ in range(2):
-                persisted, out = self._main_cycle(td)
-                self.assertFalse(persisted)
-                self.assertIn("not delivered: no route and macOS notification failed", out)
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertIn("not delivered: no route and macOS notification failed", out)
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertNotIn("no escalation", out, "the next cycle must retry")
 
     def test_exit_0_is_delivered_and_debounces(self):
         self._fake("exit 0")
@@ -1248,6 +1249,8 @@ class TestMacosNotifyAdapter(unittest.TestCase):
         self.assertIs(self._notify(), False)
         self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
         self._assert_undelivered_and_retries()
+        with open(self.calls) as f:
+            self.assertEqual(len(f.readlines()), 3, "both cycles retried the notification")
 
     def test_missing_binary_is_not_delivered(self):
         self.assertIs(self._notify(), False)
@@ -1265,6 +1268,42 @@ class TestMacosNotifyAdapter(unittest.TestCase):
                           side_effect=_sp.TimeoutExpired("osascript", 8)):
             self.assertIs(self._notify(), False)
             self._assert_undelivered_and_retries()
+
+
+class TestUndeliveredLogThrottle(unittest.TestCase):
+    """A cycle that reaches no one retries every tick but logs once per signal,
+    then at most every UNDELIVERED_LOG_INTERVAL_S; the debounce state stays empty."""
+
+    def _cycle(self, td, signal, now):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(signal, f)
+        state = os.path.join(td, "s.state")
+        with patch.object(_mod.time, "time", return_value=now), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state, "--no-macos"])
+        return out.getvalue().count("not delivered:"), os.path.exists(state)
+
+    def test_logs_once_then_again_after_the_interval(self):
+        iv = _mod.UNDELIVERED_LOG_INTERVAL_S
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1030.0), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv - 1), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 1), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 31), (0, False))
+
+    def test_a_new_signal_logs_at_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LIMIT, 1030.0), (1, False))
+
+    def test_the_debounce_state_never_holds_the_throttle(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._cycle(td, _LOGIN, 1000.0)
+            self.assertFalse(os.path.exists(os.path.join(td, "s.state")))
+            self.assertTrue(os.path.exists(os.path.join(td, "s.state.undelivered")))
 
 
 if __name__ == "__main__":
