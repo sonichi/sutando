@@ -6,8 +6,9 @@ step's unconditional `verify` exits 4 unless the files about to run match that r
 This runs ci.yml's real step for legs 1 (`without`), 6 (`only`) and 7 (`serial`): with the real
 selector each leg verifies and reaches the lane with its receipt; with a selector that
 drops its receipt, or whose output is altered after it is hashed, each leg must stop with
-exit 4 before the lane runs. A workflow that skips verification passes those spoiled
-runs and fails here; one that skips the selector has no receipt and fails in CI itself.
+exit 4 before the lane runs; and legs 6-7 must stop when one file is added to or dropped
+from their run list after sharding, the selection left intact. A workflow that skips
+verification passes those spoiled runs and fails here; one that skips the selector has no receipt and fails in CI itself.
 
 Run: python3 tests/python-ci-selector-receipt.test.py
 """
@@ -33,6 +34,16 @@ case "$SPOIL" in
   extra) out="$out"$'\\n'"$EXTRA" ;;
 esac
 printf '%s\\n' "$out"
+"""
+
+# Wraps the real sharder: the selection stays intact, the leg's run list changes after it.
+SHARD_WRAPPER = """#!/usr/bin/env bash
+out="$(bash "$(dirname "$0")/shard-real.sh" "$@")" || exit $?
+case "$SPOIL" in
+  files-add) out="$out"$'\\n'"$EXTRA" ;;
+  files-drop) out="$(printf '%s\\n' "$out" | sed '$d')" ;;
+esac
+[ -z "$out" ] || printf '%s\\n' "$out"
 """
 
 
@@ -68,6 +79,19 @@ def main() -> int:
                                  "not 4 before the lane")
                 elif "selector receipt check" not in err:
                     fails.append(f"leg {shard} exited 4 without the receipt-check message: {err.strip()!r}")
+
+        # Legs 6-7 must run exactly the selection: one file added to or dropped from the run
+        # list after sharding, with the selection and its receipt intact, stops the leg.
+        (fx / "scripts" / "shard-by-cost.sh").rename(fx / "scripts" / "shard-real.sh")
+        (fx / "scripts" / "shard-by-cost.sh").write_text(SHARD_WRAPPER)
+        for spoil in ("files-add", "files-drop"):
+            for shard in (6, 7):
+                os.environ["SPOIL"], os.environ["EXTRA"] = spoil, unlisted
+                rc, files, _w, err, _r = legs_mod.run_legs(fx, real, 8, (shard,))[shard]
+                if rc != 4 or files is not None or "is not exactly the selected suites" not in err:
+                    fails.append(f"run list {'added to' if spoil == 'files-add' else 'dropped from'} after sharding: leg {shard} exited {rc}"
+                                 f"{' and reached the lane' if files is not None else ''}, not 4 with "
+                                 f"'is not exactly the selected suites': {err.strip()[-160:]!r}")
         os.environ.pop("SPOIL", None)
         os.environ.pop("EXTRA", None)
 
@@ -76,7 +100,8 @@ def main() -> int:
     if fails:
         return 1
     print("PASS: legs 1, 6 and 7 run only selector-receipted lists; a missing receipt or an output "
-          "altered after selection stops each leg with exit 4 before the lane")
+          "altered after selection stops each leg with exit 4 before the lane; legs 6-7 also stop when "
+          "their run list gains or loses a file after sharding")
     return 0
 
 
