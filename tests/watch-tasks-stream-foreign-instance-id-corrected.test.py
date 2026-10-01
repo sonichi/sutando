@@ -131,8 +131,7 @@ cfg = ws / "state" / "task-event-handler.json"
 cfg.write_text(json.dumps({"handler": str(handler)}))
 
 # (1)+(2): the core's own <ws>/tasks, but SUTANDO_INSTANCE_ID carries a
-# foreign worker's id -- exactly the --force-restart-from-another-session
-# incident.
+# foreign worker's id (the --force-restart-from-another-session incident).
 errf_path = tmp / "watcher.err"
 errf = open(errf_path, "w")
 p = start_watcher(ws / "tasks", errf, instance="d2571c90f75e4907af9f145b01b71c1f")

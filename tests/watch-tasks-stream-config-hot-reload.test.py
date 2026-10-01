@@ -41,10 +41,8 @@ def check(name, cond, detail=""):
 
 
 def start_watcher(ws, errf, instance=None, inbox=None):
-    # A worker's own inbox is <ws>/deliveries/<id> (#4502 -- src/watch-tasks-stream.sh
-    # now derives identity from this shape, not from SUTANDO_INSTANCE_ID alone), so
-    # `instance` and `inbox` are set together: passing one without the other would
-    # test a combination that cannot occur in production.
+    # `instance` and `inbox` are set together: a worker's own inbox is
+    # <ws>/deliveries/<id> (#4502), never the bare <ws>/tasks.
     inbox = inbox or (ws / "tasks")
     env = dict(os.environ)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
@@ -167,9 +165,6 @@ finally:
 
 # (3) cfg still names `handler` from step (2); log content before this
 # section is the control -- must be byte-identical after, proving no call.
-# A worker's inbox is <ws>/deliveries/<id>, never the bare <ws>/tasks the
-# core alone watches (#4502) -- using the real shape here is what makes this
-# a test of "a worker", not of "SUTANDO_INSTANCE_ID happens to be set".
 log_before = log.read_text() if log.exists() else ""
 worker_inbox = ws / "deliveries" / "worker-1"
 worker_inbox.mkdir(parents=True)
