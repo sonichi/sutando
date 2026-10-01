@@ -79,7 +79,7 @@ annoying than silence for 2 minutes on a research task.
 `--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
 `reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
 extract or remember by hand — including the thread, the field most often dropped. Only a
-delivering bridge task sends: `slack`/`discord`/`telegram`, or a gateway room id (`!room:server`,
+delivering bridge task sends: `slack`/`discord`/`telegram`, or a gateway room id (`!room:server`, or a server-less room v12 id,
 e.g. AG2 Space or a docked voice task). Every other task — undocked `voice`, `chat`, `cron`,
 `runtime-api`, an unknown writer — sends nothing and exits 0, whatever channel config exists. Call
 **immediately after reading the task**:
