@@ -28,7 +28,7 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter, safe_body  # noqa: E402
+from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter  # noqa: E402
 from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
@@ -82,17 +82,6 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
 
 
 # ---- serve: one request against the databases document -------------------------
-
-# More unsafe characters than this and the row is left as is: each repair is one write.
-NEUTRALISE_MAX = 32
-
-
-def _first_unsafe(text: str):
-    for i, ch in enumerate(text):
-        if safe_body(ch) != ch:
-            return i
-    return None
-
 
 def _key(*parts: str) -> str:
     return "|".join(parts)
@@ -184,21 +173,6 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         if any(current[p] not in allowed for p, allowed in req["expect"].items()):
             return {"written": False, "current": current}
         await doc.put_database({"cells": _cell_writes(db, row, req["cells"], by, now_ms)})
-        return {"written": True, "current": current}
-    if op == "neutralise":
-        have = _cells(maps, db, row)
-        current = {p: have.get(p) for p in req["expect"]}
-        if any(current[p] not in allowed for p, allowed in req["expect"].items()):
-            return {"written": False, "current": current}
-        # One character per write: each is its own minimal delta, so a concurrent edit elsewhere merges.
-        body = doc.row_body(db, row) or ""
-        unsafe = sum(1 for ch in body if safe_body(ch) != ch)
-        if unsafe > NEUTRALISE_MAX:
-            return {"written": False, "current": {**current, "unsafe_characters": unsafe}}
-        while (fixed := _first_unsafe(body)) is not None:
-            body = body[:fixed] + "\ufffd" + body[fixed + 1:]
-            await doc.put_row_body(db, row, body)
-            body = doc.row_body(db, row) or ""
         return {"written": True, "current": current}
     if op == "stamp":
         body, token = doc.row_body(db, row) or "", req["token"]
