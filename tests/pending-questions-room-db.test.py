@@ -24,7 +24,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "scripts"))
+sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
 pqa = importlib.import_module("pending_questions_ask")
 adapter = importlib.import_module("pending_questions_room_db")
 pqs = importlib.import_module("pending_questions_store")
@@ -1084,6 +1084,9 @@ class TestDelegation(unittest.TestCase):
         for rel in ("src/pending_questions_store.py", "src/pending_questions_ask.py",
                     "src/check-pending-questions.py", "src/pending_questions_ledger.py"):
             self.assertNotRegex(self.src(rel), r"room[-_]collab", rel)
+        for rel in ("src/pending_questions_store.py", "src/check-pending-questions.py",
+                    "scripts/ask-owner.py", "scripts/pending-questions-migrate.py"):
+            self.assertNotRegex(self.src(rel), r"pending_questions_room_db|skills/pending-questions", rel)
 
     def test_ask_owner_writes_only_through_the_store_policy(self):
         s = self.src("src/pending_questions_ask.py")
@@ -1097,7 +1100,7 @@ class TestDelegation(unittest.TestCase):
         self.assertNotRegex(s, r"write_text|os\.replace|open\([^)]*['\"]w")
 
     def test_the_adapter_writes_only_through_the_documents_own_calls(self):
-        s = self.src("scripts/pending_questions_room_db.py")
+        s = self.src("skills/pending-questions/scripts/pending_questions_room_db.py")
         writes = set(re.findall(r"await doc\.(\w+)\(", s))
         self.assertEqual(writes, {"put_database", "put_row_body", "settle"})
         self.assertNotRegex(s, r"write_text|os\.replace")
@@ -1122,7 +1125,7 @@ class TestDelegation(unittest.TestCase):
                     "proactive_file": "p", "where": "w", "send_error": None, "macos": None}
         ws = tempfile.mkdtemp()
         sys.argv = ["ask-owner.py", "q?", "--workspace", ws]
-        with mock.patch.object(adapter, "room_store", return_value=(fake, ROOM)), \
+        with mock.patch.object(pqs, "load_adapter_store", return_value=(fake, ROOM)), \
                 mock.patch.object(pqa, "ask_owner", _ask), contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 runpy.run_path(str(REPO / "scripts" / "ask-owner.py"), run_name="__main__")

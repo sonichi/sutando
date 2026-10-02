@@ -1,0 +1,12 @@
+{
+  "name": "pending-questions",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Ask the owner, list what waits on him, resolve and remind; declares the room-database adapter for owner pending questions.",
+  "pending_questions_store": "scripts/pending_questions_room_db.py",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

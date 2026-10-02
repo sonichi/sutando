@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter, safe_body  # noqa: E402
 from workspace_default import status_path  # noqa: E402

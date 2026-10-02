@@ -648,6 +648,42 @@ def registered_adapter(workspace) -> Optional[str]:
         return None
 
 
+# The manifest field an installed skill declares its adapter script with.
+DECLARATION = "pending_questions_store"
+
+
+def declared_adapter(skills_dir) -> Optional[Path]:
+    """The adapter the first installed skill declares in its manifest; None when none does.
+    The script must resolve inside its own skill, since a manifest may come from a third party."""
+    for manifest in sorted(Path(skills_dir).glob("*/manifest.json")):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rel = data.get(DECLARATION) if isinstance(data, dict) else None
+        if not isinstance(rel, str) or not rel or data.get("enabled") is False:
+            continue
+        skill = manifest.parent.resolve()
+        script = (skill / rel).resolve()
+        if script.is_relative_to(skill) and script.is_file():
+            return script
+    return None
+
+
+def load_adapter_store(adapter, workspace) -> tuple:
+    """(store | None, why) from an adapter file's `room_store(workspace)`; never raises."""
+    if not adapter:
+        return None, "no pending-questions store adapter installed"
+    try:
+        import importlib.util  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("pq_store_adapter", str(adapter))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.room_store(Path(workspace))
+    except Exception as e:  # noqa: BLE001 — the file alone still holds every question
+        return None, f"adapter {adapter} failed to load ({type(e).__name__}: {e})"
+
+
 # ---- policy between them -------------------------------------------------------
 
 @dataclass
