@@ -195,5 +195,33 @@ class TestDeclaration(_Ws):
         self.assertIn("**Status:** open", self.pq.read_text())
 
 
+class TestSharedRoom(_Ws):
+    SHARED = "!shared:test.invalid"
+
+    def store_room(self, env):
+        rdb._install_fake_capability(self.ws)
+        store, where = rdb.adapter.room_store(self.ws, environ=env)
+        return store, where
+
+    def test_the_owner_dm_is_the_default(self):
+        store, room = self.store_room({})
+        self.assertEqual(room, ROOM)
+        self.assertIn("DM room", store.label)
+
+    def test_a_host_state_file_moves_the_database_to_the_shared_room(self):
+        (self.ws / "state" / "pending-questions-room").write_text(self.SHARED + "\n")
+        store, room = self.store_room({})
+        self.assertEqual(room, self.SHARED)
+        self.assertNotIn("DM", store.label)
+
+    def test_env_wins_over_the_state_file(self):
+        (self.ws / "state" / "pending-questions-room").write_text("!fromstate:test.invalid")
+        self.assertEqual(self.store_room({"PENDING_QUESTIONS_ROOM": self.SHARED})[1], self.SHARED)
+
+    def test_the_manifest_declares_the_key_empty(self):
+        cfg = json.loads((SKILL / "manifest.json").read_text())
+        self.assertEqual(cfg["config"], {"PENDING_QUESTIONS_ROOM": ""})
+
+
 if __name__ == "__main__":
     unittest.main()
