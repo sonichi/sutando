@@ -153,8 +153,7 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         host = req["cells"].get("host")
         mark = f"incomplete@{host}" if host else "incomplete"
         have = _cells(maps, db, row) if exists else {}
-        resume = exists and have.get("recovery") == mark and have.get("host") == host \
-            and (doc.row_body(db, row) or "") == ""
+        resume = exists and have.get("recovery") == mark and have.get("host") == host
         if exists and not resume:  # an existing row is never written here: its state is reported
             body = doc.row_body(db, row) or ""
             return {"created": False, "db": db, "row": row, "link": link,
@@ -165,7 +164,8 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
             await doc.put_database({"rows": {_key(db, row): {"order": (min(orders) - GAP) if orders else GAP,
                                                              "created": now_ms, "by": by}},
                                     "cells": _cell_writes(db, row, {**req["cells"], "recovery": mark}, by, now_ms)})
-        await doc.put_row_body(db, row, req["body"])
+        if not exists or (doc.row_body(db, row) or "") == "":  # a body that already landed is kept
+            await doc.put_row_body(db, row, req["body"])
         await doc.put_database({"cells": _cell_writes(db, row, {"recovery": None}, by, now_ms)})
         return {"created": True, "db": db, "row": row, "link": link}
     if not exists:

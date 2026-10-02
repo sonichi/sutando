@@ -1929,6 +1929,51 @@ class TestMigrateRound3(_MigrateBase):
         self.assertEqual(len(qs), 1)  # one reminder, carried by the resumed row
         self.assertEqual(notes, [])
 
+    def test_a_hard_stop_during_the_database_write_still_leaves_the_file_entry(self):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        pq = ws / "pending-questions.md"
+
+        class Killed(BaseException):
+            pass
+
+        class Dies(InProcClient):
+            def add_row(self, *a, **k):
+                raise Killed()
+        db = pqs.RoomDbStore(Dies(), lock=ws / "state" / "l", host=HOST)
+        q = pqs.Question("ask-k1", "Ship it?", None, 1_790_000_000.0, None, None, (), "Medium")
+        with self.assertRaises(Killed):
+            pqs.write_question(q, pqs.FileStore(pq), db)
+        self.assertEqual([e["ask_id"] for e in pqs.FileStore(pq).entries()], ["ask-k1"])
+
+    def test_a_body_that_landed_but_whose_mark_clear_was_lost_is_finished(self):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        pq = ws / "pending-questions.md"
+        doc = fake_client.FakeDoc()
+        real, calls = doc.put_database, {"n": 0}
+
+        async def loses_the_clear(writes):
+            cells = writes.get("cells") or {}
+            if any(k.endswith("|recovery") and v is None for k, v in cells.items()) and calls["n"] == 0:
+                calls["n"] += 1
+                raise ConnectionError("ack lost after the body landed")
+            return await real(writes)
+        doc.put_database = loses_the_clear
+        db = pqs.RoomDbStore(InProcClient(doc), lock=ws / "state" / "l", host=HOST)
+        q = pqs.Question("ask-c1", "Ship the release?", None, 1_790_000_000.0, None, None, (), "Medium")
+        out = pqs.write_question(q, pqs.FileStore(pq), db)
+        self.assertIsNotNone(out.db_error)
+        [row] = db.entries()
+        self.assertTrue(row["incomplete"])
+        self.assertIn("Ship the release?", row["body"])  # the body did land
+        sent = "**Sent:** queued owner-dm via proactive-ask-c1.txt at 2026-09-21T00:00:00Z"
+        pqs.FileStore(pq).stamp("ask-c1", sent)
+        _cpq(pq, ws).gather(db)
+        [row] = db.entries()
+        self.assertEqual((row["status"], row["incomplete"], row["recovery"]), ("Open", False, False))
+        self.assertIn("Ship the release?", row["body"])
+
     def test_an_owner_cleared_body_is_not_mistaken_for_an_incomplete_row(self):
         plan, client = self._only(), InProcClient()
         db = self.db(client)
