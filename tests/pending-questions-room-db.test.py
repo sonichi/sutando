@@ -136,9 +136,8 @@ class InProcClient:
         return self._do({"op": "stamp", "schema": schema, "row": row, "token": token,
                          "replacement": replacement})
 
-    def transition(self, schema, row, prop, expect, to):
-        return self._do({"op": "transition", "schema": schema, "row": row, "prop": prop,
-                         "expect": expect, "to": to})
+    def guarded(self, schema, row, cells, expect):
+        return self._do({"op": "guarded", "schema": schema, "row": row, "cells": cells, "expect": expect})
 
 
 class RacyClient(InProcClient):
@@ -615,7 +614,7 @@ class TestMigratedRows(_Ws):
         self.pq.write_text(self.MOVED)
         db = self.db()
         db.insert_raw("legacy-abc123def456", "migrated", "page")
-        db.set_status("legacy-abc123def456", "Superseded")
+        db.supersede("legacy-abc123def456")
         self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])
 
@@ -694,41 +693,161 @@ class TestTwoHostsOneRoom(_Ws):
                                           "legacy-abc123def456": ("Open", "host-a")})
         self.assertEqual(self._pass("host-a"), ([], []))
 
+    def test_a_host_that_loses_the_claim_leaves_the_row_alone(self):
+        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
+            "legacy-race", "migrated", "p")
+        a, b = self.hosts["host-a"], self.hosts["host-b"]
+        real_rows = b["db"].client.rows
+
+        def rows_then_a_claims(schema):
+            seen = real_rows(schema)  # host B's view: no Host yet
+            self.assertTrue(a["db"].claim_host("legacy-race"))
+            return seen
+        b["db"].client.rows = rows_then_a_claims
+        synced, errors = pqs.resync(b["file"], b["db"], evidence=lambda aid: True)
+        self.assertEqual((synced, errors), ([], []))
+        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
+        b["db"].client.rows = real_rows
+        self.assertEqual(self._pass("host-b"), ([], []))
+        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
+
 
 class TestMonotonicStatus(_Ws):
     def test_code_never_reopens_or_downgrades_a_closed_row(self):
         db = self.db()
         db.insert_raw("legacy-x", "q", "p")
         db.set_status("legacy-x", "Resolved")  # the owner
-        for frm, to in (("Resolved", "Open"), ("Resolved", SUPERSEDED_), ("Answered", "Open"),
-                        ("Resolved", "Answered")):
-            with self.assertRaisesRegex(pqs.StoreError, "not a transition code may make"):
-                db.transition("legacy-x", frm, to)
-        with self.assertRaises(pqs.CasConflict) as c:
-            db.transition("legacy-x", "Open", SUPERSEDED_)
-        self.assertEqual(c.exception.current, "Resolved")
+        with self.assertRaisesRegex(pqs.StoreError, "only closes a row"):
+            db.close("legacy-x", "Open")
+        with self.assertRaises(pqs.GuardFailed) as c:
+            db.supersede("legacy-x")
+        self.assertEqual(c.exception.current, {"status": "Resolved"})
+        with self.assertRaises(pqs.GuardFailed):
+            db.close("legacy-x", "Answered")
+        db.restore("legacy-x")
         self.assertEqual(db.status_of("legacy-x"), "Resolved")
 
-    def test_a_stale_snapshot_never_reopens_a_resolution_and_the_next_pass_converges(self):
-        self.pq.write_text(TestMigratedRows.MOVED)
-        fs, client = pqs.FileStore(self.pq), InProcClient()
-        db = self.db(client)
+    def test_a_recovery_mark_never_hides_an_owner_decision_and_the_next_pass_clears_it(self):
+        self.pq.write_text("# Open\n\n")
+        fs, doc = pqs.FileStore(self.pq), fake_client.FakeDoc()
+        db = self.db(InProcClient(doc))
         db.insert_raw("legacy-abc123def456", "migrated", "page")
-        db.set_status("legacy-abc123def456", SUPERSEDED_)
-        real = client.transition
+        db.supersede("legacy-abc123def456")  # written from a stale replica
+        doc.maps["cells"]["pendingq|q-legacy-abc123def456|status"] = {"v": "resolved", "updated": 9, "by": "owner"}
+        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
+        self.assertEqual(pqs.resync(fs, db), (["legacy-abc123def456"], []))
+        self.assertNotIn("pendingq|q-legacy-abc123def456|recovery", doc.maps["cells"])
+        self.assertEqual(pqs.resync(fs, db), ([], []))
 
-        def owner_resolves_first(*a):
-            client.transition = real
-            db.set_status("legacy-abc123def456", "Resolved")
-            return real(*a)
-        client.transition = owner_resolves_first
-        synced, errors = pqs.resync(fs, db)
-        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
-        self.assertIn("expected Superseded, the row is now Resolved; left as is", errors[0])
-        synced, errors = pqs.resync(fs, db)  # the retry, from a fresh snapshot
-        self.assertEqual(errors, [])
-        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
-        self.assertEqual(fs.entries()[0]["status"], "Resolved")
+
+class TestConcurrentReplicas(_Ws):
+    """Two replicas of one database each run a write from a stale view, then merge
+    the way a Yjs map does: per key, the higher client id wins."""
+
+    @staticmethod
+    def _merge(base, a, b, a_wins):
+        for name in a.maps:
+            for k in set(base[name]) | set(a.maps[name]) | set(b.maps[name]):
+                ca, cb = a.maps[name].get(k) != base[name].get(k), b.maps[name].get(k) != base[name].get(k)
+                pick = a if ca and (a_wins or not cb) else b
+                v = pick.maps[name].get(k)
+                for d in (a, b):
+                    if v is None:
+                        d.maps[name].pop(k, None)
+                    else:
+                        d.maps[name][k] = v
+
+    def _race(self, agent_write, owner_status, agent_wins):
+        owner, agent = fake_client.FakeDoc(), fake_client.FakeDoc()
+        seed = self.db(InProcClient(owner))
+        seed.insert_raw("legacy-abc123def456", "migrated", "page")
+        agent.maps, base = json.loads(json.dumps(owner.maps)), json.loads(json.dumps(owner.maps))
+        owner.maps["cells"]["pendingq|q-legacy-abc123def456|status"] = {"v": owner_status, "updated": 9, "by": "o"}
+        agent_write(self.db(InProcClient(agent)))  # its view still says Open
+        self._merge(base, agent, owner, a_wins=agent_wins)
+        return [pqs.effective_status(adapter._cells(d.maps, "pendingq", "q-legacy-abc123def456"))
+                for d in (owner, agent)]
+
+    def test_an_owner_decision_survives_a_concurrent_agent_write_in_either_merge_order(self):
+        writes = {"supersede": lambda d: d.supersede("legacy-abc123def456"),
+                  "close": lambda d: d.close("legacy-abc123def456", "Resolved")}
+        for name, write in writes.items():
+            for owner_status in ("resolved", "answered"):
+                for agent_wins in (True, False):
+                    with self.subTest(write=name, owner=owner_status, agent_wins=agent_wins):
+                        got = self._race(write, owner_status, agent_wins)
+                        self.assertEqual(got[0], got[1])
+                        self.assertIn(got[0], pqs.TERMINAL)
+                        if name == "supersede":
+                            self.assertEqual(got[0], owner_status.capitalize())
+
+    @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
+    def test_the_same_race_on_real_yjs_replicas_in_both_client_id_orders(self):
+        from pycrdt import Doc, Map
+
+        class Replica:
+            def __init__(self, client_id):
+                self.ydoc = Doc(client_id=client_id)
+                self.maps = {m: self.ydoc.get(m, type=Map) for m in fake_client.MAPS}
+
+            @property
+            def database(self):
+                return {m: {k: dict(v) if hasattr(v, "keys") else v for k, v in y.items()}
+                        for m, y in self.maps.items()}
+
+            async def put_database(self, writes):
+                with self.ydoc.transaction():
+                    for name, entries in writes.items():
+                        for k, v in entries.items():
+                            if v is None:
+                                self.maps[name].pop(k, None)
+                            else:
+                                self.maps[name][k] = v
+                return 0
+
+            def row_body(self, db, row):
+                return "page"
+
+            async def put_row_body(self, *a, **k):
+                return 0
+
+        def sync(a, b):
+            ua, ub = a.ydoc.get_update(b.ydoc.get_state()), b.ydoc.get_update(a.ydoc.get_state())
+            b.ydoc.apply_update(ua)
+            a.ydoc.apply_update(ub)
+
+        for owner_id, agent_id in ((1, 2), (2, 1)):
+            for write in ("supersede", "close"):
+                with self.subTest(owner_id=owner_id, agent_id=agent_id, write=write):
+                    owner, agent = Replica(owner_id), Replica(agent_id)
+                    self.db(InProcClient(owner)).insert_raw("legacy-abc123def456", "migrated", "page")
+                    sync(owner, agent)
+                    asyncio.run(owner.put_database({"cells": {"pendingq|q-legacy-abc123def456|status":
+                                                              {"v": "resolved", "updated": 9, "by": "o"}}}))
+                    db = self.db(InProcClient(agent))  # still sees Open
+                    getattr(db, write)("legacy-abc123def456", *(["Answered"] if write == "close" else []))
+                    sync(owner, agent)
+                    got = {pqs.effective_status(adapter._cells(r.database, "pendingq", "q-legacy-abc123def456"))
+                           for r in (owner, agent)}
+                    self.assertEqual(len(got), 1)
+                    self.assertTrue(got <= set(pqs.TERMINAL))
+                    if write == "supersede":
+                        self.assertEqual(got, {"Resolved"})
+
+    def test_code_writes_status_only_to_a_terminal_value(self):
+        writes = []
+
+        class Recording(InProcClient):
+            def _do(self, req):
+                if req["op"] in ("guarded", "set_cells"):
+                    writes.append(req["cells"].get("status"))
+                return super()._do(req)
+        self.pq.write_text(TestMigratedRows.MOVED.replace("moved", "answered"))
+        db = self.db(Recording())
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        db.supersede("legacy-abc123def456")
+        pqs.resync(pqs.FileStore(self.pq), db)
+        self.assertEqual({w for w in writes if w is not None}, {"answered"})
 
 
 SUPERSEDED_ = pqs.SUPERSEDED
@@ -751,7 +870,7 @@ class TestArchivedLinks(_Ws):
         client = InProcClient()
         db = self.db(client)
         db.insert_raw("legacy-abc123def456", "Archived owner answer", "page")
-        client.fail_ops = ("transition",)
+        client.fail_ops = ("guarded",)
         qs, notes = _cpq(self.pq, self.ws).gather(db)
         self.assertEqual(qs, [])
         self.assertTrue(notes)
@@ -1476,13 +1595,13 @@ class TestMigrateRound3(_MigrateBase):
             real(*a, **k)
             raise pqs.StoreError("connection lost after commit")
         db.insert_raw = committed_then_lost
-        db.transition, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.transition
+        db.supersede, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.supersede
         [done] = self.m.apply(only, self.ledger, db)
         self.assertIn("connection lost after commit", done)
         self.assertIn("the next reminder pass does it", done)
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])  # the orphan, before reconciling
         self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh\n\n**Status:** answered"))
-        db.transition = real_set
+        db.supersede = real_set
         self.assertNotIn("2026-09-29 — Pick a launch date?", self._store_view(db))
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
 
@@ -1520,6 +1639,22 @@ class TestMigrateRound3(_MigrateBase):
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
 
+    def test_a_migration_on_another_hosts_row_never_changes_it(self):
+        only = self._only()
+        aid, client = only["entries"][0]["ask_id"], InProcClient()
+        pqs.RoomDbStore(client, lock=self.ws / "state" / "a", host="host-a").insert_raw(aid, "Pick?", "page")
+        host_b = pqs.RoomDbStore(client, lock=self.ws / "state" / "b", host="host-b")
+        before = self.ledger.read_text()
+        client.fail_ops = ("add_row",)
+        [done] = self.m.apply(only, self.ledger, host_b)
+        self.assertIn("its row was left as is", done)
+        client.fail_ops = ()
+        [done] = self.m.apply(only, self.ledger, host_b)  # the insert succeeds but the row exists
+        self.assertIn("not this host's to reuse", done)
+        self.assertEqual(self.ledger.read_text(), before)
+        self.assertEqual([(e["status"], e["host"], e["recovery"]) for e in host_b.entries()],
+                         [("Open", "host-a", False)])
+
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
         client = InProcClient()
@@ -1528,7 +1663,8 @@ class TestMigrateRound3(_MigrateBase):
         db.set_status(only["entries"][0]["ask_id"], "Resolved")  # the owner, earlier
         client.fail_ops = ("add_row",)
         [done] = self.m.apply(only, self.ledger, db)
-        self.assertIn("its row was left as is (Resolved)", done)
+        self.assertIn("its row was left as is", done)
+        self.assertIn("status=Resolved", done)
         client.fail_ops = ()
         self.assertEqual(db.status_of(only["entries"][0]["ask_id"]), "Resolved")
 
