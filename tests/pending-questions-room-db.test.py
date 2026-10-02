@@ -1656,12 +1656,14 @@ class TestMigrateRound3(_MigrateBase):
         variants = {"missing nth": {k: v for k, v in e0.items() if k != "nth"},
                     "missing sha": {k: v for k, v in e0.items() if k != "sha"},
                     "unknown class": dict(e0, **{"class": "bogus"}), "unknown kind": dict(e0, kind="bogus"),
-                    "bool nth": dict(e0, nth=True), "negative nth": dict(e0, nth=-1)}
+                    "bool nth": dict(e0, nth=True), "negative nth": dict(e0, nth=-1),
+                    "nth without sha": dict(e0, sha=None), "sha without nth": dict(e0, nth=None)}
         for name, entry in variants.items():
             with self.subTest(name=name):
                 [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         for name, p in {"string close flag": dict(good, close_past_window="false"),
+                        "float version": dict(good, version=float(self.m.PLAN_VERSION)),
                         "missing ledger hash": {k: v for k, v in good.items() if k != "ledger_sha256"}}.items():
             with self.subTest(name=name):
                 [done] = self.apply(p, self.ledger, db, "this-host")
