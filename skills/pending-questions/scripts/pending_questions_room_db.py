@@ -181,16 +181,16 @@ def reconcile_pass(workspace: Path, environ=None) -> dict:
         return {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
 
 
-def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
+def gather(workspace: Path, environ=None) -> dict:
     """{"waiting", "done", "pending_close", "unavailable", "reason", "link", "notes", "store"}, each
     ask id in ONE bucket (the precedence in the module doc): this host's rows first, then the
     outbox's held questions whose id no row already placed (marked not yet in the room);
     `pending_close` names local closes with no row and no held entry. The outbox is read before
     the rows and again after, and the two reads are joined: a held question another process
-    files between them is in one of the reads, never in neither. Read-only unless `reconcile`
-    — a read writes nothing, so a row seen here is history only once a reconcile records it.
-    Without a store: the outbox, and why — an outage (`unavailable`) when a row of this
-    workspace was ever confirmed, a measurement when none was."""
+    files between them is in one of the reads, never in neither. READ-ONLY, as the contract
+    says: a read writes nothing, so a row seen here is history only once `reconcile_pass`
+    records it. Without a store: the outbox, and why — an outage (`unavailable`) when a row of
+    this workspace was ever confirmed, a measurement when none was."""
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
@@ -202,10 +202,6 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
                 "notes": [f"room database: not used ({where}); listing the local outbox only"] + _pending_note(pending)}
     notes, rows, done, placed = [], [], 0, set()
     try:
-        if reconcile:
-            from util_paths import host_label  # noqa: PLC0415
-            rec = reconcile_pending(store, ws, host_label())
-            notes += [f"reconcile: FAILED — {e}" for e in rec["errors"]]
         closing = HeldRecords(ws).closes()  # closed by the owner while the room was unreachable
         in_outbox, held = _held_snapshot(ws)
         seen = set()

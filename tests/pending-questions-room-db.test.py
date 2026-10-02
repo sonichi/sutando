@@ -578,10 +578,13 @@ class TestGather(_Ws):
     """The adapter over the fake capability: the explicit pass (reconcile), then the read-only
     gather lists rows + outbox, once each."""
 
-    def _gather(self, env=None, reconcile=True):
+    def _gather(self, env=None):
         state = self.ws / "fake-room.json"
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(state), **(env or {})}):
-            return adapter.gather(self.ws, environ={}, reconcile=reconcile)
+            rec = adapter.reconcile_pass(self.ws, environ={})
+            g = adapter.gather(self.ws, environ={})
+            g["notes"] = [f"reconcile: FAILED — {e}" for e in rec["errors"]] + g["notes"]
+            return g
 
     def test_rows_and_held_questions_are_listed_once_each_and_counted_alike(self):
         held = self.ask("Held?")  # no store yet
@@ -772,7 +775,7 @@ class TestReminder(_Ws):
         cpq = _cpq(self.ws)
         cpq.notify_macos = lambda count, titles: True
         cpq.voice_client_connected = lambda: False
-        def fake_gather(ws, environ=None, reconcile=False):
+        def fake_gather(ws, environ=None):
             return {"waiting": [pqs.waiting_item(e["ask_id"], e["title"], e["body"], e["asked_at"], True)
                                 for e in db.open_entries()] + pqs.outbox_items(ws),
                     "done": 0, "notes": [], "store": "x", "unavailable": False, "reason": None}
@@ -815,15 +818,17 @@ class TestReminder(_Ws):
 
     def test_the_store_adapter_flag_loads_the_injected_file(self):
         fake = self.ws / "fake_adapter.py"
-        fake.write_text("def gather(ws, reconcile=False):\n"
-                        "    return {'waiting': [], 'done': 0, 'notes': ['from the flag', f'reconcile={reconcile}'], 'store': 'f'}\n")
+        fake.write_text("def reconcile_pass(ws):\n"
+                        "    return {'flushed': [], 'moved': [], 'closed': [], 'errors': ['its pass ran']}\n"
+                        "def gather(ws):\n"
+                        "    return {'waiting': [], 'done': 0, 'notes': ['from the flag'], 'store': 'f'}\n")
         cpq = _cpq(self.ws)
         with mock.patch.object(sys, "argv", ["check-pending-questions.py", "--store-adapter", str(fake)]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
             cpq.main()
         self.assertIn("0 pending questions; nothing sent", out.getvalue())
         self.assertIn("from the flag", err.getvalue())
-        self.assertIn("reconcile=True", err.getvalue(), "the injected adapter is read through its pass")
+        self.assertIn("reconcile: FAILED — its pass ran", err.getvalue(), "the injected adapter is read through its pass")
 
 
 class TestDelegation(unittest.TestCase):
@@ -866,7 +871,8 @@ class TestDelegation(unittest.TestCase):
 
     def test_the_reminder_reads_the_siblings_pass_and_writes_no_row(self):
         s = self.src(self.SKILL + "pending_questions_remind.py")
-        self.assertIn("room_db.gather(WORKSPACE, reconcile=True)", s)
+        self.assertLess(s.index("room_db.reconcile_pass(WORKSPACE)"), s.index("room_db.gather(WORKSPACE)"))
+        self.assertNotIn("reconcile=True", s, "the contract's two entry points, no private keyword")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|close|clear)\(|PQ_FILE|personal_path|pending-questions\.md")
         self.assertIn('if "--notify" not in argv', s)
         shim = self.src("src/check-pending-questions.py")
