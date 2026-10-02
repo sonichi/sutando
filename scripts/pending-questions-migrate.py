@@ -267,6 +267,15 @@ def _line(v) -> bool:
     return _text(v) and bool(v)
 
 
+_BODY_UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
+def safe_body(text: str) -> str:
+    """A ledger body as the database may hold it: newlines and tabs kept, every other control
+    character and lone surrogate replaced with U+FFFD."""
+    return _BODY_UNSAFE.sub("\ufffd", text)
+
+
 def _entry_ok(e) -> bool:
     return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
             and _line(e.get("title")) and e["title"] == e["title"].strip()
@@ -281,7 +290,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
     if not isinstance(plan, dict):
         return False
     entries = plan.get("entries")
-    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and bool(host)
+    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and _line(host)
             and plan.get("host") == host and _line(plan.get("ledger")) and Path(plan["ledger"]).is_absolute()
             and isinstance(plan.get("ledger_sha256"), str) and _DIGEST.fullmatch(plan["ledger_sha256"])
             and type(plan.get("close_past_window")) is bool
@@ -322,9 +331,9 @@ def _bind(r: dict, text: str, host: Optional[str]) -> dict:
     if r["nth"] is None or r["nth"] >= len(found) or _sha(text[slice(*found[r["nth"]])]) != r["sha"]:
         return {**r, "unbound": True}
     chunk = text[slice(*found[r["nth"]])]
-    body = chunk.strip() if r["kind"] == "bullet" else chunk.partition("\n")[2].strip()
-    return {**r, "body": body, "why": " ".join(str(r["why"]).split()), "span": found[r["nth"]][0],
-            "ask_id": legacy_ask_id(r["title"], body, host, r["nth"])}
+    raw = chunk.strip() if r["kind"] == "bullet" else chunk.partition("\n")[2].strip()
+    return {**r, "body": safe_body(raw), "why": " ".join(str(r["why"]).split()), "span": found[r["nth"]][0],
+            "ask_id": legacy_ask_id(r["title"], raw, host, r["nth"])}
 
 
 def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> list:

@@ -1808,6 +1808,26 @@ class TestMigrateRound3(_MigrateBase):
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
 
+    def test_the_producers_plan_passes_the_validator(self):
+        self.assertTrue(self.m.plan_fits(json.loads(json.dumps(self.plan())), HOST))
+
+    def test_a_legacy_body_with_control_characters_reaches_the_row_neutralised(self):
+        self.ledger.write_text(self.ledger.read_text().replace("Pick a launch date?\n\n", "Pick a launch date?\n\nbad\x00\x07\x9b end\n\n", 1))
+        plan, db = self._only(), self.db()
+        [done] = self.apply(plan, self.ledger, db)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        [row] = db.entries()
+        self.assertNotRegex(row["body"], "[\x00\x07\x9b]")
+        self.assertIn("bad\ufffd\ufffd\ufffd end", row["body"])
+
+    def test_an_unsafe_host_is_refused_before_any_write(self):
+        plan, before = self._only(), self.ledger.read_text()
+        for host in ("", "h\x07", "h\ud800", 7):
+            with self.subTest(host=repr(host)):
+                [done] = self.m.apply(dict(plan, host=host), self.ledger, None, host)
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        self.assertEqual(self.ledger.read_text(), before)
+
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
         client = InProcClient()
