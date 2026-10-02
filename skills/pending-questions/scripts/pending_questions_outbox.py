@@ -14,7 +14,9 @@ skipped — named on stderr, never deleted. Close record: {"ask_id", "status", "
 Two markers under state/, kept apart: STORE_HISTORY says a room row of this workspace was
 confirmed (so a store that cannot be reached later is an outage, never a measured zero);
 ROOM_INTRODUCED says the owner was told once where the database lives. A pre-split install
-has only the second, so it still counts as history.
+has only the second, so it still counts as history. So does a close record naming no held
+question: it is only ever written with the row in view or in outage mode, so it is the
+evidence of a row when the marker itself could not be written.
 """
 from __future__ import annotations
 
@@ -54,9 +56,12 @@ def one_line_title(question: str) -> str:
 
 
 def store_history(workspace) -> bool:
-    """A room row was confirmed for this workspace once; losing the store is then an outage."""
+    """A room row was confirmed for this workspace once (a marker, or a close record naming no
+    held question); losing the store is then an outage."""
     ws = Path(workspace)
-    return status_path(STORE_HISTORY, ws).exists() or status_path(ROOM_INTRODUCED, ws).exists()
+    if status_path(STORE_HISTORY, ws).exists() or status_path(ROOM_INTRODUCED, ws).exists():
+        return True
+    return bool(local_closes(ws)[1])
 
 
 def mark_store_used(workspace, ask_id: str) -> None:

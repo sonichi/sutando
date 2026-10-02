@@ -83,6 +83,95 @@ class _FakeRoom(rdb._Ws):
         return sorted(pqs.Outbox(self.ws).closes())
 
 
+# ---- 1. a direct resolve commits the history before the close ------------------------------
+
+class ResolveCommitsHistoryFirst(_FakeRoom):
+    def pre_marker_row(self, ask_id="ask-existing"):
+        """A legitimate complete row of this workspace with no local evidence of it."""
+        self.store().insert(self.q(ask_id, "from before?"), SENT)
+        for marker in (pqo.STORE_HISTORY, pqo.ROOM_INTRODUCED):
+            (self.ws / "state" / marker).unlink(missing_ok=True)
+        return ask_id
+
+    def test_a_marker_that_cannot_be_written_leaves_the_row_open_and_records_the_close_locally(self):
+        """The reviewer's injection: a complete pre-marker row, mark_store_used raising
+        OSError('disk full') through the production adapter, then the capability removed."""
+        aid = self.pre_marker_row()
+        with _marker_fails(adapter, pqs, pqo):
+            ok, msg = adapter.resolve(self.ws, aid, "Answered")
+        self.assertTrue(ok, msg)
+        self.assertIn("recorded locally as Answered", msg)
+        self.assertIn("store history not committed (OSError: disk full)", msg)
+        self.assertIn("its row is in view", msg)
+        self.assertEqual([(e["ask_id"], e["status"]) for e in self.store().entries()], [(aid, "Open")],
+                         "the row was closed with no local evidence of it")
+        self.assertFalse(self.marker().exists())
+        self.assertEqual(self.closes(), [aid], "the close record is the evidence")
+        self.assertEqual(self.gathered(), {"waiting": [], "done": 1, "pending_close": [], "unavailable": False},
+                         "with the room in view the local close counts the row as done")
+        self.lose_capability()
+        g = self.gathered()
+        self.assertTrue(g["unavailable"], f"capability loss read as a measured zero: {g}")
+        self.assertEqual((g["done"], g["pending_close"]), (None, [aid]))
+        self.assertNotEqual((g["waiting"], g["done"]), ([], 0))
+
+    def test_the_next_reconcile_applies_the_local_close_and_commits_the_history(self):
+        aid = self.pre_marker_row()
+        with _marker_fails(adapter, pqs, pqo):
+            adapter.resolve(self.ws, aid, "Answered")
+        rec = adapter.reconcile_pass(self.ws, environ={})
+        self.assertEqual((rec["closed"], rec["errors"]), ([aid], []))
+        self.assertEqual(self.store().status_of(aid), "Answered")
+        self.assertEqual(self.marker().read_text().strip(), aid)
+        self.assertEqual(self.closes(), [])
+        self.lose_capability()
+        self.assertTrue(self.gathered()["unavailable"])
+
+    def test_a_pre_marker_row_closes_in_the_room_once_the_marker_is_committed(self):
+        """The marker lands before the close: the row is closed AND the workspace has its history."""
+        aid = self.pre_marker_row()
+        ok, msg = adapter.resolve(self.ws, aid, "Resolved")
+        self.assertTrue(ok, msg)
+        self.assertIn(f"room database: {aid} -> Resolved", msg)
+        self.assertEqual(self.store().status_of(aid), "Resolved")
+        self.assertEqual(self.marker().read_text().strip(), aid)
+        self.assertEqual(self.closes(), [])
+        self.lose_capability()
+        self.assertTrue(self.gathered()["unavailable"])
+
+    def test_an_unknown_id_on_a_pre_marker_store_writes_no_marker_and_no_record(self):
+        """No row in view: nothing is committed for it, the close is refused, no count changes."""
+        self.pre_marker_row("ask-other")
+        with _marker_fails(adapter, pqs, pqo):
+            ok, msg = adapter.resolve(self.ws, "ask-never-existed", "Answered")
+        self.assertFalse(ok, msg)
+        self.assertIn("not changed — GuardFailed: ask-never-existed: left as is (no such row)", msg)
+        self.assertEqual(self.closes(), [])
+        self.assertFalse(self.marker().exists())
+
+    def test_a_marker_already_committed_costs_the_close_no_extra_read(self):
+        store = self.store()
+        self.ask("q?", store=store)
+        [e] = store.entries()
+        self.assertTrue(self.marker().exists())
+        with mock.patch.object(pqs.RoomDbStore, "status_of", side_effect=AssertionError("read the row again")):
+            ok, msg = adapter.resolve(self.ws, e["ask_id"], "Answered")
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.store().status_of(e["ask_id"]), "Answered")
+
+    def test_a_close_record_naming_no_held_question_is_history(self):
+        """The evidence rule: such a record is only written with the row in view or in outage mode."""
+        self.assertFalse(pqo.store_history(self.ws))
+        held = self.ask("held?")
+        pqs.Outbox(self.ws).close(held["ask_id"], "Resolved")
+        self.assertFalse(pqo.store_history(self.ws), "a close of a held question is a measured closure")
+        pqs.Outbox(self.ws).close("ask-row-elsewhere", "Answered")
+        self.assertTrue(pqo.store_history(self.ws))
+        self.assertEqual(adapter.local_close_allowed(self.ws, "ask-another-row")[1],
+                         "outage mode: a room row was confirmed here before")
+
+
+
 # ---- 2. gather() is coherent under a concurrent flush ------------------------------------
 
 class GatherUnderAConcurrentFlush(_FakeRoom):
