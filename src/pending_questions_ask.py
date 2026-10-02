@@ -1,7 +1,7 @@
 """Ask the owner a pending question in a conversation he reads, and record it as a row
 of his room database — the outbox holding it meanwhile.
 
-Order, fail-open at every step: (1) with a store, the pass's reconcile (the outbox is
+Order, fail-open at every step: (1) with a store, the pass's reconcile_pending (the outbox is
 replayed first); (2) the question is QUEUED as a proactive file — to the task's own
 conversation only for an owner-tier task in the owner's own DM (`.to-<bridge>` name +
 `[channel:]` marker), to the owner's DM on the task's bridge for any other bridge task,
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from local_task_protocol import parse_task_headers_lenient
-from pending_questions_store import Outbox, Question, entry_heading, reconcile, write_question
+from pending_questions_store import Outbox, Question, entry_heading, reconcile_pending, write_question
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
@@ -199,13 +199,13 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     out = {"ask_id": ask_id, "heading": entry_heading(question, now), "record": None,
            "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
            "macos": None, "macos_fix": None, "link": None, "db_error": None, "outbox": None,
-           "reconcile": None}
+           "reconcile_pending": None}
     q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()), priority)
     if store is not None:
         try:
-            out["reconcile"] = reconcile(store, ws, host)
+            out["reconcile_pending"] = reconcile_pending(store, ws, host)
         except Exception as e:  # noqa: BLE001 — this ask still goes out
-            out["reconcile"] = {"flushed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
+            out["reconcile_pending"] = {"flushed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
 
     dest = Destination()
     if task_file:
@@ -269,13 +269,13 @@ def report_lines(out: dict) -> list:
         lines.append(f"recorded: FAILED — {out['db_error']} (NOT recorded anywhere; ask by hand)")
     if out.get("link"):
         lines.append(f"row: {out['link']}")
-    rec = out.get("reconcile") or {}
+    rec = out.get("reconcile_pending") or {}
     for err in rec.get("errors") or []:
-        lines.append(f"reconcile: FAILED — {err}")
+        lines.append(f"reconcile_pending: FAILED — {err}")
     if rec.get("flushed"):
-        lines.append(f"reconcile: filed {len(rec['flushed'])} held question(s) from the outbox")
+        lines.append(f"reconcile_pending: filed {len(rec['flushed'])} held question(s) from the outbox")
     if rec.get("moved"):
-        lines.append(f"reconcile: moved {len(rec['moved'])} legacy file entr(ies) into the database")
+        lines.append(f"reconcile_pending: moved {len(rec['moved'])} legacy file entr(ies) into the database")
     if out["proactive_file"]:
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")

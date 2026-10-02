@@ -119,7 +119,7 @@ class TestIngest(_Ws):
     def test_the_ingest_is_wired_into_every_pass_through_reconcile_only(self):
         self.file(legacy_entry("ask-old"))
         db = self.db()
-        rec = pqs.reconcile(db, self.ws, HOST)
+        rec = pqs.reconcile_pending(db, self.ws, HOST)
         self.assertEqual((rec["moved"], rec["errors"]), (["ask-old"], []))
         store_src = (REPO / "src" / "pending_questions_store.py").read_text()
         self.assertEqual(store_src.count("ingest_legacy_file_entries("), 1, "one call site")

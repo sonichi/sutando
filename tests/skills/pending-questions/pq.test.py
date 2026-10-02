@@ -83,7 +83,7 @@ class TestAsk(_Ws):
         def _ask(*a, **kw):
             seen.update(kw, question=a[0])
             return {"db_error": None, "record": "x", "heading": "## x", "outbox": None, "link": None,
-                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile": None}
+                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile_pending": None}
         with mock.patch.object(pqa, "ask_owner", _ask):
             self.cli("ask", "q?", "--context", "why", "--workspace", str(self.ws))
         self.assertEqual((seen["question"], seen["context"]), ("q?", "why"))
