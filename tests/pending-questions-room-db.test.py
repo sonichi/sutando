@@ -753,6 +753,14 @@ class TestConvergence(_Ws):
         self.assertIn("**Status:** resolved — in the room database", self.pq.read_text())
         self.assertEqual(pqs.registered_adapter(self.ws), str(Path(adapter.__file__).resolve()))
 
+    def test_a_registration_left_by_a_moved_checkout_falls_back_and_heals(self):
+        cpq = self._upgraded_install("resolved")
+        pqs.register_adapter(self.ws, self.ws / "gone" / "pending_questions_room_db.py")
+        with mock.patch.dict(os.environ, self._env()):
+            o, e = self._main(cpq)
+        self.assertIn("0 pending questions", o)
+        self.assertEqual(pqs.registered_adapter(self.ws), str(Path(adapter.__file__).resolve()))
+
     def test_an_upgraded_schedule_without_the_capability_reminds_from_the_file(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
         cpq = _cpq(self.pq, self.ws)
