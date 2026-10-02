@@ -28,6 +28,7 @@ pqa = importlib.import_module("pending_questions_ask")
 adapter = importlib.import_module("pending_questions_room_db")
 pqs = importlib.import_module("pending_questions_store")
 reader = importlib.import_module("pending_questions_reader")
+skill_roots = importlib.import_module("skill_roots")
 parse_markers = importlib.import_module("result_markers").parse_markers
 
 HOST = "test-host"
@@ -384,7 +385,7 @@ class TestEdges(_Ws):
     def test_ask_owner_cli_resolves_the_workspace_and_refuses_a_bad_option(self):
         cli = str(REPO / "scripts" / "ask-owner.py")
         with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), \
-                mock.patch.object(reader, "declared_adapter", return_value=None), \
+                mock.patch.object(skill_roots, "declared_script", return_value=None), \
                 mock.patch.object(sys, "argv", [cli, "q?", "--urgency", "durable"]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
@@ -447,7 +448,7 @@ class TestAskOwner(_Ws):
         self.assertEqual([(i["ask_id"], i["in_room"]) for i in g["waiting"]], [(out["ask_id"], False)])
         self.assertEqual((g["done"], g["pending_close"]), (0, []))
         self.assertIn("listing the local outbox only", g["notes"][0])
-        with mock.patch.object(reader, "declared_adapter", return_value=None):
+        with mock.patch.object(skill_roots, "declared_script", return_value=None):
             g = reader.gather(self.ws)
         self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []), "core alone has no store to read")
 

@@ -25,6 +25,7 @@ _spec = importlib.util.spec_from_file_location("rdb", REPO / "tests" / "pending-
 rdb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rdb)
 pqs, pqa, adapter, reader, HOST, SENT = rdb.pqs, rdb.pqa, rdb.adapter, rdb.reader, rdb.HOST, rdb.SENT
+skill_roots = importlib.import_module("skill_roots")
 pqo = importlib.import_module("pending_questions_outbox")
 compat = importlib.import_module("pending_questions_compat")
 ledger = importlib.import_module("pending_questions_ledger")
@@ -71,8 +72,8 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
         skills = self.ws / "skills-dir"
         (skills / "broken").mkdir(parents=True)
         (skills / "broken" / "manifest.json").write_text("{not json")
-        self.assertEqual(reader.declared_adapters(skills), [])
-        self.assertIsNone(reader.declared_adapter(skills))
+        self.assertEqual(skill_roots.declared_scripts(reader.DECLARATION, skills), [])
+        self.assertIsNone(skill_roots.declared_script(reader.DECLARATION, skills))
 
     def test_an_adapter_that_fails_to_import_is_unavailable_with_the_error(self):
         bad = self._adapter_file("broken_adapter.py", "raise ImportError('needs pycrdt')\n")
@@ -84,7 +85,7 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
         self.assertIn("needs pycrdt", g["reason"])
 
     def test_reconcile_pass_reports_no_store_a_missing_pass_and_a_raising_one(self):
-        rec = reader.reconcile_pass(self.ws, skills_dir=self.ws / "no-skills")
+        rec = reader.reconcile_pass(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))
         self.assertEqual(rec["flushed"], [])
         self.assertIn("no store to reconcile with", rec["errors"][0])
         bare = self._adapter_file("bare.py", "def gather(ws):\n    return {'waiting': [], 'done': 0, 'notes': []}\n")
@@ -96,7 +97,7 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
 
     def test_the_cli_counts_and_lists_held_questions_unknown_and_empty(self):
         held = pqa.ask_owner("held?", urgency="durable", workspace=self.ws, host=HOST)
-        with mock.patch.object(reader, "SKILLS_DIR", REPO / "skills"):  # the skill, no room capability
+        with mock.patch.object(skill_roots, "REPO_SKILLS", REPO / "skills"):  # the skill, no room capability
             with _Capture() as c:
                 self.assertEqual(reader.main(["count", "--workspace", str(self.ws)]), 0)
             self.assertEqual(json.loads(c.out), {"open": 1, "done": 0, "pending_close": 0, "unavailable": False, "reason": None})
@@ -119,7 +120,7 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
             with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), _Capture() as c:
                 self.assertEqual(reader.main(["count"]), 0)
             self.assertEqual(json.loads(c.out)["open"], 0, "no --workspace: the resolved one")
-        with mock.patch.object(reader, "SKILLS_DIR", self.ws / "no-skills"):
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.ws / "no-skills"):
             with _Capture() as c:
                 self.assertEqual(reader.main(["count", "--workspace", str(self.ws)]), 0)
             self.assertEqual(json.loads(c.out)["open"], None, "core alone measures nothing")
@@ -156,7 +157,7 @@ class TestShimAndAskOwnerEntries(rdb._Ws):
 
     def test_ask_owner_says_not_recorded_when_nothing_could_hold_the_question(self):
         cli = _load("ask_owner_cli_t", REPO / "scripts" / "ask-owner.py")
-        with mock.patch.object(reader, "declared_adapter", return_value=Path(adapter.__file__)), \
+        with mock.patch.object(skill_roots, "declared_script", return_value=Path(adapter.__file__)), \
                 mock.patch.object(pqo.Outbox, "save", side_effect=OSError("disk full")), _Capture() as c:
             self.assertEqual(cli.main(["q?", "--urgency", "durable", "--workspace", str(self.ws)]), 0)
         self.assertIn("ask-owner: NOT RECORDED (outbox: OSError: disk full", c.err)

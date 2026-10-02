@@ -31,6 +31,7 @@ _spec = importlib.util.spec_from_file_location("rdb", REPO / "tests" / "pending-
 rdb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rdb)
 pqs, adapter, reader, HOST, SENT = rdb.pqs, rdb.adapter, rdb.reader, rdb.HOST, rdb.SENT
+skill_roots = importlib.import_module("skill_roots")
 pqo = importlib.import_module("pending_questions_outbox")
 ADAPTER = Path(adapter.__file__)
 
@@ -98,7 +99,7 @@ class AnswerOrdering(unittest.TestCase):
         """The reviewer's injection: the task write raises OSError('disk full')."""
         resolve_calls = []
 
-        def _resolve(ws, ask_id, status):
+        def _resolve(ws, ask_id, status, store=None):
             resolve_calls.append((ask_id, status))
             return True, "closed"
         with mock.patch.object(self.api.pending_questions_reader, "gather", return_value=self._waiting("ask-crash")), \
@@ -116,7 +117,7 @@ class AnswerOrdering(unittest.TestCase):
     def test_the_close_is_asked_for_only_once_the_task_file_is_on_disk(self):
         seen_at_close = []
 
-        def _resolve(ws, ask_id, status):
+        def _resolve(ws, ask_id, status, store=None):
             seen_at_close.append(self.tasks())
             return True, "closed"
         with mock.patch.object(self.api.pending_questions_reader, "gather", return_value=self._waiting("ask-order")), \
@@ -191,7 +192,7 @@ class _FakeRoom(rdb._Ws):
         self.assertIn("used before", g["reason"])
         c = reader.count(self.ws, adapter=ADAPTER)
         self.assertEqual((c["open"], c["done"], c["unavailable"]), (None, None, True), c)
-        self.assertTrue(reader.gather(self.ws, skills_dir=self.ws / "no-skills")["unavailable"],
+        self.assertTrue(reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))["unavailable"],
                         "core alone never measures a zero either")
 
 
@@ -334,7 +335,7 @@ class LocalCloseGate(rdb._Ws):
         self.assertFalse((self.ws / "state" / "pending-questions-outbox" / "closed").exists())
 
     def test_core_alone_records_no_close_and_says_so(self):
-        ok, msg = reader.resolve(self.ws, "ask-never-existed", "Answered", skills_dir=self.ws / "no-skills")
+        ok, msg = reader.resolve(self.ws, "ask-never-existed", "Answered", skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))
         self.assertFalse(ok)
         self.assertIn("nothing records the close", msg)
         self.assertFalse((self.ws / "state" / "pending-questions-outbox").exists())

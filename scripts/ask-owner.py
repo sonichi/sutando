@@ -8,11 +8,11 @@ Usage:
       [--default "merge it" --reason "CI is green" --option "Hold=wait for the CLA"] \
       [--priority High|Medium|Low] [--store-adapter <path>]
 
-The ask belongs to the store adapter an installed skill declares (--store-adapter
-overrides the discovery): with --task-file it routes the question to that task's own
-conversation, records it as a row of the owner's room database, holds it in the
-workspace outbox while the room is unreachable, and reminds. Always exits 0 after a
-non-empty question: every failure is printed, never raised.
+The ask belongs to the store adapter an installed skill declares, resolved here across the
+installed roots (src/skill_roots.py; --store-adapter overrides): with --task-file it routes
+the question to that task's own conversation, records it as a row of the owner's room
+database, holds it in the workspace outbox while the room is unreachable, and reminds.
+Always exits 0 after a non-empty question: every failure is printed, never raised.
 
 With no adapter this entry does only what core can: it queues the question to the
 owner's DM on the bridge he was last active on (the proactive path; --task-file and the
@@ -30,6 +30,7 @@ import pending_questions_reader as reader  # noqa: E402
 from local_record import RecordDir, iso, new_name, write_text_whole
 from proactive_routing import proactive_filename
 from result_markers import neutralize_markers
+from skill_roots import declared
 from util_paths import host_label
 
 RECORDS = "ask-owner"
@@ -98,7 +99,7 @@ def main(argv=None) -> int:
     else:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         ws = resolve_workspace(migrate=False)
-    mod, why = reader._adapter(args.store_adapter)
+    mod, why = reader._adapter(declared(reader.DECLARATION, ws, override=args.store_adapter))
     if mod is None or not hasattr(mod, "ask_owner"):
         why = why if mod is None else f"adapter {why} has no ask_owner"
         print(f"ask-owner: NO STORE ({why}); the owner is asked, and nothing holds the question — "

@@ -90,7 +90,8 @@ ingest and the reminder are this skill's (`scripts/pending_questions_store.py`,
 `scripts/pending_questions_compat.py`, `scripts/pending_questions_remind.py`,
 `scripts/pending_questions_ledger.py`). Core — the dashboard, the morning briefing,
 agent-api, friction-detector, session-handoff, obsidian-mirror, the reminder entry — reaches
-it only through `src/pending_questions_reader.py`, by that field, and reads no file. Every
+it only through `src/pending_questions_reader.py`, injecting the adapter `src/skill_roots.py`
+finds by that field across `<repo>/skills` and `<workspace>/skills`, and reads no file. Every
 one of them shows "unknown" while the room cannot be read — and with no adapter installed,
 since core has no store of its own; the briefing says only the count and where to open it.
 Without this skill, `scripts/ask-owner.py` only queues the owner's DM and keeps one generic

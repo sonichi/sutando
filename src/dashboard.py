@@ -39,6 +39,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 import dashboard_schedules  # noqa: E402
 import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
@@ -123,7 +124,8 @@ def get_activity(max_items: int = 10) -> list[dict]:
 def get_pending_count() -> dict:
     """{"open", "done", "unavailable", "reason"} from the one pending-questions reader (the
     skill's adapter); `open` is None, never 0, while the room cannot be read."""
-    return pending_questions_reader.count(WORKSPACE_DIR)
+    store = skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+    return pending_questions_reader.count(WORKSPACE_DIR, store)
 
 
 def pending_tile(pending: dict) -> tuple:

@@ -23,6 +23,7 @@ _spec = importlib.util.spec_from_file_location("rdb", REPO / "tests" / "pending-
 rdb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rdb)
 pqs, pqa, adapter, reader, HOST = rdb.pqs, rdb.pqa, rdb.adapter, rdb.reader, rdb.HOST
+skill_roots = importlib.import_module("skill_roots")
 pqo = importlib.import_module("pending_questions_outbox")
 SENT = rdb.SENT
 
@@ -71,17 +72,17 @@ class TestOutageIsNeverZero(_Room):
         g = adapter.gather(self.ws, environ={})
         self.assertTrue(g["unavailable"])
         self.assertIn("used before", g["reason"])
-        self.assertEqual(reader.gather(self.ws, skills_dir=self.ws / "no-skills")["unavailable"], True)
+        self.assertEqual(reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))["unavailable"], True)
 
     def test_a_fresh_install_with_the_skill_but_no_room_measures_its_outbox_and_core_alone_measures_nothing(self):
         ws = Path(self.ws / "fresh")
         (ws / "state").mkdir(parents=True)
         g = reader.gather(ws, adapter=Path(adapter.__file__))
         self.assertEqual((g["unavailable"], g["done"], g["waiting"], g["pending_close"]), (False, 0, [], []))
-        g = reader.gather(ws, skills_dir=ws / "no-skills")
+        g = reader.gather(ws, skill_roots.declared(reader.DECLARATION, roots=ws / "no-skills"))
         self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []))
         self.assertIn("no skill declares one", g["reason"])
-        self.assertEqual(reader.count(ws, skills_dir=ws / "no-skills")["open"], None)
+        self.assertEqual(reader.count(ws, skill_roots.declared(reader.DECLARATION, roots=ws / "no-skills"))["open"], None)
 
     def test_the_reminder_and_the_core_shim_say_unknown_and_send_nothing(self):
         cpq = rdb._cpq(self.ws)

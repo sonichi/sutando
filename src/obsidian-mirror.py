@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 
 
 
@@ -171,7 +172,7 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
 def _mirror_asks(vault: Path, workspace: Path) -> bool:
     """Agent/Asks.md rendered from the one pending-questions reader; written only when changed,
     and never from a partial read — an unreadable room leaves the mirror as it is."""
-    g = pending_questions_reader.gather(workspace)
+    g = pending_questions_reader.gather(workspace, skill_roots.declared(pending_questions_reader.DECLARATION, workspace))
     if g["unavailable"]:
         print(f"obsidian-mirror: Asks.md left as is — room unreachable ({g['reason']})", file=sys.stderr)
         return False

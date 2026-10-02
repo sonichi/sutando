@@ -144,6 +144,7 @@ from util_paths import personal_path  # noqa: E402
 import local_record  # noqa: E402
 import pending_questions_reader  # noqa: E402
 import pending_questions_triage as pq_triage  # noqa: E402
+import skill_roots  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
@@ -450,10 +451,15 @@ def _question_row(item: dict) -> dict:
     }
 
 
+def _pending_store():
+    """The store adapter this edge injects: the one an installed skill declares, across the roots."""
+    return skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+
+
 def _pending_gather() -> dict:
     """The reader's gather; `unavailable` is carried to the payload so a client never
     renders an unreachable room as an empty queue."""
-    return pending_questions_reader.gather(WORKSPACE_DIR)
+    return pending_questions_reader.gather(WORKSPACE_DIR, _pending_store())
 
 
 def _questions_unavailable(g: dict) -> Optional[str]:
@@ -533,7 +539,7 @@ def answer_question(qid: str, answer: str) -> tuple:
     task_path, err = _file_answer_task(qid, answer)
     if err:
         return 500, {"error": f"answer not kept ({err}); the question stays open", "id": qid, "recorded": False}
-    closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered")
+    closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered", _pending_store())
     if not closed:
         return 503, {"error": f"answer kept as a task; the question could not be closed: {why}",
                      "id": qid, "recorded": True, "task": task_path}

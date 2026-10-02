@@ -534,7 +534,7 @@ class AdapterRows(unittest.TestCase):
         self.assertEqual(3, len(rows))
         self.assertEqual({r["id"] for r in rows}, {"ask-old", "ask-4242", "ask-4243"})
         self.assertEqual(rows[0]["asked"], "2025-08-01T00:00:00Z")
-        self.waiting.assert_called_with(self.tmp)
+        self.waiting.assert_called_with(self.tmp, api.skill_roots.declared(api.pending_questions_reader.DECLARATION, self.tmp))
 
     def test_a_dismissed_question_stops_being_offered(self):
         rows = api._pending_question_rows()
