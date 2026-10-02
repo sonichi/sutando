@@ -546,6 +546,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .q-nav { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
   #dynamic-region .q-nav .q-btn { flex: 0 0 auto; }
   #dynamic-region .q-empty { color: #666; font-size: 12px; text-align: center; padding: 12px; }
+  #dynamic-region .q-unknown { font-size: 11px; margin-bottom: 6px; padding: 5px 8px; border-radius: 6px; background: #3a1d1d; color: #e8a0a0; }
   #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
     padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
@@ -3588,11 +3589,20 @@ function questionQueueCursor(rows, index) {
   return ((index % n) + n) % n;
 }
 
+// With the room unreachable the rows are only what is held locally: the remote queue
+// is unknown, so the banner stays and the counter never claims the rows are all there is.
+function questionUnknownHtml(rows, unavailable) {
+  if (!unavailable) return '';
+  var n = (rows || []).length;
+  return '<div class="q-unknown">Pending questions unknown — room unreachable (' + esc(unavailable) + ')' +
+    (n ? ': showing ' + n + ' held locally; the remote queue is unknown' : '') + '</div>';
+}
+
 function renderQuestionQueue(rows, index, unavailable) {
   rows = rows || [];
   // An unreachable room is not an empty queue: the count is unknown, say so.
   if (!rows.length && unavailable) {
-    return '<div class="q-empty">Pending questions unknown — room unreachable (' + esc(unavailable) + ')</div>';
+    return '<div class="q-empty">' + questionUnknownHtml(rows, unavailable) + '</div>';
   }
   if (!rows.length) {
     return '<div class="q-empty">No pending questions</div>';
@@ -3600,6 +3610,7 @@ function renderQuestionQueue(rows, index, unavailable) {
   var i = questionQueueCursor(rows, index);
   var q = rows[i];
   var blocks = questionBlocksLabel(q);
+  var position = (i + 1) + ' of ' + rows.length + (unavailable ? ' held locally' : '');
   var answerBtns = q.options
     ? q.options.map(function(opt) {
         return '<button class="q-btn" data-qid="' + esc(q.id) + '" data-ans="' + esc(opt) +
@@ -3607,9 +3618,9 @@ function renderQuestionQueue(rows, index, unavailable) {
       }).join('')
     : '<button class="q-btn q-yes" data-qid="' + esc(q.id) + '" data-ans="Approved">Approve</button>' +
       '<button class="q-btn q-no" data-qid="' + esc(q.id) + '" data-ans="Rejected">Reject</button>';
-  return '<div class="dr-questions"><div class="q-item">' +
+  return '<div class="dr-questions">' + questionUnknownHtml(rows, unavailable) + '<div class="q-item">' +
     '<div class="q-queue-meta">' +
-      '<span>' + esc((i + 1) + ' of ' + rows.length) + '</span>' +
+      '<span>' + esc(position) + '</span>' +
       '<span class="q-wait">' + esc(questionWaitLabel(q)) + '</span>' +
       (blocks ? '<span class="q-blocks">' + esc(blocks) + '</span>' : '') +
     '</div>' +
