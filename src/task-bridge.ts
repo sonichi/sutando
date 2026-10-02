@@ -221,11 +221,13 @@ function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSess
 let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
 let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
 const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+let _voiceContextRevision = 0;
 
-/** Bind (or, with null, release) the origin of the live voice session. Tasks written
- *  afterwards carry the origin current at write time; a malformed origin binds nothing. */
+/** Bind (or, with null, release) the origin of the live voice session. Tasks carry
+ *  the origin current when their tool call starts; a malformed origin binds nothing. */
 export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
 	_voiceSessionOrigin = _usableOrigin(origin);
+	_voiceContextRevision++;
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
@@ -245,6 +247,11 @@ export type VoiceTurnsSnapshot = {
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
+type VoiceTurnsBinding = { provider: VoiceTurnsProvider | null; revision: number };
+
+function captureVoiceTurns(): VoiceTurnsBinding {
+	return { provider: _voiceTurns, revision: _voiceContextRevision };
+}
 
 /** Bind (or, with null, release) a reader of the live session's turns. A task written
  *  afterwards carries the owner's last spoken words verbatim, beside the model's own
@@ -253,11 +260,12 @@ let _voiceTurns: VoiceTurnsProvider | null = null;
  *  the tool ran, so the transcript block structurally lacked the utterance itself). */
 export function setVoiceTurnsProvider(fn: VoiceTurnsProvider | null): void {
 	_voiceTurns = fn;
+	_voiceContextRevision++;
 }
 
-function _readSnapshot(): VoiceTurnsSnapshot | null {
+function _readSnapshot(provider: VoiceTurnsProvider | null = _voiceTurns): VoiceTurnsSnapshot | null {
 	let raw: ReturnType<VoiceTurnsProvider>;
-	try { raw = _voiceTurns?.(); } catch { return null; }
+	try { raw = provider?.(); } catch { return null; }
 	if (!raw) return null;
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
@@ -274,8 +282,8 @@ const _NOT_OWNER_WORDS = ['[System:', '[Uploaded file:'];
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
  *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
  *  that triggered the call: a previous turn's words never stand in for this one's. */
-export function _spokenTurns(count = 2): string[] {
-	const snap = _readSnapshot();
+export function _spokenTurns(count = 2, provider: VoiceTurnsProvider | null = _voiceTurns): string[] {
+	const snap = _readSnapshot(provider);
 	if (!snap) return [];
 	const items = Array.isArray(snap.items) ? snap.items : [];
 	const spoken: string[] = [];
@@ -301,8 +309,8 @@ export const RECENT_SPEECH_MS = 10_000;
 
 /** Whether waiting for a transcription makes sense: the owner spoke recently, or the
  *  runtime cannot say. A model-initiated turn (no recent speech) has nothing to wait for. */
-export function _speechMayBeLanding(now = Date.now()): boolean {
-	const snap = _readSnapshot();
+export function _speechMayBeLanding(now = Date.now(), provider: VoiceTurnsProvider | null = _voiceTurns): boolean {
+	const snap = _readSnapshot(provider);
 	const at = snap?.lastUserSpeechAt;
 	if (typeof at !== 'number' || !Number.isFinite(at)) return true;
 	return now - at <= RECENT_SPEECH_MS;
@@ -311,14 +319,20 @@ export function _speechMayBeLanding(now = Date.now()): boolean {
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
  *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
  *  no wait for a turn the model started on its own. */
-export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))): Promise<string[]> {
-	if (!_voiceTurns) return [];
-	const first = _spokenTurns(count);
-	if (first.length > 0 || !_speechMayBeLanding()) return first;
+export async function _awaitSpokenTurns(
+	count = 2, maxMs = SPOKEN_WAIT_MS,
+	sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+	binding = captureVoiceTurns(),
+): Promise<string[]> {
+	if (!binding.provider || binding.revision !== _voiceContextRevision) return [];
+	const first = _spokenTurns(count, binding.provider);
+	if (first.length > 0 || !_speechMayBeLanding(Date.now(), binding.provider)) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
 		await sleep(SPOKEN_POLL_MS);
-		const spoken = _spokenTurns(count);
+		// A reused provider can now expose another client's or room's words.
+		if (binding.revision !== _voiceContextRevision) return [];
+		const spoken = _spokenTurns(count, binding.provider);
 		if (spoken.length > 0 || Date.now() >= deadline) return spoken;
 	}
 }
@@ -828,6 +842,10 @@ export const workTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
+		// These belong to this invocation, even if a client rebinds during an await.
+		const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+		const turns = captureVoiceTurns();
+		const recent = getRecentConversation(4);
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
 			timeout_minutes?: number;
@@ -944,7 +962,7 @@ export const workTool: ToolDefinition = {
 			// wording against real speech instead of trusting it.
 			let spokenBlock = '';
 			try {
-				const spoken = await _awaitSpokenTurns(2);
+				const spoken = await _awaitSpokenTurns(2, undefined, undefined, turns);
 				if (spoken.length > 0) {
 					spokenBlock =
 						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
@@ -954,7 +972,6 @@ export const workTool: ToolDefinition = {
 			} catch { /* best effort */ }
 			let contextBlock = '';
 			try {
-				const recent = getRecentConversation(4);
 				if (recent) {
 					contextBlock =
 						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
@@ -964,7 +981,6 @@ export const workTool: ToolDefinition = {
 			} catch { /* best effort — never block delegation on context attach */ }
 			// An origin-bound session addresses the task to its origin and adds the adapter's
 			// guidance line; without one the task keeps `channel_id: local-voice`.
-			const origin = _voiceSessionOrigin;
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
@@ -1032,6 +1048,7 @@ export function logConversation(role: string, text: string, sessionId?: string):
  *  The `SESSION_END` sentinel is unique so the reader can locate
  *  it without regex gymnastics. */
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	_voiceContextRevision++;
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 	recordSessionBoundary(reason); // #603 sqlite mirror
