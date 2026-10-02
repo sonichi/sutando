@@ -599,6 +599,7 @@ class RoomDbStore:
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
                             "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
                             "recovery": bool(cells.get("recovery")), "stale": stale_marks(cells),
+                            "incomplete": (_mark(cells, "recovery") or "") == "incomplete",
                             "status": effective_status(cells)})
         return out
 
@@ -727,7 +728,15 @@ def resync(file_store: FileStore, db_store) -> tuple:
                 synced.append(aid)
                 continue
             row, row_sent = own[aid], sent_line_of(own[aid]["body"])
-            if row["status"] == SUPERSEDED:
+            if row.get("incomplete"):  # its body commit never landed: resume it from this file entry
+                q = e["question"]
+                body = (question_body(q).replace(placeholder(aid), sent) if q is not None and sent
+                        else row_body(safe_body(e["body"]), None, None, (), "**Sent:** (legacy entry)"))
+                db_store.insert_raw(aid, q.question if q is not None else e["title"], body,
+                                    q.priority if q is not None else "Medium")
+                row["status"], row["body"], row_sent = "Open", body, sent_line_of(body)
+                synced.append(aid)
+            elif row["status"] == SUPERSEDED:
                 db_store.restore(aid)
                 row["status"] = "Open"
                 synced.append(aid)

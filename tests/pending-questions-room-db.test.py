@@ -1900,6 +1900,35 @@ class TestMigrateRound3(_MigrateBase):
         self.assertIn("# Request", row["body"])
         self.assertIn("**Sent:** (legacy entry)", row["body"])
 
+    def test_an_ask_whose_body_commit_failed_is_resumed_by_the_next_reminder_pass(self):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        pq = ws / "pending-questions.md"
+        doc = fake_client.FakeDoc()
+        real, state = doc.put_row_body, {"fail": True}
+
+        async def dies_once(*a, **k):
+            if state["fail"]:
+                state["fail"] = False
+                raise ConnectionError("socket closed between row and body")
+            return await real(*a, **k)
+        doc.put_row_body = dies_once
+        db = pqs.RoomDbStore(InProcClient(doc), lock=ws / "state" / "l", host=HOST)
+        q = pqs.Question("ask-p1", "Ship the release?", None, 1_790_000_000.0, None, None, (), "Medium")
+        out = pqs.write_question(q, pqs.FileStore(pq), db)
+        self.assertIsNotNone(out)
+        self.assertEqual(db.status_of("ask-p1"), pqs.SUPERSEDED)  # hidden while incomplete
+        sent = "**Sent:** queued owner-dm via proactive-ask-p1.txt at 2026-09-21T00:00:00Z"
+        pqs.FileStore(pq).stamp("ask-p1", sent)
+        cpq = _cpq(pq, ws)
+        qs, notes = cpq.gather(db)
+        [row] = db.entries()
+        self.assertEqual((row["status"], row["recovery"]), ("Open", False))
+        self.assertIn("Ship the release?", row["body"])
+        self.assertIn(sent, row["body"])
+        self.assertEqual(len(qs), 1)  # one reminder, carried by the resumed row
+        self.assertEqual(notes, [])
+
     def test_an_owner_cleared_body_is_not_mistaken_for_an_incomplete_row(self):
         plan, client = self._only(), InProcClient()
         db = self.db(client)
