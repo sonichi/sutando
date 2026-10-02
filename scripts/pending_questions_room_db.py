@@ -58,6 +58,7 @@ def owner_routing(workspace: Path) -> dict:
 def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     """(RoomDbStore, where) when the capability, the owner DM and an identity all
     resolve; (None, why not) otherwise."""
+    from util_paths import host_label
     env = os.environ if environ is None else environ
     scripts = skill_scripts(workspace)
     if scripts is None:
@@ -77,7 +78,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     except OSError as e:
         print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
-                       lock=status_path("pending-questions-db.lock", Path(workspace))), room
+                       lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label()), room
 
 
 # ---- serve: one request against the databases document -------------------------
@@ -103,9 +104,12 @@ def ensure_writes(maps: dict, schema: dict, by: str, now_ms: int) -> dict:
             if missing:  # options are only ever appended; nothing stored is rewritten
                 writes["props"][k] = {**have, "options": list(have.get("options") or []) + missing}
     for i, v in enumerate(schema["views"]):
-        k = _key(db, v["id"])
-        if k not in (maps.get("views") or {}):
+        k, have = _key(db, v["id"]), (maps.get("views") or {}).get(_key(db, v["id"]))
+        if not isinstance(have, dict):
             writes["views"][k] = {**{x: y for x, y in v.items() if x != "id"}, "order": (i + 1) * GAP}
+        elif [h for h in v.get("hidden") or [] if h not in (have.get("hidden") or [])]:
+            writes["views"][k] = {**have, "hidden": list(have.get("hidden") or [])
+                                  + [h for h in v["hidden"] if h not in (have.get("hidden") or [])]}
     return {m: w for m, w in writes.items() if w}
 
 
@@ -158,6 +162,13 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
     if op == "set_body":
         await doc.put_row_body(db, row, req["body"])
         return None
+    if op == "transition":
+        # Compare-and-set on one cell: written only while it still holds `expect`.
+        current = _cells(maps, db, row).get(req["prop"])
+        if current != req["expect"]:
+            return {"written": False, "current": current}
+        await doc.put_database({"cells": _cell_writes(db, row, {req["prop"]: req["to"]}, by, now_ms)})
+        return {"written": True, "current": req["to"]}
     if op == "stamp":
         body, token = doc.row_body(db, row) or "", req["token"]
         n = body.count(token)

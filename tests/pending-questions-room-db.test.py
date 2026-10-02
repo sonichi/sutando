@@ -136,6 +136,10 @@ class InProcClient:
         return self._do({"op": "stamp", "schema": schema, "row": row, "token": token,
                          "replacement": replacement})
 
+    def transition(self, schema, row, prop, expect, to):
+        return self._do({"op": "transition", "schema": schema, "row": row, "prop": prop,
+                         "expect": expect, "to": to})
+
 
 class RacyClient(InProcClient):
     """Every read of a row's body waits for a second reader (up to 0.5 s) before
@@ -247,7 +251,7 @@ class TestStoreContract(_Ws):
     def test_a_database_store_without_a_lock_refuses_to_stamp(self):
         s = pqs.RoomDbStore(InProcClient())
         s.insert(self.q())
-        with self.assertRaisesRegex(pqs.StoreError, "no stamp lock"):
+        with self.assertRaisesRegex(pqs.StoreError, "no lock"):
             s.stamp("ask-1", SENT)
 
     def test_answered_and_resolved_leave_the_open_set(self):
@@ -628,6 +632,131 @@ class TestMigratedRows(_Ws):
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
 
 
+class TestTwoHostsOneRoom(_Ws):
+    """Two hosts share one room database; each has its own ledger and results."""
+
+    def setUp(self):
+        super().setUp()
+        self.doc = fake_client.FakeDoc()
+        self.hosts = {}
+        for h in ("host-a", "host-b"):
+            d = self.ws / h
+            (d / "results" / "archive").mkdir(parents=True)
+            (d / "state").mkdir()
+            self.hosts[h] = {"dir": d, "file": pqs.FileStore(d / "pending-questions.md"),
+                             "db": pqs.RoomDbStore(InProcClient(self.doc), lock=d / "state" / "lock", host=h)}
+
+    def _pass(self, h):
+        hs = self.hosts[h]
+        return pqs.resync(hs["file"], hs["db"], claim=lambda a: pqa.asked_here(hs["dir"] / "results", a))
+
+    def _status(self):
+        return {e["ask_id"]: (e["status"], e["host"]) for e in self.hosts["host-a"]["db"].entries()}
+
+    def _gather(self, h):
+        hs = self.hosts[h]
+        cpq = _cpq(hs["file"].path, hs["dir"])
+        cpq.RESULTS_DIR = hs["dir"] / "results"
+        return sorted(q["title"] for q in cpq.gather(hs["db"])[0])
+
+    def test_neither_host_touches_the_others_rows_and_alternation_is_stable(self):
+        a = self.hosts["host-a"]
+        pqs.write_question(self.q("ask-a1", "host A's question?"), a["file"], a["db"])
+        a["file"].stamp("ask-a1", SENT.replace("ask-1", "ask-a1"))
+        a["db"].stamp("ask-a1", SENT.replace("ask-1", "ask-a1"))
+        a["file"].path.write_text(a["file"].path.read_text() + TestMigratedRows.MOVED)
+        a["db"].insert_raw("legacy-abc123def456", "migrated", "page")
+        before = self._status()
+        self.assertEqual(before, {"ask-a1": ("Open", "host-a"), "legacy-abc123def456": ("Open", "host-a")})
+        for _ in range(3):
+            self.assertEqual(self._pass("host-b"), ([], []))
+            self.assertEqual(self._status(), before)
+            self.assertEqual(self._pass("host-a"), ([], []))
+            self.assertEqual(self._status(), before)
+        self.assertEqual(self._gather("host-b"), [])
+        self.assertEqual(self._gather("host-a"), ["host A's question?", "migrated"])
+
+    def test_an_unmarked_row_is_claimed_only_by_the_host_with_evidence_and_keeps_its_status(self):
+
+        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw("ask-old", "old test row", "p")
+        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
+            "legacy-abc123def456", "migrated", "p")
+        nohost = pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x")
+        nohost.set_status("ask-old", "Resolved")
+        a = self.hosts["host-a"]
+        a["file"].path.write_text(TestMigratedRows.MOVED)
+        (a["dir"] / "results" / "archive" / "proactive-ask-old-1790000000.txt").write_text("delivered")
+        self.assertEqual(self._pass("host-b"), ([], []))
+        self.assertEqual({k: v[1] for k, v in self._status().items()}, {"ask-old": None, "legacy-abc123def456": None})
+        synced, errors = self._pass("host-a")
+        self.assertEqual((sorted(synced), errors), (["ask-old", "legacy-abc123def456"], []))
+        self.assertEqual(self._status(), {"ask-old": ("Resolved", "host-a"),
+                                          "legacy-abc123def456": ("Open", "host-a")})
+        self.assertEqual(self._pass("host-a"), ([], []))
+
+
+class TestMonotonicStatus(_Ws):
+    def test_code_never_reopens_or_downgrades_a_closed_row(self):
+        db = self.db()
+        db.insert_raw("legacy-x", "q", "p")
+        db.set_status("legacy-x", "Resolved")  # the owner
+        for frm, to in (("Resolved", "Open"), ("Resolved", SUPERSEDED_), ("Answered", "Open"),
+                        ("Resolved", "Answered")):
+            with self.assertRaisesRegex(pqs.StoreError, "not a transition code may make"):
+                db.transition("legacy-x", frm, to)
+        with self.assertRaises(pqs.CasConflict) as c:
+            db.transition("legacy-x", "Open", SUPERSEDED_)
+        self.assertEqual(c.exception.current, "Resolved")
+        self.assertEqual(db.status_of("legacy-x"), "Resolved")
+
+    def test_a_stale_snapshot_never_reopens_a_resolution_and_the_next_pass_converges(self):
+        self.pq.write_text(TestMigratedRows.MOVED)
+        fs, client = pqs.FileStore(self.pq), InProcClient()
+        db = self.db(client)
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        db.set_status("legacy-abc123def456", SUPERSEDED_)
+        real = client.transition
+
+        def owner_resolves_first(*a):
+            client.transition = real
+            db.set_status("legacy-abc123def456", "Resolved")
+            return real(*a)
+        client.transition = owner_resolves_first
+        synced, errors = pqs.resync(fs, db)
+        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
+        self.assertIn("expected Superseded, the row is now Resolved; left as is", errors[0])
+        synced, errors = pqs.resync(fs, db)  # the retry, from a fresh snapshot
+        self.assertEqual(errors, [])
+        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
+        self.assertEqual(fs.entries()[0]["status"], "Resolved")
+
+
+SUPERSEDED_ = pqs.SUPERSEDED
+
+
+class TestArchivedLinks(_Ws):
+    def test_a_migrated_entry_moved_below_the_divider_resolves_its_row(self):
+        self.pq.write_text("# Open\n\n# Resolved\n\n" + TestMigratedRows.MOVED)
+        fs, db = pqs.FileStore(self.pq), self.db()
+        db.insert_raw("legacy-abc123def456", "Archived owner answer", "page")
+        self.assertEqual(fs.entries(), [])
+        self.assertEqual(fs.archived_ids(), {"legacy-abc123def456"})
+        cpq = _cpq(self.pq, self.ws)
+        qs, notes = cpq.gather(db)
+        self.assertEqual((qs, notes), ([], []))
+        self.assertEqual(db.status_of("legacy-abc123def456"), "Resolved")
+
+    def test_an_archived_link_is_not_reminded_even_when_its_resolution_fails(self):
+        self.pq.write_text("# Open\n\n# Resolved\n\n" + TestMigratedRows.MOVED)
+        client = InProcClient()
+        db = self.db(client)
+        db.insert_raw("legacy-abc123def456", "Archived owner answer", "page")
+        client.fail_ops = ("transition",)
+        qs, notes = _cpq(self.pq, self.ws).gather(db)
+        self.assertEqual(qs, [])
+        self.assertTrue(notes)
+
+
 class TestReminder(_Ws):
     def test_it_reminds_database_rows_and_the_files_other_entries_once_each(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
@@ -850,7 +979,7 @@ class TestDelegation(unittest.TestCase):
     def test_the_reminder_writes_only_through_resync(self):
         s = self.src("src/check-pending-questions.py")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|stamp|set_status)\(")
-        self.assertIn("resync(FileStore(PQ_FILE), store)", s)
+        self.assertIn("resync(FileStore(PQ_FILE), store,", s)
 
     def test_the_migrate_writes_the_file_only_through_the_ledger(self):
         s = self.src("scripts/pending-questions-migrate.py")
@@ -1347,13 +1476,13 @@ class TestMigrateRound3(_MigrateBase):
             real(*a, **k)
             raise pqs.StoreError("connection lost after commit")
         db.insert_raw = committed_then_lost
-        db.set_status, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.set_status
+        db.transition, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.transition
         [done] = self.m.apply(only, self.ledger, db)
         self.assertIn("connection lost after commit", done)
         self.assertIn("the next reminder pass does it", done)
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])  # the orphan, before reconciling
         self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh\n\n**Status:** answered"))
-        db.set_status = real_set
+        db.transition = real_set
         self.assertNotIn("2026-09-29 — Pick a launch date?", self._store_view(db))
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
 
@@ -1390,6 +1519,18 @@ class TestMigrateRound3(_MigrateBase):
         [done] = self.m.apply(only, self.ledger, db)
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
+
+    def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
+        only = self._only()
+        client = InProcClient()
+        db = self.db(client)
+        db.insert_raw(only["entries"][0]["ask_id"], "Pick a launch date?", "page")
+        db.set_status(only["entries"][0]["ask_id"], "Resolved")  # the owner, earlier
+        client.fail_ops = ("add_row",)
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertIn("its row was left as is (Resolved)", done)
+        client.fail_ops = ()
+        self.assertEqual(db.status_of(only["entries"][0]["ask_id"]), "Resolved")
 
     def test_apply_notes_a_ledger_changed_since_the_plan(self):
         plan = self.ws / "plan.json"

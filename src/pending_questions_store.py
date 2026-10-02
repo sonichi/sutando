@@ -40,6 +40,10 @@ STATUSES = ("Open", "Answered", "Resolved")
 # A row whose file transition never committed: the file stays the truth, so
 # readers ignore the row and the file entry stays visible.
 SUPERSEDED = "Superseded"
+# The only status changes code may make on a row: Open <-> Superseded between
+# its own recovery states, and closing a row the owner closed in the file.
+TRANSITIONS = frozenset({("Open", SUPERSEDED), (SUPERSEDED, "Open"), ("Open", "Answered"), ("Open", "Resolved"),
+                         (SUPERSEDED, "Answered"), (SUPERSEDED, "Resolved")})
 PRIORITIES = ("High", "Medium", "Low")
 APPROVE = "Approve"
 # Bold field tokens the ledger's readers act on, wherever they occur in a body.
@@ -59,6 +63,14 @@ OPEN_WORDS = ("unanswered", "waiting", "open", "moved")
 
 class StoreError(Exception):
     """A store declining or failing to write; the message is the reason."""
+
+
+class CasConflict(StoreError):
+    """A status transition whose expected state no longer holds; nothing was written."""
+
+    def __init__(self, ask_id: str, expected: str, current: Optional[str]):
+        super().__init__(f"{ask_id}: expected {expected}, the row is now {current}; left as is")
+        self.current = current
 
 
 def placeholder(ask_id: str) -> str:
@@ -284,6 +296,15 @@ class FileStore:
         return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
                 if e["status"] == "Open"]
 
+    def archived_ids(self) -> set:
+        """Ask ids of linked entries below the divider: closed, whatever their status line says."""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return set()
+        stop = len(active_region(text))
+        return {a for s, e in _sections(text) if s >= stop and (a := entry_ask_id(text[s:e]))}
+
     def linked_ids(self) -> set:
         """Every ask id an entry anywhere in the file carries or names, archive included."""
         try:
@@ -312,10 +333,11 @@ DB_SCHEMA = {
          "options": [_opt("high", "High", "red"), _opt("medium", "Medium", "yellow"),
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
+        {"id": "host", "name": "Host", "type": "text"},
     ],
     "views": [
-        {"id": "board", "name": "Board", "layout": "board", "groupBy": "status", "hidden": ["ask_id"]},
-        {"id": "table", "name": "Table", "layout": "table"},
+        {"id": "board", "name": "Board", "layout": "board", "groupBy": "status", "hidden": ["ask_id", "host"]},
+        {"id": "table", "name": "Table", "layout": "table", "hidden": ["host"]},
     ],
 }
 
@@ -359,6 +381,7 @@ class DbClient(Protocol):
     def set_cells(self, schema: dict, row: str, cells: dict) -> None: ...
     def set_body(self, schema: dict, row: str, body: str) -> None: ...
     def stamp(self, schema: dict, row: str, token: str, replacement: str) -> None: ...
+    def transition(self, schema: dict, row: str, prop: str, expect, to) -> dict: ...
 
 
 class ScriptDbClient:
@@ -406,6 +429,10 @@ class ScriptDbClient:
         self._call({"op": "stamp", "schema": schema, "row": row, "token": token,
                     "replacement": replacement})
 
+    def transition(self, schema, row, prop, expect, to):
+        return self._call({"op": "transition", "schema": schema, "row": row, "prop": prop,
+                           "expect": expect, "to": to})
+
 
 def _option_id(prop_id: str, name: str) -> str:
     prop = next(p for p in DB_SCHEMA["props"] if p["id"] == prop_id)
@@ -417,12 +444,15 @@ def _option_id(prop_id: str, name: str) -> str:
 
 
 class RoomDbStore:
-    """`lock` is a host-local mkdir lock every stamp of this database takes: one
-    writer at a time on a host, and an ask id is only ever stamped by its own host."""
+    """`lock` is a host-local mkdir lock every stamp and status transition of this
+    database takes. `host` is this host's label: rows carry their origin host, and
+    a host reconciles only its own (None: a single-host store, every row is its own)."""
     kind = "room-db"
 
-    def __init__(self, client: DbClient, label: str = "the owner's DM room", lock: Optional[Path] = None):
+    def __init__(self, client: DbClient, label: str = "the owner's DM room", lock: Optional[Path] = None,
+                 host: Optional[str] = None):
         self.client, self.label, self.lock = client, label, Path(lock) if lock else None
+        self.host = host
         self.last_link: Optional[str] = None
 
     def where(self, ask_id: str) -> str:
@@ -432,6 +462,8 @@ class RoomDbStore:
                    status: str = "Open") -> dict:
         cells = {"name": one_line_title(title), "status": _option_id("status", status),
                  "priority": _option_id("priority", priority), "ask_id": ask_id}
+        if self.host:
+            cells["host"] = self.host
         res = self.client.add_row(DB_SCHEMA, row_id(ask_id), cells, body) or {}
         self.last_link = res.get("link")
         return res
@@ -445,15 +477,33 @@ class RoomDbStore:
             raise StoreError(f"no row for ask id {ask_id!r} in {DB_SCHEMA['name']}")
         return r
 
-    def stamp(self, ask_id: str, sent_line: str) -> None:
-        """One check-and-replace in the client's single call, serialized by `lock`."""
-        def _do():
-            self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line)
+    def _locked(self, fn):
         if self.lock is None:
-            raise StoreError("the room database store has no stamp lock; refusing an unserialized stamp")
-        err, _ = ledger.under_lock(self.lock, _do)
+            raise StoreError("the room database store has no lock; refusing an unserialized write")
+        err, result = ledger.under_lock(self.lock, fn)
         if err:
             raise StoreError(err)
+        return result
+
+    def stamp(self, ask_id: str, sent_line: str) -> None:
+        """One check-and-replace in the client's single call, serialized by `lock`."""
+        self._locked(lambda: self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line))
+
+    def transition(self, ask_id: str, frm: str, to: str) -> None:
+        """`frm` -> `to`, only if TRANSITIONS allows it and the row is still `frm`:
+        a compare-and-set in one client call, under `lock`. CasConflict otherwise."""
+        if (frm, to) not in TRANSITIONS:
+            raise StoreError(f"{frm} -> {to} is not a transition code may make")
+        res = self._locked(lambda: self.client.transition(
+            DB_SCHEMA, row_id(ask_id), "status", _option_id("status", frm), _option_id("status", to))) or {}
+        if not res.get("written"):
+            names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
+            raise CasConflict(ask_id, frm, names.get(res.get("current"), res.get("current")))
+
+    def claim_host(self, ask_id: str) -> bool:
+        """Set this host as the row's origin when it has none; never changes its status."""
+        res = self._locked(lambda: self.client.transition(DB_SCHEMA, row_id(ask_id), "host", None, self.host)) or {}
+        return bool(res.get("written"))
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
         self._row(ask_id)
@@ -471,13 +521,16 @@ class RoomDbStore:
             cells = r.get("cells") or {}
             if cells.get("ask_id"):
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
-                            "body": (r.get("body") or "").strip(),
+                            "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
                             "status": names.get(cells.get("status"), "Open")})
         return out
 
     def open_entries(self) -> list:
         return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
                 if e["status"] == "Open"]
+
+    def owns(self, row: dict) -> bool:
+        return self.host is None or row.get("host") == self.host
 
 
 # ---- the adapter registration ---------------------------------------------------
@@ -548,54 +601,81 @@ def settled(line: Optional[str]) -> bool:
     return bool(line) and not _PLACEHOLDER_RE.match(line)
 
 
-def resync(file_store: FileStore, db_store) -> tuple:
-    """Bring the database and the file level, never retiring a file entry: an
-    open file entry the database lacks is inserted with its own structured fields
-    and `**Sent:**` record; a status closed on either side closes the other; a
-    delivery record settled on one side fills the other's placeholder (a stamp
-    that failed on one side). A migration row no file entry links (its file
-    transition never committed, or its acknowledgement was lost) is superseded,
-    so the file stays the truth; a superseded row a file entry does link takes
-    the file's status. (synced ask ids, errors)."""
+def resync(file_store: FileStore, db_store, claim=None) -> tuple:
+    """Bring this host's rows and this host's file level, never retiring a file entry.
+
+    Only rows whose Host is this host are touched; a row with no Host is this
+    host's when its file links it or `claim(ask_id)` (this host's own evidence)
+    says so, and is then marked with no status change; any other row is foreign.
+    For this host's rows: an open file entry the database lacks is inserted with
+    its structured fields; an entry below the divider closes its row; a status
+    closed on either side closes the other; a settled `**Sent:**` fills the other
+    side's placeholder; a migration row no file entry links is superseded, and a
+    superseded row a file entry links takes the file's status. Every status write
+    is a TRANSITIONS compare-and-set: Answered and Resolved are never changed by
+    code, and a conflict is reported and left for the next pass. (synced, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
-        linked = file_store.linked_ids()
+        linked, archived = file_store.linked_ids(), file_store.archived_ids()
         found = {r["ask_id"]: r for r in db_store.entries()}
     except Exception as e:  # noqa: BLE001
         return synced, [f"read: {type(e).__name__}: {e}"]
-    rows = {a: r["status"] for a, r in found.items()}
-    for aid, st in rows.items():
-        if aid.startswith("legacy-") and aid not in linked and st == "Open":
+
+    def note(aid, ex):
+        errors.append(str(ex) if isinstance(ex, CasConflict) else f"{aid}: {type(ex).__name__}: {ex}")
+
+    own = {}
+    for aid, r in found.items():
+        if db_store.owns(r):
+            own[aid] = r
+        elif not r.get("host") and (aid in linked or (claim is not None and claim(aid))):
             try:
-                db_store.set_status(aid, SUPERSEDED)
-                rows[aid] = SUPERSEDED
-                synced.append(aid)
+                if db_store.claim_host(aid):
+                    synced.append(aid)
+                own[aid] = {**r, "host": db_store.host}
             except Exception as ex:  # noqa: BLE001
-                errors.append(f"{aid}: {type(ex).__name__}: {ex}")
+                note(aid, ex)
+
+    def move(aid, to):
+        db_store.transition(aid, own[aid]["status"], to)
+        own[aid]["status"] = to
+        synced.append(aid)
+
+    for aid, r in own.items():
+        try:
+            if aid in archived and r["status"] in ("Open", SUPERSEDED):
+                move(aid, "Resolved")
+            elif aid.startswith("legacy-") and aid not in linked and r["status"] == "Open":
+                move(aid, SUPERSEDED)
+        except Exception as ex:  # noqa: BLE001
+            note(aid, ex)
     for e in entries:
         aid, sent = e["ask_id"], sent_line_of(e["body"])
         try:
-            row_sent = sent_line_of(found[aid]["body"]) if aid in found else None
-            if rows.get(aid) == SUPERSEDED:
-                db_store.set_status(aid, e["status"])
-            elif aid not in rows:
+            if aid not in found:
                 q = e["question"]
                 if e["status"] != "Open" or q is None or not sent or _PLACEHOLDER_RE.match(sent):
                     continue  # closed, legacy, or still being asked by a live run
                 db_store.insert_raw(aid, q.question, question_body(q).replace(placeholder(aid), sent),
                                     q.priority)
-            elif rows[aid] != "Open" and e["status"] == "Open":
-                file_store.set_status(aid, rows[aid], "in the room database")
-            elif rows[aid] == "Open" and e["status"] != "Open":
-                db_store.set_status(aid, e["status"])
+                synced.append(aid)
+                continue
+            if aid not in own:
+                continue  # another host's row: never judged against this host's file
+            row, row_sent = own[aid], sent_line_of(own[aid]["body"])
+            if row["status"] == SUPERSEDED or (row["status"] == "Open" and e["status"] != "Open"):
+                if e["status"] != row["status"]:
+                    move(aid, e["status"])
+            elif row["status"] != "Open" and e["status"] == "Open":
+                file_store.set_status(aid, row["status"], "in the room database")
+                synced.append(aid)
             elif sent == placeholder(aid) and settled(row_sent):
                 file_store.stamp(aid, row_sent)
+                synced.append(aid)
             elif row_sent == placeholder(aid) and settled(sent):
                 db_store.stamp(aid, sent)
-            else:
-                continue
-            synced.append(aid)
+                synced.append(aid)
         except Exception as ex:  # noqa: BLE001 — one entry's failure leaves the rest to try
-            errors.append(f"{aid}: {type(ex).__name__}: {ex}")
-    return synced, errors
+            note(aid, ex)
+    return list(dict.fromkeys(synced)), errors
