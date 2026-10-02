@@ -82,11 +82,10 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		);
 	});
 
-	it('creates pending-questions.md with an empty placeholder', () => {
+	it('does not seed the retired pending-questions.md', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'pending-questions.md'), 'utf-8');
-		assert.match(body, /^# Pending Questions/);
-		assert.match(body, /none open/);
+		assert.equal(existsSync(join(workspace, 'pending-questions.md')), false,
+			'pending questions live in the room database, not a seeded file');
 	});
 
 	it('creates state/contextual-chips.json with a parseable shape', () => {
