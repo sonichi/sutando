@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Owner pending questions in the owner-DM room database: the file and database
-stores keep one contract, every write goes through its owner, a database failure
-falls back to the file and says so, a later run copies file entries in once, the
-reminder reads both, and the legacy triage classifies a fixture ledger. No real
-room is touched: the room-collab capability is a fake installed in a temp workspace."""
+stores keep one contract (stamping included, under concurrency), the file is the
+shadow every file-only reader keeps reading, a database failure is said loudly, a
+later run brings the two level without retiring anything, the reminder reads both
+without doubles, and the legacy triage is fail-closed, plan-bound and idempotent.
+No real room is touched: the room-collab capability is a fake in a temp workspace."""
 import asyncio
 import contextlib
 import importlib.util
@@ -16,6 +17,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -103,16 +105,16 @@ exec(FAKE_CLIENT, fake_client.__dict__)
 class InProcClient:
     """A DbClient running the adapter's `apply` on an in-memory FakeDoc."""
 
-    def __init__(self, doc=None, fail=None):
-        self.doc, self.fail, self.calls = doc or fake_client.FakeDoc(), fail, []
+    def __init__(self, doc=None, fail=None, fail_ops=()):
+        self.doc, self.fail, self.fail_ops, self.calls = doc or fake_client.FakeDoc(), fail, fail_ops, []
 
     def _do(self, req):
         self.calls.append(req["op"])
-        if self.fail:
-            raise pqs.StoreError(self.fail)
+        if self.fail or req["op"] in self.fail_ops:
+            raise pqs.StoreError(self.fail or f"{req['op']} refused")
         try:
             return asyncio.run(adapter.apply(self.doc, req, AGENT, 1_000, "https://link/row"))
-        except LookupError as e:
+        except (LookupError, ValueError) as e:
             raise pqs.StoreError(str(e)) from None
 
     def add_row(self, schema, row, cells, body):
@@ -129,6 +131,37 @@ class InProcClient:
 
     def set_body(self, schema, row, body):
         return self._do({"op": "set_body", "schema": schema, "row": row, "body": body})
+
+    def stamp(self, schema, row, token, replacement):
+        return self._do({"op": "stamp", "schema": schema, "row": row, "token": token,
+                         "replacement": replacement})
+
+
+class RacyClient(InProcClient):
+    """Every read of a row's body waits for a second reader (up to 0.5 s) before
+    the write lands: two unserialized stamps both read the placeholder."""
+
+    def __init__(self):
+        super().__init__()
+        self.barrier = threading.Barrier(2, timeout=0.5)
+
+    def _wait(self):
+        try:
+            self.barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+
+    def row(self, schema, row):
+        r = super().row(schema, row)
+        self._wait()
+        return r
+
+    def stamp(self, schema, row, token, replacement):
+        body = self.doc.row_body(schema["id"], row) or ""
+        self._wait()
+        if body.count(token) != 1:
+            raise pqs.StoreError(f"token {token!r} occurs {body.count(token)} times, expected 1")
+        self.set_body(schema, row, body.replace(token, replacement, 1))
 
 
 def _cpq(pq_file, ws):
@@ -154,12 +187,18 @@ class _Ws(unittest.TestCase):
     def q(self, ask_id="ask-1", question="Merge #12 now?", **kw):
         return pqs.Question(ask_id, question, kw.pop("context", None), 1_790_000_000.0, **kw)
 
+    def db(self, client=None):
+        return pqs.RoomDbStore(client or InProcClient(), lock=self.ws / "state" / "pq-db.lock")
+
+
+SENT = "**Sent:** queued owner-dm via proactive-ask-1.txt at 2026-09-01T00:00:00Z"
+
 
 class TestStoreContract(_Ws):
-    """Both stores answer insert / stamp / set_status / open_entries the same way."""
+    """Both stores answer insert / stamp / set_status / entries the same way."""
 
     def stores(self):
-        return [pqs.FileStore(self.pq), pqs.RoomDbStore(InProcClient())]
+        return [pqs.FileStore(self.pq), self.db()]
 
     def test_insert_lists_one_open_entry_with_its_placeholder(self):
         for s in self.stores():
@@ -175,17 +214,41 @@ class TestStoreContract(_Ws):
             self.assertEqual([e["title"] for e in s.open_entries()], ["Merge #12 now?"], s.kind)
 
     def test_stamp_replaces_the_placeholder_once(self):
-        line = "**Sent:** queued owner-dm via proactive-ask-1.txt at 2026-09-01T00:00:00Z"
         for s in self.stores():
             s.insert(self.q())
-            s.stamp("ask-1", line)
+            s.stamp("ask-1", SENT)
             body = s.open_entries()[0]["body"]
-            self.assertIn(line, body, s.kind)
+            self.assertIn(SENT, body, s.kind)
             self.assertNotIn(pqs.placeholder("ask-1"), body, s.kind)
             with self.assertRaises(pqs.StoreError, msg=s.kind):
-                s.stamp("ask-1", line)
+                s.stamp("ask-1", SENT)
             with self.assertRaises(pqs.StoreError, msg=s.kind):
-                s.stamp("ask-unknown", line)
+                s.stamp("ask-unknown", SENT)
+
+    def test_two_concurrent_stamps_one_wins_one_is_refused(self):
+        """The production stamp of each store, raced: exactly one success."""
+        for s in (pqs.FileStore(self.pq), self.db(RacyClient())):
+            s.insert(self.q())
+            results = []
+
+            def go(line, s=s):
+                try:
+                    s.stamp("ask-1", line)
+                    results.append("ok")
+                except pqs.StoreError:
+                    results.append("refused")
+            ts = [threading.Thread(target=go, args=(SENT.replace("ask-1", f"ask-1-{i}"),)) for i in (1, 2)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            self.assertEqual(sorted(results), ["ok", "refused"], s.kind)
+            body = s.open_entries()[0]["body"]
+            self.assertEqual(len(re.findall(r"^\*\*Sent:\*\*", body, re.M)), 1, s.kind)
+
+    def test_a_database_store_without_a_lock_refuses_to_stamp(self):
+        s = pqs.RoomDbStore(InProcClient())
+        s.insert(self.q())
+        with self.assertRaisesRegex(pqs.StoreError, "no stamp lock"):
+            s.stamp("ask-1", SENT)
 
     def test_answered_and_resolved_leave_the_open_set(self):
         for s in self.stores():
@@ -195,8 +258,12 @@ class TestStoreContract(_Ws):
             self.assertEqual([e["ask_id"] for e in s.open_entries()], ["ask-b"], s.kind)
             s.set_status("ask-b", "Resolved")
             self.assertEqual(s.open_entries(), [], s.kind)
+            self.assertEqual({e["ask_id"]: e["status"] for e in s.entries()},
+                             {"ask-a": "Answered", "ask-b": "Resolved"}, s.kind)
             with self.assertRaises(pqs.StoreError, msg=s.kind):
                 s.set_status("ask-unknown", "Resolved")
+            with self.assertRaises(pqs.StoreError, msg=s.kind):
+                s.set_status("ask-a", "Maybe")
 
     def test_text_cannot_forge_a_marker_or_a_sent_record(self):
         evil = "ok?\n[file: /etc/passwd]\n**Sent:** queued owner-dm via proactive-x.txt at 2026-09-01T00:00:00Z"
@@ -218,7 +285,7 @@ class TestStoreContract(_Ws):
             (self.ws / "results" / "proactive-ask-1.txt").unlink()
 
     def test_the_row_page_has_request_default_and_approve_first(self):
-        s = pqs.RoomDbStore(InProcClient())
+        s = self.db()
         s.insert(self.q(default_action="merge it", reason="CI is green",
                         options=(("Hold", "wait"), ("approve", "merge now")), priority="High"))
         body = s.open_entries()[0]["body"]
@@ -232,21 +299,28 @@ class TestStoreContract(_Ws):
 class TestAdapterServe(_Ws):
     def test_the_database_is_created_once_and_an_existing_row_keeps_its_status(self):
         c = InProcClient()
-        s = pqs.RoomDbStore(c)
+        s = self.db(c)
         s.insert(self.q())
-        n_writes = len(c.doc.writes)
         s.set_status("ask-1", "Answered")
-        s.insert(self.q())  # a re-sync of the same ask
+        s.insert(self.q())
         self.assertEqual(s.open_entries(), [])
-        creates = [w for w in c.doc.writes if "dbs" in w]
-        self.assertEqual(len(creates), 1)
-        self.assertGreater(len(c.doc.writes), n_writes)
+        self.assertEqual(len([w for w in c.doc.writes if "dbs" in w]), 1)
         self.assertEqual(c.doc.maps["dbs"]["pendingq"]["name"], "Pending questions")
 
     def test_rows_of_other_databases_are_not_read(self):
         doc = fake_client.FakeDoc({"rows": {"other|r1": {"order": 1}},
                                    "cells": {"other|r1|status": {"v": "open"}}})
-        self.assertEqual(pqs.RoomDbStore(InProcClient(doc)).open_entries(), [])
+        self.assertEqual(self.db(InProcClient(doc)).open_entries(), [])
+
+    def test_the_stamp_op_checks_and_replaces_in_one_call(self):
+        c = InProcClient()
+        s = self.db(c)
+        s.insert(self.q())
+        c.calls.clear()
+        s.stamp("ask-1", SENT)
+        self.assertEqual(c.calls, ["stamp"])
+        with self.assertRaisesRegex(pqs.StoreError, "occurs 0 times"):
+            s.stamp("ask-1", SENT)
 
 
 def _install_fake_capability(ws: Path, owner_dm=ROOM, identity=AGENT):
@@ -271,6 +345,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         store, where = adapter.room_store(self.ws, environ={"AG2SPACE_USER_ID": AGENT})
         self.assertEqual(where, ROOM)
         self.assertIn(AGENT, store.client.argv)
+        self.assertEqual(store.lock, self.ws / "state" / "pending-questions-db.lock")
 
     def test_the_script_client_round_trips_through_the_adapter(self):
         _install_fake_capability(self.ws)
@@ -278,7 +353,9 @@ class TestDiscoveryAndScriptClient(_Ws):
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(state)}):
             store, _ = adapter.room_store(self.ws, environ={})
             link = store.insert(self.q())
-            store.stamp("ask-1", "**Sent:** queued x via proactive-ask-1.txt at 2026-09-01T00:00:00Z")
+            store.stamp("ask-1", SENT)
+            with self.assertRaisesRegex(pqs.StoreError, "occurs 0 times"):
+                store.stamp("ask-1", SENT)
             [e] = store.open_entries()
         self.assertEqual(link, f"https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq")
         self.assertIn("proactive-ask-1.txt", e["body"])
@@ -294,6 +371,82 @@ class TestDiscoveryAndScriptClient(_Ws):
                 c.rows(pqs.DB_SCHEMA)
         with self.assertRaises(pqs.StoreError):
             pqs.ScriptDbClient([str(self.ws / "missing")]).rows(pqs.DB_SCHEMA)
+
+
+class TestEdges(_Ws):
+    def _serve(self, req, env):
+        if not (self.ws / "skills").exists():
+            _install_fake_capability(self.ws)
+        argv = ["serve", "--room", ROOM, "--user-id", AGENT,
+                "--skill-scripts", str(self.ws / "skills" / "room-collab" / "scripts")]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(req))), \
+                contextlib.redirect_stdout(out), mock.patch.object(adapter, "SETTLE_SEC", 0):
+            rc = adapter.main(argv)
+        return rc, json.loads(out.getvalue())
+
+    def test_serve_answers_each_op_and_reports_failures_as_json(self):
+        env = {"FAKE_ROOM_STATE": str(self.ws / "room.json")}
+        base = {"schema": pqs.DB_SCHEMA, "row": "r1"}
+        self.assertEqual(self._serve({**base, "op": "add_row", "cells": {"name": "q"}, "body": "b"}, env)[1]["ok"], True)
+        self.assertEqual(self._serve({**base, "op": "set_cells", "cells": {"name": "q2"}}, env)[0], 0)
+        self.assertEqual(self._serve({**base, "op": "set_body", "body": "new"}, env)[0], 0)
+        rc, reply = self._serve({**base, "op": "row"}, env)
+        self.assertEqual((reply["result"]["cells"]["name"], reply["result"]["body"]), ("q2", "new"))
+        for bad in ({**base, "op": "frobnicate"}, {**base, "op": "set_body", "row": "nope", "body": "x"},
+                    {**base, "op": "stamp", "token": "absent", "replacement": "x"}):
+            rc, reply = self._serve(bad, env)
+            self.assertEqual((rc, reply["ok"]), (1, False), bad)
+        rc, reply = self._serve({**base, "op": "rows"}, {**env, "FAKE_ROOM_FAIL": "1"})
+        self.assertEqual(rc, 1)
+        self.assertIn("service refused the socket", reply["error"])
+
+    def test_a_held_stamp_lock_refuses_rather_than_waits_forever(self):
+        s = self.db()
+        s.insert(self.q())
+        s.lock.mkdir(parents=True)
+        with mock.patch.object(pqs.ledger, "LOCK_WAIT_SEC", 0.1):
+            with self.assertRaisesRegex(pqs.StoreError, "could not acquire"):
+                s.stamp("ask-1", SENT)
+        self.assertTrue(s.lock.exists())
+
+    def test_a_file_entry_without_a_status_line_is_refused(self):
+        self.pq.write_text("## x\n\n**Ask id:** ask-1\n")
+        with self.assertRaisesRegex(pqs.StoreError, "no \\*\\*Status"):
+            pqs.FileStore(self.pq).set_status("ask-1", "Resolved")
+
+    def test_unreadable_fields_read_as_none(self):
+        self.assertIsNone(pqs.question_from_fields("a", "<!-- pq-fields: bm90IGpzb24= -->"))
+
+    def test_resync_reports_a_failed_row_and_tries_the_rest(self):
+        fs = pqs.FileStore(self.pq)
+        for a in ("ask-a", "ask-b"):
+            fs.insert(self.q(a, a + "?"))
+            fs.stamp(a, SENT.replace("ask-1", a))
+        synced, errors = pqs.resync(fs, self.db(InProcClient(fail_ops=("add_row",))))
+        self.assertEqual((synced, len(errors)), ([], 2))
+
+    def test_a_failed_database_stamp_is_reported_as_a_database_error(self):
+        out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST,
+                            store=self.db(InProcClient(fail_ops=("stamp",))))
+        self.assertTrue(out["db_error"].startswith("stamp: StoreError"))
+        self.assertIsNone(out["ledger_error"])
+        self.assertIn("ROOM DATABASE WRITE FAILED — stamp", "\n".join(pqa.report_lines(out)))
+
+    def test_ask_owner_cli_resolves_the_workspace_and_refuses_a_bad_option(self):
+        cli = str(REPO / "scripts" / "ask-owner.py")
+        with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), \
+                mock.patch.object(sys, "argv", [cli, "q?", "--urgency", "durable"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.suppress(SystemExit):
+                runpy.run_path(cli, run_name="__main__")
+        self.assertIn(str(self.pq), out.getvalue())
+        with mock.patch.object(sys, "argv", [cli, "q?", "--option", "no-equals"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as e:
+                runpy.run_path(cli, run_name="__main__")
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn("Label=what it does", err.getvalue())
 
 
 class TestAskOwnerWithTheDatabase(_Ws):
@@ -315,28 +468,38 @@ class TestAskOwnerWithTheDatabase(_Ws):
     def _proactive(self):
         return sorted((self.ws / "results").glob("proactive-*.txt"))
 
-    def test_with_the_capability_the_row_is_the_ledger_and_the_message_links_it(self):
+    def _names(self, state):
+        return sorted(c["v"] for k, c in json.loads(state.read_text())["cells"].items() if k.endswith("|name"))
+
+    def test_with_the_capability_the_row_is_written_and_the_file_keeps_its_shadow(self):
         _install_fake_capability(self.ws)
         state = self.ws / "fake-room.json"
         out, err = self._run("Merge #12?", "--default", "merge", "--reason", "green",
                              "--option", "Hold=wait", env={"FAKE_ROOM_STATE": str(state)})
         self.assertIn("Pending questions database", out)
-        self.assertFalse(self.pq.exists())
         [p] = self._proactive()
         self.assertIn("?surface=db&page=pendingq", p.read_text())
-        bodies = json.loads(state.read_text())["bodies"]
-        [body] = bodies.values()
+        [body] = json.loads(state.read_text())["bodies"].values()
         self.assertRegex(body, rf"\*\*Sent:\*\* queued owner-dm \(last-active bridge\) via {p.name} at ")
         self.assertIn("**Approve** -> merge\n**Hold** -> wait", body)
+        # Every file-only reader still sees the question; the store-aware reminder sees it once.
+        cpq = _cpq(self.pq, self.ws)
+        self.assertEqual(len(cpq.get_waiting_questions()), 1)
+        self.assertRegex(self.pq.read_text(), rf"\*\*Sent:\*\* queued owner-dm \(last-active bridge\) via {p.name}")
+        with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(state)}):
+            store, _ = adapter.room_store(self.ws, environ={})
+            qs, notes = cpq.gather(store)
+        self.assertEqual((len(qs), notes), (1, []))
+        self.assertEqual(qs[0]["title"], "Merge #12?")
 
-    def test_a_database_failure_falls_back_to_the_file_loudly(self):
+    def test_a_database_failure_keeps_the_file_and_says_so(self):
         _install_fake_capability(self.ws)
         out, err = self._run("Merge #12?", env={"FAKE_ROOM_STATE": str(self.ws / "s.json"),
                                                 "FAKE_ROOM_FAIL": "1"})
         self.assertIn("ROOM DATABASE WRITE FAILED", err)
         self.assertIn("ROOM DATABASE WRITE FAILED", out)
-        text = self.pq.read_text()
-        self.assertRegex(text, r"\*\*Ask id:\*\* ask-\S+\n\*\*Sent:\*\* queued owner-dm")
+        self.assertRegex(self.pq.read_text(), r"\*\*Ask id:\*\* ask-\S+\n<!-- pq-fields: \S+ -->\n"
+                                              r"\*\*Sent:\*\* queued owner-dm")
         [p] = self._proactive()
         self.assertIn("Ledger: hosts/test-host/pending-questions.md", p.read_text())
 
@@ -345,79 +508,144 @@ class TestAskOwnerWithTheDatabase(_Ws):
         self.assertIn("room database: not used (no room-collab capability installed)", out)
         self.assertIn("**Status:** open", self.pq.read_text())
 
-    def test_a_later_run_copies_the_fallback_entry_in_once(self):
+    def test_a_later_run_copies_the_fallback_entry_in_once_with_its_fields(self):
         _install_fake_capability(self.ws)
         state = self.ws / "fake-room.json"
-        self._run("first?", env={"FAKE_ROOM_STATE": str(state), "FAKE_ROOM_FAIL": "1"})
+        self._run("first?", "--priority", "High", "--default", "ship it", "--reason", "green",
+                  "--option", "Hold=wait", env={"FAKE_ROOM_STATE": str(state), "FAKE_ROOM_FAIL": "1"})
         out, _ = self._run("second?", env={"FAKE_ROOM_STATE": str(state)})
-        self.assertIn("resync: copied 1 file entr(ies)", out)
-        names = sorted(c["v"] for k, c in json.loads(state.read_text())["cells"].items() if k.endswith("|name"))
-        self.assertEqual(names, ["first?", "second?"])
-        self.assertIn("**Status:** moved — kept in the Pending questions database as row q-ask-",
-                      self.pq.read_text())
-        self.assertEqual(_cpq(self.pq, self.ws).get_waiting_questions(), [])
+        self.assertIn("resync: brought 1 entr(ies) level", out)
+        self.assertEqual(self._names(state), ["first?", "second?"])
+        d = json.loads(state.read_text())
+        first = next(k.rsplit("|", 1)[0] for k, c in d["cells"].items() if c["v"] == "first?")
+        self.assertEqual(d["cells"][first + "|priority"]["v"], "high")
+        body = d["bodies"][first]
+        self.assertIn("# Proposed default action\n\nship it — green\n\n**Approve** -> ship it\n**Hold** -> wait", body)
+        self.assertRegex(body, r"# Delivery\n\n\*\*Sent:\*\* queued owner-dm")
+        self.assertEqual(len(_cpq(self.pq, self.ws).get_waiting_questions()), 2)
         out, _ = self._run("third?", env={"FAKE_ROOM_STATE": str(state)})
         self.assertNotIn("resync:", out)
-        self.assertEqual(sum(k.endswith("|name") for k in json.loads(state.read_text())["cells"]), 3)
+        self.assertEqual(len(self._names(state)), 3)
 
 
 class TestResync(_Ws):
-    def _fallback_entry(self, ask_id="ask-f", sent=True):
+    def _fallback_entry(self, ask_id="ask-f", sent=True, **kw):
         fs = pqs.FileStore(self.pq)
-        fs.insert(self.q(ask_id, "from the file?"))
+        fs.insert(self.q(ask_id, "from the file?", **kw))
         if sent:
             fs.stamp(ask_id, f"**Sent:** queued owner-dm via proactive-{ask_id}.txt at 2026-09-01T00:00:00Z")
         return fs
 
-    def test_a_row_written_before_a_crash_is_not_written_twice(self):
-        fs = self._fallback_entry()
-        db = pqs.RoomDbStore(InProcClient())
-        db.insert_raw("ask-f", "from the file?", "already here")
+    def test_the_round_trip_rebuilds_the_same_row_as_a_direct_insert(self):
+        kw = dict(context="why", default_action="merge", reason="green",
+                  options=(("Hold", "wait"),), priority="High")
+        fs, db = self._fallback_entry(**kw), self.db()
         self.assertEqual(pqs.resync(fs, db), (["ask-f"], []))
-        [e] = db.open_entries()
-        self.assertEqual(e["body"], "already here")
-        self.assertEqual(fs.open_entries(), [])
+        direct = self.db()
+        direct.insert(self.q("ask-f", "from the file?", **kw))
+        direct.stamp("ask-f", "**Sent:** queued owner-dm via proactive-ask-f.txt at 2026-09-01T00:00:00Z")
+        self.assertEqual(db.open_entries(), direct.open_entries())
+        self.assertEqual(db.client.rows(pqs.DB_SCHEMA)[0]["cells"], direct.client.rows(pqs.DB_SCHEMA)[0]["cells"])
+
+    def test_the_file_entry_is_never_retired(self):
+        fs, db = self._fallback_entry(), self.db()
+        pqs.resync(fs, db)
+        self.assertEqual([e["ask_id"] for e in fs.open_entries()], ["ask-f"])
         self.assertEqual(pqs.resync(fs, db), ([], []))
 
-    def test_an_entry_still_being_asked_is_left_in_the_file(self):
-        fs = self._fallback_entry(sent=False)
-        db = pqs.RoomDbStore(InProcClient())
+    def test_a_row_written_before_a_crash_is_not_written_twice(self):
+        fs, db = self._fallback_entry(), self.db()
+        db.insert_raw("ask-f", "from the file?", "already here")
+        self.assertEqual(pqs.resync(fs, db), ([], []))
+        [e] = db.open_entries()
+        self.assertEqual(e["body"], "already here")
+
+    def test_closing_on_either_side_closes_the_other(self):
+        fs, db = self._fallback_entry(), self.db()
+        pqs.resync(fs, db)
+        db.set_status("ask-f", "Answered")
+        self.assertEqual(pqs.resync(fs, db), (["ask-f"], []))
+        self.assertEqual(fs.entries()[0]["status"], "Answered")
+        fs2 = self._fallback_entry("ask-g")
+        pqs.resync(fs2, db)
+        fs2.set_status("ask-g", "Resolved")
+        pqs.resync(fs2, db)
+        self.assertEqual({e["ask_id"]: e["status"] for e in db.entries()}, {"ask-f": "Answered", "ask-g": "Resolved"})
+
+    def test_an_entry_still_being_asked_is_left_alone(self):
+        fs, db = self._fallback_entry(sent=False), self.db()
         self.assertEqual(pqs.resync(fs, db), ([], []))
         self.assertEqual(db.open_entries(), [])
 
     def test_a_failing_database_leaves_the_entry_open_in_the_file(self):
         fs = self._fallback_entry()
-        moved, errors = pqs.resync(fs, pqs.RoomDbStore(InProcClient(fail="socket closed")))
-        self.assertEqual(moved, [])
+        synced, errors = pqs.resync(fs, self.db(InProcClient(fail="socket closed")))
+        self.assertEqual(synced, [])
         self.assertIn("socket closed", errors[0])
         self.assertEqual(len(fs.open_entries()), 1)
 
-    def test_legacy_entries_without_an_ask_id_are_not_the_resyncs(self):
+    def test_legacy_entries_without_fields_are_not_inserted(self):
         self.pq.write_text("## legacy — question\n\nbody\n\n**Status:** open\n")
-        db = pqs.RoomDbStore(InProcClient())
-        self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), ([], []))
+        self.assertEqual(pqs.resync(pqs.FileStore(self.pq), self.db()), ([], []))
 
 
 class TestReminder(_Ws):
-    def test_it_reminds_database_rows_and_the_files_waiting_entries(self):
+    def test_it_reminds_database_rows_and_the_files_other_entries_once_each(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
-        db = pqs.RoomDbStore(InProcClient())
-        db.insert(self.q())
+        db = self.db()
+        write = pqs.write_question(self.q(), pqs.FileStore(self.pq), db)
+        self.assertEqual([s.kind for s in write.stores], ["room-db", "file"])
         cpq = _cpq(self.pq, self.ws)
         qs, notes = cpq.gather(db)
         self.assertEqual([q["title"] for q in qs], ["Merge #12 now?", "legacy — still in the file"])
         self.assertEqual(qs[0]["snippet"], "Merge #12 now?")
         self.assertEqual(notes, [])
 
+    def test_a_migrated_bullet_and_a_moved_section_are_not_doubled(self):
+        bullet = "- **[ask-7, 2026-09-20]** go ahead with #101?"
+        moved = ("## 2026-06-01 — migrated\n\nbody\n\n"
+                 "**Status:** moved — kept in the room database as row q-legacy-abc123def456 (pending-questions-migrate)\n")
+        self.pq.write_text(moved + "\n" + bullet + "\n")
+        cpq = _cpq(self.pq, self.ws)
+        file_qs = cpq.get_waiting_questions()
+        self.assertEqual(len(file_qs), 2)  # file-only readers see both
+        db = self.db()
+        b = next(q for q in file_qs if q["kind"] == "bullet")
+        db.insert_raw(pqs.legacy_ask_id(b["title"], b["body"]), b["title"], "page")
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        qs, _ = cpq.gather(db)
+        self.assertEqual(sorted(q["title"] for q in qs), ["ask-7, 2026-09-20", "migrated"])
+
+    def test_a_database_that_fails_after_a_write_still_reminds_from_the_file(self):
+        fs = pqs.FileStore(self.pq)
+        fs.insert(self.q("ask-f", "from the file?"))
+        fs.stamp("ask-f", SENT.replace("ask-1", "ask-f"))
+        client = InProcClient()
+        db = self.db(client)
+        cpq = _cpq(self.pq, self.ws)
+        real_rows = client.rows
+        calls = []
+
+        def rows_then_fail(schema):
+            calls.append(1)
+            if len(calls) > 1:
+                raise pqs.StoreError("rows() failed after the write")
+            return real_rows(schema)
+        client.rows = rows_then_fail
+        qs, notes = cpq.gather(db)
+        self.assertEqual([q["title"] for q in qs], ["2026-09-21T14:13:20Z — from the file?"])
+        self.assertTrue(any("ROOM DATABASE READ FAILED" in n for n in notes))
+        self.assertEqual(len(client.doc.maps["rows"]), 1)  # the write landed; the file still answers
+
     def test_a_failing_database_reminds_from_the_file_and_says_so(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
         cpq = _cpq(self.pq, self.ws)
-        qs, notes = cpq.gather(pqs.RoomDbStore(InProcClient(fail="403")))
+        qs, notes = cpq.gather(self.db(InProcClient(fail="403")))
         self.assertEqual(len(qs), 1)
         self.assertTrue(any("ROOM DATABASE READ FAILED" in n or "resync" in n for n in notes))
 
     def test_a_drained_row_is_not_due_and_an_undrained_one_is(self):
-        db = pqs.RoomDbStore(InProcClient())
+        db = self.db()
         db.insert(self.q())
         import time as _t
         db.stamp("ask-1", f"**Sent:** queued owner-dm via proactive-ask-1.txt at {pqa._iso(_t.time())}")
@@ -463,10 +691,15 @@ class TestDelegation(unittest.TestCase):
         self.assertEqual(writes, {"put_database", "put_row_body", "settle"})
         self.assertNotRegex(s, r"write_text|os\.replace")
 
-    def test_the_reminder_does_not_write_the_database(self):
+    def test_the_reminder_writes_only_through_resync(self):
         s = self.src("src/check-pending-questions.py")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|stamp|set_status)\(")
         self.assertIn("resync(FileStore(PQ_FILE), store)", s)
+
+    def test_the_migrate_writes_the_file_only_through_the_ledger(self):
+        s = self.src("scripts/pending-questions-migrate.py")
+        self.assertNotRegex(s, r"\.write_text\((?!json\.dumps\(make_plan)")
+        self.assertIn("ledger.update(ledger_file,", s)
 
     def test_ask_owner_cli_injects_what_discovery_found(self):
         seen = {}
@@ -530,6 +763,10 @@ open wins
 
 - **[pr-106, 2026-07-04]** merge #106?
 
+## 2026-09-01 — answered already
+
+**Status:** answered
+
 ## ✅ RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE, nothing left to do
 
 ## ✅ [RESOLVED 2026-06-28] PR #19 (sutando-meeting) MERGED
@@ -550,9 +787,37 @@ open wins
 
 asked 2026-09-20
 
-## 2026-09-01 — answered already
+## 2026-08-04 — Merge #102 or #500?
 
-**Status:** answered
+one merged, one the server could not say
+
+## 2026-07-06 — Old ask naming #501
+
+old, and its PR is unknown (401)
+
+## 2026-08-05 — Same heading #102?
+
+the first of two
+
+## 2026-08-05 — Same heading #102?
+
+the second of two
+
+## 2026-06-01 — migrated
+
+body
+
+**Status:** moved — kept in the room database as row q-legacy-abc123def456 (pending-questions-migrate)
+
+## 2026-09-20T00:00:00Z — store-managed
+
+> body
+
+**Status:** open
+**Ask id:** ask-9
+**Sent:** queued owner-dm via proactive-ask-9.txt at 2026-09-20T00:00:00Z
+
+- **[ask-7, 2026-09-20]** go ahead with #101?
 
 # Resolved
 
@@ -564,6 +829,34 @@ archived
 PR_STATES = {101: {"state": "open"}, 102: {"state": "closed", "merged_at": "2026-08-02T00:00:00Z"},
              103: {"state": "closed", "merged_at": None}, 105: {"state": "closed", "merged_at": "x"},
              106: {"state": "closed", "merged_at": "x"}}
+EXPECTED = {
+    "2026-09-28 — Merge #101 once CI is green?": "live",
+    "2026-08-01 — Should #102 go in before the release?": "stale-merged-PR",
+    "2026-08-02 — Revive https://github.com/sonichi/sutando/pull/103 ?": "stale-closed-PR",
+    "2026-08-03 — Either #103 or #102?": "stale-merged-PR",
+    "2026-07-01 — Rename the dock?": "past-window",
+    "2026-09-29 — Pick a launch date?": "live",
+    "2026-07-02 — Close issue #404 as won't fix?": "past-window",
+    "2026-07-03 — Two PRs #105 and #101?": "live",
+    "pr-106, 2026-07-04": "stale-merged-PR",
+    "✅ RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE, nothing left to do": "self-resolved",
+    "✅ [RESOLVED 2026-06-28] PR #19 (sutando-meeting) MERGED": "self-resolved",
+    "[RESOLVED] 2026-09-17T17:35Z — #101 MERGED": "self-resolved",
+    "RESOLVED 2026-09-08T05:29Z — window granted, restart done": "self-resolved",
+    "SELF-RESOLVED 2026-09-08T10:1xZ by measurement — no answer needed.": "self-resolved",
+    "#4358 — my diagnosis dispute RESOLVED in agreement; the only remaining gap is a fresh live "
+    "witness, and it's the author's/your call to produce, not mine (updated 2026-09-17T16:57Z)": "live",
+    "An old ask with an ISO stamp (2026-07-05T14:35:18Z)": "past-window",
+    "RESOLVED? Should we revert #101": "live",
+    "2026-08-04 — Merge #102 or #500?": "unknown-PR",
+    "2026-07-06 — Old ask naming #501": "unknown-PR",
+    "2026-08-05 — Same heading #102?": "stale-merged-PR",
+    "ask-7, 2026-09-20": "live",
+    "2026-06-01 — migrated": "already-migrated",
+    "2026-09-20T00:00:00Z — store-managed": "already-migrated",
+}
+COUNTS = ("counts: already-migrated=2, self-resolved=5, live=6, unknown-PR=2, stale-merged-PR=5, "
+          "stale-closed-PR=1, past-window=3")
 
 
 class _Proc:
@@ -571,12 +864,17 @@ class _Proc:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
-class TestMigrate(unittest.TestCase):
+class _MigrateBase(unittest.TestCase):
     NOW = 1_790_000_000.0  # 2026-09-21
 
     def setUp(self):
         self.m = _load_migrate()
         self.calls, self.slept, self.forbid = [], [], {102}
+        d = Path(tempfile.mkdtemp())
+        self.ledger = d / "pending-questions.md"
+        self.ledger.write_text(FIXTURE)
+        self.ws = d
+        (d / "state").mkdir()
 
     def gh(self, argv, **kw):
         n = int(argv[-1].rsplit("/", 1)[1])
@@ -584,40 +882,53 @@ class TestMigrate(unittest.TestCase):
         if n in self.forbid:
             self.forbid.discard(n)
             return _Proc(1, "", "gh: HTTP 403: API rate limit exceeded")
+        if n == 500:
+            return _Proc(1, "", "gh: Server Error (HTTP 500)")
+        if n == 501:
+            return _Proc(1, "", "gh: Bad credentials (HTTP 401)")
         if n not in PR_STATES:
             return _Proc(1, "", "gh: Not Found (HTTP 404)")
         return _Proc(0, json.dumps(PR_STATES[n]))
 
-    def triage(self):
-        cpq = self.m._reader()
-        prs = self.m.GhPrs(runner=self.gh, sleep=self.slept.append, log=lambda *a, **k: None)
-        return self.m.triage(cpq.parse_waiting(FIXTURE, keep_title_resolved=True), prs, self.NOW, 14,
-                             "sonichi/sutando", cpq.title_says_resolved)
+    def prs(self):
+        return self.m.GhPrs(runner=self.gh, sleep=self.slept.append, log=lambda *a, **k: None)
 
+    def triage(self, text=None):
+        text = self.ledger.read_text() if text is None else text
+        cpq = self.m._reader()
+        return self.m.triage(cpq.parse_waiting(text, keep_title_resolved=True), self.prs(), self.NOW, 14,
+                             "sonichi/sutando", cpq.title_says_resolved, text)
+
+    def plan(self, cpw=False):
+        text = self.ledger.read_text()
+        return self.m.make_plan(self.triage(text), self.ledger, text, cpw)
+
+    def db(self):
+        return pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "lock")
+
+    def waiting(self):
+        return sorted(q["title"] for q in self.m._reader().parse_waiting(self.ledger.read_text()))
+
+
+
+class TestMigrate(_MigrateBase):
     def test_each_entry_is_classified(self):
-        got = {r["title"]: r["class"] for r in self.triage()}
-        self.assertEqual(got, {
-            "2026-09-28 — Merge #101 once CI is green?": "live",
-            "2026-08-01 — Should #102 go in before the release?": "stale-merged-PR",
-            "2026-08-02 — Revive https://github.com/sonichi/sutando/pull/103 ?": "stale-closed-PR",
-            "2026-08-03 — Either #103 or #102?": "stale-merged-PR",
-            "2026-07-01 — Rename the dock?": "past-window",
-            "2026-09-29 — Pick a launch date?": "live",
-            "2026-07-02 — Close issue #404 as won't fix?": "past-window",
-            "2026-07-03 — Two PRs #105 and #101?": "live",
-            "pr-106, 2026-07-04": "stale-merged-PR",
-            "✅ RESOLVED 2026-08-10 06:1x — ARR paper 4002 registration is COMPLETE, nothing left to do":
-                "self-resolved",
-            "✅ [RESOLVED 2026-06-28] PR #19 (sutando-meeting) MERGED": "self-resolved",
-            "[RESOLVED] 2026-09-17T17:35Z — #101 MERGED": "self-resolved",
-            "RESOLVED 2026-09-08T05:29Z — window granted, restart done": "self-resolved",
-            "SELF-RESOLVED 2026-09-08T10:1xZ by measurement — no answer needed.": "self-resolved",
-            "#4358 — my diagnosis dispute RESOLVED in agreement; the only remaining gap is a fresh live "
-            "witness, and it's the author's/your call to produce, not mine (updated 2026-09-17T16:57Z)": "live",
-            "RESOLVED? Should we revert #101": "live",
-            "An old ask with an ISO stamp (2026-07-05T14:35:18Z)": "past-window",
-        })
+        rows = self.triage()
+        got = {}
+        for r in rows:
+            got.setdefault(r["title"], set()).add(r["class"])
+        self.assertEqual({k: v.pop() for k, v in got.items()}, EXPECTED)
         self.assertNotIn(19, self.calls)  # a self-resolved title is decided before any PR lookup
+
+    def test_an_unknown_pr_state_fails_closed(self):
+        rows = {r["title"]: r for r in self.triage()}
+        self.assertEqual(rows["2026-08-04 — Merge #102 or #500?"]["class"], "unknown-PR")
+        self.assertEqual(rows["2026-07-06 — Old ask naming #501"]["class"], "unknown-PR")
+        self.m.apply(self.plan(cpw=True), self.ledger, self.db())
+        text = self.ledger.read_text()
+        for title in ("2026-08-04 — Merge #102 or #500?", "2026-07-06 — Old ask naming #501"):
+            self.assertIn(title, self.waiting(), title)
+        self.assertIn("## 2026-08-04 — Merge #102 or #500?\n\none merged, one the server could not say\n", text)
 
     def test_a_403_backs_off_three_minutes_and_retries_and_states_are_cached(self):
         self.triage()
@@ -625,77 +936,141 @@ class TestMigrate(unittest.TestCase):
         self.assertEqual(self.calls.count(102), 2)
         self.assertEqual(self.calls.count(101), 1)
 
-    def test_the_dry_run_prints_counts_and_rows_and_writes_nothing(self):
-        d = Path(tempfile.mkdtemp())
-        f = d / "pending-questions.md"
-        f.write_text(FIXTURE)
-        before = f.stat().st_mtime_ns
-        out = io.StringIO()
+    def test_a_403_that_never_clears_is_unknown_not_absent(self):
+        prs = self.m.GhPrs(runner=lambda *a, **k: _Proc(1, "", "HTTP 403"), sleep=self.slept.append,
+                           log=lambda *a, **k: None)
+        self.assertEqual(prs.state("sonichi/sutando", 1), self.m.UNKNOWN)
+        self.assertEqual(self.slept, [180, 180])
+
+    def test_the_dry_run_prints_counts_saves_the_plan_and_writes_nothing_else(self):
+        before = self.ledger.stat().st_mtime_ns
+        out, plan = io.StringIO(), self.ws / "plan.json"
         real = self.m.GhPrs
-        with mock.patch.object(self.m, "GhPrs", lambda: real(self.gh, self.slept.append,
-                                                              lambda *a, **k: None)), \
+        with mock.patch.object(self.m, "GhPrs", lambda: real(self.gh, self.slept.append, lambda *a, **k: None)), \
                 contextlib.redirect_stdout(out):
-            rc = self.m.main(["--ledger", str(f), "--workspace", str(d), "--now", str(self.NOW)])
+            rc = self.m.main(["--ledger", str(self.ledger), "--workspace", str(self.ws), "--now", str(self.NOW),
+                              "--plan-out", str(plan)])
         text = out.getvalue()
         self.assertEqual(rc, 0)
-        self.assertIn("counts: self-resolved=5, live=5, stale-merged-PR=3, stale-closed-PR=1, past-window=3",
-                      text)
+        self.assertIn(COUNTS, text)
         self.assertIn("rows it would create (5):", text)
-        self.assertIn("[past-window] 2026-07-01 — Rename the dock? — leave open in the file", text)
         self.assertRegex(text, r"Name=2026-09-28 — Merge #101 once CI is green\? \| Status=Open \| "
                                r"Priority=Medium \| Ask id=legacy-[0-9a-f]{12}")
+        self.assertIn("[past-window] 2026-07-01 — Rename the dock? — leave open in the file", text)
+        self.assertIn("[live] ask-7, 2026-09-20 — nothing: a bullet entry is listed", text)
         self.assertIn("dry run: nothing written", text)
-        self.assertEqual((f.read_text(), f.stat().st_mtime_ns), (FIXTURE, before))
+        self.assertEqual((self.ledger.read_text(), self.ledger.stat().st_mtime_ns), (FIXTURE, before))
+        saved = json.loads(plan.read_text())
+        self.assertEqual(len(saved["entries"]), 24)
+        self.assertFalse(saved["close_past_window"])
 
-    def test_apply_moves_live_rows_and_resolves_stale_sections_only(self):
-        d = Path(tempfile.mkdtemp())
-        f = d / "pending-questions.md"
-        f.write_text(FIXTURE)
-        db = pqs.RoomDbStore(InProcClient())
-        done = self.m.apply(self.triage(), f, db)
+    def test_apply_needs_a_reviewed_plan(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.m.main(["--apply", "--ledger", str(self.ledger)]), 2)
+        self.assertIn("reviewed plan", err.getvalue())
+        plan = self.ws / "plan.json"
+        plan.write_text(json.dumps({**self.plan(), "ledger": "/elsewhere.md"}))
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.m.main(["--apply", "--plan", str(plan), "--ledger", str(self.ledger)]), 2)
+
+    def test_apply_carries_out_the_plan_and_never_re_queries(self):
+        plan = self.plan()
+        self.calls.clear()
+        db = self.db()
+        self.m.apply(plan, self.ledger, db)
+        self.assertEqual(self.calls, [])
         self.assertEqual(len(db.open_entries()), 5)
-        text = f.read_text()
+        text = self.ledger.read_text()
         self.assertIn("**Status:** resolved — PR(s) sonichi/sutando#102 merged", text)
         self.assertEqual(text.count("**Status:** resolved — its title says resolved"), 4)
+        self.assertEqual(text.count("**Status:** moved — kept in the room database"), 5 + 1)
         self.assertNotIn("past its 14-day window", text)
         self.assertIn("- **[SELF-RESOLVED 2026-09-08T10:1xZ", text)
-        self.assertEqual(text.count("**Status:** moved — kept in the room database"), 5)
-        self.assertIn("- **[pr-106, 2026-07-04]** merge #106?", text)
-        self.assertTrue(any("left for the owner [past-window]" in x for x in done))
-        cpq = self.m._reader()
-        self.assertEqual(sorted(q["title"] for q in cpq.parse_waiting(text)),
-                         ["2026-07-01 — Rename the dock?", "2026-07-02 — Close issue #404 as won't fix?",
-                          "An old ask with an ISO stamp (2026-07-05T14:35:18Z)", "pr-106, 2026-07-04"])
-        again = self.m.apply(self.triage(), f, db)
-        self.assertEqual(len(db.open_entries()), 5)
-        self.assertTrue(again)
+        self.assertIn("- **[ask-7, 2026-09-20]** go ahead with #101?", text)
 
-    def test_close_past_window_resolves_past_window_sections_only_when_asked(self):
-        d = Path(tempfile.mkdtemp())
-        f = d / "pending-questions.md"
-        f.write_text(FIXTURE)
-        self.m.apply(self.triage(), f, None, close_past_window=True)
-        text = f.read_text()
+    def test_an_entry_changed_since_the_plan_is_skipped(self):
+        plan = self.plan()
+        self.ledger.write_text(self.ledger.read_text().replace(
+            "## 2026-08-01 — Should #102 go in before the release?\n\nbody",
+            "## 2026-08-01 — Should #102 go in before the release?\n\nbody, edited after the review"))
+        done = self.m.apply(plan, self.ledger, self.db())
+        self.assertTrue(any("changed since the plan" in d and "Should #102" in d for d in done))
+        self.assertIn("body, edited after the review\n\n## 2026-08-02", self.ledger.read_text())
+
+    def test_two_sections_with_one_heading_are_each_resolved_once(self):
+        self.m.apply(self.plan(), self.ledger, self.db())
+        text = self.ledger.read_text()
+        first = text.index("the first of two")
+        second = text.index("the second of two")
+        self.assertEqual(text.count("**Status:** resolved — PR(s) sonichi/sutando#102 merged"), 3)
+        self.assertIn("**Status:** resolved", text[first:second])
+        self.assertIn("**Status:** resolved", text[second:text.index("## 2026-06-01 — migrated")])
+
+    def test_a_live_bullet_gets_no_row_and_is_not_doubled(self):
+        db = self.db()
+        self.m.apply(self.plan(), self.ledger, db)
+        self.assertNotIn("ask-7, 2026-09-20", [e["title"] for e in db.open_entries()])
+        cpq = _cpq(self.ledger, self.ws)
+        titles = [q["title"] for q in cpq.gather(db)[0]]
+        self.assertEqual(titles.count("ask-7, 2026-09-20"), 1)
+
+    def test_a_second_apply_changes_nothing(self):
+        db = self.db()
+        self.m.apply(self.plan(cpw=True), self.ledger, db)
+        after_first, writes = self.ledger.read_text(), len(db.client.doc.writes)
+        second = self.plan(cpw=True)
+        self.assertTrue(all(self.m.action_of(e, True).startswith("nothing") for e in second["entries"]))
+        done = self.m.apply(second, self.ledger, db)
+        self.assertTrue(all(d.startswith("unchanged") for d in done), done)
+        self.assertEqual(self.ledger.read_text(), after_first)
+        self.assertEqual(len(db.client.doc.writes), writes)
+
+    def test_close_past_window_resolves_past_window_sections_only_when_planned(self):
+        self.m.apply(self.plan(cpw=True), self.ledger, None)
+        text = self.ledger.read_text()
         self.assertEqual(text.count("**Status:** resolved — past its 14-day window (closed in cleanup)"), 3)
-        cpq = self.m._reader()
-        waiting = {q["title"] for q in cpq.parse_waiting(text)}
-        self.assertFalse(waiting & {"2026-07-01 — Rename the dock?", "2026-07-02 — Close issue #404 as won't fix?"})
+        self.assertFalse(set(self.waiting()) & {"2026-07-01 — Rename the dock?",
+                                                "2026-07-02 — Close issue #404 as won't fix?"})
         self.assertIn("- **[pr-106, 2026-07-04]** merge #106?", text)
-        lines = self.m.report(self.triage(), f, close_past_window=True)
+        lines = self.m.report(self.triage(FIXTURE), self.ledger, close_past_window=True)
         self.assertIn("[past-window] 2026-07-01 — Rename the dock? — mark resolved in the file "
                       "(past its 14-day window (closed in cleanup)); no row", "\n".join(lines))
 
-    def test_close_past_window_is_off_by_default_and_the_dry_run_still_writes_nothing(self):
-        d = Path(tempfile.mkdtemp())
-        f = d / "pending-questions.md"
-        f.write_text(FIXTURE)
-        real, out = self.m.GhPrs, io.StringIO()
-        with mock.patch.object(self.m, "GhPrs", lambda: real(self.gh, self.slept.append,
-                                                              lambda *a, **k: None)), \
-                contextlib.redirect_stdout(out):
-            self.m.main(["--ledger", str(f), "--now", str(self.NOW), "--close-past-window"])
-        self.assertIn("Rename the dock? — mark resolved in the file (past its 14-day window", out.getvalue())
-        self.assertEqual(f.read_text(), FIXTURE)
+
+class TestMigrateEdges(_MigrateBase):
+    def test_a_bad_date_is_undated_and_gh_failures_are_unknown(self):
+        self.assertIsNone(self.m.asked_on("2026-13-45 — x", ""))
+
+        def boom(*a, **k):
+            raise OSError("no gh")
+        self.assertEqual(self.m.GhPrs(boom, self.slept.append, print).state("r/r", 1), self.m.UNKNOWN)
+        self.assertEqual(self.m.GhPrs(lambda *a, **k: _Proc(0, "not json"), self.slept.append, print)
+                         .state("r/r", 2), self.m.UNKNOWN)
+
+    def test_an_entry_that_cannot_be_located_is_left_alone(self):
+        self.assertEqual(self.m.identify("", {"kind": "section", "title": "gone", "body": "x"}, set()), (None, None))
+        r = {"kind": "section", "class": "stale-merged-PR", "nth": None}
+        self.assertEqual(self.m.action_of(r, False), "nothing: the entry could not be located")
+
+    def test_a_live_entry_changed_since_the_plan_gets_no_row(self):
+        plan, db = self.plan(), self.db()
+        self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh, edited"))
+        done = self.m.apply(plan, self.ledger, db)
+        self.assertTrue(any(d.startswith("skipped: changed since the plan") and "launch date" in d for d in done))
+        self.assertNotIn("2026-09-29 — Pick a launch date?", [e["title"] for e in db.open_entries()])
+
+    def test_main_applies_a_saved_plan_without_a_database(self):
+        plan = self.ws / "plan.json"
+        plan.write_text(json.dumps(self.plan()))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.m.main(["--apply", "--plan", str(plan), "--ledger", str(self.ledger),
+                              "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        self.assertIn("room database unavailable", err.getvalue())
+        self.assertIn("unchanged (no room database) [live]", out.getvalue())
+        self.assertIn("resolved: 2026-08-01 — Should #102", out.getvalue())
 
 
 class TestTitleSaysResolved(unittest.TestCase):

@@ -68,7 +68,8 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
         return None, "no agent identity to sign database writes with"
     argv = [sys.executable, str(Path(__file__).resolve()), "serve", "--room", room,
             "--user-id", user, "--skill-scripts", str(scripts)]
-    return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}"), room
+    return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
+                       lock=Path(workspace) / "state" / "pending-questions-db.lock"), room
 
 
 # ---- serve: one request against the databases document -------------------------
@@ -143,6 +144,13 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         return None
     if op == "set_body":
         await doc.put_row_body(db, row, req["body"])
+        return None
+    if op == "stamp":
+        body, token = doc.row_body(db, row) or "", req["token"]
+        n = body.count(token)
+        if n != 1:
+            raise ValueError(f"token {token!r} occurs {n} times, expected 1")
+        await doc.put_row_body(db, row, body.replace(token, req["replacement"], 1))
         return None
     raise ValueError(f"unknown op {op!r}")
 

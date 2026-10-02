@@ -2,9 +2,10 @@
 contract, and the fail-open policy between them.
 
 The contract, identical for both stores: `insert` is idempotent on the ask id,
-`stamp` replaces the entry's one `**Sent:**` placeholder, `set_status` names one
-of STATUSES (or a free note in the file), `open_entries` lists what still wants
-an answer, each with the body the reminder reads its `**Sent:**` record from.
+`stamp` replaces the entry's one `**Sent:**` placeholder atomically (a second
+stamp of the same entry is refused, under concurrency too), `set_status` names
+one of STATUSES, `entries` lists every entry with its status and `open_entries`
+the open ones, each with the body the reminder reads its `**Sent:**` record from.
 
 FileStore keeps pending-questions.md through pending_questions_ledger, the file's
 only writer. RoomDbStore keeps the "Pending questions" database through an
@@ -12,13 +13,17 @@ injected DbClient; it owns the schema, the row page and the ask-id-to-row map,
 and never names or locates the capability behind the client — the adapter
 injects that, and ScriptDbClient runs whatever script the adapter hands it.
 
-write_question(): the room database when one is injected; else, or when it fails,
-the file, with the failure returned for the caller to report. resync(): file
-entries carrying an ask id are copied into the database (an existing row is left
-as it is) and the file entry's status then names the row, so it is not open twice.
+write_question(): the room database when one is injected, and the file always —
+the file is the shadow every file-only reader keeps reading, so a database row is
+never the only copy. A database failure is returned for the caller to report.
+resync(): file entries carrying an ask id that the database lacks are inserted
+with their structured fields; a status closed on either side closes the other.
+Nothing is ever retired from the file.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import subprocess
@@ -42,6 +47,11 @@ _STATUS_LINE_RE = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 _HEADING_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z — ")
 _PLACEHOLDER_RE = re.compile(r"^\*\*Sent:\*\* \(sending \S+\)$", re.MULTILINE)
+# A legacy entry the migration moved names its row in its status line.
+_MOVED_ROW_RE = re.compile(r"^\*\*Status:\*\*[ \t]+moved\b.*?\bas row q-(\S+)", re.MULTILINE)
+_FIELDS_RE = re.compile(r"^<!-- pq-fields: ([A-Za-z0-9+/=]+) -->[ \t]*$", re.MULTILINE)
+# Status words that still want an answer; `moved` is a legacy entry whose row is open.
+OPEN_WORDS = ("unanswered", "waiting", "open", "moved")
 
 
 class StoreError(Exception):
@@ -91,10 +101,6 @@ class Question:
     priority: str = "Medium"
 
     @property
-    def title(self) -> str:
-        return one_line_title(self.question)
-
-    @property
     def proposes(self) -> bool:
         return bool((self.default_action or "").strip() or self.options)
 
@@ -136,9 +142,53 @@ def ledger_text(q: Question) -> str:
     return text
 
 
+def fields_line(q: Question) -> str:
+    """The question's structured fields, so a file entry rebuilds the same row."""
+    data = {"question": q.question, "context": q.context, "default_action": q.default_action,
+            "reason": q.reason, "options": [list(o) for o in q.options], "priority": q.priority,
+            "asked_at": q.asked_at}
+    return "<!-- pq-fields: " + base64.b64encode(json.dumps(data).encode()).decode() + " -->"
+
+
+def question_from_fields(ask_id: str, section: str) -> Optional[Question]:
+    m = _FIELDS_RE.search(section)
+    if not m:
+        return None
+    try:
+        d = json.loads(base64.b64decode(m.group(1)))
+        return Question(ask_id, str(d["question"]), d.get("context"), float(d.get("asked_at") or 0),
+                        d.get("default_action"), d.get("reason"),
+                        tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium")
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def ledger_entry(q: Question) -> str:
     return "\n".join([entry_heading(q.question, q.asked_at), "", quote_for_ledger(ledger_text(q)), "",
-                      "**Status:** open", f"**Ask id:** {q.ask_id}", placeholder(q.ask_id), ""]) + "\n"
+                      "**Status:** open", f"**Ask id:** {q.ask_id}", fields_line(q),
+                      placeholder(q.ask_id), ""]) + "\n"
+
+
+def legacy_ask_id(title: str, body: str) -> str:
+    """The ask id the migration gives an entry written before ask ids existed."""
+    return "legacy-" + hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:12]
+
+
+def entry_ask_id(section: str) -> Optional[str]:
+    """An entry's ask id: its `**Ask id:**` line, or the row a migration moved it to."""
+    ids = ASK_ID_LINE_RE.findall(section)
+    if len(ids) == 1:
+        return ids[0]
+    moved = _MOVED_ROW_RE.findall(section)
+    return moved[0] if len(ids) == 0 and len(moved) == 1 else None
+
+
+def status_name(word: str) -> str:
+    """A file status word as one of STATUSES."""
+    w = (word or "").strip().lower()
+    if not w or w.startswith(OPEN_WORDS):
+        return "Open"
+    return "Answered" if w.startswith("answered") else "Resolved"
 
 
 def _sections(text: str):
@@ -154,8 +204,7 @@ def _sections(text: str):
 
 
 def _find_section(text: str, ask_id: str):
-    hits = [(s, e) for s, e in _sections(text)
-            if any(m.group(1) == ask_id for m in ASK_ID_LINE_RE.finditer(text, s, e))]
+    hits = [(s, e) for s, e in _sections(text) if entry_ask_id(text[s:e]) == ask_id]
     if len(hits) != 1:
         raise ledger.LedgerError(f"ask id {ask_id!r} names {len(hits)} entries, expected 1")
     return hits[0]
@@ -179,7 +228,7 @@ class FileStore:
         entry = ledger_entry(q)
 
         def _do(old: str) -> str:
-            if any(m.group(1) == q.ask_id for m in ASK_ID_LINE_RE.finditer(old)):
+            if any(entry_ask_id(old[a:b]) == q.ask_id for a, b in _sections(old)):
                 return old
             return ledger.with_entry(old, entry)
         self._write(_do)
@@ -196,6 +245,8 @@ class FileStore:
         self._write(_do)
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
+        if status not in STATUSES:
+            raise StoreError(f"status {status!r} is not one of {', '.join(STATUSES)}")
         word = status.lower() + (f" — {note}" if note else "")
 
         def _do(old: str) -> str:
@@ -206,7 +257,9 @@ class FileStore:
             return old[:m.start()] + f"**Status:** {word}" + old[m.end():]
         self._write(_do)
 
-    def open_entries(self) -> list:
+    def entries(self) -> list:
+        """Every active-region entry carrying an ask id, with its status and, when
+        it was written with them, its structured fields."""
         try:
             text = active_region(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -214,14 +267,18 @@ class FileStore:
         out = []
         for s, e in _sections(text):
             sec = text[s:e]
-            ids = ASK_ID_LINE_RE.findall(sec)
-            st = _STATUS_LINE_RE.search(sec)
-            if len(ids) != 1 or not st or not st.group(0)[len("**Status:**"):].strip().lower().startswith("open"):
+            ask_id, st = entry_ask_id(sec), _STATUS_LINE_RE.search(sec)
+            if not ask_id or not st:
                 continue
             head, _, body = sec[3:].partition("\n")
-            out.append({"ask_id": ids[0], "title": _HEADING_TS_RE.sub("", head.strip()),
-                        "body": body.strip()})
+            out.append({"ask_id": ask_id, "title": _HEADING_TS_RE.sub("", head.strip()),
+                        "body": body.strip(), "question": question_from_fields(ask_id, sec),
+                        "status": status_name(st.group(0)[len("**Status:**"):])})
         return out
+
+    def open_entries(self) -> list:
+        return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
+                if e["status"] == "Open"]
 
 
 # ---- the room database ---------------------------------------------------------
@@ -288,6 +345,7 @@ class DbClient(Protocol):
     def rows(self, schema: dict) -> list: ...
     def set_cells(self, schema: dict, row: str, cells: dict) -> None: ...
     def set_body(self, schema: dict, row: str, body: str) -> None: ...
+    def stamp(self, schema: dict, row: str, token: str, replacement: str) -> None: ...
 
 
 class ScriptDbClient:
@@ -331,6 +389,10 @@ class ScriptDbClient:
     def set_body(self, schema, row, body):
         self._call({"op": "set_body", "schema": schema, "row": row, "body": body})
 
+    def stamp(self, schema, row, token, replacement):
+        self._call({"op": "stamp", "schema": schema, "row": row, "token": token,
+                    "replacement": replacement})
+
 
 def _option_id(prop_id: str, name: str) -> str:
     prop = next(p for p in DB_SCHEMA["props"] if p["id"] == prop_id)
@@ -342,10 +404,12 @@ def _option_id(prop_id: str, name: str) -> str:
 
 
 class RoomDbStore:
+    """`lock` is a host-local mkdir lock every stamp of this database takes: one
+    writer at a time on a host, and an ask id is only ever stamped by its own host."""
     kind = "room-db"
 
-    def __init__(self, client: DbClient, label: str = "the owner's DM room"):
-        self.client, self.label = client, label
+    def __init__(self, client: DbClient, label: str = "the owner's DM room", lock: Optional[Path] = None):
+        self.client, self.label, self.lock = client, label, Path(lock) if lock else None
         self.last_link: Optional[str] = None
 
     def where(self, ask_id: str) -> str:
@@ -369,84 +433,95 @@ class RoomDbStore:
         return r
 
     def stamp(self, ask_id: str, sent_line: str) -> None:
-        body, token = self._row(ask_id).get("body") or "", placeholder(ask_id)
-        n = body.count(token)
-        if n != 1:
-            raise StoreError(f"token {token!r} occurs {n} times, expected 1")
-        self.client.set_body(DB_SCHEMA, row_id(ask_id), body.replace(token, sent_line, 1))
+        """One check-and-replace in the client's single call, serialized by `lock`."""
+        def _do():
+            self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line)
+        if self.lock is None:
+            raise StoreError("the room database store has no stamp lock; refusing an unserialized stamp")
+        err, _ = ledger.under_lock(self.lock, _do)
+        if err:
+            raise StoreError(err)
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
         self._row(ask_id)
         self.client.set_cells(DB_SCHEMA, row_id(ask_id), {"status": _option_id("status", status)})
 
-    def open_entries(self) -> list:
+    def entries(self) -> list:
+        names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
         out = []
         for r in self.client.rows(DB_SCHEMA):
             cells = r.get("cells") or {}
-            if cells.get("status") == "open" and cells.get("ask_id"):
+            if cells.get("ask_id"):
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
-                            "body": (r.get("body") or "").strip()})
+                            "body": (r.get("body") or "").strip(),
+                            "status": names.get(cells.get("status"), "Open")})
         return out
+
+    def open_entries(self) -> list:
+        return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
+                if e["status"] == "Open"]
 
 
 # ---- policy between them -------------------------------------------------------
 
 @dataclass
 class WriteOutcome:
-    store: object = None              # the store now holding the entry; None when none does
+    stores: list = field(default_factory=list)   # every store now holding the entry
     link: Optional[str] = None
-    db_error: Optional[str] = None    # the room database failed; the file took the entry
-    error: Optional[str] = None       # no store took the entry
-    notes: list = field(default_factory=list)
+    db_error: Optional[str] = None    # the room database failed; the file alone holds it
+    error: Optional[str] = None       # the file (the shadow every file reader reads) failed
 
 
 def write_question(q: Question, file_store: FileStore, db_store=None) -> WriteOutcome:
-    """The room database when injected, else the file; a database failure falls
-    back to the file and is reported, never raised."""
+    """The room database when injected, and the file always; a failure on either
+    side is reported, never raised."""
     out = WriteOutcome()
     if db_store is not None:
         try:
             out.link = db_store.insert(q)
-            out.store = db_store
-            return out
+            out.stores.append(db_store)
         except Exception as e:  # noqa: BLE001 — the file must still take the entry
             out.db_error = f"{type(e).__name__}: {e}"
     try:
         file_store.insert(q)
-        out.store = file_store
+        out.stores.append(file_store)
     except Exception as e:  # noqa: BLE001
         out.error = f"{type(e).__name__}: {e}"
     return out
 
 
-def file_entry_body(body: str) -> tuple:
-    """(request text, sent line) of a FileStore entry body, its quote undone."""
-    lines, sent = [], None
-    for ln in body.splitlines():
-        if ln.startswith("**Sent:**"):
-            sent = ln
-        elif ln.startswith(">"):
-            lines.append(ln[2:] if ln.startswith("> ") else "")
-    return "\n".join(lines).strip(), sent
+def sent_line_of(body: str) -> Optional[str]:
+    m = re.search(r"^\*\*Sent:\*\*.*$", body or "", re.MULTILINE)
+    return m.group(0) if m else None
 
 
 def resync(file_store: FileStore, db_store) -> tuple:
-    """Copy each open file entry that carries an ask id and a settled `**Sent:**`
-    line into the database, then mark it in the file. (moved ask ids, errors)."""
-    moved, errors = [], []
+    """Bring the database level with the file, never retiring a file entry:
+    an open file entry the database lacks is inserted with its own structured
+    fields and `**Sent:**` record; a status closed on either side closes the
+    other. (synced ask ids, errors)."""
+    synced, errors = [], []
     try:
-        entries = file_store.open_entries()
-    except OSError as e:
-        return moved, [f"read {file_store.path}: {e}"]
+        entries = file_store.entries()
+        rows = {r["ask_id"]: r["status"] for r in db_store.entries()}
+    except Exception as e:  # noqa: BLE001
+        return synced, [f"read: {type(e).__name__}: {e}"]
     for e in entries:
-        request, sent = file_entry_body(e["body"])
-        if not sent or _PLACEHOLDER_RE.match(sent):
-            continue  # still being asked by a live run; its stamp lands in the file
+        aid, sent = e["ask_id"], sent_line_of(e["body"])
         try:
-            db_store.insert_raw(e["ask_id"], e["title"], row_body(request, None, None, (), sent))
-            file_store.set_status(e["ask_id"], "moved",
-                                  f"kept in the {DB_SCHEMA['name']} database as row {row_id(e['ask_id'])}")
-            moved.append(e["ask_id"])
+            if aid not in rows:
+                q = e["question"]
+                if e["status"] != "Open" or q is None or not sent or _PLACEHOLDER_RE.match(sent):
+                    continue  # closed, legacy, or still being asked by a live run
+                db_store.insert_raw(aid, q.question, question_body(q).replace(placeholder(aid), sent),
+                                    q.priority)
+            elif rows[aid] != "Open" and e["status"] == "Open":
+                file_store.set_status(aid, rows[aid], "in the room database")
+            elif rows[aid] == "Open" and e["status"] != "Open":
+                db_store.set_status(aid, e["status"])
+            else:
+                continue
+            synced.append(aid)
         except Exception as ex:  # noqa: BLE001 — one entry's failure leaves the rest to try
-            errors.append(f"{e['ask_id']}: {type(ex).__name__}: {ex}")
-    return moved, errors
+            errors.append(f"{aid}: {type(ex).__name__}: {ex}")
+    return synced, errors

@@ -26,7 +26,8 @@ from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
-from pending_questions_store import FileStore, resync  # noqa: E402
+from pending_questions_store import (OPEN_WORDS, FileStore, entry_ask_id,  # noqa: E402
+                                     legacy_ask_id, resync)
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -138,8 +139,7 @@ def section_is_waiting(title: str, body: str, keep_title_resolved: bool = False)
         return False
     status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
     if status_m:
-        return status_m.group(1).strip().lower().startswith(
-            ('unanswered', 'waiting', 'open'))
+        return status_m.group(1).strip().lower().startswith(OPEN_WORDS)
     return True  # no status field: free-form prose is unanswered by convention
 
 
@@ -204,7 +204,7 @@ def parse_waiting(content, keep_title_resolved=False):
         # was filed, above the divider, and counted — a verification step whose
         # failure mode is reporting the healthy case as broken.
         questions.append({"id": title[:40], "title": title, "snippet": snippet,
-                          "body": body.strip()})
+                          "body": body.strip(), "kind": "section"})
 
     # Also recognize the free-form bullet format the proactive-loop and skills
     # actually append in: `- **[label, timestamp]** ...`. The `## `-section walk
@@ -230,7 +230,7 @@ def parse_waiting(content, keep_title_resolved=False):
             # The DM renders `snippet`, not `body`; an empty one delivered the
             # bracketed label alone, so options and defaults never reached anyone.
             ask = content[m.end():stop].strip().lstrip("*").strip()
-            questions.append({"id": title[:40], "title": title,
+            questions.append({"id": title[:40], "title": title, "kind": "bullet",
                               "snippet": ask[:120], "body": body or title})
     return questions
 
@@ -246,10 +246,10 @@ def load_store(adapter_path):
         return None, f"adapter {adapter_path} failed to load ({type(e).__name__}: {e})"
 
 
-def store_questions(store):
-    """The store's open rows, shaped like get_waiting_questions' items."""
+def store_questions(entries):
+    """Open store entries, shaped like get_waiting_questions' items."""
     out = []
-    for e in store.open_entries():
+    for e in entries:
         lines = [ln.strip() for ln in e["body"].splitlines()
                  if ln.strip() and not ln.lstrip().startswith(("#", "**Sent:**"))]
         out.append({"id": e["title"][:40], "title": e["title"], "ask_id": e["ask_id"],
@@ -257,19 +257,27 @@ def store_questions(store):
     return out
 
 
+def file_key(q):
+    """The ask id a waiting file entry is known by in the database."""
+    return entry_ask_id(q.get("body", "")) or legacy_ask_id(q["title"], q.get("body", ""))
+
+
 def gather(store=None):
-    """(waiting questions, notes): an injected store's open rows, after file entries
-    carrying an ask id are copied into it, then the file's waiting entries. A store
-    that fails leaves the file alone, and the note says so."""
-    notes, rows = [], []
+    """(waiting questions, notes): an injected store's open rows, after it is
+    brought level with the file, then the file's waiting entries the store does
+    not hold. A store that fails leaves the file alone, and the note says so."""
+    notes, rows, held = [], [], set()
     if store is not None:
         try:
-            _moved, errors = resync(FileStore(PQ_FILE), store)
+            _synced, errors = resync(FileStore(PQ_FILE), store)
             notes += [f"resync: FAILED — {e}" for e in errors]
-            rows = store_questions(store)
+            entries = store.entries()
+            held = {e["ask_id"] for e in entries}
+            rows = store_questions([e for e in entries if e["status"] == "Open"])
         except Exception as e:  # noqa: BLE001
+            rows, held = [], set()
             notes.append(f"ROOM DATABASE READ FAILED ({type(e).__name__}: {e}); reminding from the file only")
-    return rows + get_waiting_questions(), notes
+    return rows + [q for q in get_waiting_questions() if file_key(q) not in held], notes
 
 
 def due_for_reminder(questions, now=None):
