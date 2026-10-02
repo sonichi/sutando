@@ -41,9 +41,11 @@ TERMINAL = ("Answered", "Resolved")
 # A row whose file transition never committed: the file stays the truth, so
 # readers ignore the row and the file entry stays visible.
 SUPERSEDED = "Superseded"
-# Code marks that in the Recovery cell, never in Status: a terminal Status wins on read,
-# so a concurrent owner decision survives however the replicas merge.
+# Code never writes Status; it is the owner's. Code's own marks (Recovery, Closed) live in
+# separate cells, and an owner's Status is read first, so it survives any merge order.
 RECOVERY = "superseded"
+# Raw Status values that read as Open: none, Open, and an older head's "superseded".
+OPEN_RAW = [None, "open", "superseded"]
 PRIORITIES = ("High", "Medium", "Low")
 APPROVE = "Approve"
 # Bold field tokens the ledger's readers act on, wherever they occur in a body.
@@ -328,19 +330,20 @@ DB_SCHEMA = {
         {"id": "name", "name": "Name", "type": "title"},
         {"id": "status", "name": "Status", "type": "status",
          "options": [_opt("open", "Open", "red", "todo"), _opt("answered", "Answered", "blue", "doing"),
-                     _opt("resolved", "Resolved", "green", "done"),
-                     _opt("superseded", SUPERSEDED, "gray", "done")]},
+                     _opt("resolved", "Resolved", "green", "done")]},
         {"id": "priority", "name": "Priority", "type": "select",
          "options": [_opt("high", "High", "red"), _opt("medium", "Medium", "yellow"),
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
         {"id": "recovery", "name": "Recovery", "type": "text"},
+        {"id": "closed", "name": "Closed", "type": "text"},
     ],
     "views": [
         {"id": "board", "name": "Board", "layout": "board", "groupBy": "status",
-         "hidden": ["ask_id", "recovery"], "filter": [{"prop": "recovery", "op": "empty"}]},
-        {"id": "table", "name": "Table", "layout": "table", "hidden": ["recovery"],
-         "filter": [{"prop": "recovery", "op": "empty"}]},
+         "hidden": ["ask_id", "recovery", "closed"],
+         "filter": [{"prop": "recovery", "op": "empty"}, {"prop": "closed", "op": "empty"}]},
+        {"id": "table", "name": "Table", "layout": "table", "hidden": ["recovery", "closed"],
+         "filter": [{"prop": "recovery", "op": "empty"}, {"prop": "closed", "op": "empty"}]},
     ],
 }
 
@@ -446,12 +449,15 @@ def _option_id(prop_id: str, name: str) -> str:
 
 
 def effective_status(cells: dict) -> str:
-    """A terminal Status wins; otherwise a Recovery mark (or a legacy Superseded Status) supersedes."""
+    """The owner's terminal Status wins; then a closure code copied from the file; then a
+    Recovery mark. Any other Status (an older head's Superseded included) reads as Open."""
     names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
     status = names.get(cells.get("status"), "Open")
     if status in TERMINAL:
         return status
-    return SUPERSEDED if cells.get("recovery") or status == SUPERSEDED else "Open"
+    if cells.get("closed") in TERMINAL:
+        return cells["closed"]
+    return SUPERSEDED if cells.get("recovery") else "Open"
 
 
 class RoomDbStore:
@@ -505,16 +511,14 @@ class RoomDbStore:
             raise GuardFailed(ask_id, {k: v for k, v in current.items() if v is not None})
 
     def close(self, ask_id: str, to: str) -> None:
-        """Status -> Answered/Resolved on a row that is not closed yet. The only
-        Status values code writes are terminal, so code never reopens a decision."""
+        """Record a closure made in the file, in the Closed cell; Status stays the owner's."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"status": _option_id("status", to)},
-                      {"status": [None, _option_id("status", "Open"), _option_id("status", SUPERSEDED)]})
+        self._guarded(ask_id, {"closed": to}, {"closed": [None]})
 
     def supersede(self, ask_id: str) -> None:
         """Mark an open row superseded, in the Recovery cell only."""
-        self._guarded(ask_id, {"recovery": RECOVERY}, {"status": [None, _option_id("status", "Open")]})
+        self._guarded(ask_id, {"recovery": RECOVERY}, {"closed": [None], "status": OPEN_RAW})
 
     def restore(self, ask_id: str) -> None:
         """Clear the Recovery mark; Status is not touched."""

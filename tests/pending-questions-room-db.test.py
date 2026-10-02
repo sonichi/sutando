@@ -618,17 +618,19 @@ class TestMigratedRows(_Ws):
         self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])
 
-    def test_an_older_database_gains_the_superseded_option(self):
+    def test_an_older_heads_superseded_status_reads_open_and_is_reconciled(self):
+        self.pq.write_text(self.MOVED)
         doc = fake_client.FakeDoc()
-        old = json.loads(json.dumps(pqs.DB_SCHEMA))
-        old["props"][1]["options"] = old["props"][1]["options"][:3]
-        asyncio.run(adapter.apply(doc, {"op": "rows", "schema": old}, AGENT, 1))
         db = self.db(InProcClient(doc))
-        db.insert_raw("legacy-x", "q", "page")
-        db.set_status("legacy-x", "Superseded")
-        opts = [o["id"] for o in doc.maps["props"]["pendingq|status"]["options"]]
-        self.assertEqual(opts, ["open", "answered", "resolved", "superseded"])
-        self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        doc.maps["cells"]["pendingq|q-legacy-abc123def456|status"] = {"v": "superseded", "updated": 1, "by": AGENT}
+        self.assertEqual([e["status"] for e in db.entries()], ["Open"])
+        fs = pqs.FileStore(self.pq)
+        self.assertEqual(pqs.resync(fs, db), ([], []))
+        self.assertEqual(_cpq(self.pq, self.ws).gather(db)[0][0]["title"], "migrated")
+        self.pq.write_text("")
+        self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
+        self.assertEqual(db.status_of("legacy-abc123def456"), pqs.SUPERSEDED)
 
 
 class TestMonotonicStatus(_Ws):
@@ -641,8 +643,7 @@ class TestMonotonicStatus(_Ws):
         with self.assertRaises(pqs.GuardFailed) as c:
             db.supersede("legacy-x")
         self.assertEqual(c.exception.current, {"status": "Resolved"})
-        with self.assertRaises(pqs.GuardFailed):
-            db.close("legacy-x", "Answered")
+        db.close("legacy-x", "Answered")  # a file closure is recorded beside the owner's Status
         db.restore("legacy-x")
         self.assertEqual(db.status_of("legacy-x"), "Resolved")
 
@@ -697,8 +698,7 @@ class TestConcurrentReplicas(_Ws):
                         got = self._race(write, owner_status, agent_wins)
                         self.assertEqual(got[0], got[1])
                         self.assertIn(got[0], pqs.TERMINAL)
-                        if name == "supersede":
-                            self.assertEqual(got[0], owner_status.capitalize())
+                        self.assertEqual(got[0], owner_status.capitalize())
 
     @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
     def test_the_same_race_on_real_yjs_replicas_in_both_client_id_orders(self):
@@ -750,10 +750,9 @@ class TestConcurrentReplicas(_Ws):
                            for r in (owner, agent)}
                     self.assertEqual(len(got), 1)
                     self.assertTrue(got <= set(pqs.TERMINAL))
-                    if write == "supersede":
-                        self.assertEqual(got, {"Resolved"})
+                    self.assertEqual(got, {"Resolved"})
 
-    def test_code_writes_status_only_to_a_terminal_value(self):
+    def test_code_never_writes_the_owners_status(self):
         writes = []
 
         class Recording(InProcClient):
@@ -766,7 +765,8 @@ class TestConcurrentReplicas(_Ws):
         db.insert_raw("legacy-abc123def456", "migrated", "page")
         db.supersede("legacy-abc123def456")
         pqs.resync(pqs.FileStore(self.pq), db)
-        self.assertEqual({w for w in writes if w is not None}, {"answered"})
+        self.assertEqual({w for w in writes if w is not None}, set())
+        self.assertEqual(db.status_of("legacy-abc123def456"), "Answered")
 
 
 SUPERSEDED_ = pqs.SUPERSEDED
@@ -1557,6 +1557,17 @@ class TestMigrateRound3(_MigrateBase):
         [done] = self.m.apply(only, self.ledger, db)
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
+
+    def test_a_retry_over_an_older_heads_superseded_row_leaves_it_visible(self):
+        only = self._only()
+        aid, client = only["entries"][0]["ask_id"], InProcClient()
+        db = self.db(client)
+        db.insert_raw(aid, "Pick a launch date?", "page")
+        client.doc.maps["cells"][f"pendingq|{pqs.row_id(aid)}|status"] = {"v": "superseded", "updated": 1, "by": AGENT}
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        self.assertEqual(db.status_of(aid), "Open")
+        self.assertEqual(self._store_view(db).count("Pick a launch date?"), 1)
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
