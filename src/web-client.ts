@@ -1915,6 +1915,7 @@ function startTaskPolling() {
       if (sysEl) sysEl.innerHTML = statusParts.length ? statusParts.join(' · ') : '';
       // Update dynamic region with latest data
       window._drQuestions = data.questions || [];
+      window._drQuestionsUnavailable = data.questions_unavailable || null;
       updateDynamicRegion();
     } catch {}
   }, 3000);
@@ -3169,6 +3170,7 @@ try { resumePendingChatSends(); } catch {}
 // Priority: dynamic-content.json > pending questions > proactive status > chips
 // Supports: audio, image, video, document, html, and fallback chips
 window._drQuestions = [];
+window._drQuestionsUnavailable = null;
 window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
@@ -3401,7 +3403,7 @@ function renderTabContent() {
       refreshQuestionQueue().then(function() { updateTabHighlights(); renderTabContent(); });
     }
     if (!window._drQueue) window._drQueue = window._drQuestions || [];
-    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0);
+    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0, window._drQuestionsUnavailable);
 
   } else if (tab === 'activity') {
     fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
@@ -3586,8 +3588,12 @@ function questionQueueCursor(rows, index) {
   return ((index % n) + n) % n;
 }
 
-function renderQuestionQueue(rows, index) {
+function renderQuestionQueue(rows, index, unavailable) {
   rows = rows || [];
+  // An unreachable room is not an empty queue: the count is unknown, say so.
+  if (!rows.length && unavailable) {
+    return '<div class="q-empty">Pending questions unknown — room unreachable (' + esc(unavailable) + ')</div>';
+  }
   if (!rows.length) {
     return '<div class="q-empty">No pending questions</div>';
   }
@@ -3633,6 +3639,7 @@ function refreshQuestionQueue() {
       if (data && data.questions) {
         window._drQueue = data.questions;
         window._drQuestions = data.questions;
+        window._drQuestionsUnavailable = data.questions_unavailable || null;
       }
       return window._drQueue;
     })

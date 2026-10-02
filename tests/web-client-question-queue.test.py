@@ -114,6 +114,17 @@ class OneAtATime(unittest.TestCase):
         self.assertTrue(out["empty"])
         self.assertEqual(0, out["items"])
 
+    def test_an_unreachable_room_is_said_to_be_unknown_never_an_empty_queue(self):
+        out = _probe("""
+        const html = renderQuestionQueue([], 0, 'adapter failed: <down>');
+        console.log(JSON.stringify({unknown: html.includes('Pending questions unknown — room unreachable'),
+                                    escaped: html.includes('&lt;down&gt;'),
+                                    empty: html.includes('No pending questions')}));
+        """)
+        self.assertTrue(out["unknown"])
+        self.assertTrue(out["escaped"])
+        self.assertFalse(out["empty"], "the outage must not read as no questions")
+
 
 class Cursor(unittest.TestCase):
     def test_next_wraps_rather_than_running_off_the_end(self):
