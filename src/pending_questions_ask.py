@@ -39,6 +39,7 @@ from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
 from util_paths import host_label, personal_path
+from workspace_default import status_path
 
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
@@ -147,6 +148,10 @@ def ledger_entry(question: str, context: Optional[str], now: float, ask_id: str)
     return _store_ledger_entry(Question(ask_id, question, context, now))
 
 
+# Marks that this workspace's owner has been told once where the questions database lives.
+INTRODUCED = "pending-questions-db-introduced"
+
+
 def proactive_body(question: str, context: Optional[str], host: str,
                    dest: Destination, link: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
@@ -233,6 +238,11 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
     body, routed = proactive_body(question, context, host, dest, out["link"])
+    introduced = status_path(INTRODUCED, ws)
+    if out["link"] and store is not None and not introduced.exists():
+        body += (f"\nAll my questions for you are kept in the Pending questions database in "
+                 f"{neutralize_markers(store.label)}; open it any time from that room. "
+                 f"Questions are sent to you as they come up, not on a schedule.\n")
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
@@ -240,6 +250,9 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         name = proactive_filename(ask_id, dest.bridge)
         write_proactive(ws / "results", name, body)
         out["proactive_file"] = name
+        if out["link"] and store is not None and not introduced.exists():
+            introduced.parent.mkdir(parents=True, exist_ok=True)
+            introduced.write_text(ask_id + "\n", encoding="utf-8")
     except Exception as e:  # noqa: BLE001 — the ledger entry already stands
         out["send_error"] = f"{type(e).__name__}: {e}"
 

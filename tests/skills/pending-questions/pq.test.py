@@ -223,5 +223,26 @@ class TestSharedRoom(_Ws):
         self.assertEqual(cfg["config"], {"PENDING_QUESTIONS_ROOM": ""})
 
 
+class TestFirstAskIntroduction(_Ws):
+    def test_the_first_ask_with_a_database_says_where_it_lives_and_only_once(self):
+        db = rdb.pqs.RoomDbStore(rdb.InProcClient(), lock=self.ws / "state" / "l", host=HOST)
+        bodies = []
+        for q in ("First?", "Second?"):
+            out = pqa.ask_owner(q, urgency="durable", workspace=self.ws, host=HOST, store=db)
+            bodies.append((self.ws / "results" / out["proactive_file"]).read_text())
+        self.assertIn("Pending questions database", bodies[0])
+        self.assertIn("not on a schedule", bodies[0])
+        self.assertNotIn("Pending questions database", bodies[1])
+
+    def test_no_database_no_introduction(self):
+        out = pqa.ask_owner("Solo?", urgency="durable", workspace=self.ws, host=HOST)
+        self.assertNotIn("Pending questions database", (self.ws / "results" / out["proactive_file"]).read_text())
+
+    def test_the_new_install_template_schedules_reconciliation_but_no_reminder(self):
+        crons = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())
+        runs = [json.dumps(c) for c in crons if "check-pending-questions" in json.dumps(c)]
+        self.assertTrue(runs)  # the silent reconciliation stays scheduled
+        self.assertTrue(all("--reconcile-only" in r for r in runs))  # nothing scheduled ever reminds
+
 if __name__ == "__main__":
     unittest.main()
