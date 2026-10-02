@@ -6,31 +6,36 @@ locates the capability behind the client — the adapter injects that, and
 ScriptDbClient runs whatever script the adapter hands it. Rows carry their Host;
 a host reads and writes only its own rows. Code never writes Status (the owner's
 cell): its own marks live in the Recovery and Closed cells, and `effective_status`
-lets the owner's terminal Status win over any of them.
+lets the owner's terminal Status win over any of them. A row key is injective in
+the ask id (`row_id`), and `complete` confirms the row by its Ask id cell, so no
+other question's row can stand in for one.
 
-Outbox is the durable local hold for unreachability only: one JSON file per ask,
-written atomically before the room write and deleted only once the complete row
-is confirmed (`RoomDbStore.complete`). It is never edited; `flush` replays each
-entry through the normal add_row path, which resumes a row left incomplete, so a
-replay is idempotent by ask id. `reconcile_pending` is every pass's first step: flush the
-outbox, then the one transitional ingest of the legacy file.
+Outbox extends core's hold (src/pending_questions_outbox.py: the record, its path
+safety, the close records) with the replay: `flush` re-inserts each held question
+through the normal add_row path (which resumes a row left incomplete) and deletes
+the entry only once that exact ask id's row is confirmed complete; `replay_closes`
+applies the local close records. `reconcile_pending` is the explicit pass: flush,
+closes, stale marks, then the one transitional ingest of the legacy file.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
-import tempfile
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Protocol
 
+REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
+if str(REPO / "src") not in sys.path:
+    sys.path.insert(0, str(REPO / "src"))
 import pending_questions_ledger as ledger
+from pending_questions_outbox import Outbox as HeldRecords
+from pending_questions_outbox import held_items, one_line_title, waiting_item  # noqa: F401 — re-exported
 from result_markers import neutralize_markers
-from workspace_default import status_path
 
 STATUSES = ("Open", "Answered", "Resolved")
 TERMINAL = ("Answered", "Resolved")
@@ -43,6 +48,8 @@ APPROVE = "Approve"
 LEDGER_FIELD_RE = re.compile(
     r"\*\*(?=(?:Status|Options|Asked|Question|Sent|Ask id):\*\*)", re.IGNORECASE)
 SENT_LINE_RE = re.compile(r"^\*\*Sent:\*\*.*$", re.MULTILINE)
+# An ask id a row key may carry verbatim; anything else is keyed by its full digest.
+ROW_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 
 
 class StoreError(Exception):
@@ -69,10 +76,6 @@ def safe_body(text: str) -> str:
 
 def _iso(now: float) -> str:
     return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def one_line_title(question: str) -> str:
-    return " ".join(neutralize_markers(question).split())[:120] or "(empty question)"
 
 
 def neutralize(text: str) -> str:
@@ -156,7 +159,11 @@ DB_SCHEMA = {
 
 
 def row_id(ask_id: str) -> str:
-    return "q-" + re.sub(r"[^A-Za-z0-9_-]", "-", ask_id)
+    """Injective: a key-safe id verbatim under `q-`, any other under `qh-` by its full sha256,
+    so two distinct ask ids never share a row."""
+    if ROW_SAFE_RE.match(ask_id):
+        return "q-" + ask_id
+    return "qh-" + hashlib.sha256(ask_id.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _page_text(text: str) -> str:
@@ -307,7 +314,7 @@ class RoomDbStore:
         return self._keys.get(ask_id) or f"{row_id(ask_id)}~{hashlib.sha256(self.host.encode()).hexdigest()[:12]}"
 
     def where(self, ask_id: str) -> str:
-        return f"{DB_SCHEMA['name']} database in {self.label}, row {row_id(ask_id)}"
+        return f"{DB_SCHEMA['name']} database in {self.label}, row {self._rid(ask_id)}"
 
     def insert_raw(self, ask_id: str, title: str, body: str, priority: str = "Medium") -> dict:
         cells = {"name": one_line_title(title), "status": _option_id("status", "Open"),
@@ -322,12 +329,15 @@ class RoomDbStore:
         return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
 
     def complete(self, ask_id: str) -> bool:
-        """The row is present with a body and no incomplete mark: the confirmation an
-        outbox entry is deleted on."""
+        """The row is present, carries this exact ask id (and this host), has a body and no
+        incomplete mark: the confirmation an outbox entry is deleted on."""
         r = self.client.row(DB_SCHEMA, self._rid(ask_id))
         if not r or not (r.get("body") or "").strip():
             return False
-        return _mark(r.get("cells") or {}, "recovery") != INCOMPLETE
+        cells = r.get("cells") or {}
+        if cells.get("ask_id") != ask_id or not self.owns(cells):
+            return False
+        return _mark(cells, "recovery") != INCOMPLETE
 
     def _locked(self, fn):
         if self.lock is None:
@@ -391,54 +401,25 @@ class RoomDbStore:
 
 # ---- the outbox -----------------------------------------------------------------
 
-OUTBOX_DIR = "pending-questions-outbox"
+class Outbox(HeldRecords):
+    """Core's held records, typed as Questions and replayed into a store."""
 
-
-class Outbox:
-    """One JSON file per ask under `<workspace>/state/pending-questions-outbox/`, holding the
-    Question and its delivery record. Written once, deleted once the row is confirmed."""
-
-    def __init__(self, workspace):
-        self.dir = status_path(OUTBOX_DIR, Path(workspace))
-
-    def path(self, ask_id: str) -> Path:
-        return self.dir / f"{ask_id}.json"
-
-    def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:
-        """Appear whole in one rename; a crash mid-write leaves nothing half-written."""
-        self.dir.mkdir(parents=True, exist_ok=True)
-        record = {"question": q.to_dict(), "sent": sent_line,
-                  "saved_at": _iso(datetime.now(timezone.utc).timestamp() if now is None else now)}
-        fd, tmp = tempfile.mkstemp(dir=str(self.dir), prefix=f".{q.ask_id}.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(record, fh, ensure_ascii=False, indent=1)
-            os.replace(tmp, self.path(q.ask_id))
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
-        return self.path(q.ask_id)
-
-    def delete(self, ask_id: str) -> None:
-        self.path(ask_id).unlink(missing_ok=True)
+    def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:  # type: ignore[override]
+        return super().save(q.to_dict(), sent_line, now)
 
     def entries(self) -> list:
-        """Every held (Question, sent line, saved_at), oldest first; an unreadable file is skipped
-        and named on stderr, never deleted."""
         out = []
-        for p in sorted(self.dir.glob("*.json")) if self.dir.is_dir() else []:
+        for e in super().entries():
             try:
-                d = json.loads(p.read_text(encoding="utf-8"))
-                out.append({"question": Question.from_dict(d["question"]), "sent": str(d.get("sent") or ""),
-                            "saved_at": str(d.get("saved_at") or ""), "path": p})
-            except (OSError, ValueError, KeyError, TypeError) as e:
-                import sys  # noqa: PLC0415
-                print(f"pending-questions outbox: {p.name} unreadable ({e}); left in place", file=sys.stderr)
+                out.append({**e, "question": Question.from_dict(e["question"])})
+            except (KeyError, TypeError, ValueError) as ex:
+                print(f"pending-questions outbox: {e['path'].name} unreadable ({ex}); left in place", file=sys.stderr)
         return out
 
     def flush(self, store) -> tuple:
         """Replay every held question into `store` through add_row (which resumes a row left
-        incomplete) and delete the file once the row is confirmed complete. (flushed ids, errors)."""
+        incomplete) and delete the entry once that exact ask id's row is confirmed complete.
+        (flushed ids, errors)."""
         flushed, errors = [], []
         for e in self.entries():
             q = e["question"]
@@ -452,22 +433,28 @@ class Outbox:
                 errors.append(f"{q.ask_id}: {type(ex).__name__}: {ex}")
         return flushed, errors
 
-
-def waiting_item(ask_id: str, title: str, body: str, asked_at: Optional[float], in_room: bool,
-                 priority: Optional[str] = None) -> dict:
-    """The one shape every reader lists: ask id, title, a one-line snippet, the body the
-    reminder reads its **Sent:** record from, when it was asked, and whether its row exists."""
-    lines = [ln.strip() for ln in (body or "").splitlines()
-             if ln.strip() and not ln.lstrip().startswith(("#", "**Sent:**"))]
-    return {"id": title[:40], "ask_id": ask_id, "title": title, "snippet": (lines[0] if lines else "")[:120],
-            "body": body or "", "asked_at": asked_at, "priority": priority, "in_room": in_room}
+    def replay_closes(self, store) -> tuple:
+        """Apply each local close record to its row; the record goes once the row is closed,
+        was already closed, or has no row and no held entry. (closed ids, errors)."""
+        closed, errors = [], []
+        held = {e["ask_id"] for e in self.entries()}
+        for ask_id, rec in self.closes().items():
+            try:
+                try:
+                    store.close(ask_id, rec["status"])
+                except GuardFailed as g:
+                    if not g.current and ask_id in held:
+                        raise StoreError("its held entry has no row yet") from None
+                self.delete_close(ask_id)
+                closed.append(ask_id)
+            except Exception as ex:  # noqa: BLE001
+                errors.append(f"close {ask_id}: {type(ex).__name__}: {ex}")
+        return closed, errors
 
 
 def outbox_items(workspace) -> list:
-    """Held questions as waiting items, each marked not yet in the room."""
-    return [waiting_item(e["question"].ask_id, one_line_title(e["question"].question),
-                         question_body(e["question"], e["sent"]), e["question"].asked_at or None, False,
-                         e["question"].priority) for e in Outbox(workspace).entries()]
+    """Held questions still open, as waiting items not yet in the room (core's rendering)."""
+    return held_items(workspace)
 
 
 # ---- policy ---------------------------------------------------------------------
@@ -497,9 +484,13 @@ def write_question(q: Question, store, sent_line: str) -> WriteOutcome:
 
 
 def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
-    """Every pass's first step with a reachable store: replay the outbox, clear stale marks on
-    this host's rows, then the transitional ingest of the legacy file (its single call site)."""
-    flushed, errors = Outbox(workspace).flush(store)
+    """The explicit pass with a reachable store: replay the outbox, apply local closes, clear
+    stale marks on this host's rows, then the transitional ingest of the legacy file (its
+    single call site)."""
+    ob = Outbox(workspace)
+    flushed, errors = ob.flush(store)
+    closed, close_errors = ob.replay_closes(store)
+    errors += close_errors
     try:
         for r in store.entries():
             if r["stale"]:
@@ -508,49 +499,4 @@ def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
         errors.append(f"stale marks: {type(e).__name__}: {e}")
     import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
     moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
-    return {"flushed": flushed, "moved": moved, "errors": errors + ingest_errors}
-
-
-# ---- adapter discovery ------------------------------------------------------------
-
-# The manifest field an installed skill declares its adapter script with.
-DECLARATION = "pending_questions_store"
-
-
-def declared_adapter(skills_dir) -> Optional[Path]:
-    """The adapter the first installed skill declares in its manifest; None when none does.
-    The script must resolve inside its own skill, since a manifest may come from a third party."""
-    for manifest in sorted(Path(skills_dir).glob("*/manifest.json")):
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        rel = data.get(DECLARATION) if isinstance(data, dict) else None
-        if not isinstance(rel, str) or not rel or data.get("enabled") is False:
-            continue
-        skill = manifest.parent.resolve()
-        script = (skill / rel).resolve()
-        if script.is_relative_to(skill) and script.is_file():
-            return script
-    return None
-
-
-def load_adapter(adapter):
-    """The adapter module from its file; None when there is none or it does not load."""
-    if not adapter:
-        return None
-    import importlib.util  # noqa: PLC0415
-    spec = importlib.util.spec_from_file_location("pq_store_adapter", str(adapter))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def load_adapter_store(adapter, workspace) -> tuple:
-    """(store | None, why) from an adapter file's `room_store(workspace)`; never raises."""
-    if not adapter:
-        return None, "no pending-questions store adapter installed"
-    try:
-        return load_adapter(adapter).room_store(Path(workspace))
-    except Exception as e:  # noqa: BLE001 — the outbox alone still holds every question
-        return None, f"adapter {adapter} failed to load ({type(e).__name__}: {e})"
+    return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}

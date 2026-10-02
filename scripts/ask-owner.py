@@ -10,11 +10,12 @@ Usage:
 
 With --task-file the question goes to that task's own conversation; without it,
 to the owner's DM on the bridge he was last active on. Always exits 0 after a
-non-empty question: every failure is printed, never raised. The question is a row
-of the "Pending questions" database in the owner's room when a store adapter
-(--store-adapter, else the one an installed skill declares) reaches it; until then
-it is held in the workspace outbox, which the next pass files, and that is said
-loudly on stderr.
+non-empty question: every failure is printed, never raised. The ask itself belongs
+to the store adapter an installed skill declares (--store-adapter overrides the
+discovery): it records the question as a row of the owner's room database, holding
+it in the workspace outbox while the room is unreachable. With no adapter this
+entry does only core's part — one outbox record and the queued proactive message —
+and says so.
 """
 import argparse
 import sys
@@ -22,8 +23,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_ask import ask_owner, report_lines  # noqa: E402
-from pending_questions_store import declared_adapter, load_adapter_store  # noqa: E402
+import pending_questions_ask as core_ask
+import pending_questions_reader as reader
 
 
 def _option(text: str):
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
                     help="'Label=what it does', repeatable; Approve is always listed first")
     ap.add_argument("--priority", choices=("High", "Medium", "Low"), default="Medium")
     ap.add_argument("--store-adapter", default=None,
-                    help="a room-database adapter file; default: the one an installed skill declares")
+                    help="a store adapter file; default: the one an installed skill declares")
     ap.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if not args.question.strip():
@@ -59,17 +60,26 @@ def main(argv=None) -> int:
     else:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         ws = resolve_workspace(migrate=False)
-    store, where = load_adapter_store(args.store_adapter or declared_adapter(REPO / "skills"), ws)
-    out = ask_owner(args.question, context=args.context, urgency=args.urgency,
-                    task_file=args.task_file, workspace=ws, store=store,
-                    default_action=args.default, reason=args.reason, options=args.option,
-                    priority=args.priority)
-    if store is None:
-        print(f"room database: not used ({where}); the question is held in the outbox")
+    kw = dict(context=args.context, urgency=args.urgency, task_file=args.task_file, workspace=ws,
+              default_action=args.default, reason=args.reason, options=args.option, priority=args.priority)
+    mod, why = reader._adapter(args.store_adapter)
+    if mod is not None and hasattr(mod, "ask_owner"):
+        store, where = mod.room_store(ws)
+        if store is None:
+            print(f"room database: not used ({where}); the question is held in the outbox")
+        out = mod.ask_owner(args.question, store=store, **kw)
+        lines = mod.report_lines(out)
+    else:
+        print(f"room database: not used ({why}); the question is held in the outbox")
+        out = core_ask.ask_owner(args.question, **kw)
+        lines = core_ask.report_lines(out)
     if out.get("outbox"):
         print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is held in "
-              f"{out['outbox']} until the next pass", file=sys.stderr)
-    print("\n".join(report_lines(out)))
+              f"{out['outbox']} until the next reconcile", file=sys.stderr)
+    elif out.get("record") is None:
+        print(f"ask-owner: NOT RECORDED ({out.get('db_error')}); the owner is asked but nothing holds the "
+              "question — ask by hand if he does not answer", file=sys.stderr)
+    print("\n".join(lines))
     return 0
 
 

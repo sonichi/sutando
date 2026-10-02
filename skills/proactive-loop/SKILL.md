@@ -62,8 +62,9 @@ caps this file and refuses date stamps in it).
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** `python3 skills/pending-questions/scripts/pq.py list`; surface via `results/question-<ts>.txt`
-   when voice is connected, plus a macOS notification.
+2. **Questions.** Nothing is surfaced on a pass: a question reaches the owner once, when it is asked
+   (`pq.py ask`), and `pq.py remind` only when he asks. Run `pq.py list` only when he asks what is
+   waiting or when you are blocked on an answer; `pq.py reconcile` files anything the outbox holds.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pq.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another

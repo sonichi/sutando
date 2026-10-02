@@ -449,13 +449,24 @@ def _question_row(item: dict) -> dict:
     }
 
 
-def _pending_question_rows(recheck: bool = False) -> list[dict]:
+def _pending_gather() -> dict:
+    """The reader's gather; `unavailable` is carried to the payload so a client never
+    renders an unreachable room as an empty queue."""
+    return pending_questions_reader.gather(WORKSPACE_DIR)
+
+
+def _questions_unavailable(g: dict) -> Optional[str]:
+    return (g["reason"] or "room unreachable") if g["unavailable"] else None
+
+
+def _pending_question_rows(recheck: bool = False, gathered: Optional[dict] = None) -> list[dict]:
     """Open questions, dismissed ones removed, ordered for the triage queue.
 
     `recheck` probes the referenced PRs first, so a question whose blocker has since
     merged is labelled at the moment it is shown rather than carried for weeks.
     """
-    rows = [_question_row(item) for item in pending_questions_reader.waiting(WORKSPACE_DIR)]
+    g = _pending_gather() if gathered is None else gathered
+    rows = [_question_row(item) for item in g["waiting"]]
     rows = pq_triage.without_dismissed(
         rows, pq_triage.load_dismissed(_dismissed_questions_path())
     )
@@ -476,7 +487,8 @@ def _pending_question_rows(recheck: bool = False) -> list[dict]:
 
 def _questions_queue_payload() -> dict:
     """Triage queue, re-checked live at the moment it is asked for."""
-    return {"questions": _pending_question_rows(recheck=True)}
+    g = _pending_gather()
+    return {"questions": _pending_question_rows(recheck=True, gathered=g), "questions_unavailable": _questions_unavailable(g)}
 
 
 def dismiss_question(qid: str) -> tuple:
@@ -489,11 +501,13 @@ def dismiss_question(qid: str) -> tuple:
 
 def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
+    g = _pending_gather()
     return {
         "tasks": _active_task_rows(),
         "watcher": watcher_ok,
         "claude": core_ok,
-        "questions": _pending_question_rows(),
+        "questions": _pending_question_rows(gathered=g),
+        "questions_unavailable": _questions_unavailable(g),
     }
 
 
@@ -1335,12 +1349,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not qid or not answer:
                     self.send_json(400, {"error": "id and answer required"})
                     return
-                closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered")
-                if not closed:
-                    self.send_json(404, {"error": f"question {qid} not found or already answered: {why}"})
-                    return
+                # The owner's typed answer is kept whatever the store says: the task file first,
+                # then the close — a store that cannot be reached records the close locally.
                 ts = int(datetime.now().timestamp() * 1000)
                 safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
+                closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered")
+                if not closed and not why.startswith("UNRECORDED"):
+                    self.send_json(404, {"error": f"question {qid} not found or already answered: {why}"})
+                    return
                 if safe_qid:
                     # realpath + startswith: the CodeQL-recognised path-injection
                     # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
@@ -1350,6 +1366,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     )
                     if task_file_str.startswith(task_dir_real + os.sep):
                         Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
+                if not closed:
+                    self.send_json(503, {"error": f"answer kept as a task; the question could not be closed: {why}",
+                                         "id": qid, "recorded": bool(safe_qid)})
+                    return
                 self.send_json(200, {"ok": True, "id": qid, "answer": answer})
             except Exception as e:
                 self.send_json(400, {"error": str(e)})

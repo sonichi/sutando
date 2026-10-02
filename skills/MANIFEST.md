@@ -137,11 +137,16 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 ## Pending-questions store adapter (`pending_questions_store`)
 
 `"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
-pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count` read
-it (after replaying the local outbox) and `resolve` closes a row. Core reaches it only through
-`src/pending_questions_reader.py` (`pending_questions_store.declared_adapter` scans manifests; the
-script must resolve inside its skill) and names no skill. With none declared, `ask` holds questions
-in `<workspace>/state/pending-questions-outbox/` and readers list that outbox alone, saying why.
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
+read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
+`reconcile` replays the local outbox and close records, `resolve` closes a row, `ask_owner` records
+a question and `remind` runs the reminder. Core reaches it only through
+`src/pending_questions_reader.py`, which scans manifests for that FIELD alone (the script must
+resolve inside its skill), names no skill, and refuses when more than one installed skill declares
+it. With none declared, core's own part still works: `scripts/ask-owner.py` writes one outbox
+record under `<workspace>/state/pending-questions-outbox/` (`src/pending_questions_outbox.py`, the
+one writer of that record) and queues the proactive message; readers list that outbox, saying why;
+a close is recorded beside it for the next reconcile with a store.
 
 ## Currently active manifest skills
 

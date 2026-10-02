@@ -202,7 +202,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Check pending questions.** `python3 skills/pending-questions/scripts/pq.py list` (the room database after this pass's outbox replay). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`pq.py ask`), and reminded only on demand (`pq.py remind`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 skills/pending-questions/scripts/pq.py reconcile` so anything the outbox holds is filed, and `pq.py list` only when the owner asks what is waiting or the pass is blocked on an answer.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -572,7 +572,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification; write to `results/question-{ts}.txt` too if voice is connected. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `pq.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `pq.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 

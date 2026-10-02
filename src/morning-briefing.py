@@ -18,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.request import urlopen
 from urllib.error import URLError
 
@@ -596,20 +597,6 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
 import pending_questions_reader  # noqa: E402
 
 
-def _load_notifier():
-    """check-pending-questions.py as a module, for VISIBLE_PREFIX only (its main() is guarded)."""
-    import importlib.util
-
-    src = _SRC_DIR / "check-pending-questions.py"
-    spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_CPQ = _load_notifier()
-
-
 #: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
 #: DM'd, so a title clipped mid-word is read aloud as a mid-word fragment. A hard
 #: `title[:60]` produced, from a real 2026-08-02 run:
@@ -676,41 +663,40 @@ def clip_for_speech(text: str, limit: int) -> str:
     return head + "\u2026"
 
 
-def get_pending_questions() -> list[str]:
-    """Waiting questions as speakable titles, from the one pending-questions reader.
-
-    Nothing here judges waiting-ness. The reader's notes (no adapter, room
-    unreachable) go to stderr so a degraded read is never a silent "none".
+def get_pending_questions() -> dict:
+    """{"count": n | None, "link": str | None, "unavailable": bool, "reason": str | None} from
+    the one pending-questions reader. The briefing speaks a COUNT and where to open it, never
+    the questions themselves: they are sent as they come up, not re-delivered on a schedule.
+    An unreadable room is `count` None — said as unknown, never as none.
     """
     g = pending_questions_reader.gather(WORKSPACE)
     for note in g["notes"]:
         print(f"  pending questions: {note}", file=sys.stderr)
-    out: list[str] = []
-    for q in g["waiting"]:
-        title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
-        title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
-        if not title:
-            continue
-        out.append(clip_for_speech(title, 60))
-    return out
+    return {"count": None if g["unavailable"] else len(g["waiting"]), "link": g.get("link"),
+            "unavailable": g["unavailable"], "reason": g["reason"]}
 
 
-def below_fold_count(total: int) -> int:
-    """How many waiting questions render on no surface the owner reads.
+def pending_summary(pending) -> str:
+    """The count for the log line: a number, or "unknown (room unreachable)"."""
+    if not isinstance(pending, dict):
+        return str(len(pending or []))
+    return "unknown (room unreachable)" if pending.get("count") is None else str(pending["count"])
 
-    The notifier sends `questions[:VISIBLE_PREFIX]`, so waiting order IS
-    priority order and everything past it counts as open while reaching
-    nobody. Returns 0 when the prefix cannot be read — an unknown cutoff
-    must not be guessed into a number the briefing then states as fact.
-    """
-    prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
-    if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
-        # Say so: without this, an unreadable prefix and a genuinely unhidden
-        # list both render as no line, which is the silent no-op this fixes.
-        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
-              file=sys.stderr)
-        return 0
-    return max(0, total - prefix)
+
+def pending_line(pending) -> Optional[str]:
+    """The spoken/DM'd sentence for the count, or None when there is nothing to say."""
+    if not pending:
+        return None
+    if not isinstance(pending, dict):  # a bare list of titles: only its length is said
+        pending = {"count": len(pending)}
+    if pending.get("unavailable") or pending.get("count") is None:
+        return f"Pending questions: unknown — the room was unreachable ({pending.get('reason') or 'no count'})."
+    n = pending["count"]
+    if not n:
+        return None
+    where = f" Open it: {pending['link']}." if pending.get("link") else ""
+    noun = "One pending question is" if n == 1 else f"{n} pending questions are"
+    return f"{noun} waiting in your Pending questions database.{where}"
 
 
 def get_health_issues() -> "list[str] | None":
@@ -805,17 +791,10 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     elif reminders is None and REMINDERS_UNREAD_NOTE:
         parts.append(REMINDERS_UNREAD_NOTE)
 
-    # Pending questions
-    if pending_qs:
-        if len(pending_qs) == 1:
-            parts.append(f"One pending question waiting: {pending_qs[0]}.")
-        else:
-            # "Top item" asserted a ranking this code does not perform: the reader
-            # yields FILE order, so index 0 is first-listed, not most important.
-            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
-        hidden = below_fold_count(len(pending_qs))
-        if hidden:
-            parts.append(f"{hidden} of them render below the fold.")
+    # Pending questions: the count and where they live, never the questions
+    pq_line = pending_line(pending_qs)
+    if pq_line:
+        parts.append(pq_line)
 
     # Overnight Discord
     if discord_msgs:
@@ -841,7 +820,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     # returning [] at the time) produced a confident "Everything looks clean"
     # over two questions nobody had answered.
     if (events == [] and reminders == [] and health_issues == []
-            and not pending_qs):
+            and not pq_line):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -891,7 +870,7 @@ def main():
 
 
     pending_qs = get_pending_questions()
-    print(f"  pending questions: {len(pending_qs)}")
+    print(f"  pending questions: {pending_summary(pending_qs)}")
 
     health_issues = get_health_issues()
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")

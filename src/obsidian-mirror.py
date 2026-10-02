@@ -169,8 +169,13 @@ def _write_result_mirror(vault: Path, result_path: Path) -> bool:
 
 
 def _mirror_asks(vault: Path, workspace: Path) -> bool:
-    """Agent/Asks.md rendered from the one pending-questions reader; written only when changed."""
-    items = pending_questions_reader.waiting(workspace)
+    """Agent/Asks.md rendered from the one pending-questions reader; written only when changed,
+    and never from a partial read — an unreadable room leaves the mirror as it is."""
+    g = pending_questions_reader.gather(workspace)
+    if g["unavailable"]:
+        print(f"obsidian-mirror: Asks.md left as is — room unreachable ({g['reason']})", file=sys.stderr)
+        return False
+    items = g["waiting"]
     dest = vault / "Sutando" / "Agent" / "Asks.md"
     if not items and not dest.exists():
         return False

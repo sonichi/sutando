@@ -20,50 +20,76 @@ python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why
     [--default-action "<what Approve does>" --reason "<why>"] [--option "Hold=wait"] \
     [--priority High|Medium|Low]
 python3 skills/pending-questions/scripts/pq.py list [--json]
+python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 ```
 
-- `ask` queues the question to the owner (the task's conversation only for an owner-tier
-  task in his DM; otherwise his DM), saves it to the outbox, writes the row born with its
-  `**Sent:**` record, and deletes the outbox file once the row is confirmed complete. Read
-  its output: a `FAILED` line is not an ask. Then continue; never block.
-- `list` runs the pass (below) and prints every open row of this host, each with its ask id,
-  plus any held question once, marked `(not yet in the room)`.
-- `resolve` closes a row as Resolved (or Answered with `--answered`). It never reopens a closed row.
-- `remind` runs `src/check-pending-questions.py --notify` with this skill's adapter: the
-  only way a reminder is sent. Nothing is scheduled; the owner is asked as questions come up.
+- `ask` reconciles, queues the question to the owner (the task's conversation only for an
+  owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
+  with its `**Sent:**` record, and deletes the outbox file once that exact row is confirmed
+  complete. If the outbox cannot hold the question, NO row is written: the owner is still
+  asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
+  ask. Then continue; never block.
+- `list` is READ-ONLY: this host's open rows plus any held question once, marked
+  `(not yet in the room)`. When the room cannot be read it prints
+  `pending questions: UNKNOWN — room unreachable (…)` and only what is held locally; it
+  never prints a zero it did not measure.
+- `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
+  transitional legacy ingest. `ask` and `remind` run it; `list` does not.
+- `resolve` closes a row as Resolved (or Answered with `--answered`). It never reopens a
+  closed row. When the room cannot be written, the closure is recorded locally
+  (`<outbox>/closed/<ask_id>.json`) and applied by the next `reconcile`.
+- `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
+  with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
+  owner is asked once, as questions come up, and reminded when he asks.
 
 ## The outbox
 
 `<workspace>/state/pending-questions-outbox/<ask_id>.json` holds a question while the room
 is unreachable: one file per ask, written atomically before the room write, never edited,
-deleted only when the complete row is confirmed. Every pass — `pq.py list`, `pq.py remind`,
-`src/check-pending-questions.py`, the next `ask` — replays it through the normal add_row
-path (which resumes a row left incomplete), so a replay is idempotent by ask id. Without
-the room-collab capability or an owner room, every ask stays in the outbox and `list`
-says why.
+deleted only when the complete row carrying that exact ask id is confirmed. Its record and
+path safety are core's (`src/pending_questions_outbox.py`: an ask id outside
+`[A-Za-z0-9][A-Za-z0-9._-]{0,119}` is refused before any path is built, a file whose stem
+does not match its inner id is skipped, and deletion stays inside the directory), so a
+checkout without this skill still asks and lists through it. `reconcile` replays each entry
+through the normal add_row path (which resumes a row left incomplete), so a replay is
+idempotent by ask id. Without a room capability or an owner room, every ask stays in the
+outbox and `list` says why.
 
 ## Who reads it
 
 This skill's adapter, `scripts/pending_questions_room_db.py`, is the single reader and
-writer (`room_store`, `gather`, `waiting`, `count`, `resolve`); the manifest's
-`pending_questions_store` field declares it (`skills/MANIFEST.md`). Core — the dashboard,
-the morning briefing, agent-api, friction-detector, session-handoff, the reminder — reaches
-it only through `src/pending_questions_reader.py`, by path, and reads no file.
+writer (`room_store`, `gather`, `waiting`, `count`, `reconcile`, `resolve`, `ask_owner`,
+`remind`); the manifest's `pending_questions_store` field declares it (`skills/MANIFEST.md`),
+and the store, the outbox replay and the legacy ingest are this skill's
+(`scripts/pending_questions_store.py`, `scripts/pending_questions_compat.py`,
+`scripts/pending_questions_remind.py`). Core — the dashboard, the morning briefing,
+agent-api, friction-detector, session-handoff, obsidian-mirror, the reminder entry — reaches
+it only through `src/pending_questions_reader.py`, by that field, and reads no file. Every
+one of them shows "unknown" while the room cannot be read; the briefing says only the
+count and where to open it.
+
+## The room capability
+
+The adapter looks for the room capability's scripts (`room_collab_client.py`,
+`room_collab.py`) in the `room-commons` skill first, then its `room-collab` alias, under
+`<workspace>/skills/` then `<repo>/skills/`. Nothing else in the repo depends on either.
 
 ## Migration from the per-host file
 
 - **Existing `<workspace>/hosts/<host>/pending-questions.md` files** are read-only history.
-  The one transitional reader, `src/pending_questions_compat.ingest_legacy_file_entries`
-  (called from every pass), copies each open entry carrying an `**Ask id:**` line into this
-  host's row once and marks the entry `**Status:** moved — as row q-…` in place; entries
-  without an ask id are history and are not surfaced.
-- **Rolling upgrade.** While an old head still writes the file, the new head's next pass
-  ingests those entries; nothing is lost in the window. The ingest is removed under
-  `docs/migration-transition-window.md`: ~30 days of zero source-side writes, checked with
-  `python3 src/pending_questions_compat.py report` (the last mutation of each host's legacy
-  file; the clock starts at the newest).
+  The one transitional reader, `scripts/pending_questions_compat.ingest_legacy_file_entries`
+  (called from `reconcile`), copies each open entry into this host's row once — an entry
+  with an `**Ask id:**` line and a settled `**Sent:**` record (#5003 and this branch's
+  earlier heads), a `## ` section without one (main's prose) keyed by a digest of its text,
+  or main's `- **[label, ts]** …` bullet — and marks it `**Status:** moved — as row q-…` in
+  place ONLY after the row is confirmed complete.
+- **Rolling upgrade.** While an old head still writes the file, the new head's next
+  `reconcile` ingests those entries; nothing is lost in the window. The ingest is removed
+  under `docs/migration-transition-window.md`: ~30 days of zero source-side writes, checked
+  with `python3 skills/pending-questions/scripts/pending_questions_compat.py report` (the
+  last mutation of each host's legacy file; the clock starts at the newest).
 - **Persisted schedules.** The `pending-questions` entry is gone from
   `skills/schedule-crons/crons.example.json`. An old `crons.json` entry that still runs
   `python3 src/check-pending-questions.py` (with no flag or the retired `--reconcile-only`)
@@ -72,5 +98,5 @@ it only through `src/pending_questions_reader.py`, by path, and reads no file.
 ## Testing against an unreachable room
 
 `PENDING_QUESTIONS_COLLAB_URL=<url>` points the adapter's collab service at that URL for a
-run, so an outage can be rehearsed: `ask` leaves the question in the outbox, and a later
-`list` with the variable unset files it.
+run, so an outage can be rehearsed: `ask` leaves the question in the outbox, `list` says
+UNKNOWN, and a later `reconcile` with the variable unset files it.

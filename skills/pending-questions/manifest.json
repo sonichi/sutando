@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Ask the owner, list what waits on him, resolve and remind; declares the room-database adapter for owner pending questions.",
+  "description": "Ask the owner, list what waits on him, resolve and remind; the store of owner pending questions (room database, outbox replay, legacy ingest, reminder) and the adapter core reaches it through.",
   "pending_questions_store": "scripts/pending_questions_room_db.py",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
