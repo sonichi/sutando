@@ -25,7 +25,6 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Protocol
 
@@ -47,7 +46,6 @@ APPROVE = "Approve"
 # Bold field tokens the readers of a body act on, wherever they occur.
 LEDGER_FIELD_RE = re.compile(
     r"\*\*(?=(?:Status|Options|Asked|Question|Sent|Ask id):\*\*)", re.IGNORECASE)
-SENT_LINE_RE = re.compile(r"^\*\*Sent:\*\*.*$", re.MULTILINE)
 # An ask id a row key may carry verbatim; anything else is keyed by its full digest.
 ROW_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 
@@ -72,10 +70,6 @@ def safe_body(text: str) -> str:
     """Text as a row body may hold it: newlines and tabs kept, every other control character and
     lone surrogate replaced with U+FFFD. Nothing else changes, so custom content survives."""
     return _BODY_UNSAFE.sub("�", text)
-
-
-def _iso(now: float) -> str:
-    return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def neutralize(text: str) -> str:
@@ -108,10 +102,6 @@ class Question:
     options: tuple = ()
     priority: str = "Medium"
 
-    @property
-    def proposes(self) -> bool:
-        return bool((self.default_action or "").strip() or self.options)
-
     def to_dict(self) -> dict:
         return {**asdict(self), "options": [list(o) for o in self.options]}
 
@@ -120,10 +110,6 @@ class Question:
         return cls(str(d["ask_id"]), str(d["question"]), d.get("context"), float(d.get("asked_at") or 0),
                    d.get("default_action"), d.get("reason"),
                    tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium")
-
-
-def entry_heading(question: str, now: float) -> str:
-    return f"## {_iso(now)} — {one_line_title(question)}"
 
 
 # ---- the room database ---------------------------------------------------------
@@ -190,11 +176,6 @@ def question_body(q: Question, sent_line: str) -> str:
     if q.context and q.context.strip():
         request += "\n\n" + q.context.strip()
     return row_body(request, q.default_action, q.reason, q.options, sent_line)
-
-
-def sent_line_of(body: str) -> Optional[str]:
-    m = SENT_LINE_RE.search(body or "")
-    return m.group(0) if m else None
 
 
 class DbClient(Protocol):
