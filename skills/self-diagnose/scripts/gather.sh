@@ -135,9 +135,9 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 _bl="${WS}/build_log.md"; [ -f "$_bl" ] || _bl="${REPO}/build_log.md"
 tail -150 "$_bl" > "$OUT/build_log-tail.md" 2>/dev/null || true
-# Pending questions come from the skill's reader (room database + outbox); the
-# retired per-host file is not read. A failure lands in .err, never aborts the gather.
-python3 "$REPO/skills/pending-questions/scripts/pq.py" list --json \
+# Pending questions come from core's reader over the declared store (room database +
+# outbox); the retired per-host file is not read. A failure lands in .err, never aborts.
+python3 "$REPO/src/pending_questions_reader.py" list --json \
 	> "$OUT/pending-questions.json" 2> "$OUT/pending-questions.err" || true
 cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 

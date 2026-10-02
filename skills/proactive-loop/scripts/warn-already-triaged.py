@@ -23,11 +23,12 @@ import re
 import subprocess
 import sys
 
-PQ_CLI = pathlib.Path(__file__).resolve().parents[2] / "pending-questions" / "scripts" / "pq.py"
+# Core's read-only entry over the store an installed skill declares; this skill names no other skill.
+PQ_CLI = pathlib.Path(__file__).resolve().parents[3] / "src" / "pending_questions_reader.py"
 
 
 class _LiveSource:
-    """Not a file: the owner's live pending questions, read once via pq.py list --json."""
+    """Not a file: the owner's live pending questions, read once via the core reader's list --json."""
     name = "pending-questions"
     parent = pathlib.PurePath("live")
 
