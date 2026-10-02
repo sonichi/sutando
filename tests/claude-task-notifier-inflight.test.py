@@ -73,6 +73,8 @@ class RePickTests(FakeTmuxHarness):
         self.write_task("task-im.txt")
         self.swallow_enter_flag.write_text("1")
         self.owner_types_after_enter_flag.write_text("1")
+        # The exit's own read fails, so submission stays open and the marker survives to the repicks.
+        self.fail_capture_skip_after_enter_flag.write_text("1")
         self.run_event("task-im.txt", timeout=30)
         self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1)
         self.assertTrue((self.inflight_dir / "task-im.txt").exists(), "precondition: the marker was recorded")
@@ -95,6 +97,7 @@ class RePickTests(FakeTmuxHarness):
         self.write_task("task-fc.txt")
         self.swallow_enter_flag.write_text("1")
         self.owner_types_after_enter_flag.write_text("1")
+        self.fail_capture_skip_after_enter_flag.write_text("1")
         self.run_event("task-fc.txt", timeout=30)
         marker = self.inflight_dir / "task-fc.txt"
         self.assertTrue(marker.exists(), "precondition: the marker was recorded")
@@ -128,6 +131,64 @@ class RePickTests(FakeTmuxHarness):
         self.addCleanup(self.inflight_dir.chmod, 0o755)
         res = self.run_event("task-fr.txt", timeout=10)
         self.assertIn("could not retire the in-flight marker for task-fr.txt", res.stderr)
+
+    def _exit_on_a_mixed_read(self, name, env=None):
+        # Enter swallowed, then the owner types into our staged prompt.
+        self.write_task(name)
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        return self.run_event(name, env_extra=env, timeout=30)
+
+    def _owner_clears_then_the_next_pick_delivers(self, name):
+        self.swallow_enter_flag.unlink(missing_ok=True)
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        enters = self.sendkeys_log_text().count("ENTER")
+        t = self._finish_on(name, lambda log: log.count("ENTER") > enters)
+        try:
+            self.run_event(name, env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("the pick after the owner cleared the composer waited on a stale marker")
+        finally:
+            t.join(timeout=5)
+        self.assertEqual(self.sendkeys_log_text().count(f"TYPE Sutando task ready: {name}"), 2)
+
+    def test_a_mixed_read_at_the_changed_exit_retires_the_marker_and_counts_at_once(self):
+        res = self._exit_on_a_mixed_read("task-mc.txt")
+        self.assertIn("composer changed since task-mc.txt staged", res.stderr)
+        self.assertFalse((self.inflight_dir / "task-mc.txt").exists(), "a mixed read proves the Enter never landed")
+        self.assertEqual(self._block_path().read_text().split()[0], "1", "the block counts at this exit, not a pick later")
+        self._owner_clears_then_the_next_pick_delivers("task-mc.txt")
+
+    def test_a_mixed_read_at_the_unconfirmed_exit_retires_the_marker_and_counts_at_once(self):
+        res = self._exit_on_a_mixed_read("task-mu.txt", {"SUTANDO_NOTIFIER_SUBMIT_RETRIES": "1"})
+        self.assertIn("submit NOT confirmed for task-mu.txt", res.stderr)
+        self.assertFalse((self.inflight_dir / "task-mu.txt").exists(), "a mixed read proves the Enter never landed")
+        self.assertEqual(self._block_path().read_text().split()[0], "1", "the block counts at this exit, not a pick later")
+        self._owner_clears_then_the_next_pick_delivers("task-mu.txt")
+
+    def _assert_submission_left_open(self, name):
+        self.assertTrue((self.inflight_dir / name).exists(), "an unknown read must keep the at-most-once marker")
+        self.assertFalse(self._block_path().exists(), "an unknown read is not counted as a block")
+
+    def test_a_failed_read_at_the_unconfirmed_exit_keeps_the_marker(self):
+        self.fail_capture_after_enter_flag.write_text("")
+        res = self._exit_on_a_mixed_read("task-fu.txt", {"SUTANDO_NOTIFIER_SUBMIT_RETRIES": "1"})
+        self.assertIn("submit NOT confirmed for task-fu.txt after 1 attempts", res.stderr)
+        self._assert_submission_left_open("task-fu.txt")
+
+    def test_a_failed_read_at_the_changed_exit_keeps_the_marker(self):
+        self.fail_capture_skip_after_enter_flag.write_text("1")
+        res = self._exit_on_a_mixed_read("task-fx.txt")
+        self.assertIn("composer changed since task-fx.txt staged", res.stderr)
+        self._assert_submission_left_open("task-fx.txt")
+
+    def test_part_of_the_prompt_at_the_changed_exit_keeps_the_marker(self):
+        prompt = self.expected_prompt("task-px.txt")
+        self.pane_after_enter_flag.write_text(
+            "1\n❯ owner text " + prompt[: len(prompt) // 2] + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        res = self._exit_on_a_mixed_read("task-px.txt")
+        self.assertIn("composer changed since task-px.txt staged", res.stderr)
+        self._assert_submission_left_open("task-px.txt")
 
     def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
         # First pass types and submits; no result ever appears. The re-pick after

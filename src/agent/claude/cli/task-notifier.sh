@@ -513,6 +513,16 @@ core_incarnation() {
   pane_history_field pane_pid
 }
 
+# Our whole prompt among other text proves its Enter never landed: retire the marker and
+# count the block. Any other read (failed, exact, partial, gone) leaves submission open.
+retire_mixed_prompt() {
+  local cap="$1" filename="$2" prompt="$3" incarnation="$4"
+  composer_holds_prompt "$cap" "$prompt" && ! prompt_is_staged "$cap" "$prompt" || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" \
+    || log_notifier "could not retire the in-flight marker for $filename; a later pick may wait on it (core may need attention)"
+  note_composer_block "$filename" "$incarnation"
+}
+
 # Marker first, then C-m, then confirm the prompt LEFT the composer (submitted, or
 # queued behind a running turn); re-press while it is still exactly ours. The marker
 # precedes the Enter so no crash window exists in which the prompt was submitted
@@ -526,7 +536,7 @@ press_enter_and_confirm() {
   fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
-    waited=0
+    waited=0 cap=""
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
       # Confirmed when the prompt has LEFT the composer: submitted, or queued
       # behind a running turn. A busy footer proves nothing about our line.
@@ -546,13 +556,20 @@ press_enter_and_confirm() {
     done
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SUBMIT_RETRIES" ]; then
+      if retire_mixed_prompt "$cap" "$filename" "$prompt" "$incarnation"; then
+        log_notifier "submit NOT confirmed for $filename: its prompt is mixed with other text, so the Enter never landed; marker retired (core may need attention)"
+        return 1
+      fi
       log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged, the next pick resumes it (core may need attention)"
       return 1
     fi
     # Re-press only while the composer is STILL exactly our prompt -- with
     # owner text mixed in, this Enter would not be ours.
-    if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+    cap="$(capture_raw)" || cap=""
+    if ! prompt_is_staged "$cap" "$prompt"; then
       log_notifier "composer changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
+      retire_mixed_prompt "$cap" "$filename" "$prompt" "$incarnation" \
+        && log_notifier "its prompt is mixed with other text, so the Enter never landed; marker retired for $filename"
       return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
@@ -706,11 +723,8 @@ submit_task_grown() {
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
-    # Precedes the marker: our prompt still in the composer means its Enter never landed.
-    "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" \
-      || log_notifier "could not retire the in-flight marker for $filename; a later pick may wait on it (core may need attention)"
-    # Owner text and an unparsed row read alike here; neither delivers, so both count.
-    note_composer_block "$filename" "$incarnation"
+    # Precedes the marker. Owner text and an unparsed row read alike here; neither delivers, so both count.
+    retire_mixed_prompt "$raw" "$filename" "$prompt" "$incarnation" || true
     return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"

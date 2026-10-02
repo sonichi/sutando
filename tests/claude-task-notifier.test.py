@@ -139,6 +139,12 @@ class FakeTmuxHarness(unittest.TestCase):
         # after-Enter variant arms it at the moment C-m lands.
         self.fail_next_capture_flag = self.root / "fail-next-capture.flag"
         self.fail_capture_after_enter_flag = self.root / "fail-capture-after-enter.flag"
+        # Holds k: after the next ENTER, k captures succeed and then one fails.
+        self.fail_capture_skip_after_enter_flag = self.root / "fail-capture-skip-after-enter.flag"
+        self.fail_capture_after_k = self.root / "fail-capture-after-k.txt"
+        # Holds "k\n<pane>": after the next ENTER, k captures later the pane becomes <pane>.
+        self.pane_after_enter_flag = self.root / "pane-after-enter.flag"
+        self.pane_pending = self.root / "pane-pending.txt"
 
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
@@ -259,6 +265,19 @@ case "$cmd" in
     [ -f "{self.pane_gone_flag}" ] && exit 1
     n=$(( $(cat "{self.capture_count}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{self.capture_count}"
     if [ -f "{self.fail_next_capture_flag}" ]; then rm -f "{self.fail_next_capture_flag}"; exit 1; fi
+    if [ -f "{self.fail_capture_after_k}" ]; then
+      k="$(cat "{self.fail_capture_after_k}")"
+      if [ "$k" -gt 0 ]; then echo $((k - 1)) > "{self.fail_capture_after_k}"
+      else rm -f "{self.fail_capture_after_k}"; exit 1; fi
+    fi
+    if [ -f "{self.pane_pending}" ]; then
+      k="$(head -n 1 "{self.pane_pending}")"
+      if [ "$k" -gt 0 ]; then
+        {{ echo $((k - 1)); tail -n +2 "{self.pane_pending}"; }} > "{self.pane_pending}.new"; mv -f "{self.pane_pending}.new" "{self.pane_pending}"
+      else
+        tail -n +2 "{self.pane_pending}" > "$PANE"; rm -f "{self.pane_pending}"
+      fi
+    fi
     # Consumed once: the pane goes BUSY on the Nth capture (a turn starting
     # between the idle gate and the paste), modeled as the footer flipping.
     if [ -f "{self.busy_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.busy_on_capture_flag}")" ]; then
@@ -358,6 +377,8 @@ case "$cmd" in
       if [ -f "{self.pid_after_enter_flag}" ]; then
         cat "{self.pid_after_enter_flag}" > "{self.pane_pid_file}"; rm -f "{self.pid_after_enter_flag}"
       fi
+      [ -f "{self.pane_after_enter_flag}" ] && mv -f "{self.pane_after_enter_flag}" "{self.pane_pending}"
+      [ -f "{self.fail_capture_skip_after_enter_flag}" ] && mv -f "{self.fail_capture_skip_after_enter_flag}" "{self.fail_capture_after_k}"
       if [ -f "{self.fail_capture_after_enter_flag}" ]; then
         rm -f "{self.fail_capture_after_enter_flag}"; touch "{self.fail_next_capture_flag}"
       fi
