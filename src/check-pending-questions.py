@@ -38,9 +38,9 @@ RESULTS_DIR = WORKSPACE / "results"
 # No read-fallback to the old root path on purpose: a missing stamp makes the
 # reader notify ONCE rather than suppress, so the move costs one notification.
 LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
-# This notification job's own adapter, found as ask-owner finds it; its discovery
-# registers on first success, so an upgraded schedule needs no flag or manual step.
-DEFAULT_STORE_ADAPTER = Path(__file__).resolve().parent.parent / "scripts" / "pending_questions_room_db.py"
+# This job's own adapter, found as ask-owner finds it; discovery registers on success.
+DEFAULT_STORE_ADAPTER = (Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+                         / "scripts" / "pending_questions_room_db.py")
 
 
 def write_notify_stamp(questions, now=None):
