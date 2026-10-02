@@ -19,9 +19,11 @@ when the room cannot be read — never a zero. `reconcile_pass(workspace)` is th
 backfill); `ask_owner` runs it first, then the queue, then the row, and writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
-the row, else records the closure locally for the next reconcile — only for a question held
-in the outbox, or in outage mode once a row of this workspace was ever confirmed; an unknown
-id with neither is refused and changes no count. `remind` is the reminder.
+the row (committing the history marker first when the row is in view and the marker is not;
+a marker that cannot be written leaves the row open and records the close locally), else
+records the closure locally for the next reconcile — only for a question held in the outbox,
+or in outage mode once a row of this workspace was ever confirmed; an unknown id with neither
+is refused and changes no count. `remind` is the reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -47,8 +49,8 @@ import pending_questions_ask as core_ask
 from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
                                       mark_store_used, room_introduced, store_history)
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
-                                     RoomDbStore, ScriptDbClient, outbox_items, reconcile_pending, safe_body,
-                                     waiting_item, write_question)
+                                     RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
+                                     safe_body, waiting_item, write_question)
 from workspace_default import status_path
 
 # The skill directories that provide the room capability, canonical name first.
@@ -248,10 +250,12 @@ def local_close_allowed(ws: Path, ask_id: str) -> tuple:
     return False, f"no held question {ask_id} and no room row was ever confirmed here; nothing to close"
 
 
-def _close_locally(ws: Path, ask_id: str, status: str, why: str) -> tuple:
-    allowed, basis = local_close_allowed(ws, ask_id)
-    if not allowed:
-        return False, f"not recorded: {basis} ({why})"
+def _close_locally(ws: Path, ask_id: str, status: str, why: str, basis: Optional[str] = None) -> tuple:
+    """`basis` given: the caller has the row in view, so the gate is not asked."""
+    if basis is None:
+        allowed, basis = local_close_allowed(ws, ask_id)
+        if not allowed:
+            return False, f"not recorded: {basis} ({why})"
     try:
         p = HeldRecords(ws).close(ask_id, status, note=why)
     except Exception as e:  # noqa: BLE001
@@ -262,8 +266,10 @@ def _close_locally(ws: Path, ask_id: str, status: str, why: str) -> tuple:
 def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
-    record instead. A row the store knows and refuses (closed already, no such row) is not
-    changed and nothing is recorded. Never reopens a closed row."""
+    record instead. A row in view before the history marker was ever committed commits it
+    first; when that fails the row is left open and the close is recorded locally — the
+    evidence outlives the capability either way. A row the store knows and refuses (closed
+    already, no such row) is not changed and nothing is recorded. Never reopens a closed row."""
     from util_paths import host_label
     ws = Path(workspace)
     store, where = room_store(ws)
@@ -271,6 +277,11 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
         return _close_locally(ws, ask_id, status, f"room database: not used ({where})")
     try:
         reconcile_pending(store, ws, host_label())
+        if not store_history(ws) and store.status_of(ask_id) is not None:
+            try:
+                Outbox(ws).commit_history(ask_id)
+            except StoreError as e:
+                return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
         store.close(ask_id, status)
         return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
