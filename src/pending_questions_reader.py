@@ -160,7 +160,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--workspace", type=Path, default=None)
-    args = ap.parse_args(argv)
+    # intermixed: an optional positional after `--workspace` is otherwise swallowed on 3.12
+    args = ap.parse_intermixed_args(argv)
     if args.workspace is None:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         args.workspace = resolve_workspace(migrate=False)
