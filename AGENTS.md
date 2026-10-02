@@ -243,10 +243,10 @@ Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop
 ## Pending decisions
 
 When you need the owner's word on a decision or are blocked:
-1. `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records the question at the top of the **per-host** `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`; `personal_path("pending-questions.md")` and every reader resolve it), queues it as `results/proactive-*.txt` (the task's conversation only for an owner-tier task in the owner's DM; otherwise the owner's DM), stamps `**Sent:** queued …` on the entry, and fires the macOS notification last, naming the fix when refused. A file line alone is a dead drop.
+1. `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records the question as a row of the Pending questions database in the owner's room (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next pass files it), queues it as `results/proactive-*.txt` (the task's conversation only for an owner-tier task in the owner's DM; otherwise the owner's DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is read-only history.
 2. Continue working on other things — don't block.
 
-Each proactive loop pass, check it (`pq.py list`, `pq.py resolve <id>`). A room-database row mirrors each question; `check-pending-questions.py --reconcile-only` keeps both level; reminders are on demand.
+Each proactive loop pass, `pq.py list` and `pq.py resolve <id>`. Reminders only on demand (`pq.py remind`); nothing is scheduled.
 
 ## Task progress notifications
 

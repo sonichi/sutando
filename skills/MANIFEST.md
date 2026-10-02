@@ -136,10 +136,12 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 
 ## Pending-questions store adapter (`pending_questions_store`)
 
-`"pending_questions_store": "scripts/<adapter>.py"` declares the script whose `room_store(workspace)`
-gives owner pending questions a second store beside the file. `src/check-pending-questions.py` and
-`scripts/ask-owner.py` find it by scanning manifests (`pending_questions_store.declared_adapter`) and
-name no skill; the script must resolve inside its skill. With none declared, the file is the only store.
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count` read
+it (after replaying the local outbox) and `resolve` closes a row. Core reaches it only through
+`src/pending_questions_reader.py` (`pending_questions_store.declared_adapter` scans manifests; the
+script must resolve inside its skill) and names no skill. With none declared, `ask` holds questions
+in `<workspace>/state/pending-questions-outbox/` and readers list that outbox alone, saying why.
 
 ## Currently active manifest skills
 
