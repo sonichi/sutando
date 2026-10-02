@@ -1664,7 +1664,7 @@ class TestMigrateRound3(_MigrateBase):
                 [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         other = next(x for x in self.plan()["entries"] if x["title"] != e0["title"] and x["sha"])
-        for name, entry in {"short digest": dict(other, sha="x"), "multiline title": dict(e0, title=e0["title"] + "\n## x"),
+        for name, entry in {"control char why": dict(other, why="ok\x07"), "short digest": dict(other, sha="x"), "multiline title": dict(e0, title=e0["title"] + "\n## x"),
                             "control char title": dict(e0, title=e0["title"] + "\x00")}.items():
             with self.subTest(name=name):
                 [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
@@ -1756,6 +1756,13 @@ class TestMigrateRound3(_MigrateBase):
         conflicting = dict(plan, entries=[dict(e, **{"class": "stale-merged-PR"}), e])  # one selector, two actions
         [done] = self.apply(conflicting, self.ledger, db)
         self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        alias = dict(plan, entries=[dict(e, **{"class": "stale-merged-PR", "title": e["title"] + " "}), e])
+        [done] = self.apply(alias, self.ledger, db)  # a whitespace alias of a title is not a selector
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        with mock.patch.object(self.m, "plan_fits", return_value=True):  # past preflight, the target guard holds
+            [done] = self.apply(conflicting, self.ledger, db)
+        self.assertTrue(done.startswith("refused: two planned entries resolve to one ledger entry"))
+        self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
         self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
 
     def test_a_multiline_why_cannot_inject_ledger_structure(self):
@@ -1764,10 +1771,9 @@ class TestMigrateRound3(_MigrateBase):
                       self.m.action_of(e, False).startswith("nothing") and e["class"] != "past-window")
         rest = [e for e in plan["entries"] if e is not target]
         evil = dict(plan, entries=[dict(target, why="x\n\n# Resolved\n\n")])
-        self.apply(evil, self.ledger, None)
-        text = self.ledger.read_text()
-        self.assertEqual(text.count("\n# Resolved"), FIXTURE.count("\n# Resolved"))
-        self.assertIn("x # Resolved", text)
+        [done] = self.apply(evil, self.ledger, None)
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        self.assertEqual(self.ledger.read_text(), FIXTURE)
 
     def test_apply_refuses_a_plan_for_another_ledger(self):
         plan, before = self._only(), self.ledger.read_text()
