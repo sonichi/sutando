@@ -1783,6 +1783,31 @@ class TestMigrateRound3(_MigrateBase):
         self.assertTrue(done.startswith("refused: the plan is for"))
         self.assertEqual(other.read_text(), before)
 
+    def test_apply_writes_the_canonical_ledger_never_a_symlink_or_relative_name(self):
+        plan, before = self._only(), self.ledger.read_text()
+        link = self.ws / "link.md"
+        link.symlink_to(self.ledger)
+        [done] = self.apply(plan, link, self.db())
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        self.assertTrue(link.is_symlink())  # the link survives; its target took the write
+        self.assertNotEqual(self.ledger.read_text(), before)
+        self.assertEqual(Path(plan["ledger"]), self.ledger.resolve())
+        rel = dict(plan, ledger=self.ledger.name)
+        [done] = self.apply(rel, self.ledger, self.db())
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+
+    def test_c1_controls_and_lone_surrogates_are_refused_before_any_write(self):
+        plan, before = self.plan(), self.ledger.read_text()
+        good = [e for e in plan["entries"] if e["sha"]]
+        db = self.db()
+        for name, bad in {"C1 in why": dict(good[1], why="ok\x9b"),
+                          "surrogate in why": dict(good[1], why="ok\ud800"),
+                          "C1 in title": dict(good[1], title=good[1]["title"] + "\x85")}.items():
+            with self.subTest(name=name):
+                [done] = self.apply(dict(plan, entries=[good[0], bad]), self.ledger, db)
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
+
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
         client = InProcClient()
