@@ -14,13 +14,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
-import subprocess
 import sys
 import urllib.error
-import urllib.request
 from pathlib import Path
+from shutil import which
+from subprocess import run
 from typing import Callable, Optional, Tuple
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 REPO = SKILL_DIR.parent.parent
@@ -59,7 +60,6 @@ def find_credential(env_file: Path) -> Tuple[str, str, str]:
 
 
 def check_url(field: str, value: str) -> str:
-    from urllib.parse import urlparse
     u = urlparse(value or "")
     if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOOPBACK):
         return value
@@ -67,10 +67,10 @@ def check_url(field: str, value: str) -> str:
 
 
 def http_discover(relay: str, secret: str) -> dict:
-    req = urllib.request.Request(relay.rstrip("/") + "/v1/mcp/discovery",
-                                 headers={"Authorization": f"Bearer {secret}", "User-Agent": USER_AGENT})
+    req = Request(relay.rstrip("/") + "/v1/mcp/discovery",
+                  headers={"Authorization": f"Bearer {secret}", "User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -123,7 +123,7 @@ def main(argv: Optional[list] = None, discover: Callable[[str, str], dict] = htt
         print(f"no agent credential found under {claude_home_path('channels', SOURCE)}. Connect an agent in "
               "AG2 Space, then save its token there as REMOTE_TASK_TOKEN='<relay-url>|<secret>'.", file=sys.stderr)
         return 1
-    node = shutil.which("node")
+    node = which("node")
     if not node:
         print("node is not on PATH; the proxy needs Node 18 or newer", file=sys.stderr)
         return 1
@@ -148,10 +148,10 @@ def main(argv: Optional[list] = None, discover: Callable[[str, str], dict] = htt
         print(f"dry run; with --apply this runs (CLAUDE_CONFIG_DIR={env['CLAUDE_CONFIG_DIR']}):\n  "
               + " ".join(cmd[:6]) + " '<entry>'\n" + json.dumps(entry, indent=2))
         return 0
-    if not shutil.which("claude"):
+    if not which("claude"):
         print("claude is not on PATH", file=sys.stderr)
         return 1
-    done = subprocess.run(cmd, env=env)
+    done = run(cmd, env=env)
     if done.returncode == 0:
         print("registered. Restart the core, then call the ag2.whoami tool to check.")
     return done.returncode
