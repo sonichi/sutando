@@ -121,8 +121,16 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 
 def get_pending_count() -> dict:
-    """{"open", "done"} from the one pending-questions reader (the skill's adapter)."""
+    """{"open", "done", "unavailable", "reason"} from the one pending-questions reader (the
+    skill's adapter); `open` is None, never 0, while the room cannot be read."""
     return pending_questions_reader.count(WORKSPACE_DIR)
+
+
+def pending_tile(pending: dict) -> tuple:
+    """(value, title) for the Pending stat: "?" with the reason when the count is unknown."""
+    if pending.get("unavailable") or pending.get("open") is None:
+        return "?", f"unknown — room unreachable ({pending.get('reason') or 'no count'})"
+    return str(pending["open"]), ""
 
 
 def get_score() -> str:
@@ -679,7 +687,7 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['disk_free']}</div><div class="stat-label">Disk Free</div></div>
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
-<div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
+<div class="stat"><div class="stat-val" title="{pending_tile(pending)[1]}">{pending_tile(pending)[0]}</div><div class="stat-label">Pending</div></div>
 <div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:#8fa3c8">{_quota_model_label(stats["quota"])}</span><br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>

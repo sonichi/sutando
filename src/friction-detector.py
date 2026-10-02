@@ -44,11 +44,16 @@ _PQ_OLDEST_SHOWN = 3
 
 
 def check_pending_questions():
-    """Find questions unanswered for >24h, from the one pending-questions reader."""
+    """Find questions unanswered for >24h, from the one pending-questions reader; an
+    unreadable room is one issue saying the count is unknown, never a clean zero."""
     issues = []
     found: list = []
     now = datetime.now(timezone.utc)
-    for q in pending_questions_reader.waiting(WORKSPACE):
+    g = pending_questions_reader.gather(WORKSPACE)
+    if g["unavailable"]:
+        return [f"Pending questions: UNKNOWN — room unreachable ({g['reason']}); "
+                f"{len(g['waiting'])} held locally"]
+    for q in g["waiting"]:
         age_str = ""
         age_days_num = -1  # unknown age sorts last, never ahead of a dated item
         if q.get("asked_at"):
