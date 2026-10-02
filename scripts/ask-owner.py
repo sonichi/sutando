@@ -11,10 +11,11 @@ Usage:
 With --task-file the question goes to that task's own conversation; without it,
 to the owner's DM on the bridge he was last active on. Always exits 0 after a
 non-empty question: every failure is printed, never raised, and the entry
-stands either way. It is a row of the "Pending questions" database in the
-owner's DM room when the room-collab capability and that room both resolve
-(pending_questions_room_db.room_store); otherwise, or when that write fails
-(said loudly on stderr), it is in hosts/<host>/pending-questions.md.
+stands either way. It is always in hosts/<host>/pending-questions.md, the copy
+every file-only reader keeps reading, and also a row of the "Pending questions"
+database in the owner's DM room when the room-collab capability and that room
+both resolve (pending_questions_room_db.room_store); a failed row is said loudly
+on stderr.
 """
 import argparse
 import sys
@@ -65,7 +66,7 @@ def main() -> int:
         print(f"room database: not used ({where}); the file is the ledger")
     if out.get("db_error"):
         print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is in "
-              f"{out['ledger']} instead", file=sys.stderr)
+              f"{out['ledger']}", file=sys.stderr)
     print("\n".join(report_lines(out)))
     return 0
 

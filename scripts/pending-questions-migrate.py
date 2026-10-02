@@ -7,17 +7,23 @@ owner's "Pending questions" room database.
 
 Each open entry (the reminder's own reading of the file, plus the entries it
 already skips because their title says resolved) is classified, first match wins:
+  already-migrated  — it carries an ask id or names its row; nothing to do
   self-resolved     — the title leads with RESOLVED / SELF-RESOLVED (the reader's rule)
   live              — an open PR it names, or none and asked within --window-days
+  unknown-PR        — a PR it names could not be looked up; nothing is done (fail closed)
   stale-merged-PR   — every PR it names is closed and at least one merged
   stale-closed-PR   — every PR it names was closed unmerged
   past-window       — no PR decides it and it is older than --window-days
-PR states come from `gh api repos/<repo>/pulls/<n>`; a 403 backs off 3 minutes
-and retries. The dry run prints the proposed action per entry and the rows it
-would create; it writes nothing. --apply creates the live rows (ask id
-`legacy-<hash>`, idempotent) and marks self-resolved and stale `## ` entries
-resolved in the file; past-window `## ` entries too with --close-past-window.
-Bullet entries are listed for the owner, never changed.
+PR states come from `gh api repos/<repo>/pulls/<n>`; a 404 means "not a PR", a
+403 backs off 3 minutes and retries, anything else is unknown. The dry run
+prints the proposed action per entry and, with --plan-out, saves the plan;
+it writes nothing else. --apply takes only a saved plan (--plan): it re-queries
+nothing, and changes an entry only while its text still hashes to what the plan
+saw (located by kind, title and occurrence, so duplicate headings are distinct).
+It creates the live `## ` rows (ask id `legacy-<hash>`, idempotent) and marks
+them moved, and marks self-resolved and stale `## ` entries resolved; past-window
+too when the plan was made with --close-past-window. Bullet entries are listed,
+never changed and never given a row. A second --apply changes nothing.
 """
 from __future__ import annotations
 
@@ -36,9 +42,11 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
-from pending_questions_store import row_body, row_id  # noqa: E402
+from pending_questions_store import entry_ask_id, legacy_ask_id, row_body, row_id  # noqa: E402
 
-CLASSES = ("self-resolved", "live", "stale-merged-PR", "stale-closed-PR", "past-window")
+CLASSES = ("already-migrated", "self-resolved", "live", "unknown-PR", "stale-merged-PR",
+           "stale-closed-PR", "past-window")
+UNKNOWN = "unknown"
 BACKOFF_SEC = 180
 TRIES = 3
 _PR_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|(?<![\w/&])#(\d{2,6})\b")
@@ -73,7 +81,7 @@ def asked_on(title: str, body: str):
 
 class GhPrs:
     """PR state by (repo, number) through `gh api`, cached: open, merged, closed,
-    or None when the number is not a PR or gh could not say."""
+    None when the number is not a PR (404), or UNKNOWN when gh could not say."""
 
     def __init__(self, runner=subprocess.run, sleep=time.sleep, log=print):
         self.runner, self.sleep, self.log, self.cache = runner, sleep, log, {}
@@ -81,23 +89,29 @@ class GhPrs:
     def state(self, repo: str, n: int):
         if (repo, n) in self.cache:
             return self.cache[(repo, n)]
-        st = None
+        st = UNKNOWN
         for attempt in range(TRIES):
-            r = self.runner(["gh", "api", f"repos/{repo}/pulls/{n}"], capture_output=True, text=True)
+            try:
+                r = self.runner(["gh", "api", f"repos/{repo}/pulls/{n}"], capture_output=True, text=True)
+            except OSError:
+                break
             err = (r.stderr or "") + (r.stdout if r.returncode else "")
             if r.returncode == 0:
                 try:
                     d = json.loads(r.stdout)
-                except ValueError:
-                    break
-                st = "merged" if d.get("merged_at") else ("open" if d.get("state") == "open" else "closed")
+                    st = "merged" if d.get("merged_at") else ("open" if d.get("state") == "open" else "closed")
+                except (ValueError, AttributeError):
+                    pass
+                break
+            if "HTTP 404" in err or "Not Found" in err:
+                st = None
                 break
             if "HTTP 403" in err or "rate limit" in err.lower():
                 if attempt + 1 < TRIES:
                     self.log(f"gh: 403 on {repo}#{n}; backing off {BACKOFF_SEC}s", file=sys.stderr)
                     self.sleep(BACKOFF_SEC)
                 continue
-            break  # 404 (an issue, not a PR) or another refusal: no PR state
+            break
         self.cache[(repo, n)] = st
         return st
 
@@ -108,14 +122,18 @@ PAST_WINDOW_WHY = "past its 14-day window (closed in cleanup)"
 
 def classify(q: dict, prs, now: float, window_days: float, repo: str, title_resolved=None) -> tuple:
     """(class, reason) for one waiting entry."""
+    if entry_ask_id(q.get("body", "")):
+        return "already-migrated", "carries an ask id or names its row"
     if title_resolved is not None and title_resolved(q["title"]):
         return "self-resolved", SELF_RESOLVED_WHY
     text = f"{q['title']}\n{q.get('body', '')}"
-    refs = pr_refs(text, repo)
-    states = {f"{r}#{n}": prs.state(r, n) for r, n in refs}
-    known = {k: v for k, v in states.items() if v}
+    states = {f"{r}#{n}": prs.state(r, n) for r, n in pr_refs(text, repo)}
+    known = {k: v for k, v in states.items() if v and v != UNKNOWN}
+    unknown = [k for k, v in states.items() if v == UNKNOWN]
     if any(v == "open" for v in known.values()):
         return "live", "open PR " + ", ".join(k for k, v in known.items() if v == "open")
+    if unknown:
+        return "unknown-PR", "could not look up " + ", ".join(unknown)
     if known and any(v == "merged" for v in known.values()):
         return "stale-merged-PR", "PR(s) " + ", ".join(f"{k} {v}" for k, v in known.items())
     if known:
@@ -127,24 +145,75 @@ def classify(q: dict, prs, now: float, window_days: float, repo: str, title_reso
     return "live", "no closed PR, within the window" if asked else "no closed PR, undated"
 
 
-def legacy_ask_id(q: dict) -> str:
-    return "legacy-" + hashlib.sha256(f"{q['title']}\n{q.get('body', '')}".encode()).hexdigest()[:12]
+def _headings(text: str, title: str) -> list:
+    return list(re.finditer(rf"^## {re.escape(title)}[ \t]*$", text, re.MULTILINE))
+
+
+def _section_span(text: str, m) -> tuple:
+    nxt = re.compile(r"^## |^# ", re.MULTILINE).search(text, m.end())
+    return m.start(), nxt.start() if nxt else len(text)
+
+
+def _bullet_spans(text: str, title: str) -> list:
+    out = []
+    for m in re.finditer(rf"^[ \t]*-[ \t]+\*\*\[{re.escape(title)}\]", text, re.MULTILINE):
+        end = text.find("\n", m.end())
+        out.append((m.start(), end if end != -1 else len(text)))
+    return out
+
+
+def spans(text: str, kind: str, title: str) -> list:
+    if kind == "bullet":
+        return _bullet_spans(text, title)
+    return [_section_span(text, m) for m in _headings(text, title)]
+
+
+def _sha(chunk: str) -> str:
+    return hashlib.sha256(chunk.encode()).hexdigest()
+
+
+def identify(text: str, q: dict, taken: set) -> tuple:
+    """(nth occurrence, sha) of the entry `q` was read from: the first span of
+    its kind and title, not already taken, whose body is q's."""
+    for i, (a, b) in enumerate(spans(text, q["kind"], q["title"])):
+        chunk = text[a:b]
+        body = chunk.strip() if q["kind"] == "bullet" else chunk.partition("\n")[2].strip()
+        if (q["kind"], q["title"], i) not in taken and body == q["body"]:
+            taken.add((q["kind"], q["title"], i))
+            return i, _sha(chunk)
+    return None, None
 
 
 ACTIONS = {
+    "already-migrated": "nothing (already migrated)",
     "self-resolved": "mark resolved in the file (its title says resolved); no row",
     "live": "create an Open row in the room database; mark the file entry moved",
+    "unknown-PR": "nothing: a PR state is unknown (fail closed); rerun later",
     "stale-merged-PR": "mark resolved in the file (its PR merged); no row",
     "stale-closed-PR": "mark resolved in the file (its PR closed unmerged); no row",
     "past-window": "leave open in the file; listed for the owner to resolve or keep",
 }
 
 
-def triage(questions: list, prs, now: float, window_days: float, repo: str, title_resolved=None) -> list:
-    out = []
+def action_of(r: dict, close_past_window: bool) -> str:
+    if r["kind"] == "bullet" and r["class"] != "already-migrated":
+        return "nothing: a bullet entry is listed for the owner, never changed or given a row"
+    if r["nth"] is None:
+        return "nothing: the entry could not be located"
+    if r["class"] == "past-window" and close_past_window:
+        return f"mark resolved in the file ({PAST_WINDOW_WHY}); no row"
+    return ACTIONS[r["class"]]
+
+
+def triage(questions: list, prs, now: float, window_days: float, repo: str, title_resolved=None,
+           text: str = "") -> list:
+    out, taken = [], set()
     for q in questions:
+        q = {**q, "kind": q.get("kind", "section")}
         cls, why = classify(q, prs, now, window_days, repo, title_resolved)
-        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q)})
+        nth, sha = identify(text, q, taken)
+        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q["title"], q["body"]),
+                    "nth": nth, "sha": sha})
     return out
 
 
@@ -153,11 +222,8 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
     lines = [f"ledger: {ledger_file}", f"waiting entries: {len(rows)}",
              "counts: " + ", ".join(f"{c}={n}" for c, n in counts.items()), ""]
     for r in rows:
-        action = ACTIONS[r["class"]]
-        if r["class"] == "past-window" and close_past_window:
-            action = f"mark resolved in the file ({PAST_WINDOW_WHY}); no row"
-        lines.append(f"[{r['class']}] {r['title'][:100]} — {action} ({r['why']})")
-    live = [r for r in rows if r["class"] == "live"]
+        lines.append(f"[{r['class']}] {r['title'][:100]} — {action_of(r, close_past_window)} ({r['why']})")
+    live = [r for r in rows if r["class"] == "live" and action_of(r, close_past_window) == ACTIONS["live"]]
     lines += ["", f"rows it would create ({len(live)}):"]
     for r in live:
         lines.append(f"  Name={r['title'][:100]} | Status=Open | Priority=Medium | Ask id={r['ask_id']}"
@@ -165,39 +231,49 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
     return lines
 
 
-def _set_section_status(text: str, title: str, status: str) -> str:
-    """The `## <title>` section's status line set; a section without one gains one."""
-    m = re.search(rf"^## {re.escape(title)}[ \t]*$", text, re.MULTILINE)
-    if not m:
-        raise ledger.LedgerError(f"no section titled {title!r}")
-    nxt = re.compile(r"^## |^# ", re.MULTILINE).search(text, m.end())
-    end = nxt.start() if nxt else len(text)
+def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool) -> dict:
+    return {"ledger": str(ledger_file), "ledger_sha256": _sha(text), "close_past_window": close_past_window,
+            "entries": [{k: r[k] for k in ("kind", "title", "nth", "sha", "class", "why", "ask_id", "body")}
+                        for r in rows]}
+
+
+def _with_status(text: str, r: dict, status: str) -> str:
+    """The planned entry's status line set, only while it still hashes as planned."""
+    found = spans(text, r["kind"], r["title"])
+    if r["nth"] is None or r["nth"] >= len(found) or _sha(text[slice(*found[r["nth"]])]) != r["sha"]:
+        raise ledger.LedgerError(f"changed since the plan: {r['title'][:80]!r}")
+    a, b = found[r["nth"]]
     line = f"**Status:** {status} (pending-questions-migrate)"
-    st = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE).search(text, m.end(), end)
+    st = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE).search(text, a, b)
     if st:
         return text[:st.start()] + line + text[st.end():]
-    return text[:end].rstrip("\n") + "\n\n" + line + "\n\n" + text[end:]
+    return text[:b].rstrip("\n") + "\n\n" + line + "\n\n" + text[b:]
 
 
-def apply(rows: list, ledger_file: Path, store, close_past_window: bool = False) -> list:
-    done = []
-    headings = ledger_file.read_text(encoding="utf-8") if ledger_file.exists() else ""
-    for r in rows:
-        is_section = re.search(rf"^## {re.escape(r['title'])}[ \t]*$", headings, re.MULTILINE) is not None
-        if r["class"] == "live" and store is not None:
+def apply(plan: dict, ledger_file: Path, store) -> list:
+    """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
+    done, cpw = [], plan.get("close_past_window", False)
+    for r in plan["entries"]:
+        action = action_of(r, cpw)
+        if action.startswith("nothing") or action == ACTIONS["past-window"]:
+            done.append(f"unchanged [{r['class']}]: {r['title'][:80]}")
+            continue
+        if r["class"] == "live":
+            if store is None:
+                done.append(f"unchanged (no room database) [live]: {r['title'][:80]}")
+                continue
+            text = ledger_file.read_text(encoding="utf-8")
+            try:
+                _with_status(text, r, "check")
+            except ledger.LedgerError as e:
+                done.append(f"skipped: {e}")
+                continue
             store.insert_raw(r["ask_id"], r["title"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
-            err = ledger.update(ledger_file, lambda t, r=r: _set_section_status(
-                t, r["title"], f"moved — kept in the room database as row {row_id(r['ask_id'])}")) \
-                if is_section else "a bullet entry: resolve it in the file by hand"
-            done.append(f"row {row_id(r['ask_id'])}{'; file: ' + err if err else ''}: {r['title'][:80]}")
-        elif is_section and (r["class"].startswith("stale-") or r["class"] == "self-resolved"
-                             or (r["class"] == "past-window" and close_past_window)):
-            why = PAST_WINDOW_WHY if r["class"] == "past-window" else r["why"]
-            err = ledger.update(ledger_file, lambda t, r=r, why=why: _set_section_status(
-                t, r["title"], f"resolved — {why}"))
-            done.append(f"{'FAILED ' + err if err else 'resolved'}: {r['title'][:80]}")
+            status = f"moved — kept in the room database as row {row_id(r['ask_id'])}"
         else:
-            done.append(f"left for the owner [{r['class']}]: {r['title'][:80]}")
+            status = f"resolved — {PAST_WINDOW_WHY if r['class'] == 'past-window' else r['why']}"
+        err = ledger.update(ledger_file, lambda t, r=r, status=status: _with_status(t, r, status))
+        done.append(f"{'skipped: ' + err if err else status.split(' — ')[0]}: {r['title'][:80]}")
     return done
 
 
@@ -211,7 +287,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default="sonichi/sutando")
     ap.add_argument("--window-days", type=float, default=14.0)
     ap.add_argument("--close-past-window", action="store_true",
-                    help="with --apply, also mark past-window `## ` entries resolved")
+                    help="plan past-window `## ` entries as resolved too")
+    ap.add_argument("--plan-out", type=Path, default=None, help="dry run: save the plan here")
+    ap.add_argument("--plan", type=Path, default=None, help="apply: the reviewed plan to carry out")
     ap.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -221,18 +299,30 @@ def main(argv=None) -> int:
         from pending_questions_ask import ledger_path  # noqa: PLC0415
         from util_paths import host_label  # noqa: PLC0415
         args.ledger = ledger_path(ws, host_label())
+    if args.apply:
+        if args.plan is None:
+            print("--apply carries out a reviewed plan: make one with --dry-run --plan-out, "
+                  "then pass it with --plan", file=sys.stderr)
+            return 2
+        plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        if Path(plan["ledger"]).resolve() != args.ledger.resolve():
+            print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
+            return 2
+        from pending_questions_room_db import room_store  # noqa: PLC0415
+        store, where = room_store(ws)
+        if store is None:
+            print(f"room database unavailable ({where}); live rows are not created", file=sys.stderr)
+        print("\n".join(apply(plan, args.ledger, store)))
+        return 0
     text = args.ledger.read_text(encoding="utf-8") if args.ledger.exists() else ""
     rows = triage(cpq.parse_waiting(text, keep_title_resolved=True), GhPrs(), args.now or time.time(),
-                  args.window_days, args.repo, cpq.title_says_resolved)
+                  args.window_days, args.repo, cpq.title_says_resolved, text)
     print("\n".join(report(rows, args.ledger, args.close_past_window)))
-    if not args.apply:
-        print("\n(dry run: nothing written; --apply after the owner has reviewed this)")
-        return 0
-    from pending_questions_room_db import room_store  # noqa: PLC0415
-    store, where = room_store(ws)
-    if store is None:
-        print(f"\nroom database unavailable ({where}); live rows are not created", file=sys.stderr)
-    print("\n" + "\n".join(apply(rows, args.ledger, store, args.close_past_window)))
+    if args.plan_out:
+        args.plan_out.write_text(json.dumps(make_plan(rows, args.ledger, text, args.close_past_window),
+                                            ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"\nplan saved: {args.plan_out} (apply it with --apply --plan {args.plan_out})")
+    print("\n(dry run: nothing written to the ledger or the room)")
     return 0
 
 

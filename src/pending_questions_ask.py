@@ -2,14 +2,13 @@
 pending-questions.md is the ledger of what was queued, not the channel.
 
 Order, fail-open at every step: (1) the entry is written, keyed by a unique ask
-id, to the store pending_questions_store.write_question picks — the room database
-the caller injected, else (or when it fails) the top of the file's active region;
-(2) the question is QUEUED as a
-proactive file — to the task's own conversation only for an owner-tier task in
+id, through pending_questions_store.write_question — to the room database the
+caller injected, and always to the top of the file's active region, the shadow
+every file-only reader reads; (2) the question is QUEUED as a proactive file — to the task's own conversation only for an owner-tier task in
 the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner's
 DM on the task's bridge for any other bridge task, else to the owner's DM on
 the bridge he was last active on; (3) the queue record is stamped on the entry's
-`**Sent:**` line in whichever store holds it — a drain delivering the file is what makes it sent, and the
+`**Sent:**` line in every store holding it — a drain delivering the file is what makes it sent, and the
 reminder treats an undrained file as not yet asked; (4) the macOS notification
 fires last, and a refusal prints the fix instead of a success.
 
@@ -229,15 +228,15 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     out["ledger"] = str(pq)
     file_store = FileStore(pq)
     if store is not None:
-        moved, errors = resync(file_store, store)
-        out["resync"] = {"moved": moved, "errors": errors}
+        synced, errors = resync(file_store, store)
+        out["resync"] = {"synced": synced, "errors": errors}
     q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()),
                  priority)
     w = write_question(q, file_store, store)
-    holder = w.store
     out["ledger_error"], out["db_error"], out["link"] = w.error, w.db_error, w.link
-    if holder is not None:
-        out["store"], out["ledger"] = holder.kind, holder.where(ask_id)
+    if w.stores:
+        out["store"] = "+".join(h.kind for h in w.stores)
+        out["ledger"] = " and ".join(h.where(ask_id) for h in w.stores)
 
     dest = Destination()
     if task_file:
@@ -260,11 +259,15 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         sent_line = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
         sent_line = f"**Sent:** FAILED — {out['send_error']} at {_iso(time.time())}"
-    if holder is not None:
+    for holder in w.stores:
         try:
             holder.stamp(ask_id, sent_line)
         except Exception as e:  # noqa: BLE001
-            out["ledger_error"] = f"{type(e).__name__}: {e}"
+            err = f"{type(e).__name__}: {e}"
+            if holder.kind == "file":
+                out["ledger_error"] = err
+            else:
+                out["db_error"] = f"stamp: {err}"
 
     if urgency == "live":
         out["macos"], out["macos_fix"] = notify_macos(f"Question: {question}")
@@ -274,14 +277,15 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
 def report_lines(out: dict) -> list:
     lines = [f"ledger: {out['ledger']} — {out['heading'][3:]}"]
     if out.get("db_error"):
-        lines.append(f"ledger: ROOM DATABASE WRITE FAILED — {out['db_error']}; kept in the file "
-                     "instead, and the next run with the database copies it there")
+        lines.append(f"ledger: ROOM DATABASE WRITE FAILED — {out['db_error']}; the file holds it, "
+                     "and the next run with the database copies it there")
     if out.get("link"):
         lines.append(f"row: {out['link']}")
     for err in (out.get("resync") or {}).get("errors") or []:
         lines.append(f"resync: FAILED — {err}")
-    if (out.get("resync") or {}).get("moved"):
-        lines.append(f"resync: copied {len(out['resync']['moved'])} file entr(ies) into the room database")
+    if (out.get("resync") or {}).get("synced"):
+        lines.append(f"resync: brought {len(out['resync']['synced'])} entr(ies) level between the file "
+                     "and the room database")
     if out["ledger_error"]:
         lines.append(f"ledger: FAILED — {out['ledger_error']}")
     if out["proactive_file"]:

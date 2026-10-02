@@ -51,6 +51,22 @@ def _acquire(lock: Path) -> Optional[str]:
             time.sleep(0.05)
 
 
+def under_lock(lock: Path, fn: Callable[[], object]):
+    """(error, result): `fn()` run while holding the mkdir lock `lock`; a held
+    lock gives up after LOCK_WAIT_SEC with the error and does not run `fn`."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    err = _acquire(lock)
+    if err:
+        return err, None
+    try:
+        return None, fn()
+    finally:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+
+
 def replace_file(pq: Path, text: str) -> None:
     """Appear whole at `pq` in one rename; a crash mid-write leaves the old file."""
     try:
