@@ -29,6 +29,7 @@ from typing import Optional
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter  # noqa: E402
+from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
 CLIENT_MODULE = "room_collab_client.py"
@@ -48,7 +49,7 @@ def skill_scripts(workspace: Path) -> Optional[Path]:
 
 def owner_routing(workspace: Path) -> dict:
     try:
-        d = json.loads((Path(workspace) / "state" / "owner-routing.json").read_text(encoding="utf-8"))
+        d = json.loads(status_path("owner-routing.json", Path(workspace)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return d if isinstance(d, dict) else {}
@@ -76,7 +77,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     except OSError as e:
         print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
-                       lock=Path(workspace) / "state" / "pending-questions-db.lock"), room
+                       lock=status_path("pending-questions-db.lock", Path(workspace))), room
 
 
 # ---- serve: one request against the databases document -------------------------
