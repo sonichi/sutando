@@ -134,6 +134,13 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 
 **Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
 
+## Pending-questions store adapter (`pending_questions_store`)
+
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script whose `room_store(workspace)`
+gives owner pending questions a second store beside the file. `src/check-pending-questions.py` and
+`scripts/ask-owner.py` find it by scanning manifests (`pending_questions_store.declared_adapter`) and
+name no skill; the script must resolve inside its skill. With none declared, the file is the only store.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).

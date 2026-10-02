@@ -42,7 +42,6 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
 from pending_questions_store import (GuardFailed, active_region, entry_ask_id,  # noqa: E402
                                      legacy_ask_id, row_body, row_id, safe_body)
@@ -457,8 +456,8 @@ def main(argv=None) -> int:
         if args.ledger.exists() and _sha(args.ledger.read_text(encoding="utf-8")) != plan.get("ledger_sha256"):
             print("note: the ledger changed since the plan; each entry is still applied only while it is "
                   "byte-identical and in the active region", file=sys.stderr)
-        from pending_questions_room_db import room_store  # noqa: PLC0415
-        store, where = room_store(ws)
+        from pending_questions_store import declared_adapter, load_adapter_store  # noqa: PLC0415
+        store, where = load_adapter_store(declared_adapter(REPO / "skills"), ws)
         if store is None:
             print(f"room database unavailable ({where}); live rows are not created", file=sys.stderr)
         done = apply(plan, args.ledger, store, host_label())

@@ -5,14 +5,13 @@ Runs on cron — independent of the proactive loop.
 Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
 `--store-adapter <path>`, else the adapter an earlier run registered in the
-workspace, else this job's own scripts/ adapter, injects a room-database adapter
-(its `room_store(workspace)`, which returns None where the capability or the
-owner DM is absent); the pass reconciles it with the file, then reminds its open
-rows and the file's rest.
+workspace, else the one an installed skill declares in its manifest, injects a
+room-database adapter (its `room_store(workspace)`, which returns None where the
+capability or the owner DM is absent); the pass reconciles it with the file, then
+reminds its open rows and the file's rest. With no adapter it reminds from the file.
 """
 
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -29,8 +28,9 @@ from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
-from pending_questions_store import (OPEN_WORDS, SUPERSEDED, FileStore, entry_ask_id,  # noqa: E402
-                                     legacy_ask_id, registered_adapter, resync)
+from pending_questions_store import (OPEN_WORDS, SUPERSEDED, FileStore, declared_adapter,  # noqa: E402
+                                     entry_ask_id, legacy_ask_id, load_adapter_store,
+                                     registered_adapter, resync)
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -38,9 +38,8 @@ RESULTS_DIR = WORKSPACE / "results"
 # No read-fallback to the old root path on purpose: a missing stamp makes the
 # reader notify ONCE rather than suppress, so the move costs one notification.
 LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
-# This job's own adapter, found as ask-owner finds it; discovery registers on success.
-DEFAULT_STORE_ADAPTER = (Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
-                         / "scripts" / "pending_questions_room_db.py")
+# Where installed skills declare a store adapter; discovery registers it on success.
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"  # lint-workspace-resolution: allow-repo-root
 
 
 def write_notify_stamp(questions, now=None):
@@ -243,13 +242,7 @@ def parse_waiting(content, keep_title_resolved=False):
 
 def load_store(adapter_path):
     """(store | None, why) from an injected adapter file's `room_store(workspace)`."""
-    try:
-        spec = importlib.util.spec_from_file_location("pq_store_adapter", adapter_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.room_store(WORKSPACE)
-    except Exception as e:  # noqa: BLE001 — the file reminder runs without it
-        return None, f"adapter {adapter_path} failed to load ({type(e).__name__}: {e})"
+    return load_adapter_store(adapter_path, WORKSPACE)
 
 
 def store_questions(entries):
@@ -634,14 +627,15 @@ def main():
     store = None
     adapter = (sys.argv[sys.argv.index("--store-adapter") + 1] if "--store-adapter" in sys.argv[:-1]
                else registered_adapter(WORKSPACE))
+    declared = declared_adapter(SKILLS_DIR)
     if adapter:
         store, why = load_store(adapter)
-        if store is None and "--store-adapter" not in sys.argv and DEFAULT_STORE_ADAPTER.is_file():
-            store, why = load_store(str(DEFAULT_STORE_ADAPTER))  # a registration left by a moved checkout
+        if store is None and "--store-adapter" not in sys.argv and declared:
+            store, why = load_store(str(declared))  # a registration left by a moved checkout
         if store is None:
             print(f"room database: not used ({why}); reminding from the file", file=sys.stderr)
-    elif DEFAULT_STORE_ADAPTER.is_file():
-        store, _why = load_store(str(DEFAULT_STORE_ADAPTER))
+    elif declared:
+        store, _why = load_store(str(declared))
     questions, notes = gather(store)
     for note in notes:
         print(note, file=sys.stderr)
