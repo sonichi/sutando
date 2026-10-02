@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
+SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 REPO = SKILL_DIR.parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
