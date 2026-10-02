@@ -58,7 +58,6 @@ def owner_routing(workspace: Path) -> dict:
 def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     """(RoomDbStore, where) when the capability, the owner DM and an identity all
     resolve; (None, why not) otherwise."""
-    from util_paths import host_label
     env = os.environ if environ is None else environ
     scripts = skill_scripts(workspace)
     if scripts is None:
@@ -78,7 +77,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     except OSError as e:
         print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
-                       lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label()), room
+                       lock=status_path("pending-questions-db.lock", Path(workspace))), room
 
 
 # ---- serve: one request against the databases document -------------------------

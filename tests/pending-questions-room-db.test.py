@@ -631,87 +631,6 @@ class TestMigratedRows(_Ws):
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
 
 
-class TestTwoHostsOneRoom(_Ws):
-    """Two hosts share one room database; each has its own ledger and results."""
-
-    def setUp(self):
-        super().setUp()
-        self.doc = fake_client.FakeDoc()
-        self.hosts = {}
-        for h in ("host-a", "host-b"):
-            d = self.ws / h
-            (d / "results" / "archive").mkdir(parents=True)
-            (d / "state").mkdir()
-            self.hosts[h] = {"dir": d, "file": pqs.FileStore(d / "pending-questions.md"),
-                             "db": pqs.RoomDbStore(InProcClient(self.doc), lock=d / "state" / "lock", host=h)}
-
-    def _pass(self, h):
-        hs = self.hosts[h]
-        return pqs.resync(hs["file"], hs["db"], evidence=lambda a: pqa.asked_here(hs["dir"] / "results", a))
-
-    def _status(self):
-        return {e["ask_id"]: (e["status"], e["host"]) for e in self.hosts["host-a"]["db"].entries()}
-
-    def _gather(self, h):
-        hs = self.hosts[h]
-        cpq = _cpq(hs["file"].path, hs["dir"])
-        cpq.RESULTS_DIR = hs["dir"] / "results"
-        return sorted(q["title"] for q in cpq.gather(hs["db"])[0])
-
-    def test_neither_host_touches_the_others_rows_and_alternation_is_stable(self):
-        a = self.hosts["host-a"]
-        pqs.write_question(self.q("ask-a1", "host A's question?"), a["file"], a["db"])
-        a["file"].stamp("ask-a1", SENT.replace("ask-1", "ask-a1"))
-        a["db"].stamp("ask-a1", SENT.replace("ask-1", "ask-a1"))
-        a["file"].path.write_text(a["file"].path.read_text() + TestMigratedRows.MOVED)
-        a["db"].insert_raw("legacy-abc123def456", "migrated", "page")
-        before = self._status()
-        self.assertEqual(before, {"ask-a1": ("Open", "host-a"), "legacy-abc123def456": ("Open", "host-a")})
-        for _ in range(3):
-            self.assertEqual(self._pass("host-b"), ([], []))
-            self.assertEqual(self._status(), before)
-            self.assertEqual(self._pass("host-a"), ([], []))
-            self.assertEqual(self._status(), before)
-        self.assertEqual(self._gather("host-b"), [])
-        self.assertEqual(self._gather("host-a"), ["host A's question?", "migrated"])
-
-    def test_an_unmarked_row_is_claimed_only_by_the_host_with_evidence_and_keeps_its_status(self):
-
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw("ask-old", "old test row", "p")
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
-            "legacy-abc123def456", "migrated", "p")
-        nohost = pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x")
-        nohost.set_status("ask-old", "Resolved")
-        a = self.hosts["host-a"]
-        a["file"].path.write_text(TestMigratedRows.MOVED)
-        (a["dir"] / "results" / "archive" / "proactive-ask-old-1790000000.txt").write_text("delivered")
-        self.assertEqual(self._pass("host-b"), ([], []))
-        self.assertEqual({k: v[1] for k, v in self._status().items()}, {"ask-old": None, "legacy-abc123def456": None})
-        synced, errors = self._pass("host-a")
-        self.assertEqual((sorted(synced), errors), (["ask-old", "legacy-abc123def456"], []))
-        self.assertEqual(self._status(), {"ask-old": ("Resolved", "host-a"),
-                                          "legacy-abc123def456": ("Open", "host-a")})
-        self.assertEqual(self._pass("host-a"), ([], []))
-
-    def test_a_host_that_loses_the_claim_leaves_the_row_alone(self):
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
-            "legacy-race", "migrated", "p")
-        a, b = self.hosts["host-a"], self.hosts["host-b"]
-        real_rows = b["db"].client.rows
-
-        def rows_then_a_claims(schema):
-            seen = real_rows(schema)  # host B's view: no Host yet
-            self.assertTrue(a["db"].claim_host("legacy-race"))
-            return seen
-        b["db"].client.rows = rows_then_a_claims
-        synced, errors = pqs.resync(b["file"], b["db"], evidence=lambda aid: True)
-        self.assertEqual((synced, errors), ([], []))
-        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
-        b["db"].client.rows = real_rows
-        self.assertEqual(self._pass("host-b"), ([], []))
-        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
-
-
 class TestMonotonicStatus(_Ws):
     def test_code_never_reopens_or_downgrades_a_closed_row(self):
         db = self.db()
@@ -1098,7 +1017,7 @@ class TestDelegation(unittest.TestCase):
     def test_the_reminder_writes_only_through_resync(self):
         s = self.src("src/check-pending-questions.py")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|stamp|set_status)\(")
-        self.assertIn("resync(FileStore(PQ_FILE), store,", s)
+        self.assertIn("resync(FileStore(PQ_FILE), store)", s)
 
     def test_the_migrate_writes_the_file_only_through_the_ledger(self):
         s = self.src("scripts/pending-questions-migrate.py")
@@ -1638,22 +1557,6 @@ class TestMigrateRound3(_MigrateBase):
         [done] = self.m.apply(only, self.ledger, db)
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
-
-    def test_a_migration_on_another_hosts_row_never_changes_it(self):
-        only = self._only()
-        aid, client = only["entries"][0]["ask_id"], InProcClient()
-        pqs.RoomDbStore(client, lock=self.ws / "state" / "a", host="host-a").insert_raw(aid, "Pick?", "page")
-        host_b = pqs.RoomDbStore(client, lock=self.ws / "state" / "b", host="host-b")
-        before = self.ledger.read_text()
-        client.fail_ops = ("add_row",)
-        [done] = self.m.apply(only, self.ledger, host_b)
-        self.assertIn("its row was left as is", done)
-        client.fail_ops = ()
-        [done] = self.m.apply(only, self.ledger, host_b)  # the insert succeeds but the row exists
-        self.assertIn("not this host's to reuse", done)
-        self.assertEqual(self.ledger.read_text(), before)
-        self.assertEqual([(e["status"], e["host"], e["recovery"]) for e in host_b.entries()],
-                         [("Open", "host-a", False)])
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()

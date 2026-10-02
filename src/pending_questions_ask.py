@@ -117,15 +117,6 @@ def drained(results_dir: Path, name: str) -> bool:
     return not p.exists()
 
 
-def asked_here(results_dir: Path, ask_id: str) -> bool:
-    """This host queued that ask: its proactive file, a claim, an archived or a
-    parked copy is in this host's results/ (which no other host shares)."""
-    if not ask_id.startswith("ask-"):
-        return False
-    pattern = str(Path(results_dir) / "**" / f"proactive-{glob.escape(ask_id)}*")
-    return next(iter(glob.iglob(pattern, recursive=True)), None) is not None
-
-
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,
                    within: float = SENT_QUIET_SEC) -> bool:
     """Queued within `within` AND drained. An undrained file is not a delivery
@@ -237,7 +228,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     out["ledger"] = str(pq)
     file_store = FileStore(pq)
     if store is not None:
-        synced, errors = resync(file_store, store, evidence=lambda a: asked_here(ws / "results", a))
+        synced, errors = resync(file_store, store)
         out["resync"] = {"synced": synced, "errors": errors}
     q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()),
                  priority)

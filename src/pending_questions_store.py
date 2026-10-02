@@ -334,13 +334,12 @@ DB_SCHEMA = {
          "options": [_opt("high", "High", "red"), _opt("medium", "Medium", "yellow"),
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
-        {"id": "host", "name": "Host", "type": "text"},
         {"id": "recovery", "name": "Recovery", "type": "text"},
     ],
     "views": [
         {"id": "board", "name": "Board", "layout": "board", "groupBy": "status",
-         "hidden": ["ask_id", "host", "recovery"], "filter": [{"prop": "recovery", "op": "empty"}]},
-        {"id": "table", "name": "Table", "layout": "table", "hidden": ["host", "recovery"],
+         "hidden": ["ask_id", "recovery"], "filter": [{"prop": "recovery", "op": "empty"}]},
+        {"id": "table", "name": "Table", "layout": "table", "hidden": ["recovery"],
          "filter": [{"prop": "recovery", "op": "empty"}]},
     ],
 }
@@ -456,15 +455,12 @@ def effective_status(cells: dict) -> str:
 
 
 class RoomDbStore:
-    """`lock` is a host-local mkdir lock every stamp and status transition of this
-    database takes. `host` is this host's label: rows carry their origin host, and
-    a host reconciles only its own (None: a single-host store, every row is its own)."""
+    """`lock` is a host-local mkdir lock every stamp and guarded write of this
+    database takes. The owner's DM has one Sutando, so this host is its only agent writer."""
     kind = "room-db"
 
-    def __init__(self, client: DbClient, label: str = "the owner's DM room", lock: Optional[Path] = None,
-                 host: Optional[str] = None):
+    def __init__(self, client: DbClient, label: str = "the owner's DM room", lock: Optional[Path] = None):
         self.client, self.label, self.lock = client, label, Path(lock) if lock else None
-        self.host = host
         self.last_link: Optional[str] = None
 
     def where(self, ask_id: str) -> str:
@@ -474,8 +470,6 @@ class RoomDbStore:
                    status: str = "Open") -> dict:
         cells = {"name": one_line_title(title), "status": _option_id("status", status),
                  "priority": _option_id("priority", priority), "ask_id": ask_id}
-        if self.host:
-            cells["host"] = self.host
         res = self.client.add_row(DB_SCHEMA, row_id(ask_id), cells, body) or {}
         self.last_link = res.get("link")
         return res
@@ -502,24 +496,16 @@ class RoomDbStore:
         self._locked(lambda: self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line))
 
     def _guarded(self, ask_id: str, cells: dict, expect: dict) -> None:
-        """Write `cells` only while every `expect` prop holds one of its listed raw values
-        (and Host is this host), checked and written in one client call under `lock`."""
-        if self.host:
-            expect = {"host": [self.host], **expect}
+        """Write `cells` only while every `expect` prop holds one of its listed raw values,
+        checked and written in one client call under `lock`."""
         res = self._locked(lambda: self.client.guarded(DB_SCHEMA, row_id(ask_id), cells, expect)) or {}
         if not res.get("written"):
             names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
             current = {k: names.get(v, v) if k == "status" else v for k, v in (res.get("current") or {}).items()}
             raise GuardFailed(ask_id, {k: v for k, v in current.items() if v is not None})
 
-    def claim_host(self, ask_id: str) -> bool:
-        """Set this host as the row's origin when it has none; never changes its status."""
-        res = self._locked(lambda: self.client.guarded(
-            DB_SCHEMA, row_id(ask_id), {"host": self.host}, {"host": [None]})) or {}
-        return bool(res.get("written"))
-
     def close(self, ask_id: str, to: str) -> None:
-        """Status -> Answered/Resolved on this host's row that is not closed yet. The only
+        """Status -> Answered/Resolved on a row that is not closed yet. The only
         Status values code writes are terminal, so code never reopens a decision."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
@@ -527,11 +513,11 @@ class RoomDbStore:
                       {"status": [None, _option_id("status", "Open"), _option_id("status", SUPERSEDED)]})
 
     def supersede(self, ask_id: str) -> None:
-        """Mark this host's open row superseded, in the Recovery cell only."""
+        """Mark an open row superseded, in the Recovery cell only."""
         self._guarded(ask_id, {"recovery": RECOVERY}, {"status": [None, _option_id("status", "Open")]})
 
     def restore(self, ask_id: str) -> None:
-        """Clear this host's Recovery mark; Status is not touched."""
+        """Clear the Recovery mark; Status is not touched."""
         self._guarded(ask_id, {"recovery": None}, {})
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
@@ -548,16 +534,13 @@ class RoomDbStore:
             cells = r.get("cells") or {}
             if cells.get("ask_id"):
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
-                            "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
+                            "body": (r.get("body") or "").strip(),
                             "recovery": bool(cells.get("recovery")), "status": effective_status(cells)})
         return out
 
     def open_entries(self) -> list:
         return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
                 if e["status"] == "Open"]
-
-    def owns(self, row: dict) -> bool:
-        return self.host is None or row.get("host") == self.host
 
 
 # ---- the adapter registration ---------------------------------------------------
@@ -628,20 +611,15 @@ def settled(line: Optional[str]) -> bool:
     return bool(line) and not _PLACEHOLDER_RE.match(line)
 
 
-def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
-    """Bring this host's rows and this host's file level, never retiring a file entry.
+def resync(file_store: FileStore, db_store) -> tuple:
+    """Bring the database and the file level, never retiring a file entry.
 
-    A row is this host's only when its Host reads as this host. A row with no Host
-    is claimed when this host's file links it or `evidence(ask_id)` says this host
-    asked it; a claim another host won first leaves it foreign, and a foreign row is
-    never judged against this host's file.
-    For this host's rows: an open file entry the database lacks is inserted; an
+    An open file entry the database lacks is inserted; an
     entry below the divider closes its row; a status closed on either side closes
     the other; a settled `**Sent:**` fills the other side's placeholder; a migration
     row no file entry links is superseded, and one a file entry links is restored.
-    Every write is guarded on Host (and on Status where it matters); code writes
-    Status only to close a row and marks recovery in its own cell, so an owner's
-    Answered/Resolved survives any concurrent pass. (synced ask ids, errors)."""
+    Code writes Status only to close a row and marks recovery in its own cell, so
+    an owner's Answered/Resolved survives a concurrent pass. (synced ask ids, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
@@ -653,18 +631,7 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
     def note(aid, ex):
         errors.append(str(ex) if isinstance(ex, GuardFailed) else f"{aid}: {type(ex).__name__}: {ex}")
 
-    own = {}
-    for aid, r in found.items():
-        if db_store.owns(r):
-            own[aid] = r
-        elif not r.get("host") and (aid in linked or (evidence is not None and evidence(aid))):
-            try:
-                if db_store.claim_host(aid):
-                    own[aid] = {**r, "host": db_store.host}
-                    synced.append(aid)
-            except Exception as ex:  # noqa: BLE001
-                note(aid, ex)
-
+    own = found
     for aid, r in own.items():
         try:
             if r["status"] in TERMINAL and r.get("recovery"):
@@ -690,8 +657,6 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
                 db_store.insert_raw(aid, q.question, question_body(q).replace(placeholder(aid), sent),
                                     q.priority)
                 synced.append(aid)
-                continue
-            if aid not in own:
                 continue
             row, row_sent = own[aid], sent_line_of(own[aid]["body"])
             if row["status"] == SUPERSEDED:
