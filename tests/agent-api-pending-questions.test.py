@@ -49,6 +49,12 @@ ITEMS = [
 ]
 
 
+def _g(items, unavailable=False, reason=None):
+    """The reader's gather shape."""
+    return {"waiting": items, "done": None if unavailable else 0, "unavailable": unavailable, "reason": reason,
+            "link": None, "notes": [], "store": None}
+
+
 class Rows(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="agentapi-pq-"))
@@ -61,7 +67,7 @@ class Rows(unittest.TestCase):
         api.WORKSPACE_DIR = self.saved
 
     def test_rows_come_from_the_reader_in_the_triage_shape(self):
-        with mock.patch.object(api.pending_questions_reader, "waiting", return_value=ITEMS) as w:
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)) as w:
             rows = api._pending_question_rows()
         w.assert_called_once_with(self.tmp)
         by_id = {r["id"]: r for r in rows}
@@ -76,18 +82,18 @@ class Rows(unittest.TestCase):
         self.assertFalse(by_id["ask-held"]["in_room"])
 
     def test_rows_are_oldest_first_undated_sorts_last(self):
-        with mock.patch.object(api.pending_questions_reader, "waiting", return_value=ITEMS):
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
             rows = api._pending_question_rows()
         self.assertEqual([r["id"] for r in rows], ["ask-alpha", "ask-bravo", "ask-held"])
 
     def test_dismissed_rows_are_removed(self):
         api.pq_triage.dismiss(api._dismissed_questions_path(), "ask-alpha")
-        with mock.patch.object(api.pending_questions_reader, "waiting", return_value=ITEMS):
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
             rows = api._pending_question_rows()
         self.assertEqual([r["id"] for r in rows], ["ask-bravo", "ask-held"])
 
     def test_recheck_labels_a_merged_blocker_stale_and_keeps_it(self):
-        with mock.patch.object(api.pending_questions_reader, "waiting", return_value=ITEMS), \
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)), \
                 mock.patch.object(api, "_probe_ref_states", return_value={("sonichi/sutando", 4242): "MERGED"}):
             rows = api._pending_question_rows(recheck=True)
         stale = [r for r in rows if r.get("recheck")]
@@ -99,8 +105,21 @@ class Rows(unittest.TestCase):
         for needle in ("parse_pending_questions", "answer_pending_question", "pending_questions_md",
                        "pending_questions_ledger", 'personal_path("pending-questions.md"'):
             self.assertNotIn(needle, src, needle)
-        self.assertIn("pending_questions_reader.waiting(", src)
+        self.assertIn("pending_questions_reader.gather(", src)
         self.assertIn("pending_questions_reader.resolve(", src)
+        self.assertNotIn("pending_questions_reader.waiting(", src, "waiting() hides `unavailable`; the payload needs it")
+
+    def test_an_unreachable_room_is_flagged_in_the_payload_not_an_empty_queue(self):
+        held = [i for i in ITEMS if not i["in_room"]]
+        with mock.patch.object(api.pending_questions_reader, "gather",
+                               return_value=_g(held, unavailable=True, reason="room down")):
+            payload = api._active_tasks_payload(True, True)
+            queue = api._questions_queue_payload()
+        self.assertEqual(payload["questions_unavailable"], "room down")
+        self.assertEqual([q["id"] for q in payload["questions"]], ["ask-held"])
+        self.assertEqual(queue["questions_unavailable"], "room down")
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
+            self.assertIsNone(api._active_tasks_payload(True, True)["questions_unavailable"])
 
 
 def _floor_interpreter():
@@ -183,10 +202,10 @@ class AnswerRoute(unittest.TestCase):
             closed.append((ask_id, status))
             return True, "closed"
 
-        def _waiting(ws):
-            return [i for i in ITEMS if i["ask_id"] not in [c[0] for c in closed]]
+        def _gather(ws):
+            return _g([i for i in ITEMS if i["ask_id"] not in [c[0] for c in closed]])
 
-        with mock.patch.object(api.pending_questions_reader, "waiting", _waiting), \
+        with mock.patch.object(api.pending_questions_reader, "gather", _gather), \
                 mock.patch.object(api.pending_questions_reader, "resolve", _resolve):
             code, data = self.req("GET", "/tasks/active")
             self.assertEqual(code, 200)
@@ -208,6 +227,26 @@ class AnswerRoute(unittest.TestCase):
             code, _ = self.req("POST", "/answer", {"id": "ask-bravo"})
             self.assertEqual(code, 400)
             self.assertEqual(len(list((self.tmp / "tasks").glob("answer-*.txt"))), 1)
+
+    def test_an_answer_during_an_outage_is_kept_and_a_local_close_counts_as_closed(self):
+        """The owner's typed answer never drops: a local close record (resolve True) is a 200
+        with the task written; only UNRECORDED is a failure, and even then the task is written."""
+        for why, code in (("recorded locally as Answered in x (room unreachable)", 200),
+                          ("UNRECORDED: room unreachable; and the local close record failed", 503)):
+            with self.subTest(why=why):
+                for f in (self.tmp / "tasks").glob("answer-*.txt"):
+                    f.unlink()
+                with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)), \
+                        mock.patch.object(api.pending_questions_reader, "resolve",
+                                          return_value=(code == 200, why)):
+                    got, data = self.req("POST", "/answer", {"id": "ask-bravo", "answer": "ship it"})
+                self.assertEqual(got, code, data)
+                [task] = list((self.tmp / "tasks").glob("answer-ask-bravo-*.txt"))
+                self.assertIn("ship it", task.read_text())
+                if code == 503:
+                    self.assertIn("could not be closed", data["error"])
+                    self.assertTrue(data["recorded"])
+                task.unlink()  # the class shares one tasks/ dir
 
 
 if __name__ == "__main__":

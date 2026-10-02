@@ -138,7 +138,7 @@ class InProcClient:
 
 
 def _cpq(ws):
-    spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+    spec = importlib.util.spec_from_file_location("cpq", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.WORKSPACE = Path(ws)
@@ -176,7 +176,8 @@ class _Ws(unittest.TestCase):
         return sorted(p.name for p in (self.ws / "state" / "pending-questions-outbox").glob("*"))
 
     def ask(self, question="q?", store=None, **kw):
-        return pqa.ask_owner(question, urgency="durable", workspace=self.ws, host=HOST, store=store, **kw)
+        """The skill's ask (reconcile, queue, hold, row); `store=None` holds it in the outbox."""
+        return adapter.ask_owner(question, urgency="durable", workspace=self.ws, host=HOST, store=store, **kw)
 
 
 SENT = "**Sent:** queued owner-dm via proactive-ask-1.txt at 2026-09-01T00:00:00Z"
@@ -383,7 +384,7 @@ class TestEdges(_Ws):
     def test_ask_owner_cli_resolves_the_workspace_and_refuses_a_bad_option(self):
         cli = str(REPO / "scripts" / "ask-owner.py")
         with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), \
-                mock.patch.object(pqs, "declared_adapter", return_value=None), \
+                mock.patch.object(reader, "declared_adapter", return_value=None), \
                 mock.patch.object(sys, "argv", [cli, "q?", "--urgency", "durable"]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
@@ -452,12 +453,12 @@ class TestAskOwner(_Ws):
         held = self.ask("First?")  # no store: held
         db = self.db()
         out = self.ask("Second?", store=db)
-        self.assertEqual(out["reconcile_pending"]["flushed"], [held["ask_id"]])
+        self.assertEqual(out["reconcile"]["flushed"], [held["ask_id"]])
         self.assertEqual(self.outbox(), [])
         self.assertEqual(sorted(e["ask_id"] for e in db.open_entries()), sorted([held["ask_id"], out["ask_id"]]))
         held_row = next(e for e in db.entries() if e["ask_id"] == held["ask_id"])
         self.assertIn(f"via {held['proactive_file']} at", held_row["body"])
-        self.assertEqual(self.ask("Third?", store=db)["reconcile_pending"]["flushed"], [])
+        self.assertEqual(self.ask("Third?", store=db)["reconcile"]["flushed"], [])
         self.assertEqual(len(db.entries()), 3)
 
     def test_crash_before_the_room_write_outbox_present_row_absent_next_pass_creates_it(self):
@@ -571,12 +572,13 @@ def reconcile_items(tc, db):
 
 
 class TestGather(_Ws):
-    """The adapter's pass, over the fake capability: reconcile_pending, then rows + outbox, once each."""
+    """The adapter over the fake capability: the explicit pass (reconcile), then the read-only
+    gather lists rows + outbox, once each."""
 
-    def _gather(self, env=None):
+    def _gather(self, env=None, reconcile=True):
         state = self.ws / "fake-room.json"
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(state), **(env or {})}):
-            return adapter.gather(self.ws, environ={})
+            return adapter.gather(self.ws, environ={}, reconcile=reconcile)
 
     def test_rows_and_held_questions_are_listed_once_each_and_counted_alike(self):
         held = self.ask("Held?")  # no store yet
@@ -590,20 +592,23 @@ class TestGather(_Ws):
             g = self._gather()
             self.assertEqual(sorted((i["ask_id"], i["in_room"]) for i in g["waiting"]),
                              sorted([(held["ask_id"], True), (asked["ask_id"], True)]))
-            self.assertEqual((g["done"], g["notes"]), (1, []))
+            self.assertEqual((g["done"], g["notes"], g["unavailable"]), (1, [], False))
             self.assertEqual(self.outbox(), [])
-            self.assertEqual(adapter.count(self.ws), {"open": 2, "done": 1})
+            full = {"open": 2, "done": 1, "unavailable": False, "reason": None}
+            self.assertEqual(adapter.count(self.ws), full)
             self.assertEqual(len(adapter.waiting(self.ws)), 2)
-            self.assertEqual(reader.count(self.ws, adapter=Path(adapter.__file__)), {"open": 2, "done": 1})
+            self.assertEqual(reader.count(self.ws, adapter=Path(adapter.__file__)), full)
 
-    def test_an_unreachable_room_lists_the_outbox_and_says_why(self):
+    def test_an_unreachable_room_lists_the_outbox_and_says_unknown_not_zero(self):
         _install_fake_capability(self.ws)
         with mock.patch.dict(os.environ, {"FAKE_ROOM_FAIL": "1", "FAKE_ROOM_STATE": str(self.ws / "r.json")}):
             store, _ = adapter.room_store(self.ws, environ={})
             out = self.ask("q?", store=store)
             g = adapter.gather(self.ws, environ={})
         self.assertEqual([(i["ask_id"], i["in_room"]) for i in g["waiting"]], [(out["ask_id"], False)])
-        self.assertTrue(any("service refused" in n for n in g["notes"]), g["notes"])
+        self.assertEqual((g["unavailable"], g["done"]), (True, None))
+        self.assertIn("service refused", g["reason"])
+        self.assertTrue(any("UNAVAILABLE" in n and "service refused" in n for n in g["notes"]), g["notes"])
 
     def test_resolve_closes_the_row_and_files_a_held_question_first(self):
         held = self.ask("Held?")
@@ -611,16 +616,20 @@ class TestGather(_Ws):
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(self.ws / "r.json")}):
             ok, msg = adapter.resolve(self.ws, held["ask_id"], "Answered")
             self.assertTrue(ok, msg)
-            self.assertEqual(adapter.count(self.ws), {"open": 0, "done": 1})
+            self.assertIn("-> Answered", msg)
+            self.assertEqual(adapter.count(self.ws)["open"], 0)
+            self.assertEqual(adapter.count(self.ws)["done"], 1)
             ok, msg = adapter.resolve(self.ws, held["ask_id"], "Resolved")
             self.assertFalse(ok)
             self.assertIn("not changed", msg)
             self.assertFalse(adapter.resolve(self.ws, "ask-nope", "Resolved")[0])
 
-    def test_without_the_capability_resolve_says_so(self):
+    def test_without_the_capability_resolve_records_the_close_locally(self):
         ok, msg = adapter.resolve(self.ws, "ask-1", "Resolved")
-        self.assertFalse(ok)
-        self.assertIn("no room-collab capability", msg)
+        self.assertTrue(ok, msg)
+        self.assertIn("recorded locally as Resolved", msg)
+        self.assertIn("no room capability installed", msg)
+        self.assertTrue((self.ws / "state" / "pending-questions-outbox" / "closed" / "ask-1.json").exists())
 
 
 class TestTwoHostsOneRoom(_Ws):
@@ -755,12 +764,12 @@ class TestReminder(_Ws):
         cpq = _cpq(self.ws)
         cpq.notify_macos = lambda count, titles: True
         cpq.voice_client_connected = lambda: False
-        fake = mock.Mock(gather=lambda ws: {"waiting": [pqs.waiting_item(e["ask_id"], e["title"], e["body"],
-                                                                         e["asked_at"], True)
-                                                        for e in db.open_entries()]
-                                            + pqs.outbox_items(ws), "done": 0, "notes": [], "store": "x"})
+        def fake_gather(ws, environ=None, reconcile=False):
+            return {"waiting": [pqs.waiting_item(e["ask_id"], e["title"], e["body"], e["asked_at"], True)
+                                for e in db.open_entries()] + pqs.outbox_items(ws),
+                    "done": 0, "notes": [], "store": "x", "unavailable": False, "reason": None}
         buf = io.StringIO()
-        with mock.patch.object(reader, "_adapter", return_value=(fake, "fake")), \
+        with mock.patch.object(adapter, "gather", fake_gather), \
                 mock.patch.object(sys, "argv", ["check-pending-questions.py", *argv]), \
                 contextlib.redirect_stdout(buf):
             cpq.main()
@@ -770,7 +779,7 @@ class TestReminder(_Ws):
         db = self.db()
         self.ask("fresh?", store=db)
         held = self.ask("held?")
-        for flags in ((), ("--reconcile_pending-only",), ("--force",)):
+        for flags in ((), ("--reconcile-only",), ("--force",)):
             out = self._main(db, *flags)
             self.assertIn("2 pending questions; nothing sent", out)
             self.assertIn(f"[{held['ask_id']}] held? (not yet in the room)", out)
@@ -810,57 +819,67 @@ class TestReminder(_Ws):
 class TestDelegation(unittest.TestCase):
     """Each write has one owner; core never names the capability or the skill."""
 
+    SKILL = "skills/pending-questions/scripts/"
+
     def src(self, rel):
         return (REPO / rel).read_text()
 
     def test_core_never_names_the_capability_or_the_skill(self):
-        for rel in ("src/pending_questions_store.py", "src/pending_questions_ask.py", "src/pending_questions_reader.py",
-                    "src/check-pending-questions.py", "src/pending_questions_ledger.py", "src/pending_questions_compat.py"):
-            self.assertNotRegex(self.src(rel), r"room[-_]collab", rel)
+        for rel in ("src/pending_questions_ask.py", "src/pending_questions_reader.py", "src/pending_questions_outbox.py",
+                    "src/check-pending-questions.py", "src/pending_questions_ledger.py", "scripts/ask-owner.py"):
+            self.assertNotRegex(self.src(rel), r"room[-_]collab|room[-_]commons", rel)
             self.assertNotRegex(self.src(rel), r"pending_questions_room_db|skills/pending-questions", rel)
-        self.assertNotRegex(self.src("scripts/ask-owner.py"), r"pending_questions_room_db|skills/pending-questions")
 
-    def test_ask_owner_writes_only_through_the_store_and_the_outbox(self):
-        s = self.src("src/pending_questions_ask.py")
-        self.assertIn("outbox.save(q, sent_line, now)", s)
-        self.assertIn("write_question(q, store, sent_line)", s)
-        self.assertLess(s.index("outbox.save("), s.index("write_question(q, store"), "outbox before the room write")
+    def test_the_skills_ask_queues_then_holds_then_writes_the_row_and_only_with_a_held_record(self):
+        s = self.src(self.SKILL + "pending_questions_room_db.py")
+        self.assertIn("core_ask.queue_question(", s)
+        self.assertIn('if out["outbox"] is None:', s)
+        self.assertLess(s.index("core_ask.queue_question("), s.index('if out["outbox"] is None:'))
+        self.assertLess(s.index('if out["outbox"] is None:'), s.index("write_question(q, store, out[\"sent_line\"])"))
         self.assertNotRegex(s, r"\bledger\.|FileStore|pending-questions\.md")
+        core = self.src("src/pending_questions_ask.py")
+        self.assertIn("Outbox(ws).save(out[\"question\"], out[\"sent_line\"], now)", core)
+        self.assertLess(core.index("write_proactive(ws"), core.index("Outbox(ws).save("), "queue, then hold")
 
-    def test_the_store_confirms_before_the_outbox_entry_goes(self):
-        s = self.src("src/pending_questions_store.py")
+    def test_the_store_confirms_the_exact_ask_id_before_the_outbox_entry_goes(self):
+        s = self.src(self.SKILL + "pending_questions_store.py")
         self.assertIn("if not store.complete(q.ask_id):", s)
         self.assertLess(s.index("store.complete(q.ask_id)"), s.index("self.delete(q.ask_id)"))
-        self.assertNotRegex(s, r"FileStore|def resync|def stamp|set_status")
+        self.assertIn('if cells.get("ask_id") != ask_id or not self.owns(cells):', s)
+        self.assertNotRegex(s, r"FileStore|def resync|def stamp|set_status|re\.sub\(r\"\[\^A-Za-z0-9_-\]\"")
 
     def test_the_adapter_writes_only_through_the_documents_own_calls(self):
-        s = self.src("skills/pending-questions/scripts/pending_questions_room_db.py")
+        s = self.src(self.SKILL + "pending_questions_room_db.py")
         writes = set(re.findall(r"await doc\.(\w+)\(", s))
         self.assertEqual(writes, {"put_database", "put_row_body", "settle"})
         self.assertNotRegex(s, r"write_text|os\.replace|pending-questions\.md")
 
-    def test_the_reminder_reads_through_the_reader_and_writes_nothing(self):
-        s = self.src("src/check-pending-questions.py")
-        self.assertIn("reader.gather(WORKSPACE, adapter, SKILLS_DIR)", s)
+    def test_the_reminder_reads_the_siblings_pass_and_writes_no_row(self):
+        s = self.src(self.SKILL + "pending_questions_remind.py")
+        self.assertIn("room_db.gather(WORKSPACE, reconcile=True)", s)
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|close|clear)\(|PQ_FILE|personal_path|pending-questions\.md")
-        self.assertIn('if "--notify" not in sys.argv', s)
+        self.assertIn('if "--notify" not in argv', s)
+        shim = self.src("src/check-pending-questions.py")
+        self.assertIn('hasattr(mod, "remind")', shim)
+        self.assertNotRegex(shim, r"notify_macos|proactive-pending-q|write_text")
 
     def test_ask_owner_cli_injects_what_discovery_found(self):
         seen = {}
-        fake = object()
+        store = object()
 
-        def _ask(*a, **kw):
+        def _ask(question, **kw):
             seen.update(kw)
             return {"db_error": None, "record": "x", "heading": "## x", "outbox": None, "link": None,
-                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile_pending": None}
+                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile": None}
+        fake = mock.Mock(room_store=lambda ws: (store, ROOM), ask_owner=_ask, report_lines=lambda out: ["recorded: x"])
         ws = tempfile.mkdtemp()
-        with mock.patch.object(pqs, "load_adapter_store", return_value=(fake, ROOM)), \
-                mock.patch.object(pqa, "ask_owner", _ask), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(reader, "_adapter", return_value=(fake, "fake.py")), \
+                contextlib.redirect_stdout(io.StringIO()):
             spec = importlib.util.spec_from_file_location("ask_owner_cli", REPO / "scripts" / "ask-owner.py")
             m = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(m)
             self.assertEqual(m.main(["q?", "--workspace", ws]), 0)
-        self.assertIs(seen["store"], fake)
+        self.assertIs(seen["store"], store)
 
     def test_the_migration_script_is_gone(self):
         self.assertFalse((REPO / "scripts" / "pending-questions-migrate.py").exists())

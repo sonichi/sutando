@@ -71,13 +71,16 @@ def test_payload_reconciles_files_history_and_questions() -> None:
                     "body": "Pick one.", "asked_at": None, "priority": "medium", "in_room": True}]
 
         try:
-            with mock.patch.object(api.pending_questions_reader, "waiting", return_value=pending):
+            gathered = {"waiting": pending, "done": 0, "unavailable": False, "reason": None, "link": None,
+                        "notes": [], "store": None}
+            with mock.patch.object(api.pending_questions_reader, "gather", return_value=gathered):
                 payload = api._active_tasks_payload(watcher_ok=True, core_ok=False)
         finally:
             api.TASK_DIR, api.RESULT_DIR, api.WORKSPACE_DIR = original
             api.task_history.clear()
 
-    assert set(payload) == {"tasks", "watcher", "claude", "questions"}
+    assert set(payload) == {"tasks", "watcher", "claude", "questions", "questions_unavailable"}
+    assert payload["questions_unavailable"] is None
     assert payload["watcher"] is True
     assert payload["claude"] is False
     rows = {row["id"]: row for row in payload["tasks"]}
