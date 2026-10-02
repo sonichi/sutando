@@ -141,6 +141,15 @@ class AnswerOrdering(unittest.TestCase):
         self.assertIn("my word", (self.tmp / "tasks" / task).read_text())
         (self.tmp / "tasks" / task).unlink()
 
+    def test_a_waiting_id_with_no_file_safe_characters_cannot_be_filed_and_stays_open(self):
+        with mock.patch.object(self.api.pending_questions_reader, "gather", return_value=self._waiting("///")), \
+                mock.patch.object(self.api.pending_questions_reader, "resolve") as r:
+            code, data = self.api.answer_question("///", "x")
+        self.assertEqual(code, 500, data)
+        self.assertIn("no file-safe characters", data["error"])
+        r.assert_not_called()
+        self.assertEqual(self.tasks(), [])
+
     def test_an_id_that_is_not_waiting_files_no_task_and_an_unclosable_one_keeps_it(self):
         with mock.patch.object(self.api.pending_questions_reader, "gather", return_value=self._waiting("ask-a")), \
                 mock.patch.object(self.api.pending_questions_reader, "resolve") as r:
@@ -297,6 +306,17 @@ class CloseReplay(rdb._Ws):
 
 
 # ---- 4. a local close stands in for a row only when something says the row exists --------
+
+class RecordNames(unittest.TestCase):
+    def test_a_name_that_is_not_one_path_segment_is_refused_before_any_path_exists(self):
+        import local_record
+        d = local_record.RecordDir(Path(tempfile.mkdtemp()) / "records")
+        for bad in ("../x", "a/b", ".hidden", "", "a b", "x" * 201, None):
+            with self.assertRaises(local_record.BadName):
+                d.path(bad)
+        self.assertFalse(d.dir.exists())
+        self.assertEqual(d.entries(), [])
+
 
 class LocalCloseGate(rdb._Ws):
     def test_an_unknown_id_with_no_adapter_store_is_refused_and_changes_no_count(self):

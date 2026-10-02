@@ -104,10 +104,6 @@ class RecordDir:
             return None
         return d
 
-    def read(self, name: str) -> Optional[dict]:
-        p = self.path(name)
-        return self.read_file(p) if p.is_file() and self.contains(p) else None
-
     def files(self) -> list:
         return sorted(p for p in self.dir.glob("*.json") if p.is_file() and self.contains(p)) if self.dir.is_dir() else []
 
