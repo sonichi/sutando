@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The room-database adapter for owner pending questions.
+"""The room-database adapter for owner pending questions — the single reader and writer
+core reaches through the manifest's `pending_questions_store` declaration.
 
 `room_store(workspace)` is the discovery, kept at this edge: the room-collab
 capability (the workspace's skill, else the repo's) and the owner's DM room and
@@ -8,8 +9,9 @@ agent identity from the gateway's own reading (`state/owner-routing.json`, an
 pending_questions_store.RoomDbStore whose client runs this file's `serve`, or
 None and the reason when anything is missing.
 
-`register` records this adapter for the reminder pass of an install whose rows
-were made before discovery recorded it.
+`gather(workspace)` is every pass: reconcile (outbox replay, stale marks, the
+transitional legacy ingest), then this host's open rows plus the outbox's held
+questions, each once. `waiting`, `count` and `resolve` are its views.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -28,7 +30,8 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter, safe_body  # noqa: E402
+from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, RoomDbStore,  # noqa: E402
+                                     ScriptDbClient, outbox_items, reconcile, safe_body, waiting_item)
 from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
@@ -38,6 +41,9 @@ GAP = 1024
 SETTLE_SEC = 1.0
 # The documented room-surface link shape; `page` is the database id.
 LINK_TEMPLATE = "{origin}/#/room/{room}?surface=db&page={db}"
+ROOM_KEY = "PENDING_QUESTIONS_ROOM"
+# A collab service URL override, so a test run can point this adapter at an unreachable one.
+URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -53,9 +59,6 @@ def owner_routing(workspace: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return d if isinstance(d, dict) else {}
-
-
-ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 
 
 def configured_room(workspace: Path, environ) -> str:
@@ -76,6 +79,18 @@ def configured_room(workspace: Path, environ) -> str:
     return room
 
 
+def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
+    """The database's page in the room, from the capability's own URL resolution; None if unknown."""
+    try:
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
+        return LINK_TEMPLATE.format(origin=resolve_url(url_override or None).rstrip("/"), room=room,
+                                    db=DB_SCHEMA["id"])
+    except Exception:  # noqa: BLE001 — a link is a convenience, never a precondition
+        return None
+
+
 def room_store(workspace: Path, environ=None, timeout: float = 90.0):
     """(RoomDbStore, where) when the capability, the room and an identity all
     resolve; (None, why not) otherwise. The room is the configured one, else the owner DM."""
@@ -93,14 +108,68 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
         or str(routing.get("identity") or "").strip()
     if not user:
         return None, "no agent identity to sign database writes with"
+    url_override = (env.get(URL_KEY) or "").strip()
     argv = [sys.executable, str(Path(__file__).resolve()), "serve", "--room", room,
             "--user-id", user, "--skill-scripts", str(scripts)]
-    try:
-        register_adapter(workspace, Path(__file__))
-    except OSError as e:
-        print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
+    if url_override:
+        argv += ["--collab-url", url_override]
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's {'room' if shared else 'DM room'} {room}",
-                       lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label()), room
+                       lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label(),
+                       link=_db_link(scripts, room, url_override)), room
+
+
+# ---- the reader -------------------------------------------------------------------
+
+def gather(workspace: Path, environ=None) -> dict:
+    """{"waiting": items, "done": n, "notes": [...], "store": where}: this host's open rows after
+    the pass's reconcile, then the outbox's held questions (each marked not yet in the room);
+    an ask id held in the outbox is listed once. Without a store: the outbox, and why."""
+    from util_paths import host_label
+    ws = Path(workspace)
+    store, where = room_store(ws, environ)
+    notes, rows, done = [], [], 0
+    if store is None:
+        notes.append(f"room database: not used ({where}); listing the local outbox only")
+        return {"waiting": outbox_items(ws), "done": 0, "notes": notes, "store": None}
+    try:
+        rec = reconcile(store, ws, host_label())
+        notes += [f"reconcile: FAILED — {e}" for e in rec["errors"]]
+        for e in store.entries():
+            if e["status"] in TERMINAL:
+                done += 1
+            elif not e["incomplete"]:
+                rows.append(waiting_item(e["ask_id"], e["title"], e["body"], e["asked_at"], True, e["priority"]))
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"ROOM DATABASE READ FAILED ({type(e).__name__}: {e}); listing the local outbox only")
+        return {"waiting": outbox_items(ws), "done": 0, "notes": notes, "store": store.label}
+    held = {r["ask_id"] for r in rows}
+    rows += [it for it in outbox_items(ws) if it["ask_id"] not in held]
+    return {"waiting": rows, "done": done, "notes": notes, "store": store.label}
+
+
+def waiting(workspace: Path) -> list:
+    return gather(workspace)["waiting"]
+
+
+def count(workspace: Path) -> dict:
+    g = gather(workspace)
+    return {"open": len(g["waiting"]), "done": g["done"]}
+
+
+def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
+    """(closed, message): the row's Closed cell takes `status` (Answered or Resolved); a held
+    outbox question is filed first. Never reopens a closed row."""
+    from util_paths import host_label
+    ws = Path(workspace)
+    store, where = room_store(ws)
+    if store is None:
+        return False, f"room database: not used ({where}); nothing to close"
+    try:
+        reconcile(store, ws, host_label())
+        store.close(ask_id, status)
+        return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"room database: not changed — {type(e).__name__}: {e}"
 
 
 # ---- serve: one request against the databases document -------------------------
@@ -145,7 +214,9 @@ def _cells(maps: dict, db: str, row: str) -> dict:
 
 
 def _row_json(doc, maps: dict, db: str, row: str) -> dict:
-    return {"id": row, "cells": _cells(maps, db, row), "body": doc.row_body(db, row) or ""}
+    meta = (maps.get("rows") or {}).get(_key(db, row)) or {}
+    return {"id": row, "cells": _cells(maps, db, row), "body": doc.row_body(db, row) or "",
+            "created": meta.get("created") if isinstance(meta, dict) else None}
 
 
 def _cell_writes(db: str, row: str, cells: dict, by: str, now_ms: int) -> dict:
@@ -173,7 +244,7 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         # Row and body are two commits. The row is born marked incomplete (hidden, by its host), the
         # body follows, then the mark is cleared; a retry by the same host resumes a marked empty row.
         host = req["cells"].get("host")
-        mark = f"incomplete@{host}" if host else "incomplete"
+        mark = f"{INCOMPLETE}@{host}" if host else INCOMPLETE
         have = _cells(maps, db, row) if exists else {}
         resume = exists and have.get("recovery") == mark and have.get("host") == host
         if exists and not resume:  # an existing row is never written here: its state is reported
@@ -207,13 +278,6 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
             return {"written": False, "current": current}
         await doc.put_database({"cells": _cell_writes(db, row, req["cells"], by, now_ms)})
         return {"written": True, "current": current}
-    if op == "stamp":
-        body, token = doc.row_body(db, row) or "", req["token"]
-        n = body.count(token)
-        if n != 1:
-            raise ValueError(f"token {token!r} occurs {n} times, expected 1")
-        await doc.put_row_body(db, row, body.replace(token, req["replacement"], 1))
-        return None
     raise ValueError(f"unknown op {op!r}")
 
 
@@ -221,7 +285,7 @@ async def _serve(args, req: dict) -> object:
     sys.path.insert(0, args.skill_scripts)
     from room_collab import resolve_token, resolve_url  # noqa: PLC0415 — the injected capability
     from room_collab_client import open_room_collab  # noqa: PLC0415
-    url, token = resolve_url(None), resolve_token(None)
+    url, token = resolve_url(args.collab_url or None), resolve_token(None)
     link = LINK_TEMPLATE.format(origin=url.rstrip("/"), room=args.room, db=req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
@@ -231,25 +295,16 @@ async def _serve(args, req: dict) -> object:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Serve one pending-questions room-database request.")
-    ap.add_argument("command", choices=("serve", "register"))
-    ap.add_argument("--room")
-    ap.add_argument("--user-id")
-    ap.add_argument("--skill-scripts")
-    ap.add_argument("--workspace", type=Path, default=None)
+    ap.add_argument("command", choices=("serve",))
+    ap.add_argument("--room", required=True)
+    ap.add_argument("--user-id", required=True)
+    ap.add_argument("--skill-scripts", required=True)
+    ap.add_argument("--collab-url", default=None)
     args = ap.parse_args(argv)
-    if args.command == "register":
-        if args.workspace is None:
-            from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
-            args.workspace = resolve_workspace(migrate=False)
-        store, where = room_store(args.workspace)
-        print(f"registered for the reminder: {where}" if store else f"not registered: {where}")
-        return 0 if store else 1
-    if not (args.room and args.user_id and args.skill_scripts):
-        ap.error("serve needs --room, --user-id and --skill-scripts")
     try:
         req = json.loads(sys.stdin.read())
         result = asyncio.run(_serve(args, req))
-    except Exception as e:  # noqa: BLE001 — the caller falls back to the file on any failure
+    except Exception as e:  # noqa: BLE001 — the caller keeps the question in the outbox on any failure
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         return 1
     print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask the owner a question he will actually see, and keep the ledger.
+"""Ask the owner a question he will actually see, and record it.
 
 Usage:
   python3 scripts/ask-owner.py "Merge #123 despite the absent CLA check?" \
@@ -10,12 +10,11 @@ Usage:
 
 With --task-file the question goes to that task's own conversation; without it,
 to the owner's DM on the bridge he was last active on. Always exits 0 after a
-non-empty question: every failure is printed, never raised, and the entry
-stands either way. It is always in hosts/<host>/pending-questions.md, the copy
-every file-only reader keeps reading, and also a row of the "Pending questions"
-database in the owner's DM room when a store adapter (--store-adapter, else the
-one an installed skill declares) finds that room; a failed row is said loudly
-on stderr.
+non-empty question: every failure is printed, never raised. The question is a row
+of the "Pending questions" database in the owner's room when a store adapter
+(--store-adapter, else the one an installed skill declares) reaches it; until then
+it is held in the workspace outbox, which the next pass files, and that is said
+loudly on stderr.
 """
 import argparse
 import sys
@@ -66,10 +65,10 @@ def main(argv=None) -> int:
                     default_action=args.default, reason=args.reason, options=args.option,
                     priority=args.priority)
     if store is None:
-        print(f"room database: not used ({where}); the file is the ledger")
-    if out.get("db_error"):
-        print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is in "
-              f"{out['ledger']}", file=sys.stderr)
+        print(f"room database: not used ({where}); the question is held in the outbox")
+    if out.get("outbox"):
+        print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is held in "
+              f"{out['outbox']} until the next pass", file=sys.stderr)
     print("\n".join(report_lines(out)))
     return 0
 
