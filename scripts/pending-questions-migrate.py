@@ -255,7 +255,7 @@ KINDS = ("section", "bullet")
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 
 
 def _text(v) -> bool:
@@ -296,7 +296,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
             and type(plan.get("close_past_window")) is bool
             and isinstance(entries, list) and all(_entry_ok(e) for e in entries)):
         return False
-    selectors = [(e["kind"], e["title"], e["nth"]) for e in entries]
+    selectors = [(e["kind"], e["title"], e["nth"]) for e in entries if e["nth"] is not None]
     return len(selectors) == len(set(selectors))
 
 
@@ -392,6 +392,7 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
         return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     if not made.get("created"):
         try:
+            store.rewrite_body(r["ask_id"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
             store.restore(r["ask_id"])
         except GuardFailed as e:
             return f"skipped: the row exists and is not this host's to reuse ({e}); the file entry stays"
