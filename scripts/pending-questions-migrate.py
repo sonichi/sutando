@@ -254,9 +254,18 @@ PLAN_VERSION = 2
 KINDS = ("section", "bullet")
 
 
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _line(v) -> bool:
+    return isinstance(v, str) and bool(v) and not _CONTROL.search(v)
+
+
 def _entry_ok(e) -> bool:
     return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
-            and all(isinstance(e.get(k), str) for k in ("title", "why", "ask_id", "body"))
+            and _line(e.get("title")) and all(isinstance(e.get(k), str) for k in ("why", "ask_id", "body"))
+            and (e.get("sha") is None or (isinstance(e.get("sha"), str) and _DIGEST.fullmatch(e["sha"])))
             and "nth" in e and "sha" in e and (e["nth"] is None) == (e["sha"] is None)
             and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0 and isinstance(e["sha"], str))))
 
@@ -266,10 +275,14 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
     if not isinstance(plan, dict):
         return False
     entries = plan.get("entries")
-    return (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and bool(host)
-            and plan.get("host") == host and isinstance(plan.get("ledger"), str)
-            and isinstance(plan.get("ledger_sha256"), str) and type(plan.get("close_past_window")) is bool
-            and isinstance(entries, list) and all(_entry_ok(e) for e in entries))
+    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and bool(host)
+            and plan.get("host") == host and _line(plan.get("ledger"))
+            and isinstance(plan.get("ledger_sha256"), str) and _DIGEST.fullmatch(plan["ledger_sha256"])
+            and type(plan.get("close_past_window")) is bool
+            and isinstance(entries, list) and all(_entry_ok(e) for e in entries)):
+        return False
+    selectors = [(e["kind"], e["title"], e["nth"]) for e in entries]
+    return len(selectors) == len(set(selectors))
 
 
 def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
@@ -310,14 +323,14 @@ def _bind(r: dict, text: str, host: Optional[str]) -> dict:
 
 def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> list:
     """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
-    done, cpw = [], plan.get("close_past_window", False)
-    if store is not None and getattr(store, "host", None) != host:
-        return [f"refused: the store is for host {getattr(store, 'host', None)!r}, not {host!r}"]
     if not plan_fits(plan, host):
         return [f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on host {host!r}; "
                 f"re-run the dry run there"]
+    done, cpw = [], plan["close_past_window"]
     if Path(plan["ledger"]).resolve() != Path(ledger_file).resolve():
         return [f"refused: the plan is for {plan['ledger']}, not {ledger_file}"]
+    if store is not None and getattr(store, "host", None) != host:
+        return [f"refused: the store is for host {getattr(store, 'host', None)!r}, not {host!r}"]
     text = ledger_file.read_text(encoding="utf-8") if ledger_file.exists() else ""
     entries = [_bind(r, text, host) for r in plan["entries"]]
     acting = [r["ask_id"] for r in entries if not r.get("unbound") and r["class"] == "live"]
