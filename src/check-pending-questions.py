@@ -5,7 +5,7 @@ Every run is a pass: the outbox is replayed into the room database and this host
 open rows plus held questions are listed, through the adapter an installed skill
 declares (`--store-adapter <path>` overrides). Without `--notify` NOTHING is sent —
 an installed schedule running this file with no flag (or the retired
-`--reconcile-only`) is that silent pass. `--notify` (what `pq.py remind` passes)
+`--reconcile_pending-only`) is that silent pass. `--notify` (what `pq.py remind` passes)
 raises the due set over macOS, voice and the owner's DM; `--force` with it skips the
 cooldown, presenter mode and the sent-quiet window.
 """
@@ -303,7 +303,7 @@ def main():
     questions, notes = gather(adapter)
     for note in notes:
         print(note, file=sys.stderr)
-    if "--notify" not in sys.argv:  # the scheduled or flagless run: reconcile and list, send nothing
+    if "--notify" not in sys.argv:  # the scheduled or flagless run: reconcile_pending and list, send nothing
         print(f"{len(questions)} pending questions; nothing sent (reminders are on demand: --notify)")
         for q in questions:
             print(f"- [{q.get('ask_id') or 'no ask id'}] {q['title']}"

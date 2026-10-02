@@ -3,7 +3,7 @@
 
   pq.py ask "<question>" [--context ..] [--urgency live|durable] [--task-file ..]
         [--default-action ..] [--reason ..] [--option 'Label=what it does'] [--priority ..]
-  pq.py list [--json]              # what is waiting on the owner, after this pass's reconcile
+  pq.py list [--json]              # what is waiting on the owner, after this pass's reconcile_pending
   pq.py resolve <ask-id> [--answered]
   pq.py remind [--force]           # src/check-pending-questions.py --notify, args passed through
 

@@ -62,7 +62,7 @@ class TestSingleStore(unittest.TestCase):
             text = p.read_text(encoding="utf-8", errors="replace")
             if re.search(r"(import|from) pending_questions_compat\b", text):
                 importers.append(rel)
-        self.assertEqual(importers, ["src/pending_questions_store.py"], "reconcile() is the single call site")
+        self.assertEqual(importers, ["src/pending_questions_store.py"], "reconcile_pending() is the single call site")
         store = (REPO / "src" / "pending_questions_store.py").read_text()
         self.assertEqual(store.count("ingest_legacy_file_entries("), 1)
         self.assertNotRegex(store, r"def (archive|archived_ids|legacy_entries)\b", "no archive reader in the store")

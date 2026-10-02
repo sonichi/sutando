@@ -9,7 +9,7 @@ agent identity from the gateway's own reading (`state/owner-routing.json`, an
 pending_questions_store.RoomDbStore whose client runs this file's `serve`, or
 None and the reason when anything is missing.
 
-`gather(workspace)` is every pass: reconcile (outbox replay, stale marks, the
+`gather(workspace)` is every pass: reconcile_pending (outbox replay, stale marks, the
 transitional legacy ingest), then this host's open rows plus the outbox's held
 questions, each once. `waiting`, `count` and `resolve` are its views.
 
@@ -31,7 +31,7 @@ from typing import Optional
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, RoomDbStore,  # noqa: E402
-                                     ScriptDbClient, outbox_items, reconcile, safe_body, waiting_item)
+                                     ScriptDbClient, outbox_items, reconcile_pending, safe_body, waiting_item)
 from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
@@ -67,7 +67,8 @@ def configured_room(workspace: Path, environ) -> str:
     room = (environ.get(ROOM_KEY) or "").strip()
     if not room:
         try:
-            cfg = json.loads((Path(__file__).resolve().parent.parent / "manifest.json").read_text(encoding="utf-8"))
+            manifest = Path(__file__).resolve().parent.parent / "manifest.json"  # lint-workspace-resolution: allow-repo-root
+            cfg = json.loads(manifest.read_text(encoding="utf-8"))
             room = str((cfg.get("config") or {}).get(ROOM_KEY) or "").strip()
         except (OSError, ValueError, AttributeError):
             room = ""
@@ -122,7 +123,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
 
 def gather(workspace: Path, environ=None) -> dict:
     """{"waiting": items, "done": n, "notes": [...], "store": where}: this host's open rows after
-    the pass's reconcile, then the outbox's held questions (each marked not yet in the room);
+    the pass's reconcile_pending, then the outbox's held questions (each marked not yet in the room);
     an ask id held in the outbox is listed once. Without a store: the outbox, and why."""
     from util_paths import host_label
     ws = Path(workspace)
@@ -132,8 +133,8 @@ def gather(workspace: Path, environ=None) -> dict:
         notes.append(f"room database: not used ({where}); listing the local outbox only")
         return {"waiting": outbox_items(ws), "done": 0, "notes": notes, "store": None}
     try:
-        rec = reconcile(store, ws, host_label())
-        notes += [f"reconcile: FAILED — {e}" for e in rec["errors"]]
+        rec = reconcile_pending(store, ws, host_label())
+        notes += [f"reconcile_pending: FAILED — {e}" for e in rec["errors"]]
         for e in store.entries():
             if e["status"] in TERMINAL:
                 done += 1
@@ -165,7 +166,7 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     if store is None:
         return False, f"room database: not used ({where}); nothing to close"
     try:
-        reconcile(store, ws, host_label())
+        reconcile_pending(store, ws, host_label())
         store.close(ask_id, status)
         return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except Exception as e:  # noqa: BLE001

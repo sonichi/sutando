@@ -12,7 +12,7 @@ Outbox is the durable local hold for unreachability only: one JSON file per ask,
 written atomically before the room write and deleted only once the complete row
 is confirmed (`RoomDbStore.complete`). It is never edited; `flush` replays each
 entry through the normal add_row path, which resumes a row left incomplete, so a
-replay is idempotent by ask id. `reconcile` is every pass's first step: flush the
+replay is idempotent by ask id. `reconcile_pending` is every pass's first step: flush the
 outbox, then the one transitional ingest of the legacy file.
 """
 from __future__ import annotations
@@ -30,6 +30,7 @@ from typing import Optional, Protocol
 
 import pending_questions_ledger as ledger
 from result_markers import neutralize_markers
+from workspace_default import status_path
 
 STATUSES = ("Open", "Answered", "Resolved")
 TERMINAL = ("Answered", "Resolved")
@@ -398,7 +399,7 @@ class Outbox:
     Question and its delivery record. Written once, deleted once the row is confirmed."""
 
     def __init__(self, workspace):
-        self.dir = Path(workspace) / "state" / OUTBOX_DIR
+        self.dir = status_path(OUTBOX_DIR, Path(workspace))
 
     def path(self, ask_id: str) -> Path:
         return self.dir / f"{ask_id}.json"
@@ -495,7 +496,7 @@ def write_question(q: Question, store, sent_line: str) -> WriteOutcome:
     return out
 
 
-def reconcile(store, workspace, host: Optional[str]) -> dict:
+def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     """Every pass's first step with a reachable store: replay the outbox, clear stale marks on
     this host's rows, then the transitional ingest of the legacy file (its single call site)."""
     flushed, errors = Outbox(workspace).flush(store)

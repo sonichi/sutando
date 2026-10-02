@@ -452,12 +452,12 @@ class TestAskOwner(_Ws):
         held = self.ask("First?")  # no store: held
         db = self.db()
         out = self.ask("Second?", store=db)
-        self.assertEqual(out["reconcile"]["flushed"], [held["ask_id"]])
+        self.assertEqual(out["reconcile_pending"]["flushed"], [held["ask_id"]])
         self.assertEqual(self.outbox(), [])
         self.assertEqual(sorted(e["ask_id"] for e in db.open_entries()), sorted([held["ask_id"], out["ask_id"]]))
         held_row = next(e for e in db.entries() if e["ask_id"] == held["ask_id"])
         self.assertIn(f"via {held['proactive_file']} at", held_row["body"])
-        self.assertEqual(self.ask("Third?", store=db)["reconcile"]["flushed"], [])
+        self.assertEqual(self.ask("Third?", store=db)["reconcile_pending"]["flushed"], [])
         self.assertEqual(len(db.entries()), 3)
 
     def test_crash_before_the_room_write_outbox_present_row_absent_next_pass_creates_it(self):
@@ -563,7 +563,7 @@ class TestAskOwner(_Ws):
 
 def reconcile_items(tc, db):
     """One pass as the adapter runs it, on the in-process store: (ask id, in room) per item."""
-    rec = pqs.reconcile(db, tc.ws, HOST)
+    rec = pqs.reconcile_pending(db, tc.ws, HOST)
     tc.assertEqual(rec["errors"], [])
     rows = [(e["ask_id"], True) for e in db.open_entries()]
     held = {a for a, _ in rows}
@@ -571,7 +571,7 @@ def reconcile_items(tc, db):
 
 
 class TestGather(_Ws):
-    """The adapter's pass, over the fake capability: reconcile, then rows + outbox, once each."""
+    """The adapter's pass, over the fake capability: reconcile_pending, then rows + outbox, once each."""
 
     def _gather(self, env=None):
         state = self.ws / "fake-room.json"
@@ -635,7 +635,7 @@ class TestTwoHostsOneRoom(_Ws):
         with self.assertRaises(pqs.StoreError):
             b.close("ask-a1", "Resolved")
         self.assertEqual(a.status_of("ask-a1"), "Open")
-        self.assertEqual(pqs.reconcile(b, self.ws, "host-b")["errors"], [])
+        self.assertEqual(pqs.reconcile_pending(b, self.ws, "host-b")["errors"], [])
         self.assertEqual(len(doc.maps["rows"]), 2)
 
     def test_two_hosts_with_one_ask_id_get_two_rows(self):
@@ -696,7 +696,7 @@ class TestConcurrentReplicas(_Ws):
         key = f"pendingq|{db._rid('ask-x')}|"
         doc.maps["cells"][key + "status"] = {"v": "answered", "updated": 9, "by": "owner"}
         self.assertEqual(db.status_of("ask-x"), "Answered")
-        self.assertEqual(pqs.reconcile(db, self.ws, HOST)["errors"], [])
+        self.assertEqual(pqs.reconcile_pending(db, self.ws, HOST)["errors"], [])
         self.assertNotIn(key + "closed", doc.maps["cells"])
         self.assertEqual(doc.maps["cells"][key + "status"]["v"], "answered")
 
@@ -770,7 +770,7 @@ class TestReminder(_Ws):
         db = self.db()
         self.ask("fresh?", store=db)
         held = self.ask("held?")
-        for flags in ((), ("--reconcile-only",), ("--force",)):
+        for flags in ((), ("--reconcile_pending-only",), ("--force",)):
             out = self._main(db, *flags)
             self.assertIn("2 pending questions; nothing sent", out)
             self.assertIn(f"[{held['ask_id']}] held? (not yet in the room)", out)
@@ -852,7 +852,7 @@ class TestDelegation(unittest.TestCase):
         def _ask(*a, **kw):
             seen.update(kw)
             return {"db_error": None, "record": "x", "heading": "## x", "outbox": None, "link": None,
-                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile": None}
+                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile_pending": None}
         ws = tempfile.mkdtemp()
         with mock.patch.object(pqs, "load_adapter_store", return_value=(fake, ROOM)), \
                 mock.patch.object(pqa, "ask_owner", _ask), contextlib.redirect_stdout(io.StringIO()):
