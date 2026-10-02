@@ -741,6 +741,33 @@ class TestConcurrentReplicas(_Ws):
         self.assertNotIn("pendingq|q-ask-x|closed", doc.maps["cells"])
         self.assertEqual(doc.maps["cells"]["pendingq|q-ask-x|status"]["v"], "answered")
 
+    def test_two_hosts_creating_one_legacy_row_at_once_never_close_the_winners_question(self):
+        for a_wins in (True, False):
+            with self.subTest(a_wins=a_wins):
+                d = self.ws / f"two-{a_wins}"
+                (d / "state").mkdir(parents=True)
+                a, b = fake_client.FakeDoc(), fake_client.FakeDoc()
+                base = json.loads(json.dumps(a.maps))
+                sa = pqs.RoomDbStore(InProcClient(a), lock=d / "state" / "a", host="host-a")
+                sb = pqs.RoomDbStore(InProcClient(b), lock=d / "state" / "b", host="host-b")
+                self.assertTrue(sa.insert_raw("legacy-abc123def456", "migrated", "page")["created"])
+                self.assertTrue(sb.insert_raw("legacy-abc123def456", "migrated", "page")["created"])
+                sb.close("legacy-abc123def456", "Resolved")  # B archived its copy, on its stale replica
+                self._merge(base, a, b, a_wins=a_wins)
+                fa = pqs.FileStore(d / "a.md")
+                fa.path.write_text(TestMigratedRows.MOVED)  # A's copy is still active
+                [row] = sa.entries()
+                if a_wins:
+                    self.assertEqual((row["host"], row["status"], row["stale"]), ("host-a", "Open", ["closed"]))
+                    pqs.resync(fa, sa)
+                    self.assertEqual(sa.entries()[0]["stale"], [])
+                    self.assertEqual(fa.entries()[0]["status"], "Open")
+                    self.assertNotIn("resolved", fa.path.read_text().lower())
+                else:
+                    self.assertEqual((row["host"], row["status"]), ("host-b", "Resolved"))
+                    self.assertEqual(pqs.resync(fa, sa), ([], []))  # another host's row: A's file untouched
+                    self.assertEqual(fa.entries()[0]["status"], "Open")
+
     @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
     def test_the_same_race_on_real_yjs_replicas_in_both_client_id_orders(self):
         from pycrdt import Doc, Map
