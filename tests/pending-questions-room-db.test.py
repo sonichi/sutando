@@ -1304,10 +1304,13 @@ class _MigrateBase(unittest.TestCase):
 
     def plan(self, cpw=False):
         text = self.ledger.read_text()
-        return self.m.make_plan(self.triage(text), self.ledger, text, cpw)
+        return self.m.make_plan(self.triage(text), self.ledger, text, cpw, HOST)
+
+    def apply(self, plan, ledger, db, host=HOST):
+        return self.m.apply(plan, ledger, db, host)
 
     def db(self, client=None):
-        return pqs.RoomDbStore(client or InProcClient(), lock=self.ws / "state" / "lock")
+        return pqs.RoomDbStore(client or InProcClient(), lock=self.ws / "state" / "lock", host=HOST)
 
     def waiting(self):
         return sorted(q["title"] for q in self.m._reader().parse_waiting(self.ledger.read_text()))
@@ -1327,7 +1330,7 @@ class TestMigrate(_MigrateBase):
         rows = {r["title"]: r for r in self.triage()}
         self.assertEqual(rows["2026-08-04 — Merge #102 or #500?"]["class"], "unknown-PR")
         self.assertEqual(rows["2026-07-06 — Old ask naming #501"]["class"], "unknown-PR")
-        self.m.apply(self.plan(cpw=True), self.ledger, self.db())
+        self.apply(self.plan(cpw=True), self.ledger, self.db())
         text = self.ledger.read_text()
         for title in ("2026-08-04 — Merge #102 or #500?", "2026-07-06 — Old ask naming #501"):
             self.assertIn(title, self.waiting(), title)
@@ -1381,7 +1384,7 @@ class TestMigrate(_MigrateBase):
         plan = self.plan()
         self.calls.clear()
         db = self.db()
-        self.m.apply(plan, self.ledger, db)
+        self.apply(plan, self.ledger, db)
         self.assertEqual(self.calls, [])
         self.assertEqual(len(db.open_entries()), 5)
         text = self.ledger.read_text()
@@ -1397,12 +1400,12 @@ class TestMigrate(_MigrateBase):
         self.ledger.write_text(self.ledger.read_text().replace(
             "## 2026-08-01 — Should #102 go in before the release?\n\nbody",
             "## 2026-08-01 — Should #102 go in before the release?\n\nbody, edited after the review"))
-        done = self.m.apply(plan, self.ledger, self.db())
+        done = self.apply(plan, self.ledger, self.db())
         self.assertTrue(any("changed since the plan" in d and "Should #102" in d for d in done))
         self.assertIn("body, edited after the review\n\n## 2026-08-02", self.ledger.read_text())
 
     def test_two_sections_with_one_heading_are_each_resolved_once(self):
-        self.m.apply(self.plan(), self.ledger, self.db())
+        self.apply(self.plan(), self.ledger, self.db())
         text = self.ledger.read_text()
         first = text.index("the first of two")
         second = text.index("the second of two")
@@ -1412,7 +1415,7 @@ class TestMigrate(_MigrateBase):
 
     def test_a_live_bullet_gets_no_row_and_is_not_doubled(self):
         db = self.db()
-        self.m.apply(self.plan(), self.ledger, db)
+        self.apply(self.plan(), self.ledger, db)
         self.assertNotIn("ask-7, 2026-09-20", [e["title"] for e in db.open_entries()])
         cpq = _cpq(self.ledger, self.ws)
         titles = [q["title"] for q in cpq.gather(db)[0]]
@@ -1420,17 +1423,17 @@ class TestMigrate(_MigrateBase):
 
     def test_a_second_apply_changes_nothing(self):
         db = self.db()
-        self.m.apply(self.plan(cpw=True), self.ledger, db)
+        self.apply(self.plan(cpw=True), self.ledger, db)
         after_first, writes = self.ledger.read_text(), len(db.client.doc.writes)
         second = self.plan(cpw=True)
         self.assertTrue(all(self.m.action_of(e, True).startswith("nothing") for e in second["entries"]))
-        done = self.m.apply(second, self.ledger, db)
+        done = self.apply(second, self.ledger, db)
         self.assertTrue(all(d.startswith("unchanged") for d in done), done)
         self.assertEqual(self.ledger.read_text(), after_first)
         self.assertEqual(len(db.client.doc.writes), writes)
 
     def test_close_past_window_resolves_past_window_sections_only_when_planned(self):
-        self.m.apply(self.plan(cpw=True), self.ledger, None)
+        self.apply(self.plan(cpw=True), self.ledger, None)
         text = self.ledger.read_text()
         self.assertEqual(text.count("**Status:** resolved — past its 14-day window (closed in cleanup)"), 3)
         self.assertFalse(set(self.waiting()) & {"2026-07-01 — Rename the dock?",
@@ -1459,7 +1462,7 @@ class TestMigrateEdges(_MigrateBase):
     def test_a_live_entry_changed_since_the_plan_gets_no_row(self):
         plan, db = self.plan(), self.db()
         self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh, edited"))
-        done = self.m.apply(plan, self.ledger, db)
+        done = self.apply(plan, self.ledger, db)
         self.assertTrue(any(d.startswith("skipped: changed since the plan") and "launch date" in d for d in done))
         self.assertNotIn("2026-09-29 — Pick a launch date?", [e["title"] for e in db.open_entries()])
 
@@ -1492,7 +1495,7 @@ class TestMigrateRound3(_MigrateBase):
 
     def test_a_private_pr_beside_a_merged_one_is_never_closed(self):
         title = "2026-07-01 — Merge #102 after https://github.com/acme/private/pull/7?"
-        self.m.apply(self.plan(cpw=True), self.ledger, self.db())
+        self.apply(self.plan(cpw=True), self.ledger, self.db())
         self.assertIn(title, self.waiting())
         self.assertIn(7, self.issue_calls)
 
@@ -1508,7 +1511,7 @@ class TestMigrateRound3(_MigrateBase):
         self._move_to_archive("## 2026-08-01 — Should #102 go in before the release?", "body")
         self._move_to_archive("## 2026-09-29 — Pick a launch date?", "fresh")
         archived = self.ledger.read_text().split("# Resolved", 1)[1]
-        done = self.m.apply(plan, self.ledger, db)
+        done = self.apply(plan, self.ledger, db)
         for t in ("Should #102", "Pick a launch date"):
             self.assertTrue(any("no longer in the active region" in d and t in d for d in done), t)
         self.assertEqual(self.ledger.read_text().split("# Resolved", 1)[1], archived)
@@ -1534,7 +1537,7 @@ class TestMigrateRound3(_MigrateBase):
             self.ledger.write_text(t.replace("## 2026-09-29 — Pick a launch date?\n\nfresh",
                                              "## 2026-09-29 — Pick a launch date?\n\nfresh\n\n**Status:** answered"))
         db = self._racing_store(owner_resolves)
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertIn("changed since the plan", done)
         self.assertIn("its row was superseded", done)
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
@@ -1555,7 +1558,7 @@ class TestMigrateRound3(_MigrateBase):
         only = self._only()
         db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace(
             "an old ask with no PR", "an old ask with no PR, edited by the owner")))
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
         text = self.ledger.read_text()
         self.assertIn("an old ask with no PR, edited by the owner", text)
@@ -1567,7 +1570,7 @@ class TestMigrateRound3(_MigrateBase):
         only = self._only()
         db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace(
             "fresh", "fresh, and the owner added a detail")))
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertIn("its row was superseded", done)
         self.assertEqual(self._store_view(db).count("2026-09-29 — Pick a launch date?"), 1)
         self.assertEqual(db.open_entries(), [])
@@ -1582,7 +1585,7 @@ class TestMigrateRound3(_MigrateBase):
             raise pqs.StoreError("connection lost after commit")
         db.insert_raw = committed_then_lost
         db.supersede, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.supersede
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertIn("connection lost after commit", done)
         self.assertIn("the next reminder pass does it", done)
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])  # the orphan, before reconciling
@@ -1594,13 +1597,13 @@ class TestMigrateRound3(_MigrateBase):
     def test_a_retry_after_a_superseded_row_reopens_it(self):
         only = self._only()
         db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh!")))
-        self.m.apply(only, self.ledger, db)
+        self.apply(only, self.ledger, db)
         self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
-        db2 = pqs.RoomDbStore(db.client, lock=db.lock)
+        db2 = pqs.RoomDbStore(db.client, lock=db.lock, host=HOST)
         self.ledger.write_text(self.ledger.read_text().replace("fresh!", "fresh"))
         retry = self._only()
         self.assertEqual(retry["entries"][0]["ask_id"], only["entries"][0]["ask_id"])
-        [done] = self.m.apply(retry, self.ledger, db2)
+        [done] = self.apply(retry, self.ledger, db2)
         self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
         self.assertEqual([e["status"] for e in db2.entries()], ["Open"])
 
@@ -1613,7 +1616,7 @@ class TestMigrateRound3(_MigrateBase):
                     held_calls.append(req["op"])
                 return super()._do(req)
         db = self.db(Watching())
-        done = self.m.apply(self.plan(cpw=True), self.ledger, db)
+        done = self.apply(self.plan(cpw=True), self.ledger, db)
         self.assertTrue(any(d.startswith("moved:") for d in done))
         self.assertEqual(held_calls, [])
 
@@ -1621,7 +1624,7 @@ class TestMigrateRound3(_MigrateBase):
         plan, before = self.plan(), self.ledger.read_text()
         only = dict(plan, entries=[e for e in plan["entries"] if e["title"] == "2026-09-29 — Pick a launch date?"])
         db = self.db(InProcClient(fail_ops=("add_row",)))
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
 
@@ -1630,7 +1633,7 @@ class TestMigrateRound3(_MigrateBase):
         aid, client = only["entries"][0]["ask_id"], InProcClient()
         pqs.RoomDbStore(client, lock=self.ws / "state" / "a", host="host-a").insert_raw(aid, "Pick?", "page")
         host_b = pqs.RoomDbStore(client, lock=self.ws / "state" / "b", host="host-b")
-        [done] = self.m.apply(only, self.ledger, host_b, "host-b")
+        [done] = self.apply(only, self.ledger, host_b, "host-b")
         self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
         self.assertEqual(sorted((e["host"], e["status"], e["recovery"]) for e in host_b.entries()),
                          [("host-a", "Open", False), ("host-b", "Open", False)])
@@ -1639,15 +1642,20 @@ class TestMigrateRound3(_MigrateBase):
         plan, before = self._only(), self.ledger.read_text()
         db = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "l", host="this-host")
         for p in ({k: v for k, v in plan.items() if k != "version"}, dict(plan, host="other-host")):
-            [done] = self.m.apply(p, self.ledger, db, "this-host")
-            self.assertTrue(done.startswith("refused: this plan is version"))
-        [done] = self.m.apply(dict(plan, host="this-host"), self.ledger, db)  # host not stated: refused
+            [done] = self.apply(p, self.ledger, db, "this-host")
+            self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        [done] = self.apply(dict(plan, host="this-host"), self.ledger, db)  # host not stated: refused
         self.assertTrue(done.startswith("refused: the store is for host"))
+        [done] = self.m.apply(dict(plan, host=None), self.ledger, None, None)  # a hostless plan: refused
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        bad = dict(plan, host="this-host", entries=plan["entries"] + [{"title": "x"}])
+        [done] = self.apply(bad, self.ledger, None, "this-host")  # a malformed entry anywhere: nothing written
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual(db.entries(), [])
         p = dict(plan, host="other-host", version=self.m.PLAN_VERSION)
-        [done] = self.m.apply(p, self.ledger, None, "this-host")  # no room database reachable
-        self.assertTrue(done.startswith("refused: this plan is version"))
+        [done] = self.apply(p, self.ledger, None, "this-host")  # no room database reachable
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         self.assertEqual(self.ledger.read_text(), before)
         planf = self.ws / "wrong-host-plan.json"
         planf.write_text(json.dumps(dict(plan, host="other-host")))
@@ -1657,8 +1665,18 @@ class TestMigrateRound3(_MigrateBase):
             rc = self.m.main(["--apply", "--plan", str(planf), "--ledger", str(self.ledger),
                               "--workspace", str(self.ws)])
         self.assertEqual(rc, 2)
-        self.assertIn("refused: this plan is version", err.getvalue())
+        self.assertIn("refused: this plan is not a well-formed", err.getvalue())
         reg.assert_not_called()  # refused before the room database is even looked up
+        self.assertEqual(self.ledger.read_text(), before)
+        planf.write_text(json.dumps(dict(plan, host=importlib.import_module("util_paths").host_label())))
+        other = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "o", host="another-host")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                mock.patch.object(adapter, "room_store", return_value=(other, "r")):
+            rc = self.m.main(["--apply", "--plan", str(planf), "--ledger", str(self.ledger),
+                              "--workspace", str(self.ws)])
+        self.assertEqual(rc, 2)  # an apply-level refusal is a failure exit, not a success
+        self.assertIn("refused: the store is for host", err.getvalue())
         self.assertEqual(self.ledger.read_text(), before)
 
     def test_host_labels_that_slug_alike_still_get_two_row_keys(self):
@@ -1693,7 +1711,7 @@ class TestMigrateRound3(_MigrateBase):
         db.insert_raw(only["entries"][0]["ask_id"], "Pick a launch date?", "page")
         db.set_status(only["entries"][0]["ask_id"], "Resolved")  # the owner, earlier
         client.fail_ops = ("add_row",)
-        [done] = self.m.apply(only, self.ledger, db)
+        [done] = self.apply(only, self.ledger, db)
         self.assertIn("its row was left as is", done)
         self.assertIn("status=Resolved", done)
         client.fail_ops = ()

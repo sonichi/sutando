@@ -248,8 +248,17 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
 PLAN_VERSION = 2
 
 
+ENTRY_FIELDS = {"kind": str, "title": str, "class": str, "why": str, "ask_id": str, "body": str, "sha": (str, type(None))}
+
+
 def plan_fits(plan: dict, host: Optional[str]) -> bool:
-    return plan.get("version") == PLAN_VERSION and plan.get("host") == host
+    """This version, made on this (named) host, and every entry well formed, checked before any write."""
+    entries = plan.get("entries")
+    return (plan.get("version") == PLAN_VERSION and bool(host) and plan.get("host") == host
+            and isinstance(entries, list) and all(
+                isinstance(e, dict) and all(isinstance(e.get(k), t) for k, t in ENTRY_FIELDS.items())
+                and (e.get("nth") is None or (isinstance(e.get("nth"), int) and e["nth"] >= 0))
+                for e in entries))
 
 
 def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
@@ -282,8 +291,8 @@ def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> l
     if store is not None and getattr(store, "host", None) != host:
         return [f"refused: the store is for host {getattr(store, 'host', None)!r}, not {host!r}"]
     if not plan_fits(plan, host):
-        return [f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
-                f"re-run the dry run on this host for a version {PLAN_VERSION} plan"]
+        return [f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on host {host!r}; "
+                f"re-run the dry run there"]
     for r in plan["entries"]:
         action = action_of(r, cpw)
         if action.startswith("nothing") or action == ACTIONS["past-window"]:
@@ -375,8 +384,8 @@ def main(argv=None) -> int:
             print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
             return 2
         if not plan_fits(plan, host_label()):
-            print(f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
-                  f"re-run the dry run on this host for a version {PLAN_VERSION} plan", file=sys.stderr)
+            print(f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on this host; "
+                  f"re-run the dry run here", file=sys.stderr)
             return 2
         if args.ledger.exists() and _sha(args.ledger.read_text(encoding="utf-8")) != plan.get("ledger_sha256"):
             print("note: the ledger changed since the plan; each entry is still applied only while it is "
@@ -385,7 +394,11 @@ def main(argv=None) -> int:
         store, where = room_store(ws)
         if store is None:
             print(f"room database unavailable ({where}); live rows are not created", file=sys.stderr)
-        print("\n".join(apply(plan, args.ledger, store, host_label())))
+        done = apply(plan, args.ledger, store, host_label())
+        if done and done[0].startswith("refused:"):
+            print(done[0], file=sys.stderr)
+            return 2
+        print("\n".join(done))
         return 0
     text = args.ledger.read_text(encoding="utf-8") if args.ledger.exists() else ""
     rows = triage(cpq.parse_waiting(text, keep_title_resolved=True), GhPrs(), args.now or time.time(),
