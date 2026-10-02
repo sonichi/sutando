@@ -648,7 +648,7 @@ class TestTwoHostsOneRoom(_Ws):
 
     def _pass(self, h):
         hs = self.hosts[h]
-        return pqs.resync(hs["file"], hs["db"], claim=lambda a: pqa.asked_here(hs["dir"] / "results", a))
+        return pqs.resync(hs["file"], hs["db"], evidence=lambda a: pqa.asked_here(hs["dir"] / "results", a))
 
     def _status(self):
         return {e["ask_id"]: (e["status"], e["host"]) for e in self.hosts["host-a"]["db"].entries()}
