@@ -1644,7 +1644,8 @@ class TestMigrateRound3(_MigrateBase):
         for p in ({k: v for k, v in plan.items() if k != "version"}, dict(plan, host="other-host")):
             [done] = self.apply(p, self.ledger, db, "this-host")
             self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
-        [done] = self.apply(dict(plan, host="this-host"), self.ledger, db)  # host not stated: refused
+        other = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "o", host="other-host")
+        [done] = self.apply(dict(plan, host="this-host"), self.ledger, other, "this-host")  # store for another host
         self.assertTrue(done.startswith("refused: the store is for host"))
         [done] = self.m.apply(dict(plan, host=None), self.ledger, None, None)  # a hostless plan: refused
         self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
@@ -1662,7 +1663,18 @@ class TestMigrateRound3(_MigrateBase):
             with self.subTest(name=name):
                 [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        other = next(x for x in self.plan()["entries"] if x["title"] != e0["title"] and x["sha"])
+        for name, entry in {"short digest": dict(other, sha="x"), "multiline title": dict(e0, title=e0["title"] + "\n## x"),
+                            "control char title": dict(e0, title=e0["title"] + "\x00")}.items():
+            with self.subTest(name=name):
+                [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        for bad in (None, [], "x"):
+            with self.subTest(root=bad):
+                [done] = self.m.apply(bad, self.ledger, db, "this-host")
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         for name, p in {"string close flag": dict(good, close_past_window="false"),
+                        "nul in ledger path": dict(good, ledger="bad\x00path"),
                         "float version": dict(good, version=float(self.m.PLAN_VERSION)),
                         "missing ledger hash": {k: v for k, v in good.items() if k != "ledger_sha256"}}.items():
             with self.subTest(name=name):
@@ -1739,7 +1751,11 @@ class TestMigrateRound3(_MigrateBase):
         dup = dict(plan, entries=plan["entries"] * 2)
         db = self.db()
         [done] = self.apply(dup, self.ledger, db)
-        self.assertTrue(done.startswith("refused: two planned entries resolve to one ask id"))
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        e = plan["entries"][0]
+        conflicting = dict(plan, entries=[dict(e, **{"class": "stale-merged-PR"}), e])  # one selector, two actions
+        [done] = self.apply(conflicting, self.ledger, db)
+        self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
 
     def test_a_multiline_why_cannot_inject_ledger_structure(self):
