@@ -566,7 +566,8 @@ class RoomDbStore:
 
     def supersede(self, ask_id: str) -> None:
         """Mark this host's open row superseded, in the Recovery cell only."""
-        self._guarded(ask_id, {"recovery": self._tag(RECOVERY)}, {"closed": [None], "status": OPEN_RAW})
+        self._guarded(ask_id, {"recovery": self._tag(RECOVERY)},
+                      {"closed": [None], "status": OPEN_RAW, "recovery": [None]})
 
     def body_of(self, ask_id: str) -> Optional[str]:
         r = self.client.row(DB_SCHEMA, self._rid(ask_id))
