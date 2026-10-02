@@ -83,6 +83,13 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
 
 # ---- serve: one request against the databases document -------------------------
 
+def _first_unsafe(text: str):
+    for i, ch in enumerate(text):
+        if safe_body(ch) != ch:
+            return i
+    return None
+
+
 def _key(*parts: str) -> str:
     return "|".join(parts)
 
@@ -179,9 +186,12 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         current = {p: have.get(p) for p in req["expect"]}
         if any(current[p] not in allowed for p, allowed in req["expect"].items()):
             return {"written": False, "current": current}
+        # One character per write: each is its own minimal delta, so a concurrent edit elsewhere merges.
         body = doc.row_body(db, row) or ""
-        if safe_body(body) != body:
-            await doc.put_row_body(db, row, safe_body(body))
+        while (fixed := _first_unsafe(body)) is not None:
+            body = body[:fixed] + "\ufffd" + body[fixed + 1:]
+            await doc.put_row_body(db, row, body)
+            body = doc.row_body(db, row) or ""
         return {"written": True, "current": current}
     if op == "stamp":
         body, token = doc.row_body(db, row) or "", req["token"]

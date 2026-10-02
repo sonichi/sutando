@@ -268,7 +268,6 @@ def _line(v) -> bool:
     return _text(v) and bool(v)
 
 
-_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def _entry_ok(e) -> bool:
@@ -285,7 +284,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
     if not isinstance(plan, dict):
         return False
     entries = plan.get("entries")
-    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and isinstance(host, str) and _HOST.fullmatch(host)
+    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and _line(host) and "\t" not in host
             and plan.get("host") == host and isinstance(plan.get("ledger"), str) and plan["ledger"]
             and "\x00" not in plan["ledger"] and not _SURROGATE.search(plan["ledger"])
             and Path(plan["ledger"]).is_absolute()
