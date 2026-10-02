@@ -1,0 +1,11 @@
+{
+  "name": "ag2-space-mcp",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Connect a Sutando install to the hosted AG2 Space MCP as its own agent, without the desktop app: a stdio proxy that holds a short-lived token, and a register script.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
