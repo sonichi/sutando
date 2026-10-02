@@ -61,7 +61,7 @@ SETTLE_SEC = 1.0
 # The documented room-surface link shape; `page` is the database id.
 LINK_TEMPLATE = "{origin}/#/room/{room}?surface=db&page={db}"
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
-# A collab service URL override, so a test run can point this adapter at an unreachable one.
+# The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
 
 
@@ -82,16 +82,25 @@ def owner_routing(workspace: Path) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def manifest_config(key: str) -> str:
+    """This skill's manifest `config[key]`, stripped; empty when unset or unreadable."""
+    try:
+        cfg = json.loads((HERE.parent / "manifest.json").read_text(encoding="utf-8"))
+        return str((cfg.get("config") or {}).get(key) or "").strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def configured(key: str, environ) -> str:
+    """One config value by the documented precedence (skills/MANIFEST.md): env, then this
+    skill's manifest `config`; the CLI tier is the caller's own argument."""
+    return (environ.get(key) or "").strip() or manifest_config(key)
+
+
 def configured_room(workspace: Path, environ) -> str:
     """The room holding the database: env, then this skill's manifest config, then
     this host's state/pending-questions-room; empty means the owner DM."""
-    room = (environ.get(ROOM_KEY) or "").strip()
-    if not room:
-        try:
-            cfg = json.loads((HERE.parent / "manifest.json").read_text(encoding="utf-8"))
-            room = str((cfg.get("config") or {}).get(ROOM_KEY) or "").strip()
-        except (OSError, ValueError, AttributeError):
-            room = ""
+    room = configured(ROOM_KEY, environ)
     if not room:
         try:
             room = status_path("pending-questions-room", Path(workspace)).read_text(encoding="utf-8").strip()
@@ -112,9 +121,10 @@ def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
         return None
 
 
-def room_store(workspace: Path, environ=None, timeout: float = 90.0):
+def room_store(workspace: Path, environ=None, timeout: float = 90.0, collab_url: Optional[str] = None):
     """(RoomDbStore, where) when the capability, the room and an identity all
-    resolve; (None, why not) otherwise. The room is the configured one, else the owner DM."""
+    resolve; (None, why not) otherwise. The room is the configured one, else the owner DM.
+    `collab_url` is the CLI tier of PENDING_QUESTIONS_COLLAB_URL (then env, then manifest)."""
     from util_paths import host_label
     env = os.environ if environ is None else environ
     scripts = skill_scripts(workspace)
@@ -129,7 +139,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
         or str(routing.get("identity") or "").strip()
     if not user:
         return None, "no agent identity to sign database writes with"
-    url_override = (env.get(URL_KEY) or "").strip()
+    url_override = (collab_url or "").strip() or configured(URL_KEY, env)
     argv = [sys.executable, str(Path(__file__).resolve()), "serve", "--room", room,
             "--user-id", user, "--skill-scripts", str(scripts)]
     if url_override:

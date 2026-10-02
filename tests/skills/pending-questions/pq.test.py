@@ -301,7 +301,7 @@ class TestSharedRoom(rdb._Ws):
 
     def test_the_manifest_declares_the_key_empty(self):
         cfg = json.loads((SKILL / "manifest.json").read_text())
-        self.assertEqual(cfg["config"], {"PENDING_QUESTIONS_ROOM": ""})
+        self.assertEqual(cfg["config"], {"PENDING_QUESTIONS_ROOM": "", "PENDING_QUESTIONS_COLLAB_URL": ""})
 
     def test_no_schedule_mentions_the_reminder(self):
         crons = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())

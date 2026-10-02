@@ -10,6 +10,7 @@
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
-    "PENDING_QUESTIONS_ROOM": ""
+    "PENDING_QUESTIONS_ROOM": "",
+    "PENDING_QUESTIONS_COLLAB_URL": ""
   }
 }
