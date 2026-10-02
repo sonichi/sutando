@@ -186,9 +186,11 @@ def ledger_entry(q: Question) -> str:
                       placeholder(q.ask_id), ""]) + "\n"
 
 
-def legacy_ask_id(title: str, body: str) -> str:
-    """The ask id the migration gives an entry written before ask ids existed."""
-    return "legacy-" + hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:12]
+def legacy_ask_id(title: str, body: str, host: Optional[str] = None) -> str:
+    """The ask id the migration gives an entry written before ask ids existed. With `host`,
+    two hosts' identical entries get different ids, so they never share a database row."""
+    salt = f"{host}\n" if host else ""
+    return "legacy-" + hashlib.sha256(f"{salt}{title}\n{body}".encode()).hexdigest()[:12]
 
 
 def entry_ask_id(section: str) -> Optional[str]:

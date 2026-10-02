@@ -1644,6 +1644,19 @@ class TestMigrateRound3(_MigrateBase):
         self.assertEqual([(e["status"], e["host"], e["recovery"]) for e in host_b.entries()],
                          [("Open", "host-a", False)])
 
+    def test_two_hosts_migrating_the_same_entry_get_separate_rows(self):
+        cpq = self.m._reader()
+        text = self.ledger.read_text()
+        qs = cpq.parse_waiting(text, keep_title_resolved=True)
+        ids = {h: {r["ask_id"] for r in self.m.triage(qs, self.prs(), self.NOW, 14, "sonichi/sutando",
+                                                     cpq.title_says_resolved, text, h)}
+               for h in ("host-a", "host-b")}
+        self.assertTrue(ids["host-a"])
+        self.assertEqual(ids["host-a"] & ids["host-b"], set())
+        unsalted = {r["ask_id"] for r in self.m.triage(qs, self.prs(), self.NOW, 14, "sonichi/sutando",
+                                                      cpq.title_says_resolved, text)}
+        self.assertEqual(ids["host-a"] & unsalted, set())
+
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
         client = InProcClient()
