@@ -55,16 +55,38 @@ def owner_routing(workspace: Path) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+ROOM_KEY = "PENDING_QUESTIONS_ROOM"
+
+
+def configured_room(workspace: Path, environ) -> str:
+    """The room holding the database: env, then this skill's manifest config, then
+    this host's state/pending-questions-room; empty means the owner DM."""
+    room = (environ.get(ROOM_KEY) or "").strip()
+    if not room:
+        try:
+            cfg = json.loads((Path(__file__).resolve().parent.parent / "manifest.json").read_text(encoding="utf-8"))
+            room = str((cfg.get("config") or {}).get(ROOM_KEY) or "").strip()
+        except (OSError, ValueError, AttributeError):
+            room = ""
+    if not room:
+        try:
+            room = status_path("pending-questions-room", Path(workspace)).read_text(encoding="utf-8").strip()
+        except OSError:
+            room = ""
+    return room
+
+
 def room_store(workspace: Path, environ=None, timeout: float = 90.0):
-    """(RoomDbStore, where) when the capability, the owner DM and an identity all
-    resolve; (None, why not) otherwise."""
+    """(RoomDbStore, where) when the capability, the room and an identity all
+    resolve; (None, why not) otherwise. The room is the configured one, else the owner DM."""
     from util_paths import host_label
     env = os.environ if environ is None else environ
     scripts = skill_scripts(workspace)
     if scripts is None:
         return None, f"no {SKILL} capability installed"
     routing = owner_routing(workspace)
-    room = str(routing.get("owner_dm") or "").strip()
+    shared = configured_room(workspace, env)
+    room = shared or str(routing.get("owner_dm") or "").strip()
     if not room:
         return None, "no owner DM room known (state/owner-routing.json has no owner_dm)"
     user = next((env[v].strip() for v in IDENTITY_VARS if (env.get(v) or "").strip()), "") \
@@ -77,7 +99,7 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
         register_adapter(workspace, Path(__file__))
     except OSError as e:
         print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
-    return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
+    return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's {'room' if shared else 'DM room'} {room}",
                        lock=status_path("pending-questions-db.lock", Path(workspace)), host=host_label()), room
 
 

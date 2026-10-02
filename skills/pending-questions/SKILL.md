@@ -6,9 +6,13 @@ description: Ask the owner a decision you need, list what is waiting on him, clo
 # pending-questions
 
 One CLI over the owner's pending questions. The ledger is always the per-host
-`<workspace>/hosts/<hostname>/pending-questions.md`; when the owner's DM room and the
-room-collab capability resolve, each question is also a row of the "Pending questions"
-database in that room. Without them every verb works on the file alone.
+`<workspace>/hosts/<hostname>/pending-questions.md`; when a room and the room-collab
+capability resolve, each question is also a row of the "Pending questions" database in
+that room. Without them every verb works on the file alone.
+
+The room is `PENDING_QUESTIONS_ROOM`: env, then this manifest's `config`, then the host's
+`<workspace>/state/pending-questions-room`; unset, the owner's DM. Point every host of the
+owner at one room shared by him and all his Sutandos; rows carry their Host.
 
 ```bash
 python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] \

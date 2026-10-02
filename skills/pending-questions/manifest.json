@@ -8,5 +8,8 @@
   "pending_questions_store": "scripts/pending_questions_room_db.py",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "PENDING_QUESTIONS_ROOM": ""
   }
 }
