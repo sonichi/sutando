@@ -154,7 +154,7 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
             await doc.put_database({"rows": {_key(db, row): {"order": (min(orders) - GAP) if orders else GAP,
                                                              "created": now_ms, "by": by}},
                                     "cells": _cell_writes(db, row, req["cells"], by, now_ms)})
-        if not exists or not (doc.row_body(db, row) or "").strip():
+        if not exists or doc.row_body(db, row) in (None, ""):  # a body anyone wrote is never replaced
             await doc.put_row_body(db, row, req["body"])
         return {"created": not exists, "db": db, "row": row, "link": link}
     if not exists:
