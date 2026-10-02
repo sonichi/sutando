@@ -161,6 +161,11 @@ def _pending_note(ids: list) -> list:
     return [f"{len(ids)} local close(s) await the row they name: {', '.join(ids)}"] if ids else []
 
 
+def _held_snapshot(ws: Path) -> tuple:
+    """(every held ask id, {ask id: waiting item} of the held questions still open) — one read."""
+    return {e["ask_id"] for e in HeldRecords(ws).entries()}, {it["ask_id"]: it for it in outbox_items(ws)}
+
+
 def reconcile_pass(workspace: Path, environ=None) -> dict:
     """The explicit pass: {"flushed", "closed", "moved", "errors"}; without a store, one error."""
     from util_paths import host_label
@@ -178,10 +183,12 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
     """{"waiting", "done", "pending_close", "unavailable", "reason", "link", "notes", "store"}, each
     ask id in ONE bucket (the precedence in the module doc): this host's rows first, then the
     outbox's held questions whose id no row already placed (marked not yet in the room);
-    `pending_close` names local closes with no row and no held entry. Read-only unless
-    `reconcile` — a read writes nothing, so a row seen here is history only once a reconcile
-    records it. Without a store: the outbox, and why — an outage (`unavailable`) when a row of
-    this workspace was ever confirmed, a measurement when none was."""
+    `pending_close` names local closes with no row and no held entry. The outbox is read before
+    the rows and again after, and the two reads are joined: a held question another process
+    files between them is in one of the reads, never in neither. Read-only unless `reconcile`
+    — a read writes nothing, so a row seen here is history only once a reconcile records it.
+    Without a store: the outbox, and why — an outage (`unavailable`) when a row of this
+    workspace was ever confirmed, a measurement when none was."""
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
@@ -198,6 +205,7 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
             rec = reconcile_pending(store, ws, host_label())
             notes += [f"reconcile: FAILED — {e}" for e in rec["errors"]]
         closing = HeldRecords(ws).closes()  # closed by the owner while the room was unreachable
+        in_outbox, held = _held_snapshot(ws)
         seen = set()
         for e in store.entries():
             seen.add(e["ask_id"])
@@ -210,8 +218,10 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
             # an open row with no body yet: its held entry (below) stands in for it
     except Exception as e:  # noqa: BLE001
         return _unavailable(ws, f"{type(e).__name__}: {e}", store)
-    in_outbox = {e["ask_id"] for e in HeldRecords(ws).entries()}
-    rows += [it for it in outbox_items(ws) if it["ask_id"] not in placed]
+    after_ids, after = _held_snapshot(ws)
+    in_outbox |= after_ids
+    held.update(after)
+    rows += [held[a] for a in sorted(held) if a not in placed]
     done += sum(1 for a in closing if a not in seen and a in in_outbox)  # held, closed locally, no row yet
     pending = sorted(a for a in closing if a not in seen and a not in in_outbox)
     return {"waiting": rows, "done": done, "pending_close": pending, "unavailable": False, "reason": None,
