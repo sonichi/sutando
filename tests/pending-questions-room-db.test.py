@@ -1727,7 +1727,7 @@ class TestMigrateRound3(_MigrateBase):
         other = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "o", host="another-host")
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
-                mock.patch.object(adapter, "room_store", return_value=(other, "r")):
+                mock.patch.object(pqs, "load_adapter_store", return_value=(other, "r")):
             rc = self.m.main(["--apply", "--plan", str(planf), "--ledger", str(self.ledger),
                               "--workspace", str(self.ws)])
         self.assertEqual(rc, 2)  # an apply-level refusal is a failure exit, not a success
