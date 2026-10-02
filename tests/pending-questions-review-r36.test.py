@@ -171,7 +171,6 @@ class ResolveCommitsHistoryFirst(_FakeRoom):
                          "outage mode: a room row was confirmed here before")
 
 
-
 # ---- 2. gather() is coherent under a concurrent flush ------------------------------------
 
 class GatherUnderAConcurrentFlush(_FakeRoom):
@@ -242,7 +241,6 @@ class GatherUnderAConcurrentFlush(_FakeRoom):
         self.assertEqual(g["done"], 0)
 
 
-
 # ---- 3. `pq.py remind` reconciles before it reminds --------------------------------------
 
 class RemindReconciles(_FakeRoom):
@@ -276,7 +274,6 @@ class RemindReconciles(_FakeRoom):
         self.assertEqual(self.outbox(), [])
         self.assertEqual([e["ask_id"] for e in self.store().entries()], [held["ask_id"]])
         self.assertIn(f"- [{held['ask_id']}] held?\n", out.getvalue())
-
 
 
 # ---- 4. the linter resolves the adapter path as discovery does ---------------------------
@@ -330,6 +327,19 @@ class LinterMatchesDiscovery(unittest.TestCase):
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("0 error(s)", r.stdout)
+
+
+# ---- the doc note ------------------------------------------------------------------------
+
+class DocDistinguishesTheCooldown(unittest.TestCase):
+    def test_no_scheduled_reminder_is_told_apart_from_the_on_demand_cooldown(self):
+        text = (REPO / "docs" / "design-mediated-capability-layer.md").read_text()
+        self.assertIn("there is no scheduled reminder at all", text)
+        self.assertIn("on-demand reminder still has a cooldown", text)
+        self.assertIn("unless `--force` is passed", text)
+        self.assertNotIn("neither the divider nor the cooldown exists on the current path", text)
+        catalog = json.loads((REPO / "docs" / "catalog.json").read_text())["documents"]
+        self.assertEqual(catalog["docs/design-mediated-capability-layer.md"]["last_verified"], "2026-10-02")
 
 
 if __name__ == "__main__":

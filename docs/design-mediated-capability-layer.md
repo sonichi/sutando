@@ -277,11 +277,14 @@ unreachable, queues the owner's DM and fires macOS-notify). It does **not** by i
 guarantee delivery: the room write can fail (the question is then held locally and
 listed as "not yet in the room" until a reconcile files it), the DM queue is drained
 by a bridge that may be down, and there is no scheduled reminder at all — a
-reminder is sent only on demand. (The earlier failure modes this section measured —
-an append landing below the per-host file's `# Resolved` divider and so uncounted,
-and a cooldown-gated per-cron notify that skipped most fires — belonged to the
-retired per-host `pending-questions.md` path; that file is read-only history now,
-and neither the divider nor the cooldown exists on the current path.) An escalation
+reminder is sent only on demand (`src/check-pending-questions.py --notify`), and that
+on-demand reminder still has a cooldown of its own: an unchanged question set is not
+raised again for a day unless `--force` is passed. (The earlier failure modes this
+section measured — an append landing below the per-host file's `# Resolved` divider
+and so uncounted, and a cooldown-gated per-cron notify that skipped most fires —
+belonged to the retired per-host `pending-questions.md` path; that file is read-only
+history now. The divider is gone with it; the cooldown is not — it no longer gates a
+cron, because no cron fires the reminder.) An escalation
 that is written-but-unfiled, or filed-but-unnotified, degrades `needs-authorization`
 into a **silent indefinite deny** — at which point the layer's guarantee is "nothing
 privileged happens" rather than "the owner decides." The layer therefore requires:
