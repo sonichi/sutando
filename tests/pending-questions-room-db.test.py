@@ -1846,6 +1846,18 @@ class TestMigrateRound3(_MigrateBase):
             other._keys[plan["entries"][0]["ask_id"]] = db._rid(plan["entries"][0]["ask_id"])
             other.neutralise_body(plan["entries"][0]["ask_id"])  # another host's row: refused in the same call
 
+    def test_neutralise_is_bounded_and_leaves_a_heavily_unsafe_row_alone(self):
+        doc = fake_client.FakeDoc()
+        db = pqs.RoomDbStore(InProcClient(doc), lock=self.ws / "state" / "n", host=HOST)
+        db.insert_raw("ask-n", "q", "x" + "\x07" * (adapter.NEUTRALISE_MAX + 1))
+        writes = len(doc.writes)
+        with self.assertRaises(pqs.GuardFailed):
+            db.neutralise_body("ask-n")
+        self.assertEqual(len(doc.writes), writes)
+        db.insert_raw("ask-m", "q", "\x07" * adapter.NEUTRALISE_MAX)
+        db.neutralise_body("ask-m")
+        self.assertNotIn("\x07", [e for e in db.entries() if e["ask_id"] == "ask-m"][0]["body"])
+
     @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
     def test_neutralise_keeps_a_concurrent_owner_edit_on_real_replicas(self):
         rc_dir = Path(os.environ.get("ROOM_COLLAB_SCRIPTS") or REPO / "skills" / "room-collab" / "scripts")
@@ -1866,10 +1878,10 @@ class TestMigrateRound3(_MigrateBase):
             agent_doc, owner_doc = Doc(client_id=2), Doc(client_id=1)
             agent = RoomDoc(Sock(), agent_doc, Awareness(agent_doc), "t", kind="db")
             await adapter.apply(agent, {"op": "add_row", "schema": pqs.DB_SCHEMA, "row": "q-x",
-                                        "cells": {"host": HOST}, "body": "head \x07 tail"}, AGENT, 1)
+                                        "cells": {"host": HOST}, "body": "head \x07 mid \x07 tail"}, AGENT, 1)
             owner_doc.apply_update(agent_doc.get_update())
             owner = RoomDoc(Sock(), owner_doc, Awareness(owner_doc), "t", kind="db")
-            await owner.put_row_body("pendingq", "q-x", "head \x07 owner-note tail")  # concurrent edit
+            await owner.put_row_body("pendingq", "q-x", "head \x07 owner-note \x07 tail")  # replaces "mid", between the two
             await adapter.apply(agent, {"op": "neutralise", "schema": pqs.DB_SCHEMA, "row": "q-x",
                                         "expect": {"host": [HOST]}}, AGENT, 2)
             a, o = agent_doc.get_update(owner_doc.get_state()), owner_doc.get_update(agent_doc.get_state())
@@ -1878,8 +1890,7 @@ class TestMigrateRound3(_MigrateBase):
             return agent.row_body("pendingq", "q-x"), owner.row_body("pendingq", "q-x")
         got_a, got_o = asyncio.run(run())
         self.assertEqual(got_a, got_o)
-        self.assertIn("owner-note", got_a)
-        self.assertNotIn("\x07", got_a)
+        self.assertEqual(got_a, "head \ufffd owner-note \ufffd tail")  # the owner's deletion of "mid" holds
 
     def test_producer_plans_with_tabs_or_unlocated_twins_pass_the_validator(self):
         tabbed = self.ws / "tab\tdir\u2028ls"
