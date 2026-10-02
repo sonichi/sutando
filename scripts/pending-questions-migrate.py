@@ -264,7 +264,8 @@ def _line(v) -> bool:
 
 def _entry_ok(e) -> bool:
     return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
-            and _line(e.get("title")) and all(isinstance(e.get(k), str) for k in ("why", "ask_id", "body"))
+            and _line(e.get("title")) and e["title"] == e["title"].strip() and all(isinstance(e.get(k), str) for k in ("ask_id", "body"))
+            and isinstance(e.get("why"), str) and not _CONTROL.search(e["why"])
             and (e.get("sha") is None or (isinstance(e.get("sha"), str) and _DIGEST.fullmatch(e["sha"])))
             and "nth" in e and "sha" in e and (e["nth"] is None) == (e["sha"] is None)
             and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0 and isinstance(e["sha"], str))))
@@ -317,7 +318,7 @@ def _bind(r: dict, text: str, host: Optional[str]) -> dict:
         return {**r, "unbound": True}
     chunk = text[slice(*found[r["nth"]])]
     body = chunk.strip() if r["kind"] == "bullet" else chunk.partition("\n")[2].strip()
-    return {**r, "body": body, "why": " ".join(str(r["why"]).split()),
+    return {**r, "body": body, "why": " ".join(str(r["why"]).split()), "span": found[r["nth"]][0],
             "ask_id": legacy_ask_id(r["title"], body, host, r["nth"])}
 
 
@@ -334,8 +335,9 @@ def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> l
     text = ledger_file.read_text(encoding="utf-8") if ledger_file.exists() else ""
     entries = [_bind(r, text, host) for r in plan["entries"]]
     acting = [r["ask_id"] for r in entries if not r.get("unbound") and r["class"] == "live"]
-    if len(acting) != len(set(acting)):
-        return ["refused: two planned entries resolve to one ask id; re-run the dry run"]
+    targets = [r["span"] for r in entries if not r.get("unbound")]
+    if len(acting) != len(set(acting)) or len(targets) != len(set(targets)):
+        return ["refused: two planned entries resolve to one ledger entry or ask id; re-run the dry run"]
     for r in entries:
         if r.get("unbound") and not action_of(r, cpw).startswith("nothing"):
             done.append(f"skipped: changed since the plan: {r['title'][:80]!r}")
