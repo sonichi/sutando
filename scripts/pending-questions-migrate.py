@@ -14,8 +14,9 @@ already skips because their title says resolved) is classified, first match wins
   stale-merged-PR   — every PR it names is closed and at least one merged
   stale-closed-PR   — every PR it names was closed unmerged
   past-window       — no PR decides it and it is older than --window-days
-PR states come from `gh api repos/<repo>/pulls/<n>`; a 404 means "not a PR", a
-403 backs off 3 minutes and retries, anything else is unknown. The dry run
+PR states come from `gh api repos/<repo>/pulls/<n>`. A 404 there is "not a PR"
+only when `repos/<repo>/issues/<n>` returns a plain issue; otherwise it is
+unknown, as is every other failure. A 403 backs off 3 minutes and retries. The dry run
 prints the proposed action per entry and, with --plan-out, saves the plan;
 it writes nothing else. --apply takes only a saved plan (--plan): it re-queries
 nothing, and changes an entry only while its text still hashes to what the plan
@@ -42,7 +43,7 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
-from pending_questions_store import entry_ask_id, legacy_ask_id, row_body, row_id  # noqa: E402
+from pending_questions_store import active_region, entry_ask_id, legacy_ask_id, row_body, row_id  # noqa: E402
 
 CLASSES = ("already-migrated", "self-resolved", "live", "unknown-PR", "stale-merged-PR",
            "stale-closed-PR", "past-window")
@@ -81,37 +82,48 @@ def asked_on(title: str, body: str):
 
 class GhPrs:
     """PR state by (repo, number) through `gh api`, cached: open, merged, closed,
-    None when the number is not a PR (404), or UNKNOWN when gh could not say."""
+    None only when the issues endpoint proves the number is a plain issue, else
+    UNKNOWN. A pulls 404 alone proves nothing: GitHub answers 404 for a private
+    or unauthorized PR too."""
 
     def __init__(self, runner=subprocess.run, sleep=time.sleep, log=print):
         self.runner, self.sleep, self.log, self.cache = runner, sleep, log, {}
 
-    def state(self, repo: str, n: int):
-        if (repo, n) in self.cache:
-            return self.cache[(repo, n)]
-        st = UNKNOWN
+    def _get(self, path: str) -> tuple:
+        """("ok", json) | ("404", None) | (UNKNOWN, None); a 403 backs off and retries."""
         for attempt in range(TRIES):
             try:
-                r = self.runner(["gh", "api", f"repos/{repo}/pulls/{n}"], capture_output=True, text=True)
+                r = self.runner(["gh", "api", path], capture_output=True, text=True)
             except OSError:
-                break
+                return UNKNOWN, None
             err = (r.stderr or "") + (r.stdout if r.returncode else "")
             if r.returncode == 0:
                 try:
                     d = json.loads(r.stdout)
-                    st = "merged" if d.get("merged_at") else ("open" if d.get("state") == "open" else "closed")
-                except (ValueError, AttributeError):
-                    pass
-                break
+                except ValueError:
+                    return UNKNOWN, None
+                return ("ok", d) if isinstance(d, dict) else (UNKNOWN, None)
             if "HTTP 404" in err or "Not Found" in err:
-                st = None
-                break
+                return "404", None
             if "HTTP 403" in err or "rate limit" in err.lower():
                 if attempt + 1 < TRIES:
-                    self.log(f"gh: 403 on {repo}#{n}; backing off {BACKOFF_SEC}s", file=sys.stderr)
+                    self.log(f"gh: 403 on {path}; backing off {BACKOFF_SEC}s", file=sys.stderr)
                     self.sleep(BACKOFF_SEC)
                 continue
-            break
+            return UNKNOWN, None
+        return UNKNOWN, None
+
+    def state(self, repo: str, n: int):
+        if (repo, n) in self.cache:
+            return self.cache[(repo, n)]
+        kind, d = self._get(f"repos/{repo}/pulls/{n}")
+        if kind == "ok":
+            st = "merged" if d.get("merged_at") else ("open" if d.get("state") == "open" else "closed")
+        elif kind == "404":
+            kind, d = self._get(f"repos/{repo}/issues/{n}")
+            st = None if kind == "ok" and "pull_request" not in d else UNKNOWN
+        else:
+            st = UNKNOWN
         self.cache[(repo, n)] = st
         return st
 
@@ -238,11 +250,14 @@ def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool)
 
 
 def _with_status(text: str, r: dict, status: str) -> str:
-    """The planned entry's status line set, only while it still hashes as planned."""
+    """The planned entry's status line set, only while it still hashes as planned
+    and still sits in the active region (an archived entry is never rewritten)."""
     found = spans(text, r["kind"], r["title"])
     if r["nth"] is None or r["nth"] >= len(found) or _sha(text[slice(*found[r["nth"]])]) != r["sha"]:
         raise ledger.LedgerError(f"changed since the plan: {r['title'][:80]!r}")
     a, b = found[r["nth"]]
+    if a >= len(active_region(text)):
+        raise ledger.LedgerError(f"no longer in the active region: {r['title'][:80]!r}")
     line = f"**Status:** {status} (pending-questions-migrate)"
     st = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE).search(text, a, b)
     if st:
@@ -262,19 +277,40 @@ def apply(plan: dict, ledger_file: Path, store) -> list:
             if store is None:
                 done.append(f"unchanged (no room database) [live]: {r['title'][:80]}")
                 continue
-            text = ledger_file.read_text(encoding="utf-8")
-            try:
-                _with_status(text, r, "check")
-            except ledger.LedgerError as e:
-                done.append(f"skipped: {e}")
-                continue
-            store.insert_raw(r["ask_id"], r["title"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
-            status = f"moved — kept in the room database as row {row_id(r['ask_id'])}"
-        else:
-            status = f"resolved — {PAST_WINDOW_WHY if r['class'] == 'past-window' else r['why']}"
+            done.append(_apply_live(r, ledger_file, store))
+            continue
+        status = f"resolved — {PAST_WINDOW_WHY if r['class'] == 'past-window' else r['why']}"
         err = ledger.update(ledger_file, lambda t, r=r, status=status: _with_status(t, r, status))
-        done.append(f"{'skipped: ' + err if err else status.split(' — ')[0]}: {r['title'][:80]}")
+        done.append(f"{'skipped: ' + err if err else 'resolved'}: {r['title'][:80]}")
     return done
+
+
+def _apply_live(r: dict, ledger_file: Path, store) -> str:
+    """Row and file move under the ledger lock: the entry is checked, the row made,
+    the file re-read unchanged, then rewritten. Any failure after the row exists
+    resolves the row, so a refused move never leaves an Open row behind."""
+    made = []
+
+    def _move(old: str) -> str:
+        new = _with_status(old, r, f"moved — kept in the room database as row {row_id(r['ask_id'])}")
+        store.insert_raw(r["ask_id"], r["title"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
+        made.append(True)
+        if ledger_file.read_text(encoding="utf-8") != old:
+            raise ledger.LedgerError(f"changed while its row was made: {r['title'][:80]!r}")
+        return new
+    try:
+        err = ledger.update(ledger_file, _move)
+    except Exception as e:  # noqa: BLE001 — the row is compensated below
+        err = f"{type(e).__name__}: {e}"
+    if not err:
+        return f"moved: {r['title'][:80]}"
+    if made:
+        try:
+            store.set_status(r["ask_id"], "Resolved")
+            err += "; its row was resolved"
+        except Exception as e:  # noqa: BLE001
+            err += f"; ROW LEFT OPEN, resolve {row_id(r['ask_id'])} by hand ({type(e).__name__}: {e})"
+    return f"skipped: {err}"
 
 
 def main(argv=None) -> int:
@@ -308,6 +344,9 @@ def main(argv=None) -> int:
         if Path(plan["ledger"]).resolve() != args.ledger.resolve():
             print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
             return 2
+        if args.ledger.exists() and _sha(args.ledger.read_text(encoding="utf-8")) != plan.get("ledger_sha256"):
+            print("note: the ledger changed since the plan; each entry is still applied only while it is "
+                  "byte-identical and in the active region", file=sys.stderr)
         from pending_questions_room_db import room_store  # noqa: PLC0415
         store, where = room_store(ws)
         if store is None:

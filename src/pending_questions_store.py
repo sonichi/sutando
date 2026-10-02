@@ -462,6 +462,32 @@ class RoomDbStore:
                 if e["status"] == "Open"]
 
 
+# ---- the adapter registration ---------------------------------------------------
+
+REGISTRATION = Path("state") / "pending-questions-store.json"
+
+
+def register_adapter(workspace, adapter: Path) -> None:
+    """Record the adapter that made a room-database store, so every later reminder
+    pass reconciles through it without a flag on its schedule."""
+    path = Path(workspace) / REGISTRATION
+    record = json.dumps({"adapter": str(Path(adapter).resolve())}) + "\n"
+    try:
+        if path.read_text(encoding="utf-8") == record:
+            return
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ledger.replace_file(path, record)
+
+
+def registered_adapter(workspace) -> Optional[str]:
+    try:
+        return str(json.loads((Path(workspace) / REGISTRATION).read_text(encoding="utf-8"))["adapter"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 # ---- policy between them -------------------------------------------------------
 
 @dataclass
@@ -495,20 +521,27 @@ def sent_line_of(body: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def settled(line: Optional[str]) -> bool:
+    return bool(line) and not _PLACEHOLDER_RE.match(line)
+
+
 def resync(file_store: FileStore, db_store) -> tuple:
-    """Bring the database level with the file, never retiring a file entry:
-    an open file entry the database lacks is inserted with its own structured
-    fields and `**Sent:**` record; a status closed on either side closes the
-    other. (synced ask ids, errors)."""
+    """Bring the database and the file level, never retiring a file entry: an
+    open file entry the database lacks is inserted with its own structured fields
+    and `**Sent:**` record; a status closed on either side closes the other; a
+    delivery record settled on one side fills the other's placeholder (a stamp
+    that failed on one side). (synced ask ids, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
-        rows = {r["ask_id"]: r["status"] for r in db_store.entries()}
+        found = {r["ask_id"]: r for r in db_store.entries()}
     except Exception as e:  # noqa: BLE001
         return synced, [f"read: {type(e).__name__}: {e}"]
+    rows = {a: r["status"] for a, r in found.items()}
     for e in entries:
         aid, sent = e["ask_id"], sent_line_of(e["body"])
         try:
+            row_sent = sent_line_of(found[aid]["body"]) if aid in found else None
             if aid not in rows:
                 q = e["question"]
                 if e["status"] != "Open" or q is None or not sent or _PLACEHOLDER_RE.match(sent):
@@ -519,6 +552,10 @@ def resync(file_store: FileStore, db_store) -> tuple:
                 file_store.set_status(aid, rows[aid], "in the room database")
             elif rows[aid] == "Open" and e["status"] != "Open":
                 db_store.set_status(aid, e["status"])
+            elif sent == placeholder(aid) and settled(row_sent):
+                file_store.stamp(aid, row_sent)
+            elif row_sent == placeholder(aid) and settled(sent):
+                db_store.stamp(aid, sent)
             else:
                 continue
             synced.append(aid)

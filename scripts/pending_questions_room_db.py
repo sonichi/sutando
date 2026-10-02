@@ -8,6 +8,9 @@ agent identity from the gateway's own reading (`state/owner-routing.json`, an
 pending_questions_store.RoomDbStore whose client runs this file's `serve`, or
 None and the reason when anything is missing.
 
+`register` records this adapter for the reminder pass of an install whose rows
+were made before discovery recorded it.
+
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
 shapes through the client's own put_database / put_row_body.
@@ -25,7 +28,7 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_store import RoomDbStore, ScriptDbClient  # noqa: E402
+from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter  # noqa: E402
 
 SKILL = "room-collab"
 CLIENT_MODULE = "room_collab_client.py"
@@ -68,6 +71,10 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
         return None, "no agent identity to sign database writes with"
     argv = [sys.executable, str(Path(__file__).resolve()), "serve", "--room", room,
             "--user-id", user, "--skill-scripts", str(scripts)]
+    try:
+        register_adapter(workspace, Path(__file__))
+    except OSError as e:
+        print(f"pending_questions_room_db: could not register for the reminder ({e})", file=sys.stderr)
     return RoomDbStore(ScriptDbClient(argv, timeout), label=f"the owner's DM room {room}",
                        lock=Path(workspace) / "state" / "pending-questions-db.lock"), room
 
@@ -169,11 +176,21 @@ async def _serve(args, req: dict) -> object:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Serve one pending-questions room-database request.")
-    ap.add_argument("command", choices=("serve",))
-    ap.add_argument("--room", required=True)
-    ap.add_argument("--user-id", required=True)
-    ap.add_argument("--skill-scripts", required=True)
+    ap.add_argument("command", choices=("serve", "register"))
+    ap.add_argument("--room")
+    ap.add_argument("--user-id")
+    ap.add_argument("--skill-scripts")
+    ap.add_argument("--workspace", type=Path, default=None)
     args = ap.parse_args(argv)
+    if args.command == "register":
+        if args.workspace is None:
+            from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
+            args.workspace = resolve_workspace(migrate=False)
+        store, where = room_store(args.workspace)
+        print(f"registered for the reminder: {where}" if store else f"not registered: {where}")
+        return 0 if store else 1
+    if not (args.room and args.user_id and args.skill_scripts):
+        ap.error("serve needs --room, --user-id and --skill-scripts")
     try:
         req = json.loads(sys.stdin.read())
         result = asyncio.run(_serve(args, req))

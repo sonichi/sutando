@@ -4,8 +4,9 @@
 Runs on cron — independent of the proactive loop.
 Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
-`--store-adapter <path>` injects a room-database adapter (its `room_store(workspace)`);
-its open rows are reminded alongside the file's waiting entries.
+`--store-adapter <path>`, else the adapter an earlier run registered in the
+workspace, injects a room-database adapter (its `room_store(workspace)`); the
+pass reconciles it with the file, then reminds its open rows and the file's rest.
 """
 
 import hashlib
@@ -27,7 +28,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
 from pending_questions_store import (OPEN_WORDS, FileStore, entry_ask_id,  # noqa: E402
-                                     legacy_ask_id, resync)
+                                     legacy_ask_id, registered_adapter, resync)
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -624,8 +625,10 @@ def zero_reason():
 def main():
     force = "--force" in sys.argv
     store = None
-    if "--store-adapter" in sys.argv[:-1]:
-        store, why = load_store(sys.argv[sys.argv.index("--store-adapter") + 1])
+    adapter = (sys.argv[sys.argv.index("--store-adapter") + 1] if "--store-adapter" in sys.argv[:-1]
+               else registered_adapter(WORKSPACE))
+    if adapter:
+        store, why = load_store(adapter)
         if store is None:
             print(f"room database: not used ({why}); reminding from the file", file=sys.stderr)
     questions, notes = gather(store)
