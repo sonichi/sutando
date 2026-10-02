@@ -43,7 +43,8 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
-from pending_questions_store import active_region, entry_ask_id, legacy_ask_id, row_body, row_id  # noqa: E402
+from pending_questions_store import (CasConflict, active_region, entry_ask_id,  # noqa: E402
+                                     legacy_ask_id, row_body, row_id)
 
 CLASSES = ("already-migrated", "self-resolved", "live", "unknown-PR", "stale-merged-PR",
            "stale-closed-PR", "past-window")
@@ -308,17 +309,19 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
         return f"skipped: {err}" + _supersede(store, r)
     if not made.get("created"):
         try:
-            if store.status_of(r["ask_id"]) == "Superseded":
-                store.set_status(r["ask_id"], "Open")
-        except Exception:  # noqa: BLE001 — the next reconciling pass reopens a linked row
+            store.transition(r["ask_id"], "Superseded", "Open")
+        except Exception:  # noqa: BLE001 — not Superseded (left as is), or the next pass reopens it
             pass
     return f"moved: {r['title'][:80]}"
 
 
 def _supersede(store, r: dict) -> str:
+    """Open -> Superseded only: a row the owner answered or resolved is never touched."""
     try:
-        store.set_status(r["ask_id"], "Superseded")
+        store.transition(r["ask_id"], "Open", "Superseded")
         return "; its row was superseded (the file entry stays the question)"
+    except CasConflict as e:
+        return f"; its row was left as is ({e.current})" if e.current else "; no row was made"
     except Exception as e:  # noqa: BLE001
         return f"; its row could not be superseded now ({type(e).__name__}); the next reminder pass does it"
 
