@@ -83,6 +83,10 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
 
 # ---- serve: one request against the databases document -------------------------
 
+# More unsafe characters than this and the row is left as is: each repair is one write.
+NEUTRALISE_MAX = 32
+
+
 def _first_unsafe(text: str):
     for i, ch in enumerate(text):
         if safe_body(ch) != ch:
@@ -188,6 +192,9 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
             return {"written": False, "current": current}
         # One character per write: each is its own minimal delta, so a concurrent edit elsewhere merges.
         body = doc.row_body(db, row) or ""
+        unsafe = sum(1 for ch in body if safe_body(ch) != ch)
+        if unsafe > NEUTRALISE_MAX:
+            return {"written": False, "current": {**current, "unsafe_characters": unsafe}}
         while (fixed := _first_unsafe(body)) is not None:
             body = body[:fixed] + "\ufffd" + body[fixed + 1:]
             await doc.put_row_body(db, row, body)
