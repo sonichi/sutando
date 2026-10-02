@@ -1630,7 +1630,7 @@ class TestMigrateRound3(_MigrateBase):
         aid, client = only["entries"][0]["ask_id"], InProcClient()
         pqs.RoomDbStore(client, lock=self.ws / "state" / "a", host="host-a").insert_raw(aid, "Pick?", "page")
         host_b = pqs.RoomDbStore(client, lock=self.ws / "state" / "b", host="host-b")
-        [done] = self.m.apply(only, self.ledger, host_b)
+        [done] = self.m.apply(only, self.ledger, host_b, "host-b")
         self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
         self.assertEqual(sorted((e["host"], e["status"], e["recovery"]) for e in host_b.entries()),
                          [("host-a", "Open", False), ("host-b", "Open", False)])
@@ -1639,19 +1639,33 @@ class TestMigrateRound3(_MigrateBase):
         plan, before = self._only(), self.ledger.read_text()
         db = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "l", host="this-host")
         for p in ({k: v for k, v in plan.items() if k != "version"}, dict(plan, host="other-host")):
-            [done] = self.m.apply(p, self.ledger, db)
+            [done] = self.m.apply(p, self.ledger, db, "this-host")
             self.assertTrue(done.startswith("refused: this plan is version"))
+        [done] = self.m.apply(dict(plan, host="this-host"), self.ledger, db)  # host not stated: refused
+        self.assertTrue(done.startswith("refused: the store is for host"))
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual(db.entries(), [])
         p = dict(plan, host="other-host", version=self.m.PLAN_VERSION)
         [done] = self.m.apply(p, self.ledger, None, "this-host")  # no room database reachable
         self.assertTrue(done.startswith("refused: this plan is version"))
         self.assertEqual(self.ledger.read_text(), before)
+        planf = self.ws / "wrong-host-plan.json"
+        planf.write_text(json.dumps(dict(plan, host="other-host")))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                mock.patch.object(adapter, "register_adapter") as reg:
+            rc = self.m.main(["--apply", "--plan", str(planf), "--ledger", str(self.ledger),
+                              "--workspace", str(self.ws)])
+        self.assertEqual(rc, 2)
+        self.assertIn("refused: this plan is version", err.getvalue())
+        reg.assert_not_called()  # refused before the room database is even looked up
+        self.assertEqual(self.ledger.read_text(), before)
 
     def test_host_labels_that_slug_alike_still_get_two_row_keys(self):
         client = InProcClient()
         keys = {h: pqs.RoomDbStore(client, lock=self.ws / "state" / h, host=h)._rid("ask-1") for h in ("a.b", "a-b")}
         self.assertNotEqual(keys["a.b"], keys["a-b"])
+        self.assertTrue(all("~" in k and "--" not in k for k in keys.values()))  # disjoint from slug keys
 
     def test_two_hosts_migrating_the_same_entry_get_separate_rows(self):
         cpq = self.m._reader()
@@ -1687,7 +1701,7 @@ class TestMigrateRound3(_MigrateBase):
 
     def test_apply_notes_a_ledger_changed_since_the_plan(self):
         plan = self.ws / "plan.json"
-        plan.write_text(json.dumps(self.plan()))
+        plan.write_text(json.dumps(dict(self.plan(), host=importlib.import_module("util_paths").host_label())))
         self.ledger.write_text(self.ledger.read_text() + "\n## 2026-09-30 — a new question\n")
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
