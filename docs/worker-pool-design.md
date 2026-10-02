@@ -319,6 +319,14 @@ turn in flight. With the same sustain and stale line, once per episode:
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
 
+An expired login is the exception to the work-owed and sustain requirements: its
+banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
+an acknowledgment saved before wedge kinds existed is rechecked for login only.
+An existing `needs-login` cause card remains the same actionable warning when HITL
+deduplicates the login request onto it; cleanup closes it after the pane recovers,
+not merely because its older card type differs. Other legacy acknowledgments keep
+their existing behavior. No login warning restarts or types into a worker session.
+
 A card decision repeats on each tick until the card is actually created, so one
 unreadable capture delays it by a tick rather than suppressing it. The clocks are
 tick-bound: with the 300 s timer the three-sighting sustain, not the 90 s line,
