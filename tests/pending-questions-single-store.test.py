@@ -18,7 +18,7 @@ PATH_RE = re.compile(r"""(["'/=]|\bpath\s)pending-questions\.md""")
 COMMENT_RE = re.compile(r"^\s*(#(?!!)|//|\*|/\*)")
 # Files whose only mentions are inventories of a legacy file they move or tidy, never read.
 INVENTORIES = {
-    "src/pending_questions_compat.py": "the transitional ingest (its docstring says when it goes)",
+    "skills/pending-questions/scripts/pending_questions_compat.py": "the transitional ingest (its docstring says when it goes)",
     "src/health-check.py": "workspace-root and hosts/ file inventories",
     "scripts/sutando-migrate.sh": "workspace migration of legacy files",
     "scripts/sync-workspace.sh": "vault migration of legacy files",
@@ -54,7 +54,7 @@ class TestSingleStore(unittest.TestCase):
                     hits.setdefault(rel, []).append(f"{n}: {line.strip()}")
         unexpected = {k: v for k, v in hits.items() if k not in INVENTORIES}
         self.assertEqual(unexpected, {}, "a reader of the legacy file outside the transitional ingest")
-        self.assertIn("src/pending_questions_compat.py", hits, "the ingest still names the file it reads")
+        self.assertIn("skills/pending-questions/scripts/pending_questions_compat.py", hits, "the ingest still names the file it reads")
 
     def test_no_open_state_path_imports_the_ingest_or_an_archive_reader(self):
         importers = []
@@ -62,13 +62,16 @@ class TestSingleStore(unittest.TestCase):
             text = p.read_text(encoding="utf-8", errors="replace")
             if re.search(r"(import|from) pending_questions_compat\b", text):
                 importers.append(rel)
-        self.assertEqual(importers, ["src/pending_questions_store.py"], "reconcile_pending() is the single call site")
-        store = (REPO / "src" / "pending_questions_store.py").read_text()
+        self.assertEqual(importers, ["skills/pending-questions/scripts/pending_questions_store.py"],
+                         "reconcile_pending() is the single call site")
+        store = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_store.py").read_text()
         self.assertEqual(store.count("ingest_legacy_file_entries("), 1)
         self.assertNotRegex(store, r"def (archive|archived_ids|legacy_entries)\b", "no archive reader in the store")
-        for rel in ("src/pending_questions_reader.py", "src/check-pending-questions.py", "src/dashboard.py",
-                    "src/agent-api.py", "src/morning-briefing.py", "src/friction-detector.py",
-                    "skills/pending-questions/scripts/pq.py", "skills/pending-questions/scripts/pending_questions_room_db.py"):
+        for rel in ("src/pending_questions_reader.py", "src/pending_questions_outbox.py", "src/pending_questions_ask.py",
+                    "src/check-pending-questions.py", "src/dashboard.py", "src/agent-api.py", "src/morning-briefing.py",
+                    "src/friction-detector.py", "src/obsidian-mirror.py", "scripts/ask-owner.py",
+                    "skills/pending-questions/scripts/pq.py", "skills/pending-questions/scripts/pending_questions_room_db.py",
+                    "skills/pending-questions/scripts/pending_questions_remind.py"):
             self.assertNotRegex((REPO / rel).read_text(), r"pending_questions_compat|legacy_entries|pending_questions_md", rel)
 
     def test_the_retired_file_readers_are_gone(self):
@@ -78,9 +81,29 @@ class TestSingleStore(unittest.TestCase):
 
     def test_every_core_reader_goes_through_the_reader_helper(self):
         for rel in ("src/dashboard.py", "src/agent-api.py", "src/morning-briefing.py", "src/friction-detector.py",
-                    "src/obsidian-mirror.py", "src/check-pending-questions.py"):
+                    "src/obsidian-mirror.py", "src/check-pending-questions.py", "scripts/ask-owner.py"):
             self.assertIn("pending_questions_reader", (REPO / rel).read_text(), rel)
         self.assertIn("pending_questions_reader.py", (REPO / "src" / "session-handoff.sh").read_text())
+
+    def test_core_keeps_only_the_contract_and_the_feature_lives_in_the_skill(self):
+        """The layout the architecture rules ask for: core = reader (discovery by the manifest
+        field), the one outbox-record writer, the provider-neutral queue, two thin entries; the
+        store, replay, ingest, reminder and adapter are the skill's. Core names no skill."""
+        src = REPO / "src"
+        for gone in ("pending_questions_store.py", "pending_questions_compat.py"):
+            self.assertFalse((src / gone).exists(), f"{gone} is feature policy; it belongs to the skill")
+        skill = REPO / "skills" / "pending-questions" / "scripts"
+        for there in ("pending_questions_store.py", "pending_questions_compat.py", "pending_questions_remind.py",
+                      "pending_questions_room_db.py", "pq.py"):
+            self.assertTrue((skill / there).exists(), there)
+        for rel in ("src/pending_questions_reader.py", "src/pending_questions_outbox.py", "src/pending_questions_ask.py",
+                    "src/check-pending-questions.py", "scripts/ask-owner.py"):
+            text = (REPO / rel).read_text()
+            # The manifest FIELD `pending_questions_store` is the contract core reads; the modules are not.
+            self.assertNotRegex(text, r"room[-_]collab|room[-_]commons|pending_questions_room_db|skills/pending-questions|"
+                                      r"pending_questions_(store|compat|remind)\.py|"
+                                      r"(import|from) pending_questions_(store|compat|remind)\b", rel)
+        self.assertLess(len((REPO / "src" / "check-pending-questions.py").read_text().splitlines()), 60, "a thin shim")
 
     def test_the_inventory_allowlist_is_still_needed(self):
         """A stale allow-list entry hides the next real reader; drop entries whose mentions are gone."""

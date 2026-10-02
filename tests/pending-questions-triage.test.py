@@ -515,7 +515,10 @@ class AdapterRows(unittest.TestCase):
         self._saved_ws = api.WORKSPACE_DIR
         api.WORKSPACE_DIR = self.tmp
         self.items = [dict(i) for i in PQ_ITEMS]
-        patcher = mock.patch.object(api.pending_questions_reader, "waiting", side_effect=lambda ws: list(self.items))
+        patcher = mock.patch.object(
+            api.pending_questions_reader, "gather",
+            side_effect=lambda ws, *a, **k: {"waiting": list(self.items), "done": 0, "unavailable": False,
+                                             "reason": None, "link": None, "notes": [], "store": "test"})
         self.waiting = patcher.start()
         self.addCleanup(patcher.stop)
 

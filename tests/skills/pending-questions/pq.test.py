@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """skills/pending-questions/scripts/pq.py: each verb delegates to the existing owner
-(ask-owner, the sibling adapter's gather/resolve, the reminder with --notify), the
-adapter is injected at this edge, and core finds it only by its manifest declaration.
-No real room or workspace is touched: a temp workspace, the fake room-collab capability
-and the in-process database store of the room-db test."""
+(ask-owner with the adapter injected, the sibling adapter's read-only gather / explicit
+reconcile / resolve, the reminder with --notify), and core finds the adapter only by its
+manifest declaration — refusing when two skills declare it. No real room or workspace is
+touched: a temp workspace, the fake room-collab capability and the in-process database
+store of the room-db test."""
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -27,7 +29,7 @@ def _load(name, path):
 
 rdb = _load("pq_room_db_test", REPO / "tests" / "pending-questions-room-db.test.py")
 pq = _load("pq_cli", SKILL / "scripts" / "pq.py")
-pqs, pqa, adapter, HOST, ROOM = rdb.pqs, rdb.pqa, rdb.adapter, rdb.HOST, rdb.ROOM
+pqs, pqa, adapter, reader, HOST, ROOM = rdb.pqs, rdb.pqa, rdb.adapter, rdb.reader, rdb.HOST, rdb.ROOM
 
 
 class _Ws(rdb._Ws):
@@ -50,10 +52,6 @@ class _Ws(rdb._Ws):
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(self.state)}):
             return adapter.room_store(self.ws, environ={})[0]
 
-    def ask(self, question, store=None):
-        with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(self.state)}):
-            return pqa.ask_owner(question, urgency="durable", workspace=self.ws, host=HOST, store=store)
-
 
 class TestAsk(_Ws):
     def test_ask_records_the_row_through_the_skill_adapter(self):
@@ -68,23 +66,22 @@ class TestAsk(_Ws):
         self.assertEqual(self.outbox(), [])
 
     def test_ask_without_the_capability_holds_the_question_in_the_outbox(self):
-        import shutil
         shutil.rmtree(self.ws / "skills")
         rc, out, err = self.cli("ask", "q?", "--urgency", "durable", "--workspace", str(self.ws))
         self.assertEqual(rc, 0)
-        self.assertIn("room database: not used (no room-collab capability installed)", out)
+        self.assertIn("room database: not used (no room capability installed", out)
         self.assertIn("recorded: OUTBOX", out)
         self.assertIn("ROOM DATABASE WRITE FAILED", err)
         self.assertEqual(len(self.outbox()), 1)
 
-    def test_ask_delegates_to_ask_owner(self):
+    def test_ask_delegates_to_the_adapters_ask_owner_with_its_store(self):
         seen = {}
 
-        def _ask(*a, **kw):
-            seen.update(kw, question=a[0])
+        def _ask(question, **kw):
+            seen.update(kw, question=question)
             return {"db_error": None, "record": "x", "heading": "## x", "outbox": None, "link": None,
-                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile_pending": None}
-        with mock.patch.object(pqa, "ask_owner", _ask):
+                    "proactive_file": "p", "where": "w", "send_error": None, "macos": None, "reconcile": None}
+        with mock.patch.object(reader, "load_adapter", return_value=adapter), mock.patch.object(adapter, "ask_owner", _ask):
             self.cli("ask", "q?", "--context", "why", "--workspace", str(self.ws))
         self.assertEqual((seen["question"], seen["context"]), ("q?", "why"))
         self.assertIsInstance(seen["store"], pqs.RoomDbStore)
@@ -102,17 +99,38 @@ class TestList(_Ws):
         rc, out, _ = self.cli("list", "--workspace", str(self.ws))
         self.assertIn(f"1 waiting on the owner:\n- [{a['ask_id']}] first?", out)
 
-    def test_a_held_question_is_listed_once_marked_and_filed_by_the_pass(self):
+    def test_list_is_read_only_and_reconcile_is_the_pass_that_files_a_held_question(self):
         held = self.ask("held?")  # no store
-        with mock.patch.dict(os.environ, {"FAKE_ROOM_FAIL": "1"}):
-            rc, out, err = self.cli("list", "--workspace", str(self.ws))
+
+        def room():
+            return json.loads(self.state.read_text()) if self.state.exists() else {}
+        rc, out, _ = self.cli("list", "--workspace", str(self.ws))
         self.assertIn(f"- [{held['ask_id']}] held? (not yet in the room)", out)
-        self.assertIn("service refused", err)
-        self.assertEqual(out.count(held["ask_id"]), 1)
-        rc, out, err = self.cli("list", "--json", "--workspace", str(self.ws))
+        self.assertEqual(self.outbox(), [f"{held['ask_id']}.json"], "list files nothing")
+        self.assertEqual((room().get("rows"), room().get("dbs")), ({}, {}), "list writes no row, not even the database")
+        rc, out, _ = self.cli("reconcile", "--workspace", str(self.ws))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("filed 1 held", out)
+        self.assertEqual(self.outbox(), [])
+        rc, out, _ = self.cli("list", "--json", "--workspace", str(self.ws))
         [item] = json.loads(out)
         self.assertEqual((item["ask_id"], item["in_room"]), (held["ask_id"], True))
-        self.assertEqual(self.outbox(), [])
+
+    def test_an_unreachable_room_lists_unknown_never_zero(self):
+        held = self.ask("held?")
+        with mock.patch.dict(os.environ, {"FAKE_ROOM_FAIL": "1"}):
+            rc, out, err = self.cli("list", "--workspace", str(self.ws))
+            self.assertEqual(rc, 0)
+            self.assertIn("pending questions: UNKNOWN — room unreachable", out)
+            self.assertIn(f"- [{held['ask_id']}] held? (not yet in the room)", out)
+            self.assertNotIn("0 pending", out)
+            self.assertIn("service refused", err)
+            rc, out, _ = self.cli("list", "--json", "--workspace", str(self.ws))
+            j = json.loads(out)
+            self.assertEqual((j["unavailable"], [i["ask_id"] for i in j["waiting"]]), (True, [held["ask_id"]]))
+            rc, out, _ = self.cli("reconcile", "--workspace", str(self.ws))
+            self.assertEqual(rc, 1)
+            self.assertIn("reconcile: FAILED", out)
 
     def test_the_count_agrees_with_the_list(self):
         store = self.store()
@@ -121,7 +139,7 @@ class TestList(_Ws):
         self.ask("held?", self.db(rdb.InProcClient(fail="down")))
         rc, out, _ = self.cli("list", "--json", "--workspace", str(self.ws))
         with mock.patch.dict(os.environ, {"FAKE_ROOM_STATE": str(self.state)}):
-            self.assertEqual(adapter.count(self.ws), {"open": len(json.loads(out)), "done": 0})
+            self.assertEqual(adapter.count(self.ws)["open"], len(json.loads(out)))
             self.assertEqual(adapter.count(self.ws)["open"], 4)
 
     def test_an_empty_list_says_where_it_looked(self):
@@ -143,15 +161,26 @@ class TestResolve(_Ws):
         self.assertIn("not changed", out)
         self.assertEqual(self.store().status_of(a["ask_id"]), "Answered")
 
-    def test_resolve_of_an_unknown_id_and_without_the_capability(self):
+    def test_an_unknown_id_is_refused_but_without_the_capability_the_close_is_recorded_locally(self):
         rc, out, _ = self.cli("resolve", "ask-nope", "--workspace", str(self.ws))
         self.assertEqual(rc, 1)
         self.assertIn("not changed", out)
-        import shutil
         shutil.rmtree(self.ws / "skills")
         rc, out, _ = self.cli("resolve", "ask-nope", "--workspace", str(self.ws))
-        self.assertEqual(rc, 1)
-        self.assertIn("room database: not used", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("recorded locally as Resolved", out)
+
+    def test_a_close_during_an_outage_is_applied_by_the_next_reconcile(self):
+        a = self.ask("first?", self.store())
+        with mock.patch.dict(os.environ, {"FAKE_ROOM_FAIL": "1"}):
+            rc, out, _ = self.cli("resolve", a["ask_id"], "--answered", "--workspace", str(self.ws))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("recorded locally as Answered", out)
+        self.assertEqual(self.store().status_of(a["ask_id"]), "Open")
+        rc, out, _ = self.cli("reconcile", "--workspace", str(self.ws))
+        self.assertIn("applied 1 local close", out)
+        self.assertEqual(self.store().status_of(a["ask_id"]), "Answered")
+        self.assertEqual(sorted((self.ws / "state" / "pending-questions-outbox" / "closed").glob("*.json")), [])
 
 
 class TestRemind(unittest.TestCase):
@@ -182,34 +211,47 @@ class TestDeclaration(rdb._Ws):
         return d
 
     def test_the_repo_skill_declares_its_adapter(self):
-        self.assertEqual(pqs.declared_adapter(REPO / "skills"), pq.ADAPTER)
-        self.assertEqual(pqs.declared_adapter(REPO / "skills"), rdb.reader._adapter()[0].__file__ and
-                         Path(rdb.reader._adapter()[1]))
+        self.assertEqual(reader.declared_adapter(REPO / "skills"), pq.ADAPTER)
+        self.assertEqual(Path(reader._adapter()[1]), pq.ADAPTER)
 
     def test_a_declaration_must_stay_inside_its_skill(self):
         skills = self.ws / "skills-dir"
         self._skill("a-off", {"enabled": False, "pending_questions_store": "scripts/a.py"})
         self._skill("b-out", {"pending_questions_store": "../a-off/scripts/a.py"})
-        self.assertIsNone(pqs.declared_adapter(skills))
+        self.assertIsNone(reader.declared_adapter(skills))
         good = self._skill("c-ok", {"pending_questions_store": "scripts/a.py"})
-        self.assertEqual(pqs.declared_adapter(skills), (good / "scripts" / "a.py").resolve())
-        self.assertEqual(pqs.load_adapter_store(pqs.declared_adapter(skills), self.ws), (None, "fake"))
-        self.assertEqual(pqs.load_adapter_store(None, self.ws)[0], None)
+        self.assertEqual(reader.declared_adapter(skills), (good / "scripts" / "a.py").resolve())
+        self.assertEqual(reader.load_adapter(reader.declared_adapter(skills)).room_store(self.ws), (None, "fake"))
+        self.assertIsNone(reader.load_adapter(None))
 
-    def test_without_the_skill_the_reader_lists_the_outbox_and_says_why(self):
+    def test_two_skills_declaring_the_store_is_a_refusal_not_an_alphabetical_pick(self):
+        skills = self.ws / "skills-dir"
+        self._skill("aaa-first", {"pending_questions_store": "scripts/a.py"})
+        self._skill("zzz-last", {"pending_questions_store": "scripts/a.py"})
+        with self.assertRaisesRegex(reader.AdapterConflict, "aaa-first, zzz-last"):
+            reader.declared_adapter(skills)
+        g = reader.gather(self.ws, skills_dir=skills)
+        self.assertTrue(g["unavailable"])
+        self.assertIn("more than one skill declares", g["reason"])
+        self.assertEqual(reader.count(self.ws, skills_dir=skills)["open"], None)
+
+    def test_without_the_skill_the_reader_lists_the_outbox_and_closes_locally(self):
         out = pqa.ask_owner("held?", urgency="durable", workspace=self.ws, host=HOST)
-        g = rdb.reader.gather(self.ws, skills_dir=self.ws / "no-skills")
+        g = reader.gather(self.ws, skills_dir=self.ws / "no-skills")
         self.assertEqual([i["ask_id"] for i in g["waiting"]], [out["ask_id"]])
+        self.assertEqual((g["unavailable"], g["done"]), (False, 0))
         self.assertIn("no skill declares one", g["notes"][0])
-        self.assertEqual(rdb.reader.resolve(self.ws, out["ask_id"], "Resolved", skills_dir=self.ws / "no-skills")[0], False)
+        ok, msg = reader.resolve(self.ws, out["ask_id"], "Resolved", skills_dir=self.ws / "no-skills")
+        self.assertTrue(ok, msg)
+        self.assertEqual(reader.count(self.ws, skills_dir=self.ws / "no-skills"), {"open": 0, "done": 1, "unavailable": False, "reason": None})
 
     def test_without_the_skill_ask_owner_holds_the_question(self):
         cli = REPO / "scripts" / "ask-owner.py"
-        with mock.patch.object(pqs, "declared_adapter", return_value=None), \
+        with mock.patch.object(reader, "declared_adapter", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             rc = _load("ask_owner_cli", cli).main(["q?", "--urgency", "durable", "--workspace", str(self.ws)])
         self.assertEqual(rc, 0)
-        self.assertIn("room database: not used (no pending-questions store adapter installed)", out.getvalue())
+        self.assertIn("room database: not used (no pending-questions store adapter installed", out.getvalue())
         self.assertEqual(len(self.outbox()), 1)
 
 
@@ -236,6 +278,14 @@ class TestSharedRoom(rdb._Ws):
         (self.ws / "state" / "pending-questions-room").write_text("!fromstate:test.invalid")
         self.assertEqual(self.store_room({"PENDING_QUESTIONS_ROOM": self.SHARED})[1], self.SHARED)
 
+    def test_the_canonical_capability_skill_is_looked_up_before_its_alias(self):
+        rdb._install_fake_capability(self.ws)
+        canonical = self.ws / "skills" / "room-commons" / "scripts"
+        shutil.copytree(self.ws / "skills" / "room-collab" / "scripts", canonical)
+        self.assertEqual(adapter.skill_scripts(self.ws), canonical)
+        shutil.rmtree(canonical.parent)
+        self.assertEqual(adapter.skill_scripts(self.ws), self.ws / "skills" / "room-collab" / "scripts")
+
     def test_the_manifest_declares_the_key_empty(self):
         cfg = json.loads((SKILL / "manifest.json").read_text())
         self.assertEqual(cfg["config"], {"PENDING_QUESTIONS_ROOM": ""})
@@ -243,6 +293,14 @@ class TestSharedRoom(rdb._Ws):
     def test_no_schedule_mentions_the_reminder(self):
         crons = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())
         self.assertEqual([c for c in crons if "pending-questions" in json.dumps(c)], [])
+
+    def test_no_pass_surfaces_questions(self):
+        """The proactive loop and the briefing hand the owner no question on a schedule."""
+        for rel in ("skills/proactive-loop/SKILL.md", "docs/proactive-loop-rationale.md"):
+            text = (REPO / rel).read_text()
+            self.assertNotRegex(text, r"question-\{?<?ts>?\}?\.txt", rel)
+            self.assertNotRegex(text, r"pq\.py list`?[^\n]*surface", rel)
+        self.assertNotIn("pending_qs[0]", (REPO / "src" / "morning-briefing.py").read_text())
 
 
 if __name__ == "__main__":

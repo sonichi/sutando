@@ -40,7 +40,8 @@ class Collapse(unittest.TestCase):
 
     def _run(self, items):
         m = _load(self.ws)
-        with mock.patch.object(m.pending_questions_reader, "waiting", return_value=items):
+        g = {"waiting": items, "done": 0, "unavailable": False, "reason": None, "notes": [], "link": None}
+        with mock.patch.object(m.pending_questions_reader, "gather", return_value=g):
             return m.check_pending_questions()
 
     def test_short_lists_are_still_enumerated_in_full(self):

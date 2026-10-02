@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+_spec = importlib.util.spec_from_file_location("cpq", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
 cpq = importlib.util.module_from_spec(_spec)
 sys.modules["cpq"] = cpq
 try:
@@ -86,7 +86,7 @@ class TestWriteNotifyStamp(unittest.TestCase):
     def test_the_notify_flow_delegates_to_it(self):
         # Guard the wiring: two inline lines could drift back in and this file's
         # location guarantee would then only cover the constant.
-        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        src = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py").read_text()
         self.assertIn("write_notify_stamp(questions)", src)
         self.assertEqual(src.count("LAST_NOTIFY_FILE.write_text("), 1,
                          "exactly one writer, inside write_notify_stamp")
@@ -114,7 +114,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
 
     def test_it_is_written_BEFORE_the_old_one_is_removed(self):
         # Order matters: remove-then-write would lose the cooldown on a crash.
-        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        src = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py").read_text()
         body = src.split("def write_notify_stamp", 1)[1].split("\ndef ", 1)[0]
         self.assertLess(body.index("write_text("), body.index('".last-pq-notify"'),
                         "the new stamp must be durable before the old one is retired")

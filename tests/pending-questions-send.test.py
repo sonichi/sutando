@@ -22,8 +22,10 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "ask-owner.py"
 sys.path.insert(0, str(REPO / "src"))
-import pending_questions_ask as pqa
-import pending_questions_store as pqs
+sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
+import pending_questions_ask as pqa  # core: queue + hold + notify
+import pending_questions_outbox as pqo
+import pending_questions_store as pqs  # the skill's typed Outbox / Question, for reading records
 import pending_questions_reader as reader
 from proactive_routing import proactive_destination
 from result_markers import parse_markers
@@ -32,7 +34,7 @@ HOST = "test-host"
 
 
 def _cpq(ws):
-    spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+    spec = importlib.util.spec_from_file_location("cpq", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.WORKSPACE = Path(ws)
@@ -53,7 +55,7 @@ class _Workspace(unittest.TestCase):
         self._osascript(0)
         os.environ["SUTANDO_HOST_LABEL"] = HOST
         self.addCleanup(os.environ.pop, "SUTANDO_HOST_LABEL", None)
-        patcher = mock.patch.object(pqs, "declared_adapter", return_value=None)
+        patcher = mock.patch.object(reader, "declared_adapter", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -270,10 +272,11 @@ class TestFailOpen(_Workspace):
         self.assertFalse(self.calls.exists())
 
     def test_an_outbox_save_that_raises_is_reported_and_the_question_still_goes_out(self):
-        with mock.patch.object(pqs.Outbox, "save", side_effect=OSError("disk full")):
+        with mock.patch.object(pqo.Outbox, "save", side_effect=OSError("disk full")):
             out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST)
         self.assertIn("outbox: OSError: disk full", out["db_error"])
         self.assertIsNotNone(out["proactive_file"])
+        self.assertIsNone(out["record"])
         self.assertIn("recorded: FAILED", "\n".join(pqa.report_lines(out)))
 
 
@@ -293,7 +296,7 @@ class TestEdges(_Workspace):
 
     def test_an_outbox_save_that_fails_mid_rename_leaves_no_temp_and_no_entry(self):
         ob = pqs.Outbox(self.ws)
-        with mock.patch.object(pqs.os, "replace", side_effect=OSError("rename refused")):
+        with mock.patch.object(pqo.os, "replace", side_effect=OSError("rename refused")):
             with self.assertRaises(OSError):
                 ob.save(pqs.Question("ask-x", "q?"), "**Sent:** x")
         self.assertEqual(list(ob.dir.iterdir()), [])
@@ -335,7 +338,6 @@ class TestReminder(_Workspace):
         cpq = _cpq(self.ws)
         cpq.notify_macos = lambda count, titles: True
         cpq.voice_client_connected = lambda: False
-        cpq.SKILLS_DIR = self.ws / "no-skills"
         buf = io.StringIO()
         with mock.patch.object(sys, "argv", ["check-pending-questions.py", *argv]), \
                 contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
