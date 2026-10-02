@@ -1838,18 +1838,42 @@ class TestMigrateRound3(_MigrateBase):
         self.assertTrue(done.startswith("skipped: its existing row holds control characters"))
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual(json.dumps(client.doc.state(), sort_keys=True), snap)  # body, cells, schema: untouched
-        writes = [op for op in client.calls[calls:] if op not in ("row", "rows")]
-        self.assertEqual(writes, [])
+        self.assertEqual([op for op in client.calls[calls:] if op not in ("row", "rows", "add_row")], [])
 
-    def test_add_row_never_replaces_an_existing_body_even_a_whitespace_one(self):
+    def test_add_row_never_writes_an_existing_row(self):
         client = InProcClient()
         db = self.db(client)
         db.insert_raw("ask-w", "q", "first")
-        for owner_body in ("\x0b", " ", "owner text"):
+        key = f"pendingq|{db._rid('ask-w')}"
+        for owner_body in ("", "\x0b", " ", "owner text"):
             with self.subTest(owner_body=repr(owner_body)):
-                client.doc.bodies[f"pendingq|{db._rid('ask-w')}"] = owner_body  # the owner, between calls
-                self.assertFalse(db.insert_raw("ask-w", "q", "generated page")["created"])
-                self.assertEqual(client.doc.bodies[f"pendingq|{db._rid('ask-w')}"], owner_body)
+                client.doc.bodies[key] = owner_body  # the owner, between calls
+                snap = json.dumps(client.doc.state(), sort_keys=True)
+                res = db.insert_raw("ask-w", "q", "generated page")
+                self.assertFalse(res["created"])
+                self.assertEqual(res["unsafe"], owner_body == "\x0b")
+                self.assertEqual(json.dumps(client.doc.state(), sort_keys=True), snap)
+
+    def test_migration_over_owner_edited_or_foreign_rows_writes_nothing(self):
+        plan = self._only()
+        aid = plan["entries"][0]["ask_id"]
+        cases = {"owner cleared the body": ("", HOST, "moved: "),
+                 "owner wrote a control": ("\x0b", HOST, "skipped: its existing row holds control characters"),
+                 "another host's row": ("", "other-host", "skipped: its row exists and is another host's")}
+        for name, (body, host, expect) in cases.items():
+            with self.subTest(name=name):
+                self.ledger.write_text(FIXTURE)
+                client = InProcClient()
+                pqs.RoomDbStore(client, lock=self.ws / "state" / "s", host=host).insert_raw(aid, "Pick?", "x")
+                key = next(k for k in client.doc.bodies if k.startswith("pendingq|"))
+                client.doc.bodies[key] = body
+                db = self.db(client)
+                db._keys[aid] = key.split("|", 1)[1]
+                [done] = self.apply(plan, self.ledger, db)
+                self.assertTrue(done.startswith(expect), done)
+                self.assertEqual(client.doc.bodies[key], body)  # never filled or replaced
+                if not expect.startswith("moved"):
+                    self.assertEqual(self.ledger.read_text(), FIXTURE)
 
     def test_a_retry_over_an_existing_clean_row_reuses_it(self):
         plan, db = self._only(), self.db()
