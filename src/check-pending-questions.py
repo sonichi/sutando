@@ -634,6 +634,8 @@ def main():
                else registered_adapter(WORKSPACE))
     if adapter:
         store, why = load_store(adapter)
+        if store is None and "--store-adapter" not in sys.argv and DEFAULT_STORE_ADAPTER.is_file():
+            store, why = load_store(str(DEFAULT_STORE_ADAPTER))  # a registration left by a moved checkout
         if store is None:
             print(f"room database: not used ({why}); reminding from the file", file=sys.stderr)
     elif DEFAULT_STORE_ADAPTER.is_file():
