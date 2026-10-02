@@ -257,8 +257,8 @@ KINDS = ("section", "bullet")
 def _entry_ok(e) -> bool:
     return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
             and all(isinstance(e.get(k), str) for k in ("title", "why", "ask_id", "body"))
-            and "nth" in e and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0))
-            and "sha" in e and (e["sha"] is None or isinstance(e["sha"], str)))
+            and "nth" in e and "sha" in e and (e["nth"] is None) == (e["sha"] is None)
+            and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0 and isinstance(e["sha"], str))))
 
 
 def plan_fits(plan: dict, host: Optional[str]) -> bool:
@@ -266,7 +266,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
     if not isinstance(plan, dict):
         return False
     entries = plan.get("entries")
-    return (plan.get("version") == PLAN_VERSION and bool(host)
+    return (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and bool(host)
             and plan.get("host") == host and isinstance(plan.get("ledger"), str)
             and isinstance(plan.get("ledger_sha256"), str) and type(plan.get("close_past_window")) is bool
             and isinstance(entries, list) and all(_entry_ok(e) for e in entries))
