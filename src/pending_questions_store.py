@@ -498,7 +498,7 @@ class RoomDbStore:
                 c = r.get("cells") or {}
                 if c.get("ask_id") and c.get("host") == self.host:
                     self._keys.setdefault(c["ask_id"], r["id"])
-        return self._keys.get(ask_id) or f"{row_id(ask_id)}--{hashlib.sha256(self.host.encode()).hexdigest()[:12]}"
+        return self._keys.get(ask_id) or f"{row_id(ask_id)}~{hashlib.sha256(self.host.encode()).hexdigest()[:12]}"
         self.last_link: Optional[str] = None
 
     def where(self, ask_id: str) -> str:

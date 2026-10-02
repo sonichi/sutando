@@ -248,6 +248,10 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
 PLAN_VERSION = 2
 
 
+def plan_fits(plan: dict, host: Optional[str]) -> bool:
+    return plan.get("version") == PLAN_VERSION and plan.get("host") == host
+
+
 def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
               host: Optional[str] = None) -> dict:
     return {"version": PLAN_VERSION, "host": host,
@@ -275,8 +279,9 @@ def _with_status(text: str, r: dict, status: str) -> str:
 def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> list:
     """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
     done, cpw = [], plan.get("close_past_window", False)
-    host = host or getattr(store, "host", None)
-    if plan.get("version") != PLAN_VERSION or (host and plan.get("host") != host):
+    if store is not None and getattr(store, "host", None) != host:
+        return [f"refused: the store is for host {getattr(store, 'host', None)!r}, not {host!r}"]
+    if not plan_fits(plan, host):
         return [f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
                 f"re-run the dry run on this host for a version {PLAN_VERSION} plan"]
     for r in plan["entries"]:
@@ -368,6 +373,10 @@ def main(argv=None) -> int:
         plan = json.loads(args.plan.read_text(encoding="utf-8"))
         if Path(plan["ledger"]).resolve() != args.ledger.resolve():
             print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
+            return 2
+        if not plan_fits(plan, host_label()):
+            print(f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
+                  f"re-run the dry run on this host for a version {PLAN_VERSION} plan", file=sys.stderr)
             return 2
         if args.ledger.exists() and _sha(args.ledger.read_text(encoding="utf-8")) != plan.get("ledger_sha256"):
             print("note: the ledger changed since the plan; each entry is still applied only while it is "
