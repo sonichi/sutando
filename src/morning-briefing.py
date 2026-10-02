@@ -593,18 +593,11 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
     return [body for _when, body in found[-5:]]
 
 
-def _load_notifier():
-    """Load check-pending-questions.py once, as a module.
+import pending_questions_reader  # noqa: E402
 
-    Module level on purpose: loading it inside get_pending_questions() would make
-    the predicate unreachable to tests, which point the notifier at a fixture by
-    swapping `PQ_FILE` on the loaded module (the pattern
-    tests/check-pending-questions-open-status.test.py already uses). A per-call
-    load rebuilds a private copy every time, so a test can only ever exercise a
-    re-implementation of the delegation instead of the shipped function — which is
-    exactly how the first version of this change shipped a regression past its own
-    test. Its main() is __name__-guarded, so importing fires no notification.
-    """
+
+def _load_notifier():
+    """check-pending-questions.py as a module, for VISIBLE_PREFIX only (its main() is guarded)."""
     import importlib.util
 
     src = _SRC_DIR / "check-pending-questions.py"
@@ -684,50 +677,22 @@ def clip_for_speech(text: str, limit: int) -> str:
 
 
 def get_pending_questions() -> list[str]:
-    """Return unanswered questions, delegating to check-pending-questions.py.
+    """Waiting questions as speakable titles, from the one pending-questions reader.
 
-    That module's `get_waiting_questions()` is the single source of truth for
-    "is this question still waiting". This function used to re-implement the
-    predicate, and the two copies drifted: on 2026-07-28 the notifier counted 33
-    and this counted 32. The missing entry was a live owner ask
-    ("/observe MVP: design fully resolved, build on your nod") dropped because
-    the local copy tested `'RESOLVED' in title.upper()` — a substring match that
-    fires on the word appearing anywhere in the prose, including in "NOT
-    self-resolved". An open question that goes uncounted goes unsurfaced.
-
-    Fixing only this copy would leave the duplicate in place to re-diverge —
-    #2351 had already fixed the notifier's side (`Status: open`) without this one
-    changing. So the predicate now lives in exactly one place.
-
-    That invariant was initially only half-true: this function still dropped
-    organizer shells and inline `[RESOLVED ...]` titles locally, so the two
-    consumers reported different counts (notifier 2 / briefing 1 on a corpus with
-    one active marker plus one open ask) — review finding on 919c35f2. Both
-    classifications now live in the shared parser, and nothing here judges
-    waiting-ness; this function only maps the result to display titles.
-
-    Deliberately no fallback parser: a second implementation is the bug. And a
-    failure here must not degrade to `[]`, which the briefing would render as the
-    confident "no pending questions" that this whole class of bug produces.
+    Nothing here judges waiting-ness. The reader's notes (no adapter, room
+    unreachable) go to stderr so a degraded read is never a silent "none".
     """
-    # The briefing resolves its OWN file and hands it to the predicate, rather
-    # than relying on the notifier's independent resolution. Two reasons: the two
-    # modules could otherwise read different files on a host where resolution
-    # differs, silently reintroducing the divergence this change removes; and it
-    # keeps `personal_path` as the single patch point the existing regression
-    # tests already use (tests/briefing-pending-status.test.py,
-    # tests/morning-briefing-pending-extract.test.py), so the seam does not move.
-    _CPQ.PQ_FILE = personal_path("pending-questions.md", WORKSPACE)
-
+    g = pending_questions_reader.gather(WORKSPACE)
+    for note in g["notes"]:
+        print(f"  pending questions: {note}", file=sys.stderr)
     out: list[str] = []
-    for q in _CPQ.get_waiting_questions():
+    for q in g["waiting"]:
         title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
         if not title:
             continue
         out.append(clip_for_speech(title, 60))
     return out
-
 
 
 def below_fold_count(total: int) -> int:
@@ -845,7 +810,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if len(pending_qs) == 1:
             parts.append(f"One pending question waiting: {pending_qs[0]}.")
         else:
-            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
+            # "Top item" asserted a ranking this code does not perform: the reader
             # yields FILE order, so index 0 is first-listed, not most important.
             parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
         hidden = below_fold_count(len(pending_qs))
