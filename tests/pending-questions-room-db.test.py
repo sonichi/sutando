@@ -1841,6 +1841,16 @@ class TestMigrateRound3(_MigrateBase):
         writes = [op for op in client.calls[calls:] if op not in ("row", "rows")]
         self.assertEqual(writes, [])
 
+    def test_add_row_never_replaces_an_existing_body_even_a_whitespace_one(self):
+        client = InProcClient()
+        db = self.db(client)
+        db.insert_raw("ask-w", "q", "first")
+        for owner_body in ("\x0b", " ", "owner text"):
+            with self.subTest(owner_body=repr(owner_body)):
+                client.doc.bodies[f"pendingq|{db._rid('ask-w')}"] = owner_body  # the owner, between calls
+                self.assertFalse(db.insert_raw("ask-w", "q", "generated page")["created"])
+                self.assertEqual(client.doc.bodies[f"pendingq|{db._rid('ask-w')}"], owner_body)
+
     def test_a_retry_over_an_existing_clean_row_reuses_it(self):
         plan, db = self._only(), self.db()
         db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "owner notes kept")
