@@ -186,10 +186,10 @@ def ledger_entry(q: Question) -> str:
                       placeholder(q.ask_id), ""]) + "\n"
 
 
-def legacy_ask_id(title: str, body: str, host: Optional[str] = None) -> str:
-    """The ask id the migration gives an entry written before ask ids existed. With `host`,
-    two hosts' identical entries get different ids, so they never share a database row."""
-    salt = f"{host}\n" if host else ""
+def legacy_ask_id(title: str, body: str, host: Optional[str] = None, nth: int = 0) -> str:
+    """The ask id the migration gives an entry written before ask ids existed. With `host`, the
+    host and the entry's occurrence index salt it, so identical entries never share an id."""
+    salt = f"{host}\n{nth}\n" if host else ""
     return "legacy-" + hashlib.sha256(f"{salt}{title}\n{body}".encode()).hexdigest()[:12]
 
 
@@ -486,6 +486,19 @@ class RoomDbStore:
                  host: Optional[str] = None):
         self.client, self.label, self.lock = client, label, Path(lock) if lock else None
         self.host = host
+        self._keys: dict = {}
+
+    def _rid(self, ask_id: str) -> str:
+        """This host's row for `ask_id`: the existing one it owns, else a new key that carries
+        the host, so two hosts' rows for one ask id are two rows, never one shared row."""
+        if not self.host:
+            return row_id(ask_id)
+        if ask_id not in self._keys:
+            for r in self.client.rows(DB_SCHEMA) or []:
+                c = r.get("cells") or {}
+                if c.get("ask_id") and c.get("host") == self.host:
+                    self._keys.setdefault(c["ask_id"], r["id"])
+        return self._keys.get(ask_id) or f"{row_id(ask_id)}--{re.sub(r'[^A-Za-z0-9_-]', '-', self.host)}"
         self.last_link: Optional[str] = None
 
     def where(self, ask_id: str) -> str:
@@ -497,7 +510,7 @@ class RoomDbStore:
                  "priority": _option_id("priority", priority), "ask_id": ask_id}
         if self.host:
             cells["host"] = self.host
-        res = self.client.add_row(DB_SCHEMA, row_id(ask_id), cells, body) or {}
+        res = self.client.add_row(DB_SCHEMA, self._rid(ask_id), cells, body) or {}
         self.last_link = res.get("link")
         return res
 
@@ -505,7 +518,7 @@ class RoomDbStore:
         return self.insert_raw(q.ask_id, q.question, question_body(q), q.priority).get("link")
 
     def _row(self, ask_id: str) -> dict:
-        r = self.client.row(DB_SCHEMA, row_id(ask_id))
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
         if not r:
             raise StoreError(f"no row for ask id {ask_id!r} in {DB_SCHEMA['name']}")
         return r
@@ -520,14 +533,14 @@ class RoomDbStore:
 
     def stamp(self, ask_id: str, sent_line: str) -> None:
         """One check-and-replace in the client's single call, serialized by `lock`."""
-        self._locked(lambda: self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line))
+        self._locked(lambda: self.client.stamp(DB_SCHEMA, self._rid(ask_id), placeholder(ask_id), sent_line))
 
     def _guarded(self, ask_id: str, cells: dict, expect: dict) -> None:
         """Write `cells` only while every `expect` prop holds one of its listed raw values
         (and Host is this host), checked and written in one client call under `lock`."""
         if self.host:
             expect = {"host": [self.host], **expect}
-        res = self._locked(lambda: self.client.guarded(DB_SCHEMA, row_id(ask_id), cells, expect)) or {}
+        res = self._locked(lambda: self.client.guarded(DB_SCHEMA, self._rid(ask_id), cells, expect)) or {}
         if not res.get("written"):
             names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
             current = {k: names.get(v, v) if k == "status" else v for k, v in (res.get("current") or {}).items()}
@@ -556,16 +569,18 @@ class RoomDbStore:
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
         self._row(ask_id)
-        self.client.set_cells(DB_SCHEMA, row_id(ask_id), {"status": _option_id("status", status)})
+        self.client.set_cells(DB_SCHEMA, self._rid(ask_id), {"status": _option_id("status", status)})
 
     def status_of(self, ask_id: str) -> Optional[str]:
-        r = self.client.row(DB_SCHEMA, row_id(ask_id))
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
         return effective_status((r or {}).get("cells") or {}) if r else None
 
     def entries(self) -> list:
         out = []
         for r in self.client.rows(DB_SCHEMA):
             cells = r.get("cells") or {}
+            if cells.get("ask_id") and self.host and cells.get("host") == self.host:
+                self._keys.setdefault(cells["ask_id"], r["id"])
             if cells.get("ask_id"):
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
                             "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
@@ -664,14 +679,13 @@ def resync(file_store: FileStore, db_store) -> tuple:
     try:
         entries = file_store.entries()
         linked, archived = file_store.linked_ids(), file_store.archived_ids()
-        found = {r["ask_id"]: r for r in db_store.entries()}
+        own = {r["ask_id"]: r for r in db_store.entries() if db_store.owns(r)}
     except Exception as e:  # noqa: BLE001
         return synced, [f"read: {type(e).__name__}: {e}"]
 
     def note(aid, ex):
         errors.append(str(ex) if isinstance(ex, GuardFailed) else f"{aid}: {type(ex).__name__}: {ex}")
 
-    own = {aid: r for aid, r in found.items() if db_store.owns(r)}
     for aid, r in own.items():
         try:
             if r.get("stale"):
@@ -690,15 +704,13 @@ def resync(file_store: FileStore, db_store) -> tuple:
     for e in entries:
         aid, sent = e["ask_id"], sent_line_of(e["body"])
         try:
-            if aid not in found:
+            if aid not in own:
                 q = e["question"]
                 if e["status"] != "Open" or q is None or not sent or _PLACEHOLDER_RE.match(sent):
                     continue  # closed, legacy, or still being asked by a live run
                 db_store.insert_raw(aid, q.question, question_body(q).replace(placeholder(aid), sent),
                                     q.priority)
                 synced.append(aid)
-                continue
-            if aid not in own:
                 continue
             row, row_sent = own[aid], sent_line_of(own[aid]["body"])
             if row["status"] == SUPERSEDED:

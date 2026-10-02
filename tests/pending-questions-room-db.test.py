@@ -735,13 +735,14 @@ class TestConcurrentReplicas(_Ws):
         db = pqs.RoomDbStore(InProcClient(doc), lock=self.ws / "state" / "l", host=HOST)
         db.insert_raw("ask-x", "q", "p")
         db.close("ask-x", "Resolved")  # from a stale replica
-        doc.maps["cells"]["pendingq|q-ask-x|status"] = {"v": "answered", "updated": 9, "by": "owner"}
+        key = f"pendingq|{db._rid('ask-x')}|"
+        doc.maps["cells"][key + "status"] = {"v": "answered", "updated": 9, "by": "owner"}
         self.assertEqual(db.status_of("ask-x"), "Answered")
         self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["ask-x"], []))
-        self.assertNotIn("pendingq|q-ask-x|closed", doc.maps["cells"])
-        self.assertEqual(doc.maps["cells"]["pendingq|q-ask-x|status"]["v"], "answered")
+        self.assertNotIn(key + "closed", doc.maps["cells"])
+        self.assertEqual(doc.maps["cells"][key + "status"]["v"], "answered")
 
-    def test_two_hosts_creating_one_legacy_row_at_once_never_close_the_winners_question(self):
+    def test_two_hosts_with_one_ask_id_get_two_rows_and_never_touch_each_other(self):
         for a_wins in (True, False):
             with self.subTest(a_wins=a_wins):
                 d = self.ws / f"two-{a_wins}"
@@ -756,17 +757,13 @@ class TestConcurrentReplicas(_Ws):
                 self._merge(base, a, b, a_wins=a_wins)
                 fa = pqs.FileStore(d / "a.md")
                 fa.path.write_text(TestMigratedRows.MOVED)  # A's copy is still active
-                [row] = sa.entries()
-                if a_wins:
-                    self.assertEqual((row["host"], row["status"], row["stale"]), ("host-a", "Open", ["closed"]))
-                    pqs.resync(fa, sa)
-                    self.assertEqual(sa.entries()[0]["stale"], [])
-                    self.assertEqual(fa.entries()[0]["status"], "Open")
-                    self.assertNotIn("resolved", fa.path.read_text().lower())
-                else:
-                    self.assertEqual((row["host"], row["status"]), ("host-b", "Resolved"))
-                    self.assertEqual(pqs.resync(fa, sa), ([], []))  # another host's row: A's file untouched
-                    self.assertEqual(fa.entries()[0]["status"], "Open")
+                rows = sorted((e["host"], e["status"]) for e in sa.entries())
+                self.assertEqual(rows, [("host-a", "Open"), ("host-b", "Resolved")])
+                self.assertEqual(pqs.resync(fa, sa), ([], []))
+                self.assertEqual(fa.entries()[0]["status"], "Open")
+                sa.set_status("legacy-abc123def456", "Answered")  # the owner answers A's row
+                pqs.resync(fa, sa)
+                self.assertEqual(fa.entries()[0]["status"], "Answered")
 
     @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
     def test_the_same_race_on_real_yjs_replicas_in_both_client_id_orders(self):
@@ -975,7 +972,7 @@ class TestConvergence(_Ws):
         pqs.write_question(self.q(), pqs.FileStore(self.pq), db)
         for s_ in (db, pqs.FileStore(self.pq)):
             s_.stamp("ask-1", SENT)
-        doc.maps["cells"]["pendingq|q-ask-1|status"] = {"v": row_status, "updated": 2, "by": AGENT}
+        doc.maps["cells"][f"pendingq|{db._rid('ask-1')}|status"] = {"v": row_status, "updated": 2, "by": AGENT}
         Path(self._env()["FAKE_ROOM_STATE"]).write_text(json.dumps({**doc.state(), "_room": ROOM}))
         self.assertIsNone(pqs.registered_adapter(self.ws))
         return _cpq(self.pq, self.ws)
@@ -1628,21 +1625,24 @@ class TestMigrateRound3(_MigrateBase):
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
 
-    def test_a_migration_on_another_hosts_row_never_changes_it(self):
-        only = self._only()
+    def test_a_migration_beside_another_hosts_row_makes_its_own_and_never_changes_theirs(self):
+        only = dict(self._only(), host="host-b")
         aid, client = only["entries"][0]["ask_id"], InProcClient()
         pqs.RoomDbStore(client, lock=self.ws / "state" / "a", host="host-a").insert_raw(aid, "Pick?", "page")
         host_b = pqs.RoomDbStore(client, lock=self.ws / "state" / "b", host="host-b")
-        before = self.ledger.read_text()
-        client.fail_ops = ("add_row",)
         [done] = self.m.apply(only, self.ledger, host_b)
-        self.assertIn("its row was left as is", done)
-        client.fail_ops = ()
-        [done] = self.m.apply(only, self.ledger, host_b)  # the insert succeeds but the row exists
-        self.assertIn("not this host's to reuse", done)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        self.assertEqual(sorted((e["host"], e["status"], e["recovery"]) for e in host_b.entries()),
+                         [("host-a", "Open", False), ("host-b", "Open", False)])
+
+    def test_a_plan_without_this_version_and_host_is_refused(self):
+        plan, before = self._only(), self.ledger.read_text()
+        db = pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "l", host="this-host")
+        for p in ({k: v for k, v in plan.items() if k != "version"}, dict(plan, host="other-host")):
+            [done] = self.m.apply(p, self.ledger, db)
+            self.assertTrue(done.startswith("refused: this plan is version"))
         self.assertEqual(self.ledger.read_text(), before)
-        self.assertEqual([(e["status"], e["host"], e["recovery"]) for e in host_b.entries()],
-                         [("Open", "host-a", False)])
+        self.assertEqual(db.entries(), [])
 
     def test_two_hosts_migrating_the_same_entry_get_separate_rows(self):
         cpq = self.m._reader()
@@ -1656,6 +1656,12 @@ class TestMigrateRound3(_MigrateBase):
         unsalted = {r["ask_id"] for r in self.m.triage(qs, self.prs(), self.NOW, 14, "sonichi/sutando",
                                                       cpq.title_says_resolved, text)}
         self.assertEqual(ids["host-a"] & unsalted, set())
+        twin = "## 2026-09-29 — Twin question?\n\nsame body\n\n**Status:** open\n\n"
+        dup = twin * 2
+        got = [r for r in self.m.triage(cpq.parse_waiting(dup, keep_title_resolved=True), self.prs(), self.NOW,
+                                        14, "sonichi/sutando", cpq.title_says_resolved, dup, "host-a")]
+        self.assertEqual(len(got), 2)
+        self.assertNotEqual(got[0]["ask_id"], got[1]["ask_id"])  # byte-identical entries, two rows
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
