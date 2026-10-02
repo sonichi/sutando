@@ -96,7 +96,8 @@ def nothing_written_holds_the_secret():
     register.write_descriptor(out, d)
     assert SECRET not in out.read_text(), "descriptor carries the secret"
     assert stat.S_IMODE(os.stat(out).st_mode) == 0o600, oct(os.stat(out).st_mode)
-    entry = register.server_entry("/usr/bin/node", out, Path("/ws"))
+    paths = register.settings(Path("/ws"), environ={"AG2_MCP_DESCRIPTOR": str(out)})
+    entry = register.server_entry("/usr/bin/node", paths)
     blob = json.dumps(entry) + register.codex_toml(entry)
     assert SECRET not in blob, "MCP config entry carries the secret"
     assert entry["args"] == [str(register.PROXY)] and register.PROXY.is_file(), entry
@@ -249,6 +250,40 @@ def empty_env_file_is_refused():
         assert "REMOTE_TASK_TOKEN" in str(e), str(e)
         return
     raise AssertionError("an env file without a credential must be refused")
+
+
+def settings_default_to_the_manifest_under_the_workspace():
+    declared = json.loads(register.MANIFEST.read_text())["config"]
+    assert set(declared) == set(register.PATH_SETTINGS), declared
+    got = register.settings(Path("/ws"), environ={})
+    for key, rel in declared.items():
+        assert got[key] == Path("/ws") / rel, (key, got[key])
+
+
+def settings_env_overrides_the_manifest():
+    got = register.settings(Path("/ws"), environ={"AG2_MCP_LOG": "/var/log/p.log", "AG2_MCP_ROOM_ACTIONS": "x/r.jsonl"})
+    assert got["AG2_MCP_LOG"] == Path("/var/log/p.log"), got
+    assert got["AG2_MCP_ROOM_ACTIONS"] == Path("/ws/x/r.jsonl"), got
+
+
+def settings_refuse_an_undeclared_key():
+    with Patch(PATH_SETTINGS=register.PATH_SETTINGS + ("AG2_MCP_NOT_DECLARED",)):
+        try:
+            register.settings(Path("/ws"), environ={})
+        except register.RegisterError as e:
+            assert "AG2_MCP_NOT_DECLARED" in str(e), str(e)
+            return
+    raise AssertionError("an undeclared setting must be refused, not invented")
+
+
+def loose_env_file_gets_a_chmod_warning():
+    ws, p = ws_and_env()
+    os.chmod(p, 0o644)
+    rc, _, err = run_main(["--env-file", str(p)], resolve_workspace=lambda: ws, which=which({"node"}))
+    assert rc == 0 and "chmod 600" in err, (rc, err)
+    os.chmod(p, 0o600)
+    rc, _, err = run_main(["--env-file", str(p)], resolve_workspace=lambda: ws, which=which({"node"}))
+    assert rc == 0 and "chmod" not in err, (rc, err)
 
 
 for name, fn in list(globals().items()):

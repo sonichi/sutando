@@ -36,6 +36,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 SERVER_KEY = "ag2-space"
 SOURCE = "ag2space"
 PROXY = SKILL_DIR / "ag2-mcp-proxy.mjs"
+MANIFEST = SKILL_DIR / "manifest.json"
+PATH_SETTINGS = ("AG2_MCP_DESCRIPTOR", "AG2_MCP_LOG", "AG2_MCP_ROOM_ACTIONS")
 USER_AGENT = "sutando-ag2-space-mcp-register/1"
 LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -98,11 +100,27 @@ def write_descriptor(path: Path, descriptor: dict) -> None:
     os.replace(tmp, path)
 
 
-def server_entry(node: str, descriptor_path: Path, workspace: Path) -> dict:
+def settings(workspace: Path, environ=None) -> dict:
+    """Env override > manifest config default; a relative value is under the workspace."""
+    env = os.environ if environ is None else environ
+    declared = json.loads(MANIFEST.read_text()).get("config", {})
+    out = {}
+    for key in PATH_SETTINGS:
+        value = env.get(key) or declared.get(key)
+        if not value:
+            raise RegisterError(f"{key} is neither set nor declared in {MANIFEST.name}")
+        path = Path(value).expanduser()
+        out[key] = path if path.is_absolute() else workspace / path
+    return out
+
+
+def loose_permissions(path: Path) -> bool:
+    return bool(os.stat(path).st_mode & 0o077)
+
+
+def server_entry(node: str, paths: dict) -> dict:
     return {"type": "stdio", "command": node, "args": [str(PROXY)],
-            "env": {"AG2_MCP_DESCRIPTOR": str(descriptor_path),
-                    "AG2_MCP_LOG": str(workspace / "logs" / "ag2-mcp-proxy.log"),
-                    "AG2_MCP_ROOM_ACTIONS": str(workspace / "state" / "room-actions.jsonl")}}
+            "env": {k: str(paths[k]) for k in PATH_SETTINGS}}
 
 
 def codex_toml(entry: dict) -> str:
@@ -128,17 +146,20 @@ def main(argv: Optional[list] = None, discover: Callable[[str, str], dict] = htt
         print("node is not on PATH; the proxy needs Node 18 or newer", file=sys.stderr)
         return 1
     workspace = Path(resolve_workspace())
-    descriptor_path = workspace / "state" / "ag2-mcp" / "descriptor.json"
     try:
+        paths = settings(workspace)
         descriptor = build_descriptor(env_file, discover)
     except RegisterError as e:
         print(f"register: {e}", file=sys.stderr)
         return 1
+    descriptor_path = paths["AG2_MCP_DESCRIPTOR"]
     write_descriptor(descriptor_path, descriptor)
+    if loose_permissions(env_file):
+        print(f"warning: {env_file} is readable by other users; run chmod 600 on it", file=sys.stderr)
     print(f"descriptor: {descriptor_path} (mcp {descriptor['mcp_url']}, key {descriptor['env_key']} "
           f"in {env_file}; the secret stays there)", flush=True)
 
-    entry = server_entry(node, descriptor_path, workspace)
+    entry = server_entry(node, paths)
     if args.runtime == "codex":
         print("add this to $CODEX_HOME/config.toml:\n\n" + codex_toml(entry))
         return 0

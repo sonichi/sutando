@@ -15,16 +15,25 @@ The desktop app registers the same proxy itself. Use this skill on any other ins
 
 ## Connect (once)
 
-1. **Get an agent identity.** In AG2 Space, connect an agent and copy its token: the
-   `<relay-url>|<secret>` string. Save it in the ag2space channel env as
-   `REMOTE_TASK_TOKEN='<relay-url>|<secret>'`
-   (`bash scripts/sutando-config.sh claude-home-path channels/ag2space/.env` prints the path).
+1. **Get an agent identity and store its token safely.** In AG2 Space, connect an agent
+   and copy its token: the `<relay-url>|<secret>` string. It is a credential.
+   - Keep the canonical copy in the vault: send `vault set REMOTE_TASK_TOKEN <token>` over
+     Slack or Discord (the bridge stores it in the Keychain before it touches disk), or run
+     `python3 skills/secret-vault/secret-vault.py set REMOTE_TASK_TOKEN` and paste it.
+   - The proxy reads the token from the ag2space channel env file on each mint, so that
+     file also holds it as `REMOTE_TASK_TOKEN='<relay-url>|<secret>'`
+     (`bash scripts/sutando-config.sh claude-home-path channels/ag2space/.env` prints the
+     path). Make it readable only by you: `chmod 600 <that file>`. `register.py` warns
+     when it is not.
 2. **Register the server.**
    `python3 skills/ag2-space-mcp/scripts/register.py` shows what it will do;
    add `--apply` to run `claude mcp add-json`, or `--runtime codex` for the
-   `config.toml` entry. It asks the relay for the MCP endpoints and writes a descriptor
-   under `<workspace>/state/ag2-mcp/`. The secret stays in the env file; neither the
-   descriptor nor the MCP config holds it.
+   `config.toml` entry. It asks the relay for the MCP endpoints and writes the proxy's
+   descriptor. The secret stays in the env file; neither the descriptor nor the MCP
+   config holds it.
+   Where the descriptor, the proxy log and the room-action record go is declared in
+   `manifest.json` `config` (`AG2_MCP_DESCRIPTOR`, `AG2_MCP_LOG`, `AG2_MCP_ROOM_ACTIONS`,
+   relative to the workspace). An env var of the same name overrides it.
 3. **Restart the core** and call `ag2.whoami`: it names the agent.
 4. **Get invited.** Agents do not join rooms on their own; a member invites the agent,
    and membership is the authorization.
@@ -65,4 +74,4 @@ available over MCP yet. Do not edit them through room messages or state events.
 
 - `register.py` says the relay has no hosted MCP: that deployment has none; nothing to fix here.
 - `mint: bearer rejected`: the agent credential was revoked or is not an agent's; connect again.
-- The proxy logs to `<workspace>/logs/ag2-mcp-proxy.log` (no secrets).
+- The proxy logs to `AG2_MCP_LOG`, by default `<workspace>/logs/ag2-mcp-proxy.log` (no secrets).
