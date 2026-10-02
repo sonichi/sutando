@@ -88,6 +88,47 @@ class RePickTests(FakeTmuxHarness):
         self.assertFalse((self.inflight_dir / "task-im.txt").exists(), "the unlanded Enter's marker is retired")
         self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1, "never Enter into owner text")
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores a read-only directory")
+    def test_a_failed_marker_clear_cannot_hold_the_queue_once_the_composer_clears(self):
+        # The mixed pick retires the marker while its directory refuses the unlink; after the
+        # owner clears the composer, the next pick must deliver, not wait on that marker.
+        self.write_task("task-fc.txt")
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        self.run_event("task-fc.txt", timeout=30)
+        marker = self.inflight_dir / "task-fc.txt"
+        self.assertTrue(marker.exists(), "precondition: the marker was recorded")
+        env = {"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}
+        self.inflight_dir.chmod(0o555)
+        self.addCleanup(self.inflight_dir.chmod, 0o755)
+        mixed = self.run_event("task-fc.txt", env_extra=env, timeout=10)
+        self.assertIn("with other text", mixed.stderr)
+        self.inflight_dir.chmod(0o755)
+        self.swallow_enter_flag.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        t = self._finish_on("task-fc.txt", lambda log: log.count("ENTER") >= 2)
+        try:
+            self.run_event("task-fc.txt", env_extra=env, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("the pick after the composer cleared waited on a marker the mixed pick had retired")
+        finally:
+            t.join(timeout=5)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-fc.txt"), 2)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores read-only modes")
+    def test_a_marker_that_cannot_be_retired_at_all_is_reported(self):
+        self.write_task("task-fr.txt")
+        prompt = self.expected_prompt("task-fr.txt")
+        self.pane_file.write_text("❯ owner draft " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        self.inflight_dir.mkdir(parents=True, exist_ok=True)
+        marker = self.inflight_dir / "task-fr.txt"
+        marker.write_text("4242\n")
+        marker.chmod(0o444)
+        self.inflight_dir.chmod(0o555)
+        self.addCleanup(self.inflight_dir.chmod, 0o755)
+        res = self.run_event("task-fr.txt", timeout=10)
+        self.assertIn("could not retire the in-flight marker for task-fr.txt", res.stderr)
+
     def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
         # First pass types and submits; no result ever appears. The re-pick after
         # the completion timeout must see the line in the pane and wait, not queue it twice.

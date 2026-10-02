@@ -707,7 +707,8 @@ submit_task_grown() {
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
     # Precedes the marker: our prompt still in the composer means its Enter never landed.
-    "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
+    "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" \
+      || log_notifier "could not retire the in-flight marker for $filename; a later pick may wait on it (core may need attention)"
     # Owner text and an unparsed row read alike here; neither delivers, so both count.
     note_composer_block "$filename" "$incarnation"
     return 0

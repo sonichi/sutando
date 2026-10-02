@@ -898,6 +898,18 @@ class InflightRecordTest(unittest.TestCase):
         clear_inflight(self.dir, "task-a.txt")
         self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores a read-only directory")
+    def test_a_clear_the_directory_refuses_still_ends_the_marker(self):
+        mark_inflight(self.dir, "task-ro.txt", "4242")
+        self.dir.chmod(0o555)
+        self.addCleanup(self.dir.chmod, 0o755)
+        self.assertEqual(0, _main(["inflight-clear", str(self.dir), "task-ro.txt"]))
+        self.assertFalse(inflight_is_live(self.dir, "task-ro.txt", "4242"))
+        self.assertFalse(inflight_is_live(self.dir, "task-ro.txt", ""), "a retired marker against an unreadable incarnation")
+        self.dir.chmod(0o755)
+        self.assertFalse(inflight_is_live(self.dir, "task-ro.txt", "4242"))
+        self.assertFalse((self.dir / "task-ro.txt").exists(), "the retired marker is removed once the directory allows it")
+
     def test_whitespace_in_a_filename_is_identity(self):
         mark_inflight(self.dir, "task-a b.txt", "4242")
         self.assertFalse(inflight_is_live(self.dir, "task-ab.txt", "4242"))
