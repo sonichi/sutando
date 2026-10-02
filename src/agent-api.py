@@ -493,22 +493,32 @@ def _questions_queue_payload() -> dict:
 
 
 def _file_answer_task(qid: str, answer: str) -> tuple:
-    """(task path, None) once the owner's answer is published whole under tasks/, else (None, why)."""
+    """(task path, None) once the owner's answer is published whole under tasks/, else (None, why).
+    The name is unique per call (local_record.new_name) and the file is created exclusively, so
+    two answers to one question in the same millisecond are two files, never one overwritten."""
     safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
     if not safe_qid:
         return None, "the id has no file-safe characters"
     # realpath + startswith: the CodeQL-recognised path-injection
     # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
     task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
-    task_file_str = os.path.realpath(os.path.join(
-        task_dir_real, f"answer-{safe_qid}-{int(datetime.now().timestamp() * 1000)}.txt"))
-    if not task_file_str.startswith(task_dir_real + os.sep):
-        return None, "the id does not name a file under tasks/"
-    try:
-        local_record.write_text_whole(Path(task_file_str), f"User answered {safe_qid}: {confine_user_content(answer)}")
-    except OSError as e:
-        return None, str(e)
-    return task_file_str, None
+    body = f"User answered {safe_qid}: {confine_user_content(answer)}"
+    for _ in range(8):
+        try:
+            name = local_record.new_name("answer-" + safe_qid)
+        except ValueError as e:
+            return None, str(e)
+        task_file_str = os.path.realpath(os.path.join(task_dir_real, f"{name}.txt"))
+        if not task_file_str.startswith(task_dir_real + os.sep):
+            return None, "the id does not name a file under tasks/"
+        try:
+            local_record.create_text_whole(Path(task_file_str), body)
+        except FileExistsError:
+            continue  # another answer took this name a moment ago; its file is left as it is
+        except OSError as e:
+            return None, str(e)
+        return task_file_str, None
+    return None, "no free task name after 8 tries"
 
 
 def answer_question(qid: str, answer: str) -> tuple:

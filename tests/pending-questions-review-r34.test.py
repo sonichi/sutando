@@ -104,7 +104,8 @@ class AnswerOrdering(unittest.TestCase):
         with mock.patch.object(self.api.pending_questions_reader, "gather", return_value=self._waiting("ask-crash")), \
                 mock.patch.object(self.api.pending_questions_reader, "resolve", _resolve), \
                 mock.patch.object(Path, "write_text", side_effect=OSError("disk full")), \
-                mock.patch("os.replace", side_effect=OSError("disk full")):
+                mock.patch("os.replace", side_effect=OSError("disk full")), \
+                mock.patch("os.link", side_effect=OSError("disk full")):
             code, data = self.post({"id": "ask-crash", "answer": "keep me"})
         self.assertEqual(resolve_calls, [], f"http={code} {data}: the close was asked for with no durable answer")
         self.assertEqual(self.tasks(), [])
