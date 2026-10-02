@@ -37,13 +37,13 @@ from pending_questions_md import DIVIDER_RE, active_region, mask_markup
 from result_markers import neutralize_markers
 
 STATUSES = ("Open", "Answered", "Resolved")
+TERMINAL = ("Answered", "Resolved")
 # A row whose file transition never committed: the file stays the truth, so
 # readers ignore the row and the file entry stays visible.
 SUPERSEDED = "Superseded"
-# The only status changes code may make on a row: Open <-> Superseded between
-# its own recovery states, and closing a row the owner closed in the file.
-TRANSITIONS = frozenset({("Open", SUPERSEDED), (SUPERSEDED, "Open"), ("Open", "Answered"), ("Open", "Resolved"),
-                         (SUPERSEDED, "Answered"), (SUPERSEDED, "Resolved")})
+# Code marks that in the Recovery cell, never in Status: a terminal Status wins on read,
+# so a concurrent owner decision survives however the replicas merge.
+RECOVERY = "superseded"
 PRIORITIES = ("High", "Medium", "Low")
 APPROVE = "Approve"
 # Bold field tokens the ledger's readers act on, wherever they occur in a body.
@@ -65,11 +65,12 @@ class StoreError(Exception):
     """A store declining or failing to write; the message is the reason."""
 
 
-class CasConflict(StoreError):
-    """A status transition whose expected state no longer holds; nothing was written."""
+class GuardFailed(StoreError):
+    """A guarded write whose preconditions (Host, Status) did not hold; nothing was written."""
 
-    def __init__(self, ask_id: str, expected: str, current: Optional[str]):
-        super().__init__(f"{ask_id}: expected {expected}, the row is now {current}; left as is")
+    def __init__(self, ask_id: str, current: dict):
+        shown = ", ".join(f"{k}={v}" for k, v in sorted(current.items())) or "no such row"
+        super().__init__(f"{ask_id}: left as is ({shown})")
         self.current = current
 
 
@@ -334,10 +335,13 @@ DB_SCHEMA = {
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
         {"id": "host", "name": "Host", "type": "text"},
+        {"id": "recovery", "name": "Recovery", "type": "text"},
     ],
     "views": [
-        {"id": "board", "name": "Board", "layout": "board", "groupBy": "status", "hidden": ["ask_id", "host"]},
-        {"id": "table", "name": "Table", "layout": "table", "hidden": ["host"]},
+        {"id": "board", "name": "Board", "layout": "board", "groupBy": "status",
+         "hidden": ["ask_id", "host", "recovery"], "filter": [{"prop": "recovery", "op": "empty"}]},
+        {"id": "table", "name": "Table", "layout": "table", "hidden": ["host", "recovery"],
+         "filter": [{"prop": "recovery", "op": "empty"}]},
     ],
 }
 
@@ -381,7 +385,7 @@ class DbClient(Protocol):
     def set_cells(self, schema: dict, row: str, cells: dict) -> None: ...
     def set_body(self, schema: dict, row: str, body: str) -> None: ...
     def stamp(self, schema: dict, row: str, token: str, replacement: str) -> None: ...
-    def transition(self, schema: dict, row: str, prop: str, expect, to) -> dict: ...
+    def guarded(self, schema: dict, row: str, cells: dict, expect: dict) -> dict: ...
 
 
 class ScriptDbClient:
@@ -429,9 +433,8 @@ class ScriptDbClient:
         self._call({"op": "stamp", "schema": schema, "row": row, "token": token,
                     "replacement": replacement})
 
-    def transition(self, schema, row, prop, expect, to):
-        return self._call({"op": "transition", "schema": schema, "row": row, "prop": prop,
-                           "expect": expect, "to": to})
+    def guarded(self, schema, row, cells, expect):
+        return self._call({"op": "guarded", "schema": schema, "row": row, "cells": cells, "expect": expect})
 
 
 def _option_id(prop_id: str, name: str) -> str:
@@ -441,6 +444,15 @@ def _option_id(prop_id: str, name: str) -> str:
             return o["id"]
     raise StoreError(f"{prop['name']} has no option {name!r}; it has: "
                      + ", ".join(o["name"] for o in prop["options"]))
+
+
+def effective_status(cells: dict) -> str:
+    """A terminal Status wins; otherwise a Recovery mark (or a legacy Superseded Status) supersedes."""
+    names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
+    status = names.get(cells.get("status"), "Open")
+    if status in TERMINAL:
+        return status
+    return SUPERSEDED if cells.get("recovery") or status == SUPERSEDED else "Open"
 
 
 class RoomDbStore:
@@ -489,21 +501,38 @@ class RoomDbStore:
         """One check-and-replace in the client's single call, serialized by `lock`."""
         self._locked(lambda: self.client.stamp(DB_SCHEMA, row_id(ask_id), placeholder(ask_id), sent_line))
 
-    def transition(self, ask_id: str, frm: str, to: str) -> None:
-        """`frm` -> `to`, only if TRANSITIONS allows it and the row is still `frm`:
-        a compare-and-set in one client call, under `lock`. CasConflict otherwise."""
-        if (frm, to) not in TRANSITIONS:
-            raise StoreError(f"{frm} -> {to} is not a transition code may make")
-        res = self._locked(lambda: self.client.transition(
-            DB_SCHEMA, row_id(ask_id), "status", _option_id("status", frm), _option_id("status", to))) or {}
+    def _guarded(self, ask_id: str, cells: dict, expect: dict) -> None:
+        """Write `cells` only while every `expect` prop holds one of its listed raw values
+        (and Host is this host), checked and written in one client call under `lock`."""
+        if self.host:
+            expect = {"host": [self.host], **expect}
+        res = self._locked(lambda: self.client.guarded(DB_SCHEMA, row_id(ask_id), cells, expect)) or {}
         if not res.get("written"):
             names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
-            raise CasConflict(ask_id, frm, names.get(res.get("current"), res.get("current")))
+            current = {k: names.get(v, v) if k == "status" else v for k, v in (res.get("current") or {}).items()}
+            raise GuardFailed(ask_id, {k: v for k, v in current.items() if v is not None})
 
     def claim_host(self, ask_id: str) -> bool:
         """Set this host as the row's origin when it has none; never changes its status."""
-        res = self._locked(lambda: self.client.transition(DB_SCHEMA, row_id(ask_id), "host", None, self.host)) or {}
+        res = self._locked(lambda: self.client.guarded(
+            DB_SCHEMA, row_id(ask_id), {"host": self.host}, {"host": [None]})) or {}
         return bool(res.get("written"))
+
+    def close(self, ask_id: str, to: str) -> None:
+        """Status -> Answered/Resolved on this host's row that is not closed yet. The only
+        Status values code writes are terminal, so code never reopens a decision."""
+        if to not in TERMINAL:
+            raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
+        self._guarded(ask_id, {"status": _option_id("status", to)},
+                      {"status": [None, _option_id("status", "Open"), _option_id("status", SUPERSEDED)]})
+
+    def supersede(self, ask_id: str) -> None:
+        """Mark this host's open row superseded, in the Recovery cell only."""
+        self._guarded(ask_id, {"recovery": RECOVERY}, {"status": [None, _option_id("status", "Open")]})
+
+    def restore(self, ask_id: str) -> None:
+        """Clear this host's Recovery mark; Status is not touched."""
+        self._guarded(ask_id, {"recovery": None}, {})
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
         self._row(ask_id)
@@ -511,18 +540,16 @@ class RoomDbStore:
 
     def status_of(self, ask_id: str) -> Optional[str]:
         r = self.client.row(DB_SCHEMA, row_id(ask_id))
-        names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
-        return names.get(((r or {}).get("cells") or {}).get("status")) if r else None
+        return effective_status((r or {}).get("cells") or {}) if r else None
 
     def entries(self) -> list:
-        names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
         out = []
         for r in self.client.rows(DB_SCHEMA):
             cells = r.get("cells") or {}
             if cells.get("ask_id"):
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
                             "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
-                            "status": names.get(cells.get("status"), "Open")})
+                            "recovery": bool(cells.get("recovery")), "status": effective_status(cells)})
         return out
 
     def open_entries(self) -> list:
@@ -604,16 +631,17 @@ def settled(line: Optional[str]) -> bool:
 def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
     """Bring this host's rows and this host's file level, never retiring a file entry.
 
-    Only rows whose Host is this host are touched; a row with no Host is this
-    host's when its file links it or `evidence(ask_id)` (this host's own evidence)
-    says so, and is then marked with no status change; any other row is foreign.
-    For this host's rows: an open file entry the database lacks is inserted with
-    its structured fields; an entry below the divider closes its row; a status
-    closed on either side closes the other; a settled `**Sent:**` fills the other
-    side's placeholder; a migration row no file entry links is superseded, and a
-    superseded row a file entry links takes the file's status. Every status write
-    is a TRANSITIONS compare-and-set: Answered and Resolved are never changed by
-    code, and a conflict is reported and left for the next pass. (synced, errors)."""
+    A row is this host's only when its Host reads as this host. A row with no Host
+    is claimed when this host's file links it or `evidence(ask_id)` says this host
+    asked it; a claim another host won first leaves it foreign, and a foreign row is
+    never judged against this host's file.
+    For this host's rows: an open file entry the database lacks is inserted; an
+    entry below the divider closes its row; a status closed on either side closes
+    the other; a settled `**Sent:**` fills the other side's placeholder; a migration
+    row no file entry links is superseded, and one a file entry links is restored.
+    Every write is guarded on Host (and on Status where it matters); code writes
+    Status only to close a row and marks recovery in its own cell, so an owner's
+    Answered/Resolved survives any concurrent pass. (synced ask ids, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
@@ -623,7 +651,7 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
         return synced, [f"read: {type(e).__name__}: {e}"]
 
     def note(aid, ex):
-        errors.append(str(ex) if isinstance(ex, CasConflict) else f"{aid}: {type(ex).__name__}: {ex}")
+        errors.append(str(ex) if isinstance(ex, GuardFailed) else f"{aid}: {type(ex).__name__}: {ex}")
 
     own = {}
     for aid, r in found.items():
@@ -632,22 +660,24 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
         elif not r.get("host") and (aid in linked or (evidence is not None and evidence(aid))):
             try:
                 if db_store.claim_host(aid):
+                    own[aid] = {**r, "host": db_store.host}
                     synced.append(aid)
-                own[aid] = {**r, "host": db_store.host}
             except Exception as ex:  # noqa: BLE001
                 note(aid, ex)
 
-    def move(aid, to):
-        db_store.transition(aid, own[aid]["status"], to)
-        own[aid]["status"] = to
-        synced.append(aid)
-
     for aid, r in own.items():
         try:
-            if aid in archived and r["status"] in ("Open", SUPERSEDED):
-                move(aid, "Resolved")
+            if r["status"] in TERMINAL and r.get("recovery"):
+                db_store.restore(aid)
+            elif aid in archived and r["status"] not in TERMINAL:
+                db_store.close(aid, "Resolved")
+                r["status"] = "Resolved"
             elif aid.startswith("legacy-") and aid not in linked and r["status"] == "Open":
-                move(aid, SUPERSEDED)
+                db_store.supersede(aid)
+                r["status"] = SUPERSEDED
+            else:
+                continue
+            synced.append(aid)
         except Exception as ex:  # noqa: BLE001
             note(aid, ex)
     for e in entries:
@@ -662,12 +692,16 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
                 synced.append(aid)
                 continue
             if aid not in own:
-                continue  # another host's row: never judged against this host's file
+                continue
             row, row_sent = own[aid], sent_line_of(own[aid]["body"])
-            if row["status"] == SUPERSEDED or (row["status"] == "Open" and e["status"] != "Open"):
-                if e["status"] != row["status"]:
-                    move(aid, e["status"])
-            elif row["status"] != "Open" and e["status"] == "Open":
+            if row["status"] == SUPERSEDED:
+                db_store.restore(aid)
+                row["status"] = "Open"
+                synced.append(aid)
+            if row["status"] == "Open" and e["status"] in TERMINAL:
+                db_store.close(aid, e["status"])
+                synced.append(aid)
+            elif row["status"] in TERMINAL and e["status"] == "Open":
                 file_store.set_status(aid, row["status"], "in the room database")
                 synced.append(aid)
             elif sent == placeholder(aid) and settled(row_sent):

@@ -107,9 +107,12 @@ def ensure_writes(maps: dict, schema: dict, by: str, now_ms: int) -> dict:
         k, have = _key(db, v["id"]), (maps.get("views") or {}).get(_key(db, v["id"]))
         if not isinstance(have, dict):
             writes["views"][k] = {**{x: y for x, y in v.items() if x != "id"}, "order": (i + 1) * GAP}
-        elif [h for h in v.get("hidden") or [] if h not in (have.get("hidden") or [])]:
-            writes["views"][k] = {**have, "hidden": list(have.get("hidden") or [])
-                                  + [h for h in v["hidden"] if h not in (have.get("hidden") or [])]}
+        else:  # hidden props and filter clauses are only ever appended
+            hide = [h for h in v.get("hidden") or [] if h not in (have.get("hidden") or [])]
+            filt = [f for f in v.get("filter") or [] if f not in (have.get("filter") or [])]
+            if hide or filt:
+                writes["views"][k] = {**have, "hidden": list(have.get("hidden") or []) + hide,
+                                      "filter": list(have.get("filter") or []) + filt}
     return {m: w for m, w in writes.items() if w}
 
 
@@ -162,13 +165,15 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
     if op == "set_body":
         await doc.put_row_body(db, row, req["body"])
         return None
-    if op == "transition":
-        # Compare-and-set on one cell: written only while it still holds `expect`.
-        current = _cells(maps, db, row).get(req["prop"])
-        if current != req["expect"]:
+    if op == "guarded":
+        # A precondition on this replica's view, not a distributed lock: callers keep
+        # writes whose merge order cannot matter (see pending_questions_store).
+        have = _cells(maps, db, row)
+        current = {p: have.get(p) for p in req["expect"]}
+        if any(current[p] not in allowed for p, allowed in req["expect"].items()):
             return {"written": False, "current": current}
-        await doc.put_database({"cells": _cell_writes(db, row, {req["prop"]: req["to"]}, by, now_ms)})
-        return {"written": True, "current": req["to"]}
+        await doc.put_database({"cells": _cell_writes(db, row, req["cells"], by, now_ms)})
+        return {"written": True, "current": current}
     if op == "stamp":
         body, token = doc.row_body(db, row) or "", req["token"]
         n = body.count(token)

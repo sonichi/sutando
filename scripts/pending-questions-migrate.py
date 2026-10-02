@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
-from pending_questions_store import (CasConflict, active_region, entry_ask_id,  # noqa: E402
+from pending_questions_store import (GuardFailed, active_region, entry_ask_id,  # noqa: E402
                                      legacy_ask_id, row_body, row_id)
 
 CLASSES = ("already-migrated", "self-resolved", "live", "unknown-PR", "stale-merged-PR",
@@ -303,25 +303,27 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
                                 row_body(r["body"], None, None, (), "**Sent:** (legacy entry)")) or {}
     except Exception as e:  # noqa: BLE001 — the outcome is unknown; supersede whatever exists
         return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
+    if not made.get("created"):
+        try:
+            store.restore(r["ask_id"])
+        except GuardFailed as e:
+            return f"skipped: the row exists and is not this host's to reuse ({e}); the file entry stays"
+        except Exception as e:  # noqa: BLE001
+            return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     moved = f"moved — kept in the room database as row {row_id(r['ask_id'])}"
     err = ledger.update(ledger_file, lambda t: _with_status(t, r, moved))
     if err:
         return f"skipped: {err}" + _supersede(store, r)
-    if not made.get("created"):
-        try:
-            store.transition(r["ask_id"], "Superseded", "Open")
-        except Exception:  # noqa: BLE001 — not Superseded (left as is), or the next pass reopens it
-            pass
     return f"moved: {r['title'][:80]}"
 
 
 def _supersede(store, r: dict) -> str:
-    """Open -> Superseded only: a row the owner answered or resolved is never touched."""
+    """Only this host's open row is marked; another host's row or a closed one is left as is."""
     try:
-        store.transition(r["ask_id"], "Open", "Superseded")
+        store.supersede(r["ask_id"])
         return "; its row was superseded (the file entry stays the question)"
-    except CasConflict as e:
-        return f"; its row was left as is ({e.current})" if e.current else "; no row was made"
+    except GuardFailed as e:
+        return f"; its row was left as is ({e})" if e.current else "; no row was made"
     except Exception as e:  # noqa: BLE001
         return f"; its row could not be superseded now ({type(e).__name__}); the next reminder pass does it"
 
