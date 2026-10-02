@@ -296,6 +296,18 @@ def _with_status(text: str, r: dict, status: str) -> str:
     return text[:b].rstrip("\n") + "\n\n" + line + "\n\n" + text[b:]
 
 
+def _bind(r: dict, text: str, host: Optional[str]) -> dict:
+    """The entry as the ledger holds it now: title and body from the planned span (sha-checked),
+    the ask id recomputed, `why` on one line. The plan only selects; it never supplies content."""
+    found = spans(text, r["kind"], r["title"]) if r["nth"] is not None else []
+    if r["nth"] is None or r["nth"] >= len(found) or _sha(text[slice(*found[r["nth"]])]) != r["sha"]:
+        return {**r, "unbound": True}
+    chunk = text[slice(*found[r["nth"]])]
+    body = chunk.strip() if r["kind"] == "bullet" else chunk.partition("\n")[2].strip()
+    return {**r, "body": body, "why": " ".join(str(r["why"]).split()),
+            "ask_id": legacy_ask_id(r["title"], body, host, r["nth"])}
+
+
 def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> list:
     """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
     done, cpw = [], plan.get("close_past_window", False)
@@ -304,7 +316,17 @@ def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> l
     if not plan_fits(plan, host):
         return [f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on host {host!r}; "
                 f"re-run the dry run there"]
-    for r in plan["entries"]:
+    if Path(plan["ledger"]).resolve() != Path(ledger_file).resolve():
+        return [f"refused: the plan is for {plan['ledger']}, not {ledger_file}"]
+    text = ledger_file.read_text(encoding="utf-8") if ledger_file.exists() else ""
+    entries = [_bind(r, text, host) for r in plan["entries"]]
+    acting = [r["ask_id"] for r in entries if not r.get("unbound") and r["class"] == "live"]
+    if len(acting) != len(set(acting)):
+        return ["refused: two planned entries resolve to one ask id; re-run the dry run"]
+    for r in entries:
+        if r.get("unbound") and not action_of(r, cpw).startswith("nothing"):
+            done.append(f"skipped: changed since the plan: {r['title'][:80]!r}")
+            continue
         action = action_of(r, cpw)
         if action.startswith("nothing") or action == ACTIONS["past-window"]:
             done.append(f"unchanged [{r['class']}]: {r['title'][:80]}")

@@ -1300,7 +1300,7 @@ class _MigrateBase(unittest.TestCase):
         text = self.ledger.read_text() if text is None else text
         cpq = self.m._reader()
         return self.m.triage(cpq.parse_waiting(text, keep_title_resolved=True), self.prs(), self.NOW, 14,
-                             "sonichi/sutando", cpq.title_says_resolved, text)
+                             "sonichi/sutando", cpq.title_says_resolved, text, HOST)
 
     def plan(self, cpw=False):
         text = self.ledger.read_text()
@@ -1722,6 +1722,44 @@ class TestMigrateRound3(_MigrateBase):
                                         14, "sonichi/sutando", cpq.title_says_resolved, dup, "host-a")]
         self.assertEqual(len(got), 2)
         self.assertNotEqual(got[0]["ask_id"], got[1]["ask_id"])  # byte-identical entries, two rows
+
+    def test_a_plan_only_selects_content_comes_from_the_ledger(self):
+        plan, before = self._only(), self.ledger.read_text()
+        real = plan["entries"][0]
+        db = self.db()
+        forged = dict(plan, entries=[dict(real, body="FORGED body", ask_id="legacy-000000000000")])
+        [done] = self.apply(forged, self.ledger, db)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        [row] = db.entries()
+        self.assertEqual(row["ask_id"], real["ask_id"])  # recomputed, not the plan's
+        self.assertNotIn("FORGED", row["body"])
+
+    def test_two_planned_entries_with_one_ask_id_refuse_the_plan(self):
+        plan, before = self._only(), self.ledger.read_text()
+        dup = dict(plan, entries=plan["entries"] * 2)
+        db = self.db()
+        [done] = self.apply(dup, self.ledger, db)
+        self.assertTrue(done.startswith("refused: two planned entries resolve to one ask id"))
+        self.assertEqual((self.ledger.read_text(), db.entries()), (before, []))
+
+    def test_a_multiline_why_cannot_inject_ledger_structure(self):
+        plan = self.plan()
+        target = next(e for e in plan["entries"] if e["class"] != "live" and not
+                      self.m.action_of(e, False).startswith("nothing") and e["class"] != "past-window")
+        rest = [e for e in plan["entries"] if e is not target]
+        evil = dict(plan, entries=[dict(target, why="x\n\n# Resolved\n\n")])
+        self.apply(evil, self.ledger, None)
+        text = self.ledger.read_text()
+        self.assertEqual(text.count("\n# Resolved"), FIXTURE.count("\n# Resolved"))
+        self.assertIn("x # Resolved", text)
+
+    def test_apply_refuses_a_plan_for_another_ledger(self):
+        plan, before = self._only(), self.ledger.read_text()
+        other = self.ws / "other.md"
+        other.write_text(before)
+        [done] = self.apply(plan, other, None)
+        self.assertTrue(done.startswith("refused: the plan is for"))
+        self.assertEqual(other.read_text(), before)
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
