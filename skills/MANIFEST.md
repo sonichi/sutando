@@ -139,8 +139,9 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 `"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
 pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
 read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
-`reconcile` replays the local outbox and close records, `resolve` closes a row, `ask_owner` records
-a question and `remind` runs the reminder. Core reaches it only through
+`reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
+records a question and `remind` runs the reminder. The field is in `schemas/skill-manifest.schema.json`
+(a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
 `src/pending_questions_reader.py`, which scans manifests for that FIELD alone (the script must
 resolve inside its skill), names no skill, and refuses when more than one installed skill declares
 it. With none declared there is no store: readers report `unavailable` with that reason (never a

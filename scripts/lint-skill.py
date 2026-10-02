@@ -135,6 +135,17 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
                 warn(f"supervised_worker.interpreter.config '{interp['config']}' "
                      "is not declared in the config block")
 
+    # pending_questions_store: core loads this script by path as the one store of owner
+    # pending questions, so it must be a relative .py file that resolves inside the skill.
+    pqs = m.get("pending_questions_store")
+    if pqs is not None:
+        if not isinstance(pqs, str) or not pqs.endswith(".py") or not pqs[:-3]:
+            err("pending_questions_store must be a relative path to a .py script")
+        elif pqs.startswith("/") or ".." in Path(pqs).parts or any(c.isspace() for c in pqs):
+            err("pending_questions_store must stay inside the skill directory")
+        elif not (skill_dir / pqs).is_file():
+            err(f"pending_questions_store does not exist: {pqs}")
+
     # required
     for req in ("name", "version", "owner", "stability"):
         if req not in m or m[req] in (None, ""):

@@ -356,5 +356,78 @@ class GatherIsReadOnly(_FakeRoom):
         self.assertTrue(adapter.gather(self.ws, environ={})["unavailable"])
 
 
+# ---- 6. contracts: the schema, the linter, the declared config ---------------------------
+
+def _validate(manifest: dict, schema: dict) -> list:
+    """The checks the schema states for a top-level manifest, stdlib only: closed property set,
+    required fields, string types, patterns and enums. (jsonschema is not a dependency here.)"""
+    import re
+    errors = []
+    props = schema["properties"]
+    if schema.get("additionalProperties") is False:
+        errors += [f"additional property {k!r}" for k in manifest if k not in props]
+    errors += [f"missing {k!r}" for k in schema.get("required", []) if k not in manifest]
+    for k, v in manifest.items():
+        spec = props.get(k)
+        if not spec:
+            continue
+        if spec.get("type") == "string" and not isinstance(v, str):
+            errors.append(f"{k}: not a string")
+        elif spec.get("type") == "string":
+            if "pattern" in spec and not re.match(spec["pattern"], v):
+                errors.append(f"{k}: {v!r} does not match {spec['pattern']}")
+            if "enum" in spec and v not in spec["enum"]:
+                errors.append(f"{k}: {v!r} not in {spec['enum']}")
+        elif spec.get("type") == "object" and not isinstance(v, dict):
+            errors.append(f"{k}: not an object")
+    return errors
+
+
+class ManifestContract(unittest.TestCase):
+    schema = json.loads((REPO / "schemas" / "skill-manifest.schema.json").read_text())
+    manifest = json.loads((SKILL / "manifest.json").read_text())
+    lint = _load("lint_skill_r35", REPO / "scripts" / "lint-skill.py")
+
+    def test_the_canonical_manifest_validates_against_the_canonical_schema(self):
+        self.assertTrue("pending_questions_store" in self.schema["properties"], "the field is not in the schema")
+        self.assertEqual([k for k in self.manifest if k not in self.schema["properties"]], [],
+                         "manifest keys absent from the schema")
+        self.assertEqual(_validate(self.manifest, self.schema), [])
+        try:
+            import jsonschema  # noqa: PLC0415
+        except ImportError:
+            return
+        jsonschema.validate(self.manifest, self.schema)
+
+    def test_the_validator_rejects_what_the_schema_forbids(self):
+        self.assertEqual(_validate({**self.manifest, "bogus": 1}, self.schema), ["additional property 'bogus'"])
+        for bad in ("../x.py", "/abs/x.py", "scripts/../x.py", "scripts/x.sh", "scripts/a b.py", ""):
+            self.assertTrue(_validate({**self.manifest, "pending_questions_store": bad}, self.schema), bad)
+        self.assertTrue(_validate({**self.manifest, "pending_questions_store": 3}, self.schema))
+
+    def test_the_linter_validates_the_field_rather_than_only_allowing_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="lint-pqs-"))
+
+        def lint(value):
+            d = tmp / "pq"
+            shutil.rmtree(d, ignore_errors=True)
+            (d / "scripts").mkdir(parents=True)
+            (d / "scripts" / "adapter.py").write_text("# adapter\n")
+            (d / "manifest.json").write_text(json.dumps({"name": "pq", "version": "1.0.0", "owner": "x",
+                                                         "stability": "experimental", "pending_questions_store": value}))
+            errors, warnings = self.lint._lint_manifest(d)
+            return [e for e in errors if "pending_questions_store" in e], [w for w in warnings if "pending_questions_store" in w]
+        self.assertEqual(lint("scripts/adapter.py"), ([], []))
+        self.assertIn("must stay inside the skill directory", lint("../adapter.py")[0][0])
+        self.assertIn("must stay inside the skill directory", lint("/etc/adapter.py")[0][0])
+        self.assertIn("does not exist", lint("scripts/missing.py")[0][0])
+        self.assertIn("relative path to a .py script", lint("scripts/adapter.sh")[0][0])
+        self.assertIn("relative path to a .py script", lint(7)[0][0])
+        r = subprocess.run([sys.executable, str(REPO / "scripts" / "lint-skill.py"), str(SKILL)],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 error(s), 0 warning(s)", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
