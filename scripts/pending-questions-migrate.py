@@ -305,7 +305,7 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
         return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     if not made.get("created"):
         try:
-            store.restore(r["ask_id"])
+            store.adopt(r["ask_id"])
         except GuardFailed as e:
             return f"skipped: the row exists and is not this host's to reuse ({e}); the file entry stays"
         except Exception as e:  # noqa: BLE001
