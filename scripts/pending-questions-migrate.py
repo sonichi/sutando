@@ -248,17 +248,28 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
 PLAN_VERSION = 2
 
 
-ENTRY_FIELDS = {"kind": str, "title": str, "class": str, "why": str, "ask_id": str, "body": str, "sha": (str, type(None))}
+
+
+
+KINDS = ("section", "bullet")
+
+
+def _entry_ok(e) -> bool:
+    return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
+            and all(isinstance(e.get(k), str) for k in ("title", "why", "ask_id", "body"))
+            and "nth" in e and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0))
+            and "sha" in e and (e["sha"] is None or isinstance(e["sha"], str)))
 
 
 def plan_fits(plan: dict, host: Optional[str]) -> bool:
-    """This version, made on this (named) host, and every entry well formed, checked before any write."""
+    """This version, made on this (named) host, with every field well formed, checked before any write."""
+    if not isinstance(plan, dict):
+        return False
     entries = plan.get("entries")
-    return (plan.get("version") == PLAN_VERSION and bool(host) and plan.get("host") == host
-            and isinstance(entries, list) and all(
-                isinstance(e, dict) and all(isinstance(e.get(k), t) for k, t in ENTRY_FIELDS.items())
-                and (e.get("nth") is None or (isinstance(e.get("nth"), int) and e["nth"] >= 0))
-                for e in entries))
+    return (plan.get("version") == PLAN_VERSION and bool(host)
+            and plan.get("host") == host and isinstance(plan.get("ledger"), str)
+            and isinstance(plan.get("ledger_sha256"), str) and type(plan.get("close_past_window")) is bool
+            and isinstance(entries, list) and all(_entry_ok(e) for e in entries))
 
 
 def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
@@ -379,13 +390,16 @@ def main(argv=None) -> int:
             print("--apply carries out a reviewed plan: make one with --dry-run --plan-out, "
                   "then pass it with --plan", file=sys.stderr)
             return 2
-        plan = json.loads(args.plan.read_text(encoding="utf-8"))
-        if Path(plan["ledger"]).resolve() != args.ledger.resolve():
-            print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
-            return 2
+        try:
+            plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan = None
         if not plan_fits(plan, host_label()):
             print(f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on this host; "
                   f"re-run the dry run here", file=sys.stderr)
+            return 2
+        if Path(plan["ledger"]).resolve() != args.ledger.resolve():
+            print(f"the plan is for {plan['ledger']}, not {args.ledger}", file=sys.stderr)
             return 2
         if args.ledger.exists() and _sha(args.ledger.read_text(encoding="utf-8")) != plan.get("ledger_sha256"):
             print("note: the ledger changed since the plan; each entry is still applied only while it is "

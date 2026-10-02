@@ -1651,6 +1651,23 @@ class TestMigrateRound3(_MigrateBase):
         bad = dict(plan, host="this-host", entries=plan["entries"] + [{"title": "x"}])
         [done] = self.apply(bad, self.ledger, None, "this-host")  # a malformed entry anywhere: nothing written
         self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        good = dict(plan, host="this-host")
+        e0 = good["entries"][0]
+        variants = {"missing nth": {k: v for k, v in e0.items() if k != "nth"},
+                    "missing sha": {k: v for k, v in e0.items() if k != "sha"},
+                    "unknown class": dict(e0, **{"class": "bogus"}), "unknown kind": dict(e0, kind="bogus"),
+                    "bool nth": dict(e0, nth=True), "negative nth": dict(e0, nth=-1)}
+        for name, entry in variants.items():
+            with self.subTest(name=name):
+                [done] = self.apply(dict(good, entries=[e0, entry]), self.ledger, db, "this-host")
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        for name, p in {"string close flag": dict(good, close_past_window="false"),
+                        "missing ledger hash": {k: v for k, v in good.items() if k != "ledger_sha256"}}.items():
+            with self.subTest(name=name):
+                [done] = self.apply(p, self.ledger, db, "this-host")
+                self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
+        self.assertEqual(self.ledger.read_text(), before)
+        self.assertEqual(db.entries(), [])
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual(db.entries(), [])
         p = dict(plan, host="other-host", version=self.m.PLAN_VERSION)
