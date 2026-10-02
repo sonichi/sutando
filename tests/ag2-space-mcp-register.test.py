@@ -280,7 +280,7 @@ def loose_env_file_gets_a_chmod_warning():
     ws, p = ws_and_env()
     os.chmod(p, 0o644)
     rc, _, err = run_main(["--env-file", str(p)], resolve_workspace=lambda: ws, which=which({"node"}))
-    assert rc == 0 and "chmod 600" in err, (rc, err)
+    assert rc == 0 and "accessible by other users" in err and "chmod 600" in err, (rc, err)
     os.chmod(p, 0o600)
     rc, _, err = run_main(["--env-file", str(p)], resolve_workspace=lambda: ws, which=which({"node"}))
     assert rc == 0 and "chmod" not in err, (rc, err)

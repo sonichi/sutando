@@ -155,7 +155,7 @@ def main(argv: Optional[list] = None, discover: Callable[[str, str], dict] = htt
     descriptor_path = paths["AG2_MCP_DESCRIPTOR"]
     write_descriptor(descriptor_path, descriptor)
     if loose_permissions(env_file):
-        print(f"warning: {env_file} is readable by other users; run chmod 600 on it", file=sys.stderr)
+        print(f"warning: {env_file} is accessible by other users; run chmod 600 on it", file=sys.stderr)
     print(f"descriptor: {descriptor_path} (mcp {descriptor['mcp_url']}, key {descriptor['env_key']} "
           f"in {env_file}; the secret stays there)", flush=True)
 
