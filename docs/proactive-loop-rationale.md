@@ -241,12 +241,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a regex not matching real exit codes, a truncated function-window read, `ps | grep` matching its
    own argv, a `git log --name-only` block-split) — each a clean, quotable, WRONG zero, never an
    error. The mitigation was a token-search of the claim's own nouns against the parking files
-   (pending questions via `src/pending_questions_reader.py list`, `current-track.md`, `build_log.md`, core memory), via
+   (pending questions, `current-track.md`, `build_log.md`, core memory), via
    `warn-already-triaged.py --claim`, chained before any claim-to-owner send.
 
    It genuinely caught things (its own test suite, `tests/proactive-loop-warn-already-triaged.test.py`,
-   still lives and still passes — the script is UNCHANGED, `gh-duplicate-check.py`/step 3.45 still
-   imports its tokenizer). But the clause was itself patched twice in place after recurring — once on
+   still lives and still passes; `gh-duplicate-check.py`/step 3.45 still imports its tokenizer). The
+   script itself changed with the pending-questions store move (#5027): its first parking source was
+   the per-host `pending-questions.md` file, and is now the live listing from core's reader
+   (`src/pending_questions_reader.py list --json`), read once per run and treated as empty — said once
+   on stderr — when the store cannot be read; the tokenizer, the verdicts and the other sources are as
+   they were. But the clause was itself patched twice in place after recurring — once on
    2026-09-01 after five same-night instances, and again the same day on a claim that had already been
    filed AND retracted in `current-track.md`, found only because "prose in a file I read is not a
    gate" — even a file reread every pass. Owner, 2026-09-15, on being told the check is a token/grep
