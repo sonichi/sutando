@@ -1465,7 +1465,7 @@ class TestMigrateEdges(_MigrateBase):
 
     def test_main_applies_a_saved_plan_without_a_database(self):
         plan = self.ws / "plan.json"
-        plan.write_text(json.dumps(self.plan()))
+        plan.write_text(json.dumps(dict(self.plan(), host=importlib.import_module("util_paths").host_label())))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = self.m.main(["--apply", "--plan", str(plan), "--ledger", str(self.ledger),
@@ -1643,6 +1643,15 @@ class TestMigrateRound3(_MigrateBase):
             self.assertTrue(done.startswith("refused: this plan is version"))
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual(db.entries(), [])
+        p = dict(plan, host="other-host", version=self.m.PLAN_VERSION)
+        [done] = self.m.apply(p, self.ledger, None, "this-host")  # no room database reachable
+        self.assertTrue(done.startswith("refused: this plan is version"))
+        self.assertEqual(self.ledger.read_text(), before)
+
+    def test_host_labels_that_slug_alike_still_get_two_row_keys(self):
+        client = InProcClient()
+        keys = {h: pqs.RoomDbStore(client, lock=self.ws / "state" / h, host=h)._rid("ask-1") for h in ("a.b", "a-b")}
+        self.assertNotEqual(keys["a.b"], keys["a-b"])
 
     def test_two_hosts_migrating_the_same_entry_get_separate_rows(self):
         cpq = self.m._reader()
