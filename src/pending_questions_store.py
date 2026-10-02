@@ -653,20 +653,20 @@ class WriteOutcome:
 
 
 def write_question(q: Question, file_store: FileStore, db_store=None) -> WriteOutcome:
-    """The room database when injected, and the file always; a failure on either
-    side is reported, never raised."""
+    """The file first, always, then the room database when injected: a hard stop between them
+    leaves the file entry, which the next reconciling pass copies in. Failures are reported."""
     out = WriteOutcome()
-    if db_store is not None:
-        try:
-            out.link = db_store.insert(q)
-            out.stores.append(db_store)
-        except Exception as e:  # noqa: BLE001 — the file must still take the entry
-            out.db_error = f"{type(e).__name__}: {e}"
     try:
         file_store.insert(q)
         out.stores.append(file_store)
     except Exception as e:  # noqa: BLE001
         out.error = f"{type(e).__name__}: {e}"
+    if db_store is not None:
+        try:
+            out.link = db_store.insert(q)
+            out.stores.insert(0, db_store)
+        except Exception as e:  # noqa: BLE001 — the file already holds the entry
+            out.db_error = f"{type(e).__name__}: {e}"
     return out
 
 
