@@ -12,7 +12,10 @@ himself (code never writes it — its own marks live in the Recovery and Closed 
 
 The room is `PENDING_QUESTIONS_ROOM`: env, then this manifest's `config`, then the host's
 `<workspace>/state/pending-questions-room`; unset, the owner's DM. Point every host of the
-owner at one room shared by him and all his Sutandos.
+owner at one room shared by him and all his Sutandos. The collab service is the room
+capability's own, unless `PENDING_QUESTIONS_COLLAB_URL` names one (env, then this manifest's
+`config`, per `skills/MANIFEST.md`); the adapter's `room_store(..., collab_url=)` is the CLI
+tier above both.
 
 ```bash
 python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] \
@@ -120,6 +123,18 @@ The adapter looks for the room capability's scripts (`room_collab_client.py`,
 
 ## Testing against an unreachable room
 
-`PENDING_QUESTIONS_COLLAB_URL=<url>` points the adapter's collab service at that URL for a
-run, so an outage can be rehearsed: `ask` leaves the question in the outbox, `list` says
-UNKNOWN, and a later `reconcile` with the variable unset files it.
+`PENDING_QUESTIONS_COLLAB_URL` (declared in this skill's `manifest.json` `config` block,
+empty by default; the env override wins) points the adapter's collab service at that URL
+for a run, so an outage can be rehearsed from the CLI:
+
+```bash
+PENDING_QUESTIONS_COLLAB_URL=https://unreachable.test.invalid \
+    python3 skills/pending-questions/scripts/pq.py ask "outage rehearsal?" --urgency durable
+PENDING_QUESTIONS_COLLAB_URL=https://unreachable.test.invalid \
+    python3 skills/pending-questions/scripts/pq.py list
+python3 skills/pending-questions/scripts/pq.py reconcile
+```
+
+`ask` leaves the question in the outbox (`recorded: OUTBOX …`), `list` says
+`pending questions: UNKNOWN — room unreachable (…)` with the held question, and the
+`reconcile` with the variable unset files it.

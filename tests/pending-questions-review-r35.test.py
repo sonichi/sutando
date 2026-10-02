@@ -428,6 +428,25 @@ class ManifestContract(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("0 error(s), 0 warning(s)", r.stdout)
 
+    def test_the_collab_url_is_declared_config_read_by_the_documented_precedence(self):
+        self.assertIn(adapter.URL_KEY, self.manifest["config"], "declared in the manifest config block")
+        self.assertEqual(adapter.configured(adapter.URL_KEY, {}), "", "unset by default")
+        with mock.patch.object(adapter, "manifest_config", return_value="https://from-manifest.test.invalid"):
+            self.assertEqual(adapter.configured(adapter.URL_KEY, {}), "https://from-manifest.test.invalid")
+            self.assertEqual(adapter.configured(adapter.URL_KEY, {adapter.URL_KEY: " https://from-env.test.invalid "}),
+                             "https://from-env.test.invalid", "env wins over the manifest")
+        ws = Path(tempfile.mkdtemp(prefix="r35-url-"))
+        (ws / "state").mkdir()
+        rdb._install_fake_capability(ws)
+        env = {adapter.URL_KEY: "https://from-env.test.invalid"}
+        store, _ = adapter.room_store(ws, environ=env)
+        self.assertIn("https://from-env.test.invalid", store.client.argv)
+        store, _ = adapter.room_store(ws, environ=env, collab_url="https://from-cli.test.invalid")
+        self.assertIn("https://from-cli.test.invalid", store.client.argv, "the CLI tier wins over env")
+        self.assertNotIn("https://from-env.test.invalid", store.client.argv)
+        store, _ = adapter.room_store(ws, environ={})
+        self.assertNotIn("--collab-url", store.client.argv)
+
 
 if __name__ == "__main__":
     unittest.main()
