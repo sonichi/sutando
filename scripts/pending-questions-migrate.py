@@ -272,10 +272,10 @@ def _with_status(text: str, r: dict, status: str) -> str:
     return text[:b].rstrip("\n") + "\n\n" + line + "\n\n" + text[b:]
 
 
-def apply(plan: dict, ledger_file: Path, store) -> list:
+def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> list:
     """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
     done, cpw = [], plan.get("close_past_window", False)
-    host = getattr(store, "host", None)
+    host = host or getattr(store, "host", None)
     if plan.get("version") != PLAN_VERSION or (host and plan.get("host") != host):
         return [f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
                 f"re-run the dry run on this host for a version {PLAN_VERSION} plan"]
@@ -356,9 +356,9 @@ def main(argv=None) -> int:
 
     cpq = _reader()
     ws = args.workspace or cpq.WORKSPACE
+    from util_paths import host_label  # noqa: PLC0415
     if args.ledger is None:
         from pending_questions_ask import ledger_path  # noqa: PLC0415
-        from util_paths import host_label  # noqa: PLC0415
         args.ledger = ledger_path(ws, host_label())
     if args.apply:
         if args.plan is None:
@@ -376,10 +376,9 @@ def main(argv=None) -> int:
         store, where = room_store(ws)
         if store is None:
             print(f"room database unavailable ({where}); live rows are not created", file=sys.stderr)
-        print("\n".join(apply(plan, args.ledger, store)))
+        print("\n".join(apply(plan, args.ledger, store, host_label())))
         return 0
     text = args.ledger.read_text(encoding="utf-8") if args.ledger.exists() else ""
-    from util_paths import host_label  # noqa: PLC0415
     rows = triage(cpq.parse_waiting(text, keep_title_resolved=True), GhPrs(), args.now or time.time(),
                   args.window_days, args.repo, cpq.title_says_resolved, text, host_label())
     print("\n".join(report(rows, args.ledger, args.close_past_window)))
