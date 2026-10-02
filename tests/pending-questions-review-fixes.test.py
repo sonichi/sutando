@@ -73,11 +73,15 @@ class TestOutageIsNeverZero(_Room):
         self.assertIn("used before", g["reason"])
         self.assertEqual(reader.gather(self.ws, skills_dir=self.ws / "no-skills")["unavailable"], True)
 
-    def test_a_fresh_install_with_no_store_measures_its_outbox(self):
+    def test_a_fresh_install_with_the_skill_but_no_room_measures_its_outbox_and_core_alone_measures_nothing(self):
         ws = Path(self.ws / "fresh")
         (ws / "state").mkdir(parents=True)
+        g = reader.gather(ws, adapter=Path(adapter.__file__))
+        self.assertEqual((g["unavailable"], g["done"], g["waiting"], g["pending_close"]), (False, 0, [], []))
         g = reader.gather(ws, skills_dir=ws / "no-skills")
-        self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (False, 0, []))
+        self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []))
+        self.assertIn("no skill declares one", g["reason"])
+        self.assertEqual(reader.count(ws, skills_dir=ws / "no-skills")["open"], None)
 
     def test_the_reminder_and_the_core_shim_say_unknown_and_send_nothing(self):
         cpq = rdb._cpq(self.ws)
@@ -115,18 +119,17 @@ class TestClosesSurviveAnOutage(_Room):
         self.assertEqual(self.store.status_of(self.a["ask_id"]), "Answered")
         self.assertEqual(pqo.Outbox(self.ws).closes(), {})
 
-    def test_the_reader_closes_locally_when_the_adapter_raises_and_names_unrecorded_when_it_cannot(self):
+    def test_the_reader_records_nothing_when_the_adapter_raises_and_the_adapter_names_unrecorded_when_it_cannot(self):
         bad = self.ws / "raising_adapter.py"
         bad.write_text("def resolve(ws, ask_id, status):\n    raise ConnectionError('room down')\n")
-        ok, msg = reader.resolve(self.ws, "ask-x", "Answered", adapter=bad)
-        self.assertTrue(ok, msg)
-        self.assertIn("recorded locally", msg)
+        ok, msg = reader.resolve(self.ws, self.a["ask_id"], "Answered", adapter=bad)
+        self.assertFalse(ok)
+        self.assertIn("adapter failed (ConnectionError: room down); nothing records the close", msg)
+        self.assertEqual(pqo.Outbox(self.ws).closes(), {}, "core holds no close schema to record with")
         closed_dir = pqo.Outbox(self.ws).closed_dir
-        for p in closed_dir.iterdir():
-            p.unlink()
-        closed_dir.rmdir()
         closed_dir.write_text("a file where the directory should be")
-        ok, msg = reader.resolve(self.ws, "ask-y", "Answered", adapter=bad)
+        with self.outage():
+            ok, msg = adapter.resolve(self.ws, self.a["ask_id"], "Answered")
         self.assertFalse(ok)
         self.assertTrue(msg.startswith("UNRECORDED:"), msg)
 
@@ -142,8 +145,10 @@ class TestClosesSurviveAnOutage(_Room):
 
     def test_a_held_question_closed_before_it_reached_the_room_is_filed_then_closed(self):
         held = self.ask("held?")  # no store
-        ok, msg = reader.resolve(self.ws, held["ask_id"], "Resolved", skills_dir=self.ws / "no-skills")
+        with self.outage():
+            ok, msg = adapter.resolve(self.ws, held["ask_id"], "Resolved")
         self.assertTrue(ok, msg)
+        self.assertIn("held in the outbox", msg)
         self.assertNotIn(held["ask_id"], [i["ask_id"] for i in adapter.gather(self.ws, environ={})["waiting"]],
                          "a locally closed held question is no longer waiting")
         rec = adapter.reconcile_pass(self.ws, environ={})
@@ -236,9 +241,12 @@ class TestOutboxPathSafety(rdb._Ws):
         ob.dir.mkdir(parents=True)
         (ob.dir / "..json").write_text("{}")
         (ob.dir / "a b.json").write_text("{}")
+        (ob.dir / "a:b.json").write_text(json.dumps({"question": {"ask_id": "a:b"}}))  # a file name, not an ask id
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(ob.entries(), [])
-        self.assertIn("is not named by an ask id", err.getvalue())
+        self.assertIn("..json is not a record name", err.getvalue())
+        self.assertIn("a b.json is not a record name", err.getvalue())
+        self.assertIn("a:b.json is not named by an ask id", err.getvalue())
 
     def test_a_close_record_is_validated_the_same_way(self):
         ob = pqo.Outbox(self.ws)

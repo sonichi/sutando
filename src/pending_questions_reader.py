@@ -1,18 +1,19 @@
 """The one way core reads owner pending questions: through the adapter an installed skill
 declares in its manifest (`pending_questions_store`), picked by that field alone and loaded
-by path — core names no skill, and refuses when more than one skill declares it.
+by path — core names no skill, carries no question schema, and refuses when more than one
+skill declares it.
 
-`gather(workspace)` returns {"waiting": [items], "done": n | None, "unavailable": bool,
-"reason": str | None, "link": str | None, "notes": [...], "store": where}. An unreachable
-store is NEVER a measured zero: `unavailable` is True, `done` is None, and `waiting` holds
-only the local outbox. With no adapter installed, the outbox IS the store (every ask holds
-there), so the count is a measurement — unless a store was used before, which is an outage
-too. `waiting`, `count` and `resolve` are the thin views every core reader uses; a read
-never reconciles (`reconcile_pass` does, on demand). Never read any file for this.
+`gather(workspace)` returns {"waiting": [items], "done": n | None, "pending_close": [ids],
+"unavailable": bool, "reason": str | None, "link": str | None, "notes": [...], "store": where}.
+A store that cannot be read is NEVER a measured zero: `unavailable` is True, `done` is None.
+With no adapter installed there is no store to read, so the result is unavailable with that
+reason — what the adapter holds locally, lists or counts is the adapter's to say. `waiting`,
+`count` and `resolve` are the thin views every core reader uses; a read never reconciles
+(`reconcile_pass` does, on demand). Never read any file for this.
 
-`resolve` closes through the adapter, else records the closure locally so the next
-reconcile with a store applies it; it returns (False, "UNRECORDED: …") only when neither
-could record it — the one case a caller must treat as a failure to keep the answer.
+`resolve` closes through the adapter; with no adapter, or an adapter that raises, it returns
+(False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
+answer task before it asks for the close).
 
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count`.
 """
@@ -22,9 +23,6 @@ import json
 import sys
 from pathlib import Path
 from typing import Optional
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pending_questions_outbox import Outbox, held_items, local_done_count, room_was_used
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"  # lint-workspace-resolution: allow-repo-root
 # The manifest field an installed skill declares its adapter script with.
@@ -92,29 +90,23 @@ def _adapter(adapter=None, skills_dir=None):
         return None, f"adapter {path} failed to load ({type(e).__name__}: {e})"
 
 
-def _unavailable(workspace, reason: str, store=None) -> dict:
-    return {"waiting": held_items(workspace), "done": None, "unavailable": True, "reason": reason,
-            "link": None, "store": store, "notes": [f"ROOM DATABASE UNAVAILABLE ({reason}); the count is unknown"]}
-
-
-def _outbox_only(workspace, why: str) -> dict:
-    return {"waiting": held_items(workspace), "done": local_done_count(workspace), "unavailable": False,
-            "reason": None, "link": None, "store": None, "notes": [f"{why}; listing the local outbox only"]}
+def _unavailable(reason: str) -> dict:
+    return {"waiting": [], "done": None, "pending_close": [], "unavailable": True, "reason": reason,
+            "link": None, "store": None, "notes": [f"PENDING QUESTIONS UNAVAILABLE ({reason}); the count is unknown"]}
 
 
 def gather(workspace, adapter=None, skills_dir=None, reconcile: bool = False) -> dict:
     mod, why = _adapter(adapter, skills_dir)
     if mod is None:
-        if why == NO_ADAPTER and not room_was_used(workspace):
-            return _outbox_only(workspace, why)
-        return _unavailable(workspace, why if why != NO_ADAPTER else f"{why}, but a room store was used before")
+        return _unavailable(why)
     try:
         g = mod.gather(Path(workspace), reconcile=reconcile) if reconcile else mod.gather(Path(workspace))
     except Exception as e:  # noqa: BLE001
-        return _unavailable(workspace, f"adapter failed: {type(e).__name__}: {e}")
+        return _unavailable(f"adapter failed: {type(e).__name__}: {e}")
     g.setdefault("unavailable", False)
     g.setdefault("reason", None)
     g.setdefault("link", None)
+    g.setdefault("pending_close", [])
     return g
 
 
@@ -123,10 +115,11 @@ def waiting(workspace, adapter=None, skills_dir=None) -> list:
 
 
 def count(workspace, adapter=None, skills_dir=None) -> dict:
-    """{"open": n | None, "done": n | None, "unavailable", "reason"}; None is unknown, never 0."""
+    """{"open": n | None, "done": n | None, "pending_close": n, "unavailable", "reason"}; None is
+    unknown, never 0."""
     g = gather(workspace, adapter, skills_dir)
     return {"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
-            "unavailable": g["unavailable"], "reason": g["reason"]}
+            "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"], "reason": g["reason"]}
 
 
 def reconcile_pass(workspace, adapter=None, skills_dir=None) -> dict:
@@ -140,23 +133,16 @@ def reconcile_pass(workspace, adapter=None, skills_dir=None) -> dict:
         return {"flushed": [], "moved": [], "closed": [], "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
 
 
-def _close_locally(workspace, ask_id: str, status: str, why: str) -> tuple:
-    try:
-        p = Outbox(workspace).close(ask_id, status, note=why)
-    except Exception as e:  # noqa: BLE001
-        return False, f"UNRECORDED: {why}; and the local close record failed ({type(e).__name__}: {e})"
-    return True, f"recorded locally as {status} in {p} ({why}); the next reconcile with a store applies it"
-
-
 def resolve(workspace, ask_id: str, status: str, adapter=None, skills_dir=None) -> tuple:
-    """(closed, message): the adapter's `resolve`, else a local close record (see the module doc)."""
+    """(closed, message): the adapter's `resolve`; (False, why) with nothing recorded when there
+    is no adapter or it raises (see the module doc)."""
     mod, why = _adapter(adapter, skills_dir)
     if mod is None:
-        return _close_locally(workspace, ask_id, status, why)
+        return False, f"not closed: {why}; nothing records the close"
     try:
         return mod.resolve(Path(workspace), ask_id, status)
     except Exception as e:  # noqa: BLE001
-        return _close_locally(workspace, ask_id, status, f"adapter failed: {type(e).__name__}: {e}")
+        return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
 
 
 def unknown_line(g: dict) -> str:
@@ -178,7 +164,8 @@ def main(argv=None) -> int:
         print(note, file=sys.stderr)
     if args.command == "count":
         print(json.dumps({"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
-                          "unavailable": g["unavailable"], "reason": g["reason"]}))
+                          "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"],
+                          "reason": g["reason"]}))
         return 0
     if args.json:
         print(json.dumps({"unavailable": g["unavailable"], "reason": g["reason"], "waiting": g["waiting"]}
@@ -186,11 +173,13 @@ def main(argv=None) -> int:
         return 0
     if g["unavailable"]:
         print(unknown_line(g))
-    elif not g["waiting"]:
+    elif not g["waiting"] and not g["pending_close"]:
         print("0 pending questions" + (f" in {g['store']}" if g.get("store") else ""))
         return 0
     for it in g["waiting"]:
         print(f"- [{it['ask_id']}] {it['title']}" + ("" if it.get("in_room", True) else " (not yet in the room)"))
+    for ask_id in g["pending_close"]:
+        print(f"- [{ask_id}] closed locally; its row is not in view yet")
     return 0
 
 

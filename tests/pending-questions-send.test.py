@@ -2,8 +2,9 @@
 """ask-owner queues a pending question where the owner reads and records it: the owner's
 question is never routed into a shared room, the record (row or outbox entry) carries
 the queue line, adversarial text cannot issue markers, a published file is only a queue
-record until a drain takes it, and a refused osascript names the fix. No adapter is
-installed in the fixture, so every record here is an outbox entry."""
+record until a drain takes it, and a refused osascript names the fix. The skill's adapter
+is injected but no room capability is installed, so every record here is an outbox entry;
+TestNoSkill covers the core-only entry (a generic record and the DM, nothing more)."""
 import contextlib
 import importlib.util
 import io
@@ -97,9 +98,11 @@ def deny_outbound(targets, attempts):
         setattr(obj, attr, _refuse)
         rebound.append((name, attr))
     return tuple(rebound)
+ADAPTER = REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_room_db.py"
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
-import pending_questions_ask as pqa  # core: queue + hold + notify
+import local_record
+import pending_questions_ask as pqa  # the skill: queue + hold + notify
 import pending_questions_outbox as pqo
 import pending_questions_store as pqs  # the skill's typed Outbox / Question, for reading records
 import pending_questions_reader as reader
@@ -131,7 +134,7 @@ class _Workspace(unittest.TestCase):
         self._osascript(0)
         os.environ["SUTANDO_HOST_LABEL"] = HOST
         self.addCleanup(os.environ.pop, "SUTANDO_HOST_LABEL", None)
-        patcher = mock.patch.object(reader, "declared_adapter", return_value=None)
+        patcher = mock.patch.object(reader, "declared_adapter", return_value=ADAPTER)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -188,7 +191,7 @@ class TestRecord(_Workspace):
         self.assertEqual(sent, f"**Sent:** queued owner-dm (last-active bridge) via {f.name} at " + sent[-20:])
         self.assertIn("recorded: OUTBOX", r.stdout)
         self.assertIn("ROOM DATABASE WRITE FAILED (no room database store)", r.stderr)
-        [item] = reader.waiting(self.ws, skills_dir=self.ws / "no-skills")
+        [item] = reader.waiting(self.ws, adapter=ADAPTER)
         self.assertEqual((item["title"], item["in_room"]), ("which draft?", False))
         self.assertIn(sent, item["body"])
 
@@ -428,7 +431,7 @@ class TestAdversarialText(_Workspace):
         self.assertEqual([(a.kind, a.value) for a in parsed.actions], [("redirect", "!abc:ag2.space")],
                          "no attach, dm-only, skip or second redirect from the text")
         self.assertIn("file: /etc/passwd", parsed.body, "the words still reach the owner")
-        [item] = reader.waiting(self.ws, skills_dir=self.ws / "no-skills")
+        [item] = reader.waiting(self.ws, adapter=ADAPTER)
         self.assertEqual([a for a in parse_markers(item["body"]).actions if a.kind != "redirect"], [])
         self.assertEqual(item["body"].count("**Sent:**"), 1)
         self.assertEqual(pqa.queued_send(item["body"])[0], f.name)
@@ -503,14 +506,14 @@ class TestEdges(_Workspace):
 
     def test_a_publish_that_fails_mid_rename_leaves_no_temp(self):
         res = self.ws / "results"
-        with mock.patch.object(pqa.os, "replace", side_effect=OSError("rename refused")):
+        with mock.patch.object(local_record.os, "replace", side_effect=OSError("rename refused")):
             with self.assertRaises(OSError):
                 pqa.write_proactive(res, "proactive-x.txt", "body")
         self.assertEqual(list(res.iterdir()), [])
 
     def test_an_outbox_save_that_fails_mid_rename_leaves_no_temp_and_no_entry(self):
         ob = pqs.Outbox(self.ws)
-        with mock.patch.object(pqo.os, "replace", side_effect=OSError("rename refused")):
+        with mock.patch.object(local_record.os, "replace", side_effect=OSError("rename refused")):
             with self.assertRaises(OSError):
                 ob.save(pqs.Question("ask-x", "q?"), "**Sent:** x")
         self.assertEqual(list(ob.dir.iterdir()), [])
@@ -559,7 +562,7 @@ class TestReminder(_Workspace):
         return buf.getvalue()
 
     def _items(self):
-        return reader.waiting(self.ws, skills_dir=self.ws / "no-skills")
+        return reader.waiting(self.ws, adapter=ADAPTER)
 
     def test_published_but_undrained_stays_due_and_notify_fires(self):
         pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
@@ -663,6 +666,49 @@ class TestReminder(_Workspace):
         body = "**Sent:** queued owner-dm via proactive-ask-1.txt at 2026-13-45T99:99:99Z"
         item = pqs.waiting_item("ask-1", "q", body, None, True)
         self.assertEqual(len(_cpq(self.ws).due_for_reminder([item])), 1)
+
+
+class TestNoSkill(_Workspace):
+    """The core-only entry: no adapter declared. It queues the DM through the proactive path,
+    keeps one generic record, and claims nothing it cannot do."""
+
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(reader, "declared_adapter", return_value=None).start()
+
+    def test_the_question_is_queued_to_the_dm_and_one_generic_record_is_kept(self):
+        r = self._run("which draft?", "--context", "A or B", "--task-file", self._task(
+            "source: ag2space\naccess_tier: owner\nchannel_kind: dm\nchannel_id: !abc:ag2.space\ntask: x\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [f] = self._proactive()
+        self.assertIsNone(proactive_destination(f.name), "no routing without the skill: the last-active bridge")
+        body = f.read_text()
+        self.assertTrue(body.startswith("[dm-only]\n"), body)
+        self.assertIn("which draft?\n\nA or B\n", body)
+        self.assertEqual([a.kind for a in parse_markers(body).actions], ["dm-only"])
+        [(name, rec, path)] = local_record.RecordDir(self.ws / "state" / "ask-owner").entries()
+        self.assertEqual((rec["id"], rec["title"], rec["queued"], rec["error"]), (name, "which draft?", f.name, None))
+        self.assertEqual(path.parent, self.ws / "state" / "ask-owner")
+        self.assertIn("recorded: NO STORE", r.stdout)
+        self.assertIn("ask-owner: NO STORE", r.stderr)
+        self.assertNotIn("macos:", r.stdout, "no notification without the skill")
+        self.assertFalse(self.calls.exists())
+        self.assertEqual(self._records(), [], "no outbox entry: the outbox is the skill's")
+        self.assertTrue(reader.gather(self.ws, skills_dir=self.ws / "no-skills")["unavailable"])
+
+    def test_a_failed_send_is_in_the_record_and_a_failed_record_is_named(self):
+        (self.ws / "results").rmdir()
+        (self.ws / "results").write_text("not a directory")
+        r = self._run("still asked?")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("sent: FAILED", r.stdout)
+        [(_, rec, _)] = local_record.RecordDir(self.ws / "state" / "ask-owner").entries()
+        self.assertIsNone(rec["queued"])
+        self.assertIn("FileExistsError", rec["error"])
+        with mock.patch.object(local_record.os, "replace", side_effect=OSError("disk full")):
+            r = self._run("q?")
+        self.assertIn("record: FAILED — OSError: disk full (NOT recorded anywhere", r.stdout)
+        self.assertEqual(len(local_record.RecordDir(self.ws / "state" / "ask-owner").entries()), 1, "no half-written record")
 
 
 if __name__ == "__main__":

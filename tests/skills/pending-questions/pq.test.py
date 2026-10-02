@@ -161,14 +161,24 @@ class TestResolve(_Ws):
         self.assertIn("not changed", out)
         self.assertEqual(self.store().status_of(a["ask_id"]), "Answered")
 
-    def test_an_unknown_id_is_refused_but_without_the_capability_the_close_is_recorded_locally(self):
+    def test_an_unknown_id_is_refused_with_and_without_the_capability_and_a_known_one_closes_locally(self):
         rc, out, _ = self.cli("resolve", "ask-nope", "--workspace", str(self.ws))
         self.assertEqual(rc, 1)
         self.assertIn("not changed", out)
+        a = self.ask("first?", self.store())  # a confirmed row: the store has history
         shutil.rmtree(self.ws / "skills")
         rc, out, _ = self.cli("resolve", "ask-nope", "--workspace", str(self.ws))
         self.assertEqual(rc, 0, out)
         self.assertIn("recorded locally as Resolved", out)
+        self.assertIn("outage mode", out)
+        rc, out, _ = self.cli("resolve", a["ask_id"], "--workspace", str(self.ws))
+        self.assertEqual(rc, 0, out)
+        fresh = self.ws / "fresh"
+        (fresh / "state").mkdir(parents=True)
+        rc, out, _ = self.cli("resolve", "ask-nope", "--workspace", str(fresh))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no held question ask-nope and no room row was ever confirmed here", out)
+        self.assertEqual(adapter.count(fresh), {"open": 0, "done": 0, "pending_close": 0, "unavailable": False, "reason": None})
 
     def test_a_close_during_an_outage_is_applied_by_the_next_reconcile(self):
         a = self.ask("first?", self.store())
@@ -235,24 +245,27 @@ class TestDeclaration(rdb._Ws):
         self.assertIn("more than one skill declares", g["reason"])
         self.assertEqual(reader.count(self.ws, skills_dir=skills)["open"], None)
 
-    def test_without_the_skill_the_reader_lists_the_outbox_and_closes_locally(self):
+    def test_without_the_skill_the_reader_is_unavailable_and_closes_nothing(self):
         out = pqa.ask_owner("held?", urgency="durable", workspace=self.ws, host=HOST)
         g = reader.gather(self.ws, skills_dir=self.ws / "no-skills")
-        self.assertEqual([i["ask_id"] for i in g["waiting"]], [out["ask_id"]])
-        self.assertEqual((g["unavailable"], g["done"]), (False, 0))
-        self.assertIn("no skill declares one", g["notes"][0])
+        self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []))
+        self.assertIn("no skill declares one", g["reason"])
         ok, msg = reader.resolve(self.ws, out["ask_id"], "Resolved", skills_dir=self.ws / "no-skills")
-        self.assertTrue(ok, msg)
-        self.assertEqual(reader.count(self.ws, skills_dir=self.ws / "no-skills"), {"open": 0, "done": 1, "unavailable": False, "reason": None})
+        self.assertFalse(ok)
+        self.assertIn("nothing records the close", msg)
+        self.assertEqual(reader.count(self.ws, skills_dir=self.ws / "no-skills")["open"], None)
+        g = reader.gather(self.ws, skills_dir=REPO / "skills")  # the skill, without its room
+        self.assertEqual(([i["ask_id"] for i in g["waiting"]], g["unavailable"], g["done"]), ([out["ask_id"]], False, 0))
 
-    def test_without_the_skill_ask_owner_holds_the_question(self):
+    def test_without_the_skill_ask_owner_keeps_a_generic_record_only(self):
         cli = REPO / "scripts" / "ask-owner.py"
         with mock.patch.object(reader, "declared_adapter", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             rc = _load("ask_owner_cli", cli).main(["q?", "--urgency", "durable", "--workspace", str(self.ws)])
         self.assertEqual(rc, 0)
-        self.assertIn("room database: not used (no pending-questions store adapter installed", out.getvalue())
-        self.assertEqual(len(self.outbox()), 1)
+        self.assertIn("recorded: NO STORE — no pending-questions store adapter installed", out.getvalue())
+        self.assertEqual(self.outbox(), [], "the outbox is the skill's")
+        self.assertEqual(len(list((self.ws / "state" / "ask-owner").glob("ask-*.json"))), 1)
 
 
 class TestSharedRoom(rdb._Ws):

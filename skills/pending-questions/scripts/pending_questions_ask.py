@@ -1,14 +1,14 @@
 """Queue a pending question to the owner in a conversation he reads, and hold it locally.
 
-Core's provider-neutral half of an ask, fail-open at every step: (1) the question is
+The skill's provider-neutral half of an ask, fail-open at every step: (1) the question is
 QUEUED as a proactive file — to the task's own conversation only for an owner-tier task
 in the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner's DM on
 the task's bridge for any other bridge task, else to the owner's DM on the bridge he was
 last active on; a drain delivering the file is what makes it sent; (2) the question and
 its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) the
 macOS notification fires last, and a refusal prints the fix instead of a success. The
-store an installed skill declares builds its row on top of `queue_question`; with no
-skill, `ask_owner` here is the whole ask and the outbox is the record.
+room-database adapter builds its row on top of `queue_question`; with no room, `ask_owner`
+here is the whole ask and the outbox is the record.
 
 Question and context text is embedded, never interpolated: result markers are
 neutralized (`[ file:`), so no text can become a drain action.
@@ -16,17 +16,21 @@ neutralized (`[ file:`), so no text can become a drain action.
 from __future__ import annotations
 
 import glob
-import os
 import re
-import secrets
 import subprocess
-import tempfile
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
+HERE = Path(__file__).resolve().parent
+for _p in (REPO / "src", HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+from local_record import new_name, write_text_whole
 from pending_questions_outbox import Outbox, one_line_title
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
@@ -66,7 +70,7 @@ def _iso(now: float) -> str:
 
 def new_ask_id(now: float) -> str:
     """Unique per call: the row key, the outbox file, the proactive file stem and the report share it."""
-    return f"ask-{int(now * 1000)}-{os.getpid()}-{secrets.token_hex(3)}"
+    return new_name("ask", now)
 
 
 def entry_heading(question: str, now: float) -> str:
@@ -175,16 +179,7 @@ def proactive_body(question: str, context: Optional[str], host: str,
 
 def write_proactive(results: Path, name: str, body: str) -> Path:
     """Publish atomically: a drain claims proactive-*.txt on sight."""
-    results.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(results), prefix=f".{name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(body)
-        os.replace(tmp, results / name)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-    return results / name
+    return write_text_whole(Path(results) / name, body)
 
 
 def notify_macos(text: str) -> tuple:
@@ -253,7 +248,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """The whole ask with no store installed: queue, hold in the outbox, notify."""
+    """The whole ask with no room store: queue, hold in the outbox, notify."""
     out = queue_question(question, context, task_file, workspace, host, now, None, None,
                          default_action, reason, options, priority)
     out.update({"record": f"outbox {out['outbox']}" if out["outbox"] else None,
