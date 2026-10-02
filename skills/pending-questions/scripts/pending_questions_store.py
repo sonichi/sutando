@@ -13,10 +13,12 @@ other question's row can stand in for one.
 Outbox extends the sibling hold (pending_questions_outbox.py: the record, its path
 safety, the close records) with the replay: `flush` re-inserts each held question
 through the normal add_row path (which resumes a row left incomplete) and deletes
-the entry only once that exact ask id's row is confirmed complete; `replay_closes`
-applies the local close records, keeping any the store cannot confirm closed.
-`reconcile_pending` is the explicit pass: flush, closes, stale marks, then the one
-transitional ingest of the legacy file; anything it lands marks the store as used.
+the entry only once that exact ask id's row is confirmed complete AND the store-history
+marker is committed — the local evidence is released after the durable fact, never
+before; `replay_closes` applies the local close records, keeping any whose row the
+store cannot confirm closed and complete. `reconcile_pending` is the explicit pass:
+flush, closes, stale marks, then the one transitional ingest of the legacy file; any
+row it lands or observes marks the store as used.
 """
 from __future__ import annotations
 
@@ -388,8 +390,19 @@ class RoomDbStore:
 class Outbox(HeldRecords):
     """Core's held records, typed as Questions and replayed into a store."""
 
+    def __init__(self, workspace):
+        super().__init__(workspace)
+        self.workspace = Path(workspace)
+
     def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:  # type: ignore[override]
         return super().save(q.to_dict(), sent_line, now)
+
+    def commit_history(self, ask_id: str) -> None:
+        """The durable fact a confirmed row proves, committed before any local evidence goes."""
+        try:
+            mark_store_used(self.workspace, ask_id)
+        except OSError as e:
+            raise StoreError(f"store history not committed ({type(e).__name__}: {e}); the local record is kept") from None
 
     def entries(self) -> list:
         out = []
@@ -402,8 +415,9 @@ class Outbox(HeldRecords):
 
     def flush(self, store) -> tuple:
         """Replay every held question into `store` through add_row (which resumes a row left
-        incomplete) and delete the entry once that exact ask id's row is confirmed complete.
-        (flushed ids, errors)."""
+        incomplete); once that exact ask id's row is confirmed complete the history marker is
+        committed, and only then is the entry deleted — a marker that cannot be written keeps
+        the entry. (flushed ids, errors)."""
         flushed, errors = [], []
         for e in self.entries():
             q = e["question"]
@@ -411,6 +425,7 @@ class Outbox(HeldRecords):
                 store.insert(q, e["sent"] or f"**Sent:** record not kept; held in the outbox since {e['saved_at']}")
                 if not store.complete(q.ask_id):
                     raise StoreError("the row is still incomplete after the replay")
+                self.commit_history(q.ask_id)
                 self.delete(q.ask_id)
                 flushed.append(q.ask_id)
             except Exception as ex:  # noqa: BLE001 — one entry's failure leaves the rest to try
@@ -419,8 +434,9 @@ class Outbox(HeldRecords):
 
     def replay_closes(self, store) -> tuple:
         """Apply each local close record to its row. The record goes only once the row is
-        closed by this replay or seen closed already; a row this store view does not show is
-        ambiguous (empty, stale or the wrong store), so the record stays and is reported.
+        closed by this replay or seen closed already AND complete (its body landed): a row
+        this store view does not show is ambiguous (empty, stale or the wrong store) and an
+        incomplete one is still being filed, so in both cases the record stays and is reported.
         (closed ids, errors)."""
         closed, errors = [], []
         held = {e["ask_id"] for e in self.entries()}
@@ -434,6 +450,9 @@ class Outbox(HeldRecords):
                                          "no row for it in this store view; kept until one is seen") from None
                     if effective_status(g.current) not in TERMINAL:
                         raise StoreError(f"its row is not closed ({g})") from None
+                if not store.complete(ask_id):
+                    raise StoreError("its row is still incomplete (no body yet); kept until it lands")
+                self.commit_history(ask_id)
                 self.delete_close(ask_id)
                 closed.append(ask_id)
             except Exception as ex:  # noqa: BLE001
@@ -475,7 +494,9 @@ def write_question(q: Question, store, sent_line: str) -> WriteOutcome:
 def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     """The explicit pass with a reachable store: replay the outbox, apply local closes, clear
     stale marks on this host's rows, then the transitional ingest of the legacy file (its
-    single call site). Any row landed or observed marks the store as used."""
+    single call site). A row landed commits the history marker before its local evidence
+    goes (flush, replay, ingest); a row merely observed commits it here — the one backfill
+    for a workspace whose rows predate the marker, so no read ever has to write."""
     ob = Outbox(workspace)
     flushed, errors = ob.flush(store)
     closed, close_errors = ob.replay_closes(store)
@@ -490,10 +511,9 @@ def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
         errors.append(f"stale marks: {type(e).__name__}: {e}")
     import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
     moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
-    for ask_id in flushed + closed + moved + seen:
+    if seen:
         try:
-            mark_store_used(workspace, ask_id)
+            mark_store_used(workspace, min(seen))
         except OSError as e:
             errors.append(f"store history: {type(e).__name__}: {e}")
-        break
     return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}

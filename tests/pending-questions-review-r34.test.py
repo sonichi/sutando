@@ -229,14 +229,17 @@ class StoreHistory(_FakeRoom):
         self.lose_capability()
         self.assert_outage()
 
-    def test_a_pre_existing_row_observed_by_a_read_is_history(self):
-        """An upgraded workspace: rows exist in the room, no marker was ever written here."""
+    def test_a_pre_existing_row_observed_by_a_reconcile_is_history(self):
+        """An upgraded workspace: rows exist in the room, no marker was ever written here. A
+        read leaves it that way (round 35: a read never writes); the explicit pass records it."""
         self.store().insert(self.q("ask-old", "from before?"), SENT)
         for marker in ("pending-questions-db-introduced", "pending-questions-store-history"):
             (self.ws / "state" / marker).unlink(missing_ok=True)
         self.assertFalse(_history(self.ws))
         self.assertEqual(adapter.count(self.ws)["open"], 1)
-        self.assertTrue(_history(self.ws), "the read saw a row of this workspace")
+        self.assertFalse(_history(self.ws), "a read wrote the marker")
+        self.assertEqual(adapter.reconcile_pass(self.ws, environ={})["errors"], [])
+        self.assertTrue(_history(self.ws), "the reconcile saw a row of this workspace")
         self.lose_capability()
         self.assert_outage()
 

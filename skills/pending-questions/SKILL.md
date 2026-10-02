@@ -27,27 +27,35 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
 
 - `ask` reconciles, queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
-  with its `**Sent:**` record, and deletes the outbox file once that exact row is confirmed
-  complete. If the outbox cannot hold the question, NO row is written: the owner is still
+  with its `**Sent:**` record, and once that exact row is confirmed complete commits the
+  store-history marker and THEN deletes the outbox file — a marker that cannot be written
+  keeps the file (`history: FAILED` in the report) so the local evidence outlives the
+  failure. If the outbox cannot hold the question, NO row is written: the owner is still
   asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
   ask. Then continue; never block.
-- `list` is READ-ONLY: this host's open rows plus any held question once, marked
-  `(not yet in the room)`, then any local close whose row is not in view (`closed locally;
-  its row is not in view yet` — neither open nor done, `pending_close` in `count`). When the
-  room cannot be read it prints `pending questions: UNKNOWN — room unreachable (…)` and only
-  what is held locally; it never prints a zero it did not measure. Once a row of this
-  workspace was ever confirmed (written, replayed, ingested or seen by a read), a room that
-  cannot be reached is an outage, not an empty outbox — whatever became of the one-time
-  introduction message.
+- `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask
+  id in exactly one bucket, by precedence: a terminal or locally closed row is done; a
+  complete open row waits; an open row whose body has not landed is stood in for by its held
+  entry; a held entry with no row waits, marked `(not yet in the room)`, or is done when
+  closed locally; a local close naming neither is `closed locally; its row is not in view
+  yet` (neither open nor done, `pending_close` in `count`). When the room cannot be read it
+  prints `pending questions: UNKNOWN — room unreachable (…)` and only what is held locally;
+  it never prints a zero it did not measure. Once a row of this workspace was ever confirmed
+  (written, replayed, ingested or observed by a reconcile), a room that cannot be reached is
+  an outage, not an empty outbox — whatever became of the one-time introduction message.
 - `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
-  transitional legacy ingest. `ask` and `remind` run it; `list` does not.
+  transitional legacy ingest, and the history backfill for rows that predate the marker.
+  Every step commits the history marker before it releases local evidence (an outbox entry,
+  a close record, a legacy file entry), and keeps that evidence when the commit fails. `ask`
+  and `remind` run it; `list` does not.
 - `resolve` closes a row as Resolved (or Answered with `--answered`). It never reopens a
   closed row. When the room cannot be written, the closure is recorded locally
   (`<outbox>/closed/<ask_id>.json`) and applied by the next `reconcile` — but only for a
   question the outbox holds, or in outage mode (a row was confirmed here before); an unknown
   id with neither is refused and changes no count. The replay retires a local close only
-  once its row is closed or seen closed; a row the store view does not show is ambiguous,
-  so the record stays and `reconcile` reports it.
+  once its row is closed (or seen closed) AND complete — its body landed; a row the store
+  view does not show is ambiguous and an incomplete one is still being filed, so in both
+  cases the record stays and `reconcile` reports it.
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
