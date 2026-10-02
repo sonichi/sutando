@@ -29,6 +29,7 @@ _spec = importlib.util.spec_from_file_location("rdb", REPO / "tests" / "pending-
 rdb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rdb)
 pqs, adapter, reader, HOST, SENT = rdb.pqs, rdb.adapter, rdb.reader, rdb.HOST, rdb.SENT
+skill_roots = importlib.import_module("skill_roots")
 pqo = importlib.import_module("pending_questions_outbox")
 ADAPTER = Path(adapter.__file__)
 SKILL = REPO / "skills" / "pending-questions"
@@ -309,7 +310,7 @@ class LinterMatchesDiscovery(unittest.TestCase):
         self.assertIn(str(outside.resolve()), errors[0])
         self.assertEqual(rc, 1, out)
         self.assertIn("1 error(s)", out)
-        self.assertEqual(reader.declared_adapters(self.skills), [], "runtime discovery rejects it too")
+        self.assertEqual(skill_roots.declared_scripts(reader.DECLARATION, self.skills), [], "runtime discovery rejects it too")
 
     def test_a_symlink_inside_the_skill_passes_both(self):
         impl = self.skill / "impl" / "adapter.py"
@@ -318,7 +319,7 @@ class LinterMatchesDiscovery(unittest.TestCase):
         os.symlink(Path("..") / "impl" / "adapter.py", self.skill / "scripts" / "adapter.py")
         errors, rc, _ = self.lint()
         self.assertEqual((errors, rc), ([], 0))
-        self.assertEqual([(n, p) for n, p in reader.declared_adapters(self.skills)], [("pq", impl.resolve())])
+        self.assertEqual([(n, p) for n, p in skill_roots.declared_scripts(reader.DECLARATION, self.skills)], [("pq", impl.resolve())])
 
     def test_a_plain_file_passes_and_the_real_manifests_stay_clean(self):
         (self.skill / "scripts" / "adapter.py").write_text("def gather(ws):\n    return {}\n")

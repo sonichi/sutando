@@ -595,6 +595,7 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
 
 
 import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 
 
 #: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
@@ -669,7 +670,7 @@ def get_pending_questions() -> dict:
     the questions themselves: they are sent as they come up, not re-delivered on a schedule.
     An unreadable room is `count` None — said as unknown, never as none.
     """
-    g = pending_questions_reader.gather(WORKSPACE)
+    g = pending_questions_reader.gather(WORKSPACE, skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE))
     for note in g["notes"]:
         print(f"  pending questions: {note}", file=sys.stderr)
     return {"count": None if g["unavailable"] else len(g["waiting"]), "link": g.get("link"),

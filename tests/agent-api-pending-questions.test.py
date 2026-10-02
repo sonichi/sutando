@@ -69,7 +69,7 @@ class Rows(unittest.TestCase):
     def test_rows_come_from_the_reader_in_the_triage_shape(self):
         with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)) as w:
             rows = api._pending_question_rows()
-        w.assert_called_once_with(self.tmp)
+        w.assert_called_once_with(self.tmp, api.skill_roots.declared(api.pending_questions_reader.DECLARATION, self.tmp))
         by_id = {r["id"]: r for r in rows}
         self.assertEqual(set(by_id), {"ask-alpha", "ask-bravo", "ask-held"})
         self.assertEqual(by_id["ask-alpha"]["text"], "ALPHA, oldest and blocking nothing")
@@ -196,13 +196,13 @@ class AnswerRoute(unittest.TestCase):
     def test_listing_answer_and_404s(self):
         closed = []
 
-        def _resolve(ws, ask_id, status):
+        def _resolve(ws, ask_id, status, store=None):
             if ask_id in [c[0] for c in closed] or ask_id not in {i["ask_id"] for i in ITEMS}:
                 return False, f"no open row for {ask_id}"
             closed.append((ask_id, status))
             return True, "closed"
 
-        def _gather(ws):
+        def _gather(ws, store=None):
             return _g([i for i in ITEMS if i["ask_id"] not in [c[0] for c in closed]])
 
         with mock.patch.object(api.pending_questions_reader, "gather", _gather), \

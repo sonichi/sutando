@@ -23,6 +23,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, personal_path, shared_personal_path  # noqa: E402
 import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
@@ -49,7 +50,7 @@ def check_pending_questions():
     issues = []
     found: list = []
     now = datetime.now(timezone.utc)
-    g = pending_questions_reader.gather(WORKSPACE)
+    g = pending_questions_reader.gather(WORKSPACE, skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE))
     if g["unavailable"]:
         return [f"Pending questions: UNKNOWN — room unreachable ({g['reason']}); "
                 f"{len(g['waiting'])} held locally"]

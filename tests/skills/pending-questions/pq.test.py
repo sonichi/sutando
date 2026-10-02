@@ -30,6 +30,7 @@ def _load(name, path):
 rdb = _load("pq_room_db_test", REPO / "tests" / "pending-questions-room-db.test.py")
 pq = _load("pq_cli", SKILL / "scripts" / "pq.py")
 pqs, pqa, adapter, reader, HOST, ROOM = rdb.pqs, rdb.pqa, rdb.adapter, rdb.reader, rdb.HOST, rdb.ROOM
+skill_roots = importlib.import_module("skill_roots")
 
 
 class _Ws(rdb._Ws):
@@ -221,45 +222,45 @@ class TestDeclaration(rdb._Ws):
         return d
 
     def test_the_repo_skill_declares_its_adapter(self):
-        self.assertEqual(reader.declared_adapter(REPO / "skills"), pq.ADAPTER)
-        self.assertEqual(Path(reader._adapter()[1]), pq.ADAPTER)
+        self.assertEqual(skill_roots.declared_script(reader.DECLARATION, REPO / "skills"), pq.ADAPTER)
+        self.assertEqual(Path(reader._adapter(skill_roots.declared(reader.DECLARATION, self.ws))[1]), pq.ADAPTER)
 
     def test_a_declaration_must_stay_inside_its_skill(self):
         skills = self.ws / "skills-dir"
         self._skill("a-off", {"enabled": False, "pending_questions_store": "scripts/a.py"})
         self._skill("b-out", {"pending_questions_store": "../a-off/scripts/a.py"})
-        self.assertIsNone(reader.declared_adapter(skills))
+        self.assertIsNone(skill_roots.declared_script(reader.DECLARATION, skills))
         good = self._skill("c-ok", {"pending_questions_store": "scripts/a.py"})
-        self.assertEqual(reader.declared_adapter(skills), (good / "scripts" / "a.py").resolve())
-        self.assertEqual(reader.load_adapter(reader.declared_adapter(skills)).room_store(self.ws), (None, "fake"))
+        self.assertEqual(skill_roots.declared_script(reader.DECLARATION, skills), (good / "scripts" / "a.py").resolve())
+        self.assertEqual(reader.load_adapter(skill_roots.declared_script(reader.DECLARATION, skills)).room_store(self.ws), (None, "fake"))
         self.assertIsNone(reader.load_adapter(None))
 
     def test_two_skills_declaring_the_store_is_a_refusal_not_an_alphabetical_pick(self):
         skills = self.ws / "skills-dir"
         self._skill("aaa-first", {"pending_questions_store": "scripts/a.py"})
         self._skill("zzz-last", {"pending_questions_store": "scripts/a.py"})
-        with self.assertRaisesRegex(reader.AdapterConflict, "aaa-first, zzz-last"):
-            reader.declared_adapter(skills)
-        g = reader.gather(self.ws, skills_dir=skills)
+        with self.assertRaisesRegex(skill_roots.DeclarationConflict, "aaa-first, zzz-last"):
+            skill_roots.declared_script(reader.DECLARATION, skills)
+        g = reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=skills))
         self.assertTrue(g["unavailable"])
         self.assertIn("more than one skill declares", g["reason"])
-        self.assertEqual(reader.count(self.ws, skills_dir=skills)["open"], None)
+        self.assertEqual(reader.count(self.ws, skill_roots.declared(reader.DECLARATION, roots=skills))["open"], None)
 
     def test_without_the_skill_the_reader_is_unavailable_and_closes_nothing(self):
         out = pqa.ask_owner("held?", urgency="durable", workspace=self.ws, host=HOST)
-        g = reader.gather(self.ws, skills_dir=self.ws / "no-skills")
+        g = reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))
         self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []))
         self.assertIn("no skill declares one", g["reason"])
-        ok, msg = reader.resolve(self.ws, out["ask_id"], "Resolved", skills_dir=self.ws / "no-skills")
+        ok, msg = reader.resolve(self.ws, out["ask_id"], "Resolved", skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))
         self.assertFalse(ok)
         self.assertIn("nothing records the close", msg)
-        self.assertEqual(reader.count(self.ws, skills_dir=self.ws / "no-skills")["open"], None)
-        g = reader.gather(self.ws, skills_dir=REPO / "skills")  # the skill, without its room
+        self.assertEqual(reader.count(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))["open"], None)
+        g = reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=REPO / "skills"))  # the skill, without its room
         self.assertEqual(([i["ask_id"] for i in g["waiting"]], g["unavailable"], g["done"]), ([out["ask_id"]], False, 0))
 
     def test_without_the_skill_ask_owner_keeps_a_generic_record_only(self):
         cli = REPO / "scripts" / "ask-owner.py"
-        with mock.patch.object(reader, "declared_adapter", return_value=None), \
+        with mock.patch.object(skill_roots, "declared_script", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             rc = _load("ask_owner_cli", cli).main(["q?", "--urgency", "durable", "--workspace", str(self.ws)])
         self.assertEqual(rc, 0)

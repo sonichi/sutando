@@ -30,6 +30,7 @@ import pending_questions_ask as pqa  # the skill: queue + hold + notify
 import pending_questions_outbox as pqo
 import pending_questions_store as pqs  # the skill's typed Outbox / Question, for reading records
 import pending_questions_reader as reader
+import skill_roots
 from proactive_routing import proactive_destination
 from result_markers import parse_markers
 
@@ -58,7 +59,7 @@ class _Workspace(unittest.TestCase):
         self._osascript(0)
         os.environ["SUTANDO_HOST_LABEL"] = HOST
         self.addCleanup(os.environ.pop, "SUTANDO_HOST_LABEL", None)
-        patcher = mock.patch.object(reader, "declared_adapter", return_value=ADAPTER)
+        patcher = mock.patch.object(skill_roots, "declared_script", return_value=ADAPTER)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -404,7 +405,7 @@ class TestNoSkill(_Workspace):
 
     def setUp(self):
         super().setUp()
-        mock.patch.object(reader, "declared_adapter", return_value=None).start()
+        mock.patch.object(skill_roots, "declared_script", return_value=None).start()
 
     def test_the_question_is_queued_to_the_dm_and_one_generic_record_is_kept(self):
         r = self._run("which draft?", "--context", "A or B", "--task-file", self._task(
@@ -424,7 +425,7 @@ class TestNoSkill(_Workspace):
         self.assertNotIn("macos:", r.stdout, "no notification without the skill")
         self.assertFalse(self.calls.exists())
         self.assertEqual(self._records(), [], "no outbox entry: the outbox is the skill's")
-        self.assertTrue(reader.gather(self.ws, skills_dir=self.ws / "no-skills")["unavailable"])
+        self.assertTrue(reader.gather(self.ws, skill_roots.declared(reader.DECLARATION, roots=self.ws / "no-skills"))["unavailable"])
 
     def test_a_failed_send_is_in_the_record_and_a_failed_record_is_named(self):
         (self.ws / "results").rmdir()

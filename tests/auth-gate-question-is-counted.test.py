@@ -44,8 +44,9 @@ def waiting(ws: Path) -> list:
     spec = importlib.util.spec_from_file_location("pq_reader", REPO / "src" / "pending_questions_reader.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    import skill_roots  # noqa: PLC0415
     # The repo's skill declares the adapter; with no room capability it lists the outbox alone.
-    return m.waiting(ws, skills_dir=REPO / "skills")
+    return m.waiting(ws, skill_roots.declared(m.DECLARATION, roots=REPO / "skills"))
 
 
 def extract_writer() -> str:

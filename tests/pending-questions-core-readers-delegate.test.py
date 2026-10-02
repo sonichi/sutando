@@ -57,7 +57,7 @@ class Dashboard(unittest.TestCase):
         c_ok = {"open": 3, "done": 7, "unavailable": False, "reason": None}
         with mock.patch.object(dash.pending_questions_reader, "count", return_value=c_ok) as c:
             self.assertEqual(dash.get_pending_count(), c_ok)
-        c.assert_called_once_with(dash.WORKSPACE_DIR)
+        c.assert_called_once_with(dash.WORKSPACE_DIR, dash.skill_roots.declared(dash.pending_questions_reader.DECLARATION, dash.WORKSPACE_DIR))
         self.assertEqual(_no_file_read(SRC / "dashboard.py"), [])
 
     def test_an_unreachable_room_renders_a_question_mark_with_the_reason_never_zero(self):

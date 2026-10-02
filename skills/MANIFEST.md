@@ -142,9 +142,14 @@ read it (read-only; `unavailable: True` and `done: None` when the room cannot be
 `reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
 records a question and `remind` runs the reminder. The field is in `schemas/skill-manifest.schema.json`
 (a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
-`src/pending_questions_reader.py`, which scans manifests for that FIELD alone (the script must
-resolve inside its skill), names no skill, and refuses when more than one installed skill declares
-it. With none declared there is no store: readers report `unavailable` with that reason (never a
+`src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
+skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
+friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
+`declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
+roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+resolve inside its skill), and refuses when more than one installed skill declares it, in one root
+or one per root; a `--store-adapter <path>` flag overrides the scan.
+With none declared there is no store: readers report `unavailable` with that reason (never a
 zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
 the owner's DM through the proactive path and keeps one generic record under
 `<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.

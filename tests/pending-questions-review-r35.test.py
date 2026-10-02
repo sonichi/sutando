@@ -196,7 +196,7 @@ class AnswerRace(unittest.TestCase):
         resolve() until the other has filed its task."""
         barrier = threading.Barrier(2)
 
-        def _resolve(ws, a, s):
+        def _resolve(ws, a, s, store=None):
             barrier.wait(timeout=10)
             return True, "closed"
         responses = {}
