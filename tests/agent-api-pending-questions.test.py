@@ -221,7 +221,7 @@ class AnswerRoute(unittest.TestCase):
             self.assertNotIn("ask-alpha", [q["id"] for q in data["questions"]])
             code, data = self.req("POST", "/answer", {"id": "ask-alpha", "answer": "again"})
             self.assertEqual(code, 404)
-            self.assertIn("no open row", data["error"])
+            self.assertIn("is not waiting", data["error"])
             code, _ = self.req("POST", "/answer", {"id": "Q1", "answer": "stale"})
             self.assertEqual(code, 404)
             code, _ = self.req("POST", "/answer", {"id": "ask-bravo"})

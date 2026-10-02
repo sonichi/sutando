@@ -141,6 +141,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
+import local_record  # noqa: E402
 import pending_questions_reader  # noqa: E402
 import pending_questions_triage as pq_triage  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -489,6 +490,44 @@ def _questions_queue_payload() -> dict:
     """Triage queue, re-checked live at the moment it is asked for."""
     g = _pending_gather()
     return {"questions": _pending_question_rows(recheck=True, gathered=g), "questions_unavailable": _questions_unavailable(g)}
+
+
+def _file_answer_task(qid: str, answer: str) -> tuple:
+    """(task path, None) once the owner's answer is published whole under tasks/, else (None, why)."""
+    safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
+    if not safe_qid:
+        return None, "the id has no file-safe characters"
+    # realpath + startswith: the CodeQL-recognised path-injection
+    # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
+    task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
+    task_file_str = os.path.realpath(os.path.join(
+        task_dir_real, f"answer-{safe_qid}-{int(datetime.now().timestamp() * 1000)}.txt"))
+    if not task_file_str.startswith(task_dir_real + os.sep):
+        return None, "the id does not name a file under tasks/"
+    try:
+        local_record.write_text_whole(Path(task_file_str), f"User answered {safe_qid}: {confine_user_content(answer)}")
+    except OSError as e:
+        return None, str(e)
+    return task_file_str, None
+
+
+def answer_question(qid: str, answer: str) -> tuple:
+    """(status, body) for POST /answer. The answer task is published whole BEFORE the close is
+    asked for: a close with no durable answer loses the owner's word; the reverse is at worst
+    a question answered twice. A failed publish leaves the question open."""
+    if not qid or not answer:
+        return 400, {"error": "id and answer required"}
+    g = _pending_gather()
+    if not g["unavailable"] and qid not in {w["ask_id"] for w in g["waiting"]}:
+        return 404, {"error": f"question {qid} is not waiting (answered, dismissed or unknown)"}
+    task_path, err = _file_answer_task(qid, answer)
+    if err:
+        return 500, {"error": f"answer not kept ({err}); the question stays open", "id": qid, "recorded": False}
+    closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered")
+    if not closed:
+        return 503, {"error": f"answer kept as a task; the question could not be closed: {why}",
+                     "id": qid, "recorded": True, "task": task_path}
+    return 200, {"ok": True, "id": qid, "answer": answer, "task": task_path}
 
 
 def dismiss_question(qid: str) -> tuple:
@@ -1344,33 +1383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
-                qid = data.get("id", "")
-                answer = data.get("answer", "")
-                if not qid or not answer:
-                    self.send_json(400, {"error": "id and answer required"})
-                    return
-                # The owner's typed answer is kept whatever the store says: the task file first,
-                # then the close — a store that cannot be reached records the close locally.
-                ts = int(datetime.now().timestamp() * 1000)
-                safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
-                closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered")
-                if not closed and not why.startswith("UNRECORDED"):
-                    self.send_json(404, {"error": f"question {qid} not found or already answered: {why}"})
-                    return
-                if safe_qid:
-                    # realpath + startswith: the CodeQL-recognised path-injection
-                    # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
-                    task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
-                    task_file_str = os.path.realpath(
-                        os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
-                    )
-                    if task_file_str.startswith(task_dir_real + os.sep):
-                        Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
-                if not closed:
-                    self.send_json(503, {"error": f"answer kept as a task; the question could not be closed: {why}",
-                                         "id": qid, "recorded": bool(safe_qid)})
-                    return
-                self.send_json(200, {"ok": True, "id": qid, "answer": answer})
+                self.send_json(*answer_question(str(data.get("id", "")), str(data.get("answer", ""))))
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
             return
