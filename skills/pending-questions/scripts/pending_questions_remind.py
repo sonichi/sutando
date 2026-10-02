@@ -6,7 +6,8 @@ macOS, voice and the owner's DM, and `--force` with it skips the cooldown, prese
 the sent-quiet window. Without `--notify` NOTHING is sent — an installed schedule running the
 core entry with no flag is that silent pass. An unreachable room is reported as UNKNOWN,
 never as zero, and nothing is reminded from a count that could not be measured.
-`--store-adapter <path>` injects another adapter file (its `gather(ws)` is what is read).
+`--store-adapter <path>` injects another adapter file (its `gather(ws, reconcile=True)` is
+what is read — the pass reconciles whichever adapter it reads through).
 Entry: src/check-pending-questions.py, or `pq.py remind`.
 """
 
@@ -79,16 +80,15 @@ def voice_client_connected():
 
 
 def gather(adapter=None):
-    """The pass's result through the sibling adapter (reconcile, then read), or the injected
-    adapter file's `gather(ws)`: {"waiting", "notes", "unavailable", "reason", ...}."""
+    """The pass's result — reconcile, then read — through the sibling adapter, or the injected
+    adapter file (what `pq.py remind` passes): {"waiting", "notes", "unavailable", "reason", ...}."""
     if adapter:
         spec = importlib.util.spec_from_file_location("pq_store_adapter_injected", str(adapter))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        g = mod.gather(WORKSPACE)
+        room_db = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(room_db)
     else:
         import pending_questions_room_db as room_db  # noqa: PLC0415
-        g = room_db.gather(WORKSPACE, reconcile=True)
+    g = room_db.gather(WORKSPACE, reconcile=True)
     g.setdefault("unavailable", False)
     g.setdefault("reason", None)
     return g

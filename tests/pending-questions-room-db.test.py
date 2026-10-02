@@ -814,13 +814,15 @@ class TestReminder(_Ws):
 
     def test_the_store_adapter_flag_loads_the_injected_file(self):
         fake = self.ws / "fake_adapter.py"
-        fake.write_text("def gather(ws):\n    return {'waiting': [], 'done': 0, 'notes': ['from the flag'], 'store': 'f'}\n")
+        fake.write_text("def gather(ws, reconcile=False):\n"
+                        "    return {'waiting': [], 'done': 0, 'notes': ['from the flag', f'reconcile={reconcile}'], 'store': 'f'}\n")
         cpq = _cpq(self.ws)
         with mock.patch.object(sys, "argv", ["check-pending-questions.py", "--store-adapter", str(fake)]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
             cpq.main()
         self.assertIn("0 pending questions; nothing sent", out.getvalue())
         self.assertIn("from the flag", err.getvalue())
+        self.assertIn("reconcile=True", err.getvalue(), "the injected adapter is read through its pass")
 
 
 class TestDelegation(unittest.TestCase):
