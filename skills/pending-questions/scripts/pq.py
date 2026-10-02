@@ -3,14 +3,13 @@
 
   pq.py ask "<question>" [--context ..] [--urgency live|durable] [--task-file ..]
         [--default-action ..] [--reason ..] [--option 'Label=what it does'] [--priority ..]
-  pq.py list [--json]              # what is waiting on the owner (the reminder's set)
+  pq.py list [--json]              # what is waiting on the owner, after this pass's reconcile
   pq.py resolve <ask-id> [--answered]
-  pq.py remind [args]              # src/check-pending-questions.py, args passed through
+  pq.py remind [--force]           # src/check-pending-questions.py --notify, args passed through
 
-Every verb delegates: `ask` to scripts/ask-owner.py, `list` to the reminder's
-gather(), `resolve` to FileStore.set_status and RoomDbStore.close, `remind` to
-the reminder itself. This file injects its sibling room-database adapter; the
-file ledger works without it.
+Every verb delegates: `ask` to scripts/ask-owner.py, `list` and `resolve` to the
+sibling room-database adapter (the one reader and writer), `remind` to the reminder
+with that adapter injected.
 """
 from __future__ import annotations
 
@@ -37,9 +36,11 @@ def _load(name: str, path: Path):
     return mod
 
 
-def _room_store(ws: Path):
-    from pending_questions_room_db import room_store  # noqa: PLC0415 — optional capability
-    return room_store(ws)
+def _workspace(opt):
+    if opt:
+        return Path(opt)
+    from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
+    return resolve_workspace(migrate=False)
 
 
 def _with_adapter(args: list) -> list:
@@ -53,26 +54,22 @@ def cmd_ask(args: list) -> int:
 def cmd_list(args: list) -> int:
     ap = argparse.ArgumentParser(prog="pq.py list")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     opts = ap.parse_args(args)
-    from pending_questions_store import entry_ask_id
-    cpq = _load("pq_reminder", REMINDER)
-    store, where = _room_store(cpq.WORKSPACE)
-    if store is None:
-        print(f"room database: not used ({where}); listing from the file", file=sys.stderr)
-    questions, notes = cpq.gather(store)
-    for note in notes:
+    import pending_questions_room_db as adapter  # noqa: PLC0415
+    g = adapter.gather(_workspace(opts.workspace))
+    for note in g["notes"]:
         print(note, file=sys.stderr)
-    items = [{"ask_id": q.get("ask_id") or entry_ask_id(q.get("body", "")), "title": q["title"],
-              "snippet": q.get("snippet", ""), "body": q.get("body", "")} for q in questions]
+    items = g["waiting"]
     if opts.json:
         print(json.dumps(items, ensure_ascii=False, indent=1))
         return 0
     if not items:
-        print(cpq.zero_reason())
+        print("0 pending questions" + (f" in {g['store']}" if g.get("store") else " (no room database; the outbox is empty)"))
         return 0
     print(f"{len(items)} waiting on the owner:")
     for it in items:
-        print(f"- [{it['ask_id'] or 'no ask id'}] {it['title']}")
+        print(f"- [{it['ask_id']}] {it['title']}" + ("" if it.get("in_room", True) else " (not yet in the room)"))
         if it["snippet"] and it["snippet"] != it["title"]:
             print(f"    {it['snippet']}")
     return 0
@@ -84,37 +81,14 @@ def cmd_resolve(args: list) -> int:
     ap.add_argument("--answered", action="store_true", help="mark it Answered, not Resolved")
     ap.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     opts = ap.parse_args(args)
-    from pending_questions_ask import ledger_path
-    from pending_questions_store import FileStore
-    from util_paths import host_label
-    if opts.workspace:
-        ws = Path(opts.workspace)
-    else:
-        from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
-        ws = resolve_workspace(migrate=False)
-    status = "Answered" if opts.answered else "Resolved"
-    closed = 0
-    pq = ledger_path(ws, host_label())
-    try:
-        FileStore(pq).set_status(opts.ask_id, status)
-        print(f"file: {opts.ask_id} -> {status} in {pq}")
-        closed += 1
-    except Exception as e:  # noqa: BLE001 — the database may still hold it
-        print(f"file: not changed — {type(e).__name__}: {e}")
-    store, where = _room_store(ws)
-    if store is None:
-        print(f"room database: not used ({where})")
-    else:
-        try:
-            store.close(opts.ask_id, status)
-            print(f"room database: {opts.ask_id} -> {status} in {store.where(opts.ask_id)}")
-            closed += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"room database: not changed — {type(e).__name__}: {e}")
-    return 0 if closed else 1
+    import pending_questions_room_db as adapter  # noqa: PLC0415
+    ok, msg = adapter.resolve(_workspace(opts.workspace), opts.ask_id, "Answered" if opts.answered else "Resolved")
+    print(msg)
+    return 0 if ok else 1
 
 
 def cmd_remind(args: list) -> int:
+    args = args if "--notify" in args else ["--notify", *args]
     return subprocess.run([sys.executable, str(REMINDER), *_with_adapter(args)]).returncode
 
 

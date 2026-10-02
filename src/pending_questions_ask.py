@@ -1,21 +1,18 @@
-"""Ask the owner a pending question in a conversation he reads; the per-host
-pending-questions.md is the ledger of what was queued, not the channel.
+"""Ask the owner a pending question in a conversation he reads, and record it as a row
+of his room database — the outbox holding it meanwhile.
 
-Order, fail-open at every step: (1) the entry is written, keyed by a unique ask
-id, through pending_questions_store.write_question — to the room database the
-caller injected, and always to the top of the file's active region, the shadow
-every file-only reader reads; (2) the question is QUEUED as a proactive file — to the task's own conversation only for an owner-tier task in
-the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner's
-DM on the task's bridge for any other bridge task, else to the owner's DM on
-the bridge he was last active on; (3) the queue record is stamped on the entry's
-`**Sent:**` line in every store holding it — a drain delivering the file is what makes it sent, and the
-reminder treats an undrained file as not yet asked; (4) the macOS notification
+Order, fail-open at every step: (1) with a store, the pass's reconcile (the outbox is
+replayed first); (2) the question is QUEUED as a proactive file — to the task's own
+conversation only for an owner-tier task in the owner's own DM (`.to-<bridge>` name +
+`[channel:]` marker), to the owner's DM on the task's bridge for any other bridge task,
+else to the owner's DM on the bridge he was last active on; a drain delivering the file
+is what makes it sent; (3) the Question and its queue record are saved to the outbox,
+atomically, BEFORE any room write; (4) the row is written, born with that record, and
+confirmed complete — only then is the outbox file deleted; (5) the macOS notification
 fires last, and a refusal prints the fix instead of a success.
 
-Question and context text is embedded, never interpolated: result markers and
-ledger field tokens are neutralized (`[ file:`, `** Status:`), the ledger copy is
-a block quote whose open backtick spans are closed, so no text can cut the active
-region, split the entry or become a drain action.
+Question and context text is embedded, never interpolated: result markers and field
+tokens are neutralized (`[ file:`, `** Status:`), so no text can become a drain action.
 """
 from __future__ import annotations
 
@@ -31,20 +28,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import pending_questions_ledger as ledger
-from pending_questions_md import mask_markup
-from pending_questions_store import (FileStore, Question, entry_heading,  # noqa: F401
-                                     placeholder, quote_for_ledger, resync, write_question)
-from pending_questions_store import ledger_entry as _store_ledger_entry
+from pending_questions_store import Outbox, Question, entry_heading, reconcile, write_question
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
-from util_paths import host_label, personal_path
+from util_paths import host_label
 from workspace_default import status_path
 
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
-# Grammar of the ledger's queue record; the notifier reads the stamp back.
+# Grammar of the row's queue record; the reminder reads it back.
 SENT_RE = re.compile(
     r"^\*\*Sent:\*\*\s+queued\s+(?P<where>.*?)\s+via\s+(?P<file>proactive-\S+\.txt)\s+at\s+"
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
@@ -74,7 +67,7 @@ def _iso(now: float) -> str:
 
 
 def new_ask_id(now: float) -> str:
-    """Unique per call: the ledger token, the proactive file stem and the report share it."""
+    """Unique per call: the row key, the outbox file, the proactive file stem and the report share it."""
     return f"ask-{int(now * 1000)}-{os.getpid()}-{secrets.token_hex(3)}"
 
 
@@ -149,17 +142,6 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
     return Destination(bridge=source)
 
 
-def ledger_path(workspace: Path, host: str) -> Path:
-    """The file the readers resolve when one exists; else the per-host home,
-    which personal_path probes first on read but never hands out as a write target."""
-    p = Path(personal_path("pending-questions.md", workspace))
-    return p if p.exists() else workspace / "hosts" / host / "pending-questions.md"
-
-
-def ledger_entry(question: str, context: Optional[str], now: float, ask_id: str) -> str:
-    return _store_ledger_entry(Question(ask_id, question, context, now))
-
-
 # Marks that this workspace's owner has been told once where the questions database lives.
 INTRODUCED = "pending-questions-db-introduced"
 
@@ -167,7 +149,7 @@ INTRODUCED = "pending-questions-db-introduced"
 def proactive_body(question: str, context: Optional[str], host: str,
                    dest: Destination, link: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
-    `link` is the question's row in the owner's room database, when it has one."""
+    `link` is the Pending questions database in the owner's room, when the adapter knows it."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
              f"Question for you from the {host} core — it needs your word:", "",
@@ -177,7 +159,7 @@ def proactive_body(question: str, context: Optional[str], host: str,
     if link:
         lines += ["", f"Reply here, or set its Status on the row: {neutralize_markers(link)}"]
     else:
-        lines += ["", f"Reply here. Ledger: hosts/{host}/pending-questions.md"]
+        lines += ["", "Reply here."]
     return "\n".join(lines) + "\n", routed
 
 
@@ -217,31 +199,23 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Ledger, queue, stamp, notify — each step reported, none raising past here.
-    `store` is a room-database store the adapter injected; None keeps the file only."""
+    """Reconcile, queue, outbox, row, notify — each step reported, none raising past here.
+    `store` is a room-database store the adapter injected; None leaves the question in the outbox."""
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
     host = host or host_label()
     now = time.time() if now is None else now
     ask_id = new_ask_id(now)
-    out = {"ask_id": ask_id, "ledger": None, "heading": entry_heading(question, now),
-           "ledger_error": None, "bridge": None, "channel": None, "where": None,
-           "proactive_file": None, "send_error": None, "macos": None, "macos_fix": None,
-           "store": None, "link": None, "db_error": None, "resync": None}
-
-    pq = ledger_path(ws, host)
-    out["ledger"] = str(pq)
-    file_store = FileStore(pq)
+    out = {"ask_id": ask_id, "heading": entry_heading(question, now), "record": None,
+           "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
+           "macos": None, "macos_fix": None, "link": None, "db_error": None, "outbox": None,
+           "reconcile": None}
+    q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()), priority)
     if store is not None:
-        synced, errors = resync(file_store, store)
-        out["resync"] = {"synced": synced, "errors": errors}
-    q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()),
-                 priority)
-    w = write_question(q, file_store, store)
-    out["ledger_error"], out["db_error"], out["link"] = w.error, w.db_error, w.link
-    if w.stores:
-        out["store"] = "+".join(h.kind for h in w.stores)
-        out["ledger"] = " and ".join(h.where(ask_id) for h in w.stores)
+        try:
+            out["reconcile"] = reconcile(store, ws, host)
+        except Exception as e:  # noqa: BLE001 — this ask still goes out
+            out["reconcile"] = {"flushed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
 
     dest = Destination()
     if task_file:
@@ -249,9 +223,10 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
             dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"), ws)
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
-    body, routed = proactive_body(question, context, host, dest, out["link"])
+    link = getattr(store, "link", None) if store is not None else None
+    body, routed = proactive_body(question, context, host, dest, link)
     introduced = status_path(INTRODUCED, ws)
-    if out["link"] and store is not None and not introduced.exists():
+    if store is not None and not introduced.exists():
         body += (f"\nAll my questions for you are kept in the Pending questions database in "
                  f"{neutralize_markers(store.label)}; open it any time from that room. "
                  f"Questions are sent to you as they come up, not on a schedule.\n")
@@ -262,59 +237,60 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         name = proactive_filename(ask_id, dest.bridge)
         write_proactive(ws / "results", name, body)
         out["proactive_file"] = name
-        if out["link"] and store is not None and not introduced.exists():
+        if store is not None and not introduced.exists():
             introduced.parent.mkdir(parents=True, exist_ok=True)
             introduced.write_text(ask_id + "\n", encoding="utf-8")
-    except Exception as e:  # noqa: BLE001 — the ledger entry already stands
+    except Exception as e:  # noqa: BLE001 — the question is still recorded below
         out["send_error"] = f"{type(e).__name__}: {e}"
 
     if out["proactive_file"]:
         sent_line = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
         sent_line = f"**Sent:** FAILED — {out['send_error']} at {_iso(time.time())}"
-    for holder in w.stores:
-        try:
-            holder.stamp(ask_id, sent_line)
-        except Exception as e:  # noqa: BLE001
-            if _carries(holder, ask_id, sent_line):
-                continue  # a reconciling pass copied this run's record across first
-            err = f"{type(e).__name__}: {e}"
-            if holder.kind == "file":
-                out["ledger_error"] = err
-            else:
-                out["db_error"] = f"stamp: {err}"
+    outbox = Outbox(ws)
+    try:
+        out["outbox"] = str(outbox.save(q, sent_line, now))
+    except Exception as e:  # noqa: BLE001 — the row write below is still attempted
+        out["db_error"] = f"outbox: {type(e).__name__}: {e}"
+    w = write_question(q, store, sent_line)
+    out["link"], out["db_error"] = w.link or link, out["db_error"] or w.db_error
+    if w.complete:
+        out["record"] = store.where(ask_id)
+        if out["outbox"]:
+            outbox.delete(ask_id)
+            out["outbox"] = None
+    else:
+        out["record"] = f"outbox {out['outbox']}" if out["outbox"] else None
 
     if urgency == "live":
         out["macos"], out["macos_fix"] = notify_macos(f"Question: {question}")
     return out
 
 
-def _carries(holder, ask_id: str, sent_line: str) -> bool:
-    try:
-        return any(e["ask_id"] == ask_id and sent_line in e["body"] for e in holder.entries())
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def report_lines(out: dict) -> list:
-    lines = [f"ledger: {out['ledger']} — {out['heading'][3:]}"]
-    if out.get("db_error"):
-        lines.append(f"ledger: ROOM DATABASE WRITE FAILED — {out['db_error']}; the file holds it, "
-                     "and the next run with the database copies it there")
+    lines = []
+    if out["outbox"] is None and out.get("record"):
+        lines.append(f"recorded: {out['record']} — {out['heading'][3:]}")
+    elif out["outbox"]:
+        lines.append(f"recorded: OUTBOX {out['outbox']} — {out['heading'][3:]}")
+        lines.append(f"recorded: ROOM DATABASE WRITE FAILED — {out['db_error']}; the outbox holds it and "
+                     "the next pass files it")
+    else:
+        lines.append(f"recorded: FAILED — {out['db_error']} (NOT recorded anywhere; ask by hand)")
     if out.get("link"):
         lines.append(f"row: {out['link']}")
-    for err in (out.get("resync") or {}).get("errors") or []:
-        lines.append(f"resync: FAILED — {err}")
-    if (out.get("resync") or {}).get("synced"):
-        lines.append(f"resync: brought {len(out['resync']['synced'])} entr(ies) level between the file "
-                     "and the room database")
-    if out["ledger_error"]:
-        lines.append(f"ledger: FAILED — {out['ledger_error']}")
+    rec = out.get("reconcile") or {}
+    for err in rec.get("errors") or []:
+        lines.append(f"reconcile: FAILED — {err}")
+    if rec.get("flushed"):
+        lines.append(f"reconcile: filed {len(rec['flushed'])} held question(s) from the outbox")
+    if rec.get("moved"):
+        lines.append(f"reconcile: moved {len(rec['moved'])} legacy file entr(ies) into the database")
     if out["proactive_file"]:
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")
     else:
-        lines.append(f"sent: FAILED — {out['send_error']} (the ledger entry stands; ask by hand)")
+        lines.append(f"sent: FAILED — {out['send_error']} (the record stands; ask by hand)")
     if out["send_error"] and out["proactive_file"]:
         lines.append(f"note: {out['send_error']}")
     if out["macos"] is True:
