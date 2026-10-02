@@ -307,7 +307,7 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
         try:
             store.restore(r["ask_id"])
         except GuardFailed as e:
-            return f"skipped: the existing row could not be reused ({e}); the file entry stays"
+            return f"skipped: the row exists and is not this host's to reuse ({e}); the file entry stays"
         except Exception as e:  # noqa: BLE001
             return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     moved = f"moved — kept in the room database as row {row_id(r['ask_id'])}"
@@ -318,7 +318,7 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
 
 
 def _supersede(store, r: dict) -> str:
-    """Only an open row is marked; a row the owner closed is left as is."""
+    """Only this host's open row is marked; another host's row or a closed one is left as is."""
     try:
         store.supersede(r["ask_id"])
         return "; its row was superseded (the file entry stays the question)"

@@ -28,7 +28,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
+from pending_questions_ask import SENT_QUIET_SEC, asked_here, asked_recently  # noqa: E402
 from pending_questions_store import (OPEN_WORDS, SUPERSEDED, FileStore, entry_ask_id,  # noqa: E402
                                      legacy_ask_id, registered_adapter, resync)
 
@@ -269,18 +269,20 @@ def file_key(q):
 
 
 def gather(store=None):
-    """(waiting questions, notes): an injected store's open rows, after it is
-    brought level with the file, then the file's waiting entries the store does
-    not hold. A store that fails leaves the file alone, and the note says so."""
+    """(waiting questions, notes): this host's open rows of an injected store, after
+    it is brought level with this host's file, then the file's waiting entries no
+    row of this host holds. Another host's rows are neither reminded nor allowed
+    to hide this host's file entries. A store that fails leaves the file alone."""
     notes, rows, held = [], [], set()
     if store is not None:
         try:
-            _synced, errors = resync(FileStore(PQ_FILE), store)
+            _synced, errors = resync(FileStore(PQ_FILE), store,
+                                     evidence=lambda a: asked_here(RESULTS_DIR, a))
             notes += [f"resync: FAILED — {e}" for e in errors]
             archived = FileStore(PQ_FILE).archived_ids()
-            entries = store.entries()
-            held = {e["ask_id"] for e in entries if e["status"] != SUPERSEDED}
-            rows = store_questions([e for e in entries if e["status"] == "Open" and e["ask_id"] not in archived])
+            mine = [e for e in store.entries() if store.owns(e)]
+            held = {e["ask_id"] for e in mine if e["status"] != SUPERSEDED}
+            rows = store_questions([e for e in mine if e["status"] == "Open" and e["ask_id"] not in archived])
         except Exception as e:  # noqa: BLE001
             rows, held = [], set()
             notes.append(f"ROOM DATABASE READ FAILED ({type(e).__name__}: {e}); reminding from the file only")
