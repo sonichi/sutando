@@ -28,7 +28,7 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter  # noqa: E402
+from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter, safe_body  # noqa: E402
 from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
@@ -154,9 +154,12 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
             await doc.put_database({"rows": {_key(db, row): {"order": (min(orders) - GAP) if orders else GAP,
                                                              "created": now_ms, "by": by}},
                                     "cells": _cell_writes(db, row, req["cells"], by, now_ms)})
-        if not exists or doc.row_body(db, row) in (None, ""):  # a body anyone wrote is never replaced
-            await doc.put_row_body(db, row, req["body"])
-        return {"created": not exists, "db": db, "row": row, "link": link}
+        if exists:  # an existing row is never written here: its state is reported for the caller to judge
+            body = doc.row_body(db, row) or ""
+            return {"created": False, "db": db, "row": row, "link": link,
+                    "host": _cells(maps, db, row).get("host"), "unsafe": safe_body(body) != body}
+        await doc.put_row_body(db, row, req["body"])
+        return {"created": True, "db": db, "row": row, "link": link}
     if not exists:
         raise LookupError(f"no row {row!r} in database {db!r}")
     if op == "set_cells":

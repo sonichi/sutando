@@ -382,17 +382,15 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
     except ledger.LedgerError as e:
         return f"skipped: {e}"
     try:
-        existing = store.body_of(r["ask_id"])
-    except Exception as e:  # noqa: BLE001
-        return f"skipped: {type(e).__name__}: {e}"
-    if existing is not None and safe_body(existing) != existing:
-        return "skipped: its existing row holds control characters; left as is for the owner, the file entry stays"
-    try:
         made = store.insert_raw(r["ask_id"], r["title"],
                                 row_body(r["body"], None, None, (), "**Sent:** (legacy entry)")) or {}
     except Exception as e:  # noqa: BLE001 — the outcome is unknown; supersede whatever exists
         return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     if not made.get("created"):
+        if getattr(store, "host", None) and made.get("host") != store.host:
+            return "skipped: its row exists and is another host's; the file entry stays"
+        if made.get("unsafe"):
+            return "skipped: its existing row holds control characters; left as is for the owner, the file entry stays"
         try:
             store.restore(r["ask_id"])
         except GuardFailed as e:
