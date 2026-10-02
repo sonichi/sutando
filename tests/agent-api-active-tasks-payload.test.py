@@ -67,11 +67,11 @@ def test_payload_reconciles_files_history_and_questions() -> None:
             "source": "",
         }
 
-        pending = root / "pending-questions.md"
-        pending.write_text("## Choose a mode\n\nPick one.\n\n**Options:** A | B\n")
+        pending = [{"id": "Choose a mode", "ask_id": "ask-mode", "title": "Choose a mode", "snippet": "Pick one.",
+                    "body": "Pick one.", "asked_at": None, "priority": "medium", "in_room": True}]
 
         try:
-            with mock.patch.object(api, "personal_path", return_value=pending):
+            with mock.patch.object(api.pending_questions_reader, "waiting", return_value=pending):
                 payload = api._active_tasks_payload(watcher_ok=True, core_ok=False)
         finally:
             api.TASK_DIR, api.RESULT_DIR, api.WORKSPACE_DIR = original
@@ -95,7 +95,8 @@ def test_payload_reconciles_files_history_and_questions() -> None:
     assert rows["task-live-result"]["result"] == "live result"
     assert rows["task-remembered"]["result"] == "remembered result"
     assert payload["questions"][0]["text"] == "Choose a mode"
-    assert payload["questions"][0]["options"] == ["A", "B"]
+    assert payload["questions"][0]["id"] == "ask-mode"
+    assert payload["questions"][0]["detail"] == "Pick one."
     assert "start" not in payload["questions"][0]
     assert "end" not in payload["questions"][0]
 
