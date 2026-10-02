@@ -145,6 +145,10 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
             err("pending_questions_store must stay inside the skill directory")
         elif not (skill_dir / pqs).is_file():
             err(f"pending_questions_store does not exist: {pqs}")
+        # Symlinks followed, the same containment discovery applies (src/pending_questions_reader.py).
+        elif not (skill_dir / pqs).resolve().is_relative_to(skill_dir.resolve()):
+            err(f"pending_questions_store must resolve inside the skill directory; {pqs} resolves to "
+                f"{(skill_dir / pqs).resolve()}")
 
     # required
     for req in ("name", "version", "owner", "stability"):

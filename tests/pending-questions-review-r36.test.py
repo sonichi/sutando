@@ -278,5 +278,59 @@ class RemindReconciles(_FakeRoom):
         self.assertIn(f"- [{held['ask_id']}] held?\n", out.getvalue())
 
 
+
+# ---- 4. the linter resolves the adapter path as discovery does ---------------------------
+
+class LinterMatchesDiscovery(unittest.TestCase):
+    linter = _load("lint_skill_r36", REPO / "scripts" / "lint-skill.py")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lint-r36-"))
+        self.skills = self.tmp / "skills"
+        self.skill = self.skills / "pq"
+        (self.skill / "scripts").mkdir(parents=True)
+        (self.skill / "manifest.json").write_text(json.dumps(
+            {"name": "pq", "version": "1.0.0", "owner": "x", "stability": "experimental",
+             "pending_questions_store": "scripts/adapter.py"}))
+
+    def lint(self):
+        errors, _ = self.linter._lint_manifest(self.skill)
+        r = subprocess.run([sys.executable, str(REPO / "scripts" / "lint-skill.py"), str(self.skill)],
+                           capture_output=True, text=True, timeout=60)
+        return [e for e in errors if "pending_questions_store" in e], r.returncode, r.stdout
+
+    def test_a_symlink_escaping_the_skill_is_a_lint_error_as_it_is_a_discovery_miss(self):
+        """The reviewer's injection: scripts/adapter.py is a symlink to a file outside the skill."""
+        outside = self.tmp / "elsewhere" / "adapter.py"
+        outside.parent.mkdir()
+        outside.write_text("def gather(ws):\n    return {}\n")
+        os.symlink(outside, self.skill / "scripts" / "adapter.py")
+        self.assertTrue((self.skill / "scripts" / "adapter.py").is_file(), "the textual check alone passes it")
+        errors, rc, out = self.lint()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("must resolve inside the skill directory", errors[0])
+        self.assertIn(str(outside.resolve()), errors[0])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 error(s)", out)
+        self.assertEqual(reader.declared_adapters(self.skills), [], "runtime discovery rejects it too")
+
+    def test_a_symlink_inside_the_skill_passes_both(self):
+        impl = self.skill / "impl" / "adapter.py"
+        impl.parent.mkdir()
+        impl.write_text("def gather(ws):\n    return {}\n")
+        os.symlink(Path("..") / "impl" / "adapter.py", self.skill / "scripts" / "adapter.py")
+        errors, rc, _ = self.lint()
+        self.assertEqual((errors, rc), ([], 0))
+        self.assertEqual([(n, p) for n, p in reader.declared_adapters(self.skills)], [("pq", impl.resolve())])
+
+    def test_a_plain_file_passes_and_the_real_manifests_stay_clean(self):
+        (self.skill / "scripts" / "adapter.py").write_text("def gather(ws):\n    return {}\n")
+        self.assertEqual(self.lint()[:2], ([], 0))
+        r = subprocess.run([sys.executable, str(REPO / "scripts" / "lint-skill.py"), "--all"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 error(s)", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
