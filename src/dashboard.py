@@ -39,6 +39,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
+from pending_questions_store import TERMINAL, entry_status  # noqa: E402
 import dashboard_schedules  # noqa: E402
 import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
@@ -137,8 +138,11 @@ def get_pending_count() -> dict:
     # /json, so it was reporting a confident zero.
     active = active_region(content)
     resolved = content[len(active):]
-    open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
-    done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
+    # A section closed in place (its **Status:** says Answered/Resolved) is done, wherever it sits.
+    sections = re.split(r'(?m)^(?=## )', active)[1:]
+    closed_here = sum(1 for s in sections if entry_status(s) in TERMINAL)
+    open_count = len(sections) - closed_here
+    done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE)) + closed_here
     return {"open": open_count, "done": done_count}
 
 
