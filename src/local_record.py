@@ -61,6 +61,21 @@ def write_whole(path: Path, record: dict) -> Path:
     return write_text_whole(path, json.dumps(record, ensure_ascii=False, indent=1))
 
 
+def create_text_whole(path: Path, text: str) -> Path:
+    """Appear whole AND only where nothing exists yet: the temp is linked to `path`, which fails
+    with FileExistsError instead of replacing a file another writer just published."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.link(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return path
+
+
 def _default_ident(record: dict):
     return record.get("id")
 
