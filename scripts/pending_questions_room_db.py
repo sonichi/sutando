@@ -103,16 +103,6 @@ def ensure_writes(maps: dict, schema: dict, by: str, now_ms: int) -> dict:
             missing = [o for o in p["options"] if o["id"] not in known]
             if missing:  # options are only ever appended; nothing stored is rewritten
                 writes["props"][k] = {**have, "options": list(have.get("options") or []) + missing}
-    used = {c.get("v") for k, c in (maps.get("cells") or {}).items() if isinstance(c, dict)
-            and k.startswith(db + "|") and k.rsplit("|", 1)[-1] in (schema.get("retired_options") or {})}
-    for pid, gone in (schema.get("retired_options") or {}).items():
-        k = _key(db, pid)
-        have = (maps.get("props") or {}).get(k) or writes["props"].get(k)
-        if isinstance(have, dict) and any(o.get("id") in gone and o.get("id") not in used
-                                          for o in have.get("options") or [] if isinstance(o, dict)):
-            writes["props"][k] = {**have, "options": [o for o in have.get("options") or []
-                                                      if not (isinstance(o, dict) and o.get("id") in gone
-                                                              and o.get("id") not in used)]}
     for i, v in enumerate(schema["views"]):
         k, have = _key(db, v["id"]), (maps.get("views") or {}).get(_key(db, v["id"]))
         if not isinstance(have, dict):

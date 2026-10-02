@@ -28,7 +28,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from pending_questions_ask import SENT_QUIET_SEC, asked_here, asked_recently  # noqa: E402
+from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
 from pending_questions_store import (OPEN_WORDS, SUPERSEDED, FileStore, entry_ask_id,  # noqa: E402
                                      legacy_ask_id, registered_adapter, resync)
 
@@ -276,8 +276,7 @@ def gather(store=None):
     notes, rows, held = [], [], set()
     if store is not None:
         try:
-            _synced, errors = resync(FileStore(PQ_FILE), store,
-                                     evidence=lambda a: asked_here(RESULTS_DIR, a))
+            _synced, errors = resync(FileStore(PQ_FILE), store)
             notes += [f"resync: FAILED — {e}" for e in errors]
             archived = FileStore(PQ_FILE).archived_ids()
             mine = [e for e in store.entries() if store.owns(e)]

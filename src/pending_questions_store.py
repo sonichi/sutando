@@ -44,8 +44,7 @@ SUPERSEDED = "Superseded"
 # Code never writes Status; it is the owner's. Code's own marks (Recovery, Closed) live in
 # separate cells, and an owner's Status is read first, so it survives any merge order.
 RECOVERY = "superseded"
-# Raw Status values that read as Open: none, Open, and an older head's "superseded".
-OPEN_RAW = [None, "open", "superseded"]
+OPEN_RAW = [None, "open"]
 PRIORITIES = ("High", "Medium", "Low")
 APPROVE = "Approve"
 # Bold field tokens the ledger's readers act on, wherever they occur in a body.
@@ -339,8 +338,6 @@ DB_SCHEMA = {
         {"id": "recovery", "name": "Recovery", "type": "text"},
         {"id": "closed", "name": "Closed", "type": "text"},
     ],
-    # Status options an earlier head wrote: dropped from a database once no row holds them.
-    "retired_options": {"status": ["superseded"]},
     "views": [
         {"id": "board", "name": "Board", "layout": "board", "groupBy": "status",
          "hidden": ["ask_id", "host", "recovery", "closed"],
@@ -451,15 +448,6 @@ def _option_id(prop_id: str, name: str) -> str:
                      + ", ".join(o["name"] for o in prop["options"]))
 
 
-def _mark(value, host):
-    """The mark's value when it was written by the row's own Host (an untagged mark counts only
-    on a row with no Host); a losing claimant's mark is ignored once the replicas merge."""
-    if not isinstance(value, str) or not value:
-        return None
-    val, _, tag = value.partition("@")
-    return val if (tag or None) == (host or None) else None
-
-
 def owner_status(cells: dict) -> Optional[str]:
     names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
     status = names.get(cells.get("status"))
@@ -467,19 +455,15 @@ def owner_status(cells: dict) -> Optional[str]:
 
 
 def effective_status(cells: dict) -> str:
-    """The owner's terminal Status wins; then the row Host's own Closed mark; then its own
-    Recovery mark. Any other Status (an older head's raw superseded included) reads as Open."""
-    host = cells.get("host") or None
-    closed = _mark(cells.get("closed"), host)
+    """The owner's terminal Status wins; then the row's Closed mark; then its Recovery mark."""
+    closed = cells.get("closed")
     return (owner_status(cells) or (closed if closed in TERMINAL else None)
-            or (SUPERSEDED if _mark(cells.get("recovery"), host) else "Open"))
+            or (SUPERSEDED if cells.get("recovery") else "Open"))
 
 
 def stale_marks(cells: dict) -> list:
-    """Code marks to clear: one beside the owner's terminal Status, or one another host wrote."""
-    host = cells.get("host") or None
-    return [k for k in ("closed", "recovery") if cells.get(k)
-            and (owner_status(cells) or _mark(cells.get(k), host) is None)]
+    """Code marks beside the owner's terminal Status: cleared so the views show his decision."""
+    return [k for k in ("closed", "recovery") if cells.get(k)] if owner_status(cells) else []
 
 
 class RoomDbStore:
@@ -539,42 +523,23 @@ class RoomDbStore:
             current = {k: names.get(v, v) if k == "status" else v for k, v in (res.get("current") or {}).items()}
             raise GuardFailed(ask_id, {k: v for k, v in current.items() if v is not None})
 
-    def claim_host(self, ask_id: str) -> bool:
-        """Set this host as the row's origin when it has none; never changes its status."""
-        res = self._locked(lambda: self.client.guarded(
-            DB_SCHEMA, row_id(ask_id), {"host": self.host}, {"host": [None]})) or {}
-        return bool(res.get("written"))
-
-    def _tag(self, value: str) -> str:
-        return f"{value}@{self.host}" if self.host else value
-
     def close(self, ask_id: str, to: str) -> None:
         """Record a closure made in this host's file, in the Closed cell; Status stays the owner's."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        self._guarded(ask_id, {"closed": to}, {"closed": [None]})
 
     def supersede(self, ask_id: str) -> None:
         """Mark this host's open row superseded, in the Recovery cell only."""
-        self._guarded(ask_id, {"recovery": self._tag(RECOVERY)}, {"closed": [None], "status": OPEN_RAW})
+        self._guarded(ask_id, {"recovery": RECOVERY}, {"closed": [None], "status": OPEN_RAW})
 
     def restore(self, ask_id: str) -> None:
-        """Clear this host's Recovery mark; a raw Status an earlier head left as superseded
-        goes back to Open, guarded on that exact value. An owner's Status is never touched."""
+        """Clear this host's Recovery mark; Status is not touched."""
         self._guarded(ask_id, {"recovery": None}, {})
-        try:
-            self._guarded(ask_id, {"status": _option_id("status", "Open")}, {"status": ["superseded"]})
-        except GuardFailed:
-            pass
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""
         self._guarded(ask_id, {p: None for p in props}, {})
-
-    def adopt(self, ask_id: str) -> None:
-        """Claim a row that has no Host (one written before Host existed), then restore it."""
-        self.claim_host(ask_id)
-        self.restore(ask_id)
 
     def set_status(self, ask_id: str, status: str, note: str = "") -> None:
         self._row(ask_id)
@@ -592,7 +557,6 @@ class RoomDbStore:
                 out.append({"ask_id": cells["ask_id"], "title": cells.get("name") or "",
                             "body": (r.get("body") or "").strip(), "host": cells.get("host") or None,
                             "recovery": bool(cells.get("recovery")), "stale": stale_marks(cells),
-                            "legacy_status": cells.get("status") == "superseded",
                             "status": effective_status(cells)})
         return out
 
@@ -672,20 +636,17 @@ def settled(line: Optional[str]) -> bool:
     return bool(line) and not _PLACEHOLDER_RE.match(line)
 
 
-def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
+def resync(file_store: FileStore, db_store) -> tuple:
     """Bring this host's rows and this host's file level, never retiring a file entry.
 
-    A row is this host's only when its Host reads as this host. A row with no Host
-    is claimed when this host's file links it or `evidence(ask_id)` says this host
-    asked it; a claim another host won first leaves it foreign, and a foreign row is
-    never judged against this host's file.
-    For this host's rows: an open file entry the database lacks is inserted; an
-    entry below the divider closes its row; a status closed on either side closes
-    the other; a settled `**Sent:**` fills the other side's placeholder; a migration
-    row no file entry links is superseded, and one a file entry links is restored.
-    Every write is guarded on Host (and on Status where it matters); code writes
-    Status only to close a row and marks recovery in its own cell, so an owner's
-    Answered/Resolved survives any concurrent pass. (synced ask ids, errors)."""
+    A row is this host's when its Host is this host (every row is created with its
+    Host, and only that host writes it); any other row is never judged against this
+    host's file. For this host's rows: an open file entry the database lacks is
+    inserted; code marks beside the owner's terminal Status are cleared; an entry
+    below the divider closes its row; a status closed on either side closes the
+    other; a settled `**Sent:**` fills the other side's placeholder; a migration row
+    no file entry links is superseded, and one a file entry links is restored. Code
+    never writes Status; its marks live in their own cells. (synced ask ids, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
@@ -697,33 +658,20 @@ def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
     def note(aid, ex):
         errors.append(str(ex) if isinstance(ex, GuardFailed) else f"{aid}: {type(ex).__name__}: {ex}")
 
-    own = {}
-    for aid, r in found.items():
-        if db_store.owns(r):
-            own[aid] = r
-        elif not r.get("host") and (aid in linked or (evidence is not None and evidence(aid))):
-            try:
-                if db_store.claim_host(aid):
-                    own[aid] = {**r, "host": db_store.host}
-                    synced.append(aid)
-            except Exception as ex:  # noqa: BLE001
-                note(aid, ex)
-
+    own = {aid: r for aid, r in found.items() if db_store.owns(r)}
     for aid, r in own.items():
         try:
             if r.get("stale"):
                 db_store.clear(aid, r["stale"])
-            elif r.get("legacy_status"):
-                db_store.restore(aid)
-            elif aid in archived and r["status"] not in TERMINAL:
+                synced.append(aid)
+            if aid in archived and r["status"] not in TERMINAL:
                 db_store.close(aid, "Resolved")
                 r["status"] = "Resolved"
+                synced.append(aid)
             elif aid.startswith("legacy-") and aid not in linked and r["status"] == "Open":
                 db_store.supersede(aid)
                 r["status"] = SUPERSEDED
-            else:
-                continue
-            synced.append(aid)
+                synced.append(aid)
         except Exception as ex:  # noqa: BLE001
             note(aid, ex)
     for e in entries:
