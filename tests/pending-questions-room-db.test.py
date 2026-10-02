@@ -139,6 +139,9 @@ class InProcClient:
     def guarded(self, schema, row, cells, expect):
         return self._do({"op": "guarded", "schema": schema, "row": row, "cells": cells, "expect": expect})
 
+    def neutralise(self, schema, row, expect):
+        return self._do({"op": "neutralise", "schema": schema, "row": row, "expect": expect})
+
 
 class RacyClient(InProcClient):
     """Every read of a row's body waits for a second reader (up to 0.5 s) before
@@ -1822,7 +1825,7 @@ class TestMigrateRound3(_MigrateBase):
 
     def test_an_unsafe_host_is_refused_before_any_write(self):
         plan, before = self._only(), self.ledger.read_text()
-        for host in ("", "h\x07", "h\ud800", 7, "h\u2028x", "h\u2029x"):
+        for host in ("", "h\x07", "h\ud800", 7, "h\u2028x", "h\u2029x", "h\tx", "h x", "-h"):
             with self.subTest(host=repr(host)):
                 [done] = self.m.apply(dict(plan, host=host), self.ledger, None, host)
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
@@ -1832,15 +1835,18 @@ class TestMigrateRound3(_MigrateBase):
         self.ledger.write_text(self.ledger.read_text().replace("Pick a launch date?\n\n", "Pick a launch date?\n\nbad\x07 end\n\n", 1))
         plan, client = self._only(), InProcClient()
         db = self.db(client)
-        db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "old \x07 unsafe body")
+        db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "owner notes \x07 kept")
         [done] = self.apply(plan, self.ledger, db)
         self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
         [row] = db.entries()
-        self.assertNotIn("\x07", row["body"])
-        self.assertIn("bad\ufffd end", row["body"])
+        self.assertEqual(row["body"], "owner notes \ufffd kept")  # content kept, only the unsafe byte changed
+        other = pqs.RoomDbStore(InProcClient(db.client.doc), lock=self.ws / "state" / "o", host="other-host")
+        with self.assertRaises(pqs.GuardFailed):
+            other._keys[plan["entries"][0]["ask_id"]] = db._rid(plan["entries"][0]["ask_id"])
+            other.neutralise_body(plan["entries"][0]["ask_id"])  # another host's row: refused in the same call
 
     def test_producer_plans_with_tabs_or_unlocated_twins_pass_the_validator(self):
-        tabbed = self.ws / "tab\tdir"
+        tabbed = self.ws / "tab\tdir\u2028ls"
         tabbed.mkdir()
         plan = dict(self.plan(), ledger=str((tabbed / "pending-questions.md").resolve()))
         plan["entries"] += [dict(plan["entries"][0], title="2026-09-29 — Tab\there?")]
