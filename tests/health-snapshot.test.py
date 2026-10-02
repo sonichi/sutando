@@ -439,6 +439,73 @@ class Views(Base):
             self.snap(view="everything")
 
 
+class InstanceSessionSuspended(Base):
+    ME = "@mark-desktop.agent:ag2.space"
+
+    def lane(self, name="gateway-status.json", agent_id=ME, connected=True, age=5.0, last_ok=True):
+        self.ws.json(f"state/{name}", {"connected": connected, "ts": NOW - age,
+                                       "last_ok_ts": NOW - age if last_ok else None, "agent_id": agent_id})
+
+    def test_instance_is_the_identity_the_serving_lane_signed_in_as(self):
+        self.lane()
+        self.assertEqual(self.snap()["instance"], self.ME)
+
+    def test_a_parked_or_stale_lane_does_not_name_the_instance(self):
+        self.lane()
+        self.lane("gateway-status.dev.json", agent_id="@old:dev.ag2.space", age=600)
+        self.lane("gateway-status.local.json", agent_id="@down:ag2.space", connected=False)
+        self.assertEqual(self.snap()["instance"], self.ME)
+
+    def test_no_serving_lane_or_no_identity_is_null(self):
+        self.assertIsNone(self.snap()["instance"])
+        self.lane(last_ok=False)
+        self.assertIsNone(self.snap()["instance"])
+        self.lane(agent_id=None)
+        self.assertIsNone(self.snap()["instance"])
+
+    def test_two_serving_lanes_that_disagree_name_no_instance(self):
+        self.lane()
+        self.lane("gateway-status.dev.json", agent_id="@mark-dev:dev.ag2.space")
+        self.assertIsNone(self.snap()["instance"])
+
+    def test_core_session_comes_from_its_beat_then_its_supervisor(self):
+        self.assertIsNone(self.core()["session"])
+        self.ws.supervisor("idle-ready", session="sutando-core")
+        self.assertEqual(self.core()["session"], "sutando-core")
+        self.ws.json(f"state/cores/{HOST}.alive", {"session": "sutando-core-2"})
+        self.assertEqual(self.core()["session"], "sutando-core-2")
+
+    def test_worker_session_comes_from_its_seat_file_or_is_null(self):
+        self.ws.worker()
+        worker = lambda: next(a for a in self.snap()["agents"] if a["id"] == WID)  # noqa: E731
+        self.assertIsNone(worker()["session"])
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json")
+        self.assertEqual(worker()["session"], f"sutando-worker-{WID}")
+
+    def test_a_worker_the_suspension_took_down_is_not_alive_whatever_its_files_say(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=10)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": [WID]})
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["motion"], w["condition"], w["reason"], w["since"]),
+                         (False, "unknown", "unknown", "suspended", NOW - 3))
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": []})
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+
+    def test_suspended_reads_the_pool_marker(self):
+        self.assertIsNone(self.snap()["suspended"])
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": 5, "stopped": [WID]})
+        self.assertEqual(self.snap()["suspended"], {"reason": "app-quit", "at": 5})
+        (self.ws.root / "state" / "pool-suspended").write_text("app-quit 5\n")
+        self.assertEqual(self.snap()["suspended"], {"reason": "app-quit 5", "at": None})
+        (self.ws.root / "state" / "pool-suspended").write_text("")
+        self.assertEqual(self.snap()["suspended"], {"reason": "suspended", "at": None})
+
+
 def _load_agent_api():
     spec = importlib.util.spec_from_file_location("agent_api_health", REPO / "src" / "agent-api.py")
     module = importlib.util.module_from_spec(spec)

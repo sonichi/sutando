@@ -75,6 +75,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -8331,18 +8332,13 @@ def check_pool_suspended() -> dict:
     """A pool suspension never expires; only resuming the pool lifts it. One still present
     while a core runs means the host never resumed it, and no worker is being healed."""
     name = "pool-suspended"
-    path = WORKSPACE_DIR / "state" / "pool-suspended"
     try:
-        text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+        rec = pool_suspension.read(WORKSPACE_DIR)
     except OSError as e:
         return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
-    try:
-        rec = json.loads(text)
-    except ValueError:
-        rec = None
-    what = (f"{rec.get('reason')} since {rec.get('at')}" if isinstance(rec, dict) else text[:80])
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
     if not _any_core_alive():
         return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
     return {"name": name, "status": "warn",

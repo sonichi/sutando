@@ -38,6 +38,8 @@ def _sibling(name):
 
 
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parents[2] / "src"))
+import pool_suspension  # noqa: E402
 sup = _sibling("pool_supervise")
 sw = _sibling("spawn_worker")
 pd = _sibling("pool_delivery")
@@ -48,27 +50,19 @@ RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
     "recovered", "already-running", "indeterminate", "paused", "no-recorded-session",
     "failed")
 SUSPENDED = "suspended"
-SUSPENDED_REL = Path("state") / "pool-suspended"
+SUSPENDED_REL = pool_suspension.REL
 
 
 def suspended_path(workspace) -> Path:
-    return Path(workspace) / SUSPENDED_REL
+    return pool_suspension.path(workspace)
 
 
 def _marker(workspace) -> dict | None:
     """The suspension record {reason, at, stopped}, or None when not suspended."""
     try:
-        text = suspended_path(workspace).read_text().strip()
+        return pool_suspension.read(workspace)
     except OSError:
         return None
-    try:
-        rec = json.loads(text)
-    except ValueError:
-        rec = None
-    if not isinstance(rec, dict):
-        # A marker that isn't the record still suspends; it just names no workers.
-        return {"reason": text or SUSPENDED, "at": None, "stopped": []}
-    return rec
 
 
 def suspension(workspace) -> str | None:
