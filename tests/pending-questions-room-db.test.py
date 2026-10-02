@@ -1712,6 +1712,7 @@ class TestMigrateRound3(_MigrateBase):
         self.assertEqual(rc, 2)  # an apply-level refusal is a failure exit, not a success
         self.assertIn("refused: the store is for host", err.getvalue())
         self.assertEqual(self.ledger.read_text(), before)
+        self.assertTrue(self.m.plan_fits(dict(plan, host="my host"), "my host"))  # a configured label may hold spaces
 
     def test_host_labels_that_slug_alike_still_get_two_row_keys(self):
         client = InProcClient()
@@ -1825,7 +1826,7 @@ class TestMigrateRound3(_MigrateBase):
 
     def test_an_unsafe_host_is_refused_before_any_write(self):
         plan, before = self._only(), self.ledger.read_text()
-        for host in ("", "h\x07", "h\ud800", 7, "h\u2028x", "h\u2029x", "h\tx", "h x", "-h"):
+        for host in ("", "h\x07", "h\ud800", 7, "h\u2028x", "h\u2029x", "h\tx", "h\x85x"):
             with self.subTest(host=repr(host)):
                 [done] = self.m.apply(dict(plan, host=host), self.ledger, None, host)
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
@@ -1844,6 +1845,41 @@ class TestMigrateRound3(_MigrateBase):
         with self.assertRaises(pqs.GuardFailed):
             other._keys[plan["entries"][0]["ask_id"]] = db._rid(plan["entries"][0]["ask_id"])
             other.neutralise_body(plan["entries"][0]["ask_id"])  # another host's row: refused in the same call
+
+    @unittest.skipUnless(importlib.util.find_spec("pycrdt"), "pycrdt is not installed")
+    def test_neutralise_keeps_a_concurrent_owner_edit_on_real_replicas(self):
+        rc_dir = Path(os.environ.get("ROOM_COLLAB_SCRIPTS") or REPO / "skills" / "room-collab" / "scripts")
+        if not (rc_dir / "room_collab_client.py").is_file():
+            self.skipTest("room-collab capability not installed in this checkout")
+        sys.path.insert(0, str(rc_dir))
+        from pycrdt import Awareness, Doc
+        spec = importlib.util.spec_from_file_location("real_room_collab_client", rc_dir / "room_collab_client.py")
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        RoomDoc = real.RoomDoc
+
+        class Sock:
+            async def send(self, _):
+                return None
+
+        async def run():
+            agent_doc, owner_doc = Doc(client_id=2), Doc(client_id=1)
+            agent = RoomDoc(Sock(), agent_doc, Awareness(agent_doc), "t", kind="db")
+            await adapter.apply(agent, {"op": "add_row", "schema": pqs.DB_SCHEMA, "row": "q-x",
+                                        "cells": {"host": HOST}, "body": "head \x07 tail"}, AGENT, 1)
+            owner_doc.apply_update(agent_doc.get_update())
+            owner = RoomDoc(Sock(), owner_doc, Awareness(owner_doc), "t", kind="db")
+            await owner.put_row_body("pendingq", "q-x", "head \x07 owner-note tail")  # concurrent edit
+            await adapter.apply(agent, {"op": "neutralise", "schema": pqs.DB_SCHEMA, "row": "q-x",
+                                        "expect": {"host": [HOST]}}, AGENT, 2)
+            a, o = agent_doc.get_update(owner_doc.get_state()), owner_doc.get_update(agent_doc.get_state())
+            owner_doc.apply_update(a)
+            agent_doc.apply_update(o)
+            return agent.row_body("pendingq", "q-x"), owner.row_body("pendingq", "q-x")
+        got_a, got_o = asyncio.run(run())
+        self.assertEqual(got_a, got_o)
+        self.assertIn("owner-note", got_a)
+        self.assertNotIn("\x07", got_a)
 
     def test_producer_plans_with_tabs_or_unlocated_twins_pass_the_validator(self):
         tabbed = self.ws / "tab\tdir\u2028ls"
