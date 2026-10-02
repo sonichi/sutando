@@ -255,17 +255,22 @@ KINDS = ("section", "bullet")
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
+def _text(v) -> bool:
+    """A string with no control character (C0, DEL, C1) and no lone surrogate, so it encodes as UTF-8."""
+    return isinstance(v, str) and not _CONTROL.search(v)
 
 
 def _line(v) -> bool:
-    return isinstance(v, str) and bool(v) and not _CONTROL.search(v)
+    return _text(v) and bool(v)
 
 
 def _entry_ok(e) -> bool:
     return (isinstance(e, dict) and e.get("kind") in KINDS and e.get("class") in CLASSES
-            and _line(e.get("title")) and e["title"] == e["title"].strip() and all(isinstance(e.get(k), str) for k in ("ask_id", "body"))
-            and isinstance(e.get("why"), str) and not _CONTROL.search(e["why"])
+            and _line(e.get("title")) and e["title"] == e["title"].strip()
+            and _text(e.get("why")) and _text(e.get("ask_id")) and isinstance(e.get("body"), str)
             and (e.get("sha") is None or (isinstance(e.get("sha"), str) and _DIGEST.fullmatch(e["sha"])))
             and "nth" in e and "sha" in e and (e["nth"] is None) == (e["sha"] is None)
             and (e["nth"] is None or (type(e["nth"]) is int and e["nth"] >= 0 and isinstance(e["sha"], str))))
@@ -277,7 +282,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
         return False
     entries = plan.get("entries")
     if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and bool(host)
-            and plan.get("host") == host and _line(plan.get("ledger"))
+            and plan.get("host") == host and _line(plan.get("ledger")) and Path(plan["ledger"]).is_absolute()
             and isinstance(plan.get("ledger_sha256"), str) and _DIGEST.fullmatch(plan["ledger_sha256"])
             and type(plan.get("close_past_window")) is bool
             and isinstance(entries, list) and all(_entry_ok(e) for e in entries)):
@@ -289,7 +294,7 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
 def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
               host: Optional[str] = None) -> dict:
     return {"version": PLAN_VERSION, "host": host,
-            "ledger": str(ledger_file), "ledger_sha256": _sha(text), "close_past_window": close_past_window,
+            "ledger": str(Path(ledger_file).resolve()), "ledger_sha256": _sha(text), "close_past_window": close_past_window,
             "entries": [{k: r[k] for k in ("kind", "title", "nth", "sha", "class", "why", "ask_id", "body")}
                         for r in rows]}
 
@@ -328,7 +333,8 @@ def apply(plan: dict, ledger_file: Path, store, host: Optional[str] = None) -> l
         return [f"refused: this plan is not a well-formed version {PLAN_VERSION} plan made on host {host!r}; "
                 f"re-run the dry run there"]
     done, cpw = [], plan["close_past_window"]
-    if Path(plan["ledger"]).resolve() != Path(ledger_file).resolve():
+    ledger_file = Path(ledger_file).resolve()
+    if Path(plan["ledger"]).resolve() != ledger_file:
         return [f"refused: the plan is for {plan['ledger']}, not {ledger_file}"]
     if store is not None and getattr(store, "host", None) != host:
         return [f"refused: the store is for host {getattr(store, 'host', None)!r}, not {host!r}"]
@@ -422,6 +428,7 @@ def main(argv=None) -> int:
     if args.ledger is None:
         from pending_questions_ask import ledger_path  # noqa: PLC0415
         args.ledger = ledger_path(ws, host_label())
+    args.ledger = args.ledger.resolve()
     if args.apply:
         if args.plan is None:
             print("--apply carries out a reviewed plan: make one with --dry-run --plan-out, "
