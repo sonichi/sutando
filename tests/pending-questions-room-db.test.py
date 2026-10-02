@@ -861,6 +861,27 @@ class TestArchivedLinks(_Ws):
         self.assertTrue(notes)
 
 
+class TestReconcileOnly(_Ws):
+    def test_reconcile_only_converges_and_sends_nothing(self):
+        cpq = _cpq(self.pq, self.ws)
+        db = self.db()
+        pqs.write_question(self.q(), pqs.FileStore(self.pq), db)
+        for s_ in (db, pqs.FileStore(self.pq)):
+            s_.stamp("ask-1", SENT)
+        db.set_status("ask-1", "Resolved")
+        sent = []
+        with mock.patch.object(sys, "argv", ["x", "--reconcile-only"]), \
+                mock.patch.object(cpq, "load_store", return_value=(db, "")), \
+                mock.patch.object(cpq, "registered_adapter", return_value="x"), \
+                mock.patch.object(cpq, "send_notification", side_effect=lambda *a, **k: sent.append(a), create=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cpq.main()
+        self.assertIn("(reconcile-only)", out.getvalue())
+        self.assertIn("**Status:** resolved", self.pq.read_text())
+        self.assertEqual(sent, [])
+        self.assertFalse(list((self.ws / "results").glob("proactive-*")))
+
+
 class TestReminder(_Ws):
     def test_it_reminds_database_rows_and_the_files_other_entries_once_each(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
@@ -1973,6 +1994,34 @@ class TestMigrateRound3(_MigrateBase):
         [row] = db.entries()
         self.assertEqual((row["status"], row["incomplete"], row["recovery"]), ("Open", False, False))
         self.assertIn("Ship the release?", row["body"])
+
+    def test_a_failed_file_insert_writes_no_database_only_question(self):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        client = InProcClient()
+        db = pqs.RoomDbStore(client, lock=ws / "state" / "l", host=HOST)
+
+        class BrokenFile(pqs.FileStore):
+            def insert(self, q):
+                raise OSError("disk full")
+        q = pqs.Question("ask-f1", "Ship it?", None, 1_790_000_000.0, None, None, (), "Medium")
+        out = pqs.write_question(q, BrokenFile(ws / "pq.md"), db)
+        self.assertIn("disk full", out.error)
+        self.assertEqual(db.entries(), [])
+        self.assertNotIn("add_row", client.calls)
+
+    def test_the_dashboard_counts_a_question_resolved_in_place_as_done(self):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state").mkdir()
+        pq = ws / "pending-questions.md"
+        q = pqs.Question("ask-d1", "Merge it?", None, 1_790_000_000.0, None, None, (), "Medium")
+        pqs.FileStore(pq).insert(q)
+        dash = importlib.import_module("dashboard")
+        with mock.patch.object(dash, "personal_path", return_value=str(pq)):
+            self.assertEqual(dash.get_pending_count(), {"open": 1, "done": 0})
+            pqs.FileStore(pq).set_status("ask-d1", "Resolved", "in the room database")
+            self.assertEqual(dash.get_pending_count(), {"open": 0, "done": 1})
+            self.assertEqual(_cpq(pq, ws).get_waiting_questions(), [])  # the two readers agree
 
     def test_an_owner_cleared_body_is_not_mistaken_for_an_incomplete_row(self):
         plan, client = self._only(), InProcClient()

@@ -211,6 +211,12 @@ def entry_ask_id(section: str) -> Optional[str]:
     return moved[0] if len(ids) == 0 and len(moved) == 1 else None
 
 
+def entry_status(section: str) -> Optional[str]:
+    """A section's **Status:** as Open/Answered/Resolved, or None when it has no status line."""
+    st = _STATUS_LINE_RE.search(section)
+    return status_name(st.group(0)[len("**Status:**"):]) if st else None
+
+
 def status_name(word: str) -> str:
     """A file status word as one of STATUSES."""
     w = (word or "").strip().lower()
@@ -661,6 +667,7 @@ def write_question(q: Question, file_store: FileStore, db_store=None) -> WriteOu
         out.stores.append(file_store)
     except Exception as e:  # noqa: BLE001
         out.error = f"{type(e).__name__}: {e}"
+        return out  # no database-only question: the file is the ledger every reader shares
     if db_store is not None:
         try:
             out.link = db_store.insert(q)

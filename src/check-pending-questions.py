@@ -645,6 +645,9 @@ def main():
     questions, notes = gather(store)
     for note in notes:
         print(note, file=sys.stderr)
+    if "--reconcile-only" in sys.argv:  # the scheduled run: keep the file and the database level, notify no one
+        print(f"(reconcile-only) {len(questions)} pending questions; nothing sent")
+        return
     if not questions:
         # Never return silently: see zero_reason.__doc__.
         print(zero_reason())
