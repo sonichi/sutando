@@ -464,13 +464,18 @@ class RoomDbStore:
 
 # ---- the adapter registration ---------------------------------------------------
 
-REGISTRATION = Path("state") / "pending-questions-store.json"
+REGISTRATION = "pending-questions-store.json"
+
+
+def registration_path(workspace) -> Path:
+    from workspace_default import status_path  # noqa: PLC0415 — heavy loader
+    return status_path(REGISTRATION, Path(workspace))
 
 
 def register_adapter(workspace, adapter: Path) -> None:
     """Record the adapter that made a room-database store, so every later reminder
     pass reconciles through it without a flag on its schedule."""
-    path = Path(workspace) / REGISTRATION
+    path = registration_path(workspace)
     record = json.dumps({"adapter": str(Path(adapter).resolve())}) + "\n"
     try:
         if path.read_text(encoding="utf-8") == record:
@@ -483,7 +488,7 @@ def register_adapter(workspace, adapter: Path) -> None:
 
 def registered_adapter(workspace) -> Optional[str]:
     try:
-        return str(json.loads((Path(workspace) / REGISTRATION).read_text(encoding="utf-8"))["adapter"])
+        return str(json.loads(registration_path(workspace).read_text(encoding="utf-8"))["adapter"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
