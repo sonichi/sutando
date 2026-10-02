@@ -136,8 +136,9 @@ clear_composer_block() {
     || log_notifier "could not clear composer-block record $COMPOSER_BLOCK_FILE; continuing"
 }
 
+# $2 empty = the count could not be read.
 alert_composer_block() {
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for ${2:-an unknown number of} consecutive attempts; clear the composer or press Enter to resume"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
@@ -158,28 +159,41 @@ alert_composer_block() {
   ) >/dev/null 2>&1 &
 }
 
-# Record "n incarnation filename [alerted]", keyed so the count spans --event runs and retries.
+# Record "n incarnation -|alerted filename": the free-form filename is last, so spaces survive.
 # Persist before alerting; at-least-once: a lost "alerted" write may repeat the alert.
 note_composer_block() {
-  local filename="$1" incarnation="$2" n=0 alerted="" rec_n rec_inc rec_file rec_alerted
-  if [ -n "$COMPOSER_BLOCK_FILE" ] \
-     && read -r rec_n rec_inc rec_file rec_alerted 2>/dev/null <"$COMPOSER_BLOCK_FILE" \
-     && [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
-    case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
-    [ "$rec_alerted" = alerted ] && alerted=alerted
+  local filename="$1" incarnation="$2" n=0 alerted="" known=1 rec="" rest rec_n rec_inc rec_flag rec_file
+  if [ -z "$COMPOSER_BLOCK_FILE" ]; then
+    known=""
+  elif [ -e "$COMPOSER_BLOCK_FILE" ] && ! IFS= read -r rec 2>/dev/null <"$COMPOSER_BLOCK_FILE"; then
+    known=""
   fi
+  case "$rec" in *" "*" "*)
+    rec_n="${rec%% *}"; rest="${rec#* }"; rec_inc="${rest%% *}"; rest="${rest#* }"
+    # Also reads the older "n incarnation filename [alerted]" record.
+    case "$rest" in
+      "- "*|"alerted "*) rec_flag="${rest%% *}"; rec_file="${rest#* }" ;;
+      *" alerted") rec_flag=alerted; rec_file="${rest% alerted}" ;;
+      *) rec_flag=-; rec_file="$rest" ;;
+    esac
+    if [ "$rec_inc" = "$incarnation" ] && [ "$rec_file" = "$filename" ]; then
+      case "$rec_n" in ''|*[!0-9]*) ;; *) n="$rec_n" ;; esac
+      [ "$rec_flag" = alerted ] && alerted=alerted
+    fi
+    ;;
+  esac
   n=$((n + 1))
-  if write_composer_block "$n $incarnation $filename${alerted:+ $alerted}"; then
+  if write_composer_block "$n $incarnation ${alerted:--} $filename"; then
     [ -z "$alerted" ] && [ "$n" -ge "$COMPOSER_BLOCK_ESCALATE_AFTER" ] || return 0
     alert_composer_block "$filename" "$n"
-    write_composer_block "$n $incarnation $filename alerted" \
+    write_composer_block "$n $incarnation alerted $filename" \
       || log_notifier "could not record the composer-block alert for $filename; it may repeat"
     return 0
   fi
   log_notifier "could not persist composer-block count for $filename (${COMPOSER_BLOCK_FILE:-path unresolved}); alerting now"
   [ "$COMPOSER_BLOCK_ALERTED" = "$incarnation $filename" ] && return 0
   COMPOSER_BLOCK_ALERTED="$incarnation $filename"
-  alert_composer_block "$filename" "$n"
+  alert_composer_block "$filename" "${known:+$n}"
 }
 
 # Completion detection is src/delivery/task_dispatch.py's contract, shared
@@ -458,7 +472,8 @@ deliver_prompt_grown() {
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       composer_is_cut_prompt "$baseline_raw" "$prompt" \
         && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
-      note_composer_block "$filename" "$incarnation"
+      # A retype finds our own paste (whole or cut at a chunk); the next pick counts what stays.
+      [ "$type_tries" -gt 0 ] || note_composer_block "$filename" "$incarnation"
       return 1
     fi
     clear_composer_block
@@ -498,6 +513,16 @@ core_incarnation() {
   pane_history_field pane_pid
 }
 
+# Our whole prompt among other text proves its Enter never landed: retire the marker and
+# count the block. Any other read (failed, exact, partial, gone) leaves submission open.
+retire_mixed_prompt() {
+  local cap="$1" filename="$2" prompt="$3" incarnation="$4"
+  composer_holds_prompt "$cap" "$prompt" && ! prompt_is_staged "$cap" "$prompt" || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" \
+    || log_notifier "could not retire the in-flight marker for $filename; a later pick may wait on it (core may need attention)"
+  note_composer_block "$filename" "$incarnation"
+}
+
 # Marker first, then C-m, then confirm the prompt LEFT the composer (submitted, or
 # queued behind a running turn); re-press while it is still exactly ours. The marker
 # precedes the Enter so no crash window exists in which the prompt was submitted
@@ -511,17 +536,19 @@ press_enter_and_confirm() {
   fi
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
-    waited=0
+    waited=0 cap=""
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
       # Confirmed when the prompt has LEFT the composer: submitted, or queued
       # behind a running turn. A busy footer proves nothing about our line.
       if has_result "$filename"; then
+        clear_composer_block
         return 0
       fi
       # A failed capture says nothing about the composer; only a read that
       # shows the prompt gone confirms.
       if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
+        clear_composer_block
         return 0
       fi
       sleep 1
@@ -529,13 +556,20 @@ press_enter_and_confirm() {
     done
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SUBMIT_RETRIES" ]; then
+      if retire_mixed_prompt "$cap" "$filename" "$prompt" "$incarnation"; then
+        log_notifier "submit NOT confirmed for $filename: its prompt is mixed with other text, so the Enter never landed; marker retired (core may need attention)"
+        return 1
+      fi
       log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged, the next pick resumes it (core may need attention)"
       return 1
     fi
     # Re-press only while the composer is STILL exactly our prompt -- with
     # owner text mixed in, this Enter would not be ours.
-    if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+    cap="$(capture_raw)" || cap=""
+    if ! prompt_is_staged "$cap" "$prompt"; then
       log_notifier "composer changed since $filename staged; not re-pressing C-m (failing closed, core may need attention)"
+      retire_mixed_prompt "$cap" "$filename" "$prompt" "$incarnation" \
+        && log_notifier "its prompt is mixed with other text, so the Enter never landed; marker retired for $filename"
       return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
@@ -687,13 +721,15 @@ submit_task_grown() {
     fi
     log_notifier "prompt for $filename is staged but unsent; resuming its submission"
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
+  elif composer_holds_prompt "$raw" "$prompt"; then
+    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
+    # Precedes the marker. Owner text and an unparsed row read alike here; neither delivers, so both count.
+    retire_mixed_prompt "$raw" "$filename" "$prompt" "$incarnation" || true
+    return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
   elif composer_is_cut_prompt "$raw" "$prompt"; then
     log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); leaving it queued (failing closed, core may need attention)"
-    return 0
-  elif composer_holds_prompt "$raw" "$prompt"; then
-    log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
     return 0
   else
     deliver_prompt "$filename" "$prompt" || return 0

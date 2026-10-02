@@ -47,6 +47,7 @@ answering about an archived body while reading an untouched live placeholder ins
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -319,9 +320,10 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     except FileNotFoundError:
         return False
     if not recorded:
-        # The writer refuses an empty identity; a blank file is a corrupt marker,
-        # not a submit, and reading it as live would hold the task forever.
-        path.unlink(missing_ok=True)
+        # The writer refuses an empty identity; a blank file is a corrupt or retired
+        # marker, never a submit, so a failed unlink cannot make it live.
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
         return False
     current = incarnation.strip()
     if current and recorded != current:
@@ -331,7 +333,12 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
 
 
 def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
-    _inflight_path(inflight_dir, filename).unlink(missing_ok=True)
+    path = _inflight_path(inflight_dir, filename)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        # Unlinking needs the directory, truncating only the file; a blank marker is never live.
+        path.write_text("")
 
 
 _USAGE = (

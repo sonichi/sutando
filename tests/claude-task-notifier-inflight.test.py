@@ -62,6 +62,134 @@ class NarrowCaptureTests(FakeTmuxHarness):
 
 
 class RePickTests(FakeTmuxHarness):
+    _osascript_stub = _h.EventDispatchTests._osascript_stub
+    _notifications = _h.EventDispatchTests._notifications
+    _block_path = _h.EventDispatchTests._block_path
+
+    def test_a_marker_behind_a_mixed_composer_still_counts_and_never_waits(self):
+        # The marker is written before C-m; a swallowed Enter plus owner text leaves our
+        # prompt mixed in the composer, so the marker records an Enter that never landed.
+        calls = self._osascript_stub()
+        self.write_task("task-im.txt")
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        # The exit's own read fails, so submission stays open and the marker survives to the repicks.
+        self.fail_capture_skip_after_enter_flag.write_text("1")
+        self.run_event("task-im.txt", timeout=30)
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1)
+        self.assertTrue((self.inflight_dir / "task-im.txt").exists(), "precondition: the marker was recorded")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3",
+               "SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}
+        for attempt in range(1, 4):
+            try:
+                self.run_event("task-im.txt", env_extra=env, timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail(f"pick {attempt} waited on the completion timeout behind a mixed composer")
+        self.assertEqual(self._notifications(calls, 1), 1, "escalate once, at the 3rd refusal")
+        self.assertEqual(self._block_path().read_text().split()[:3][0::2], ["3", "alerted"])
+        self.assertFalse((self.inflight_dir / "task-im.txt").exists(), "the unlanded Enter's marker is retired")
+        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1, "never Enter into owner text")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores a read-only directory")
+    def test_a_failed_marker_clear_cannot_hold_the_queue_once_the_composer_clears(self):
+        # The mixed pick retires the marker while its directory refuses the unlink; after the
+        # owner clears the composer, the next pick must deliver, not wait on that marker.
+        self.write_task("task-fc.txt")
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        self.fail_capture_skip_after_enter_flag.write_text("1")
+        self.run_event("task-fc.txt", timeout=30)
+        marker = self.inflight_dir / "task-fc.txt"
+        self.assertTrue(marker.exists(), "precondition: the marker was recorded")
+        env = {"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}
+        self.inflight_dir.chmod(0o555)
+        self.addCleanup(self.inflight_dir.chmod, 0o755)
+        mixed = self.run_event("task-fc.txt", env_extra=env, timeout=10)
+        self.assertIn("with other text", mixed.stderr)
+        self.inflight_dir.chmod(0o755)
+        self.swallow_enter_flag.unlink()
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        t = self._finish_on("task-fc.txt", lambda log: log.count("ENTER") >= 2)
+        try:
+            self.run_event("task-fc.txt", env_extra=env, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("the pick after the composer cleared waited on a marker the mixed pick had retired")
+        finally:
+            t.join(timeout=5)
+        self.assertEqual(self.sendkeys_log_text().count("TYPE Sutando task ready: task-fc.txt"), 2)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores read-only modes")
+    def test_a_marker_that_cannot_be_retired_at_all_is_reported(self):
+        self.write_task("task-fr.txt")
+        prompt = self.expected_prompt("task-fr.txt")
+        self.pane_file.write_text("❯ owner draft " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        self.inflight_dir.mkdir(parents=True, exist_ok=True)
+        marker = self.inflight_dir / "task-fr.txt"
+        marker.write_text("4242\n")
+        marker.chmod(0o444)
+        self.inflight_dir.chmod(0o555)
+        self.addCleanup(self.inflight_dir.chmod, 0o755)
+        res = self.run_event("task-fr.txt", timeout=10)
+        self.assertIn("could not retire the in-flight marker for task-fr.txt", res.stderr)
+
+    def _exit_on_a_mixed_read(self, name, env=None):
+        # Enter swallowed, then the owner types into our staged prompt.
+        self.write_task(name)
+        self.swallow_enter_flag.write_text("1")
+        self.owner_types_after_enter_flag.write_text("1")
+        return self.run_event(name, env_extra=env, timeout=30)
+
+    def _owner_clears_then_the_next_pick_delivers(self, name):
+        self.swallow_enter_flag.unlink(missing_ok=True)
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        enters = self.sendkeys_log_text().count("ENTER")
+        t = self._finish_on(name, lambda log: log.count("ENTER") > enters)
+        try:
+            self.run_event(name, env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "3600"}, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("the pick after the owner cleared the composer waited on a stale marker")
+        finally:
+            t.join(timeout=5)
+        self.assertEqual(self.sendkeys_log_text().count(f"TYPE Sutando task ready: {name}"), 2)
+
+    def test_a_mixed_read_at_the_changed_exit_retires_the_marker_and_counts_at_once(self):
+        res = self._exit_on_a_mixed_read("task-mc.txt")
+        self.assertIn("composer changed since task-mc.txt staged", res.stderr)
+        self.assertFalse((self.inflight_dir / "task-mc.txt").exists(), "a mixed read proves the Enter never landed")
+        self.assertEqual(self._block_path().read_text().split()[0], "1", "the block counts at this exit, not a pick later")
+        self._owner_clears_then_the_next_pick_delivers("task-mc.txt")
+
+    def test_a_mixed_read_at_the_unconfirmed_exit_retires_the_marker_and_counts_at_once(self):
+        res = self._exit_on_a_mixed_read("task-mu.txt", {"SUTANDO_NOTIFIER_SUBMIT_RETRIES": "1"})
+        self.assertIn("submit NOT confirmed for task-mu.txt", res.stderr)
+        self.assertFalse((self.inflight_dir / "task-mu.txt").exists(), "a mixed read proves the Enter never landed")
+        self.assertEqual(self._block_path().read_text().split()[0], "1", "the block counts at this exit, not a pick later")
+        self._owner_clears_then_the_next_pick_delivers("task-mu.txt")
+
+    def _assert_submission_left_open(self, name):
+        self.assertTrue((self.inflight_dir / name).exists(), "an unknown read must keep the at-most-once marker")
+        self.assertFalse(self._block_path().exists(), "an unknown read is not counted as a block")
+
+    def test_a_failed_read_at_the_unconfirmed_exit_keeps_the_marker(self):
+        self.fail_capture_after_enter_flag.write_text("")
+        res = self._exit_on_a_mixed_read("task-fu.txt", {"SUTANDO_NOTIFIER_SUBMIT_RETRIES": "1"})
+        self.assertIn("submit NOT confirmed for task-fu.txt after 1 attempts", res.stderr)
+        self._assert_submission_left_open("task-fu.txt")
+
+    def test_a_failed_read_at_the_changed_exit_keeps_the_marker(self):
+        self.fail_capture_skip_after_enter_flag.write_text("1")
+        res = self._exit_on_a_mixed_read("task-fx.txt")
+        self.assertIn("composer changed since task-fx.txt staged", res.stderr)
+        self._assert_submission_left_open("task-fx.txt")
+
+    def test_part_of_the_prompt_at_the_changed_exit_keeps_the_marker(self):
+        prompt = self.expected_prompt("task-px.txt")
+        self.pane_after_enter_flag.write_text(
+            "1\n❯ owner text " + prompt[: len(prompt) // 2] + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        res = self._exit_on_a_mixed_read("task-px.txt")
+        self.assertIn("composer changed since task-px.txt staged", res.stderr)
+        self._assert_submission_left_open("task-px.txt")
+
     def test_a_delivered_prompt_still_in_the_pane_is_not_typed_again(self):
         # First pass types and submits; no result ever appears. The re-pick after
         # the completion timeout must see the line in the pane and wait, not queue it twice.

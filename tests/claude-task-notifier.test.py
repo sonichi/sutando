@@ -139,6 +139,12 @@ class FakeTmuxHarness(unittest.TestCase):
         # after-Enter variant arms it at the moment C-m lands.
         self.fail_next_capture_flag = self.root / "fail-next-capture.flag"
         self.fail_capture_after_enter_flag = self.root / "fail-capture-after-enter.flag"
+        # Holds k: after the next ENTER, k captures succeed and then one fails.
+        self.fail_capture_skip_after_enter_flag = self.root / "fail-capture-skip-after-enter.flag"
+        self.fail_capture_after_k = self.root / "fail-capture-after-k.txt"
+        # Holds "k\n<pane>": after the next ENTER, k captures later the pane becomes <pane>.
+        self.pane_after_enter_flag = self.root / "pane-after-enter.flag"
+        self.pane_pending = self.root / "pane-pending.txt"
 
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
@@ -259,6 +265,19 @@ case "$cmd" in
     [ -f "{self.pane_gone_flag}" ] && exit 1
     n=$(( $(cat "{self.capture_count}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{self.capture_count}"
     if [ -f "{self.fail_next_capture_flag}" ]; then rm -f "{self.fail_next_capture_flag}"; exit 1; fi
+    if [ -f "{self.fail_capture_after_k}" ]; then
+      k="$(cat "{self.fail_capture_after_k}")"
+      if [ "$k" -gt 0 ]; then echo $((k - 1)) > "{self.fail_capture_after_k}"
+      else rm -f "{self.fail_capture_after_k}"; exit 1; fi
+    fi
+    if [ -f "{self.pane_pending}" ]; then
+      k="$(head -n 1 "{self.pane_pending}")"
+      if [ "$k" -gt 0 ]; then
+        {{ echo $((k - 1)); tail -n +2 "{self.pane_pending}"; }} > "{self.pane_pending}.new"; mv -f "{self.pane_pending}.new" "{self.pane_pending}"
+      else
+        tail -n +2 "{self.pane_pending}" > "$PANE"; rm -f "{self.pane_pending}"
+      fi
+    fi
     # Consumed once: the pane goes BUSY on the Nth capture (a turn starting
     # between the idle gate and the paste), modeled as the footer flipping.
     if [ -f "{self.busy_on_capture_flag}" ] && [ "$n" -ge "$(cat "{self.busy_on_capture_flag}")" ]; then
@@ -358,6 +377,8 @@ case "$cmd" in
       if [ -f "{self.pid_after_enter_flag}" ]; then
         cat "{self.pid_after_enter_flag}" > "{self.pane_pid_file}"; rm -f "{self.pid_after_enter_flag}"
       fi
+      [ -f "{self.pane_after_enter_flag}" ] && mv -f "{self.pane_after_enter_flag}" "{self.pane_pending}"
+      [ -f "{self.fail_capture_skip_after_enter_flag}" ] && mv -f "{self.fail_capture_skip_after_enter_flag}" "{self.fail_capture_after_k}"
       if [ -f "{self.fail_capture_after_enter_flag}" ]; then
         rm -f "{self.fail_capture_after_enter_flag}"; touch "{self.fail_next_capture_flag}"
       fi
@@ -799,10 +820,105 @@ class EventDispatchTests(FakeTmuxHarness):
         record.write_text(f"5 {inc} task-t.txt\n")
         self.run_event("task-t.txt", env_extra=env, timeout=8)
         self.assertEqual(self._notifications(calls, 1), 1)
-        self.assertEqual(record.read_text().split(), ["6", inc, "task-t.txt", "alerted"])
+        self.assertEqual(record.read_text().split(), ["6", inc, "alerted", "task-t.txt"])
         self.run_event("task-t.txt", env_extra=env, timeout=8)
         time.sleep(0.5)
         self.assertEqual(self._notifications(calls, 1), 1, "an alerted episode must not re-alert")
+
+    def test_a_filename_with_spaces_keeps_its_count(self):
+        # The flag sits before the free-form filename, so a space cannot shift it.
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-s p.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "2"}
+        self._block("task-s p.txt", 3, env)
+        record = self._block_path().read_text()
+        self.assertTrue(record.startswith("3 ") and record.endswith(" alerted task-s p.txt\n"), record)
+        self.assertEqual(self._notifications(calls, 1), 1, "escalate once, at the 2nd refusal")
+
+    def test_an_old_format_alerted_record_is_still_read(self):
+        calls = self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-o2.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        inc = self._incarnation("task-o2.txt", env)
+        record = self._block_path()
+        record.write_text(f"5 {inc} task-o2.txt alerted\n")
+        self.run_event("task-o2.txt", env_extra=env, timeout=8)
+        self.assertEqual(record.read_text().split(), ["6", inc, "alerted", "task-o2.txt"])
+        self.assertEqual(self._notifications(calls, 0), 0, "an episode alerted under the old format must not re-alert")
+
+    def test_an_unreadable_record_alerts_with_an_unknown_count(self):
+        # The degraded path must not print a count it never read.
+        self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-v.txt")
+        self._block_path().mkdir(parents=True)
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "4"}
+        self.run_event("task-v.txt", env_extra=env, timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("for an unknown number of consecutive attempts", log)
+        self.assertNotIn("for 1 consecutive attempts", log)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores a read-only directory")
+    def test_an_unwritable_record_alerts_with_the_count_it_read(self):
+        self._osascript_stub()
+        self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        self.write_task("task-w.txt")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "9"}
+        inc = self._incarnation("task-w.txt", env)
+        record = self._block_path()
+        record.write_text(f"3 {inc} - task-w.txt\n")
+        record.parent.chmod(0o555)
+        self.addCleanup(record.parent.chmod, 0o755)
+        self.run_event("task-w.txt", env_extra=env, timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("could not persist composer-block count", log)
+        self.assertIn("for 4 consecutive attempts", log)
+
+    def test_our_own_unstaged_paste_is_not_counted_as_an_owner_draft(self):
+        # A row the parser does not strip keeps our paste from reading as staged;
+        # the retype then sees our own prompt, which is not an owner block.
+        self.pane_file.write_text(IDLE_FOOTER + "\n  unrecognised hint row\n")
+        self.write_task("task-own.txt")
+        self.run_event("task-own.txt", timeout=8)
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("did not stage; re-typing", log)
+        self.assertIn("composer not empty for task-own.txt", log)
+        self.assertFalse(self._block_path().exists(), "our own paste must not count as an owner block")
+        # Left in place, it blocks the next pick like any draft, and that pick counts it.
+        self.run_event("task-own.txt", timeout=8)
+        self.assertEqual(self._block_path().read_text().split()[0], "1")
+
+    def test_our_prompt_mixed_with_other_text_escalates_at_the_threshold(self):
+        # A mixed composer fails closed on every pick, whether the rest is owner text or an
+        # unparsed row; neither delivers, so the episode must count and reach the owner.
+        calls = self._osascript_stub()
+        self.write_task("task-mx.txt")
+        prompt = self.expected_prompt("task-mx.txt")
+        self.pane_file.write_text("❯ owner draft " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        env = {"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "3"}
+        for attempt in range(1, 5):
+            self.run_event("task-mx.txt", env_extra=env, timeout=8)
+            self.assertEqual(self._notifications(calls, 0 if attempt < 3 else 1), 0 if attempt < 3 else 1,
+                             f"attempt {attempt}: escalate at the 3rd refusal, never again")
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("composer holds task-mx.txt's prompt with other text", log)
+        self.assertNotIn("TYPE", self.sendkeys_log_text())
+        self.assertEqual(self._block_path().read_text().split()[0], "4")
+
+    def test_a_resumed_submit_clears_the_block_record(self):
+        # The owner cleared the draft and the staged prompt was sent: the episode is over.
+        self.write_task("task-r.txt")
+        prompt = self.expected_prompt("task-r.txt")
+        self.pane_file.write_text("❯ " + prompt + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+        record = self._block_path()
+        record.write_text("1 4242 - task-r.txt\n")
+        self.run_event("task-r.txt", timeout=8, env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn("is staged but unsent; resuming", log)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        self.assertFalse(record.exists(), "a confirmed submit must end the block episode")
 
     def test_startup_survives_an_unremovable_block_record(self):
         # The startup reset is best-effort: under set -e a failed rm must not kill the notifier.
@@ -820,14 +936,17 @@ class EventDispatchTests(FakeTmuxHarness):
                 pass
             proc.wait(timeout=5)
 
-    def _notifications(self, calls, expect):
-        # The notification is backgrounded, so its stub may land just after the event returns.
+    def _notifications(self, calls, expect, settle=0.5):
+        # The alert is backgrounded and may land after the event returns: wait for `expect`,
+        # then settle, so an extra or early alert is still counted (an expect of 0 waits too).
+        def count():
+            return calls.read_text().count("display notification") if calls.exists() else 0
         for _ in range(40):
-            got = calls.read_text().count("display notification") if calls.exists() else 0
-            if got >= expect:
+            if count() >= expect:
                 break
             time.sleep(0.05)
-        return got
+        time.sleep(settle)
+        return count()
 
     def _osascript_stub(self, body=""):
         calls = self.root / "osascript.calls"
