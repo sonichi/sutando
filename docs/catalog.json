@@ -176,7 +176,7 @@
    ],
    "status": "draft",
    "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
-   "last_verified": "2026-08-04"
+   "last_verified": "2026-10-02"
   },
   "docs/host-cli-bindings.md": {
    "title": "Host CLI bindings",
@@ -310,7 +310,7 @@
    ],
    "status": "active",
    "canonical_for": "generated source-module inventory",
-   "last_verified": "2026-09-18"
+   "last_verified": "2026-10-02"
   },
   "docs/state-sync-allowlist.md": {
    "title": "State sync allowlist design",
@@ -382,7 +382,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace operational contract",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-design.md": {
    "title": "Workspace design",
@@ -392,7 +392,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace two-space mental model",
-   "last_verified": null
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-hosts-convention.md": {
    "title": "Per-host workspace convention",
@@ -402,7 +402,7 @@
    ],
    "status": "canonical",
    "canonical_for": "hosts/<hostname> workspace convention",
-   "last_verified": "2026-09-08"
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-per-host-paths.md": {
    "title": "Per-host carried paths",
@@ -463,7 +463,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-09-29"
+   "last_verified": "2026-10-02"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
