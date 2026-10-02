@@ -1822,11 +1822,40 @@ class TestMigrateRound3(_MigrateBase):
 
     def test_an_unsafe_host_is_refused_before_any_write(self):
         plan, before = self._only(), self.ledger.read_text()
-        for host in ("", "h\x07", "h\ud800", 7):
+        for host in ("", "h\x07", "h\ud800", 7, "h\u2028x", "h\u2029x"):
             with self.subTest(host=repr(host)):
                 [done] = self.m.apply(dict(plan, host=host), self.ledger, None, host)
                 self.assertTrue(done.startswith("refused: this plan is not a well-formed"))
         self.assertEqual(self.ledger.read_text(), before)
+
+    def test_a_retry_over_an_existing_row_rewrites_its_body_safely(self):
+        self.ledger.write_text(self.ledger.read_text().replace("Pick a launch date?\n\n", "Pick a launch date?\n\nbad\x07 end\n\n", 1))
+        plan, client = self._only(), InProcClient()
+        db = self.db(client)
+        db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "old \x07 unsafe body")
+        [done] = self.apply(plan, self.ledger, db)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        [row] = db.entries()
+        self.assertNotIn("\x07", row["body"])
+        self.assertIn("bad\ufffd end", row["body"])
+
+    def test_producer_plans_with_tabs_or_unlocated_twins_pass_the_validator(self):
+        tabbed = self.ws / "tab\tdir"
+        tabbed.mkdir()
+        plan = dict(self.plan(), ledger=str((tabbed / "pending-questions.md").resolve()))
+        plan["entries"] += [dict(plan["entries"][0], title="2026-09-29 — Tab\there?")]
+        plan["entries"] += [dict(plan["entries"][0], title="2026-09-29 \u00a0Twin", nth=None, sha=None)] * 2
+        self.assertTrue(self.m.plan_fits(json.loads(json.dumps(plan)), HOST))
+
+    def test_refusals_write_nothing_to_the_raw_database(self):
+        plan, client = self._only(), InProcClient()
+        db = self.db(client)
+        snap = json.dumps(client.doc.maps, sort_keys=True)
+        for bad in (dict(plan, version=1), dict(plan, host="other"), dict(plan, close_past_window="x")):
+            [done] = self.apply(bad, self.ledger, db)
+            self.assertTrue(done.startswith("refused:"))
+        self.assertEqual(json.dumps(client.doc.maps, sort_keys=True), snap)
+        self.assertEqual(client.calls, [])
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()

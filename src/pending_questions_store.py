@@ -559,6 +559,16 @@ class RoomDbStore:
         """Mark this host's open row superseded, in the Recovery cell only."""
         self._guarded(ask_id, {"recovery": self._tag(RECOVERY)}, {"closed": [None], "status": OPEN_RAW})
 
+    def rewrite_body(self, ask_id: str, body: str) -> None:
+        """Replace this host's own row's page body; another host's row is never touched."""
+        def _do():
+            r = self.client.row(DB_SCHEMA, self._rid(ask_id)) or {}
+            host = (r.get("cells") or {}).get("host")
+            if self.host and host != self.host:
+                raise GuardFailed(ask_id, {"host": host})
+            self.client.set_body(DB_SCHEMA, self._rid(ask_id), body)
+        self._locked(_do)
+
     def restore(self, ask_id: str) -> None:
         """Clear this host's Recovery mark; Status is not touched."""
         self._guarded(ask_id, {"recovery": None}, {})
