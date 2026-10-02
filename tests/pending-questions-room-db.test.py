@@ -1875,6 +1875,41 @@ class TestMigrateRound3(_MigrateBase):
                 if not expect.startswith("moved"):
                     self.assertEqual(self.ledger.read_text(), FIXTURE)
 
+    def test_a_crash_between_row_and_body_commits_is_resumed_by_the_retry(self):
+        plan = self._only()
+        aid = plan["entries"][0]["ask_id"]
+        doc = fake_client.FakeDoc()
+        real = doc.put_row_body
+        state = {"fail": True}
+
+        async def dies_once(*a, **k):
+            if state["fail"]:
+                state["fail"] = False
+                raise ConnectionError("socket closed between commits")
+            return await real(*a, **k)
+        doc.put_row_body = dies_once
+        db = self.db(InProcClient(doc))
+        [first] = self.apply(plan, self.ledger, db)
+        self.assertTrue(first.startswith("skipped: ConnectionError"), first)
+        self.assertEqual(self.ledger.read_text(), FIXTURE)
+        self.assertEqual(db.status_of(aid), pqs.SUPERSEDED)  # born marked: hidden, never an empty Open row
+        [retry] = self.apply(plan, self.ledger, db)
+        self.assertEqual(retry, "moved: 2026-09-29 — Pick a launch date?")
+        [row] = db.entries()
+        self.assertEqual(row["status"], "Open")
+        self.assertIn("# Request", row["body"])
+        self.assertIn("**Sent:** (legacy entry)", row["body"])
+
+    def test_an_owner_cleared_body_is_not_mistaken_for_an_incomplete_row(self):
+        plan, client = self._only(), InProcClient()
+        db = self.db(client)
+        db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "complete")
+        key = f"pendingq|{db._rid(plan['entries'][0]['ask_id'])}"
+        client.doc.bodies[key] = ""  # the owner cleared it; no incomplete mark remains
+        [done] = self.apply(plan, self.ledger, db)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        self.assertEqual(client.doc.bodies[key], "")
+
     def test_a_retry_over_an_existing_clean_row_reuses_it(self):
         plan, db = self._only(), self.db()
         db.insert_raw(plan["entries"][0]["ask_id"], "Pick a launch date?", "owner notes kept")

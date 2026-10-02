@@ -148,17 +148,25 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
     if op == "row":
         return _row_json(doc, maps, db, row) if exists else None
     if op == "add_row":
+        # Row and body are two commits. The row is born marked incomplete (hidden, by its host), the
+        # body follows, then the mark is cleared; a retry by the same host resumes a marked empty row.
+        host = req["cells"].get("host")
+        mark = f"incomplete@{host}" if host else "incomplete"
+        have = _cells(maps, db, row) if exists else {}
+        resume = exists and have.get("recovery") == mark and have.get("host") == host \
+            and (doc.row_body(db, row) or "") == ""
+        if exists and not resume:  # an existing row is never written here: its state is reported
+            body = doc.row_body(db, row) or ""
+            return {"created": False, "db": db, "row": row, "link": link,
+                    "host": have.get("host"), "unsafe": safe_body(body) != body}
         if not exists:
             orders = [v.get("order") for k, v in rows.items() if k.startswith(db + "|") and isinstance(v, dict)
                       and isinstance(v.get("order"), (int, float))]
             await doc.put_database({"rows": {_key(db, row): {"order": (min(orders) - GAP) if orders else GAP,
                                                              "created": now_ms, "by": by}},
-                                    "cells": _cell_writes(db, row, req["cells"], by, now_ms)})
-        if exists:  # an existing row is never written here: its state is reported for the caller to judge
-            body = doc.row_body(db, row) or ""
-            return {"created": False, "db": db, "row": row, "link": link,
-                    "host": _cells(maps, db, row).get("host"), "unsafe": safe_body(body) != body}
+                                    "cells": _cell_writes(db, row, {**req["cells"], "recovery": mark}, by, now_ms)})
         await doc.put_row_body(db, row, req["body"])
+        await doc.put_database({"cells": _cell_writes(db, row, {"recovery": None}, by, now_ms)})
         return {"created": True, "db": db, "row": row, "link": link}
     if not exists:
         raise LookupError(f"no row {row!r} in database {db!r}")
