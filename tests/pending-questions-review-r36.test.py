@@ -242,5 +242,41 @@ class GatherUnderAConcurrentFlush(_FakeRoom):
         self.assertEqual(g["done"], 0)
 
 
+
+# ---- 3. `pq.py remind` reconciles before it reminds --------------------------------------
+
+class RemindReconciles(_FakeRoom):
+    def test_the_documented_command_files_the_held_ask_before_reminding(self):
+        """The real `pq.py remind` subprocess (check-pending-questions.py with the sibling adapter
+        injected) under the fake capability, with one held ask. The ask's queued DM is drained, so
+        nothing is due and no notification fires; the pass must still have filed the row."""
+        held = self.ask("held?")
+        aid = held["ask_id"]
+        (self.ws / "results" / held["proactive_file"]).unlink()
+        self.assertEqual(self.outbox(), [f"{aid}.json"])
+        env = {**ENV, "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_HOST_LABEL": HOST,
+               "FAKE_ROOM_STATE": str(self.ws / "fake-room.json")}
+        r = subprocess.run([sys.executable, str(SKILL / "scripts" / "pq.py"), "remind"], capture_output=True,
+                           text=True, timeout=300, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.outbox(), [], f"the held ask was not filed by the reminder's pass:\n{r.stdout}{r.stderr}")
+        [row] = self.store().entries()
+        self.assertEqual((row["ask_id"], row["status"], row["incomplete"]), (aid, "Open", False))
+        self.assertTrue((self.ws / "state" / pqo.STORE_HISTORY).exists())
+        self.assertNotIn("not yet in the room", r.stdout)
+        self.assertIn("(sent) 1 pending questions", r.stdout, "the filed row was read, and found just asked")
+        self.assertEqual([p.name for p in (self.ws / "results").iterdir() if p.name.startswith("proactive-pending-q-")], [])
+
+    def test_the_injected_branch_reads_through_the_pass(self):
+        cpq = rdb._cpq(self.ws)
+        held = self.ask("held?")
+        with mock.patch.object(sys, "argv", ["check-pending-questions.py", "--store-adapter", str(ADAPTER)]), \
+                rdb.contextlib.redirect_stdout(rdb.io.StringIO()) as out, rdb.contextlib.redirect_stderr(rdb.io.StringIO()):
+            self.assertEqual(cpq.main(), 0)
+        self.assertEqual(self.outbox(), [])
+        self.assertEqual([e["ask_id"] for e in self.store().entries()], [held["ask_id"]])
+        self.assertIn(f"- [{held['ask_id']}] held?\n", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -395,7 +395,7 @@ class TestReminderQuietExits(rdb._Ws):
     def _fake(self, items, unavailable=False):
         fake = self.ws / "fake_adapter.py"
         fake.write_text("import json\n"
-                        f"def gather(ws):\n    return json.loads({json.dumps(json.dumps({'waiting': items, 'done': 0, 'notes': [], 'store': 'f', 'unavailable': unavailable, 'reason': 'down' if unavailable else None}))})\n")
+                        f"def gather(ws, reconcile=False):\n    return json.loads({json.dumps(json.dumps({'waiting': items, 'done': 0, 'notes': [], 'store': 'f', 'unavailable': unavailable, 'reason': 'down' if unavailable else None}))})\n")
         return str(fake)
 
     def _item(self, ask_id="ask-1", title="Merge?"):
