@@ -96,17 +96,22 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
 
     def test_the_cli_counts_and_lists_held_questions_unknown_and_empty(self):
         held = pqa.ask_owner("held?", urgency="durable", workspace=self.ws, host=HOST)
-        with mock.patch.object(reader, "SKILLS_DIR", self.ws / "no-skills"):
+        with mock.patch.object(reader, "SKILLS_DIR", REPO / "skills"):  # the skill, no room capability
             with _Capture() as c:
                 self.assertEqual(reader.main(["count", "--workspace", str(self.ws)]), 0)
-            self.assertEqual(json.loads(c.out), {"open": 1, "done": 0, "unavailable": False, "reason": None})
+            self.assertEqual(json.loads(c.out), {"open": 1, "done": 0, "pending_close": 0, "unavailable": False, "reason": None})
             with _Capture() as c:
                 self.assertEqual(reader.main(["list", "--json", "--workspace", str(self.ws)]), 0)
             self.assertEqual([i["ask_id"] for i in json.loads(c.out)], [held["ask_id"]])
             with _Capture() as c:
                 self.assertEqual(reader.main(["list", "--workspace", str(self.ws)]), 0)
             self.assertIn(f"- [{held['ask_id']}] held? (not yet in the room)", c.out)
-            self.assertIn("no skill declares one", c.err)
+            self.assertIn("room database: not used", c.err)
+            pqo.Outbox(self.ws).close("ask-elsewhere", "Resolved")  # a close whose row is not in view
+            with _Capture() as c:
+                self.assertEqual(reader.main(["list", "--workspace", str(self.ws)]), 0)
+            self.assertIn("- [ask-elsewhere] closed locally; its row is not in view yet", c.out)
+            pqo.Outbox(self.ws).delete_close("ask-elsewhere")
             pqo.Outbox(self.ws).delete(held["ask_id"])
             with _Capture() as c:
                 self.assertEqual(reader.main(["list", "--workspace", str(self.ws)]), 0)
@@ -114,8 +119,11 @@ class TestReaderDiscoveryAndCli(rdb._Ws):
             with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), _Capture() as c:
                 self.assertEqual(reader.main(["count"]), 0)
             self.assertEqual(json.loads(c.out)["open"], 0, "no --workspace: the resolved one")
-        pqo.mark_room_used(self.ws, "ask-earlier")
         with mock.patch.object(reader, "SKILLS_DIR", self.ws / "no-skills"):
+            with _Capture() as c:
+                self.assertEqual(reader.main(["count", "--workspace", str(self.ws)]), 0)
+            self.assertEqual(json.loads(c.out)["open"], None, "core alone measures nothing")
+            self.assertIn("no skill declares one", c.err)
             with _Capture() as c:
                 self.assertEqual(reader.main(["list", "--json", "--workspace", str(self.ws)]), 0)
             self.assertEqual(json.loads(c.out)["unavailable"], True)
@@ -148,13 +156,20 @@ class TestShimAndAskOwnerEntries(rdb._Ws):
 
     def test_ask_owner_says_not_recorded_when_nothing_could_hold_the_question(self):
         cli = _load("ask_owner_cli_t", REPO / "scripts" / "ask-owner.py")
-        with mock.patch.object(reader, "declared_adapter", return_value=None), \
+        with mock.patch.object(reader, "declared_adapter", return_value=Path(adapter.__file__)), \
                 mock.patch.object(pqo.Outbox, "save", side_effect=OSError("disk full")), _Capture() as c:
             self.assertEqual(cli.main(["q?", "--urgency", "durable", "--workspace", str(self.ws)]), 0)
-        self.assertIn("ask-owner: NOT RECORDED (outbox: OSError: disk full)", c.err)
+        self.assertIn("ask-owner: NOT RECORDED (outbox: OSError: disk full", c.err)
         self.assertIn("recorded: FAILED", c.out)
         self.assertIn("sent: queued", c.out)
         self.assertEqual(self.outbox(), [])
+        no_ask = self.ws / "no_ask.py"
+        no_ask.write_text("def gather(ws):\n    return {}\n")
+        with _Capture() as c:
+            self.assertEqual(cli.main(["q?", "--urgency", "durable", "--workspace", str(self.ws),
+                                       "--store-adapter", str(no_ask)]), 0)
+        self.assertIn("has no ask_owner", c.err)
+        self.assertIn("recorded: NO STORE", c.out)
 
 
 class TestOutboxRecords(rdb._Ws):
@@ -173,7 +188,7 @@ class TestOutboxRecords(rdb._Ws):
     def test_a_path_that_cannot_be_resolved_is_not_contained(self):
         ob = pqo.Outbox(self.ws)
         with mock.patch.object(Path, "resolve", side_effect=OSError("loop")):
-            self.assertFalse(ob._contained(ob.dir / "ask-1.json"))
+            self.assertFalse(ob._held.contains(ob.dir / "ask-1.json"))
 
     def test_the_skills_outbox_skips_a_record_without_a_question_text(self):
         ob = pqs.Outbox(self.ws)
@@ -209,11 +224,12 @@ class TestStoreRefusals(rdb._Ws):
         ob.close("ask-gone", "Resolved")
         db = self.db()
         closed, errors = ob.replay_closes(db)
-        self.assertEqual(closed, ["ask-gone"], "a close with no row and no held entry is simply dropped")
-        self.assertEqual(errors, ["close ask-held: StoreError: its held entry has no row yet"])
-        self.assertEqual(sorted(ob.closes()), ["ask-held"])
+        self.assertEqual(closed, [], "a close with no row in view is kept, never dropped")
+        self.assertEqual(errors, ["close ask-gone: StoreError: no row for it in this store view; kept until one is seen",
+                                  "close ask-held: StoreError: its held entry has no row yet"])
+        self.assertEqual(sorted(ob.closes()), ["ask-gone", "ask-held"])
         closed, errors = ob.replay_closes(self.db(rdb.InProcClient(fail="down")))
-        self.assertEqual((closed, errors), ([], ["close ask-held: StoreError: down"]))
+        self.assertEqual((closed, errors), ([], ["close ask-gone: StoreError: down", "close ask-held: StoreError: down"]))
 
     def test_write_question_reports_a_row_that_did_not_confirm(self):
         db = self.db()
@@ -309,6 +325,10 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
         closed_dir.write_text("not a directory")
         ok, msg = adapter._close_locally(self.ws, "ask-x", "Resolved", "why")
         self.assertFalse(ok)
+        self.assertTrue(msg.startswith("not recorded: no held question ask-x"), msg)
+        pqo.mark_store_used(self.ws, "ask-earlier")  # outage mode: the write is attempted, and fails
+        ok, msg = adapter._close_locally(self.ws, "ask-x", "Resolved", "why")
+        self.assertFalse(ok)
         self.assertTrue(msg.startswith("UNRECORDED: why; and the local close record failed"), msg)
 
     def test_the_ask_survives_a_failing_reconcile_and_an_unwritable_introduction_mark(self):
@@ -324,10 +344,15 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
         self.assertEqual((out["macos"], out["macos_fix"]), (False, "no osascript"))
         macos.assert_called_once()
         mark.rmdir()
-        with mock.patch.object(adapter, "mark_room_used", side_effect=OSError("read-only")):
+        with mock.patch.object(adapter, "mark_room_introduced", side_effect=OSError("read-only")):
             out = adapter.ask_owner("q2?", urgency="durable", workspace=self.ws, host=HOST, store=store)
         self.assertEqual(out["send_error"], "OSError: read-only")
         self.assertIsNotNone(out["record"], "the row still lands")
+        with mock.patch.object(adapter, "mark_store_used", side_effect=OSError("read-only")):
+            out = adapter.ask_owner("q3?", urgency="durable", workspace=self.ws, host=HOST, store=store)
+        self.assertEqual(out["history_error"], "OSError: read-only")
+        self.assertIsNotNone(out["record"], "the row still lands")
+        self.assertIn("history: FAILED — OSError: read-only", "\n".join(adapter.report_lines(out)))
 
     def test_report_lines_name_every_reconcile_outcome(self):
         out = {"outbox": None, "record": "row", "heading": "## x — q?", "proactive_file": "p.txt", "where": "owner-dm",

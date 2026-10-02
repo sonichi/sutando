@@ -4,8 +4,8 @@ that preserves the file's mode. A lock is removed only by the writer that took i
 held lock makes the write give up after LOCK_WAIT_SEC, untouched, with the manual
 remedy in the error.
 
-Users: pending_questions_store.RoomDbStore (`under_lock` around status transitions)
-and the transitional pending_questions_compat (`update`, the moved mark).
+The skill's own: pending_questions_store.RoomDbStore (`under_lock` around status
+transitions) and the transitional pending_questions_compat (`update`, the moved mark).
 """
 from __future__ import annotations
 

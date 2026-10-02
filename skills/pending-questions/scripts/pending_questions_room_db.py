@@ -11,10 +11,13 @@ file's `serve`, or None and the reason when anything is missing.
 
 `gather(workspace)` is READ-ONLY: this host's open rows plus the outbox's held questions,
 each once, with `unavailable: True` and `done: None` when the room cannot be read — never a
-zero. `reconcile_pass(workspace)` is the explicit pass (outbox replay, local closes, stale marks,
-the transitional legacy ingest); `ask_owner` runs it first, then core's queue, then the
-row, and writes no row when the outbox could not hold the question. `resolve` closes the
-row, else records the closure locally for the next reconcile. `remind` is the reminder.
+zero; a local close whose row the view does not show is listed as `pending_close`, neither
+open nor done. `reconcile_pass(workspace)` is the explicit pass (outbox replay, local closes,
+stale marks, the transitional legacy ingest); `ask_owner` runs it first, then the queue, then
+the row, and writes no row when the outbox could not hold the question. `resolve` closes the
+row, else records the closure locally for the next reconcile — only for a question held in
+the outbox, or in outage mode once a row of this workspace was ever confirmed; an unknown id
+with neither is refused and changes no count. `remind` is the reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -37,8 +40,8 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import pending_questions_ask as core_ask
-from pending_questions_outbox import (ROOM_INTRODUCED, Outbox as HeldRecords, local_done_count,
-                                      mark_room_used, room_was_used)
+from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
+                                      mark_store_used, room_introduced, store_history)
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, outbox_items, reconcile_pending, safe_body,
                                      waiting_item, write_question)
@@ -135,9 +138,13 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0):
 # ---- the reader -------------------------------------------------------------------
 
 def _unavailable(ws: Path, reason: str, store) -> dict:
-    return {"waiting": outbox_items(ws), "done": None, "unavailable": True, "reason": reason,
-            "link": getattr(store, "link", None), "store": getattr(store, "label", None),
+    return {"waiting": outbox_items(ws), "done": None, "pending_close": local_closes(ws)[1], "unavailable": True,
+            "reason": reason, "link": getattr(store, "link", None), "store": getattr(store, "label", None),
             "notes": [f"ROOM DATABASE UNAVAILABLE ({reason}); the count is unknown"]}
+
+
+def _pending_note(ids: list) -> list:
+    return [f"{len(ids)} local close(s) await the row they name: {', '.join(ids)}"] if ids else []
 
 
 def reconcile_pass(workspace: Path, environ=None) -> dict:
@@ -154,17 +161,20 @@ def reconcile_pass(workspace: Path, environ=None) -> dict:
 
 
 def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
-    """{"waiting", "done", "unavailable", "reason", "link", "notes", "store"}: this host's open
-    rows then the outbox's held questions (each marked not yet in the room), an ask id listed
-    once. Read-only unless `reconcile`. Without a store: the outbox, and why — an outage
-    (`unavailable`) when a room store was used before, a measurement when none ever was."""
+    """{"waiting", "done", "pending_close", "unavailable", "reason", "link", "notes", "store"}: this
+    host's open rows then the outbox's held questions (each marked not yet in the room), an ask
+    id listed once; `pending_close` names local closes with no row in view. Read-only unless
+    `reconcile`. Without a store: the outbox, and why — an outage (`unavailable`) when a row
+    of this workspace was ever confirmed, a measurement when none was."""
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
-        if room_was_used(ws):
+        if store_history(ws):
             return _unavailable(ws, f"room database not reachable ({where}), though it was used before", None)
-        return {"waiting": outbox_items(ws), "done": local_done_count(ws), "unavailable": False, "reason": None,
-                "link": None, "store": None, "notes": [f"room database: not used ({where}); listing the local outbox only"]}
+        done, pending = local_closes(ws)
+        return {"waiting": outbox_items(ws), "done": len(done), "pending_close": pending, "unavailable": False,
+                "reason": None, "link": None, "store": None,
+                "notes": [f"room database: not used ({where}); listing the local outbox only"] + _pending_note(pending)}
     notes, rows, done = [], [], 0
     try:
         if reconcile:
@@ -172,17 +182,23 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
             rec = reconcile_pending(store, ws, host_label())
             notes += [f"reconcile: FAILED — {e}" for e in rec["errors"]]
         closing = HeldRecords(ws).closes()  # closed by the owner while the room was unreachable
+        seen = set()
         for e in store.entries():
+            seen.add(e["ask_id"])
             if e["status"] in TERMINAL or e["ask_id"] in closing:
                 done += 1
             elif not e["incomplete"]:
                 rows.append(waiting_item(e["ask_id"], e["title"], e["body"], e["asked_at"], True, e["priority"]))
+        if seen:
+            mark_store_used(ws, min(seen))
     except Exception as e:  # noqa: BLE001
         return _unavailable(ws, f"{type(e).__name__}: {e}", store)
     held = {r["ask_id"] for r in rows}
     rows += [it for it in outbox_items(ws) if it["ask_id"] not in held]
-    return {"waiting": rows, "done": done, "unavailable": False, "reason": None, "link": store.link,
-            "notes": notes, "store": store.label}
+    in_outbox = {e["ask_id"] for e in HeldRecords(ws).entries()}
+    pending = sorted(a for a in closing if a not in seen and a not in in_outbox)
+    return {"waiting": rows, "done": done, "pending_close": pending, "unavailable": False, "reason": None,
+            "link": store.link, "notes": notes + _pending_note(pending), "store": store.label}
 
 
 def waiting(workspace: Path) -> list:
@@ -192,15 +208,28 @@ def waiting(workspace: Path) -> list:
 def count(workspace: Path) -> dict:
     g = gather(workspace)
     return {"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
-            "unavailable": g["unavailable"], "reason": g["reason"]}
+            "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"], "reason": g["reason"]}
+
+
+def local_close_allowed(ws: Path, ask_id: str) -> tuple:
+    """(allowed, why): a local close stands in for the row only when the outbox holds the ask
+    (the row is not born yet) or a row of this workspace was ever confirmed (outage mode)."""
+    if any(e["ask_id"] == ask_id for e in HeldRecords(ws).entries()):
+        return True, "held in the outbox"
+    if store_history(ws):
+        return True, "outage mode: a room row was confirmed here before"
+    return False, f"no held question {ask_id} and no room row was ever confirmed here; nothing to close"
 
 
 def _close_locally(ws: Path, ask_id: str, status: str, why: str) -> tuple:
+    allowed, basis = local_close_allowed(ws, ask_id)
+    if not allowed:
+        return False, f"not recorded: {basis} ({why})"
     try:
         p = HeldRecords(ws).close(ask_id, status, note=why)
     except Exception as e:  # noqa: BLE001
         return False, f"UNRECORDED: {why}; and the local close record failed ({type(e).__name__}: {e})"
-    return True, f"recorded locally as {status} in {p} ({why}); the next reconcile applies it to the row"
+    return True, f"recorded locally as {status} in {p} ({why}; {basis}); the next reconcile applies it to the row"
 
 
 def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
@@ -234,7 +263,8 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               options=(), priority: str = "Medium") -> dict:
     """Reconcile, queue (core), hold, row, notify — each step reported, none raising past here.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
-    no row: the question is still queued to the owner, and the report says it was not held."""
+    no row: the question is still queued to the owner, and the report says it was not held. A
+    confirmed row marks the store as used; the queued introduction marks only itself."""
     from util_paths import host_label
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
@@ -245,19 +275,18 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
             rec = reconcile_pending(store, ws, host)
         except Exception as e:  # noqa: BLE001 — this ask still goes out
             rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
-    introduced = status_path(ROOM_INTRODUCED, ws)
     intro = None
-    if store is not None and not introduced.exists():
+    if store is not None and not room_introduced(ws):
         intro = (f"All my questions for you are kept in the Pending questions database in {store.label}; "
                  "open it any time from that room. Questions are sent to you as they come up, not on a schedule.")
     link = getattr(store, "link", None) if store is not None else None
     out = core_ask.queue_question(question, context, task_file, ws, host, now, link, intro,
                                   default_action, reason, options, priority)
     out.update({"reconcile": rec, "record": None, "db_error": out["outbox_error"], "link": link,
-                "macos": None, "macos_fix": None})
+                "macos": None, "macos_fix": None, "history_error": None})
     if out["proactive_file"] and intro:
         try:
-            mark_room_used(ws, out["ask_id"])
+            mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
             out["send_error"] = f"{type(e).__name__}: {e}"
     if out["outbox"] is None:
@@ -268,6 +297,10 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         out["link"], out["db_error"] = w.link or link, w.db_error
         if w.complete:
             out["record"] = store.where(q.ask_id)
+            try:
+                mark_store_used(ws, q.ask_id)
+            except OSError as e:
+                out["history_error"] = f"{type(e).__name__}: {e}"
             Outbox(ws).delete(q.ask_id)
             out["outbox"] = None
         else:
@@ -288,6 +321,8 @@ def report_lines(out: dict) -> list:
         lines.append(f"reconcile: applied {len(rec['closed'])} local close(s)")
     if rec.get("moved"):
         lines.append(f"reconcile: moved {len(rec['moved'])} legacy file entr(ies) into the database")
+    if out.get("history_error"):
+        lines.append(f"history: FAILED — {out['history_error']} (a later outage would read as a measured count)")
     return lines
 
 

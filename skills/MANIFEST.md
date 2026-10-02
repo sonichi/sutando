@@ -143,10 +143,11 @@ read it (read-only; `unavailable: True` and `done: None` when the room cannot be
 a question and `remind` runs the reminder. Core reaches it only through
 `src/pending_questions_reader.py`, which scans manifests for that FIELD alone (the script must
 resolve inside its skill), names no skill, and refuses when more than one installed skill declares
-it. With none declared, core's own part still works: `scripts/ask-owner.py` writes one outbox
-record under `<workspace>/state/pending-questions-outbox/` (`src/pending_questions_outbox.py`, the
-one writer of that record) and queues the proactive message; readers list that outbox, saying why;
-a close is recorded beside it for the next reconcile with a store.
+it. With none declared there is no store: readers report `unavailable` with that reason (never a
+zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
+the owner's DM through the proactive path and keeps one generic record under
+`<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
+The outbox, the ask-id grammar and every question schema are the declaring skill's.
 
 ## Currently active manifest skills
 

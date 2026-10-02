@@ -34,8 +34,10 @@ from pathlib import Path
 from typing import Optional
 
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
-if str(REPO / "src") not in sys.path:
-    sys.path.insert(0, str(REPO / "src"))
+HERE = Path(__file__).resolve().parent
+for _p in (REPO / "src", HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 import pending_questions_ledger as ledger
 from pending_questions_md import DIVIDER_RE, active_region, mask_markup
 from pending_questions_store import Question, StoreError, question_body, row_body, row_id, safe_body

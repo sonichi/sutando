@@ -153,6 +153,7 @@ class SessionHandoff(unittest.TestCase):
 
     def test_the_reader_cli_lists_a_held_question_from_an_empty_workspace(self):
         ws = Path(tempfile.mkdtemp())
+        sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
         import pending_questions_outbox as pqo
         q = {"ask_id": "ask-held", "question": "Held one?", "context": None, "asked_at": 0, "default_action": None,
              "reason": None, "options": [], "priority": "Medium"}
@@ -163,13 +164,13 @@ class SessionHandoff(unittest.TestCase):
         r = self._cli(ws, "list", "--json")
         self.assertEqual([i["ask_id"] for i in json.loads(r.stdout)], ["ask-held"])
         self.assertEqual(json.loads(self._cli(ws, "count").stdout),
-                         {"open": 1, "done": 0, "unavailable": False, "reason": None})
+                         {"open": 1, "done": 0, "pending_close": 0, "unavailable": False, "reason": None})
 
     def test_the_reader_cli_says_unknown_for_an_unreachable_room(self):
         """The handoff echoes this stdout: it must carry the word UNKNOWN, not a zero."""
         ws = Path(tempfile.mkdtemp())
         (ws / "state").mkdir()
-        (ws / "state" / "pending-questions-db-introduced").write_text("ask-x\n")  # a store was used before
+        (ws / "state" / "pending-questions-store-history").write_text("ask-x\n")  # a row was confirmed before
         r = self._cli(ws, "list")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("pending questions: UNKNOWN — room unreachable", r.stdout)

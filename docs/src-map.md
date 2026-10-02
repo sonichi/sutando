@@ -110,6 +110,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
+- **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
 - **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
@@ -132,11 +133,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
-- **`pending_questions_ask.py`** — Queue a pending question to the owner in a conversation he reads, and hold it locally.
-- **`pending_questions_ledger.py`** — Locked, atomic file mutation for the pending-questions stores: one mkdir lock shared by every writer of a path, a read-transform-replace under it, and a temp-file + rename that preserves the file's mode.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
-- **`pending_questions_outbox.py`** — The local hold for an owner pending question: one JSON record per ask under `<workspace>/state/pending-questions-outbox/`, written whole in one rename before anything else is done with the question, and a close record under its `closed/` when an answer or a closure arrives while no store can take it.
-- **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the adapter an installed skill declares in its manifest (`pending_questions_store`), picked by that field alone and loaded by path — core names no skill, and refuses when more than one skill declares it.
+- **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the adapter an installed skill declares in its manifest (`pending_questions_store`), picked by that field alone and loaded by path — core names no skill, carries no question schema, and refuses when more than one skill declares it.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.

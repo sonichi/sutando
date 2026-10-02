@@ -5,8 +5,9 @@
 stops a boot on a logged-out CLI. The record of why the machine did not come up is
 the worst one to lose, and a writer can look successful in every cheap way — so this
 test counts through the SHIPPED reader (`src/pending_questions_reader.py`), never
-by grepping what was written. With no room reachable from the fixture, the record is
-the workspace outbox entry, which the reader lists once as not yet in the room.
+by grepping what was written. The reader reaches the repo's pending-questions skill
+(the one declared adapter); with no room reachable from the fixture, the record is the
+workspace outbox entry, which the adapter lists once as not yet in the room.
 
 Run:  python3 tests/auth-gate-question-is-counted.test.py
 Exit: 0 on pass, 1 on fail.
@@ -43,8 +44,8 @@ def waiting(ws: Path) -> list:
     spec = importlib.util.spec_from_file_location("pq_reader", REPO / "src" / "pending_questions_reader.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    # No skill declares an adapter in this empty dir, so the reader lists the outbox alone.
-    return m.waiting(ws, skills_dir=ws / "no-skills")
+    # The repo's skill declares the adapter; with no room capability it lists the outbox alone.
+    return m.waiting(ws, skills_dir=REPO / "skills")
 
 
 def extract_writer() -> str:

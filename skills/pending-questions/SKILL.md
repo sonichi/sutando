@@ -32,14 +32,22 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
   asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
   ask. Then continue; never block.
 - `list` is READ-ONLY: this host's open rows plus any held question once, marked
-  `(not yet in the room)`. When the room cannot be read it prints
-  `pending questions: UNKNOWN — room unreachable (…)` and only what is held locally; it
-  never prints a zero it did not measure.
+  `(not yet in the room)`, then any local close whose row is not in view (`closed locally;
+  its row is not in view yet` — neither open nor done, `pending_close` in `count`). When the
+  room cannot be read it prints `pending questions: UNKNOWN — room unreachable (…)` and only
+  what is held locally; it never prints a zero it did not measure. Once a row of this
+  workspace was ever confirmed (written, replayed, ingested or seen by a read), a room that
+  cannot be reached is an outage, not an empty outbox — whatever became of the one-time
+  introduction message.
 - `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
   transitional legacy ingest. `ask` and `remind` run it; `list` does not.
 - `resolve` closes a row as Resolved (or Answered with `--answered`). It never reopens a
   closed row. When the room cannot be written, the closure is recorded locally
-  (`<outbox>/closed/<ask_id>.json`) and applied by the next `reconcile`.
+  (`<outbox>/closed/<ask_id>.json`) and applied by the next `reconcile` — but only for a
+  question the outbox holds, or in outage mode (a row was confirmed here before); an unknown
+  id with neither is refused and changes no count. The replay retires a local close only
+  once its row is closed or seen closed; a row the store view does not show is ambiguous,
+  so the record stays and `reconcile` reports it.
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
@@ -48,27 +56,34 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
 
 `<workspace>/state/pending-questions-outbox/<ask_id>.json` holds a question while the room
 is unreachable: one file per ask, written atomically before the room write, never edited,
-deleted only when the complete row carrying that exact ask id is confirmed. Its record and
-path safety are core's (`src/pending_questions_outbox.py`: an ask id outside
+deleted only when the complete row carrying that exact ask id is confirmed. Its record,
+the ask-id grammar and the close record are this skill's (`scripts/pending_questions_outbox.py`
+over core's generic record directory, `src/local_record.py`: an ask id outside
 `[A-Za-z0-9][A-Za-z0-9._-]{0,119}` is refused before any path is built, a file whose stem
-does not match its inner id is skipped, and deletion stays inside the directory), so a
-checkout without this skill still asks and lists through it. `reconcile` replays each entry
-through the normal add_row path (which resumes a row left incomplete), so a replay is
-idempotent by ask id. Without a room capability or an owner room, every ask stays in the
-outbox and `list` says why.
+does not match its inner id is skipped, and deletion stays inside the directory). `reconcile`
+replays each entry through the normal add_row path (which resumes a row left incomplete), so
+a replay is idempotent by ask id. Without a room capability or an owner room, every ask stays
+in the outbox and `list` says why. Two markers under `state/` are kept apart:
+`pending-questions-store-history` (a row of this workspace was confirmed; from then on no
+store is an outage) and `pending-questions-db-introduced` (the owner was told once where the
+database lives).
 
 ## Who reads it
 
 This skill's adapter, `scripts/pending_questions_room_db.py`, is the single reader and
 writer (`room_store`, `gather`, `waiting`, `count`, `reconcile`, `resolve`, `ask_owner`,
 `remind`); the manifest's `pending_questions_store` field declares it (`skills/MANIFEST.md`),
-and the store, the outbox replay and the legacy ingest are this skill's
-(`scripts/pending_questions_store.py`, `scripts/pending_questions_compat.py`,
-`scripts/pending_questions_remind.py`). Core — the dashboard, the morning briefing,
+and the store, the outbox and its replay, the queue/routing of the owner message, the legacy
+ingest and the reminder are this skill's (`scripts/pending_questions_store.py`,
+`scripts/pending_questions_outbox.py`, `scripts/pending_questions_ask.py`,
+`scripts/pending_questions_compat.py`, `scripts/pending_questions_remind.py`,
+`scripts/pending_questions_ledger.py`). Core — the dashboard, the morning briefing,
 agent-api, friction-detector, session-handoff, obsidian-mirror, the reminder entry — reaches
 it only through `src/pending_questions_reader.py`, by that field, and reads no file. Every
-one of them shows "unknown" while the room cannot be read; the briefing says only the
-count and where to open it.
+one of them shows "unknown" while the room cannot be read — and with no adapter installed,
+since core has no store of its own; the briefing says only the count and where to open it.
+Without this skill, `scripts/ask-owner.py` only queues the owner's DM and keeps one generic
+record under `<workspace>/state/ask-owner/`, and says that nothing lists or closes it.
 
 ## The room capability
 

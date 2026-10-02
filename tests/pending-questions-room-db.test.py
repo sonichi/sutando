@@ -389,7 +389,7 @@ class TestEdges(_Ws):
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 runpy.run_path(cli, run_name="__main__")
-        self.assertIn("pending-questions-outbox", out.getvalue())
+        self.assertIn(str(self.ws / "state" / "ask-owner"), out.getvalue(), "the resolved workspace, core's record")
         with mock.patch.object(sys, "argv", [cli, "q?", "--option", "no-equals"]), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(SystemExit) as e:
@@ -443,11 +443,13 @@ class TestAskOwner(_Ws):
         out = self.ask("Solo?")
         self.assertEqual(self.outbox(), [f"{out['ask_id']}.json"])
         self.assertNotIn("Pending questions database", (self.ws / "results" / out["proactive_file"]).read_text())
+        g = reader.gather(self.ws, adapter=Path(adapter.__file__))
+        self.assertEqual([(i["ask_id"], i["in_room"]) for i in g["waiting"]], [(out["ask_id"], False)])
+        self.assertEqual((g["done"], g["pending_close"]), (0, []))
+        self.assertIn("listing the local outbox only", g["notes"][0])
         with mock.patch.object(reader, "declared_adapter", return_value=None):
             g = reader.gather(self.ws)
-        self.assertEqual([(i["ask_id"], i["in_room"]) for i in g["waiting"]], [(out["ask_id"], False)])
-        self.assertEqual(g["done"], 0)
-        self.assertIn("listing the local outbox only", g["notes"][0])
+        self.assertEqual((g["unavailable"], g["done"], g["waiting"]), (True, None, []), "core alone has no store to read")
 
     def test_the_next_ask_files_the_held_question_once(self):
         held = self.ask("First?")  # no store: held
@@ -594,7 +596,7 @@ class TestGather(_Ws):
                              sorted([(held["ask_id"], True), (asked["ask_id"], True)]))
             self.assertEqual((g["done"], g["notes"], g["unavailable"]), (1, [], False))
             self.assertEqual(self.outbox(), [])
-            full = {"open": 2, "done": 1, "unavailable": False, "reason": None}
+            full = {"open": 2, "done": 1, "pending_close": 0, "unavailable": False, "reason": None}
             self.assertEqual(adapter.count(self.ws), full)
             self.assertEqual(len(adapter.waiting(self.ws)), 2)
             self.assertEqual(reader.count(self.ws, adapter=Path(adapter.__file__)), full)
@@ -624,12 +626,17 @@ class TestGather(_Ws):
             self.assertIn("not changed", msg)
             self.assertFalse(adapter.resolve(self.ws, "ask-nope", "Resolved")[0])
 
-    def test_without_the_capability_resolve_records_the_close_locally(self):
-        ok, msg = adapter.resolve(self.ws, "ask-1", "Resolved")
+    def test_without_the_capability_resolve_records_the_close_locally_for_a_held_question_only(self):
+        held = self.ask("Held?")
+        ok, msg = adapter.resolve(self.ws, held["ask_id"], "Resolved")
         self.assertTrue(ok, msg)
         self.assertIn("recorded locally as Resolved", msg)
         self.assertIn("no room capability installed", msg)
-        self.assertTrue((self.ws / "state" / "pending-questions-outbox" / "closed" / "ask-1.json").exists())
+        self.assertTrue((self.ws / "state" / "pending-questions-outbox" / "closed" / f"{held['ask_id']}.json").exists())
+        ok, msg = adapter.resolve(self.ws, "ask-1", "Resolved")
+        self.assertFalse(ok)
+        self.assertIn("no held question ask-1 and no room row was ever confirmed here", msg)
+        self.assertFalse((self.ws / "state" / "pending-questions-outbox" / "closed" / "ask-1.json").exists())
 
 
 class TestTwoHostsOneRoom(_Ws):
@@ -825,8 +832,8 @@ class TestDelegation(unittest.TestCase):
         return (REPO / rel).read_text()
 
     def test_core_never_names_the_capability_or_the_skill(self):
-        for rel in ("src/pending_questions_ask.py", "src/pending_questions_reader.py", "src/pending_questions_outbox.py",
-                    "src/check-pending-questions.py", "src/pending_questions_ledger.py", "scripts/ask-owner.py"):
+        for rel in ("src/pending_questions_reader.py", "src/local_record.py", "src/check-pending-questions.py",
+                    "scripts/ask-owner.py"):
             self.assertNotRegex(self.src(rel), r"room[-_]collab|room[-_]commons", rel)
             self.assertNotRegex(self.src(rel), r"pending_questions_room_db|skills/pending-questions", rel)
 
@@ -837,7 +844,7 @@ class TestDelegation(unittest.TestCase):
         self.assertLess(s.index("core_ask.queue_question("), s.index('if out["outbox"] is None:'))
         self.assertLess(s.index('if out["outbox"] is None:'), s.index("write_question(q, store, out[\"sent_line\"])"))
         self.assertNotRegex(s, r"\bledger\.|FileStore|pending-questions\.md")
-        core = self.src("src/pending_questions_ask.py")
+        core = self.src(self.SKILL + "pending_questions_ask.py")
         self.assertIn("Outbox(ws).save(out[\"question\"], out[\"sent_line\"], now)", core)
         self.assertLess(core.index("write_proactive(ws"), core.index("Outbox(ws).save("), "queue, then hold")
 

@@ -10,12 +10,13 @@ lets the owner's terminal Status win over any of them. A row key is injective in
 the ask id (`row_id`), and `complete` confirms the row by its Ask id cell, so no
 other question's row can stand in for one.
 
-Outbox extends core's hold (src/pending_questions_outbox.py: the record, its path
+Outbox extends the sibling hold (pending_questions_outbox.py: the record, its path
 safety, the close records) with the replay: `flush` re-inserts each held question
 through the normal add_row path (which resumes a row left incomplete) and deletes
 the entry only once that exact ask id's row is confirmed complete; `replay_closes`
-applies the local close records. `reconcile_pending` is the explicit pass: flush,
-closes, stale marks, then the one transitional ingest of the legacy file.
+applies the local close records, keeping any the store cannot confirm closed.
+`reconcile_pending` is the explicit pass: flush, closes, stale marks, then the one
+transitional ingest of the legacy file; anything it lands marks the store as used.
 """
 from __future__ import annotations
 
@@ -29,11 +30,13 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
-if str(REPO / "src") not in sys.path:
-    sys.path.insert(0, str(REPO / "src"))
+HERE = Path(__file__).resolve().parent
+for _p in (REPO / "src", HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 import pending_questions_ledger as ledger
 from pending_questions_outbox import Outbox as HeldRecords
-from pending_questions_outbox import held_items, one_line_title, waiting_item  # noqa: F401 — re-exported
+from pending_questions_outbox import held_items, mark_store_used, one_line_title, waiting_item  # noqa: F401 — re-exported
 from result_markers import neutralize_markers
 
 STATUSES = ("Open", "Answered", "Resolved")
@@ -415,8 +418,10 @@ class Outbox(HeldRecords):
         return flushed, errors
 
     def replay_closes(self, store) -> tuple:
-        """Apply each local close record to its row; the record goes once the row is closed,
-        was already closed, or has no row and no held entry. (closed ids, errors)."""
+        """Apply each local close record to its row. The record goes only once the row is
+        closed by this replay or seen closed already; a row this store view does not show is
+        ambiguous (empty, stale or the wrong store), so the record stays and is reported.
+        (closed ids, errors)."""
         closed, errors = [], []
         held = {e["ask_id"] for e in self.entries()}
         for ask_id, rec in self.closes().items():
@@ -424,8 +429,11 @@ class Outbox(HeldRecords):
                 try:
                     store.close(ask_id, rec["status"])
                 except GuardFailed as g:
-                    if not g.current and ask_id in held:
-                        raise StoreError("its held entry has no row yet") from None
+                    if not g.current:
+                        raise StoreError("its held entry has no row yet" if ask_id in held else
+                                         "no row for it in this store view; kept until one is seen") from None
+                    if effective_status(g.current) not in TERMINAL:
+                        raise StoreError(f"its row is not closed ({g})") from None
                 self.delete_close(ask_id)
                 closed.append(ask_id)
             except Exception as ex:  # noqa: BLE001
@@ -467,17 +475,25 @@ def write_question(q: Question, store, sent_line: str) -> WriteOutcome:
 def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     """The explicit pass with a reachable store: replay the outbox, apply local closes, clear
     stale marks on this host's rows, then the transitional ingest of the legacy file (its
-    single call site)."""
+    single call site). Any row landed or observed marks the store as used."""
     ob = Outbox(workspace)
     flushed, errors = ob.flush(store)
     closed, close_errors = ob.replay_closes(store)
     errors += close_errors
+    seen = []
     try:
         for r in store.entries():
+            seen.append(r["ask_id"])
             if r["stale"]:
                 store.clear(r["ask_id"], r["stale"])
     except Exception as e:  # noqa: BLE001
         errors.append(f"stale marks: {type(e).__name__}: {e}")
     import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
     moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
+    for ask_id in flushed + closed + moved + seen:
+        try:
+            mark_store_used(workspace, ask_id)
+        except OSError as e:
+            errors.append(f"store history: {type(e).__name__}: {e}")
+        break
     return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}
