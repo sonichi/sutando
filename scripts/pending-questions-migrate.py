@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pending_questions_ledger as ledger  # noqa: E402
 from pending_questions_store import (GuardFailed, active_region, entry_ask_id,  # noqa: E402
-                                     legacy_ask_id, row_body, row_id)
+                                     legacy_ask_id, row_body, row_id, safe_body)
 
 CLASSES = ("already-migrated", "self-resolved", "live", "unknown-PR", "stale-merged-PR",
            "stale-closed-PR", "past-window")
@@ -256,6 +256,7 @@ KINDS = ("section", "bullet")
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 def _text(v) -> bool:
@@ -267,13 +268,7 @@ def _line(v) -> bool:
     return _text(v) and bool(v)
 
 
-_BODY_UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
-
-
-def safe_body(text: str) -> str:
-    """A ledger body as the database may hold it: newlines and tabs kept, every other control
-    character and lone surrogate replaced with U+FFFD."""
-    return _BODY_UNSAFE.sub("\ufffd", text)
+_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def _entry_ok(e) -> bool:
@@ -290,8 +285,10 @@ def plan_fits(plan: dict, host: Optional[str]) -> bool:
     if not isinstance(plan, dict):
         return False
     entries = plan.get("entries")
-    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and _line(host)
-            and plan.get("host") == host and _line(plan.get("ledger")) and Path(plan["ledger"]).is_absolute()
+    if not (type(plan.get("version")) is int and plan.get("version") == PLAN_VERSION and isinstance(host, str) and _HOST.fullmatch(host)
+            and plan.get("host") == host and isinstance(plan.get("ledger"), str) and plan["ledger"]
+            and "\x00" not in plan["ledger"] and not _SURROGATE.search(plan["ledger"])
+            and Path(plan["ledger"]).is_absolute()
             and isinstance(plan.get("ledger_sha256"), str) and _DIGEST.fullmatch(plan["ledger_sha256"])
             and type(plan.get("close_past_window")) is bool
             and isinstance(entries, list) and all(_entry_ok(e) for e in entries)):
@@ -392,7 +389,7 @@ def _apply_live(r: dict, ledger_file: Path, store) -> str:
         return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
     if not made.get("created"):
         try:
-            store.rewrite_body(r["ask_id"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
+            store.neutralise_body(r["ask_id"])
             store.restore(r["ask_id"])
         except GuardFailed as e:
             return f"skipped: the row exists and is not this host's to reuse ({e}); the file entry stays"

@@ -28,7 +28,7 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
-from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter  # noqa: E402
+from pending_questions_store import RoomDbStore, ScriptDbClient, register_adapter, safe_body  # noqa: E402
 from workspace_default import status_path  # noqa: E402
 
 SKILL = "room-collab"
@@ -173,6 +173,15 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
         if any(current[p] not in allowed for p, allowed in req["expect"].items()):
             return {"written": False, "current": current}
         await doc.put_database({"cells": _cell_writes(db, row, req["cells"], by, now_ms)})
+        return {"written": True, "current": current}
+    if op == "neutralise":
+        have = _cells(maps, db, row)
+        current = {p: have.get(p) for p in req["expect"]}
+        if any(current[p] not in allowed for p, allowed in req["expect"].items()):
+            return {"written": False, "current": current}
+        body = doc.row_body(db, row) or ""
+        if safe_body(body) != body:
+            await doc.put_row_body(db, row, safe_body(body))
         return {"written": True, "current": current}
     if op == "stamp":
         body, token = doc.row_body(db, row) or "", req["token"]

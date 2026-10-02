@@ -75,6 +75,15 @@ class GuardFailed(StoreError):
         self.current = current
 
 
+_BODY_UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
+def safe_body(text: str) -> str:
+    """Text as a row body may hold it: newlines and tabs kept, every other control character and
+    lone surrogate replaced with U+FFFD. Nothing else changes, so custom content survives."""
+    return _BODY_UNSAFE.sub("\ufffd", text)
+
+
 def placeholder(ask_id: str) -> str:
     return f"**Sent:** (sending {ask_id})"
 
@@ -390,6 +399,7 @@ class DbClient(Protocol):
     def set_body(self, schema: dict, row: str, body: str) -> None: ...
     def stamp(self, schema: dict, row: str, token: str, replacement: str) -> None: ...
     def guarded(self, schema: dict, row: str, cells: dict, expect: dict) -> dict: ...
+    def neutralise(self, schema: dict, row: str, expect: dict) -> dict: ...
 
 
 class ScriptDbClient:
@@ -439,6 +449,9 @@ class ScriptDbClient:
 
     def guarded(self, schema, row, cells, expect):
         return self._call({"op": "guarded", "schema": schema, "row": row, "cells": cells, "expect": expect})
+
+    def neutralise(self, schema, row, expect):
+        return self._call({"op": "neutralise", "schema": schema, "row": row, "expect": expect})
 
 
 def _option_id(prop_id: str, name: str) -> str:
@@ -559,15 +572,13 @@ class RoomDbStore:
         """Mark this host's open row superseded, in the Recovery cell only."""
         self._guarded(ask_id, {"recovery": self._tag(RECOVERY)}, {"closed": [None], "status": OPEN_RAW})
 
-    def rewrite_body(self, ask_id: str, body: str) -> None:
-        """Replace this host's own row's page body; another host's row is never touched."""
-        def _do():
-            r = self.client.row(DB_SCHEMA, self._rid(ask_id)) or {}
-            host = (r.get("cells") or {}).get("host")
-            if self.host and host != self.host:
-                raise GuardFailed(ask_id, {"host": host})
-            self.client.set_body(DB_SCHEMA, self._rid(ask_id), body)
-        self._locked(_do)
+    def neutralise_body(self, ask_id: str) -> None:
+        """Make this host's own row body safe in place, in one client call under `lock`; content
+        is kept, only unsafe characters change. Another host's row is refused, untouched."""
+        expect = {"host": [self.host]} if self.host else {}
+        res = self._locked(lambda: self.client.neutralise(DB_SCHEMA, self._rid(ask_id), expect)) or {}
+        if not res.get("written"):
+            raise GuardFailed(ask_id, {k: v for k, v in (res.get("current") or {}).items() if v is not None})
 
     def restore(self, ask_id: str) -> None:
         """Clear this host's Recovery mark; Status is not touched."""
