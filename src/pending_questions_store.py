@@ -454,16 +454,24 @@ def owner_status(cells: dict) -> Optional[str]:
     return status if status in TERMINAL else None
 
 
+def _mark(cells: dict, prop: str) -> Optional[str]:
+    """A mark counts only when the row's own Host wrote it ("<value>@<host>"): two hosts that
+    both created one row on stale replicas merge to one Host, and the other's mark is ignored."""
+    val, _, tag = str(cells.get(prop) or "").partition("@")
+    return val if val and (tag or None) == (cells.get("host") or None) else None
+
+
 def effective_status(cells: dict) -> str:
     """The owner's terminal Status wins; then the row's Closed mark; then its Recovery mark."""
-    closed = cells.get("closed")
+    closed = _mark(cells, "closed")
     return (owner_status(cells) or (closed if closed in TERMINAL else None)
-            or (SUPERSEDED if cells.get("recovery") else "Open"))
+            or (SUPERSEDED if _mark(cells, "recovery") else "Open"))
 
 
 def stale_marks(cells: dict) -> list:
-    """Code marks beside the owner's terminal Status: cleared so the views show his decision."""
-    return [k for k in ("closed", "recovery") if cells.get(k)] if owner_status(cells) else []
+    """Code marks the owning host clears: one beside the owner's terminal Status, or one
+    another host wrote."""
+    return [k for k in ("closed", "recovery") if cells.get(k) and (owner_status(cells) or not _mark(cells, k))]
 
 
 class RoomDbStore:
@@ -523,15 +531,18 @@ class RoomDbStore:
             current = {k: names.get(v, v) if k == "status" else v for k, v in (res.get("current") or {}).items()}
             raise GuardFailed(ask_id, {k: v for k, v in current.items() if v is not None})
 
+    def _tag(self, value: str) -> str:
+        return f"{value}@{self.host}" if self.host else value
+
     def close(self, ask_id: str, to: str) -> None:
         """Record a closure made in this host's file, in the Closed cell; Status stays the owner's."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": to}, {"closed": [None]})
+        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
 
     def supersede(self, ask_id: str) -> None:
         """Mark this host's open row superseded, in the Recovery cell only."""
-        self._guarded(ask_id, {"recovery": RECOVERY}, {"closed": [None], "status": OPEN_RAW})
+        self._guarded(ask_id, {"recovery": self._tag(RECOVERY)}, {"closed": [None], "status": OPEN_RAW})
 
     def restore(self, ask_id: str) -> None:
         """Clear this host's Recovery mark; Status is not touched."""
