@@ -6,6 +6,9 @@
    links) and injected into src/pending_questions_reader.py, which scans nothing itself. A
    conforming declarer under `<workspace>/skills/custom` is what production selects when the
    shipped one is absent; one in each root is a refusal in every edge, never a silent pick.
+2. The reminder reads an injected adapter through the manifest contract's two entry points —
+   `reconcile_pass(ws)` then `gather(ws)` — so a minimal adapter implementing only the documented
+   contract runs without TypeError and its held ask is reconciled; a reconcile error is kept.
 
 Run: python3 tests/pending-questions-review-r37.test.py
 """
@@ -13,6 +16,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -48,6 +52,34 @@ def ask_owner(question, store=None, **kw):
     return {{"outbox": None, "record": "row", "where": "workspace", "question": question}}
 def report_lines(out):
     return [f"recorded: in the workspace store ({{out['question']}})"]
+'''
+
+# A minimal adapter: ONLY what skills/MANIFEST.md documents for the reminder's pass.
+MINIMAL = '''
+import json
+from pathlib import Path
+def room_store(ws):
+    return None, "minimal"
+def _rows(ws):
+    p = Path(ws) / "room.json"
+    return json.loads(p.read_text()) if p.exists() else []
+def gather(ws):
+    rows = [{"ask_id": r["ask_id"], "title": r["title"], "snippet": "", "body": "", "asked_at": None,
+             "priority": "medium", "in_room": True} for r in _rows(ws)]
+    return {"waiting": rows, "done": 0, "pending_close": [], "unavailable": False, "reason": None,
+            "link": None, "notes": [], "store": "minimal"}
+def reconcile_pass(ws):
+    held = Path(ws) / "held.json"
+    if (Path(ws) / "fail").exists():
+        return {"flushed": [], "moved": [], "closed": [], "errors": ["replay refused"]}
+    if not held.exists():
+        return {"flushed": [], "moved": [], "closed": [], "errors": []}
+    rows = _rows(ws) + [json.loads(held.read_text())]
+    (Path(ws) / "room.json").write_text(json.dumps(rows))
+    held.unlink()
+    return {"flushed": [rows[-1]["ask_id"]], "moved": [], "closed": [], "errors": []}
+def resolve(ws, ask_id, status):
+    return True, "closed"
 '''
 
 
@@ -172,6 +204,72 @@ class Finding1Roots(_Roots):
         for rel in ("src/sparrowd.py", "src/skill_hooks.py"):
             self.assertNotRegex((REPO / rel).read_text(), r"pending_questions", rel)
 
+
+class Finding2ReminderContract(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pq-r37-remind-"))
+        self.ws = self.tmp / "ws"
+        for d in ("results", "state", "logs"):
+            (self.ws / d).mkdir(parents=True)
+        self.minimal = self.tmp / "minimal_adapter.py"
+        self.minimal.write_text(MINIMAL)
+        self.cpq = _load("pq_remind_r37", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
+        self.cpq.notify_macos = lambda count, titles: True
+        self.cpq.voice_client_connected = lambda: False
+
+    def run_reminder(self, *argv):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = self.cpq.main(["--store-adapter", str(self.minimal), *argv], workspace=self.ws)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_minimal_contract_adapter_runs_and_its_held_ask_is_reconciled(self):
+        """The reviewer's injection: only the documented entry points; the old call raised TypeError."""
+        (self.ws / "held.json").write_text(json.dumps({"ask_id": "ask-held", "title": "held until reconciled?"}))
+        rc, out, err = self.run_reminder()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("TypeError", err)
+        self.assertIn("1 pending questions; nothing sent", out)
+        self.assertIn("[ask-held] held until reconciled?", out)
+        self.assertFalse((self.ws / "held.json").exists(), "reconcile_pass filed it")
+        self.assertEqual([r["ask_id"] for r in json.loads((self.ws / "room.json").read_text())], ["ask-held"])
+        rc, out, _ = self.run_reminder("--notify", "--force")
+        self.assertEqual(rc, 0)
+        self.assertIn("Notified: 1 pending questions", out)
+        [f] = [p for p in (self.ws / "results").iterdir() if p.name.startswith("proactive-pending-q-")]
+        self.assertIn("held until reconciled?", f.read_text())
+
+    def test_a_reconcile_error_is_kept_in_the_output_and_the_read_still_lists(self):
+        (self.ws / "room.json").write_text(json.dumps([{"ask_id": "ask-row", "title": "a row?"}]))
+        (self.ws / "fail").write_text("")
+        rc, out, err = self.run_reminder()
+        self.assertEqual(rc, 0)
+        self.assertIn("reconcile: FAILED — replay refused", err)
+        self.assertIn("[ask-row] a row?", out)
+
+    def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
+        calls = []
+        fake = mock.Mock()
+        fake.reconcile_pass.side_effect = lambda ws: calls.append(("reconcile_pass", ws)) or {"errors": ["e1"]}
+        fake.gather.side_effect = lambda ws: calls.append(("gather", ws)) or {"waiting": [], "notes": ["n"]}
+        with mock.patch.object(self.cpq.importlib.util, "spec_from_file_location") as sfl:
+            sfl.return_value.loader.exec_module = lambda m: None
+            with mock.patch.object(self.cpq.importlib.util, "module_from_spec", return_value=fake):
+                g = self.cpq.gather(str(self.minimal))
+        self.assertEqual([c[0] for c in calls], ["reconcile_pass", "gather"])
+        self.assertEqual({c[1] for c in calls}, {self.cpq.WORKSPACE})
+        self.assertEqual(fake.gather.call_args, mock.call(self.cpq.WORKSPACE), "plain gather(ws): no private keyword")
+        self.assertEqual(g["notes"], ["reconcile: FAILED — e1", "n"])
+
+    def test_the_contract_doc_and_the_shipped_adapter_agree(self):
+        contract = (REPO / "skills" / "MANIFEST.md").read_text()
+        self.assertIn("`reconcile_pass(workspace)`", contract)
+        self.assertIn("then `gather(workspace)`", contract)
+        reminder = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py").read_text()
+        self.assertNotIn("reconcile=", reminder)
+        self.assertNotIn("reconcile=", (REPO / "src" / "pending_questions_reader.py").read_text())
+        shipped = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_room_db.py").read_text()
+        self.assertRegex(shipped, r"def gather\(workspace: Path, environ=None\) -> dict:")
+        self.assertIsNone(re.search(r"def gather\([^)]*reconcile", shipped), "no keyword the contract does not name")
 
 
 if __name__ == "__main__":

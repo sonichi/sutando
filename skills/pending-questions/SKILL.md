@@ -82,7 +82,7 @@ database lives).
 ## Who reads it
 
 This skill's adapter, `scripts/pending_questions_room_db.py`, is the single reader and
-writer (`room_store`, `gather`, `waiting`, `count`, `reconcile`, `resolve`, `ask_owner`,
+writer (`room_store`, `gather`, `waiting`, `count`, `reconcile_pass`, `resolve`, `ask_owner`,
 `remind`); the manifest's `pending_questions_store` field declares it (`skills/MANIFEST.md`),
 and the store, the outbox and its replay, the queue/routing of the owner message, the legacy
 ingest and the reminder are this skill's (`scripts/pending_questions_store.py`,

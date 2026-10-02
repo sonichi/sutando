@@ -302,7 +302,8 @@ class CloseReplay(rdb._Ws):
             store = adapter.room_store(self.ws, environ={})[0]
             self.ask("in the room?", store=store)
             pqs.Outbox(self.ws).close("ask-elsewhere", "Resolved")
-            g = adapter.gather(self.ws, environ={}, reconcile=True)
+            adapter.reconcile_pass(self.ws, environ={})
+            g = adapter.gather(self.ws, environ={})
             self.assertEqual((len(g["waiting"]), g["done"], g["pending_close"]), (1, 0, ["ask-elsewhere"]), g)
             self.assertTrue(any("await the row they name" in n for n in g["notes"]), g["notes"])
             c = adapter.count(self.ws)

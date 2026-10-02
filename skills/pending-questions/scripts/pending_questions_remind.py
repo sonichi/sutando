@@ -6,8 +6,9 @@ macOS, voice and the owner's DM, and `--force` with it skips the cooldown, prese
 the sent-quiet window. Without `--notify` NOTHING is sent — an installed schedule running the
 core entry with no flag is that silent pass. An unreachable room is reported as UNKNOWN,
 never as zero, and nothing is reminded from a count that could not be measured.
-`--store-adapter <path>` injects another adapter file (its `gather(ws, reconcile=True)` is
-what is read — the pass reconciles whichever adapter it reads through).
+`--store-adapter <path>` injects another adapter file; the pass is the manifest contract's
+two entry points on whichever adapter it reads through — `reconcile_pass(ws)`, its errors kept
+in the notes, then the read-only `gather(ws)` (skills/MANIFEST.md).
 Entry: src/check-pending-questions.py, or `pq.py remind`.
 """
 
@@ -80,17 +81,20 @@ def voice_client_connected():
 
 
 def gather(adapter=None):
-    """The pass's result — reconcile, then read — through the sibling adapter, or the injected
-    adapter file (what `pq.py remind` passes): {"waiting", "notes", "unavailable", "reason", ...}."""
+    """The pass's result — `reconcile_pass`, then the read-only `gather`, the contract's two entry
+    points — through the sibling adapter, or the injected adapter file (what `pq.py remind`
+    passes): {"waiting", "notes", "unavailable", "reason", ...}; a reconcile error is a note."""
     if adapter:
         spec = importlib.util.spec_from_file_location("pq_store_adapter_injected", str(adapter))
         room_db = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(room_db)
     else:
         import pending_questions_room_db as room_db  # noqa: PLC0415
-    g = room_db.gather(WORKSPACE, reconcile=True)
+    rec = room_db.reconcile_pass(WORKSPACE)
+    g = room_db.gather(WORKSPACE)
     g.setdefault("unavailable", False)
     g.setdefault("reason", None)
+    g["notes"] = [f"reconcile: FAILED — {e}" for e in rec.get("errors", [])] + list(g.get("notes", []))
     return g
 
 
