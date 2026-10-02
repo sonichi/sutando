@@ -286,31 +286,41 @@ def apply(plan: dict, ledger_file: Path, store) -> list:
 
 
 def _apply_live(r: dict, ledger_file: Path, store) -> str:
-    """Row and file move under the ledger lock: the entry is checked, the row made,
-    the file re-read unchanged, then rewritten. Any failure after the row exists
-    resolves the row, so a refused move never leaves an Open row behind."""
-    made = []
-
-    def _move(old: str) -> str:
-        new = _with_status(old, r, f"moved — kept in the room database as row {row_id(r['ask_id'])}")
-        store.insert_raw(r["ask_id"], r["title"], row_body(r["body"], None, None, (), "**Sent:** (legacy entry)"))
-        made.append(True)
-        if ledger_file.read_text(encoding="utf-8") != old:
-            raise ledger.LedgerError(f"changed while its row was made: {r['title'][:80]!r}")
-        return new
+    """Two phases. The row is made Open outside the ledger lock; then, under the
+    lock and with no network call, the target entry alone is re-checked (hash and
+    active region) and moved. Unrelated edits are kept. A row whose move does not
+    commit, or whose creation's outcome is unknown, is superseded: readers ignore
+    it, the file entry stays visible, and the next reconciling pass supersedes any
+    such row this run could not reach."""
+    seen = ledger_file.read_text(encoding="utf-8")
     try:
-        err = ledger.update(ledger_file, _move)
-    except Exception as e:  # noqa: BLE001 — the row is compensated below
-        err = f"{type(e).__name__}: {e}"
-    if not err:
-        return f"moved: {r['title'][:80]}"
-    if made:
+        _with_status(seen, r, "check")
+    except ledger.LedgerError as e:
+        return f"skipped: {e}"
+    try:
+        made = store.insert_raw(r["ask_id"], r["title"],
+                                row_body(r["body"], None, None, (), "**Sent:** (legacy entry)")) or {}
+    except Exception as e:  # noqa: BLE001 — the outcome is unknown; supersede whatever exists
+        return f"skipped: {type(e).__name__}: {e}" + _supersede(store, r)
+    moved = f"moved — kept in the room database as row {row_id(r['ask_id'])}"
+    err = ledger.update(ledger_file, lambda t: _with_status(t, r, moved))
+    if err:
+        return f"skipped: {err}" + _supersede(store, r)
+    if not made.get("created"):
         try:
-            store.set_status(r["ask_id"], "Resolved")
-            err += "; its row was resolved"
-        except Exception as e:  # noqa: BLE001
-            err += f"; ROW LEFT OPEN, resolve {row_id(r['ask_id'])} by hand ({type(e).__name__}: {e})"
-    return f"skipped: {err}"
+            if store.status_of(r["ask_id"]) == "Superseded":
+                store.set_status(r["ask_id"], "Open")
+        except Exception:  # noqa: BLE001 — the next reconciling pass reopens a linked row
+            pass
+    return f"moved: {r['title'][:80]}"
+
+
+def _supersede(store, r: dict) -> str:
+    try:
+        store.set_status(r["ask_id"], "Superseded")
+        return "; its row was superseded (the file entry stays the question)"
+    except Exception as e:  # noqa: BLE001
+        return f"; its row could not be superseded now ({type(e).__name__}); the next reminder pass does it"
 
 
 def main(argv=None) -> int:

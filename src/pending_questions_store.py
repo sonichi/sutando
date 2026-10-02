@@ -37,6 +37,9 @@ from pending_questions_md import DIVIDER_RE, active_region, mask_markup
 from result_markers import neutralize_markers
 
 STATUSES = ("Open", "Answered", "Resolved")
+# A row whose file transition never committed: the file stays the truth, so
+# readers ignore the row and the file entry stays visible.
+SUPERSEDED = "Superseded"
 PRIORITIES = ("High", "Medium", "Low")
 APPROVE = "Approve"
 # Bold field tokens the ledger's readers act on, wherever they occur in a body.
@@ -47,8 +50,8 @@ _STATUS_LINE_RE = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 _HEADING_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z — ")
 _PLACEHOLDER_RE = re.compile(r"^\*\*Sent:\*\* \(sending \S+\)$", re.MULTILINE)
-# A legacy entry the migration moved names its row in its status line.
-_MOVED_ROW_RE = re.compile(r"^\*\*Status:\*\*[ \t]+moved\b.*?\bas row q-(\S+)", re.MULTILINE)
+# A legacy entry the migration moved names its row in its status line, whatever the status.
+_MOVED_ROW_RE = re.compile(r"^\*\*Status:\*\*.*?\bas row q-(\S+)", re.MULTILINE)
 _FIELDS_RE = re.compile(r"^<!-- pq-fields: ([A-Za-z0-9+/=]+) -->[ \t]*$", re.MULTILINE)
 # Status words that still want an answer; `moved` is a legacy entry whose row is open.
 OPEN_WORDS = ("unanswered", "waiting", "open", "moved")
@@ -254,7 +257,8 @@ class FileStore:
             m = _STATUS_LINE_RE.search(old, s, e)
             if not m:
                 raise ledger.LedgerError(f"entry {ask_id!r} has no **Status:** line")
-            return old[:m.start()] + f"**Status:** {word}" + old[m.end():]
+            linked = "" if ASK_ID_LINE_RE.search(old, s, e) else f", kept as row {row_id(ask_id)}"
+            return old[:m.start()] + f"**Status:** {word}{linked}" + old[m.end():]
         self._write(_do)
 
     def entries(self) -> list:
@@ -280,6 +284,14 @@ class FileStore:
         return [{k: e[k] for k in ("ask_id", "title", "body")} for e in self.entries()
                 if e["status"] == "Open"]
 
+    def linked_ids(self) -> set:
+        """Every ask id an entry anywhere in the file carries or names, archive included."""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return set()
+        return {a for s, e in _sections(text) if (a := entry_ask_id(text[s:e]))}
+
 
 # ---- the room database ---------------------------------------------------------
 
@@ -294,7 +306,8 @@ DB_SCHEMA = {
         {"id": "name", "name": "Name", "type": "title"},
         {"id": "status", "name": "Status", "type": "status",
          "options": [_opt("open", "Open", "red", "todo"), _opt("answered", "Answered", "blue", "doing"),
-                     _opt("resolved", "Resolved", "green", "done")]},
+                     _opt("resolved", "Resolved", "green", "done"),
+                     _opt("superseded", SUPERSEDED, "gray", "done")]},
         {"id": "priority", "name": "Priority", "type": "select",
          "options": [_opt("high", "High", "red"), _opt("medium", "Medium", "yellow"),
                      _opt("low", "Low", "gray")]},
@@ -446,6 +459,11 @@ class RoomDbStore:
         self._row(ask_id)
         self.client.set_cells(DB_SCHEMA, row_id(ask_id), {"status": _option_id("status", status)})
 
+    def status_of(self, ask_id: str) -> Optional[str]:
+        r = self.client.row(DB_SCHEMA, row_id(ask_id))
+        names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
+        return names.get(((r or {}).get("cells") or {}).get("status")) if r else None
+
     def entries(self) -> list:
         names = {o["id"]: o["name"] for o in DB_SCHEMA["props"][1]["options"]}
         out = []
@@ -535,19 +553,33 @@ def resync(file_store: FileStore, db_store) -> tuple:
     open file entry the database lacks is inserted with its own structured fields
     and `**Sent:**` record; a status closed on either side closes the other; a
     delivery record settled on one side fills the other's placeholder (a stamp
-    that failed on one side). (synced ask ids, errors)."""
+    that failed on one side). A migration row no file entry links (its file
+    transition never committed, or its acknowledgement was lost) is superseded,
+    so the file stays the truth; a superseded row a file entry does link takes
+    the file's status. (synced ask ids, errors)."""
     synced, errors = [], []
     try:
         entries = file_store.entries()
+        linked = file_store.linked_ids()
         found = {r["ask_id"]: r for r in db_store.entries()}
     except Exception as e:  # noqa: BLE001
         return synced, [f"read: {type(e).__name__}: {e}"]
     rows = {a: r["status"] for a, r in found.items()}
+    for aid, st in rows.items():
+        if aid.startswith("legacy-") and aid not in linked and st == "Open":
+            try:
+                db_store.set_status(aid, SUPERSEDED)
+                rows[aid] = SUPERSEDED
+                synced.append(aid)
+            except Exception as ex:  # noqa: BLE001
+                errors.append(f"{aid}: {type(ex).__name__}: {ex}")
     for e in entries:
         aid, sent = e["ask_id"], sent_line_of(e["body"])
         try:
             row_sent = sent_line_of(found[aid]["body"]) if aid in found else None
-            if aid not in rows:
+            if rows.get(aid) == SUPERSEDED:
+                db_store.set_status(aid, e["status"])
+            elif aid not in rows:
                 q = e["question"]
                 if e["status"] != "Open" or q is None or not sent or _PLACEHOLDER_RE.match(sent):
                     continue  # closed, legacy, or still being asked by a live run

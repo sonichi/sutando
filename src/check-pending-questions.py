@@ -5,8 +5,10 @@ Runs on cron — independent of the proactive loop.
 Sends notifications via macOS + Discord DM if questions are waiting.
 Use --force to bypass the 1-hour cooldown.
 `--store-adapter <path>`, else the adapter an earlier run registered in the
-workspace, injects a room-database adapter (its `room_store(workspace)`); the
-pass reconciles it with the file, then reminds its open rows and the file's rest.
+workspace, else this job's own scripts/ adapter, injects a room-database adapter
+(its `room_store(workspace)`, which returns None where the capability or the
+owner DM is absent); the pass reconciles it with the file, then reminds its open
+rows and the file's rest.
 """
 
 import hashlib
@@ -27,7 +29,7 @@ from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently  # noqa: E402
-from pending_questions_store import (OPEN_WORDS, FileStore, entry_ask_id,  # noqa: E402
+from pending_questions_store import (OPEN_WORDS, SUPERSEDED, FileStore, entry_ask_id,  # noqa: E402
                                      legacy_ask_id, registered_adapter, resync)
 
 WORKSPACE = resolve_workspace()
@@ -36,6 +38,9 @@ RESULTS_DIR = WORKSPACE / "results"
 # No read-fallback to the old root path on purpose: a missing stamp makes the
 # reader notify ONCE rather than suppress, so the move costs one notification.
 LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+# This notification job's own adapter, found as ask-owner finds it; its discovery
+# registers on first success, so an upgraded schedule needs no flag or manual step.
+DEFAULT_STORE_ADAPTER = Path(__file__).resolve().parent.parent / "scripts" / "pending_questions_room_db.py"
 
 
 def write_notify_stamp(questions, now=None):
@@ -273,7 +278,7 @@ def gather(store=None):
             _synced, errors = resync(FileStore(PQ_FILE), store)
             notes += [f"resync: FAILED — {e}" for e in errors]
             entries = store.entries()
-            held = {e["ask_id"] for e in entries}
+            held = {e["ask_id"] for e in entries if e["status"] != SUPERSEDED}
             rows = store_questions([e for e in entries if e["status"] == "Open"])
         except Exception as e:  # noqa: BLE001
             rows, held = [], set()
@@ -631,6 +636,8 @@ def main():
         store, why = load_store(adapter)
         if store is None:
             print(f"room database: not used ({why}); reminding from the file", file=sys.stderr)
+    elif DEFAULT_STORE_ADAPTER.is_file():
+        store, _why = load_store(str(DEFAULT_STORE_ADAPTER))
     questions, notes = gather(store)
     for note in notes:
         print(note, file=sys.stderr)
