@@ -40,7 +40,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
-- **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
+- **`check-pending-questions.py`** — Reconcile and list the owner's pending questions; remind only on demand.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
@@ -132,11 +132,13 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
-- **`pending_questions_ask.py`** — Ask the owner a pending question in a conversation he reads; the per-host pending-questions.md is the ledger of what was queued, not the channel.
-- **`pending_questions_ledger.py`** — The one writer contract for pending-questions.md: every mutation of the file goes through `update()` — one mkdir lock shared by all writers, a read-transform- replace under it, and a temp-file + rename that preserves the file's mode.
+- **`pending_questions_ask.py`** — Ask the owner a pending question in a conversation he reads, and record it as a row of his room database — the outbox holding it meanwhile.
+- **`pending_questions_compat.py`** — TRANSITIONAL — the only code that reads the legacy per-host pending-questions file.
+- **`pending_questions_ledger.py`** — Locked, atomic file mutation for the pending-questions stores: one mkdir lock shared by every writer of a path, a read-transform-replace under it, and a temp-file + rename that preserves the file's mode.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
-- **`pending_questions_store.py`** — Where an owner pending question is kept: one Question, two stores with one contract, and the fail-open policy between them.
-- **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
+- **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by path — core names no skill.
+- **`pending_questions_store.py`** — Where an owner pending question is kept: one Question, one store, one outbox.
+- **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).

@@ -270,7 +270,7 @@ nothing and the whole class would go invisible. Requirements:
 ### Escalation delivery contract (the `needs-authorization` path must actually deliver)
 
 `needs-authorization` is only a real gate if the escalation reaches the owner.
-The reused path (`pending-questions.md` + macOS-notify) does **not** guarantee
+The reused path (a pending question via `pq.py ask` + macOS-notify) does **not** guarantee
 that today, measured on a live host: the reader counts only entries **above the
 file's `# Resolved` divider**, so an append at EOF lands below it and is
 silently uncounted (same defect class PR #2521 fixed in `auth-preflight-gate.sh`);
@@ -336,7 +336,7 @@ becomes expensive later).
   since merged the code, so "reuses shipped code" is now literal, not aspirational.)
 - **Delegation:** the `delegate` decision is today's `codex exec --sandbox
   read-only` path, promoted from ad hoc to a first-class outcome.
-- **Escalation:** `needs-authorization` reuses `pending-questions.md` + the
+- **Escalation:** `needs-authorization` reuses `pq.py ask` + the
   macOS-notify path already used for owner decisions — but only under the
   write-then-assert delivery contract above, because that path does not
   guarantee delivery as-is (silent EOF-below-divider miss, notify cooldown).
