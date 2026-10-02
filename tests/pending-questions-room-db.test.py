@@ -589,6 +589,45 @@ class TestResync(_Ws):
         self.assertEqual(pqs.resync(pqs.FileStore(self.pq), self.db()), ([], []))
 
 
+class TestMigratedRows(_Ws):
+    """Rows the migration made: linked by their file entry's status line."""
+
+    MOVED = ("## 2026-06-01 — migrated\n\nbody\n\n"
+             "**Status:** moved — kept in the room database as row q-legacy-abc123def456 (pending-questions-migrate)\n")
+
+    def test_a_resolution_keeps_the_row_link_and_the_row_is_not_superseded(self):
+        self.pq.write_text(self.MOVED)
+        fs, db = pqs.FileStore(self.pq), self.db()
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        db.set_status("legacy-abc123def456", "Resolved")
+        pqs.resync(fs, db)
+        self.assertIn("**Status:** resolved — in the room database, kept as row q-legacy-abc123def456",
+                      self.pq.read_text())
+        self.assertIn("legacy-abc123def456", fs.linked_ids())
+        pqs.resync(fs, db)
+        self.assertEqual([e["status"] for e in db.entries()], ["Resolved"])
+
+    def test_a_linked_superseded_row_takes_the_files_status(self):
+        self.pq.write_text(self.MOVED)
+        db = self.db()
+        db.insert_raw("legacy-abc123def456", "migrated", "page")
+        db.set_status("legacy-abc123def456", "Superseded")
+        self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
+        self.assertEqual([e["status"] for e in db.entries()], ["Open"])
+
+    def test_an_older_database_gains_the_superseded_option(self):
+        doc = fake_client.FakeDoc()
+        old = json.loads(json.dumps(pqs.DB_SCHEMA))
+        old["props"][1]["options"] = old["props"][1]["options"][:3]
+        asyncio.run(adapter.apply(doc, {"op": "rows", "schema": old}, AGENT, 1))
+        db = self.db(InProcClient(doc))
+        db.insert_raw("legacy-x", "q", "page")
+        db.set_status("legacy-x", "Superseded")
+        opts = [o["id"] for o in doc.maps["props"]["pendingq|status"]["options"]]
+        self.assertEqual(opts, ["open", "answered", "resolved", "superseded"])
+        self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
+
+
 class TestReminder(_Ws):
     def test_it_reminds_database_rows_and_the_files_other_entries_once_each(self):
         self.pq.write_text("## legacy — still in the file\n\nbody\n")
@@ -690,18 +729,37 @@ class TestConvergence(_Ws):
             self.assertEqual(adapter.main(["register", "--workspace", str(bare)]), 1)
         self.assertIn("not registered", out.getvalue())
 
-    def test_an_existing_schedule_converges_a_database_resolution(self):
+    def _upgraded_install(self, row_status):
+        """An install as an older version left it: the capability, the owner DM, a
+        row and its file shadow, and NO registration; nothing of this head is called."""
         _install_fake_capability(self.ws)
+        doc = fake_client.FakeDoc()
+        db = pqs.RoomDbStore(InProcClient(doc), lock=self.ws / "state" / "setup.lock")
+        pqs.write_question(self.q(), pqs.FileStore(self.pq), db)
+        for s_ in (db, pqs.FileStore(self.pq)):
+            s_.stamp("ask-1", SENT)
+        doc.maps["cells"]["pendingq|q-ask-1|status"] = {"v": row_status, "updated": 2, "by": AGENT}
+        Path(self._env()["FAKE_ROOM_STATE"]).write_text(json.dumps({**doc.state(), "_room": ROOM}))
+        self.assertIsNone(pqs.registered_adapter(self.ws))
+        return _cpq(self.pq, self.ws)
+
+    def test_an_upgraded_schedule_converges_a_database_resolution_unaided(self):
+        cpq = self._upgraded_install("resolved")
+        self.assertEqual(len(cpq.get_waiting_questions()), 1)  # the stale file shadow
         with mock.patch.dict(os.environ, self._env()):
-            store, _ = adapter.room_store(self.ws, environ={})
-            out = pqa.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=HOST, store=store)
-            cpq = _cpq(self.pq, self.ws)
-            self.assertEqual(len(cpq.get_waiting_questions()), 1)
-            store.set_status(out["ask_id"], "Resolved")
-            o, e = self._main(cpq)  # the existing schedule: no --store-adapter
+            o, e = self._main(cpq)  # the existing schedule: no flag, no registration, no manual step
         self.assertIn("0 pending questions", o)
         self.assertEqual(cpq.get_waiting_questions(), [])
         self.assertIn("**Status:** resolved — in the room database", self.pq.read_text())
+        self.assertEqual(pqs.registered_adapter(self.ws), str(Path(adapter.__file__).resolve()))
+
+    def test_an_upgraded_schedule_without_the_capability_reminds_from_the_file(self):
+        self.pq.write_text("## legacy — still in the file\n\nbody\n")
+        cpq = _cpq(self.pq, self.ws)
+        with mock.patch.object(cpq, "deliver", return_value="Notified: 1") as deliver:
+            o, e = self._main(cpq)
+        self.assertEqual(deliver.call_count, 1)
+        self.assertIsNone(pqs.registered_adapter(self.ws))
 
     def test_a_failed_database_stamp_heals_on_the_next_pass(self):
         db = self.db(InProcClient(fail_ops=("stamp",)))
@@ -1235,21 +1293,87 @@ class TestMigrateRound3(_MigrateBase):
                                              "## 2026-09-29 — Pick a launch date?\n\nfresh\n\n**Status:** answered"))
         db = self._racing_store(owner_resolves)
         [done] = self.m.apply(only, self.ledger, db)
-        self.assertIn("changed while its row was made", done)
-        self.assertIn("its row was resolved", done)
-        self.assertEqual(db.open_entries(), [])
+        self.assertIn("changed since the plan", done)
+        self.assertIn("its row was superseded", done)
+        self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
         self.assertIn("fresh\n\n**Status:** answered", self.ledger.read_text())
         text = self.ledger.read_text()
         section = text[text.index("## 2026-09-29"):text.index("## 2026-07-02")]
         self.assertNotIn("moved — kept", section)
 
-    def test_a_row_that_cannot_be_compensated_is_named(self):
+    def _only(self, title="2026-09-29 — Pick a launch date?"):
         plan = self.plan()
-        only = dict(plan, entries=[e for e in plan["entries"] if e["title"] == "2026-09-29 — Pick a launch date?"])
-        db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text() + "\nedit\n"))
-        db.set_status = mock.Mock(side_effect=pqs.StoreError("socket closed"))
+        return dict(plan, entries=[e for e in plan["entries"] if e["title"] == title])
+
+    def _store_view(self, db):
+        qs, _ = _cpq(self.ledger, self.ws).gather(db)
+        return [q["title"] for q in qs]
+
+    def test_an_unrelated_edit_inside_the_row_window_is_kept_and_the_move_commits(self):
+        only = self._only()
+        db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace(
+            "an old ask with no PR", "an old ask with no PR, edited by the owner")))
         [done] = self.m.apply(only, self.ledger, db)
-        self.assertIn("ROW LEFT OPEN, resolve q-legacy-", done)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        text = self.ledger.read_text()
+        self.assertIn("an old ask with no PR, edited by the owner", text)
+        self.assertIn("fresh\n\n**Status:** moved — kept in the room database as row q-legacy-", text)
+        self.assertEqual([e["status"] for e in db.entries()], ["Open"])
+        self.assertEqual(self._store_view(db).count("2026-09-29 — Pick a launch date?"), 1)
+
+    def test_a_target_edit_in_the_window_leaves_the_file_entry_visible(self):
+        only = self._only()
+        db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace(
+            "fresh", "fresh, and the owner added a detail")))
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertIn("its row was superseded", done)
+        self.assertEqual(self._store_view(db).count("2026-09-29 — Pick a launch date?"), 1)
+        self.assertEqual(db.open_entries(), [])
+
+    def test_a_lost_acknowledgement_after_commit_converges_to_the_file(self):
+        only = self._only()
+        db = self.db()
+        real = db.insert_raw
+
+        def committed_then_lost(*a, **k):
+            real(*a, **k)
+            raise pqs.StoreError("connection lost after commit")
+        db.insert_raw = committed_then_lost
+        db.set_status, real_set = mock.Mock(side_effect=pqs.StoreError("still offline")), db.set_status
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertIn("connection lost after commit", done)
+        self.assertIn("the next reminder pass does it", done)
+        self.assertEqual([e["status"] for e in db.entries()], ["Open"])  # the orphan, before reconciling
+        self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh\n\n**Status:** answered"))
+        db.set_status = real_set
+        self.assertNotIn("2026-09-29 — Pick a launch date?", self._store_view(db))
+        self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
+
+    def test_a_retry_after_a_superseded_row_reopens_it(self):
+        only = self._only()
+        db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text().replace("fresh", "fresh!")))
+        self.m.apply(only, self.ledger, db)
+        self.assertEqual([e["status"] for e in db.entries()], ["Superseded"])
+        db2 = pqs.RoomDbStore(db.client, lock=db.lock)
+        self.ledger.write_text(self.ledger.read_text().replace("fresh!", "fresh"))
+        retry = self._only()
+        self.assertEqual(retry["entries"][0]["ask_id"], only["entries"][0]["ask_id"])
+        [done] = self.m.apply(retry, self.ledger, db2)
+        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
+        self.assertEqual([e["status"] for e in db2.entries()], ["Open"])
+
+    def test_no_database_call_is_made_while_the_ledger_lock_is_held(self):
+        lock, held_calls = pqs.ledger.lock_path(self.ledger), []
+
+        class Watching(InProcClient):
+            def _do(self, req):
+                if lock.exists():
+                    held_calls.append(req["op"])
+                return super()._do(req)
+        db = self.db(Watching())
+        done = self.m.apply(self.plan(cpw=True), self.ledger, db)
+        self.assertTrue(any(d.startswith("moved:") for d in done))
+        self.assertEqual(held_calls, [])
 
     def test_a_failed_insert_changes_nothing(self):
         plan, before = self.plan(), self.ledger.read_text()

@@ -87,16 +87,21 @@ def _key(*parts: str) -> str:
 
 
 def ensure_writes(maps: dict, schema: dict, by: str, now_ms: int) -> dict:
-    """The database from `schema` if it is missing, and any of its properties or
-    views that are missing; nothing that exists is rewritten."""
+    """The database from `schema` if it is missing, and any of its properties,
+    options or views that are missing; nothing that exists is changed."""
     db, writes = schema["id"], {m: {} for m in ("dbs", "props", "views")}
     if db not in (maps.get("dbs") or {}):
         writes["dbs"][db] = {"name": schema["name"], "order": (len(maps.get("dbs") or {}) + 1) * GAP,
                              "created": now_ms, "by": by}
     for i, p in enumerate(schema["props"]):
-        k = _key(db, p["id"])
-        if k not in (maps.get("props") or {}):
+        k, have = _key(db, p["id"]), (maps.get("props") or {}).get(_key(db, p["id"]))
+        if not isinstance(have, dict):
             writes["props"][k] = {**{x: y for x, y in p.items() if x != "id"}, "order": (i + 1) * GAP}
+        elif p.get("options"):
+            known = {o.get("id") for o in have.get("options") or [] if isinstance(o, dict)}
+            missing = [o for o in p["options"] if o["id"] not in known]
+            if missing:  # options are only ever appended; nothing stored is rewritten
+                writes["props"][k] = {**have, "options": list(have.get("options") or []) + missing}
     for i, v in enumerate(schema["views"]):
         k = _key(db, v["id"])
         if k not in (maps.get("views") or {}):
