@@ -663,6 +663,96 @@ class TestReminder(_Ws):
         self.assertIsNone(cpq.load_store(str(self.ws / "missing.py"))[0])
 
 
+class TestConvergence(_Ws):
+    """Existing schedules reconcile through the registered adapter; a one-sided
+    stamp heals in both directions."""
+
+    def _env(self):
+        return {"FAKE_ROOM_STATE": str(self.ws / "fake-room.json")}
+
+    def _main(self, cpq, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["check-pending-questions.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cpq.main()
+        return out.getvalue(), err.getvalue()
+
+    def test_discovery_registers_the_adapter_and_register_reports(self):
+        self.assertIsNone(pqs.registered_adapter(self.ws))
+        _install_fake_capability(self.ws)
+        adapter.room_store(self.ws, environ={})
+        self.assertEqual(pqs.registered_adapter(self.ws), str(Path(adapter.__file__).resolve()))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(adapter.main(["register", "--workspace", str(self.ws)]), 0)
+        self.assertIn(f"registered for the reminder: {ROOM}", out.getvalue())
+        bare = Path(tempfile.mkdtemp())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(adapter.main(["register", "--workspace", str(bare)]), 1)
+        self.assertIn("not registered", out.getvalue())
+
+    def test_an_existing_schedule_converges_a_database_resolution(self):
+        _install_fake_capability(self.ws)
+        with mock.patch.dict(os.environ, self._env()):
+            store, _ = adapter.room_store(self.ws, environ={})
+            out = pqa.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=HOST, store=store)
+            cpq = _cpq(self.pq, self.ws)
+            self.assertEqual(len(cpq.get_waiting_questions()), 1)
+            store.set_status(out["ask_id"], "Resolved")
+            o, e = self._main(cpq)  # the existing schedule: no --store-adapter
+        self.assertIn("0 pending questions", o)
+        self.assertEqual(cpq.get_waiting_questions(), [])
+        self.assertIn("**Status:** resolved — in the room database", self.pq.read_text())
+
+    def test_a_failed_database_stamp_heals_on_the_next_pass(self):
+        db = self.db(InProcClient(fail_ops=("stamp",)))
+        out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST, store=db)
+        self.assertTrue(out["db_error"].startswith("stamp:"))
+        (self.ws / "results" / out["proactive_file"]).unlink()  # a bridge drained it
+        db.client.fail_ops = ()
+        self.assertIn(pqs.placeholder(out["ask_id"]), db.open_entries()[0]["body"])
+        cpq = _cpq(self.pq, self.ws)
+        qs, notes = cpq.gather(db)
+        self.assertEqual((cpq.due_for_reminder(qs), notes), ([], []))
+        self.assertIn(f"via {out['proactive_file']}", db.open_entries()[0]["body"])
+
+    def test_a_failed_file_stamp_heals_on_the_next_pass(self):
+        db = self.db()
+        real = pqs.FileStore.stamp
+        with mock.patch.object(pqs.FileStore, "stamp", side_effect=OSError("disk busy")):
+            out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST, store=db)
+        self.assertEqual(out["ledger_error"], "OSError: disk busy")
+        (self.ws / "results" / out["proactive_file"]).unlink()
+        cpq = _cpq(self.pq, self.ws)
+        self.assertEqual(len(cpq.due_for_reminder(cpq.get_waiting_questions())), 1)
+        cpq.gather(db)
+        self.assertEqual(cpq.due_for_reminder(cpq.get_waiting_questions()), [])
+        self.assertIs(pqs.FileStore.stamp, real)
+
+    def test_a_record_copied_across_first_is_not_a_stamp_failure(self):
+        fs = pqs.FileStore(self.pq)
+        fs.insert(self.q())
+        fs.stamp("ask-1", SENT)
+        self.assertTrue(pqa._carries(fs, "ask-1", SENT))
+        self.assertFalse(pqa._carries(fs, "ask-1", "**Sent:** other"))
+        self.assertFalse(pqa._carries(self.db(InProcClient(fail="down")), "ask-1", SENT))
+
+    def test_a_reconciler_that_stamped_first_is_not_reported_as_a_failure(self):
+        real = pqs.FileStore.stamp
+
+        def reconciler_wins(store, ask_id, line):
+            real(store, ask_id, line)
+            raise pqs.StoreError("token occurs 0 times, expected 1")
+        with mock.patch.object(pqs.FileStore, "stamp", reconciler_wins):
+            out = pqa.ask_owner("q?", urgency="durable", workspace=self.ws, host=HOST, store=self.db())
+        self.assertIsNone(out["ledger_error"])
+
+    def test_two_placeholders_are_left_for_the_live_run(self):
+        fs, db = pqs.FileStore(self.pq), self.db()
+        pqs.write_question(self.q(), fs, db)
+        self.assertEqual(pqs.resync(fs, db), ([], []))
+        self.assertIn(pqs.placeholder("ask-1"), fs.open_entries()[0]["body"])
+
+
 class TestDelegation(unittest.TestCase):
     """Each write has one owner; core never names the capability."""
 
@@ -791,6 +881,10 @@ asked 2026-09-20
 
 one merged, one the server could not say
 
+## 2026-07-01 — Merge #102 after https://github.com/acme/private/pull/7?
+
+a merged PR and a private one the token cannot see (404 on both endpoints)
+
 ## 2026-07-06 — Old ask naming #501
 
 old, and its PR is unknown (401)
@@ -850,12 +944,14 @@ EXPECTED = {
     "RESOLVED? Should we revert #101": "live",
     "2026-08-04 — Merge #102 or #500?": "unknown-PR",
     "2026-07-06 — Old ask naming #501": "unknown-PR",
+    "2026-07-01 — Merge #102 after https://github.com/acme/private/pull/7?": "unknown-PR",
     "2026-08-05 — Same heading #102?": "stale-merged-PR",
     "ask-7, 2026-09-20": "live",
     "2026-06-01 — migrated": "already-migrated",
     "2026-09-20T00:00:00Z — store-managed": "already-migrated",
 }
-COUNTS = ("counts: already-migrated=2, self-resolved=5, live=6, unknown-PR=2, stale-merged-PR=5, "
+ISSUES = {404, 4358}  # numbers the issues endpoint proves are plain issues
+COUNTS = ("counts: already-migrated=2, self-resolved=5, live=6, unknown-PR=3, stale-merged-PR=5, "
           "stale-closed-PR=1, past-window=3")
 
 
@@ -869,7 +965,7 @@ class _MigrateBase(unittest.TestCase):
 
     def setUp(self):
         self.m = _load_migrate()
-        self.calls, self.slept, self.forbid = [], [], {102}
+        self.calls, self.issue_calls, self.slept, self.forbid = [], [], [], {102}
         d = Path(tempfile.mkdtemp())
         self.ledger = d / "pending-questions.md"
         self.ledger.write_text(FIXTURE)
@@ -878,6 +974,13 @@ class _MigrateBase(unittest.TestCase):
 
     def gh(self, argv, **kw):
         n = int(argv[-1].rsplit("/", 1)[1])
+        if "/issues/" in argv[-1]:
+            self.issue_calls.append(n)
+            if n in ISSUES:
+                return _Proc(0, json.dumps({"number": n}))
+            if n in PR_STATES:
+                return _Proc(0, json.dumps({"number": n, "pull_request": {}}))
+            return _Proc(1, "", "gh: Not Found (HTTP 404)")
         self.calls.append(n)
         if n in self.forbid:
             self.forbid.discard(n)
@@ -903,8 +1006,8 @@ class _MigrateBase(unittest.TestCase):
         text = self.ledger.read_text()
         return self.m.make_plan(self.triage(text), self.ledger, text, cpw)
 
-    def db(self):
-        return pqs.RoomDbStore(InProcClient(), lock=self.ws / "state" / "lock")
+    def db(self, client=None):
+        return pqs.RoomDbStore(client or InProcClient(), lock=self.ws / "state" / "lock")
 
     def waiting(self):
         return sorted(q["title"] for q in self.m._reader().parse_waiting(self.ledger.read_text()))
@@ -961,7 +1064,7 @@ class TestMigrate(_MigrateBase):
         self.assertIn("dry run: nothing written", text)
         self.assertEqual((self.ledger.read_text(), self.ledger.stat().st_mtime_ns), (FIXTURE, before))
         saved = json.loads(plan.read_text())
-        self.assertEqual(len(saved["entries"]), 24)
+        self.assertEqual(len(saved["entries"]), 25)
         self.assertFalse(saved["close_past_window"])
 
     def test_apply_needs_a_reviewed_plan(self):
@@ -1071,6 +1174,99 @@ class TestMigrateEdges(_MigrateBase):
         self.assertIn("room database unavailable", err.getvalue())
         self.assertIn("unchanged (no room database) [live]", out.getvalue())
         self.assertIn("resolved: 2026-08-01 — Should #102", out.getvalue())
+
+
+class TestMigrateRound3(_MigrateBase):
+    def _gh(self, pulls, issues):
+        def run(argv, **kw):
+            path = argv[-1]
+            code, body = (issues if "/issues/" in path else pulls)
+            return _Proc(0, json.dumps(body)) if code == 200 else _Proc(1, "", f"gh: (HTTP {code})")
+        return self.m.GhPrs(run, self.slept.append, lambda *a, **k: None)
+
+    def test_a_404_is_unknown_unless_the_issues_endpoint_proves_an_issue(self):
+        self.assertEqual(self._gh((404, None), (404, None)).state("acme/private", 7), self.m.UNKNOWN)
+        self.assertEqual(self._gh((404, None), (200, {"number": 7})).state("r/r", 7), None)
+        self.assertEqual(self._gh((404, None), (200, {"pull_request": {}})).state("r/r", 7), self.m.UNKNOWN)
+        self.assertEqual(self._gh((404, None), (500, None)).state("r/r", 7), self.m.UNKNOWN)
+
+    def test_a_private_pr_beside_a_merged_one_is_never_closed(self):
+        title = "2026-07-01 — Merge #102 after https://github.com/acme/private/pull/7?"
+        self.m.apply(self.plan(cpw=True), self.ledger, self.db())
+        self.assertIn(title, self.waiting())
+        self.assertIn(7, self.issue_calls)
+
+    def _move_to_archive(self, heading_line, body):
+        text = self.ledger.read_text()
+        block = f"{heading_line}\n\n{body}\n\n"
+        self.assertIn(block, text)
+        text = text.replace(block, "")
+        self.ledger.write_text(text.replace("# Resolved\n\n", "# Resolved\n\n" + block))
+
+    def test_an_entry_moved_below_the_divider_is_never_rewritten_or_revived(self):
+        plan, db = self.plan(), self.db()
+        self._move_to_archive("## 2026-08-01 — Should #102 go in before the release?", "body")
+        self._move_to_archive("## 2026-09-29 — Pick a launch date?", "fresh")
+        archived = self.ledger.read_text().split("# Resolved", 1)[1]
+        done = self.m.apply(plan, self.ledger, db)
+        for t in ("Should #102", "Pick a launch date"):
+            self.assertTrue(any("no longer in the active region" in d and t in d for d in done), t)
+        self.assertEqual(self.ledger.read_text().split("# Resolved", 1)[1], archived)
+        self.assertNotIn("2026-09-29 — Pick a launch date?", [e["title"] for e in db.open_entries()])
+
+    def _racing_store(self, during_insert):
+        db = self.db()
+        real = db.insert_raw
+
+        def insert_raw(*a, **k):
+            res = real(*a, **k)
+            during_insert()
+            return res
+        db.insert_raw = insert_raw
+        return db
+
+    def test_an_owner_edit_inside_the_row_window_leaves_no_open_row(self):
+        plan = self.plan()
+        only = dict(plan, entries=[e for e in plan["entries"] if e["title"] == "2026-09-29 — Pick a launch date?"])
+
+        def owner_resolves():
+            t = self.ledger.read_text()
+            self.ledger.write_text(t.replace("## 2026-09-29 — Pick a launch date?\n\nfresh",
+                                             "## 2026-09-29 — Pick a launch date?\n\nfresh\n\n**Status:** answered"))
+        db = self._racing_store(owner_resolves)
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertIn("changed while its row was made", done)
+        self.assertIn("its row was resolved", done)
+        self.assertEqual(db.open_entries(), [])
+        self.assertIn("fresh\n\n**Status:** answered", self.ledger.read_text())
+        text = self.ledger.read_text()
+        section = text[text.index("## 2026-09-29"):text.index("## 2026-07-02")]
+        self.assertNotIn("moved — kept", section)
+
+    def test_a_row_that_cannot_be_compensated_is_named(self):
+        plan = self.plan()
+        only = dict(plan, entries=[e for e in plan["entries"] if e["title"] == "2026-09-29 — Pick a launch date?"])
+        db = self._racing_store(lambda: self.ledger.write_text(self.ledger.read_text() + "\nedit\n"))
+        db.set_status = mock.Mock(side_effect=pqs.StoreError("socket closed"))
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertIn("ROW LEFT OPEN, resolve q-legacy-", done)
+
+    def test_a_failed_insert_changes_nothing(self):
+        plan, before = self.plan(), self.ledger.read_text()
+        only = dict(plan, entries=[e for e in plan["entries"] if e["title"] == "2026-09-29 — Pick a launch date?"])
+        db = self.db(InProcClient(fail_ops=("add_row",)))
+        [done] = self.m.apply(only, self.ledger, db)
+        self.assertTrue(done.startswith("skipped: StoreError"))
+        self.assertEqual(self.ledger.read_text(), before)
+
+    def test_apply_notes_a_ledger_changed_since_the_plan(self):
+        plan = self.ws / "plan.json"
+        plan.write_text(json.dumps(self.plan()))
+        self.ledger.write_text(self.ledger.read_text() + "\n## 2026-09-30 — a new question\n")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.m.main(["--apply", "--plan", str(plan), "--ledger", str(self.ledger), "--workspace", str(self.ws)])
+        self.assertIn("the ledger changed since the plan", err.getvalue())
 
 
 class TestTitleSaysResolved(unittest.TestCase):

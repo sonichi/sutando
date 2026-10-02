@@ -251,6 +251,8 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         try:
             holder.stamp(ask_id, sent_line)
         except Exception as e:  # noqa: BLE001
+            if _carries(holder, ask_id, sent_line):
+                continue  # a reconciling pass copied this run's record across first
             err = f"{type(e).__name__}: {e}"
             if holder.kind == "file":
                 out["ledger_error"] = err
@@ -260,6 +262,13 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     if urgency == "live":
         out["macos"], out["macos_fix"] = notify_macos(f"Question: {question}")
     return out
+
+
+def _carries(holder, ask_id: str, sent_line: str) -> bool:
+    try:
+        return any(e["ask_id"] == ask_id and sent_line in e["body"] for e in holder.entries())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def report_lines(out: dict) -> list:
