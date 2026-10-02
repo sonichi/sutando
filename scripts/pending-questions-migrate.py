@@ -226,7 +226,7 @@ def triage(questions: list, prs, now: float, window_days: float, repo: str, titl
         q = {**q, "kind": q.get("kind", "section")}
         cls, why = classify(q, prs, now, window_days, repo, title_resolved)
         nth, sha = identify(text, q, taken)
-        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q["title"], q["body"], host),
+        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q["title"], q["body"], host, nth or 0),
                     "nth": nth, "sha": sha})
     return out
 
@@ -245,8 +245,13 @@ def report(rows: list, ledger_file: Path, close_past_window: bool = False) -> li
     return lines
 
 
-def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool) -> dict:
-    return {"ledger": str(ledger_file), "ledger_sha256": _sha(text), "close_past_window": close_past_window,
+PLAN_VERSION = 2
+
+
+def make_plan(rows: list, ledger_file: Path, text: str, close_past_window: bool,
+              host: Optional[str] = None) -> dict:
+    return {"version": PLAN_VERSION, "host": host,
+            "ledger": str(ledger_file), "ledger_sha256": _sha(text), "close_past_window": close_past_window,
             "entries": [{k: r[k] for k in ("kind", "title", "nth", "sha", "class", "why", "ask_id", "body")}
                         for r in rows]}
 
@@ -270,6 +275,10 @@ def _with_status(text: str, r: dict, status: str) -> str:
 def apply(plan: dict, ledger_file: Path, store) -> list:
     """Carry out a saved plan, entry by entry, each guarded by its planned hash."""
     done, cpw = [], plan.get("close_past_window", False)
+    host = getattr(store, "host", None)
+    if plan.get("version") != PLAN_VERSION or (host and plan.get("host") != host):
+        return [f"refused: this plan is version {plan.get('version')} for host {plan.get('host')!r}; "
+                f"re-run the dry run on this host for a version {PLAN_VERSION} plan"]
     for r in plan["entries"]:
         action = action_of(r, cpw)
         if action.startswith("nothing") or action == ACTIONS["past-window"]:
@@ -375,7 +384,7 @@ def main(argv=None) -> int:
                   args.window_days, args.repo, cpq.title_says_resolved, text, host_label())
     print("\n".join(report(rows, args.ledger, args.close_past_window)))
     if args.plan_out:
-        args.plan_out.write_text(json.dumps(make_plan(rows, args.ledger, text, args.close_past_window),
+        args.plan_out.write_text(json.dumps(make_plan(rows, args.ledger, text, args.close_past_window, host_label()),
                                             ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"\nplan saved: {args.plan_out} (apply it with --apply --plan {args.plan_out})")
     print("\n(dry run: nothing written to the ledger or the room)")
