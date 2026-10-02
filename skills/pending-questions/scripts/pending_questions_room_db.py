@@ -9,15 +9,19 @@ repo's) and the owner's DM room and agent identity from the gateway's own readin
 winning). It returns a pending_questions_store.RoomDbStore whose client runs this
 file's `serve`, or None and the reason when anything is missing.
 
-`gather(workspace)` is READ-ONLY: this host's open rows plus the outbox's held questions,
-each once, with `unavailable: True` and `done: None` when the room cannot be read — never a
-zero; a local close whose row the view does not show is listed as `pending_close`, neither
-open nor done. `reconcile_pass(workspace)` is the explicit pass (outbox replay, local closes,
-stale marks, the transitional legacy ingest); `ask_owner` runs it first, then the queue, then
-the row, and writes no row when the outbox could not hold the question. `resolve` closes the
-row, else records the closure locally for the next reconcile — only for a question held in
-the outbox, or in outage mode once a row of this workspace was ever confirmed; an unknown id
-with neither is refused and changes no count. `remind` is the reminder.
+`gather(workspace)` is READ-ONLY — it writes no file, not even the history marker — and
+lists each ask id in exactly one bucket, by precedence: a terminal or locally closed row is
+done; a complete open row waits (in the room); an open row with no body is stood in for by
+its held entry; a held entry with no row waits (not yet in the room), or is done when closed
+locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
+when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
+(outbox replay, local closes, stale marks, the transitional legacy ingest, the history
+backfill); `ask_owner` runs it first, then the queue, then the row, and writes no row when
+the outbox could not hold the question; a confirmed row commits the history marker BEFORE
+its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
+the row, else records the closure locally for the next reconcile — only for a question held
+in the outbox, or in outage mode once a row of this workspace was ever confirmed; an unknown
+id with neither is refused and changes no count. `remind` is the reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -161,11 +165,13 @@ def reconcile_pass(workspace: Path, environ=None) -> dict:
 
 
 def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
-    """{"waiting", "done", "pending_close", "unavailable", "reason", "link", "notes", "store"}: this
-    host's open rows then the outbox's held questions (each marked not yet in the room), an ask
-    id listed once; `pending_close` names local closes with no row in view. Read-only unless
-    `reconcile`. Without a store: the outbox, and why — an outage (`unavailable`) when a row
-    of this workspace was ever confirmed, a measurement when none was."""
+    """{"waiting", "done", "pending_close", "unavailable", "reason", "link", "notes", "store"}, each
+    ask id in ONE bucket (the precedence in the module doc): this host's rows first, then the
+    outbox's held questions whose id no row already placed (marked not yet in the room);
+    `pending_close` names local closes with no row and no held entry. Read-only unless
+    `reconcile` — a read writes nothing, so a row seen here is history only once a reconcile
+    records it. Without a store: the outbox, and why — an outage (`unavailable`) when a row of
+    this workspace was ever confirmed, a measurement when none was."""
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
@@ -175,7 +181,7 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
         return {"waiting": outbox_items(ws), "done": len(done), "pending_close": pending, "unavailable": False,
                 "reason": None, "link": None, "store": None,
                 "notes": [f"room database: not used ({where}); listing the local outbox only"] + _pending_note(pending)}
-    notes, rows, done = [], [], 0
+    notes, rows, done, placed = [], [], 0, set()
     try:
         if reconcile:
             from util_paths import host_label  # noqa: PLC0415
@@ -187,15 +193,16 @@ def gather(workspace: Path, environ=None, reconcile: bool = False) -> dict:
             seen.add(e["ask_id"])
             if e["status"] in TERMINAL or e["ask_id"] in closing:
                 done += 1
+                placed.add(e["ask_id"])
             elif not e["incomplete"]:
                 rows.append(waiting_item(e["ask_id"], e["title"], e["body"], e["asked_at"], True, e["priority"]))
-        if seen:
-            mark_store_used(ws, min(seen))
+                placed.add(e["ask_id"])
+            # an open row with no body yet: its held entry (below) stands in for it
     except Exception as e:  # noqa: BLE001
         return _unavailable(ws, f"{type(e).__name__}: {e}", store)
-    held = {r["ask_id"] for r in rows}
-    rows += [it for it in outbox_items(ws) if it["ask_id"] not in held]
     in_outbox = {e["ask_id"] for e in HeldRecords(ws).entries()}
+    rows += [it for it in outbox_items(ws) if it["ask_id"] not in placed]
+    done += sum(1 for a in closing if a not in seen and a in in_outbox)  # held, closed locally, no row yet
     pending = sorted(a for a in closing if a not in seen and a not in in_outbox)
     return {"waiting": rows, "done": done, "pending_close": pending, "unavailable": False, "reason": None,
             "link": store.link, "notes": notes + _pending_note(pending), "store": store.label}
@@ -264,7 +271,9 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     """Reconcile, queue (core), hold, row, notify — each step reported, none raising past here.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
-    confirmed row marks the store as used; the queued introduction marks only itself."""
+    confirmed row commits the store-history marker, then releases its outbox entry; a marker
+    that cannot be written keeps the entry (`history_error` says so). The queued introduction
+    marks only itself."""
     from util_paths import host_label
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
@@ -299,10 +308,10 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
             out["record"] = store.where(q.ask_id)
             try:
                 mark_store_used(ws, q.ask_id)
-            except OSError as e:
+                Outbox(ws).delete(q.ask_id)
+                out["outbox"] = None
+            except OSError as e:  # the entry stays: local evidence a later outage can be read from
                 out["history_error"] = f"{type(e).__name__}: {e}"
-            Outbox(ws).delete(q.ask_id)
-            out["outbox"] = None
         else:
             out["record"] = f"outbox {out['outbox']}"
     if urgency == "live":
@@ -322,7 +331,8 @@ def report_lines(out: dict) -> list:
     if rec.get("moved"):
         lines.append(f"reconcile: moved {len(rec['moved'])} legacy file entr(ies) into the database")
     if out.get("history_error"):
-        lines.append(f"history: FAILED — {out['history_error']} (a later outage would read as a measured count)")
+        lines.append(f"history: FAILED — {out['history_error']}; the row landed, and its outbox entry is kept "
+                     "until a reconcile commits the history")
     return lines
 
 

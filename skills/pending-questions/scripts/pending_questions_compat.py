@@ -9,9 +9,9 @@ placeholder means a live run is still asking and is left alone); a `## ` section
 no ask id — main's prose, open unless its **Status:** says otherwise — keyed by a digest
 of its text; and main's free-form `- **[label, ts]** …` bullets, keyed the same way. A
 digest-keyed entry gets a settled Sent line saying its delivery was not recorded. The
-file entry is marked moved ONLY after the row is confirmed complete (`store.complete`),
-so a crash between the row and its body leaves the entry open for the next pass to
-finish. It changes nothing else in the file, no other module may read the file's
+file entry is marked moved ONLY after the row is confirmed complete (`store.complete`)
+and the store-history marker is committed, so a crash between the row and its body, or
+a marker that cannot be written, leaves the entry open for the next pass to finish. It changes nothing else in the file, no other module may read the file's
 active region, and `pending_questions_store.reconcile_pending` is its single call site.
 
 Delete this module, that call, and tests/pending-questions-compat-ingest.test.py under
@@ -40,6 +40,7 @@ for _p in (REPO / "src", HERE):
         sys.path.insert(0, str(_p))
 import pending_questions_ledger as ledger
 from pending_questions_md import DIVIDER_RE, active_region, mask_markup
+from pending_questions_outbox import mark_store_used
 from pending_questions_store import Question, StoreError, question_body, row_body, row_id, safe_body
 
 LEGACY_FILE = "pending-questions.md"
@@ -204,6 +205,7 @@ def ingest_legacy_file_entries(workspace, host: Optional[str], store) -> tuple:
                                  q.priority if q is not None else "Medium")
             if not store.complete(aid):
                 raise StoreError("the row is still incomplete")
+            mark_store_used(workspace, aid)  # the durable fact first; the file entry stays open if it fails
             err = _mark_moved(path, aid, row_id(aid))
             if err:
                 raise StoreError(err)

@@ -112,9 +112,12 @@ def main(argv=None) -> int:
         print(f"room database: not used ({where}); the question is held in the outbox")
     out = mod.ask_owner(args.question, store=store, **kw)
     lines = mod.report_lines(out)
-    if out.get("outbox"):
+    if out.get("outbox") and out.get("db_error"):
         print(f"ask-owner: ROOM DATABASE WRITE FAILED ({out['db_error']}); the question is held in "
               f"{out['outbox']} until the next reconcile", file=sys.stderr)
+    elif out.get("outbox"):
+        print(f"ask-owner: the row landed but its history was not committed ({out.get('history_error')}); "
+              f"the question stays held in {out['outbox']} until the next reconcile", file=sys.stderr)
     elif out.get("record") is None:
         print(f"ask-owner: NOT RECORDED ({out.get('db_error')}); the owner is asked but nothing holds the "
               "question — ask by hand if he does not answer", file=sys.stderr)
