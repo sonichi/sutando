@@ -135,7 +135,7 @@ Each pass, in order:
 
    Either way: budget informs the **depth** of step 6 — not whether to do it when quota permits. When the branch resolves to `LIGHT`/`MINIMAL`, skip autonomous self-development/research in step 6 even if the self-development policy is enabled; owner-requested tasks, pending questions, health/service recovery, watcher maintenance, and the build-log update remain active. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the other legitimate reasons step 6 may be skipped.
 
-0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id> --serving <task channel_id>` (task-serving; gated) or `--operator` (autonomous pass)), pending questions (`pq.py list`), the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
+0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id> --serving <task channel_id>` (task-serving; gated) or `--operator` (autonomous pass)), pending questions (`python3 src/pending_questions_reader.py list`), the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
 
 ## Skip conditions for step 6 (the ONLY legitimate reasons)
 
@@ -202,7 +202,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`pq.py ask`), and reminded only on demand (`pq.py remind`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 skills/pending-questions/scripts/pq.py reconcile` so anything the outbox holds is filed, and `pq.py list` only when the owner asks what is waiting or the pass is blocked on an answer.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list, nothing sent) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -219,7 +219,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ```bash
    # token = an entity from the warn TEXT (a path, filename, host, command), not the probe name
    H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"
-   grep -in "<subject-token>" "$H/current-track.md" | head; python3 skills/pending-questions/scripts/pq.py list --json | grep -i "<subject-token>"
+   grep -in "<subject-token>" "$H/current-track.md" | head; python3 src/pending_questions_reader.py list --json | grep -i "<subject-token>"
    ```
 
    **Grep BOTH parking files.** Warns get parked wherever the pass that triaged them was writing —
@@ -241,7 +241,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a regex not matching real exit codes, a truncated function-window read, `ps | grep` matching its
    own argv, a `git log --name-only` block-split) — each a clean, quotable, WRONG zero, never an
    error. The mitigation was a token-search of the claim's own nouns against the parking files
-   (pending questions via `pq.py list`, `current-track.md`, `build_log.md`, core memory), via
+   (pending questions via `src/pending_questions_reader.py list`, `current-track.md`, `build_log.md`, core memory), via
    `warn-already-triaged.py --claim`, chained before any claim-to-owner send.
 
    It genuinely caught things (its own test suite, `tests/proactive-loop-warn-already-triaged.test.py`,
@@ -526,7 +526,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
    ran, which is true even when the append was the one that silently went elsewhere.
 
-   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or the pending questions (`pq.py list`)? Typical relay-worthy events:
+   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or the pending questions (`python3 src/pending_questions_reader.py list`)? Typical relay-worthy events:
    - A PR opened, merged, or got a meaningful review reply
    - A pending question resolved (owner picked an option)
    - A design decision reached that hasn't shipped yet ("we'll do X tomorrow")
@@ -572,7 +572,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `pq.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
@@ -669,7 +669,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - First-PR-opened wins the claim. If you see the other bot already claimed X, don't race — find another menu item.
    - Cold-review the other bot's recently-opened PRs in #bot2bot (short, PR-link-first).
    - **No merge authority for bots.** All merges remain owner's call. Bots prepare + review; owner merges.
-   - Unresolved disagreement after 3 round-trips → aggregate both positions into one `pq.py ask`, proceed with whichever option is cheaper to reverse.
+   - Unresolved disagreement after 3 round-trips → aggregate both positions into one `scripts/ask-owner.py` ask, proceed with whichever option is cheaper to reverse.
 
 11. **Heartbeat.** If this pass shipped anything substantive (commit / PR opened or merged / memory edit / new note / new skill) AND (#bot2bot is configured AND other bot is active), post a short `done: <one-line summary>` to #bot2bot via the `bot2bot-post` skill. Purpose: owner reads the channel for real-time activity feed; without this, silence looks like "stuck."
 

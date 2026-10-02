@@ -35,7 +35,7 @@ if [ -n "$OUT" ]; then
 	for f in meta.txt git-log.txt git-status.txt build_log-tail.md health.txt quota.txt; do
 		[ -f "$OUT/$f" ] && pass "expected file exists: $f" || fail "missing file: $f"
 	done
-	# Pending questions are read through pq.py list --json: the listing (or the
+	# Pending questions are read through src/pending_questions_reader.py list --json: the listing (or the
 	# reason it failed, in .err) is always produced; the retired .md never is.
 	if [ -s "$OUT/pending-questions.json" ]; then
 		python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/pending-questions.json" \

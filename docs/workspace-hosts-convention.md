@@ -97,7 +97,7 @@ Per-host **config that should survive a rebuild** (the backup hole):
 | settings.json snapshot | (unbacked) | hosts/<hostname>/settings.json |
 | crons | `crons/<hostname>.json` (#1716) | `hosts/<hostname>/crons.json` — **wired** in `schedule-crons/SKILL.md` (self-heals from the interim/legacy path) |
 | build_log.md | machine-<host>/ (per-host) | `hosts/<hostname>/build_log.md` — F1 per-host decision; migrator (#1721) emits it; *loop write-side still emits workspace-root, relocation deferred* |
-| pending-questions.md | machine-local (per-host) | `hosts/<hostname>/pending-questions.md` — legacy, read-only history; live questions are rows of the room database (`pq.py list`) |
+| pending-questions.md | machine-local (per-host) | `hosts/<hostname>/pending-questions.md` — legacy, read-only history; live questions are rows of the room database (`src/pending_questions_reader.py list`) |
 | health-checks-extra.json | (did not exist — a host-specific probe meant editing `run_all_checks` in shared repo code) | `hosts/<hostname>/health-checks-extra.json` — **wired** in `src/health-check.py` (`check_user_defined`); opt-in, absent on a host that declares none |
 
 ### Wiring status (implemented vs deferred)

@@ -242,11 +242,11 @@ Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop
 
 ## Pending decisions
 
-When you need the owner's word on a decision or are blocked:
-1. `python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records the question as a row of the Pending questions database in the owner's room (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; `pq.py reconcile` files it), queues it as `results/proactive-*.txt` (the task's conversation only for an owner-tier task in the owner's DM; otherwise the owner's DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is read-only history.
-2. Continue working on other things — don't block.
+When you need the owner's word or are blocked:
+1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records it as a row of the owner's Pending questions database, via the store an installed skill declares (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next reconcile files it), queues it as `results/proactive-*.txt` (the task's conversation when that is the owner's DM; else his DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is history only.
+2. Continue with other work; don't block.
 
-`pq.py list` is read-only and only when the owner asks or you are blocked; `pq.py resolve <id>` when he answers. Reminders only on demand (`pq.py remind`); nothing is scheduled or surfaced per pass.
+`python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists; `--notify` reminds, on demand only; nothing is scheduled or surfaced per pass.
 
 ## Task progress notifications
 

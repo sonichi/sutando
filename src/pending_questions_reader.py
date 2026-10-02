@@ -15,7 +15,9 @@ reason — what the adapter holds locally, lists or counts is the adapter's to s
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
-CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count`.
+CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count`; and the
+one write a core caller makes through the same contract, `resolve <ask-id> [--answered]`
+(Resolved, or Answered), which is `resolve` above and nothing else.
 """
 from __future__ import annotations
 
@@ -151,14 +153,23 @@ def unknown_line(g: dict) -> str:
 
 def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
-    ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only).")
-    ap.add_argument("command", choices=("list", "count"))
+    ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
+                                 "or resolve one through the declared store.")
+    ap.add_argument("command", choices=("list", "count", "resolve"))
+    ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--workspace", type=Path, default=None)
     args = ap.parse_args(argv)
     if args.workspace is None:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         args.workspace = resolve_workspace(migrate=False)
+    if args.command == "resolve":
+        if not args.ask_id:
+            ap.error("resolve needs an ask id")
+        ok, msg = resolve(args.workspace, args.ask_id, "Answered" if args.answered else "Resolved")
+        print(msg)
+        return 0 if ok else 1
     g = gather(args.workspace)
     for note in g["notes"]:
         print(note, file=sys.stderr)

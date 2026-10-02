@@ -447,6 +447,36 @@ class ManifestContract(unittest.TestCase):
         store, _ = adapter.room_store(ws, environ={})
         self.assertNotIn("--collab-url", store.client.argv)
 
+    def test_core_instructions_and_sibling_skills_name_the_public_contract_not_the_skills_cli(self):
+        for rel in ("CLAUDE.md", "AGENTS.md", "skills/context-reconstruct/SKILL.md", "skills/proactive-loop/SKILL.md",
+                    "skills/proactive-loop/scripts/warn-already-triaged.py", "skills/self-diagnose/scripts/gather.sh",
+                    "docs/proactive-loop-rationale.md", "docs/design-mediated-capability-layer.md"):
+            text = (REPO / rel).read_text()
+            self.assertNotIn("pq.py", text, f"{rel} names the skill's private CLI")
+            self.assertNotIn("skills/pending-questions/scripts", text, rel)
+        for rel in ("CLAUDE.md", "AGENTS.md"):
+            text = (REPO / rel).read_text()
+            for entry in ("scripts/ask-owner.py", "src/pending_questions_reader.py list", "src/check-pending-questions.py"):
+                self.assertIn(entry, text, f"{rel} lacks {entry}")
+        self.assertLessEqual(len((REPO / "CLAUDE.md").read_bytes()), 40960)
+
+    def test_the_reader_cli_resolves_through_the_declared_store(self):
+        ws = Path(tempfile.mkdtemp(prefix="r35-cli-"))
+        for d in ("results", "state", f"hosts/{HOST}"):
+            (ws / d).mkdir(parents=True)
+        held = adapter.ask_owner("held?", urgency="durable", workspace=ws, host=HOST, store=None)
+        cmd = [sys.executable, str(REPO / "src" / "pending_questions_reader.py"), "resolve", "--workspace", str(ws)]
+        r = subprocess.run(cmd + ["ask-never-existed"], capture_output=True, text=True, timeout=120, env=ENV)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no held question ask-never-existed", r.stdout)
+        r = subprocess.run(cmd + [held["ask_id"], "--answered"], capture_output=True, text=True, timeout=120, env=ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("recorded locally as Answered", r.stdout)
+        self.assertEqual(sorted(pqs.Outbox(ws).closes()), [held["ask_id"]])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=ENV)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("resolve needs an ask id", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
