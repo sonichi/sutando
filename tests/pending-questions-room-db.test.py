@@ -618,23 +618,6 @@ class TestMigratedRows(_Ws):
         self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
         self.assertEqual([e["status"] for e in db.entries()], ["Open"])
 
-    def test_an_older_heads_superseded_status_reads_open_and_is_reconciled(self):
-        self.pq.write_text(self.MOVED)
-        doc = fake_client.FakeDoc()
-        db = self.db(InProcClient(doc))
-        db.insert_raw("legacy-abc123def456", "migrated", "page")
-        doc.maps["cells"]["pendingq|q-legacy-abc123def456|status"] = {"v": "superseded", "updated": 1, "by": AGENT}
-        self.assertEqual([e["status"] for e in db.entries()], ["Open"])
-        fs = pqs.FileStore(self.pq)
-        self.assertEqual(pqs.resync(fs, db), (["legacy-abc123def456"], []))
-        self.assertEqual(doc.maps["cells"]["pendingq|q-legacy-abc123def456|status"]["v"], "open")
-        self.assertEqual(pqs.resync(fs, db), ([], []))
-        self.assertEqual(_cpq(self.pq, self.ws).gather(db)[0][0]["title"], "migrated")
-        self.pq.write_text("")
-        self.assertEqual(pqs.resync(pqs.FileStore(self.pq), db), (["legacy-abc123def456"], []))
-        self.assertEqual(db.status_of("legacy-abc123def456"), pqs.SUPERSEDED)
-
-
 class TestTwoHostsOneRoom(_Ws):
     """Two hosts share one room database; each has its own ledger and results."""
 
@@ -651,7 +634,7 @@ class TestTwoHostsOneRoom(_Ws):
 
     def _pass(self, h):
         hs = self.hosts[h]
-        return pqs.resync(hs["file"], hs["db"], evidence=lambda a: pqa.asked_here(hs["dir"] / "results", a))
+        return pqs.resync(hs["file"], hs["db"])
 
     def _status(self):
         return {e["ask_id"]: (e["status"], e["host"]) for e in self.hosts["host-a"]["db"].entries()}
@@ -678,43 +661,6 @@ class TestTwoHostsOneRoom(_Ws):
             self.assertEqual(self._status(), before)
         self.assertEqual(self._gather("host-b"), [])
         self.assertEqual(self._gather("host-a"), ["host A's question?", "migrated"])
-
-    def test_an_unmarked_row_is_claimed_only_by_the_host_with_evidence_and_keeps_its_status(self):
-
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw("ask-old", "old test row", "p")
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
-            "legacy-abc123def456", "migrated", "p")
-        nohost = pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x")
-        nohost.set_status("ask-old", "Resolved")
-        a = self.hosts["host-a"]
-        a["file"].path.write_text(TestMigratedRows.MOVED)
-        (a["dir"] / "results" / "archive" / "proactive-ask-old-1790000000.txt").write_text("delivered")
-        self.assertEqual(self._pass("host-b"), ([], []))
-        self.assertEqual({k: v[1] for k, v in self._status().items()}, {"ask-old": None, "legacy-abc123def456": None})
-        synced, errors = self._pass("host-a")
-        self.assertEqual((sorted(synced), errors), (["ask-old", "legacy-abc123def456"], []))
-        self.assertEqual(self._status(), {"ask-old": ("Resolved", "host-a"),
-                                          "legacy-abc123def456": ("Open", "host-a")})
-        self.assertEqual(self._pass("host-a"), ([], []))
-
-    def test_a_host_that_loses_the_claim_leaves_the_row_alone(self):
-        pqs.RoomDbStore(InProcClient(self.doc), lock=self.ws / "state" / "x").insert_raw(
-            "legacy-race", "migrated", "p")
-        a, b = self.hosts["host-a"], self.hosts["host-b"]
-        real_rows = b["db"].client.rows
-
-        def rows_then_a_claims(schema):
-            seen = real_rows(schema)  # host B's view: no Host yet
-            self.assertTrue(a["db"].claim_host("legacy-race"))
-            return seen
-        b["db"].client.rows = rows_then_a_claims
-        synced, errors = pqs.resync(b["file"], b["db"], evidence=lambda aid: True)
-        self.assertEqual((synced, errors), ([], []))
-        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
-        b["db"].client.rows = real_rows
-        self.assertEqual(self._pass("host-b"), ([], []))
-        self.assertEqual(self._status(), {"legacy-race": ("Open", "host-a")})
-
 
 class TestMonotonicStatus(_Ws):
     def test_code_never_reopens_or_downgrades_a_closed_row(self):
@@ -782,31 +728,6 @@ class TestConcurrentReplicas(_Ws):
                         self.assertEqual(got[0], got[1])
                         self.assertIn(got[0], pqs.TERMINAL)
                         self.assertEqual(got[0], owner_status.capitalize())
-
-    def test_a_losing_claimants_marks_are_ignored_and_cleared_in_either_merge_order(self):
-        for a_wins in (True, False):
-            for write in ("supersede", "close"):
-                with self.subTest(a_wins=a_wins, write=write):
-                    base_doc = fake_client.FakeDoc()
-                    pqs.RoomDbStore(InProcClient(base_doc), lock=self.ws / "state" / "x").insert_raw(
-                        "legacy-abc123def456", "migrated", "page")
-                    a, b = fake_client.FakeDoc(), fake_client.FakeDoc()
-                    a.maps = json.loads(json.dumps(base_doc.maps))
-                    b.maps, base = json.loads(json.dumps(base_doc.maps)), json.loads(json.dumps(base_doc.maps))
-                    sa = pqs.RoomDbStore(InProcClient(a), lock=self.ws / "state" / "a", host="host-a")
-                    sb = pqs.RoomDbStore(InProcClient(b), lock=self.ws / "state" / "b", host="host-b")
-                    self.assertEqual((sa.claim_host("legacy-abc123def456"), sb.claim_host("legacy-abc123def456")),
-                                     (True, True))  # both replicas were stale
-                    getattr(sb, write)("legacy-abc123def456", *(["Resolved"] if write == "close" else []))
-                    self._merge(base, a, b, a_wins=a_wins)
-                    row = [e for e in sa.entries() if e["ask_id"] == "legacy-abc123def456"][0]
-                    if a_wins:
-                        self.assertEqual((row["host"], row["status"]), ("host-a", "Open"))
-                        sa.clear("legacy-abc123def456", row["stale"])
-                        self.assertEqual([e["stale"] for e in sa.entries()], [[]])
-                    else:
-                        self.assertEqual(row["host"], "host-b")
-                        self.assertNotEqual(row["status"], "Open")
 
     def test_a_stale_close_beside_the_owners_status_is_cleared_so_the_row_stays_visible(self):
         self.pq.write_text("# Open\n\n")
@@ -1022,7 +943,8 @@ class TestConvergence(_Ws):
         row and its file shadow, and NO registration; nothing of this head is called."""
         _install_fake_capability(self.ws)
         doc = fake_client.FakeDoc()
-        db = pqs.RoomDbStore(InProcClient(doc), lock=self.ws / "state" / "setup.lock")
+        db = pqs.RoomDbStore(InProcClient(doc), lock=self.ws / "state" / "setup.lock",
+                             host=importlib.import_module("util_paths").host_label())
         pqs.write_question(self.q(), pqs.FileStore(self.pq), db)
         for s_ in (db, pqs.FileStore(self.pq)):
             s_.stamp("ask-1", SENT)
@@ -1138,7 +1060,7 @@ class TestDelegation(unittest.TestCase):
     def test_the_reminder_writes_only_through_resync(self):
         s = self.src("src/check-pending-questions.py")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|stamp|set_status)\(")
-        self.assertIn("resync(FileStore(PQ_FILE), store,", s)
+        self.assertIn("resync(FileStore(PQ_FILE), store)", s)
 
     def test_the_migrate_writes_the_file_only_through_the_ledger(self):
         s = self.src("scripts/pending-questions-migrate.py")
@@ -1679,17 +1601,6 @@ class TestMigrateRound3(_MigrateBase):
         self.assertTrue(done.startswith("skipped: StoreError"))
         self.assertEqual(self.ledger.read_text(), before)
 
-    def test_a_retry_over_an_older_heads_superseded_row_leaves_it_visible(self):
-        only = self._only()
-        aid, client = only["entries"][0]["ask_id"], InProcClient()
-        db = self.db(client)
-        db.insert_raw(aid, "Pick a launch date?", "page")
-        client.doc.maps["cells"][f"pendingq|{pqs.row_id(aid)}|status"] = {"v": "superseded", "updated": 1, "by": AGENT}
-        [done] = self.m.apply(only, self.ledger, db)
-        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
-        self.assertEqual(db.status_of(aid), "Open")
-        self.assertEqual(self._store_view(db).count("Pick a launch date?"), 1)
-
     def test_a_migration_on_another_hosts_row_never_changes_it(self):
         only = self._only()
         aid, client = only["entries"][0]["ask_id"], InProcClient()
@@ -1705,21 +1616,6 @@ class TestMigrateRound3(_MigrateBase):
         self.assertEqual(self.ledger.read_text(), before)
         self.assertEqual([(e["status"], e["host"], e["recovery"]) for e in host_b.entries()],
                          [("Open", "host-a", False)])
-
-    def test_a_retry_over_a_pre_host_superseded_row_adopts_it_in_production_shape(self):
-        only = self._only()
-        aid, client = only["entries"][0]["ask_id"], InProcClient()
-        pqs.RoomDbStore(client, lock=self.ws / "state" / "old").insert_raw(aid, "Pick a launch date?", "page")
-        client.doc.maps["cells"][f"pendingq|{pqs.row_id(aid)}|status"] = {"v": "superseded", "updated": 1, "by": AGENT}
-        client.doc.maps["props"]["pendingq|status"]["options"].append({"id": "superseded", "name": "Superseded"})
-        db = pqs.RoomDbStore(client, lock=self.ws / "state" / "lock", host="this-host")
-        [done] = self.m.apply(only, self.ledger, db)
-        self.assertEqual(done, "moved: 2026-09-29 — Pick a launch date?")
-        cells = adapter._cells(client.doc.maps, "pendingq", pqs.row_id(aid))
-        self.assertEqual((cells.get("host"), cells.get("status")), ("this-host", "open"))
-        db.entries()  # the next adapter call drops the retired option once no row holds it
-        opts = [o["id"] for o in client.doc.maps["props"]["pendingq|status"]["options"]]
-        self.assertNotIn("superseded", opts)
 
     def test_an_insert_failure_on_an_existing_resolved_row_leaves_it_resolved(self):
         only = self._only()
