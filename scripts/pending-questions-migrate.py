@@ -38,6 +38,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
@@ -219,13 +220,13 @@ def action_of(r: dict, close_past_window: bool) -> str:
 
 
 def triage(questions: list, prs, now: float, window_days: float, repo: str, title_resolved=None,
-           text: str = "") -> list:
+           text: str = "", host: Optional[str] = None) -> list:
     out, taken = [], set()
     for q in questions:
         q = {**q, "kind": q.get("kind", "section")}
         cls, why = classify(q, prs, now, window_days, repo, title_resolved)
         nth, sha = identify(text, q, taken)
-        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q["title"], q["body"]),
+        out.append({**q, "class": cls, "why": why, "ask_id": legacy_ask_id(q["title"], q["body"], host),
                     "nth": nth, "sha": sha})
     return out
 
@@ -369,8 +370,9 @@ def main(argv=None) -> int:
         print("\n".join(apply(plan, args.ledger, store)))
         return 0
     text = args.ledger.read_text(encoding="utf-8") if args.ledger.exists() else ""
+    from util_paths import host_label  # noqa: PLC0415
     rows = triage(cpq.parse_waiting(text, keep_title_resolved=True), GhPrs(), args.now or time.time(),
-                  args.window_days, args.repo, cpq.title_says_resolved, text)
+                  args.window_days, args.repo, cpq.title_says_resolved, text, host_label())
     print("\n".join(report(rows, args.ledger, args.close_past_window)))
     if args.plan_out:
         args.plan_out.write_text(json.dumps(make_plan(rows, args.ledger, text, args.close_past_window),
