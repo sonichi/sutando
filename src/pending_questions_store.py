@@ -601,11 +601,11 @@ def settled(line: Optional[str]) -> bool:
     return bool(line) and not _PLACEHOLDER_RE.match(line)
 
 
-def resync(file_store: FileStore, db_store, claim=None) -> tuple:
+def resync(file_store: FileStore, db_store, evidence=None) -> tuple:
     """Bring this host's rows and this host's file level, never retiring a file entry.
 
     Only rows whose Host is this host are touched; a row with no Host is this
-    host's when its file links it or `claim(ask_id)` (this host's own evidence)
+    host's when its file links it or `evidence(ask_id)` (this host's own evidence)
     says so, and is then marked with no status change; any other row is foreign.
     For this host's rows: an open file entry the database lacks is inserted with
     its structured fields; an entry below the divider closes its row; a status
@@ -629,7 +629,7 @@ def resync(file_store: FileStore, db_store, claim=None) -> tuple:
     for aid, r in found.items():
         if db_store.owns(r):
             own[aid] = r
-        elif not r.get("host") and (aid in linked or (claim is not None and claim(aid))):
+        elif not r.get("host") and (aid in linked or (evidence is not None and evidence(aid))):
             try:
                 if db_store.claim_host(aid):
                     synced.append(aid)

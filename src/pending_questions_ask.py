@@ -237,7 +237,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     out["ledger"] = str(pq)
     file_store = FileStore(pq)
     if store is not None:
-        synced, errors = resync(file_store, store, claim=lambda a: asked_here(ws / "results", a))
+        synced, errors = resync(file_store, store, evidence=lambda a: asked_here(ws / "results", a))
         out["resync"] = {"synced": synced, "errors": errors}
     q = Question(ask_id, question, context, now, default_action, reason, tuple(options or ()),
                  priority)

@@ -277,7 +277,7 @@ def gather(store=None):
     if store is not None:
         try:
             _synced, errors = resync(FileStore(PQ_FILE), store,
-                                     claim=lambda a: asked_here(RESULTS_DIR, a))
+                                     evidence=lambda a: asked_here(RESULTS_DIR, a))
             notes += [f"resync: FAILED — {e}" for e in errors]
             archived = FileStore(PQ_FILE).archived_ids()
             mine = [e for e in store.entries() if store.owns(e)]
