@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -339,7 +340,7 @@ class Finding2ReminderContract(unittest.TestCase):
 
     def test_a_failed_import_executes_once_per_process_and_once_per_public_invocation(self):
         """Round 41: a failing adapter was executed again by the public fallback and by the second
-        phase of the pass. The failure is remembered like a success; one operation resolves once."""
+        phase of the pass. The failure is remembered for the failure window; one operation resolves once."""
         import pending_questions_reader as reader
         reader._LOADED.clear()
         f = self._counting_adapter("failing", fail=True)
@@ -359,7 +360,7 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("UNKNOWN", out.getvalue())
         self.assertIn("adapter executed 1", out.getvalue(), "the public fallback kept the first failure")
-        self.assertEqual(self._count(f), 1, "no retry of a failed import in the same process")
+        self.assertEqual(self._count(f), 1, "no retry of a failed import inside the failure window")
         self.assertEqual(loads.call_count, 1, "one resolution per public invocation, cache or not")
 
     def test_reconcile_then_gather_hands_one_resolved_module_to_both_phases(self):
@@ -435,6 +436,167 @@ class Finding2ReminderContract(unittest.TestCase):
         shipped = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_room_db.py").read_text()
         self.assertRegex(shipped, r"def gather\(workspace: Path, environ=None\) -> dict:")
         self.assertIsNone(re.search(r"def gather\([^)]*reconcile", shipped), "no keyword the contract does not name")
+
+
+# An adapter whose top level counts its executions, raises while a `.down` sidecar exists,
+# and reports the store `label`; `extra` runs before the contract body.
+def _adapter_source(label, extra=""):
+    return (
+        "from pathlib import Path as _P\n"
+        "_c = _P(__file__).with_suffix('.count')\n"
+        "_c.write_text(str(int(_c.read_text()) + 1) if _c.exists() else '1')\n"
+        "if _P(__file__).with_suffix('.down').exists():\n"
+        "    raise ImportError('transient dependency unavailable')\n"
+        + extra + MINIMAL.replace('"minimal"', f'"{label}"'))
+
+
+class _Gate:
+    """A stand-in for the reader's lock: `arrived` fires when a caller reaches it; `inner` is
+    what it then takes, so the test holds the entry while it replaces the adapter file."""
+
+    def __init__(self, inner, arrived):
+        self.inner, self.arrived = inner, arrived
+
+    def __enter__(self):
+        self.arrived.set()
+        return self.inner.__enter__()
+
+    def __exit__(self, *a):
+        return self.inner.__exit__(*a)
+
+
+class Round42LoaderLifecycle(unittest.TestCase):
+    """keweichen at 711b9f7f9: a load failure was the one retained exception object, re-raised
+    (and growing) for the process lifetime; the cache key was sampled before the lock, so a file
+    replaced while waiting was published under the old key; the successful public reminder path
+    resolved its adapter twice."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pq-r42-"))
+        self.ws = self.tmp / "ws"
+        for d in ("results", "state", "logs"):
+            (self.ws / d).mkdir(parents=True)
+        (self.ws / "room.json").write_text(json.dumps([{"ask_id": "ask-ok", "title": "live?"}]))
+        self.f = self.tmp / "adapter.py"
+        reader._LOADED.clear()
+
+    def _count(self):
+        c = self.f.with_suffix(".count")
+        return int(c.read_text()) if c.exists() else 0
+
+    def _replace(self, source):
+        tmp = self.f.with_name("incoming.py")
+        tmp.write_text(source)
+        import os
+        os.replace(tmp, self.f)
+
+    def test_a_transient_load_failure_recovers_after_the_failure_window(self):
+        """Her repro: the adapter raises while its dependency is unavailable; with the dependency
+        back and the file unchanged, a later operation must read live again. The failure is served
+        inside FAILURE_TTL_SEC (one operation, the polls behind it), then the file is retried."""
+        self.f.write_text(_adapter_source("v1"))
+        self.f.with_suffix(".down").write_text("")
+        first = reader.gather(self.ws, self.f)
+        self.assertTrue(first["unavailable"])
+        self.assertIn("transient dependency unavailable", first["reason"])
+        self.f.with_suffix(".down").unlink()
+        second = reader.gather(self.ws, self.f)
+        self.assertTrue(second["unavailable"], "inside the window the one failure is served, not re-executed")
+        self.assertEqual(self._count(), 1)
+        later = time.monotonic() + reader.FAILURE_TTL_SEC + 1
+        with mock.patch.object(reader.time, "monotonic", return_value=later):
+            third = reader.gather(self.ws, self.f)
+        self.assertFalse(third["unavailable"], third["reason"])
+        self.assertEqual([q["ask_id"] for q in third["waiting"]], ["ask-ok"])
+        self.assertEqual(self._count(), 2, "retried once the window passed, nothing in between")
+
+    def test_repeated_reads_of_a_cached_failure_keep_a_string_and_a_constant_traceback(self):
+        """Her repro: 10,000 reads of one retained exception accumulated 20,002 frames and ~20 MB.
+        The cache holds the reason as a string; each hit raises a fresh LoadFailed."""
+        import traceback
+        self.f.write_text(_adapter_source("v1"))
+        self.f.with_suffix(".down").write_text("")
+        self.assertTrue(reader.gather(self.ws, self.f)["unavailable"])
+        depths, raised = set(), []  # the exceptions are kept alive so their ids are not reused
+        for _ in range(1000):
+            with self.assertRaises(reader.LoadFailed) as cm:
+                reader.load_adapter(self.f)
+            depths.add(len(traceback.extract_tb(cm.exception.__traceback__)))
+            raised.append(cm.exception)
+            self.assertEqual(str(cm.exception), "ImportError: transient dependency unavailable")
+        self.assertEqual(len(depths), 1, f"traceback depth must not grow with reads: {sorted(depths)}")
+        self.assertEqual(self._count(), 1)
+        [entry] = reader._LOADED.values()
+        self.assertNotIsInstance(entry, BaseException, "the cache never retains an exception object")
+        self.assertIsInstance(entry.reason, str)
+        self.assertEqual(len({id(e) for e in raised}), 1000, "a fresh exception per hit, not one re-raised object")
+
+    def test_a_file_replaced_while_a_reader_waits_at_the_lock_is_published_under_its_own_key(self):
+        """Her repro: a reader sampled v1's key, waited at the lock while the file became v2, then
+        executed v2 and published it under v1's key; the next reader executed v2 again. The identity
+        is taken under the lock, so v2 executes once, under its key, and both readers read live."""
+        import os
+        import threading
+        v2 = _adapter_source("v2", "_m = _P(__file__).with_suffix('.v2')\n"
+                                   "if _m.exists():\n    raise RuntimeError('v2 executed twice')\n"
+                                   "_m.write_text('1')\n")
+        self.f.write_text(_adapter_source("v1"))
+        inner, arrived, results = threading.Lock(), threading.Event(), []
+        inner.acquire()
+        a = threading.Thread(target=lambda: results.append(reader.gather(self.ws, self.f)))
+        with mock.patch.object(reader, "_LOAD_LOCK", _Gate(inner, arrived)):
+            a.start()
+            self.assertTrue(arrived.wait(5), "reader A reached the lock")
+            self._replace(v2)
+            st = self.f.stat()
+            os.utime(self.f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # a distinct mtime, whatever the clock
+            inner.release()
+            a.join(5)
+            results.append(reader.gather(self.ws, self.f))
+        self.assertEqual([(g["unavailable"], g.get("store"), g["reason"]) for g in results],
+                         [(False, "v2", None), (False, "v2", None)], "both readers read the live v2, never UNKNOWN")
+        self.assertEqual(self._count(), 1, "v2 executed exactly once")
+        self.assertEqual(len(reader._LOADED), 1, "one entry, v2 under v2's own identity")
+        self.assertEqual(reader.gather(self.ws, self.f)["store"], "v2")
+        self.assertEqual(self._count(), 1, "the next read is the cached v2")
+
+    def test_a_file_replaced_during_its_execution_is_served_under_the_bytes_each_reader_ran(self):
+        """Thread A executes v1 (slow) under the lock; the file becomes v2 meanwhile. A publishes
+        the bytes it ran under their digest; B reads the file again and executes v2 once; v1's
+        entry goes (one version per path), and the next read is the cached v2."""
+        import threading
+        v1 = _adapter_source("v1", "import time as _t\n_P(__file__).with_suffix('.started').write_text('')\n_t.sleep(0.4)\n")
+        self.f.write_text(v1)
+        started, results = self.f.with_suffix(".started"), []
+        a = threading.Thread(target=lambda: results.append(reader.gather(self.ws, self.f)))
+        a.start()
+        for _ in range(100):
+            if started.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(started.exists(), "v1 is executing")
+        self._replace(_adapter_source("v2"))
+        a.join(5)
+        results.append(reader.gather(self.ws, self.f))
+        self.assertEqual([(g["unavailable"], g.get("store")) for g in results], [(False, "v1"), (False, "v2")])
+        self.assertEqual(self._count(), 2, "v1 once, v2 once")
+        self.assertEqual(len(reader._LOADED), 1, "v1's identity is not retained beside v2's")
+        reader.gather(self.ws, self.f)
+        self.assertEqual(self._count(), 2, "the next read is the cached v2")
+
+    def test_a_same_size_same_second_rewrite_is_new_bytes_not_a_cache_hit(self):
+        """A stat key (path, mtime, size) is the same for this rewrite, and the stale __pycache__
+        entry would run v1 again: the identity is the bytes, and they are what is compiled."""
+        import os
+        self.f.write_text(_adapter_source("v1"))
+        self.assertEqual(reader.gather(self.ws, self.f)["store"], "v1")
+        st = self.f.stat()
+        self._replace(_adapter_source("v2"))  # the same length
+        os.utime(self.f, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual((self.f.stat().st_mtime_ns, self.f.stat().st_size), (st.st_mtime_ns, st.st_size))
+        self.assertEqual(reader.gather(self.ws, self.f)["store"], "v2")
+        self.assertEqual(self._count(), 2)
+        self.assertEqual(len(reader._LOADED), 1, "the old identity's module is not retained")
 
 
 if __name__ == "__main__":
