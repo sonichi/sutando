@@ -156,12 +156,16 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
 
 
 def attested_task_headers(text: str, workspace: Path | None = None):
-    """Headers a tier or routing decision may read: the strict task-last parse, plus the
-    region below `task:` (last-wins) only when the envelope verifies; a body line never fills a gap."""
+    """Headers a tier or routing decision may read. The strict task-last parse always;
+    the full last-wins scan only when the writer declared `task_layout: mid` above
+    `task:` AND the envelope verifies. The HMAC alone proves bytes, not shape: a signed
+    task-last body could otherwise promote header-looking lines."""
     import local_task_protocol as ltp  # noqa: PLC0415
-    if verify_text(text, workspace).get("verdict") == "verified":
+    strict = ltp.parse_task_headers(text)
+    if (strict.headers.get("task_layout") or "").strip() == "mid" and \
+            verify_text(text, workspace).get("verdict") == "verified":
         return ltp.parse_task_headers_trusted(text)
-    return ltp.parse_task_headers(text)
+    return strict
 
 
 def main(argv: list[str]) -> int:

@@ -1736,6 +1736,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
                 "source", "channel_id",
+                # Declares the task-mid shape (one-line body, writer-owned trailer) so a
+                # verified reader may trust the lines below task:. Above it: a body cannot claim it.
+                "task_layout",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -3289,6 +3292,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "task_layout":
+            lines.append("task_layout: mid")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.

@@ -194,6 +194,9 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
+    # one line and every later line is the writer's; meaningful only under a verified envelope.
+    "task_layout",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
