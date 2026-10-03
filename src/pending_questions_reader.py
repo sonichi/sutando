@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
+from typing import NamedTuple, Optional
 from skill_roots import declared
 
 # The manifest field an installed skill declares its adapter script with.
@@ -34,39 +36,71 @@ DECLARATION = "pending_questions_store"
 
 
 _LOADED: dict = {}
+_LOAD_LOCK = threading.Lock()
+
+
+class LoadFailed(RuntimeError):
+    """The adapter file raised when executed; remembered per file identity, like a success."""
+
+
+class Resolved(NamedTuple):
+    """One operation's adapter: the module, or None with `reason`. Resolved exactly once per
+    public call and handed to every phase, so reconcile and gather never see two modules."""
+    module: object
+    reason: Optional[str]
 
 
 def load_adapter(adapter):
-    """The adapter module from its file, executed once per process; None when there is none."""
+    """The adapter module from its file, executed once per process under a lock — concurrent
+    first reads wait for the one execution; a failure is remembered the same way; None when there
+    is none. A rewritten file (mtime or size changed) is a new file."""
     if not adapter:
         return None
     path = Path(adapter).resolve()
     st = path.stat()
-    key = (str(path), st.st_mtime_ns, st.st_size)  # the same file once; a rewritten file is new
-    if key not in _LOADED:
-        import importlib.util  # noqa: PLC0415
-        spec = importlib.util.spec_from_file_location("pq_store_adapter", str(path))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _LOADED[key] = mod
-    return _LOADED[key]
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    with _LOAD_LOCK:
+        if key not in _LOADED:
+            import importlib.util  # noqa: PLC0415
+            spec = importlib.util.spec_from_file_location("pq_store_adapter", str(path))
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as e:  # noqa: BLE001 — third-party code
+                _LOADED[key] = LoadFailed(f"{type(e).__name__}: {e}")
+            else:
+                _LOADED[key] = mod
+        got = _LOADED[key]
+    if isinstance(got, LoadFailed):
+        raise got
+    return got
 
 
 NO_ADAPTER = "no pending-questions store adapter installed (no skill declares one)"
 
 
-def _adapter(adapter=None):
-    """(module, path) or (None, why). `adapter` is what the edge injected: a script path, or the
-    skill_roots.Declaration it resolved; None, or a declaration of none, is NO_ADAPTER exactly."""
+def resolve_adapter(adapter=None) -> Resolved:
+    """The one resolution of what an edge injected: a `Resolved` is returned as is; a loaded module
+    is wrapped; a script path or skill_roots.Declaration is loaded (once per process); None, or a
+    declaration of none, is NO_ADAPTER exactly."""
+    if isinstance(adapter, Resolved):
+        return adapter
     if hasattr(adapter, "gather"):  # an already-loaded module: no second execution
-        return adapter, getattr(adapter, "__file__", "<module>")
+        return Resolved(adapter, getattr(adapter, "__file__", "<module>"))
     path, why = adapter if isinstance(adapter, tuple) else (adapter, None)  # a Declaration is a tuple
     if not path:
-        return None, why or NO_ADAPTER
+        return Resolved(None, why or NO_ADAPTER)
     try:
-        return load_adapter(path), str(path)
+        return Resolved(load_adapter(path), str(path))
     except Exception as e:  # noqa: BLE001
-        return None, f"adapter {path} failed to load ({type(e).__name__}: {e})"
+        reason = str(e) if isinstance(e, LoadFailed) else f"{type(e).__name__}: {e}"
+        return Resolved(None, f"adapter {path} failed to load ({reason})")
+
+
+def _adapter(adapter=None):
+    """(module, path) or (None, why) — `resolve_adapter` as a pair, for the phases."""
+    r = resolve_adapter(adapter)
+    return r.module, r.reason
 
 
 def _unavailable(reason: str) -> dict:
@@ -115,8 +149,9 @@ def reconcile_pass(workspace, adapter=None) -> dict:
 def reconcile_then_gather(workspace, adapter=None) -> dict:
     """The reminder's pass: `reconcile_pass`, its errors as notes, then `gather` — one load, one
     failure policy (a raised step is a note or UNKNOWN, never a traceback)."""
-    rec = reconcile_pass(workspace, adapter)
-    g = gather(workspace, adapter)
+    one = resolve_adapter(adapter)  # both phases see this module, or this one failure
+    rec = reconcile_pass(workspace, one)
+    g = gather(workspace, one)
     g["notes"] = [f"reconcile: FAILED — {e}" for e in rec.get("errors", [])] + list(g.get("notes", []))
     return g
 

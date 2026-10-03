@@ -19,8 +19,8 @@ def main(argv=None) -> int:
     override = argv[argv.index("--store-adapter") + 1] if "--store-adapter" in argv[:-1] else None
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     workspace = resolve_workspace(migrate=False)
-    store = declared(reader.DECLARATION, workspace, override=override)
-    mod, why = reader._adapter(store)
+    store = reader.resolve_adapter(declared(reader.DECLARATION, workspace, override=override))
+    mod, why = store  # resolved once for this invocation; a load failure is not retried below
     if mod is not None and hasattr(mod, "remind"):
         return int(mod.remind(argv, workspace) or 0)
     g = reader.gather(workspace, store)
