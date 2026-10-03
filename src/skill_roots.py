@@ -3,7 +3,9 @@ sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skil
 `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two). Generic:
 a caller names the manifest FIELD it wants, never a skill; a disabled manifest is skipped; the
 declared script must resolve inside its own skill, symlinks followed (a manifest may be a third
-party's). Two declarers, in one root or one per root, are a conflict nobody picks from.
+party's). Two declarers, in one root or one per root, are a conflict nobody picks from —
+except the same skill name in both roots: the shipped copy wins and shadows the owner's, the
+rule `skills/install.sh` applies to the same pair.
 
 `declared(field, workspace, override=...)` is what an edge injects into a core helper: the one
 script, or none and why. Core helpers receive that; they do not call this.
@@ -43,19 +45,25 @@ def declared_scripts(field: str, roots) -> list:
     """(skill name, script) per enabled manifest under `roots` declaring `field` with a script that
     resolves inside its skill. `roots`: one directory or several."""
     dirs = [Path(roots)] if isinstance(roots, (str, Path)) else [Path(d) for d in roots]
-    out = []
-    for manifest in sorted(m for d in dirs for m in d.glob("*/manifest.json")):
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        rel = data.get(field) if isinstance(data, dict) else None
-        if not isinstance(rel, str) or not rel or data.get("enabled") is False:
-            continue
-        skill = manifest.parent.resolve()
-        script = (skill / rel).resolve()
-        if script.is_relative_to(skill) and script.is_file():
-            out.append((manifest.parent.name, script))
+    out: list = []
+    seen: set = set()
+    for d in dirs:  # root order is precedence: a same-name skill in a later root is shadowed
+        for manifest in sorted(d.glob("*/manifest.json")):
+            name = manifest.parent.name
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            rel = data.get(field) if isinstance(data, dict) else None
+            if not isinstance(rel, str) or not rel or data.get("enabled") is False:
+                continue
+            skill = manifest.parent.resolve()
+            script = (skill / rel).resolve()
+            if script.is_relative_to(skill) and script.is_file():
+                out.append((name, script))
     return out
 
 

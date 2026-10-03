@@ -148,7 +148,7 @@ friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py`
 `declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
 roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
 resolve inside its skill), and refuses when more than one installed skill declares it, in one root
-or one per root; a `--store-adapter <path>` flag overrides the scan. The reminder
+or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
 (`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
 its errors kept as notes, then `gather(workspace)` — a `gather` keyword is not part of the contract.
 With none declared there is no store: readers report `unavailable` with that reason (never a

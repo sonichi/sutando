@@ -86,6 +86,24 @@ class Declarations(_Tmp):
                              skill_roots.Declaration(self.tmp / "x.py", None), "an override is taken as given")
             self.assertEqual(skill_roots.declared(FIELD, roots=self.engine).script, (self.engine / "shipped" / "scripts" / "run.py").resolve())
 
+    def test_the_same_skill_name_in_both_roots_is_shadowed_not_a_conflict(self):
+        """install.sh's rule: the shipped copy wins a name collision; the owner's copy of the same
+        name is skipped, and a plain symlink of the shipped skill into the workspace root changes
+        nothing. A different name in the other root is still a conflict."""
+        shipped = self.skill(self.engine, "pq", {FIELD: "scripts/run.py"})
+        os.symlink(shipped, self.ws / "skills" / "pq")
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
+            self.assertEqual(skill_roots.declared(FIELD, self.ws),
+                             skill_roots.Declaration((shipped / "scripts" / "run.py").resolve(), None))
+        (self.ws / "skills" / "pq").unlink()
+        own = self.skill(self.ws / "skills", "pq", {FIELD: "scripts/other.py"}, script="scripts/other.py")
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
+            d = skill_roots.declared(FIELD, self.ws)
+        self.assertEqual(d.script, (shipped / "scripts" / "run.py").resolve())
+        self.assertNotEqual(d.script, (own / "scripts" / "other.py").resolve())
+        self.assertEqual([n for n, _ in skill_roots.declared_scripts(FIELD, [self.ws / "skills", self.engine])],
+                         ["pq"], "root order is the precedence, whichever root comes first")
+
     def test_two_declarers_in_one_root_are_a_conflict_not_an_alphabetical_pick(self):
         self.skill(self.engine, "aaa", {FIELD: "scripts/run.py"})
         self.skill(self.engine, "zzz", {FIELD: "scripts/run.py"})
