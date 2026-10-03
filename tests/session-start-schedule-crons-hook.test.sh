@@ -26,13 +26,14 @@ pass=0; fail=0
 ok()   { echo "  ok  $1"; pass=$((pass+1)); }
 fail() { echo "FAIL: $1" >&2; fail=$((fail+1)); }
 
-# ── 1. Hint script outputs valid JSON with expected structure ──────────────────
-# The hint gates on SUTANDO_CORE_SESSION=1 (only the core bootstraps), so set it
-# for the "fires" assertions below.
-out="$(SUTANDO_CORE_SESSION=1 bash "$HINT")"
+# ── 1. Hint script outputs valid JSON with expected structure (core path) ──────
+# The hint gates on SUTANDO_CORE_SESSION=1 (core bootstrap path), so set it for
+# the "fires" assertions below and unset the worker marker so the two paths
+# can't bleed into each other.
+out="$(SUTANDO_CORE_SESSION=1 env -u SUTANDO_WORKER_BOOTSTRAP bash "$HINT")"
 # Must be valid JSON
 echo "$out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null \
-  && ok "hint script outputs valid JSON" \
+  && ok "hint script outputs valid JSON (core path)" \
   || fail "hint script output is not valid JSON: $out"
 
 # Must contain hookSpecificOutput.additionalContext
@@ -42,21 +43,63 @@ d=json.load(sys.stdin)
 print(d['hookSpecificOutput']['additionalContext'])
 " 2>/dev/null)"
 [ -n "$ctx" ] \
-  && ok "hint script additionalContext is non-empty" \
+  && ok "hint script additionalContext is non-empty (core path)" \
   || fail "hint script missing hookSpecificOutput.additionalContext"
 
-# Must mention /startup (the canonical bootstrap: orphan-recovery THEN crons)
+# Must mention /startup (the canonical bootstrap: orphan-recovery THEN crons),
+# and must NOT say "--worker" — the core path is the plain command.
 case "$ctx" in
-  */startup*) ok "hint script mentions /startup" ;;
+  */startup*) ok "hint script mentions /startup (core path)" ;;
   *) fail "hint script additionalContext does not mention /startup: $ctx" ;;
 esac
+case "$ctx" in
+  *"/startup --worker"*) fail "core-path hint wrongly mentions /startup --worker: $ctx" ;;
+  *) ok "core-path hint does not mention --worker" ;;
+esac
 
-# Scope gate: WITHOUT the core marker the hint must stay silent (no context) so
-# ad-hoc sessions in the checkout don't trigger a redundant cron bootstrap.
-out_nogate="$(env -u SUTANDO_CORE_SESSION bash "$HINT")"
+# ── 1b. Worker path — SUTANDO_WORKER_BOOTSTRAP set, core marker absent ─────────
+# Added 2026-09-28: a pool worker was originally treated as an "ad-hoc session"
+# and got no reminder at all, so a worker's session-only cron that vanished at
+# a context-compaction boundary was never re-registered (found live, stayed
+# dead 22.6h). Detect via $SUTANDO_WORKER_BOOTSTRAP (the marker
+# skills/startup/SKILL.md step 1 names for a worker), not $SUTANDO_INSTANCE_ID.
+out_worker="$(env -u SUTANDO_CORE_SESSION SUTANDO_WORKER_BOOTSTRAP=/fake/worker_bootstrap.py bash "$HINT")"
+echo "$out_worker" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null \
+  && ok "hint script outputs valid JSON (worker path)" \
+  || fail "worker-path hint output is not valid JSON: $out_worker"
+
+ctx_worker="$(echo "$out_worker" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d['hookSpecificOutput']['additionalContext'])
+" 2>/dev/null)"
+[ -n "$ctx_worker" ] \
+  && ok "hint script additionalContext is non-empty (worker path)" \
+  || fail "worker-path hint missing hookSpecificOutput.additionalContext"
+
+case "$ctx_worker" in
+  *"/startup --worker"*) ok "worker-path hint mentions /startup --worker" ;;
+  *) fail "worker-path hint additionalContext does not mention /startup --worker: $ctx_worker" ;;
+esac
+case "$ctx_worker" in
+  *compaction*) ok "worker-path hint mentions compaction (the failure this closes)" ;;
+  *) fail "worker-path hint does not mention compaction: $ctx_worker" ;;
+esac
+
+# Both markers set: core takes priority (must NOT emit the worker wording).
+out_both="$(SUTANDO_CORE_SESSION=1 SUTANDO_WORKER_BOOTSTRAP=/fake/worker_bootstrap.py bash "$HINT")"
+case "$out_both" in
+  *"/startup --worker"*) fail "core marker did not take priority over worker marker: $out_both" ;;
+  *) ok "core marker takes priority when both markers are set" ;;
+esac
+
+# Scope gate: with NEITHER marker the hint must stay silent (no context) so
+# ad-hoc sessions in the checkout (PR review, codex, a plain claude) don't
+# trigger a redundant cron bootstrap.
+out_nogate="$(env -u SUTANDO_CORE_SESSION -u SUTANDO_WORKER_BOOTSTRAP bash "$HINT")"
 [ -z "$out_nogate" ] \
-  && ok "hint script is silent without SUTANDO_CORE_SESSION marker" \
-  || fail "hint script emitted output without the core marker: $out_nogate"
+  && ok "hint script is silent with neither SUTANDO_CORE_SESSION nor SUTANDO_WORKER_BOOTSTRAP" \
+  || fail "hint script emitted output with neither marker set: $out_nogate"
 
 # ── 2. Installer creates settings.json from scratch ───────────────────────────
 # NOTE: do NOT invoke the real installer here — it hardcodes REPO and would
