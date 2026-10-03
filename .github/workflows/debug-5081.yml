@@ -10,22 +10,31 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: bash version
+        continue-on-error: true
         run: bash --version | head -1; nproc
       - name: lost-signal probe (shipped watchdog shape, parent traps TERM) under 4 hogs
+        continue-on-error: true
         run: bash debug5081/lost-probe.sh 300 4
       - name: lost-signal probe, idle
+        continue-on-error: true
         run: bash debug5081/lost-probe.sh 300 0
       - name: main tree
+        continue-on-error: true
         run: git worktree add /tmp/main origin/main
       - name: gating tests at origin/main, 4 copies x 8 rounds, 2 hogs
+        continue-on-error: true
         run: bash debug5081/ci-repro.sh /tmp/main 8 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
       - name: gating tests at HEAD (fix), 4 copies x 8 rounds, 2 hogs
+        continue-on-error: true
         run: bash debug5081/ci-repro.sh "$PWD" 8 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
       - name: new + repointed suites at HEAD, 4 copies x 2 rounds, 2 hogs
+        continue-on-error: true
         run: bash debug5081/ci-repro.sh "$PWD" 2 4 2 tests/bounded-wait.test.sh tests/watch-tasks-stream-watchdog-trap-race.test.sh tests/watcher-inbox-resolver.test.sh
       - name: sync-workspace at origin/main (expect exit 128 at Test 24) and at HEAD
+        continue-on-error: true
         run: |
           bash /tmp/main/tests/sync-workspace.test.sh > /tmp/sw-main.out 2>&1; echo "main rc=$?"; grep -n "FAIL\|Test 24\|Test 28" /tmp/sw-main.out; tail -3 /tmp/sw-main.out
           bash tests/sync-workspace.test.sh > /tmp/sw-head.out 2>&1; echo "head rc=$?"; grep -n "FAIL\|Test 24\|Test 28" /tmp/sw-head.out; tail -3 /tmp/sw-head.out
       - name: sutando-migrate at HEAD (captured failure line)
+        continue-on-error: true
         run: bash tests/sutando-migrate.test.sh; echo "rc=$?"
