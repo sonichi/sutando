@@ -150,10 +150,28 @@ class Hermetic(unittest.TestCase):
                   "REMOTE_MEDIA_DIR": "/tmp/pq-send-outside-scratch/media", "AG2_DEVICE_ENV": "/tmp/pq-send-outside-scratch/device.env",
                   "CLAUDE_CONFIG_DIR": "/tmp/pq-send-outside-scratch/ccd", "AGENT_CONNECT_STATE_DIR": "/tmp/pq-send-outside-scratch/state",
                   "SUTANDO_TELEMETRY": "1", "DO_NOT_TRACK": ""}
-        r = subprocess.run([_sys.executable, str(SUITE), "-k", "real_gateway"], env={**os.environ, **poison},
+        import json
+        import tempfile
+        probe = os.path.join(tempfile.mkdtemp(prefix="pq-send-probe-"), "captured.json")
+        r = subprocess.run([_sys.executable, str(SUITE), "-v", "-k", "real_gateway"],
+                           env={**os.environ, **poison, "PQ_SEND_PROBE_OUT": probe},
                            capture_output=True, text=True, timeout=300)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
-        self.assertIn("OK", r.stderr)
+        # the one test was collected and passed by name, not merely "nothing ran"
+        self.assertIn("test_the_real_gateway_writer_routes_to_its_dm (", r.stderr, "the real-writer test was not collected")
+        self.assertIn("Ran 1 test", r.stderr)
+        self.assertRegex(r.stderr, r"(?m)^ok$")  # verbose runner: the test's own verdict line (logs may interleave)
+        self.assertNotRegex(r.stderr, r"(?m)^(FAIL|ERROR)")
+        got = json.loads(Path(probe).read_text())
+        scratch = os.path.realpath(got["scratch"])
+        self.assertEqual(got["CHANNEL_DIR"], "pq-send-channel")
+        self.assertEqual(got["URL"], "http://127.0.0.1:9")
+        self.assertEqual(got["TOKEN"], "fake-gateway-token")
+        for key in ("TOKEN_FILE", "MEDIA_DIR"):
+            with self.subTest(key):
+                real = os.path.realpath(got[key])
+                self.assertTrue(real.startswith(scratch + os.sep), f"{key}={got[key]} captured outside the child's fixture")
+                self.assertNotIn("pq-send-outside-scratch", real)
 
     def test_the_module_check_follows_the_gateway_import_immediately(self):
         funcs = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)

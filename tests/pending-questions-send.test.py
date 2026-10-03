@@ -375,8 +375,13 @@ class TestRouting(_Workspace):
         import task_envelope
         import telemetry
         assert_isolated(os.environ, _GW_SCRATCH)
-        from ag2_sparrow import remote_gateway_bridge as rgb  # env above makes this hermetic
+        from ag2_sparrow import remote_gateway_bridge as rgb
         assert_gateway_isolated(rgb, _GW_SCRATCH)  # what the module captured, whatever the env did
+        if os.environ.get("PQ_SEND_PROBE_OUT"):  # the hermetic pin's child-process control reads this back
+            import json
+            Path(os.environ["PQ_SEND_PROBE_OUT"]).write_text(json.dumps(
+                {"scratch": _GW_SCRATCH, "CHANNEL_DIR": rgb.CHANNEL_DIR, "TOKEN_FILE": str(rgb.TOKEN_FILE),
+                 "MEDIA_DIR": str(rgb.MEDIA_DIR), "URL": rgb.URL, "TOKEN": rgb.TOKEN}))
         from ag2_sparrow.local_task_protocol import set_task_stamper
         self.assertTrue(telemetry.opted_out(), "telemetry would report the queued tasks")
 
