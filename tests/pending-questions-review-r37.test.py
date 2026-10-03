@@ -64,6 +64,8 @@ def _rows(ws):
     p = Path(ws) / "room.json"
     return json.loads(p.read_text()) if p.exists() else []
 def gather(ws):
+    if (Path(ws) / "raise-read").exists():
+        raise ConnectionError("read down")
     rows = [{"ask_id": r["ask_id"], "title": r["title"], "snippet": "", "body": "", "asked_at": None,
              "priority": "medium", "in_room": True} for r in _rows(ws)]
     return {"waiting": rows, "done": 0, "pending_close": [], "unavailable": False, "reason": None,
@@ -258,6 +260,17 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertIn("reconcile: FAILED — adapter failed: ConnectionError: replay down", err)
         self.assertIn("[ask-existing] still waiting?", out)
         self.assertNotIn("Traceback", err)
+
+    def test_a_raised_read_is_unknown_not_a_traceback(self):
+        """Round 39: the injected adapter's gather raises; the reminder reports UNKNOWN with the
+        reason, as the core reader does, exits 0, and sends nothing even with --notify."""
+        (self.ws / "raise-read").write_text("")
+        rc, out, err = self.run_reminder("--notify", "--force")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("UNKNOWN", out + err)
+        self.assertIn("adapter failed: ConnectionError: read down", out + err)
+        self.assertEqual([p for p in (self.ws / "results").iterdir()], [], "nothing is sent on an unknown count")
 
     def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
         calls = []

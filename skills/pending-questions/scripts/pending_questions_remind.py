@@ -94,7 +94,11 @@ def gather(adapter=None):
         rec = room_db.reconcile_pass(WORKSPACE)
     except Exception as e:  # noqa: BLE001 — the adapter is third-party code
         rec = {"errors": [f"adapter failed: {type(e).__name__}: {e}"]}
-    g = room_db.gather(WORKSPACE)
+    try:  # a raised read is UNKNOWN, the shape the core reader gives it, never a traceback
+        g = room_db.gather(WORKSPACE)
+    except Exception as e:  # noqa: BLE001 — the adapter is third-party code
+        g = {"waiting": [], "done": None, "pending_close": [], "unavailable": True, "link": None,
+             "reason": f"adapter failed: {type(e).__name__}: {e}", "store": None, "notes": []}
     g.setdefault("unavailable", False)
     g.setdefault("reason", None)
     g["notes"] = [f"reconcile: FAILED — {e}" for e in rec.get("errors", [])] + list(g.get("notes", []))
