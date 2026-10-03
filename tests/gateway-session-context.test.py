@@ -323,6 +323,98 @@ class SessionContext(unittest.TestCase):
         self.assertIsNone(self._serve(move_mark()))
         self.assertEqual(len(self._ledger()["rooms"][ROOM][CARD]["events"]), 1)
 
+    # -- 6. the poll loop's own branch, and the context never blocking a task -- #
+
+    def test_the_poll_loop_records_a_mark_and_never_calls_write_task(self):
+        mod = self.mod
+        saved = {n: getattr(mod, n) for n in (
+            "TOKEN", "URL", "_acquire_singleton", "_load_inflight", "_recover_orphan_proactive",
+            "_maybe_start_event_channel", "_heartbeat_singleton", "_post_heartbeat",
+            "_post_task_ack", "_post_ready_results", "_post_proactive", "_reconcile_abandoned",
+            "_emit_gateway_status", "_save_inflight", "_write_task", "_req", "_log",
+            "_push_pool_advertisement", "_start_results_watcher", "_start_outbound_worker")}
+        alive, served, logs, posted = [True, False], [move_mark("task-loop-move")], [], []
+
+        def poll(method, path, payload=None, **kw):
+            if path.startswith("/v1/tasks?wait="):
+                return {"tasks": [served.pop(0)] if served else []}
+            posted.append((path, payload))
+            return {}
+
+        class _Thread:
+            def join(self, timeout=None):
+                return None
+        try:
+            mod.TOKEN, mod.URL = "secret", "http://relay.invalid"
+            mod._acquire_singleton = lambda *a, **k: True
+            mod._load_inflight = lambda *a, **k: set()
+            mod._heartbeat_singleton = lambda *a, **k: alive.pop(0) if alive else False
+            for noop in ("_recover_orphan_proactive", "_maybe_start_event_channel", "_post_heartbeat",
+                         "_post_task_ack", "_post_ready_results", "_post_proactive",
+                         "_push_pool_advertisement", "_save_inflight"):
+                setattr(mod, noop, lambda *a, **k: None)
+            mod._start_results_watcher = lambda *a, **k: None
+            mod._start_outbound_worker = lambda *a, **k: _Thread()
+            mod._reconcile_abandoned = lambda inflight, s, *a, **k: s
+            mod._emit_gateway_status = lambda connected, **k: None
+            mod._log = lambda m: logs.append(str(m))
+            mod._write_task = lambda *a, **k: self.fail("a move mark must never reach _write_task")
+            mod._req = poll
+            mod.main()
+        finally:
+            for n, v in saved.items():
+                setattr(mod, n, v)
+        self.assertIn("session mark task-loop-move recorded, not queued", logs)
+        self.assertIn(("/v1/results", {"id": "task-loop-move", "body": "[no-send]"}), posted)
+        self.assertEqual(self._ledger()["rooms"][ROOM][CARD]["positions"]["qingyun"], "Doc · Testing")
+
+    def test_a_broken_ledger_never_blocks_the_task(self):
+        mod = self.mod
+        with patch.object(mod, "_session_ledger", side_effect=OSError("disk")):
+            text = self._serve(_event("task-robust-1", "hello", thread=False))
+        self.assertEqual(_task_line(text), "hello")
+        from ag2_sparrow.session_context import SessionLedger
+        with patch.object(SessionLedger, "save", return_value=False), \
+             patch.object(mod, "_log") as log:
+            text = self._serve(_event("task-robust-2", "hello again", thread=False))
+        self.assertEqual(_task_line(text), "hello again")
+        self.assertTrue(any("session ledger write failed" in str(c) for c in log.call_args_list))
+
+    # -- 7. the pure module's edges ------------------------------------------ #
+
+    def test_pure_module_edges(self):
+        from ag2_sparrow import session_context as sc
+        bad = "[AG2 Space working session; quoted]\n{not json}\nwords\n[End AG2 Space working session]\n"
+        self.assertIsNone(sc.broker_session_block(bad))
+        self.assertIsNone(sc.broker_session_block("plain words"))
+        # Content without any session key falls through to the body, and a bare body still spells a Join.
+        task = _event("t-join-body", "joined the session", content={"msgtype": "m.text", "body": "joined the session"})
+        self.assertEqual(sc.classify(task).kind, "member")
+        bad_file = self.ws / "state" / "bad.json"
+        bad_file.write_text(json.dumps({"rooms": {"!r": "not a dict"}}))
+        self.assertEqual(sc.SessionLedger(bad_file).rooms, {})
+        bad_file.write_text(json.dumps({"rooms": []}))
+        self.assertEqual(sc.SessionLedger(bad_file).rooms, {})
+        bad_file.write_text("{{{")
+        self.assertEqual(sc.SessionLedger(bad_file).rooms, {})
+        # A ledger whose parent is a file cannot be written: False, no exception.
+        blocked = sc.SessionLedger(bad_file / "child.json")
+        self.assertFalse(blocked.save())
+
+    def test_ledger_bounds_evict_the_oldest(self):
+        from ag2_sparrow import session_context as sc
+        ledger = sc.SessionLedger(self.ws / "state" / "bounds.json")
+        for i in range(sc.MAX_SESSIONS_PER_ROOM + 1):
+            task = dict(move_mark(f"t-{i}"), thread_root=f"$card{i}")
+            ledger.observe(task, now=1000 + i)
+        self.assertEqual(len(ledger.rooms[ROOM]), sc.MAX_SESSIONS_PER_ROOM)
+        self.assertNotIn("$card0", ledger.rooms[ROOM])
+        for i in range(sc.MAX_ROOMS + 1):
+            ledger.observe(_event(f"r-{i}", "qingyun moved to Doc · P", room=f"!room{i}:s"), now=5000 + i)
+        self.assertLessEqual(len(ledger.rooms), sc.MAX_ROOMS)
+        self.assertNotIn("!room0:s", ledger.rooms)
+        self.assertIn(f"!room{sc.MAX_ROOMS}:s", ledger.rooms)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
