@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -583,6 +584,273 @@ class WitnessRunner(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(
                 self.wit.main(["case3", "--marker", "m4", "--timeout", "1"]), 1)
+
+
+class EditIntroducesTheTag(unittest.TestCase):
+    """An owner tag added by an EDIT must reach the same gate as one that
+    arrived with the message. The bridge already reprocesses edits, but Case 1
+    asked `_message_mentions_bot`, which the gate is precisely what stands in
+    for — so a tag typed in two minutes later was judged by a different rule."""
+
+    _next_id = 550000000
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        # seen_message_ids is a module global; a shared fake id would dedup a
+        # later test's message and read as a gate failure.
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def _edit(self, before_content, after_content, allow=None, require_mention=True):
+        """Drive the production on_message_edit; return (stdout, tasks)."""
+        before, after = _FakeMsg(before_content), _FakeMsg(after_content)
+        EditIntroducesTheTag._next_id += 1
+        before.id = after.id = EditIntroducesTheTag._next_id
+        self._require_mention = require_mention
+        before.mentions = [NS(id=111222333)] if "<@111222333>" in before_content else []
+        after.mentions = [NS(id=111222333)] if "<@111222333>" in after_content else []
+        fake_client = NS(user=object())
+        cfg = (require_mention, allow if allow is not None else {str(STRANGER)})
+        buf = io.StringIO()
+
+        async def _noop(*a, **k):
+            return None
+
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: cfg), \
+                contextlib.redirect_stdout(buf):
+            try:
+                asyncio.run(db.on_message_edit(before, after))
+            except Exception:
+                pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_an_edit_that_adds_the_owner_tag_is_ingested_while_the_gate_is_on(self):
+        # Measured 2026-08-29: posted untagged at 17:28, tag appended at 17:30.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(len(_audit_rows()), 1, out)
+
+    def test_the_same_edit_is_not_ingested_while_the_gate_is_off(self):
+        # Fail-closed is the whole design: OFF must keep today's behavior.
+        mg.write_state(_WS, mentions_enabled=False)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_edit_to_an_already_tagged_message_does_not_ingest_twice(self):
+        # The guard that makes this safe: `before` already counted, so the edit
+        # introduced nothing. Without it every later typo re-queues the message.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("<@111222333> take a look",
+                                  "<@111222333> take a look please")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_already_tagged_edit_announces_no_admission(self):
+        # Reviewer, 2026-08-29: `tasks=0 audit=0 admitted_log_lines=2` — the
+        # `before` arm announces an admission that never happens.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("<@111222333> take a look",
+                                  "<@111222333> take a look please")
+        self.assertEqual(written, [])
+        self.assertEqual(out.count("admitted as a mention"), 0, out)
+
+    def test_a_real_admission_still_announces_exactly_once(self):
+        # Positive control: silencing the line everywhere would pass the case
+        # above and delete the only console trace of a live gate admission.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(out.count("admitted as a mention"), 1, out)
+
+    def test_an_edit_adding_no_tag_at_all_is_still_ignored(self):
+        # Negative control: without it the predicate could admit every edit.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("first draft", "second draft")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_unauthorized_sender_edit_leaves_neither_task_nor_audit(self):
+        # The allowlist still runs after the gate admits, exactly as on arrival.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("nothing yet", "<@111222333> now tagged",
+                                  allow={"999999999"})
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+
+class FreeListenChannelIsNotDoubleIngested(unittest.TestCase):
+    """`requireMention:false` is the adjacent value the edit cases all fixed.
+
+    Arrival consults the gate ONLY inside its requireMention branch, so a
+    predicate that consults it unconditionally re-queues a message a free-listen
+    channel had already ingested — one task on arrival, a second on the edit.
+    """
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def _arrive_then_edit(self, require_mention):
+        """Production on_message THEN on_message_edit, one authorized human."""
+        before = _FakeMsg("here are the six launch videos")
+        after = _FakeMsg("here are the six launch videos <@111222333>")
+        before.mentions, after.mentions = [], [NS(id=111222333)]
+        before.id = after.id = 770000001 if require_mention else 770000002
+        cfg = (require_mention, {str(STRANGER)})
+        fake_client = NS(user=object())
+
+        async def _noop(*a, **k):
+            return None
+
+        buf = io.StringIO()
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: cfg), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            for coro in (db._handle_discord_message(before),
+                         db.on_message_edit(before, after)):
+                try:
+                    asyncio.run(coro)
+                except Exception:
+                    pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_free_listen_arrival_plus_edit_is_exactly_one_task(self):
+        # The reviewer's control: parent gave 1 then 2; this must stay at 1.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._arrive_then_edit(require_mention=False)
+        self.assertEqual(len(written), 1,
+                         f"free-listen must not re-queue on edit, got {written}\n{out}")
+
+    def test_require_mention_channel_still_ingests_on_the_edit(self):
+        # The positive control that keeps the scoping from disabling the fix:
+        # here arrival skips and the edit is the ONLY thing that can ingest.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._arrive_then_edit(require_mention=True)
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(len(_audit_rows()), 1, out)
+
+
+class DMIsNotTheGatesTerritory(unittest.TestCase):
+    """Arrival evaluates requireMention and the gate only inside `if not is_dm`.
+
+    An authorized non-owner's DM is ingested on ARRIVAL, so a later edit adding
+    the owner tag must not enter Case 1 and force a second task — and it slips
+    past the DM age guard because Case 1 is checked before it.
+    """
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def _dm_pair(self, age_sec):
+        before, after = _FakeMsg("hello"), _FakeMsg("hello <@111222333>")
+        before.mentions, after.mentions = [], [NS(id=111222333)]
+        before.id = after.id = 880000001
+        dm = mock.MagicMock(spec=discord.DMChannel)
+        dm.id = 999000111
+        dm.name = "dm"
+        for m in (before, after):
+            m.channel = dm
+            m.created_at = NS(timestamp=lambda _t=time.time() - age_sec: _t)
+        return before, after
+
+    def _drive(self, age_sec):
+        before, after = self._dm_pair(age_sec)
+        fake_client = NS(user=object())
+
+        async def _noop(*a, **k):
+            return None
+
+        buf = io.StringIO()
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: None), \
+                mock.patch.object(db, "load_allowed", lambda: {str(STRANGER)}), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            for coro in (db._handle_discord_message(before),
+                         db.on_message_edit(before, after)):
+                try:
+                    asyncio.run(coro)
+                except Exception:
+                    pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_an_old_dm_edited_to_add_the_owner_tag_is_not_ingested_twice(self):
+        # Reviewer's control: main gives 1, the unscoped predicate gives 2.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._drive(age_sec=600)
+        self.assertLessEqual(len(written), 1,
+                             f"a DM must not be re-queued by the gate, got {written}\n{out}")
+
+
+class AnAddedBotMentionStillReprocesses(unittest.TestCase):
+    """The explicit-bot branch of the predicate — the behaviour that predates
+    the gate entirely, and the line the coverage gate reported uncovered."""
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def test_gate_off_an_edit_adding_the_bot_mention_still_reprocesses(self):
+        # Gate OFF on purpose: this path must not depend on the gate at all.
+        mg.write_state(_WS, mentions_enabled=False)
+        bot = NS(id=777000111)
+        before, after = _FakeMsg("hello"), _FakeMsg("hello <@777000111>")
+        before.mentions, after.mentions = [], [bot]
+        before.id = after.id = 990000001
+        seen = []
+        fake_client = NS(user=bot)
+
+        async def _capture(msg, force=False):
+            seen.append((msg.id, force))
+
+        buf = io.StringIO()
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_handle_discord_message", _capture), \
+                contextlib.redirect_stdout(buf):
+            asyncio.run(db.on_message_edit(before, after))
+        self.assertEqual(seen, [(990000001, True)], buf.getvalue())
 
 
 if __name__ == "__main__":
