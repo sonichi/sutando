@@ -393,6 +393,100 @@ class TestAnswer(unittest.TestCase):
             self.assertNotIn(qs[0]["text"], waiting)
             self.assertIn("❓ Rebuild the Swift menu-bar app?", waiting)
 
+    def test_a_reply_keeps_the_question_open_for_both_readers(self):
+        """The owner's Reply is his words to the agent, not a decision. On 2026-09-08 his
+        counter-question ("decide what?") landed as an answer and CLOSED the item: the
+        notifier dropped it and the triage list lost it. A reply must stay open in the
+        agent API's own parse AND in check-pending-questions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pq = Path(tmp) / "pending-questions.md"
+            qs = api.parse_pending_questions(FREE_FORM)
+            updated = api.answer_pending_question(FREE_FORM, qs[0], "decide what?", resolve=False)
+            self.assertIn("**Status:** open — owner replied", updated)
+            self.assertIn("decide what?", updated)
+            self.assertNotIn("**Status:** Answered", updated)
+            still = [q["text"] for q in api.parse_pending_questions(updated)]
+            self.assertIn(qs[0]["text"], still)
+            pq.write_text(updated)
+            cpq.PQ_FILE = pq
+            waiting = [q["title"] for q in cpq.get_waiting_questions()]
+            self.assertIn(qs[0]["text"], waiting)
+
+    def test_a_second_reply_replaces_the_status_line_and_a_real_answer_still_closes(self):
+        qs = api.parse_pending_questions(FREE_FORM)
+        once = api.answer_pending_question(FREE_FORM, qs[0], "which one?", resolve=False)
+        twice = api.answer_pending_question(once, api.parse_pending_questions(once)[0], "and why?",
+                                            resolve=False)
+        self.assertEqual(twice.count("**Status:**"), 1)
+        self.assertIn("and why?", twice)
+        closed = api.answer_pending_question(twice, api.parse_pending_questions(twice)[0], "B")
+        self.assertNotIn(qs[0]["text"], [q["text"] for q in api.parse_pending_questions(closed)])
+
+    def test_the_heuristic_errs_toward_closing_and_says_so(self):
+        """Stated, not hidden: without the flag, a reply that is not phrased as a question
+        ("say more") RESOLVES. That is the expensive direction (a silent close), and it is
+        reachable only from a client that sends no `resolve` — today the dashboard's Answer
+        form, where the human means an answer. The triage card always sends resolve=false."""
+        self.assertFalse(api.is_question_back("say more"))
+        qs = api.parse_pending_questions(FREE_FORM)
+        closed = api.answer_pending_question(FREE_FORM, qs[0], "say more",
+                                             resolve=not api.is_question_back("say more"))
+        self.assertIn("**Status:** Answered", closed)
+        kept = api.answer_pending_question(FREE_FORM, qs[0], "say more", resolve=False)
+        self.assertIn("**Status:** open — owner replied", kept)
+
+    def test_the_rewrite_moves_no_structural_marker_and_the_readers_count_moves_by_exactly_what_it_should(self):
+        """The control this seam actually needs (peer measurement, 2026-09-09: one moved
+        `# Resolved` divider took check-pending-questions from 115 waiting to 1 while the
+        file read perfectly). A rewrite may add one Status line inside one section and
+        nothing else: the divider count and its line stay, no heading-like line appears, and
+        BOTH readers' counts move by exactly -1 (answer) or 0 (reply) — asserted on the
+        LAST active section, the one adjacent to the divider."""
+        doc = ("# Pending Questions\n\n## ❓ First?\nBody one.\n\n## ❓ Second?\nBody two.\n\n"
+               "## ❓ Last before the divider?\nBody three.\n\n# Resolved\n\n## ❓ Archived\nDone.\n")
+
+        def divider(text):
+            lines = text.splitlines()
+            idx = [i for i, ln in enumerate(lines) if ln == "# Resolved"]
+            return len(idx), idx[0] if idx else None
+
+        def heading_lines(text):
+            return sum(1 for ln in text.splitlines() if ln.startswith("## "))
+
+        def waiting(text):
+            with tempfile.TemporaryDirectory() as tmp:
+                pq = Path(tmp) / "pending-questions.md"
+                pq.write_text(text)
+                cpq.PQ_FILE = pq
+                return len(cpq.get_waiting_questions())
+
+        qs = api.parse_pending_questions(doc)
+        last = qs[-1]
+        self.assertEqual(last["text"], "❓ Last before the divider?")
+        n_api, n_cpq = len(qs), waiting(doc)
+        self.assertEqual((n_api, n_cpq), (3, 3))
+
+        # A reply that tries to smuggle structure: newlines, a heading, a divider.
+        reply = api.answer_pending_question(doc, last, "hm\n## fake heading\n# Resolved\nwhich two?",
+                                            resolve=False)
+        self.assertEqual(divider(reply)[0], 1, "divider duplicated or lost")
+        self.assertEqual(divider(reply)[1], divider(doc)[1] + 1, "divider moved by other than the one added line")
+        self.assertEqual(heading_lines(reply), heading_lines(doc), "a heading-like line appeared")
+        self.assertEqual(len(api.parse_pending_questions(reply)), n_api, "agent API count changed on a reply")
+        self.assertEqual(waiting(reply), n_cpq, "notifier count changed on a reply")
+
+        answered = api.answer_pending_question(doc, last, "B\n# Resolved")
+        self.assertEqual(divider(answered)[0], 1)
+        self.assertEqual(heading_lines(answered), heading_lines(doc))
+        self.assertEqual(len(api.parse_pending_questions(answered)), n_api - 1, "agent API count on an answer")
+        self.assertEqual(waiting(answered), n_cpq - 1, "notifier count on an answer")
+
+    def test_a_question_back_is_recognised(self):
+        self.assertTrue(api.is_question_back("decide what?"))
+        self.assertTrue(api.is_question_back("  which one ?  "))
+        self.assertFalse(api.is_question_back("B, and ship it."))
+        self.assertFalse(api.is_question_back(""))
+
     def test_structured_status_line_is_updated_in_place(self):
         qs = api.parse_pending_questions(STRUCTURED)
         updated = api.answer_pending_question(STRUCTURED, qs[0], "Later")
