@@ -100,7 +100,13 @@ import {
 import {
 	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
 } from './voice-redial-scheduler.js';
-import { createUpstreamRedialer, type RecoverySurface } from './voice-upstream-recovery.js';
+import {
+	createUpstreamRedialer,
+	hostOwnsUpstreamRecovery,
+	parkIdleUpstream,
+	type ParkSurface,
+	type RecoverySurface,
+} from './voice-upstream-recovery.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -1137,7 +1143,13 @@ async function main() {
 		// greeting, context replay and especially the CLOSED auto-reconnect —
 		// would be uncounted bypasses of the attempt budget. The synthetic hold
 		// already gates the injection paths post-recovery; this gates the dial.
-		suppressClientAutoActions: () => voiceRecoveryCoordinator?.ownsRecovery ?? false,
+		// A fatal close's 5-min backoff gates the engine's own reconnector too, not just the host dialers.
+		suppressClientAutoActions: () => hostOwnsUpstreamRecovery({
+			coordinatorOwns: voiceRecoveryCoordinator?.ownsRecovery ?? false,
+			state: (voiceSessionRef as any)?.sessionManager?.state,
+			now: Date.now(),
+			fatalBackoffUntil: voiceFatalBackoffUntil,
+		}),
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
 		// context occupancy and connection lineage (design §1.1/§1.4).
 		// The per-modality breakdown rides the same message (design §1.4) but is
@@ -1719,10 +1731,9 @@ async function main() {
 	// produces a phantom assistant turn (sometimes a tool call) with no user
 	// input. Symptoms observed: phantom save_meeting_note polluting markdown
 	// notes, phantom open_url opening browser tabs, phantom work tool calls
-	// writing fake task files. CLOSED state is a fixed point when
-	// clientConnected=false (the existing health monitor only reconnects
-	// CLOSED→CONNECTING when a client is present), so once we transition there
-	// no phantoms can fire until the next legitimate client reconnect.
+	// writing fake task files. Under bodhi >= 0.4 a closed transport is resumed by
+	// the engine itself, so the upstream is parked instead: UPSTREAM_LOST rests until
+	// a client attaches, and the attach policy's recoverUpstream reopens it.
 	// Tunable via env var per Mini's #602 review note. Defaults to 60s — sane
 	// for the voice / phone reconnect cadence we've observed; raise if a host
 	// has frequent ~70s connect/disconnect churn that re-opens too aggressively.
@@ -1734,15 +1745,10 @@ async function main() {
 	// attachment at fire time so a client that connected while the timer was
 	// pending is never torn down under.
 	const teardownIdleUpstream = async (via: string) => {
-		if ((session as any).clientConnected) return;
-		const transport = (session as any).transport;
-		if (!transport?.disconnect) return;
-		console.log(`${ts()} [VoiceSession] Idle (${via}) — closing Gemini transport (no phantoms while CLOSED)`);
-		try {
-			await transport.disconnect();
-		} catch (err) {
-			console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
-		}
+		await parkIdleUpstream(session as unknown as ParkSurface, via, {
+			log: (m) => console.log(`${ts()} [VoiceSession] ${m}`),
+			error: (m, err) => console.error(`${ts()} [VoiceSession] ${m}`, err),
+		});
 	};
 
 	const cancelIdleTeardown = () => {

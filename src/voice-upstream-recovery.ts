@@ -141,3 +141,46 @@ export function createPostParkRedialer(
 		return path === 'recover' ? 'recover' : 'none';
 	};
 }
+
+/** The part of a VoiceSession the idle teardown touches. */
+export interface ParkSurface {
+	clientConnected?: boolean;
+	parkUpstream?: (reason: string) => Promise<unknown>;
+}
+
+/**
+ * Park the upstream of a session no client is attached to. Under bodhi >= 0.4 closing the transport
+ * instead makes the engine resume the session itself, so only a park rests until a client attaches.
+ */
+export async function parkIdleUpstream(
+	s: ParkSurface | null | undefined,
+	via: string,
+	out: RecoveryLog,
+): Promise<'parked' | 'attached' | 'unavailable' | 'failed'> {
+	if (!s) return 'unavailable';
+	if (s.clientConnected) return 'attached';
+	if (typeof s.parkUpstream !== 'function') return 'unavailable';
+	out.log(`Idle (${via}) — parking the Gemini upstream until a client attaches`);
+	try {
+		await s.parkUpstream(via);
+		return 'parked';
+	} catch (err) {
+		// It refuses outside ACTIVE/RECONNECTING/UPSTREAM_LOST (e.g. mid-CONNECTING); the next idle check retries.
+		out.error('Idle park failed:', (err as Error)?.message ?? err);
+		return 'failed';
+	}
+}
+
+/**
+ * The value of `suppressClientAutoActions`: the coordinator owns recovery, or the engine is about to
+ * redial on its own while a fatal close's backoff is pending. Scoped to RECONNECTING so a client
+ * attach from a parked state still dials and still gets its greeting.
+ */
+export function hostOwnsUpstreamRecovery(o: {
+	coordinatorOwns: boolean;
+	state: unknown;
+	now: number;
+	fatalBackoffUntil: number;
+}): boolean {
+	return o.coordinatorOwns || (o.state === 'RECONNECTING' && o.now < o.fatalBackoffUntil);
+}

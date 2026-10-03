@@ -225,4 +225,13 @@ describe('voice-agent.ts delegates every upstream dial', () => {
 	it('keeps no private dial', () => {
 		assert.doesNotMatch(src, /\bonConnectingTick\(|\breplaceHungDial\(|\bredialUpstream\(|\.recoverUpstream\(|nextConnectingTick\(/);
 	});
+
+	it('parks the idle upstream through parkIdleUpstream, never by closing the transport', () => {
+		assert.match(src, /^\t\tawait parkIdleUpstream\(session as unknown as ParkSurface, via, \{$/m);
+		assert.doesNotMatch(src, /transport\.disconnect\(\)/);
+	});
+
+	it('gates the engine reconnector on the fatal backoff through hostOwnsUpstreamRecovery', () => {
+		assert.match(src, /suppressClientAutoActions: \(\) => hostOwnsUpstreamRecovery\(\{\n\t\t\tcoordinatorOwns: voiceRecoveryCoordinator\?\.ownsRecovery \?\? false,\n\t\t\tstate: \(voiceSessionRef as any\)\?\.sessionManager\?\.state,\n\t\t\tnow: Date\.now\(\),\n\t\t\tfatalBackoffUntil: voiceFatalBackoffUntil,\n/);
+	});
 });
