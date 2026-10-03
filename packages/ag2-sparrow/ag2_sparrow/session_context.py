@@ -8,10 +8,14 @@ own. This module is the one place that reads them:
   * classify(): which mark (if any) a gateway task is. The Matrix content is
     read when the broker forwards it (exact keys from the client's
     workingSession.ts); otherwise the deterministic bodies the client writes
-    are matched against the broker-supplied sender_name inside a thread.
-  * SessionLedger: per room + session thread, the members' latest page, the
-    last few session events, when it started and when it was last active.
-    One writer (the bridge), one JSON file under the bridge's state dir.
+    are matched against the broker-supplied sender_name — but only inside a
+    thread the ledger already knows as a session, so prose in an ordinary
+    thread is never consumed.
+  * SessionLedger: per room + session thread, each member's latest page (by
+    mxid), the last few session events (kind and sender, never text), when it
+    started and when it was last active. One writer (the bridge), one JSON
+    file under the bridge's state dir. Bodies reach it only after the writer's
+    secret filter, and no message text is ever copied into another task.
   * SessionLedger.observe(): the ledger update plus what the task file gets —
     a `page:` header, a `session:` header, a body prefix — or that no task is
     written at all.
@@ -41,8 +45,9 @@ QUIET_S = 2 * 60 * 60
 MAX_ROOMS = 32
 MAX_SESSIONS_PER_ROOM = 8
 MAX_EVENTS = 5
-MAX_EVENT_TEXT = 200
-PREFIX_TEXT = 80
+TITLE_MAX = 120
+# A file at any other version is ignored and rewritten: v1 kept unfiltered message text.
+LEDGER_VERSION = 2
 
 # Leading quoted blocks the broker puts ahead of the body; the sender's words follow them.
 _BLOCK_RE = re.compile(r"^\s*\[AG2 Space ([a-z ]+?);[^\]]*\].*?\[End AG2 Space \1\]\s*",
@@ -76,11 +81,13 @@ class Observation:
 
 @dataclass
 class _Session:
+    """members are mxids; positions map mxid -> {"name", "page"}; events are {"id", "ts",
+    "sender", "kind"} with no text; agent_in turns false at this agent's own Leave."""
     title: str = ""
     started: float = 0.0
     last_ts: float = 0.0
     ended: bool = False
-    agent_in: bool = True      # false once this agent's own Leave was seen
+    agent_in: bool = True
     members: list = field(default_factory=list)
     positions: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
@@ -157,12 +164,12 @@ def _mark_from_body(body: str, sender_name: str) -> Optional[Mark]:
     return None
 
 
-def classify(task: dict) -> Optional[Mark]:
+def classify(task: dict, *, known: bool = False) -> Optional[Mark]:
     """Which session mark this gateway task is, or None for an ordinary message.
 
-    Content wins when the broker forwards it. The body fallback only fires inside
-    a thread (every mark is a thread reply) and anchors a move on the
-    broker-supplied sender_name, so a body alone cannot spell one."""
+    Content wins when the broker forwards it. The body fallback fires only with
+    `known` — the thread is a session the ledger has seen — and anchors a move
+    on the broker-supplied sender_name, so prose alone cannot spell a mark."""
     words = strip_blocks(str(task.get("task") or ""))
     content = task.get("content")
     if isinstance(content, dict):
@@ -173,7 +180,7 @@ def classify(task: dict) -> Optional[Mark]:
                 if spelled:
                     mark.title = spelled.group("where").partition(" · ")[2].strip()
             return mark
-    if not _one_line(task.get("thread_root")):
+    if not known or not _one_line(task.get("thread_root")):
         return None
     return _mark_from_body(words, _one_line(task.get("sender_name")))
 
@@ -193,7 +200,9 @@ class SessionLedger:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        rooms = raw.get("rooms") if isinstance(raw, dict) else None
+        if not isinstance(raw, dict) or raw.get("v") != LEDGER_VERSION:
+            return
+        rooms = raw.get("rooms")
         if not isinstance(rooms, dict):
             return
         for room, sessions in rooms.items():
@@ -208,11 +217,12 @@ class SessionLedger:
                         ended=bool(rec.get("ended")),
                         agent_in=rec.get("agent_in") is not False,
                         members=[m for m in rec.get("members") or [] if isinstance(m, str)],
-                        positions={k: str(v) for k, v in (rec.get("positions") or {}).items()},
+                        positions={k: v for k, v in (rec.get("positions") or {}).items()
+                                   if isinstance(v, dict)},
                         events=[e for e in rec.get("events") or [] if isinstance(e, dict)])
 
     def save(self) -> bool:
-        payload = {"v": 1, "rooms": {
+        payload = {"v": LEDGER_VERSION, "rooms": {
             room: {root: {"title": s.title, "started": s.started, "last_ts": s.last_ts,
                           "ended": s.ended, "agent_in": s.agent_in, "members": s.members,
                           "positions": s.positions, "events": s.events}
@@ -232,6 +242,20 @@ class SessionLedger:
             return False
 
     # -- queries --------------------------------------------------------------- #
+
+    def known(self, room: str, root: str, body: str = "") -> bool:
+        """Is `root` a session this ledger has seen, or one the broker's block names?"""
+        if not root:
+            return False
+        if root in self.rooms.get(room, {}):
+            return True
+        block = broker_session_block(body)
+        return block is not None and block["card_id"] == root
+
+    def classify(self, task: dict) -> Optional[Mark]:
+        """classify() with the text fallback allowed only in a known session thread."""
+        room, root = _one_line(task.get("channel_id")), _one_line(task.get("thread_root"))
+        return classify(task, known=self.known(room, root, str(task.get("task") or "")))
 
     def live_session(self, room: str, now: float,
                      prefer: str = "") -> "Optional[tuple[str, _Session]]":
@@ -264,15 +288,14 @@ class SessionLedger:
         return sessions[root]
 
     @staticmethod
-    def _record(s: _Session, event_id: str, who: str, text: str, now: float) -> None:
+    def _record(s: _Session, event_id: str, who: str, kind: str, now: float) -> None:
         """A session event: bumps activity, keeps the last few, dedupes a redelivery."""
         s.last_ts = max(s.last_ts, now)
         if who and who not in s.members:
             s.members.append(who)
         if event_id and any(e.get("id") == event_id for e in s.events):
             return
-        s.events.append({"id": event_id, "ts": now, "sender": who,
-                         "text": _one_line(text)[:MAX_EVENT_TEXT]})
+        s.events.append({"id": event_id, "ts": now, "sender": who, "kind": kind})
         del s.events[:-MAX_EVENTS]
 
     def _absorb_broker_block(self, room: str, body: str, now: float) -> str:
@@ -282,7 +305,7 @@ class SessionLedger:
             return ""
         s = self._session(room, block["card_id"], now)
         loc = block.get("location") if isinstance(block.get("location"), dict) else {}
-        s.title = s.title or _one_line(loc.get("title"))[:120]
+        s.title = s.title or _one_line(loc.get("title"))[:TITLE_MAX]
         started = block.get("started_at")
         if isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0:
             s.started = min(s.started or started / 1000.0, started / 1000.0)
@@ -291,49 +314,51 @@ class SessionLedger:
         return block["card_id"]
 
     def observe(self, task: dict, now: Optional[float] = None) -> Observation:
-        """Record what this task says about its room's session; say what the task gets."""
+        """Record what this task says about its room's session; say what the task gets.
+
+        `task["task"]` must already be the writer's filtered body: whatever
+        reaches here may be kept on disk (titles, pages), though never as text
+        copied into another task."""
         now = time.time() if now is None else now
         out = Observation()
         room = _one_line(task.get("channel_id"))
         if not room:
             return out
         body = str(task.get("task") or "")
-        words = strip_blocks(body)
-        who = _one_line(task.get("sender_name")) or _one_line(task.get("user_id"))
+        who = _one_line(task.get("user_id"))
+        name = _one_line(task.get("sender_name")) or who
         event_id = _one_line(task.get("source_message_id"))
-        is_agent = bool(task.get("agent_mxid")) and task.get("user_id") == task.get("agent_mxid")
+        is_agent = bool(who) and who == _one_line(task.get("agent_mxid"))
         card = self._absorb_broker_block(room, body, now)
         root = _one_line(task.get("thread_root")) or card
-        mark = classify(task)
+        mark = classify(task, known=self.known(room, root, body))
 
         if mark is not None and root:
             s = self._session(room, root, now)
             if mark.kind == "member":
                 if is_agent:
                     s.agent_in = mark.action == "join"
-                self._record(s, event_id, who, f"{who} {words}", now)
+                self._record(s, event_id, who, mark.action, now)
                 if mark.action == "leave":
                     s.members = [m for m in s.members if m != who]
                 out.consumed = True
                 return out
             if mark.kind == "move":
-                s.positions[who] = _place_label(mark.surface, mark.title)
-                s.title = s.title or mark.title
-                self._record(s, event_id, who, words, now)
+                self._place(s, who, name, mark)
+                self._record(s, event_id, who, "move", now)
                 out.consumed = True
                 return out
             if mark.kind == "reactivate":
-                s.title = mark.title or s.title
+                s.title = _one_line(mark.title)[:TITLE_MAX] or s.title
                 s.ended = False
-                self._record(s, event_id, who, words, now)
-                page = s.positions.get(who) or _place_label(mark.surface, mark.title) or "the chat"
-                out.body_prefix = (f"[session reactivated by {who} on {page}: "
+                self._record(s, event_id, who, "reactivate", now)
+                page = self._page_of(s, who) or _place_label(mark.surface, mark.title) or "the chat"
+                out.body_prefix = (f"[session reactivated by {name} on {_one_line(page)}: "
                                    "read the session thread first]")
                 out.session_header = self._session_header(root, s)
                 return out
             # kind == "at": a session message carrying the sender's place
-            s.positions[who] = _place_label(mark.surface, mark.title)
-            s.title = s.title or mark.title
+            self._place(s, who, name, mark)
             s.ended = False
             out.page_header = f"{mark.surface} · {mark.page or '-'} · {mark.title or '-'}"
 
@@ -341,14 +366,23 @@ class SessionLedger:
         if live is None:
             return out
         root, s = live
-        last = s.events[-1]["text"] if s.events else ""
         out.session_header = self._session_header(root, s)
-        out.body_prefix = (f"[live session: {s.title or 'session'}; {who} last on "
-                           f"{s.positions.get(who) or 'an unknown page'}; "
-                           f"last session message: {last[:PREFIX_TEXT]}]")
+        # Session id, title and the sender's own page only: never another member's words.
+        out.body_prefix = (f"[live session: {s.title or 'session'}; {name} last on "
+                           f"{self._page_of(s, who) or 'an unknown page'}]")
         if root == _one_line(task.get("thread_root")):
-            self._record(s, event_id, who, words, now)
+            self._record(s, event_id, who, "message", now)
         return out
+
+    @staticmethod
+    def _place(s: _Session, who: str, name: str, mark: Mark) -> None:
+        s.positions[who] = {"name": name, "page": _place_label(mark.surface, mark.title)}
+        s.title = s.title or _one_line(mark.title)[:TITLE_MAX]
+
+    @staticmethod
+    def _page_of(s: _Session, who: str) -> str:
+        pos = s.positions.get(who)
+        return _one_line(pos.get("page")) if isinstance(pos, dict) else ""
 
     @staticmethod
     def _session_header(root: str, s: _Session) -> str:

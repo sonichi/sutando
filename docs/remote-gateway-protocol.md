@@ -239,30 +239,37 @@ request, not one per navigation:
   `moved: true`; body `<name> moved to <Surface · title>` or `… the chat`) or a
   Join/Leave mark (`space.ag2.commons.session.member` `{v:1, action}`; body
   `joined the session` / `left the session`). The bridge records them in
-  `<state>/ag2space-sessions[.<instance>].json` — per room and session thread:
-  each member's latest page, the last five session events, start and last
-  activity — and closes the task with a `[no-send]` result, the same path a
-  card click takes.
+  `<state>/ag2space-sessions[.<instance>].json` (schema `v: 2`; a file at any
+  other version is ignored and rewritten) — per room and session thread: each
+  member's latest page keyed by mxid, the last five session events as kind +
+  sender (never message text), start and last activity — and closes the task
+  with a `[no-send]` result, the same path a card click takes.
 - `page: <surface> · <page id> · <title>` is written above `task:` for a
   message carrying `space.ag2.commons.session.at` (the sender's current page).
 - `session: <thread_root> | <title> | started <ts>` is written above `task:`,
-  and the body is prefixed `[live session: <title>; <sender> last on <page>;
-  last session message: <first 80 chars>]`, for every task from a room whose
-  session the bridge has seen and that is still live — not ended by the
-  broker's session block, this agent has not left it, and someone spoke in it
-  within the client's two quiet hours. This includes plain room messages
-  outside the thread. `channel_id` and `thread_root` are unchanged.
+  and the body is prefixed `[live session: <title>; <sender> last on <page>]`,
+  for every task from a room whose session the bridge has seen and that is
+  still live — not ended by the broker's session block, this agent has not
+  left it, and someone spoke in it within the client's two quiet hours. This
+  includes plain room messages outside the thread. `channel_id` and
+  `thread_root` are unchanged. The prefix names the session, its title and the
+  sender's own page only — no other member's words ever cross into a task,
+  and the ledger sees a body only after the writer's secret filter.
 - A Reactivate (`space.ag2.commons.session.reactivate` `{v:1, page, by}`) is a
   task whose body is prefixed `[session reactivated by <name> on <page>: read
   the session thread first]`.
 
 A broker **may** forward the Matrix event content as `"content"` (an object);
 the bridge reads only the three keys above from it. Without it the bridge
-falls back to the bodies the client writes, matched only inside a thread and
-only against the broker-supplied `sender_name`; the page id is then unknown
-(`-`), and the `page:` header needs `content` to appear at all. The broker's
-own `[AG2 Space working session; …]` body block, when present, seeds the
-session's title, start and live/ended state.
+falls back to the bodies the client writes — but only inside a thread the
+ledger already knows as a session (from a content-bearing mark, or the
+broker's own `[AG2 Space working session; …]` body block naming that thread),
+and only against the broker-supplied `sender_name`. Mark-shaped prose in an
+ordinary thread is an ordinary task. In the fallback the page id is unknown
+(`-`), and the `page:` header needs `content` to appear at all. The broker
+block, when present, also seeds the session's title, start and live/ended
+state. Both prefixes are plain text attributable only through the broker's
+`sender_name`; a reader must not treat them as the sender's own words.
 
 ## Media markers (optional)
 

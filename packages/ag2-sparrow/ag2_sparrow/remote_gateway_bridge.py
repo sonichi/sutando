@@ -297,7 +297,6 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .session_context import Observation as _SessionObservation, SessionLedger
-from .session_context import classify as _classify_session_mark
 from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
@@ -3280,11 +3279,17 @@ def _observe_session(task: dict) -> _SessionObservation:
 
 
 def _consume_session_mark(task: dict) -> bool:
-    """A move or Join/Leave mark in a session thread is recorded, never queued."""
-    mark = _classify_session_mark(task)
+    """A move or Join/Leave mark in a known session thread is recorded, never queued."""
+    try:
+        mark = _session_ledger().classify(task)
+    except Exception as exc:  # noqa: BLE001 — an unreadable ledger makes it an ordinary task
+        _log(f"session mark check skipped for {task.get('id')}: {type(exc).__name__}: {exc}")
+        return False
     if mark is None or mark.kind not in ("move", "member"):
         return False
-    return _observe_session(task).consumed
+    # The ledger keeps a move's page title: filter it the way _write_task filters a body.
+    body = filter_chat_secrets(_local_redact_vault_set(str(task.get("task") or ""))).text
+    return _observe_session({**task, "task": body}).consumed
 
 
 def _write_task(task: dict) -> "tuple[str, bool] | None":
@@ -3344,8 +3349,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
-    # After the dedup returns above, so a redelivery is not recorded twice.
-    _sess = _observe_session(task)
+    _sess = _SessionObservation()
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
@@ -3371,11 +3375,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
                     lines.append("sensitive_data_filter: false")
-            # Session context the bridge derived, above task: so a body cannot claim it.
-            if _sess.page_header:
-                lines.append(f"page: {_one_line(_sess.page_header)}")
-            if _sess.session_header:
-                lines.append(f"session: {_one_line(_sess.session_header)}")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
             _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
@@ -3410,9 +3409,17 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _secret_types = tuple(_filtered.secret_types)
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
+            # Only the FILTERED body reaches the session ledger; after the dedup
+            # returns above, so a redelivery is not recorded twice.
+            _sess = _observe_session({**task, "task": _filtered.text})
+            # Session context the bridge derived, above task: so a body cannot claim it.
+            if _sess.page_header:
+                lines.append(f"page: {_one_line(_sess.page_header)}")
+            if _sess.session_header:
+                lines.append(f"session: {_one_line(_sess.session_header)}")
             _body = _filtered.text
             if _sess.body_prefix:
-                _body = f"{_sess.body_prefix} {_body}"
+                _body = f"{_one_line(_sess.body_prefix)} {_body}"
             lines.append(f"task: {_one_line(_body)}")
             # Make the sanitized body authoritative everywhere, not just this task file —
             # _write_owner_activity() re-reads task["task"] independently and isn't vault-aware.
