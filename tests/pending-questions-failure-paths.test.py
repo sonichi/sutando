@@ -368,7 +368,10 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
         remind = importlib.import_module("pending_questions_remind")
         with mock.patch.object(remind, "main", return_value=7) as m:
             self.assertEqual(adapter.remind(["--notify"], self.ws), 7)
-        m.assert_called_once_with(["--notify"], self.ws)
+        m.assert_called_once_with(["--notify", "--store-adapter", adapter.__file__], self.ws)
+        with mock.patch.object(remind, "main", return_value=7) as m:  # an injected one is kept
+            adapter.remind(["--store-adapter", "/x/a.py"], self.ws)
+        m.assert_called_once_with(["--store-adapter", "/x/a.py"], self.ws)
 
     def test_ensure_writes_appends_missing_options_hidden_props_and_filters_only(self):
         schema = adapter.DB_SCHEMA

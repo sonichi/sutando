@@ -272,6 +272,33 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertIn("adapter failed: ConnectionError: read down", out + err)
         self.assertEqual([p for p in (self.ws / "results").iterdir()], [], "nothing is sent on an unknown count")
 
+    def test_the_flagless_entry_runs_the_shipped_adapter_once(self):
+        """rui at ad33218b0: with no --store-adapter the core loaded the shipped adapter by path and
+        the reminder re-imported it by module name — a second execution. The adapter's remind now
+        hands its own file to the pass, so the one load serves both."""
+        import pending_questions_reader as reader
+        import skill_roots
+        import workspace_default
+        shim = _load("pq_shim_r37b", REPO / "src" / "check-pending-questions.py")
+        shipped = REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_room_db.py"
+        reader._LOADED.clear()
+        sys.modules.pop("pending_questions_room_db", None)
+        seen = []
+        real = reader.reconcile_then_gather
+        def spy(ws, adapter=None):
+            seen.append(adapter)
+            return real(ws, adapter)
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
+             mock.patch.object(shim, "declared", return_value=skill_roots.Declaration(shipped, None)), \
+             mock.patch.object(reader, "reconcile_then_gather", spy), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = shim.main([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(Path(seen[0]).resolve(), shipped.resolve(), "the pass got the adapter's own file")
+        self.assertIs(reader.load_adapter(seen[0]), reader.load_adapter(shipped), "one cached load")
+        self.assertNotIn("pending_questions_room_db", sys.modules, "no second execution by module name")
+
     def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
         """The reminder delegates to the core reader's one pass: the adapter is loaded once,
         reconcile_pass then plain gather(ws), no private keyword."""

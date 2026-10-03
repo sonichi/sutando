@@ -364,8 +364,10 @@ def report_lines(out: dict) -> list:
 
 
 def remind(argv: list, workspace: Path) -> int:
-    """The reminder (pending_questions_remind.main) with this adapter injected."""
+    """The reminder (pending_questions_remind.main) with this adapter injected by its own file,
+    so the core reader's one load serves it too (never a re-import by module name)."""
     import pending_questions_remind as reminder  # noqa: PLC0415
+    argv = list(argv) if "--store-adapter" in argv else [*argv, "--store-adapter", __file__]
     return reminder.main(argv, Path(workspace))
 
 
