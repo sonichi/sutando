@@ -354,11 +354,6 @@ def merge_snapshots(newer: list, older: list, lstart_by_pid, now_ts: float) -> t
     return merged, kept, dropped
 
 
-def _sha256(path: Path) -> str:
-    import hashlib
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _mtime_ns_portable(path: Path):
     """Nanosecond mtime via the PATH-resolved `stat` command — the same four
     candidate forms, in the same order, as scripts/sutando-migrate.sh's own
@@ -387,12 +382,11 @@ def _mtime_ns_portable(path: Path):
         if not v or any(c not in "0123456789." for c in v) or v.count(".") > 1 \
                 or v.startswith(".") or v.endswith("."):
             continue
+        # sec/frac are guaranteed pure-digit by the character/shape check above
+        # (nonempty, digits-and-at-most-one-interior-dot), so int() cannot raise here.
         sec, _, frac = v.partition(".")
         frac = (frac + "0" * 9)[:9]
-        try:
-            return int(sec) * 10 ** 9 + int(frac)
-        except ValueError:
-            continue
+        return int(sec) * 10 ** 9 + int(frac)
     return None
 
 

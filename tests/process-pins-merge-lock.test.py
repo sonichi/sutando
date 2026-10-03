@@ -258,6 +258,50 @@ class InProcess(unittest.TestCase):
         with self.assertRaises(ValueError):          # over the bound
             pp.merge_into(self.dst, self.src)
 
+    def _stat_shim(self, body):
+        """A PATH-bound `stat` that answers with `body` for every candidate
+        invocation form `_mtime_ns_portable` tries (GNU and BSD alike)."""
+        d = self.tmp / "statbin"
+        d.mkdir(parents=True, exist_ok=True)
+        sh = d / "stat"
+        sh.write_text("#!/bin/sh\n" + body + "\n")
+        sh.chmod(0o755)
+        os.environ["PATH"] = f"{d}:{self._path}"
+
+    def test_mtime_unavailable_raises_naming_which_side(self):
+        """`_mtime_ns_portable` exhausting every candidate form (no `stat` at
+        all, or one that only ever prints something unparseable) must surface
+        as merge_into() refusing and naming the failing side -- source probed
+        first, so a source failure must never reach the destination check."""
+        base = time.time_ns() - 10 ** 12
+        self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "s")], base)
+        self._write(self.dst, [_pin("telegram-bridge", self.me, self.my_lstart, "d")], base)
+        # no `stat` binary anywhere on PATH -> every candidate form raises OSError
+        os.environ["PATH"] = str(self.tmp / "nowhere")
+        with self.assertRaises(ValueError) as cm:
+            pp.merge_into(self.dst, self.src)
+        self.assertIn("source", str(cm.exception))
+        # source absent (i_mt=0, no probe) + destination present + stat unusable
+        # -> the destination check is what raises, naming the destination this time
+        self.src.unlink()
+        with self.assertRaises(ValueError) as cm:
+            pp.merge_into(self.dst, self.src)
+        self.assertIn("destination", str(cm.exception))
+        # a `stat` that exists but never prints a parseable value (every
+        # candidate form rejected by the character/shape guard) is the same
+        # "unavailable" outcome through a different internal branch
+        self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "s")], base)
+        self._stat_shim("printf 'not-a-timestamp\\n'")
+        with self.assertRaises(ValueError) as cm:
+            pp.merge_into(self.dst, self.src)
+        self.assertIn("source", str(cm.exception))
+        # and a `stat` that runs but exits nonzero on every form (e.g. ENOENT
+        # reported as a status rather than a failed exec) takes the sibling branch
+        self._stat_shim("exit 1")
+        with self.assertRaises(ValueError) as cm:
+            pp.merge_into(self.dst, self.src)
+        self.assertIn("source", str(cm.exception))
+
     def test_stale_pre_lock_ordering_no_longer_loses_a_fresh_arm(self):
         """keweichen's review of #3356, reproduced 2026-09-30: a caller that reads
         dst's mtime, THEN separately reads its hash to detect drift, has a gap
