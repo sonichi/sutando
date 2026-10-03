@@ -199,6 +199,9 @@ KNOWN_HEADER_KEYS = (
     "task_layout",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
+# Only the task-mid writer may declare its layout; a task-last file carrying it
+# would hand its multi-line body to the trusted scan.
+WRITER_ONLY_KEYS = frozenset({"task_layout"})
 
 # Canonical live task-id shape: `task-<slug>` where slug is dash-separated
 # [a-z0-9] segments (task-1783..., task-chat-1783..., task-phone-...,
@@ -828,6 +831,8 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
             raise ValueError("pass the body via task_body, not as a header")
         if key not in _KNOWN_KEY_SET:
             raise ValueError(f"unknown header key {key!r} — add it to KNOWN_HEADER_KEYS first")
+        if key in WRITER_ONLY_KEYS:
+            raise ValueError(f"header {key!r} is reserved for the task-mid writer")
         if "\n" in value or "\r" in value:
             raise ValueError(f"header {key!r} value contains a newline")
         lines.append(f"{key}: {value}")

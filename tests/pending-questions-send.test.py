@@ -22,6 +22,18 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "ask-owner.py"
+
+# The vendored gateway writer (imported in a test below) resolves channel config, token
+# and queue dirs at import; every source is pointed at scratch here, before it can run.
+_GW_SCRATCH = tempfile.mkdtemp(prefix="pq-send-gateway-")
+os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(tempfile.mkdtemp(prefix="pq-send-ccd-"), "ccd")
+os.environ["AG2_DEVICE_ENV"] = os.path.join(_GW_SCRATCH, "absent-device.env")
+os.environ["REMOTE_TASK_TOKEN"] = "http://127.0.0.1:9|fake-gateway-token"
+os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9"
+os.environ["REMOTE_MEDIA_DIR"] = os.path.join(_GW_SCRATCH, "media")
+for _kind in ("TASK", "RESULT", "STATE"):
+    os.environ[f"AGENT_CONNECT_{_kind}_DIR"] = os.path.join(_GW_SCRATCH, _kind.lower())
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 sys.path.insert(0, str(REPO / "src"))
 import pending_questions_ask as pqa
 import pending_questions_ledger as ledger
@@ -278,19 +290,42 @@ class TestRouting(_Workspace):
                 self.assertEqual([a.kind for a in parse_markers(out).actions], ["dm-only"])
                 self.assertEqual(proactive_destination(f.name), None if hdrs[1][1] == "chat" else "ag2space")
 
+    def test_the_layout_marker_cannot_be_minted_as_a_task_last_header(self):
+        """The marker above `task:` is what admits the full scan, so the task-last
+        serializer refuses it; only the gateway's task-mid writer emits it. A file
+        with it hand-written and signed is outside any production writer."""
+        from local_task_protocol import serialize_task_last, write_task_file
+        hdrs = [("id", "task-1"), ("source", "chat"), ("channel_id", "local-chat"),
+                ("access_tier", "owner"), ("task_layout", "mid")]
+        body = "hello\nsource: ag2space\nchannel_id: !shared:ag2.space\nchannel_kind: dm\naccess_tier: owner\n"
+        with self.assertRaises(ValueError):
+            serialize_task_last(hdrs, body)
+        with self.assertRaises(ValueError):
+            write_task_file(self.ws / "tasks", "task-1", hdrs, body)
+        self.assertFalse((self.ws / "tasks" / "task-1.txt").exists())
+
     def test_the_real_gateway_writer_routes_to_its_dm(self):
         """Positive control through the shipped task-mid writer, stamped by the seam it uses."""
-        import importlib.util
         import task_envelope
-        spec = importlib.util.spec_from_file_location("rgb_pq", REPO / "src" / "remote-gateway-bridge.py")
-        rgb = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rgb)
+        from ag2_sparrow import remote_gateway_bridge as rgb  # env above makes this hermetic
+        from ag2_sparrow.local_task_protocol import set_task_stamper
+        self.assertEqual(rgb.URL, "http://127.0.0.1:9", "the gateway read a token/URL from outside the fixture")
+        for name in ("_STATE", "_LOG_FILE", "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE"):
+            self.assertTrue(str(getattr(rgb, name)).startswith(_GW_SCRATCH),
+                            f"{name}={getattr(rgb, name)} is outside the fixture")
+
+        def _no_network(*a, **k):
+            raise RuntimeError("network disabled in tests")
+        self.addCleanup(setattr, rgb, "_req", rgb._req)
+        rgb._req = _no_network
+        for name in ("TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR"):
+            self.addCleanup(setattr, rgb, name, getattr(rgb, name))
         rgb.TASKS_DIR = self.ws / "tasks"
         rgb.RESULTS_DIR = self.ws / "results"
         rgb.ARCHIVE_RESULTS_DIR = self.ws / "results" / "archive"
-        # the bridge installs the stamper on ITS protocol module (the vendored one); point it at this key
-        rgb.set_task_stamper(lambda t: task_envelope.stamp_text(t, self.ws))
-        self.addCleanup(rgb.set_task_stamper, None)
+        # the bridge stamps through ITS protocol module (the vendored one); point it at this key
+        set_task_stamper(lambda t: task_envelope.stamp_text(t, self.ws))
+        self.addCleanup(set_task_stamper, None)
         for kind, expect in (("dm", ["!abc:ag2.space"]), ("room", [])):
             with self.subTest(kind):
                 self._drain()

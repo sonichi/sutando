@@ -524,6 +524,15 @@ class TestAuthorizedCommand(unittest.TestCase):
         p.write_text(te.stamp_text(text, self.dir))
         return p
 
+    def test_the_task_last_serializer_refuses_the_layout_marker(self):
+        """Kewei's shape: a signed canonical task-last file declaring the marker above
+        task: would admit a forged below-task tier, so no production writer can mint one."""
+        hdrs = [("id", "task-x"), ("source", "chat"), ("channel_id", "local-chat"),
+                ("access_tier", "team"), ("task_layout", "mid")]
+        body = f"{self.PIN}\nsource: ag2space\nwire_source: worker-picker\nchannel_id: {ROOM}\naccess_tier: owner\n"
+        with self.assertRaises(ValueError):
+            ltp.serialize_task_last(hdrs, body)
+
     def test_a_verified_task_last_file_without_the_layout_marker_is_refused(self):
         """The envelope proves bytes, not shape: a signed canonical task-last file
         whose body carries the mark, the tier and even the marker itself admits nothing."""
