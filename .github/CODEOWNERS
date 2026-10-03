@@ -43,7 +43,7 @@
 
 # Susan: areas she leads or co-leads over the full history.
 # (no line for skills/discord-voice/ -- zero currently-tracked files, same
-# dead-path reasoning as the room-collab exclusion note below.)
+# dead-path reasoning as the room-commons exclusion note below.)
 /skills/screen-companion/  @liususan091219                # Susan 6, Qingyun 4, James 3, Chi 2
 /skills/screen-record/     @liususan091219 @sonichi       # Susan 8, Chi 8
 /src/browser-tools.ts      @sonichi @liususan091219       # Chi 27, Susan 18
