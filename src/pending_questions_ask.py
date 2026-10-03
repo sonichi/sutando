@@ -105,10 +105,18 @@ def drained(results_dir: Path, name: str) -> bool:
     if not name.startswith("proactive-"):
         return False
     p = Path(results_dir) / name
-    stem = glob.escape(p.stem)
-    left = [Path(results_dir).glob(stem + ".sending*"),
-            quarantine_dir(Path(results_dir)).glob(stem + "*")]
-    return not p.exists() and all(next(g, None) is None for g in left)
+    if p.exists():
+        return False
+    for d, prefix in ((Path(results_dir), p.stem + ".sending"), (quarantine_dir(Path(results_dir)), p.stem)):
+        try:  # scandir raises where glob() reads an unreadable directory as empty; fail closed
+            with os.scandir(d) as it:
+                if any(e.name.startswith(prefix) for e in it):
+                    return False
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False  # an uninspectable claim or quarantine is not evidence of delivery
+    return True
 
 
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,

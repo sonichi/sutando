@@ -553,6 +553,32 @@ class TestReminder(_Workspace):
         self.assertIn("Notified: 1 pending questions", out)
         self.assertTrue(any(f.name.startswith("proactive-pending-q-") for f in self._proactive()))
 
+    def test_an_unreadable_quarantine_reads_as_not_delivered(self):
+        """A write+execute-only results/undelivered/ (0300): the failure path can still park the
+        exact body there, while glob() reads the directory as empty. Inspection fails closed."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        self._drain()
+        for f in (self.ws / "results").iterdir():
+            f.unlink()
+        pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
+        f = next(p for p in self._proactive() if p.name.endswith(".txt"))
+        self._park_terminal_failure(f)
+        q = self.ws / "results" / "undelivered"
+        os.chmod(q, 0o300)
+        try:
+            with self.assertRaises(PermissionError):
+                os.scandir(q).close()
+            self.assertEqual(list(q.glob("proactive-*")), [], "glob reads the unreadable directory as empty")
+            body = _cpq(self.pq).get_waiting_questions()[0]["body"]
+            self.assertFalse(pqa.drained(self.ws / "results", f.name), "uninspectable quarantine: not drained")
+            self.assertFalse(pqa.asked_recently(body, self.ws / "results"))
+            out = self._main()
+            self.assertIn("Notified: 1 pending questions", out, "the known non-delivery stays due")
+        finally:
+            os.chmod(q, 0o700)
+        self.pq.unlink()
+
     def test_a_claimed_in_flight_file_is_not_yet_delivered(self):
         for suffix in (".sending", f".sending.{os.getpid()}", "undelivered"):
             with self.subTest(claim=suffix):
