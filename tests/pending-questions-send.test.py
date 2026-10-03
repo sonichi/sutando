@@ -579,6 +579,38 @@ class TestReminder(_Workspace):
             os.chmod(q, 0o700)
         self.pq.unlink()
 
+    def test_a_transient_retry_restoring_the_live_file_mid_check_is_not_delivered(self):
+        """The production transient path renames the claim back to the live name. If that lands
+        between an exists() check and a claims-only scan, the old check read the live, undelivered
+        file as drained. One scan sees the live name and the claims together."""
+        from send_failure_policy import resolve_failed_send
+        self._drain()
+        for f in (self.ws / "results").iterdir():
+            f.unlink()
+        pqa.ask_owner("fresh?", urgency="durable", workspace=self.ws, host=HOST)
+        f = next(p for p in self._proactive() if p.name.endswith(".txt"))
+        claim = f.with_suffix(f".sending.{os.getpid()}")
+        f.rename(claim)
+        real_scandir = os.scandir
+        state = {"released": False}
+        def racing_scandir(d):
+            if not state["released"] and Path(d) == self.ws / "results":
+                state["released"] = True
+                outcome = resolve_failed_send(claim, ConnectionError("transient"), {}, progressed=False,
+                                              body=f, undelivered_dir=self.ws / "results" / "undelivered")
+                self.assertEqual(outcome, "retried")
+                self.assertTrue(f.exists() and not claim.exists(), "the claim was released to the live name")
+            return real_scandir(d)
+        with mock.patch.object(pqa.os, "scandir", racing_scandir):
+            self.assertFalse(pqa.drained(self.ws / "results", f.name), "a live undelivered file is not drained")
+        self.assertTrue(state["released"])
+        # the scan itself must see the live name: with exists() patched to lie, the live file
+        # restored before the scan is still found by the one enumeration
+        with mock.patch.object(pqa.Path, "exists", lambda self_: False):
+            self.assertFalse(pqa.drained(self.ws / "results", f.name), "the scan recognises the exact live filename")
+        self.assertFalse(pqa.drained(self.ws / "results", f.name), "stable afterwards too")
+        self.pq.unlink()
+
     def test_a_claimed_in_flight_file_is_not_yet_delivered(self):
         for suffix in (".sending", f".sending.{os.getpid()}", "undelivered"):
             with self.subTest(claim=suffix):
