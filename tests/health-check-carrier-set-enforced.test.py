@@ -1001,6 +1001,85 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIn("check_carrier_set_enforced()", src,
                       "probe defined but never invoked from the run list")
 
+    def test_the_stale_message_names_the_dropped_match_not_only_the_entry(self):
+        """A glob entry resolves to several paths; the entry alone is not actionable.
+
+        Live case: `hosts/*/` had four matches — two carried host directories and two
+        stray FILES at hosts/ level. The message named only `hosts/*/`, which reads as
+        "the whole host subtree is unbacked" and sends the operator to
+        `--force-gitignore`, which cannot reach a file at that level.
+        """
+        spec = importlib.util.spec_from_file_location("hc_msg", SRC)
+        hc = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(hc)
+        except SystemExit:
+            pass
+        ws = Path("/tmp")
+        self.assertEqual(
+            hc._stale_with_culprits(["hosts/*/"], {"hosts/*/": ws / "hosts" / "current-track.md"}, ws),
+            "hosts/*/ -> hosts/current-track.md")
+        # An entry whose culprit IS the entry adds nothing — stays unadorned.
+        self.assertEqual(
+            hc._stale_with_culprits(["notes/"], {"notes/": ws / "notes"}, ws), "notes/")
+        # A missing culprit degrades to the entry rather than raising.
+        self.assertEqual(hc._stale_with_culprits(["build_log.md"], {}, ws), "build_log.md")
+        # A culprit outside the workspace cannot be made relative — show it whole
+        # rather than raising inside a health probe.
+        outside = Path("/definitely/not/under") / "tmp" / "stray.md"
+        self.assertEqual(hc._stale_with_culprits(["hosts/*/"], {"hosts/*/": outside}, ws),
+                         f"hosts/*/ -> {outside}")
+        # The message must USE it: testing the helper alone left a revert to
+        # entry-only green.
+        src = SRC.read_text()
+        self.assertIn("_stale_with_culprits(stale, stale_culprit, workspace)", src,
+                      "the STILL GIT-IGNORED message no longer names the dropped match")
+        self.assertIn("stale_culprit[entry] = culprit", src,
+                      "nothing records which match git ignored")
+
+
+class TheProbeSelectsTheIgnoredMatch(CarrierSetProbe):
+    """The formatter cases above supply the culprit; these make the PROBE pick it.
+
+    Handing `_stale_with_culprits` a dictionary tests the rendering and never the
+    selection, so `culprit = reps[0]` — naming a carried directory as the one git
+    ignores — passes every one of them. These drive the shipped probe over a real
+    git fixture instead.
+    """
+
+    def _two_hosts_and_a_stray(self, stray: bool):
+        # The generator's real carve-out: `!hosts/*/` + `!hosts/*/**` carries each
+        # host subtree, and cannot reach a file sitting directly in `hosts/`.
+        files = ["hosts/a/current-track.md", "hosts/b/current-track.md"]
+        if stray:
+            files.append("hosts/current-track.md")
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/*/", "hosts/*/**"], files)
+        self._patch_resolved(["hosts/*/"])
+        self._patch_shipped(["hosts/*/"])
+        return ws
+
+    def test_the_detail_names_the_ignored_stray_not_a_carried_host(self):
+        ws = self._two_hosts_and_a_stray(stray=True)
+        reps = [p.name for p in self.hc._carrier_representatives(ws, "hosts/*/")]
+        self.assertEqual(reps, ["a", "b", "current-track.md"],
+                         "fixture no longer puts a carried host FIRST, so reps[0] "
+                         "would coincide with the answer and prove nothing")
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail", r["detail"])
+        self.assertIn("hosts/*/ -> hosts/current-track.md", r["detail"])
+        for carried in ("-> hosts/a", "-> hosts/b"):
+            self.assertNotIn(carried, r["detail"],
+                             f"the probe blamed a carried host: {r['detail']}")
+
+    def test_without_the_stray_the_same_fixture_is_ok(self):
+        """Positive control: the warn above must come from the stray, not from
+        the fixture being unbacked in some way I did not intend."""
+        ws = self._two_hosts_and_a_stray(stray=False)
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok", r["detail"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
