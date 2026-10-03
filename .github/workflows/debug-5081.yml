@@ -1,0 +1,31 @@
+name: debug-5081 (throwaway)
+on:
+  push:
+    branches: [tmp/5081-repro]
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: bash version
+        run: bash --version | head -1; nproc
+      - name: lost-signal probe (shipped watchdog shape, parent traps TERM) under 4 hogs
+        run: bash debug5081/lost-probe.sh 300 4
+      - name: lost-signal probe, idle
+        run: bash debug5081/lost-probe.sh 300 0
+      - name: main tree
+        run: git worktree add /tmp/main origin/main
+      - name: gating tests at origin/main, 4 copies x 5 rounds, 2 hogs
+        run: bash debug5081/ci-repro.sh /tmp/main 5 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
+      - name: gating tests at HEAD (fix), 4 copies x 5 rounds, 2 hogs
+        run: bash debug5081/ci-repro.sh "$PWD" 5 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
+      - name: new + repointed suites at HEAD, 4 copies x 2 rounds, 2 hogs
+        run: bash debug5081/ci-repro.sh "$PWD" 2 4 2 tests/bounded-wait.test.sh tests/watch-tasks-stream-watchdog-trap-race.test.sh tests/watcher-inbox-resolver.test.sh
+      - name: sync-workspace at origin/main (expect exit 128 at Test 24) and at HEAD
+        run: |
+          bash /tmp/main/tests/sync-workspace.test.sh > /tmp/sw-main.out 2>&1; echo "main rc=$?"; grep -n "FAIL\|Test 24\|Test 28" /tmp/sw-main.out; tail -3 /tmp/sw-main.out
+          bash tests/sync-workspace.test.sh > /tmp/sw-head.out 2>&1; echo "head rc=$?"; grep -n "FAIL\|Test 24\|Test 28" /tmp/sw-head.out; tail -3 /tmp/sw-head.out
+      - name: sutando-migrate at HEAD (captured failure line)
+        run: bash tests/sutando-migrate.test.sh; echo "rc=$?"
