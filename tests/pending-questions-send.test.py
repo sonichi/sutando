@@ -26,7 +26,7 @@ CLI = REPO / "scripts" / "ask-owner.py"
 # The vendored gateway writer (imported in a test below) resolves channel config, token
 # and queue dirs at import; every source is pointed at scratch here, before it can run.
 _GW_SCRATCH = tempfile.mkdtemp(prefix="pq-send-gateway-")
-os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(tempfile.mkdtemp(prefix="pq-send-ccd-"), "ccd")
+os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(_GW_SCRATCH, "ccd")
 os.environ["AG2_DEVICE_ENV"] = os.path.join(_GW_SCRATCH, "absent-device.env")
 os.environ["REMOTE_TASK_TOKEN"] = "http://127.0.0.1:9|fake-gateway-token"
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9"
@@ -40,6 +40,23 @@ os.environ["DO_NOT_TRACK"] = "1"
 os.environ["SUTANDO_STATE_DIR"] = os.path.join(_GW_SCRATCH, "state")
 os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(_GW_SCRATCH, "telemetry-id")
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+
+OUTBOUND_SEAMS = (("rgb", "_req"), ("urllib.request", "urlopen"), ("socket", "create_connection"))
+
+
+def deny_outbound(targets, attempts):
+    """Rebind every outbound seam to a recorder that raises; returns the (name, attr)
+    pairs actually rebound so a caller can assert nothing was skipped."""
+    rebound = []
+    for name, attr in OUTBOUND_SEAMS:
+        obj = targets[name]
+
+        def _refuse(*a, _seam=attr, **k):
+            attempts.append(_seam)
+            raise RuntimeError(f"{_seam} disabled in tests")
+        setattr(obj, attr, _refuse)
+        rebound.append((name, attr))
+    return tuple(rebound)
 sys.path.insert(0, str(REPO / "src"))
 import pending_questions_ask as pqa
 import pending_questions_ledger as ledger
@@ -326,17 +343,18 @@ class TestRouting(_Workspace):
                             f"{name}={getattr(rgb, name)} is outside the fixture")
 
         attempts = []
-
-        def _deny(seam):
-            def _refuse(*a, **k):
-                attempts.append(seam)
-                raise RuntimeError(f"{seam} disabled in tests")
-            return _refuse
+        targets = {"rgb": rgb, "urllib.request": urllib.request, "socket": socket}
+        for name, attr in OUTBOUND_SEAMS:
+            self.addCleanup(setattr, targets[name], attr, getattr(targets[name], attr))
         # the bridge's own client is denied (it does try a fleet read per task, fail-open),
         # and the transports below it prove nothing can leave the process another way
-        for obj, attr in ((rgb, "_req"), (urllib.request, "urlopen"), (socket, "create_connection")):
-            self.addCleanup(setattr, obj, attr, getattr(obj, attr))
-            setattr(obj, attr, _deny(attr))
+        self.assertEqual(deny_outbound(targets, attempts), OUTBOUND_SEAMS)
+        for name, attr in OUTBOUND_SEAMS:
+            with self.assertRaises(RuntimeError):
+                getattr(targets[name], attr)()
+        attempts.clear()
+        # the module swaps socket.getaddrinfo at import; put the original back after this test
+        self.addCleanup(setattr, socket, "getaddrinfo", rgb._getaddrinfo_prefer_v4._ag2_orig_getaddrinfo)
         for name in ("TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR"):
             self.addCleanup(setattr, rgb, name, getattr(rgb, name))
         rgb.TASKS_DIR = self.ws / "tasks"
