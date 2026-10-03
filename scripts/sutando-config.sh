@@ -81,6 +81,18 @@ from src.sutando_config import resolve_workspace
 print(resolve_workspace(), end='')
 "
     ;;
+  skill-roots)
+    # Every directory that holds skills, one per line, in precedence order (src/skill_roots.py).
+    # $2 (optional): an already-resolved workspace root, as for voice-pidfile.
+    if [ -n "${2:-}" ]; then _ws="$2"; else _ws="$(bash "$0" workspace)" || exit 1; fi
+    py - "$REPO_ROOT" "$_ws" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1] + '/src')
+from skill_roots import skill_roots
+for root in skill_roots(sys.argv[1], sys.argv[2]):
+    print(root)
+PYEOF
+    ;;
   voice-pidfile)
     # Single resolver for the voice-agent pid metadata file (#2722). Canonical
     # lives under state/locks/; the root path is a ~30-day reader fallback so an
@@ -789,7 +801,7 @@ print(json.dumps({
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|skill-roots [workspace]|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

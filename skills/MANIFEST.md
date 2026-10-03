@@ -11,7 +11,7 @@ A manifest-loaded skill is a directory containing:
 - `tools.ts` (if `manifest.tools` is set) — exports `tools: ToolDefinition[]`, picked up at agent startup
 - optional `server.py` / `start.sh` / other runtime infrastructure the tools rely on
 
-At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`.
+At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory, the workspace's `<workspace>/skills/`, **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`. A tools file outside the engine tree may import the engine's own dependencies (e.g. `zod`) exactly as a shipped skill does.
 
 The same `inlineTools` list is also pushed into the phone agent's tool table (see `skills/phone-conversation/scripts/conversation-server.ts:587`), so any tool a manifest-loaded skill contributes is automatically available to:
 
@@ -117,7 +117,7 @@ Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifes
 
 ## Supervised workers (`supervised_worker`)
 
-A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `*/manifest.json` in every skill root — shipped `skills/`, `<workspace>/skills/`, external plugin dirs and, only in the app's `engine/` layout, sibling checkouts (a plain clone opts siblings in through `$SUTANDO_EXTERNAL_PLUGIN_DIRS`), in the order `src/skill_roots.py` (`scripts/sutando-config.sh skill-roots`) gives; a shipped skill wins a name collision, as in `skills/install.sh`; only a manifest with `"enabled": true` is started, the voice loader's gate; an unreadable root is skipped, and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
 
 ```json
 "supervised_worker": {

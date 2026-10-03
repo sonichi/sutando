@@ -40,6 +40,164 @@ def find(specs, name):
     return next((s for s in specs if s.name == name), None)
 
 
+def workspace_skills(mod):
+    """A skill in <workspace>/skills/ is supervised like a shipped one; a shipped
+    skill of the same name wins, as in skills/install.sh."""
+    import tempfile
+    print("── a workspace skill ──")
+    saved = {k: os.environ.get(k) for k in ("SUTANDO_TEST_MODE", "SUTANDO_WORKSPACE", "WS_FIXTURE_PYTHON")}
+    with tempfile.TemporaryDirectory() as tmp:
+        ws, elsewhere = Path(tmp) / "workspace", Path(tmp) / "other-checkout" / "skills"
+        def put(dir_name, worker):
+            skill = elsewhere / dir_name
+            (skill / "scripts").mkdir(parents=True, exist_ok=True)
+            (skill / "scripts" / "loop.py").write_text("# a worker\n", encoding="utf-8")
+            (skill / "manifest.json").write_text(json.dumps({"enabled": True, "supervised_worker": {
+                "name": worker, "script": "scripts/loop.py",
+                "interpreter": {"config": "WS_FIXTURE_PYTHON"}}}), encoding="utf-8")
+            (ws / "skills").mkdir(parents=True, exist_ok=True)
+            (ws / "skills" / dir_name).symlink_to(skill)
+        put("zz-ws-fixture-skill", "ws-fixture-worker")
+        shipped = next(p.parent.name for p in sorted((REPO / "skills").glob("*/manifest.json")))
+        put(shipped, "ws-shadow-worker")
+        os.environ.update(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws), WS_FIXTURE_PYTHON=sys.executable)
+        try:
+            specs, skipped = mod._skill_worker_specs()
+            spec = find(specs, "ws-fixture-worker")
+            check("a workspace skill's declared worker is supervised", spec is not None, str(skipped))
+            if spec is not None:
+                check("...running the script inside that skill (through its symlink)",
+                      Path(spec.argv[1]) == (elsewhere / "zz-ws-fixture-skill" / "scripts" / "loop.py").resolve())
+            check("a workspace skill named like a shipped skill is not supervised",
+                  find(specs, "ws-shadow-worker") is None)
+            os.environ.pop("WS_FIXTURE_PYTHON")
+            _, skipped = mod._skill_worker_specs()
+            check("an unconfigured workspace worker names its own manifest",
+                  any("ws-fixture-worker" in s and str(ws) in s for s in skipped), str(skipped))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def outside_the_engine(mod):
+    """A skill in a sibling checkout's skills/ or an external plugin dir is supervised too;
+    the workspace comes first, and a shipped skill still wins."""
+    import tempfile
+    print("── sibling-checkout and external-dir skills ──")
+    keys = ("SUTANDO_EXTERNAL_PLUGIN_DIRS", "SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR", "WS_FIXTURE_PYTHON")
+    saved, saved_repo = {k: os.environ.get(k) for k in keys}, mod.REPO
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        engine, ws = tmp / "engine" / "sutando", tmp / "workspace"
+        sibling, external = tmp / "engine" / "neighbor" / "skills", tmp / "plugins" / "extra"
+        def put(base, dir_name, worker):
+            skill = base / dir_name
+            (skill / "scripts").mkdir(parents=True, exist_ok=True)
+            (skill / "scripts" / "loop.py").write_text("# a worker\n", encoding="utf-8")
+            (skill / "manifest.json").write_text(json.dumps({"enabled": True, "supervised_worker": {
+                "name": worker, "script": "scripts/loop.py",
+                "interpreter": {"config": "WS_FIXTURE_PYTHON"}}}), encoding="utf-8")
+        (engine / "skills" / "shipped-fixture").mkdir(parents=True)
+        (engine / "skills" / "shipped-fixture" / "SKILL.md").write_text("# shipped\n", encoding="utf-8")
+        (ws / "skills").mkdir(parents=True)
+        put(sibling, "sibling-fixture", "sibling-worker")
+        put(sibling, "shipped-fixture", "sibling-shadow-worker")
+        put(ws / "skills", "both-places", "ws-first-worker")
+        put(sibling, "both-places", "sibling-second-worker")
+        put(external / "skills", "external-fixture", "external-worker")
+        mod.REPO = engine
+        os.environ.update(SUTANDO_EXTERNAL_PLUGIN_DIRS=str(external), WS_FIXTURE_PYTHON=sys.executable)
+        for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
+            os.environ.pop(k, None)
+        try:
+            order = [m.parent.name for m in mod._skill_manifests(workspace=ws)]
+            check("roots are scanned workspace, external dir, then sibling checkout",
+                  order == ["both-places", "external-fixture", "sibling-fixture"], str(order))
+            real = mod._skill_manifests
+            mod._skill_manifests = lambda: real(workspace=ws)
+            try:
+                specs, skipped = mod._skill_worker_specs()
+            finally:
+                mod._skill_manifests = real
+            names = {s.name for s in specs}
+            check("a sibling checkout's skill worker is supervised", "sibling-worker" in names, str(skipped))
+            check("an external plugin dir's skill worker is supervised", "external-worker" in names, str(skipped))
+            spec = find(specs, "sibling-worker")
+            check("...running the script inside the sibling skill", spec is not None and
+                  Path(spec.argv[1]) == (sibling / "sibling-fixture" / "scripts" / "loop.py").resolve())
+            check("a shipped skill folder shadows a sibling's", "sibling-shadow-worker" not in names)
+            check("the workspace copy wins over a sibling's", "ws-first-worker" in names
+                  and "sibling-second-worker" not in names, str(names))
+        finally:
+            mod.REPO = saved_repo
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def guarded_scan(mod):
+    """An unreadable root is skipped, a leftover folder claims no name, and a worker whose
+    manifest is not enabled is not started (the voice loader's gate)."""
+    import tempfile
+    print("── guards ──")
+    saved_repo, saved_py = mod.REPO, os.environ.get("WS_FIXTURE_PYTHON")
+    saved_ext = os.environ.get("SUTANDO_EXTERNAL_PLUGIN_DIRS")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        engine, ws, ext, locked = tmp / "engine" / "sutando", tmp / "workspace", tmp / "ext", tmp / "locked"
+        (engine / "skills").mkdir(parents=True)
+        def put(base, dir_name, worker, enabled=True):
+            skill = base / dir_name
+            (skill / "scripts").mkdir(parents=True, exist_ok=True)
+            (skill / "scripts" / "loop.py").write_text("# a worker\n", encoding="utf-8")
+            body = {"supervised_worker": {"name": worker, "script": "scripts/loop.py",
+                                          "interpreter": {"config": "WS_FIXTURE_PYTHON"}}}
+            if enabled is not None:
+                body["enabled"] = enabled
+            (skill / "manifest.json").write_text(json.dumps(body), encoding="utf-8")
+        (ws / "skills" / "leftover" / "__pycache__").mkdir(parents=True)
+        put(ext / "skills", "leftover", "leftover-worker")
+        put(ext / "skills", "off-skill", "off-worker", enabled=False)
+        put(ext / "skills", "unset-skill", "unset-worker", enabled=None)
+        put(locked / "skills", "hidden", "hidden-worker")
+        mod.REPO = engine
+        os.environ.update(SUTANDO_EXTERNAL_PLUGIN_DIRS=os.pathsep.join([str(locked), str(ext)]),
+                          WS_FIXTURE_PYTHON=sys.executable)
+        (locked / "skills").chmod(0)
+        try:
+            try:
+                found, raised = [m.parent.name for m in mod._skill_manifests(workspace=ws)], None
+            except OSError as exc:
+                found, raised = [], exc
+            check("an unreadable skill root is skipped, not fatal", raised is None, str(raised))
+            check("a leftover folder without a skill does not claim the name, and later roots still count",
+                  "leftover" in found, str(found))
+            real = mod._skill_manifests
+            mod._skill_manifests = lambda: real(workspace=ws)
+            try:
+                specs, skipped = mod._skill_worker_specs()
+            finally:
+                mod._skill_manifests = real
+            names = {s.name for s in specs}
+            check("a worker whose manifest says enabled: false is not started", "off-worker" not in names)
+            check("...nor one whose manifest has no enabled", "unset-worker" not in names)
+            check("...and the reason says so", any("not enabled" in r for r in skipped), str(skipped))
+            check("an enabled worker is still started", "leftover-worker" in names, str(skipped))
+        finally:
+            (locked / "skills").chmod(0o755)
+            mod.REPO = saved_repo
+            for k, v in (("SUTANDO_EXTERNAL_PLUGIN_DIRS", saved_ext), ("WS_FIXTURE_PYTHON", saved_py)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def main() -> int:
     mod = load()
     check("core names no concrete skill",
@@ -56,7 +214,7 @@ def main() -> int:
             decl = {"name": "synthetic-worker", "script": "scripts/loop.py",
                     "interpreter": {"config": "SYNTHETIC_WORKER_PYTHON", "needs": "nothing"}}
             decl.update(over.pop("worker", {}))
-            body = {"config": over.pop("config", {}), "supervised_worker": decl}
+            body = {"enabled": True, "config": over.pop("config", {}), "supervised_worker": decl}
             body.update(over)
             manifest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
 
@@ -135,6 +293,10 @@ def main() -> int:
         os.environ.pop("SYNTHETIC_WORKER_PYTHON", None)
         if keep is not None:
             os.environ["SYNTHETIC_WORKER_PYTHON"] = keep
+
+    workspace_skills(mod)
+    outside_the_engine(mod)
+    guarded_scan(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0
