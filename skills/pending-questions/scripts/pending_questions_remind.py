@@ -81,10 +81,11 @@ def voice_client_connected():
 
 def gather(adapter=None):
     """The pass's result — `reconcile_pass`, then the read-only `gather`, the contract's two entry
-    points — through the sibling adapter, or the injected adapter file (what `pq.py remind`
-    passes): {"waiting", "notes", "unavailable", "reason", ...}; a reconcile error is a note."""
+    points — through the caller's adapter (a core-reader `Resolved`, carried through as is; or
+    the injected adapter file `pq.py remind` passes), else the sibling: {"waiting", "notes",
+    "unavailable", "reason", ...}; a reconcile error is a note."""
     import pending_questions_reader as reader  # noqa: PLC0415 — the one owner of adapter failures
-    if not adapter:
+    if adapter is None:
         import pending_questions_room_db as adapter  # noqa: PLC0415 — the sibling, already a module
     return reader.reconcile_then_gather(WORKSPACE, adapter)
 
@@ -302,7 +303,9 @@ def deliver(questions, count, titles):
     return summary
 
 
-def main(argv=None, workspace=None):
+def main(argv=None, workspace=None, adapter=None):
+    """`adapter`, when the caller already resolved one (the core entry's Resolved), is read as is
+    and wins over a `--store-adapter` flag in argv."""
     global WORKSPACE, RESULTS_DIR, LAST_NOTIFY_FILE, VOICE_LOG
     argv = sys.argv[1:] if argv is None else list(argv)
     if workspace is not None and Path(workspace) != WORKSPACE:
@@ -310,7 +313,8 @@ def main(argv=None, workspace=None):
         RESULTS_DIR, LAST_NOTIFY_FILE = WORKSPACE / "results", WORKSPACE / "state" / "last-pq-notify"
         VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
     force = "--force" in argv
-    adapter = argv[argv.index("--store-adapter") + 1] if "--store-adapter" in argv[:-1] else None
+    if adapter is None and "--store-adapter" in argv[:-1]:
+        adapter = argv[argv.index("--store-adapter") + 1]
     g = gather(adapter)
     questions, notes = g["waiting"], g["notes"]
     for note in notes:

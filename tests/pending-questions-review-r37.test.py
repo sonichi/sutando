@@ -296,8 +296,9 @@ class Finding2ReminderContract(unittest.TestCase):
             rc = shim.main([])
         self.assertEqual(rc, 0)
         self.assertEqual(len(seen), 1)
-        self.assertEqual(Path(seen[0]).resolve(), shipped.resolve(), "the pass got the adapter's own file")
-        self.assertIs(reader.load_adapter(seen[0]), reader.load_adapter(shipped), "one cached load")
+        self.assertIsInstance(seen[0], reader.Resolved, "the pass got the entry's one resolution (round 42)")
+        self.assertEqual(Path(seen[0].reason).resolve(), shipped.resolve())
+        self.assertIs(seen[0].module, reader.load_adapter(shipped), "one cached load")
         self.assertNotIn("pending_questions_room_db", sys.modules, "no second execution by module name")
 
     def _counting_adapter(self, name, slow=False, fail=False):
@@ -597,6 +598,44 @@ class Round42LoaderLifecycle(unittest.TestCase):
         self.assertEqual(reader.gather(self.ws, self.f)["store"], "v2")
         self.assertEqual(self._count(), 2)
         self.assertEqual(len(reader._LOADED), 1, "the old identity's module is not retained")
+
+    def test_the_flagless_public_entry_carries_its_one_resolved_through_the_reminder(self):
+        """Her repro: the stable flagless path measured load_adapter_calls=2 — the entry resolved
+        once, then the shipped `remind` re-injected `__file__` and the reminder resolved the path
+        again. The entry's one Resolved is now handed to `remind(resolved=...)`, through
+        `reminder.main(adapter=...)`, and every phase returns it as is."""
+        import pending_questions_remind as reminder
+        import workspace_default
+        shim = _load("pq_shim_r42", REPO / "src" / "check-pending-questions.py")
+        sys.modules.pop("pending_questions_room_db", None)
+        seen, loads = [], mock.Mock(wraps=reader.load_adapter)
+        real = reader.resolve_adapter
+        def spy(adapter=None):
+            r = real(adapter)
+            seen.append((adapter, r))
+            return r
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
+             mock.patch.object(shim, "declared", return_value=skill_roots.Declaration(SHIPPED, None)), \
+             mock.patch.object(reader, "load_adapter", loads), mock.patch.object(reader, "resolve_adapter", spy), \
+             mock.patch.object(reminder, "main", wraps=reminder.main) as rmain, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = shim.main([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(loads.call_count, 1, f"one load for the whole invocation; load args {[c.args for c in loads.call_args_list]}")
+        first = seen[0][1]
+        self.assertIsInstance(first, reader.Resolved)
+        self.assertIsNotNone(first.module, first.reason)
+        self.assertEqual([a for a, _ in seen[1:]], [first] * (len(seen) - 1), "every later phase was handed the one Resolved")
+        self.assertTrue(all(r is first for _, r in seen), "returned as is, never re-resolved")
+        self.assertEqual(rmain.call_args.kwargs.get("adapter"), first, "the reminder got the Resolved, not a file")
+        self.assertNotIn("--store-adapter", rmain.call_args.args[0], "no `__file__` re-injected on the successful path")
+
+    def test_a_two_arg_remind_still_gets_argv_and_workspace(self):
+        shim = _load("pq_shim_r42b", REPO / "src" / "check-pending-questions.py")
+        self.assertFalse(shim._takes_resolved(lambda argv, ws: 0))
+        self.assertTrue(shim._takes_resolved(lambda argv, ws, resolved=None: 0))
+        self.assertTrue(shim._takes_resolved(lambda argv, ws, **kw: 0))
+        self.assertFalse(shim._takes_resolved(3), "not a callable: the two-arg call, whose error is the adapter's")
 
 
 if __name__ == "__main__":

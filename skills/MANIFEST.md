@@ -140,7 +140,9 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
 read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
 `reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
-records a question and `remind` runs the reminder. The field is in `schemas/skill-manifest.schema.json`
+records a question and `remind(argv, workspace, resolved=None)` runs the reminder — `resolved` is optional:
+the core entry passes its one resolution of the adapter when `remind` accepts the keyword, and a
+two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-manifest.schema.json`
 (a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
 `src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
 skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
