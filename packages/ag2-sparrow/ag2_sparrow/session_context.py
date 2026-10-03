@@ -102,6 +102,10 @@ def _one_line(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def _cap(value) -> str:
+    return _one_line(value)[:TITLE_MAX]
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -144,10 +148,11 @@ def _mark_from_content(content: dict) -> Optional[Mark]:
     at = content.get(AT_KEY)
     if isinstance(at, dict) and at.get("v") == 1 and isinstance(at.get("surface"), str):
         page = at.get("page")
+        # Every member-controlled field is one line and capped before it can reach a header.
         return Mark(kind="move" if at.get("moved") is True else "at",
-                    surface=at["surface"],
-                    page=page if isinstance(page, str) else "",
-                    title=_one_line(at.get("title"))[:120])
+                    surface=_cap(at["surface"]),
+                    page=_cap(page if isinstance(page, str) else ""),
+                    title=_cap(at.get("title")))
     member = content.get(MEMBER_KEY)
     if isinstance(member, dict) and member.get("v") == 1 and member.get("action") in ("join", "leave"):
         return Mark(kind="member", action=member["action"])
@@ -155,7 +160,7 @@ def _mark_from_content(content: dict) -> Optional[Mark]:
     if isinstance(react, dict) and react.get("v") == 1 and isinstance(react.get("by"), str):
         page = react.get("page") if isinstance(react.get("page"), str) else ""
         surface, _, page_id = page.partition(":")
-        return Mark(kind="reactivate", surface=surface, page=page_id, by=react["by"])
+        return Mark(kind="reactivate", surface=_cap(surface), page=_cap(page_id), by=react["by"])
     return None
 
 
@@ -165,14 +170,14 @@ def _mark_from_body(body: str, sender_name: str) -> Optional[Mark]:
     m = _REACTIVATE_RE.match(body)
     if m:
         surface, _, title = m.group("where").partition(" · ")
-        return Mark(kind="reactivate", surface=surface.strip(), title=title.strip(),
+        return Mark(kind="reactivate", surface=_cap(surface), title=_cap(title),
                     by=m.group("by").strip())
     if sender_name and body.startswith(f"{sender_name} moved to "):
         where = body[len(sender_name) + len(" moved to "):]
         if where == "the chat":
             return Mark(kind="move", surface="chat")
         surface, _, title = where.partition(" · ")
-        return Mark(kind="move", surface=surface.strip(), title=title.strip())
+        return Mark(kind="move", surface=_cap(surface), title=_cap(title))
     return None
 
 
@@ -393,7 +398,7 @@ class SessionLedger:
     @staticmethod
     def _place(s: _Session, who: str, name: str, mark: Mark) -> None:
         s.positions[who] = {"name": name, "surface": mark.surface, "page": mark.page,
-                            "title": _one_line(mark.title)[:TITLE_MAX]}
+                            "title": mark.title}
 
     @staticmethod
     def _page_of(s: _Session, who: str) -> str:
