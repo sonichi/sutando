@@ -6,6 +6,7 @@ pass itself — reconcile, list, and with `--notify` the reminder — is the ski
 adapter nothing can be reminded: the held questions are listed and nothing is sent, which is
 also what a flagless run does.
 """
+import inspect
 import sys
 from pathlib import Path
 
@@ -14,14 +15,25 @@ import pending_questions_reader as reader
 from skill_roots import declared
 
 
+def _takes_resolved(remind) -> bool:
+    """Whether the adapter's `remind` accepts the `resolved` keyword (a two-arg one still works)."""
+    try:
+        params = inspect.signature(remind).parameters
+    except (TypeError, ValueError):
+        return False
+    return "resolved" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     override = argv[argv.index("--store-adapter") + 1] if "--store-adapter" in argv[:-1] else None
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     workspace = resolve_workspace(migrate=False)
     store = reader.resolve_adapter(declared(reader.DECLARATION, workspace, override=override))
-    mod, why = store  # resolved once for this invocation; a load failure is not retried below
+    mod, why = store  # resolved once for this invocation; carried through, never resolved again
     if mod is not None and hasattr(mod, "remind"):
+        if _takes_resolved(mod.remind):
+            return int(mod.remind(argv, workspace, resolved=store) or 0)
         return int(mod.remind(argv, workspace) or 0)
     g = reader.gather(workspace, store)
     for note in g["notes"]:

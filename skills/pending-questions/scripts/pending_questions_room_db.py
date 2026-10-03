@@ -363,12 +363,15 @@ def report_lines(out: dict) -> list:
     return lines
 
 
-def remind(argv: list, workspace: Path) -> int:
-    """The reminder (pending_questions_remind.main) with this adapter injected by its own file,
-    so the core reader's one load serves it too (never a re-import by module name)."""
+def remind(argv: list, workspace: Path, resolved=None) -> int:
+    """The reminder (pending_questions_remind.main) on the caller's `resolved` (the core reader's
+    one Resolved of this adapter, carried through, nothing resolved again); without one, this
+    adapter injected by its own file, so the reader's one load serves it (never a re-import)."""
     import pending_questions_remind as reminder  # noqa: PLC0415
-    argv = list(argv) if "--store-adapter" in argv else [*argv, "--store-adapter", __file__]
-    return reminder.main(argv, Path(workspace))
+    argv = list(argv)
+    if resolved is None and "--store-adapter" not in argv:
+        argv += ["--store-adapter", __file__]
+    return reminder.main(argv, Path(workspace), adapter=resolved)
 
 
 # ---- serve: one request against the databases document -------------------------
