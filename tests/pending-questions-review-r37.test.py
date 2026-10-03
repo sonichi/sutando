@@ -72,6 +72,8 @@ def reconcile_pass(ws):
     held = Path(ws) / "held.json"
     if (Path(ws) / "fail").exists():
         return {"flushed": [], "moved": [], "closed": [], "errors": ["replay refused"]}
+    if (Path(ws) / "raise").exists():
+        raise ConnectionError("replay down")
     if not held.exists():
         return {"flushed": [], "moved": [], "closed": [], "errors": []}
     rows = _rows(ws) + [json.loads(held.read_text())]
@@ -245,6 +247,17 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("reconcile: FAILED — replay refused", err)
         self.assertIn("[ask-row] a row?", out)
+
+    def test_a_raised_reconcile_failure_is_a_note_and_the_read_still_lists(self):
+        """Round 38: the injected adapter's reconcile_pass raises; the reminder must still read and
+        list, with the failure as a note, not exit 1 before gather."""
+        (self.ws / "room.json").write_text(json.dumps([{"ask_id": "ask-existing", "title": "still waiting?"}]))
+        (self.ws / "raise").write_text("")
+        rc, out, err = self.run_reminder()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("reconcile: FAILED — adapter failed: ConnectionError: replay down", err)
+        self.assertIn("[ask-existing] still waiting?", out)
+        self.assertNotIn("Traceback", err)
 
     def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
         calls = []

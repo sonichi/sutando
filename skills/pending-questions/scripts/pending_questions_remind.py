@@ -90,7 +90,10 @@ def gather(adapter=None):
         spec.loader.exec_module(room_db)
     else:
         import pending_questions_room_db as room_db  # noqa: PLC0415
-    rec = room_db.reconcile_pass(WORKSPACE)
+    try:  # a raised replay failure is a note, never a reason to skip the read
+        rec = room_db.reconcile_pass(WORKSPACE)
+    except Exception as e:  # noqa: BLE001 — the adapter is third-party code
+        rec = {"errors": [f"adapter failed: {type(e).__name__}: {e}"]}
     g = room_db.gather(WORKSPACE)
     g.setdefault("unavailable", False)
     g.setdefault("reason", None)
