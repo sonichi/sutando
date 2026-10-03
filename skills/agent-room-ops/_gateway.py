@@ -25,6 +25,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    import room_message
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import room_message
+
 HTTP_TIMEOUT = 15
 
 
@@ -247,6 +253,9 @@ def http_request(method, url, headers=None, data=None, max_bytes=None):
 
 def http_json(method, url, headers=None, payload=None):
     """JSON request/response. Returns (status, parsed_json)."""
+    if (method == "POST" and urllib.parse.urlsplit(url).path.endswith("/v1/room")
+            and isinstance(payload, dict) and payload.get("op") in ("message", "edit")):
+        payload = room_message.room_message_payload(payload)
     data = json.dumps(payload).encode() if payload is not None else None
     h = dict(headers or {})
     if data is not None:

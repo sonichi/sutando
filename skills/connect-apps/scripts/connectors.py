@@ -91,6 +91,7 @@ from typing import Any, Callable
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+import room_message
 import cloud_auth  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
@@ -1339,12 +1340,12 @@ def card_message(wait: dict, owner: str, task: str, intro: str, switch: bool) ->
     connector = {"version": 1, "for": owner, "toolkits": [{"slug": str(x["slug"])} for x in toolkits]}
     if switch:
         connector["mode"] = "switch"
-    return {
+    return room_message.room_message_payload({
         "body": f"{intro}\n\n{card_outro(names, switch)}",
         "extra_content": {"space.ag2.connector": connector},
         "reply_to": wait["reply_to"],
         "operation_id": f"{task}:{'switch' if switch else 'connect'}-card",
-    }
+    })
 
 
 def cmd_card(

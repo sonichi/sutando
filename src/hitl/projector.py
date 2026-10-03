@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Tuple
 
+import room_message
+
 from .manager import HitlManager
 from .schema import (
     CATEGORY_BLOCKED,
@@ -90,7 +92,7 @@ def project(manager: HitlManager, send: Sender, room_id: str) -> List[Tuple[str,
             payload.update({"op": "edit", "event_id": target})
         else:
             payload["op"] = "message"
-        answer = send(payload)
+        answer = send(room_message.room_message_payload(payload))
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         event_id = str(answer.get("event_id") or "") or None
