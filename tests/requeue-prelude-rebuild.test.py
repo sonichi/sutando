@@ -106,6 +106,62 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     check("ADDRESSING: this message replies to @peer:ag2.space" in out2,
           "addressed_to from the header is re-rendered into the fresh prelude")
 
+    # --- widened guard: reply_to_me=False + reply_to_sender fires ADDRESSING
+    # even with no explicit @-mention (no addressed_to at all) ---
+    replied_not_me = stored_task().replace(
+        "user_id:",
+        "reply_to_me: False\nreply_to_sender: @susan:ag2.space\nuser_id:")
+    out8 = build_requeued_task(replied_not_me, "task-req999", 1,
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="dev-ag2space")
+    check("ADDRESSING: this message replies to @susan:ag2.space" in out8,
+          "reply_to_me=False + reply_to_sender fires ADDRESSING with no addressed_to")
+
+    # --- reply_to_me=True: this message IS addressed to me, no guard ---
+    replied_me = stored_task().replace(
+        "user_id:",
+        "reply_to_me: True\nreply_to_sender: @susan:ag2.space\nuser_id:")
+    out9 = build_requeued_task(replied_me, "task-req1010", 1,
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="dev-ag2space")
+    check("ADDRESSING:" not in out9,
+          "reply_to_me=True never fires the guard, regardless of reply_to_sender")
+
+    # --- no reply context at all: absent fields, no guard ---
+    out10 = build_requeued_task(stored_task(), "task-req1111", 1,
+                                "!other:dev.ag2.space", "task-holder",
+                                channel_dir="dev-ag2space")
+    check("ADDRESSING:" not in out10,
+          "no reply_to_me/reply_to_sender at all -> no guard")
+
+    # --- an explicit addressed_to still wins even alongside reply_to_me=False ---
+    both = stored_task().replace(
+        "user_id:",
+        "addressed_to: @explicit:ag2.space\nreply_to_me: False\n"
+        "reply_to_sender: @susan:ag2.space\nuser_id:")
+    out11 = build_requeued_task(both, "task-req1212", 1,
+                                "!other:dev.ag2.space", "task-holder",
+                                channel_dir="dev-ag2space")
+    check("ADDRESSING: this message replies to @explicit:ag2.space" in out11,
+          "an explicit addressed_to takes precedence over reply_to_sender")
+
+    # --- render_skill_prelude called directly with a live Python bool, the
+    # shape the gateway's task-write path actually passes (not a header string) ---
+    live_false = "\n".join(render_skill_prelude(
+        "!room1:dev.ag2.space", "ag2space", "task-live1",
+        "", False, "@susan:ag2.space"))
+    check("ADDRESSING: this message replies to @susan:ag2.space" in live_false,
+          "a live bool False + reply_to_sender fires the guard")
+    live_true = "\n".join(render_skill_prelude(
+        "!room1:dev.ag2.space", "ag2space", "task-live2",
+        "", True, "@susan:ag2.space"))
+    check("ADDRESSING:" not in live_true,
+          "a live bool True never fires the guard")
+    live_none = "\n".join(render_skill_prelude(
+        "!room1:dev.ag2.space", "ag2space", "task-live3", "", None, ""))
+    check("ADDRESSING:" not in live_none,
+          "reply_to_me=None (not a reply at all) never fires the guard")
+
     # --- a task born without a prelude must not gain one ---
     out3 = build_requeued_task(stored_task(prelude=False), "task-req444", 1,
                                "!other:dev.ag2.space", "task-holder",
