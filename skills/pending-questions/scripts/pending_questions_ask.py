@@ -16,6 +16,7 @@ neutralized (`[ file:`), so no text can become a drain action.
 from __future__ import annotations
 
 import glob
+import os
 import re
 import subprocess
 import sys
