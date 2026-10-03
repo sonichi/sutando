@@ -34,7 +34,7 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
 from pending_questions_md import (  # noqa: E402
     DIVIDER_OR_DONE_RE, active_region, mask_html_comments, mask_markup)
 

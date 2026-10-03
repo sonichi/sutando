@@ -103,20 +103,21 @@ class TestSingleStore(unittest.TestCase):
         schemas, the markers, the queue/routing policy, the store, replay, ingest, reminder and
         adapter are the skill's. Core names no skill and carries none of that policy."""
         src = REPO / "src"
+        # The legacy-file Markdown grammar (`pending_questions_md`) is the ingest's parser: skill policy too.
         for gone in ("pending_questions_store.py", "pending_questions_compat.py", "pending_questions_outbox.py",
-                     "pending_questions_ask.py", "pending_questions_ledger.py"):
+                     "pending_questions_ask.py", "pending_questions_ledger.py", "pending_questions_md.py"):
             self.assertFalse((src / gone).exists(), f"{gone} is feature policy; it belongs to the skill")
         skill = REPO / "skills" / "pending-questions" / "scripts"
         for there in ("pending_questions_store.py", "pending_questions_compat.py", "pending_questions_remind.py",
                       "pending_questions_room_db.py", "pending_questions_outbox.py", "pending_questions_ask.py",
-                      "pending_questions_ledger.py", "pq.py"):
+                      "pending_questions_ledger.py", "pending_questions_md.py", "pq.py"):
             self.assertTrue((skill / there).exists(), there)
         for rel in self.CORE:
             text = (REPO / rel).read_text()
             # The manifest FIELD `pending_questions_store` is the contract core reads; the modules are not.
             self.assertNotRegex(text, r"room[-_]collab|room[-_]commons|pending_questions_room_db|skills/pending-questions|"
-                                      r"pending_questions_(store|compat|remind|outbox|ask|ledger)\.py|"
-                                      r"(import|from) pending_questions_(store|compat|remind|outbox|ask|ledger)\b", rel)
+                                      r"pending_questions_(store|compat|remind|outbox|ask|ledger|md)\.py|"
+                                      r"(import|from) pending_questions_(store|compat|remind|outbox|ask|ledger|md)\b", rel)
             hits = sorted({m.group(0) for m in self.SKILL_POLICY.finditer(text)})
             self.assertEqual(hits, [], f"{rel} carries the skill's grammar or schema: {hits}")
         self.assertLess(len((REPO / "src" / "check-pending-questions.py").read_text().splitlines()), 60, "a thin shim")
