@@ -199,8 +199,9 @@ consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
 fallback) own transport routing and upload calls only — they must not define
 marker regexes or path-policy copies.
 
-**All four Python consumers now conform, and the guard enforces it.**
-`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, and `slack-bridge.py`
+**All five Python consumers now conform, and the guard enforces it.**
+`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, `slack-bridge.py`,
+and the gateway bridge
 obtain marker grammar solely from `parse_markers()`.
 `tests/bridge-marker-no-leak.test.py` fails if any of them declares the grammar
 itself, matching the grammar in any regex literal so a renamed private parser
