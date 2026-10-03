@@ -24,7 +24,8 @@ wait_bounded() {
     # from the child's own exit or signal.
     [ -z "$timeout_flag" ] || : > "$timeout_flag"
     kill -TERM "$pid" 2>/dev/null; sleep 1
-    kill -KILL "$pid" 2>/dev/null ) &
+    # A child the TERM already ended was reaped and its pid may be reused by now.
+    [ -e "$done_flag" ] || kill -KILL "$pid" 2>/dev/null ) &
   watchdog_pid=$!
   wait "$pid" 2>/dev/null
   rc=$?
