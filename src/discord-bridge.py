@@ -165,7 +165,7 @@ from policy.egress.result import guard_result_for_tier, resolve_access_tier as _
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
-from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
+from reply_chain import bare_mention_context_line, format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, readable_attachments, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
 # Cap the reply-chain CONTENT walk (a fetch per level; the immediate parent is
 # depth 0). Only the immediate parent is inlined, so beyond this there is no
@@ -3737,7 +3737,9 @@ async def _handle_discord_message(message, force=False):
                 # dropped — only the reply's own (often empty) attachment
                 # set was scanned above. Same save + sanitized-basename +
                 # image-vision pattern as the primary loop.
-                for att in getattr(ref_msg, "attachments", []):
+                # A forwarded parent keeps its files in message_snapshots, so
+                # a plain ref_msg.attachments read is empty for exactly that shape.
+                for att in readable_attachments(ref_msg):
                     p_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                     try:
                         await att.save(p_path)
@@ -3766,21 +3768,10 @@ async def _handle_discord_message(message, force=False):
         if is_dm or _message_mentions_bot(message):
             context_lines = []
             try:
-                async for prev in message.channel.history(limit=5, before=message):
-                    prev_author = str(prev.author)
-                    prev_content = (prev.content or "").strip()
-                    # Strip mentions so they don't pollute the context snippet
-                    for u in prev.mentions:
-                        prev_content = prev_content.replace(f"<@{u.id}>", f"@{u.name}")
-                    for r in prev.role_mentions:
-                        prev_content = prev_content.replace(f"<@&{r.id}>", f"@&{r.name}")
-                    if not prev_content and not prev.attachments:
-                        continue
-                    # Truncate each message and collapse newlines
-                    snippet = prev_content[:200].replace("\n", " ")
-                    if prev.attachments:
-                        snippet += f" [+{len(prev.attachments)} attachment(s)]"
-                    context_lines.append(f"  {prev_author}: {snippet}")
+                async for prev in message.channel.history(limit=5, before=message):  # pragma: no cover
+                    line = bare_mention_context_line(str(prev.author), prev)  # pragma: no cover
+                    if line is not None:
+                        context_lines.append(line)  # pragma: no cover
             except Exception as e:
                 print(f"  [bare-mention] history fetch failed: {e}", flush=True)
             if context_lines:
