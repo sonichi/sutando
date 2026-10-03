@@ -53,7 +53,8 @@ _REAL_SYNC_DIR="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
 # operator's own clone by hand.
 # shellcheck source=lib/real-clone-guard.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/real-clone-guard.sh"
-rcg_snapshot "$_REAL_SYNC_DIR"
+# rcg_snapshot comes below, under the private git config: the guard digests
+# `ls-files --exclude-standard`, so an inherited core.excludesFile alone trips it.
 
 # Deny by default. Per-test fixtures still set these explicitly per invocation.
 _DENIED_SYNC_DIR="$(mktemp -d -t sync-ws-denied.XXXXXX)"
@@ -80,14 +81,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT="$(mktemp -d -t sync-workspace-test.XXXXXX)"
-# bash traps REPLACE rather than stack, so the tripwire must run from the SAME EXIT
-# trap as the cleanup or a later trap silently discards it.
-trap '_assert_real_clone_untouched; rm -rf "$TEST_ROOT" "$_DENIED_SYNC_DIR"' EXIT
 # Every git in this run reads ONE config, written here: the operator's global
 # config (gpgsign, hooksPath, defaultBranch, rerere) never reaches a fixture.
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL="$TEST_ROOT/gitconfig"
 printf '[user]\n\tname = %s\n\temail = %s\n' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" > "$GIT_CONFIG_GLOBAL"
+# Under the same config the EXIT trap's rcg_assert reads (see above).
+rcg_snapshot "$_REAL_SYNC_DIR"
+# bash traps REPLACE rather than stack, so the tripwire must run from the SAME EXIT
+# trap as the cleanup or a later trap silently discards it.
+trap '_assert_real_clone_untouched; rm -rf "$TEST_ROOT" "$_DENIED_SYNC_DIR"' EXIT
 # The script's log defaults to ONE file under $TMPDIR, shared by every suite in a lane.
 export SYNC_WORKSPACE_LOG="$TEST_ROOT/sync-workspace.log"
 # The fixtures below that start from a bare environment (`env -i`) must carry the
