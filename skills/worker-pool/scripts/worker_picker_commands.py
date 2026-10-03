@@ -261,9 +261,9 @@ def authorized_command(path, workspace=None) -> "dict | None":
     A task-last writer puts every header above `task:`; everything below is the
     sender's text and may promote nothing. The gateway instead writes the picker
     mark and the tier BELOW `task:`, so reading its tier needs the last-wins
-    parse -- which is only safe on a file whose whole content is attested.
-    The envelope HMAC is that attestation and the only thing consulted here:
-    fail closed on unsigned/invalid/unverifiable, per task_envelope's contract.
+    parse -- which is only safe on a file whose writer declared the one-line
+    task-mid layout above `task:` AND whose envelope HMAC verifies; either
+    missing falls back to the strict parse (task_envelope.attested_task_headers).
     """
     import task_envelope as te
     text = Path(path).read_text(encoding="utf-8", errors="replace")

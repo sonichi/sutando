@@ -31,8 +31,14 @@ os.environ["AG2_DEVICE_ENV"] = os.path.join(_GW_SCRATCH, "absent-device.env")
 os.environ["REMOTE_TASK_TOKEN"] = "http://127.0.0.1:9|fake-gateway-token"
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9"
 os.environ["REMOTE_MEDIA_DIR"] = os.path.join(_GW_SCRATCH, "media")
-for _kind in ("TASK", "RESULT", "STATE"):
-    os.environ[f"AGENT_CONNECT_{_kind}_DIR"] = os.path.join(_GW_SCRATCH, _kind.lower())
+os.environ["AGENT_CONNECT_TASK_DIR"] = os.path.join(_GW_SCRATCH, "task")
+os.environ["AGENT_CONNECT_RESULT_DIR"] = os.path.join(_GW_SCRATCH, "result")
+os.environ["AGENT_CONNECT_STATE_DIR"] = os.path.join(_GW_SCRATCH, "state")
+# the writer reports a telemetry event per queued task: opt out, and point its id/state at scratch
+os.environ["SUTANDO_TELEMETRY"] = "0"
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["SUTANDO_STATE_DIR"] = os.path.join(_GW_SCRATCH, "state")
+os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(_GW_SCRATCH, "telemetry-id")
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 sys.path.insert(0, str(REPO / "src"))
 import pending_questions_ask as pqa
@@ -306,18 +312,31 @@ class TestRouting(_Workspace):
 
     def test_the_real_gateway_writer_routes_to_its_dm(self):
         """Positive control through the shipped task-mid writer, stamped by the seam it uses."""
+        import socket
+        import urllib.request
         import task_envelope
+        import telemetry
         from ag2_sparrow import remote_gateway_bridge as rgb  # env above makes this hermetic
         from ag2_sparrow.local_task_protocol import set_task_stamper
-        self.assertEqual(rgb.URL, "http://127.0.0.1:9", "the gateway read a token/URL from outside the fixture")
+        self.assertEqual(rgb.URL, "http://127.0.0.1:9", "the gateway read a URL from outside the fixture")
+        self.assertEqual(rgb.TOKEN, "fake-gateway-token", "the gateway read a token from outside the fixture")
+        self.assertTrue(telemetry.opted_out(), "telemetry would report the queued tasks")
         for name in ("_STATE", "_LOG_FILE", "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE"):
             self.assertTrue(str(getattr(rgb, name)).startswith(_GW_SCRATCH),
                             f"{name}={getattr(rgb, name)} is outside the fixture")
 
-        def _no_network(*a, **k):
-            raise RuntimeError("network disabled in tests")
-        self.addCleanup(setattr, rgb, "_req", rgb._req)
-        rgb._req = _no_network
+        attempts = []
+
+        def _deny(seam):
+            def _refuse(*a, **k):
+                attempts.append(seam)
+                raise RuntimeError(f"{seam} disabled in tests")
+            return _refuse
+        # the bridge's own client is denied (it does try a fleet read per task, fail-open),
+        # and the transports below it prove nothing can leave the process another way
+        for obj, attr in ((rgb, "_req"), (urllib.request, "urlopen"), (socket, "create_connection")):
+            self.addCleanup(setattr, obj, attr, getattr(obj, attr))
+            setattr(obj, attr, _deny(attr))
         for name in ("TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR"):
             self.addCleanup(setattr, rgb, name, getattr(rgb, name))
         rgb.TASKS_DIR = self.ws / "tasks"
@@ -339,6 +358,9 @@ class TestRouting(_Workspace):
                 [f] = self._proactive()
                 redirect = [a.value for a in parse_markers(f.read_text()).actions if a.kind == "redirect"]
                 self.assertEqual(redirect, expect)
+        self.assertEqual([a for a in attempts if a != "_req"], [], "a request reached a transport")
+        self.assertEqual(set(attempts), {"_req"}, "the fleet read is the only outbound call, and it was refused")
+        self.assertFalse(Path(os.environ["SUTANDO_TELEMETRY_ID_FILE"]).exists(), "telemetry minted an id")
 
     def test_a_verified_gateway_task_routes_to_its_dm(self):
         self._run("ship it?", "--task-file", self._task(self._gateway_task("dm")))
