@@ -152,17 +152,22 @@ class Hermetic(unittest.TestCase):
                   "SUTANDO_TELEMETRY": "1", "DO_NOT_TRACK": ""}
         import json
         import tempfile
-        probe = os.path.join(tempfile.mkdtemp(prefix="pq-send-probe-"), "captured.json")
+        # an inherited sink path must be ignored: the probe goes to captured stdout, never a file
+        sentinel = Path(tempfile.mkdtemp(prefix="pq-send-sentinel-")) / "sentinel.txt"
+        sentinel.write_text("do not touch me")
         r = subprocess.run([_sys.executable, str(SUITE), "-v", "-k", "real_gateway"],
-                           env={**os.environ, **poison, "PQ_SEND_PROBE_OUT": probe},
+                           env={**os.environ, **poison, "PQ_SEND_PROBE": "1", "PQ_SEND_PROBE_OUT": str(sentinel)},
                            capture_output=True, text=True, timeout=300)
+        self.assertEqual(sentinel.read_text(), "do not touch me", "the child wrote to an inherited path")
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         # the one test was collected and passed by name, not merely "nothing ran"
         self.assertIn("test_the_real_gateway_writer_routes_to_its_dm (", r.stderr, "the real-writer test was not collected")
-        self.assertIn("Ran 1 test", r.stderr)
+        self.assertRegex(r.stderr, r"(?m)^Ran 1 test in ")
         self.assertRegex(r.stderr, r"(?m)^ok$")  # verbose runner: the test's own verdict line (logs may interleave)
         self.assertNotRegex(r.stderr, r"(?m)^(FAIL|ERROR)")
-        got = json.loads(Path(probe).read_text())
+        lines = [l for l in r.stdout.splitlines() if l.startswith("PQ_SEND_PROBE ")]
+        self.assertEqual(len(lines), 1, "exactly one probe line on stdout")
+        got = json.loads(lines[0][len("PQ_SEND_PROBE "):])
         scratch = os.path.realpath(got["scratch"])
         self.assertEqual(got["CHANNEL_DIR"], "pq-send-channel")
         self.assertEqual(got["URL"], "http://127.0.0.1:9")
