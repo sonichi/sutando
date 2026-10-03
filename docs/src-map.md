@@ -29,7 +29,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
-- **`bounded-wait.sh`** — One bounded wait for the watcher's inline child runs (resolver, task handler).
+- **`bounded-wait.sh`** — The watcher's one bounded child run.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.

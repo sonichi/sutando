@@ -676,7 +676,7 @@ SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
   local task_path="$1" disposition="${2:-fallback}" filename announce handler_rc verdict claim_settled
-  local handler_pid timeout_flag timed_out
+  local timeout_flag timed_out
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
@@ -698,20 +698,19 @@ run_handler_now() {
     echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
     handler_rc=1
   else
-    # Bounded (wait_bounded) the same way resolve_inbox_entry bounds a resolver
+    # Bounded (run_bounded) the same way resolve_inbox_entry bounds a resolver
     # in this same single-threaded dispatch loop. A genuinely hung handler was
     # never observed, but is no longer isolated in its own process either
     # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
     # ~250x the measured normal ~35-40ms cost) bounds it regardless.
     timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/sutando-handler-timeout.XXXXXX")"
-    "$CURRENT_HANDLER" \
+    run_bounded "$SUTANDO_HANDLER_RUN_TIMEOUT" "$timeout_flag" -- \
+      "$CURRENT_HANDLER" \
       --runtime "${SUTANDO_CORE_RUNTIME:-}" \
       --workspace "$WORKSPACE_DIR" \
       --task-file "$task_path" \
       --results-dir "$RESULTS_DIR" \
-      --repo "$__REPO_ROOT" >/dev/null &
-    handler_pid=$!
-    wait_bounded "$handler_pid" "$SUTANDO_HANDLER_RUN_TIMEOUT" "$timeout_flag"
+      --repo "$__REPO_ROOT" >/dev/null
     handler_rc=$?
     if [ -f "$timeout_flag" ]; then
       timed_out=1

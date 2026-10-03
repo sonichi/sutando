@@ -1,6 +1,6 @@
 #!/bin/bash
 # Inbox-entry resolver — sourceable so a test can invoke it in isolation.
-# Sourcing this file defines resolve_inbox_entry, plus wait_bounded from bounded-wait.sh.
+# Sourcing this file defines resolve_inbox_entry, plus run_bounded from bounded-wait.sh.
 
 # Only the adapter that wrote a sentinel knows where its payload lives, so
 # the core just runs the executable it was handed.
@@ -13,7 +13,7 @@
 # shellcheck source=bounded-wait.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded-wait.sh"
 resolve_inbox_entry() {
-	local entry="$1" out rc resolved not_absolute out_file resolver_pid
+	local entry="$1" out rc resolved not_absolute out_file
 	if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ]; then
 		printf '%s\n' "$entry"
 		return 0
@@ -25,9 +25,8 @@ resolve_inbox_entry() {
 	out_file="$(mktemp)"
 	# The assignment is APPENDED: $1 stays the entry, so a resolver written
 	# before this flag existed is unaffected, and a new one can require it.
-	"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null &
-	resolver_pid=$!
-	wait_bounded "$resolver_pid" "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}"
+	run_bounded "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}" -- \
+		"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null
 	rc=$?
 	out="$(cat "$out_file" 2>/dev/null)"
 	rm -f "$out_file"
