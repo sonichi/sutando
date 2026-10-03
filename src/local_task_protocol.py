@@ -155,7 +155,7 @@ KNOWN_HEADER_KEYS = (
     "author_id", "chat_id",
     # Reply addressing: header status means only the trusted bridge writes
     # them, and the guard defangs forged body copies of the same names.
-    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
