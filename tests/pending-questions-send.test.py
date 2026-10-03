@@ -39,18 +39,23 @@ os.environ["SUTANDO_TELEMETRY"] = "0"
 os.environ["DO_NOT_TRACK"] = "1"
 os.environ["SUTANDO_STATE_DIR"] = os.path.join(_GW_SCRATCH, "state")
 os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(_GW_SCRATCH, "telemetry-id")
+# an inherited channel dir or token file would make the gateway read outside the fixture
+os.environ["REMOTE_TASK_CHANNEL_DIR"] = "pq-send-channel"
+os.environ["REMOTE_TASK_TOKEN_FILE"] = os.path.join(_GW_SCRATCH, "absent-token-file")
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 OUTBOUND_SEAMS = (("rgb", "_req"), ("urllib.request", "urlopen"), ("socket", "create_connection"))
 ISOLATED_PATH_KEYS = ("CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_DIR", "AGENT_CONNECT_TASK_DIR",
                       "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "SUTANDO_STATE_DIR",
-                      "SUTANDO_TELEMETRY_ID_FILE")
+                      "SUTANDO_TELEMETRY_ID_FILE", "REMOTE_TASK_TOKEN_FILE")
 ISOLATED_EXACT = {"REMOTE_TASK_TOKEN": "http://127.0.0.1:9|fake-gateway-token",
-                  "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1"}
+                  "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1",
+                  "REMOTE_TASK_CHANNEL_DIR": "pq-send-channel"}
 
 
 GATEWAY_DERIVED_PATHS = ("MEDIA_DIR", "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "_STATE", "_LOG_FILE",
-                         "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE", "GATEWAY_STATUS_FILE")
+                         "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE", "GATEWAY_STATUS_FILE",
+                         "TOKEN_FILE")
 
 
 def assert_gateway_isolated(rgb, scratch):
@@ -62,6 +67,7 @@ def assert_gateway_isolated(rgb, scratch):
         real = os.path.realpath(str(getattr(rgb, name)))
         assert real == root or real.startswith(root + os.sep), f"rgb.{name}={getattr(rgb, name)} is outside the fixture"
     assert rgb.URL == ISOLATED_EXACT["REMOTE_TASK_URL"], f"rgb.URL={rgb.URL!r}"
+    assert rgb.CHANNEL_DIR == ISOLATED_EXACT["REMOTE_TASK_CHANNEL_DIR"], f"rgb.CHANNEL_DIR={rgb.CHANNEL_DIR!r}"
     assert rgb.TOKEN == ISOLATED_EXACT["REMOTE_TASK_TOKEN"].split("|", 1)[1], "the gateway holds a token from outside the fixture"
 
 

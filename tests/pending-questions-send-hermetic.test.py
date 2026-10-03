@@ -16,9 +16,17 @@ REPO = Path(__file__).resolve().parent.parent
 SUITE = REPO / "tests" / "pending-questions-send.test.py"
 PATH_KEYS = ("CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_DIR", "AGENT_CONNECT_TASK_DIR",
              "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "SUTANDO_STATE_DIR",
-             "SUTANDO_TELEMETRY_ID_FILE")
+             "SUTANDO_TELEMETRY_ID_FILE", "REMOTE_TASK_TOKEN_FILE")
 EXACT = {"REMOTE_TASK_TOKEN": "http://127.0.0.1:9|fake-gateway-token",
-         "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1"}
+         "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1",
+         "REMOTE_TASK_CHANNEL_DIR": "pq-send-channel"}
+# Declared here, independently of the suite's own inventory: every path the gateway
+# module derives from the environment at import (remote_gateway_bridge.py module globals).
+EXPECTED_GATEWAY_PATHS = frozenset({"MEDIA_DIR", "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "_STATE",
+                                    "_LOG_FILE", "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE",
+                                    "GATEWAY_STATUS_FILE", "TOKEN_FILE"})
+EXPECTED_GATEWAY_SCALARS = {"URL": "http://127.0.0.1:9", "TOKEN": "fake-gateway-token",
+                            "CHANNEL_DIR": "pq-send-channel"}
 CONTRACT_KEYS = PATH_KEYS + tuple(EXACT)
 GATEWAY_MODULE = "remote_gateway_bridge"
 SEAMS = (("rgb", "_req"), ("urllib.request", "urlopen"), ("socket", "create_connection"))
@@ -109,23 +117,43 @@ class Hermetic(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.mod.assert_isolated({**good, key: bad}, self.mod._GW_SCRATCH)
 
+    def test_the_suite_checks_every_expected_gateway_path(self):
+        # the inventory the helper walks must equal the set declared here, so dropping
+        # an entry from the suite cannot pass by also dropping it from the test
+        self.assertEqual(frozenset(self.mod.GATEWAY_DERIVED_PATHS), EXPECTED_GATEWAY_PATHS)
+
     def test_the_module_check_rejects_a_gateway_that_captured_an_outside_path(self):
         class Stub:
             pass
         inside = os.path.join(self.mod._GW_SCRATCH, "x")
         good = Stub()
-        for name in self.mod.GATEWAY_DERIVED_PATHS:
+        for name in EXPECTED_GATEWAY_PATHS:
             setattr(good, name, inside)
-        good.URL = "http://127.0.0.1:9"
-        good.TOKEN = "fake-gateway-token"
+        for name, value in EXPECTED_GATEWAY_SCALARS.items():
+            setattr(good, name, value)
         self.mod.assert_gateway_isolated(good, self.mod._GW_SCRATCH)
-        for name in self.mod.GATEWAY_DERIVED_PATHS + ("URL", "TOKEN"):
+        for name in sorted(EXPECTED_GATEWAY_PATHS) + sorted(EXPECTED_GATEWAY_SCALARS):
             with self.subTest(name):
                 bad = Stub()
                 bad.__dict__.update(good.__dict__)
-                setattr(bad, name, "/tmp/pq-send-outside-scratch" if name not in ("URL", "TOKEN") else "inherited")
+                setattr(bad, name, "/tmp/pq-send-outside-scratch" if name in EXPECTED_GATEWAY_PATHS else "inherited")
                 with self.assertRaises(AssertionError):
                     self.mod.assert_gateway_isolated(bad, self.mod._GW_SCRATCH)
+
+    def test_inherited_gateway_inputs_are_neutralised(self):
+        """Positive control: the real-writer test passes in a child process whose inherited
+        environment points every gateway input outside any fixture."""
+        import subprocess
+        import sys as _sys
+        poison = {"REMOTE_TASK_CHANNEL_DIR": "inherited-channel", "REMOTE_TASK_TOKEN_FILE": "/tmp/pq-send-outside-scratch/token",
+                  "REMOTE_TASK_TOKEN": "http://127.0.0.1:1|inherited-token", "REMOTE_TASK_URL": "http://127.0.0.1:1",
+                  "REMOTE_MEDIA_DIR": "/tmp/pq-send-outside-scratch/media", "AG2_DEVICE_ENV": "/tmp/pq-send-outside-scratch/device.env",
+                  "CLAUDE_CONFIG_DIR": "/tmp/pq-send-outside-scratch/ccd", "AGENT_CONNECT_STATE_DIR": "/tmp/pq-send-outside-scratch/state",
+                  "SUTANDO_TELEMETRY": "1", "DO_NOT_TRACK": ""}
+        r = subprocess.run([_sys.executable, str(SUITE), "-k", "real_gateway"], env={**os.environ, **poison},
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        self.assertIn("OK", r.stderr)
 
     def test_the_module_check_follows_the_gateway_import_immediately(self):
         funcs = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)
