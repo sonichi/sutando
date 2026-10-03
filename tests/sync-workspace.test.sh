@@ -77,6 +77,11 @@ export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-sync-workspace-test}"
 export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync-workspace-test@invalid}"
 export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-sync-workspace-test}"
 export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-sync-workspace-test@invalid}"
+# The fixtures below that start from a bare environment (`env -i`) must carry that
+# identity too, or on a runner with no global git config their commits die with 128.
+BARE_ENV=(env -i HOME="$HOME" PATH="$PATH"
+  GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL"
+  GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -1078,7 +1083,7 @@ mkdir -p "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory"
 mkdir -p "$WSA_WS/notes"
 echo "from workspace A" > "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory/feedback_wsA.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSA_REPO" \
     SUTANDO_WORKSPACE="$WSA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1103,7 +1108,7 @@ mkdir -p "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory"
 mkdir -p "$WSB_WS/notes"
 echo "from workspace B" > "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory/feedback_wsB.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSB_REPO" \
     SUTANDO_WORKSPACE="$WSB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1137,7 +1142,7 @@ else
 fi
 
 # Re-run --init on wsA WITHOUT override → must NOT regenerate, reads persisted
-RERUN_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+RERUN_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSA_REPO" \
     SUTANDO_WORKSPACE="$WSA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1184,7 +1189,7 @@ echo "hostA note" > "$HOSTA_WS/notes/hostA-note.md"
 # Run --init on host A — hostname is the same across both hosts (same machine
 # running the test), so we override HOST per-invocation via the
 # SUTANDO_HOST_OVERRIDE test-only shim in the script.
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTA_REPO" \
     SUTANDO_WORKSPACE="$HOSTA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1211,7 +1216,7 @@ mkdir -p "$HOSTB_WS/notes"
 echo "from hostB" > "$HOSTB_WS/.claude-sutando/projects/${HOSTB_SLUG}/memory/feedback_hostB.md"
 echo "hostB note" > "$HOSTB_WS/notes/hostB-note.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTB_REPO" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1237,7 +1242,7 @@ else
 fi
 
 # Now run --pull-only on host B → should merge hostA in via --allow-unrelated-histories
-PULL_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+PULL_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTB_REPO" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1376,7 +1381,7 @@ else
 fi
 
 # Run the NEW sync (default bidirectional). Migration should fire.
-T27_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+T27_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$T27_REPO" \
     SUTANDO_WORKSPACE="$T27_WS" \
     SUTANDO_TEST_MODE=1 \
