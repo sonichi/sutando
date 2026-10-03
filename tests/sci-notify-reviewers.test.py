@@ -57,7 +57,10 @@ class NotifyReviewers(unittest.TestCase):
         p = run({"kim": {"human": "@kim:x", "room": "!r:x"}},
                 "--reviewers", "kim", "--message", "m")
         self.assertEqual(p.returncode, 3)
-        self.assertIn("not Stand addressing", p.stderr)
+        # The refusal must say a human handle is not Stand addressing. Asserted
+        # on meaning, not the old literal, so rewording cannot fail it falsely.
+        self.assertIn("no addressable route", p.stderr)
+        self.assertIn("triggers no Stand", p.stderr)
 
     def test_known_off_allowlist_refused_exit_4(self):
         p = run({"mini": {"stand": "@mini:x", "room": "!r:x",

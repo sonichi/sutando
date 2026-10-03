@@ -85,8 +85,15 @@ class Kind(unittest.TestCase):
     def test_CONTROL_an_ask_is_recorded(self):
         rc = self._run(["--reviewers", "alice,bob", "--message", f"review {PR}", "--send"])
         self.assertEqual(rc, 0)
-        self.assertEqual(len(self._ledger_lines()), 2,
+        rows = [json.loads(x) for x in self._ledger_lines()]
+        # Both transports now reserve then settle, so count the LIFECYCLE, not
+        # lines. `actor` is on both rows; `reviewer` only on the settlement.
+        self.assertEqual({r["actor"] for r in rows}, {"alice", "bob"},
                          "the ask path must write, or the notice assertion below is vacuous")
+        for who in ("alice", "bob"):
+            outcomes = [r.get("outcome") for r in rows if r.get("actor") == who]
+            self.assertIn("pending", outcomes, f"{who} never reserved a park")
+            self.assertIn("confirmed", outcomes, f"{who} never settled its reservation")
 
     def test_a_notice_is_not_recorded_as_an_ask(self):
         rc = self._run(["--reviewers", "alice,bob", "--message", f"merged {PR}",
