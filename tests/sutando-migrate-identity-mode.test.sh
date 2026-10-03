@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# Identity = bytes AND mode, uniformly: mode-only differences are divergence,
+# ignorable entries never outrank actionable ones, unverified is never genuine.
+set -u
+cd "$(dirname "$0")/.."
+fails=0
+check() { if [ "$2" = "$3" ]; then echo "  ok  $1"; else echo "FAIL  $1 — got '$2', want '$3'"; fails=$((fails+1)); fi; }
+
+# --- control 1: identity_match itself, plus the commit-path consequence ---
+# Extract and exercise the REAL helpers from the shipped script.
+tmp="$(mktemp -d -t migrate-identity.XXXXXX)"
+trap 'rm -rf "$tmp"' EXIT
+printf '#!/bin/sh\necho hi\n' > "$tmp/a.sh"; chmod 0755 "$tmp/a.sh"
+printf '#!/bin/sh\necho hi\n' > "$tmp/b.sh"; chmod 0644 "$tmp/b.sh"
+printf '#!/bin/sh\necho hi\n' > "$tmp/c.sh"; chmod 0755 "$tmp/c.sh"
+helpers="$tmp/helpers.sh"
+sed -n '/^_stat() {/,/^}/p; /^mode_of() {/,/^}/p; /^mtime_date() {/,/^}/p; /^identity_match() {/,/^}/p; /^sha_match() {/,/^}/p' scripts/sutando-migrate.sh > "$helpers"
+# shellcheck disable=SC1090
+. "$helpers"
+# A failed extraction must fail loudly HERE: command-not-found inside a
+# yes/no capture reads as a clean "no" and false-passes the no-expecting checks.
+type identity_match >/dev/null 2>&1 || { echo "FAIL  helper extraction produced no identity_match"; exit 1; }
+type _stat >/dev/null 2>&1 || { echo "FAIL  helper extraction produced no _stat (mode_of would return empty and every identity check would false-pass)"; exit 1; }
+check "same bytes + same mode IS identical" "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "yes"
+check "same bytes + different mode is NOT identical (exec bit must survive)" \
+  "$(identity_match "$tmp/a.sh" "$tmp/b.sh" && echo yes || echo no)" "no"
+check "different bytes never identical whatever the mode" \
+  "$(printf 'other\n' > "$tmp/d.sh"; chmod 0755 "$tmp/d.sh"; identity_match "$tmp/a.sh" "$tmp/d.sh" && echo yes || echo no)" "no"
+# a failing mode probe
+# must FAIL the identity, never blank-compare into a false duplicate.
+mode_of() { return 1; }
+check "both mode probes failing -> NOT identical (fail closed)" \
+  "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "no"
+mode_of() { echo ""; }
+check "empty mode output -> NOT identical (fail closed)" \
+  "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "no"
+# restore the real helper for anything below
+# shellcheck disable=SC1090
+. "$helpers"
+
+# every commit/delete/verify decision site uses identity_match, none bare sha_match
+bare="$(grep -cE 'if (\[ -f "\$(cand|g)" \] && )?sha_match ' scripts/sutando-migrate.sh)"
+check "no decision site bypasses the mode check (bare sha_match ifs)" "$bare" "0"
+
+# --- controls 2+3: the summary logic, driven through the real python block ---
+summary_out="$(python3 - <<'PYEOF'
+import json, os, tempfile, hashlib, subprocess, re, sys
+# Run the shipped summary python against a synthetic index:
+# 50 identical(mtime-diff) + 1 divergent + the unreadable-only variant.
+src = open("scripts/sutando-migrate.sh").read()
+m = re.search(r"_MAP = \{\"identical\": True.*?json\.dump\(out, sys\.stdout, indent=2\)", src, re.S)
+assert m, "summary block not found"
+block = m.group(0)
+def run_case(verdict_map, collisions):
+    g = {"_verdicts": verdict_map, "collisions": collisions,
+         "by_rel": {k: [1,2] for k in collisions}, "defaultdict": __import__("collections").defaultdict,
+         "json": json, "sys": sys, "a": "", "b": "", "c": "", "dest": "d"}
+    import io
+    old = sys.stdout; sys.stdout = io.StringIO()
+    try:
+        exec(block + "\n", g)
+        return json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdout = old
+def entry(tag, mtime, size):
+    return {"tag": tag, "mtime": mtime, "size": size, "class": "structural"}
+# case A: 50 identical-with-differing-mtimes + 1 proven divergent (same size/mtime)
+coll = {}
+verd = {}
+for i in range(50):
+    k = f"zz-ident-{i:02d}"          # names sort AFTER the divergent one alphabetically? make them sort FIRST to stress the cap:
+    k = f"aa-ident-{i:02d}"
+    coll[k] = [entry("A", 100+i, 10), entry("B", 200+i, 10)]
+    verd[k] = "identical"
+coll["zz-the-divergent"] = [entry("A", 100, 10), entry("B", 200, 10)]
+verd["zz-the-divergent"] = "divergent"
+outA = run_case(verd, coll)
+notable = outA["notable_collisions"]
+first = notable[0]["rel"] if notable else ""
+present = any(r["rel"] == "zz-the-divergent" for r in notable)
+# case B: unreadable-only
+outB = run_case({"u1": "unverified"}, {"u1": [entry("A", 1, 5), entry("B", 2, 6)]})
+print(json.dumps({
+    "A_first": first, "A_divergent_present": present,
+    "A_genuine": outA["totals"]["genuine_conflicts"],
+    "B_genuine": outB["totals"]["genuine_conflicts"],
+    "B_unverified": outB["totals"]["identity_unverified"],
+}))
+PYEOF
+)"
+A_first="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['A_first'])" "$summary_out")"
+A_present="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['A_divergent_present'])" "$summary_out")"
+A_genuine="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['A_genuine'])" "$summary_out")"
+B_genuine="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['B_genuine'])" "$summary_out")"
+B_unverified="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['B_unverified'])" "$summary_out")"
+check "51-collision: the one divergent entry renders FIRST" "$A_first" "zz-the-divergent"
+check "51-collision: the divergent entry survives the cap" "$A_present" "True"
+check "51-collision: genuine_conflicts counts only the proven one" "$A_genuine" "1"
+check "unreadable-only: genuine_conflicts is 0" "$B_genuine" "0"
+check "unreadable-only: surfaced as identity_unverified" "$B_unverified" "1"
+
+
+# --- control 4: the PRODUCTION scan -> commit -> verify path, not helpers ---
+# Umask would decide the fresh temp's mode: 0600 allowlist -> 0644, scan clean.
+e2e="$(mktemp -d -t migrate-mode-e2e.XXXXXX)"
+trap 'rm -rf "$tmp" "$e2e"' EXIT
+SRC="$e2e/A"; DEST="$e2e/dest"
+mkdir -p "$SRC/state" "$DEST/state"
+REL="state/slack-allowed-recipients.json"   # the shipped union-json-array rule
+printf '{"allow": ["a@example.org"]}\n' > "$SRC/$REL";  chmod 0644 "$SRC/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$DEST/$REL"; chmod 0600 "$DEST/$REL"
+
+RUN_E2E() { SUTANDO_MIGRATE_SRC_A="$SRC" SUTANDO_MIGRATE_DEST="$DEST" \
+            bash scripts/sutando-migrate.sh "$@" 2>&1; }
+
+_scan="$(RUN_E2E scan --source A)"
+check "the union collision is SURFACED by scan, not silently absent" \
+  "$(printf '%s' "$_scan" | grep -c 'slack-allowed-recipients' | tr -d ' ')" "1"
+
+RUN_E2E commit --source A >/dev/null 2>&1
+# GNU first — see mode_of()'s note: BSD-first emits filesystem info AND the mode.
+_mode="$(stat -c '%a' "$DEST/$REL" 2>/dev/null || stat -f '%Lp' "$DEST/$REL" 2>/dev/null)"
+check "a 0644 source must NOT widen a 0600 destination through the union" "$_mode" "600"
+check "and the union still merged both allow-lists" \
+  "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+check "the pre-existing entry survives the union" \
+  "$(grep -c 'b@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+
+# Positive control: the check above must be capable of FAILING. A destination
+# the union never touched would also read 0600, so prove the path ran.
+check "the destination was actually rewritten (control: not an untouched file)" \
+  "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+
+
+# --- control 4b: VERIFY owns the manifest mode for a union entry ---
+
+# Byte-equal union output is the bypass precondition, so the source must
+# already carry the merged set in the writer's own serialization.
+_u="$e2e/u"; mkdir -p "$_u/s1/state" "$_u/d1/state"
+printf '{"allow": ["a@example.org", "b@example.org"]}\n' > "$_u/s1/$REL"
+printf '{"allow": ["b@example.org"]}\n'                  > "$_u/d1/$REL"
+SUTANDO_MIGRATE_SRC_A="$_u/s1" SUTANDO_MIGRATE_DEST="$_u/d1" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+
+mkdir -p "$_u/A/state" "$_u/dest/state"
+cp "$_u/d1/$REL" "$_u/A/$REL";                 chmod 0644 "$_u/A/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$_u/dest/$REL"; chmod 0600 "$_u/dest/$REL"
+_RUN_U() { SUTANDO_MIGRATE_SRC_A="$_u/A" SUTANDO_MIGRATE_DEST="$_u/dest" \
+           bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_U commit --source A
+
+check "the union output is byte-equal to the source (the bypass precondition)" \
+  "$(cmp -s "$_u/A/$REL" "$_u/dest/$REL" && echo yes || echo no)" "yes"
+_um="$(stat -c '%a' "$_u/dest/$REL" 2>/dev/null || stat -f '%Lp' "$_u/dest/$REL")"
+check "commit still refuses to widen the 0600 destination" "$_um" "600"
+
+_v_rc=0; _RUN_U verify --source A || _v_rc=$?
+check "verify passes while the dest still holds its manifest mode" "$_v_rc" "0"
+
+chmod 0644 "$_u/dest/$REL"
+_v_widened=0; _RUN_U verify --source A || _v_widened=$?
+check "verify FAILS on a widened union dest, despite byte identity with the source" \
+  "$([ "$_v_widened" -ne 0 ] && echo failed || echo certified)" "failed"
+
+# --- control 4c: an identical drop must carry the winner's mtime ---
+
+# The union preserves max(mtime); a drop that skips it lets a later OLDER
+# source outrank the newest input and win the scalars.
+_m="$e2e/m"; mkdir -p "$_m/A/state" "$_m/B/state" "$_m/dest/state"
+printf '{"schemaVersion": 3, "allow": ["pre"]}\n' > "$_m/dest/$REL"; touch -t 202608281100 "$_m/dest/$REL"
+printf '{"schemaVersion": 3, "allow": ["pre"]}\n' > "$_m/A/$REL";    touch -t 202608281300 "$_m/A/$REL"
+printf '{"schemaVersion": 2, "allow": ["b"]}\n'   > "$_m/B/$REL";    touch -t 202608281200 "$_m/B/$REL"
+_RUN_M(){ SUTANDO_MIGRATE_SRC_A="$_m/A" SUTANDO_MIGRATE_SRC_B="$_m/B" \
+          SUTANDO_MIGRATE_DEST="$_m/dest" bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_M commit --source A
+_RUN_M commit --source B
+check "the newest source wins the scalar even when its content is an identical drop" \
+  "$(python3 -c "import json;print(json.load(open('$_m/dest/$REL'))['schemaVersion'])")" "3"
+check "and the union still accumulated both arrays" \
+  "$(grep -c 'b' "$_m/dest/$REL" | tr -d ' ')" "1"
+
+# --- control 4d: a missing mode table cannot certify an unknown mode ---
+
+# record_union_scalars writes the mode beside every rel, so an absent table or
+# rel is damage; the pristine case below proves the check can still pass.
+_md_probe() {
+  local drop="$1" md; md="$(mktemp -d)"
+  mkdir -p "$md/A/state" "$md/dest/state"
+  printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$md/A/$REL";    chmod 0600 "$md/A/$REL"
+  printf '{"schemaVersion": 3, "allow": ["b"]}\n' > "$md/dest/$REL"; chmod 0600 "$md/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$md/A" SUTANDO_MIGRATE_DEST="$md/dest" \
+    bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+  local man; man="$(ls -t "$md/dest/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)"
+  if [ "$drop" = "table" ]; then
+    python3 -c "import json,sys;p=sys.argv[1];d=json.load(open(p));d.pop('__union_modes__',None);json.dump(d,open(p,'w'))" "$man"
+  elif [ "$drop" = "rel" ]; then
+    python3 -c "import json,sys;p=sys.argv[1];d=json.load(open(p));d.get('__union_modes__',{}).clear();json.dump(d,open(p,'w'))" "$man"
+  fi
+  [ "$drop" = "none" ] || chmod 0644 "$md/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$md/A" SUTANDO_MIGRATE_DEST="$md/dest" \
+    bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1
+  local rc=$?; rm -rf "$md"
+  [ "$rc" -eq 0 ] && echo certified || echo refused
+}
+check "a widened dest with NO mode table is refused"       "$(_md_probe table)" "refused"
+check "a widened dest with an empty mode table is refused" "$(_md_probe rel)"   "refused"
+check "control: an intact manifest still certifies"        "$(_md_probe none)"  "certified"
+
+# --- control 4e: the STRUCTURAL branch obeys the same provenance rule ---
+
+# Same three-input chain as 4c but on a non-JSON path, which takes the
+# structural branch. Before the shared owner existed only union promoted.
+_s="$e2e/s"; SREL="scripts/tool.sh"
+mkdir -p "$_s/A/scripts" "$_s/B/scripts" "$_s/dest/scripts"
+printf 'version=3\n' > "$_s/dest/$SREL"; touch -t 202608281100 "$_s/dest/$SREL"
+printf 'version=3\n' > "$_s/A/$SREL";    touch -t 202608281300 "$_s/A/$SREL"
+printf 'version=2\n' > "$_s/B/$SREL";    touch -t 202608281200 "$_s/B/$SREL"
+_RUN_S(){ SUTANDO_MIGRATE_SRC_A="$_s/A" SUTANDO_MIGRATE_SRC_B="$_s/B" \
+          SUTANDO_MIGRATE_DEST="$_s/dest" bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_S commit --source A
+_RUN_S commit --source B
+check "structural: the newest source survives an identical drop" \
+  "$(cat "$_s/dest/$SREL")" "version=3"
+
+# --- control 4f: a failed mtime promotion is write-failed, not a silent drop ---
+
+# The promotion materializes through the contained copy (cp -p + mv), never
+# `touch -r` on the existing inode. Shadow only `cp -p`; plain cp still works.
+_tf="$(mktemp -d)"; mkdir -p "$_tf/bin"
+cat > "$_tf/bin/cp" <<'STUB'
+#!/bin/sh
+[ "$1" = "-p" ] && exit 1
+exec /bin/cp "$@"
+STUB
+chmod +x "$_tf/bin/cp"
+mkdir -p "$_tf/A/scripts" "$_tf/dest/scripts"
+printf 'version=3\n' > "$_tf/dest/$SREL"; touch -t 202608281100 "$_tf/dest/$SREL"
+printf 'version=3\n' > "$_tf/A/$SREL";    touch -t 202608281300 "$_tf/A/$SREL"
+_tf_out="$(PATH="$_tf/bin:$PATH" SUTANDO_MIGRATE_SRC_A="$_tf/A" \
+           SUTANDO_MIGRATE_DEST="$_tf/dest" \
+           bash scripts/sutando-migrate.sh commit --source A 2>&1)"; _tf_rc=$?
+check "a failed identity-drop mtime promotion is reported, not swallowed" \
+  "$([ "$_tf_rc" -ne 0 ] && echo reported || echo swallowed)" "reported"
+rm -rf "$_tf"
+
+# --- control 4g: every union-class outcome leaves a verifiable expectation ---
+
+# Verify's mode check runs only where a manifest exists, so an outcome without
+# one is unprovable rather than proven-good.
+_uc_probe() {  # $1=fresh|drop -> certified|refused after a widen
+  local w; w="$(mktemp -d)"; mkdir -p "$w/A/state" "$w/dest/state"
+  printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$w/A/$REL"; chmod 0600 "$w/A/$REL"
+  if [ "$1" = "drop" ]; then
+    printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$w/dest/$REL"; chmod 0600 "$w/dest/$REL"
+  fi
+  SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+    bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+  chmod 0644 "$w/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+    bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1
+  local rc=$?; rm -rf "$w"
+  [ "$rc" -eq 0 ] && echo certified || echo refused
+}
+check "a widened FRESH union copy is refused"    "$(_uc_probe fresh)" "refused"
+check "a widened identical-drop dest is refused" "$(_uc_probe drop)"  "refused"
+
+# --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
+# Equal bytes, modes 0755 vs 0644 -> True; every DECISION still uses both fields.
+j5="$(mktemp -d -t migrate-json5.XXXXXX)"
+_scan_case() {  # $1=bytes_differ(0|1) $2=srcmode $3=dstmode -> prints compact json
+    local w="$j5/$RANDOM$RANDOM"; mkdir -p "$w/A/notes" "$w/dest/notes"
+    # SAME LENGTH on purpose: proxy_identical_divergent needs equal size + mtime
+    # + different bytes; a shorter variant is a size_mismatch and never reaches it.
+    if [ "$1" = "1" ]; then printf 'IDENTICAL BYTES\n' > "$w/A/notes/same.md"
+    else printf 'identical bytes\n' > "$w/A/notes/same.md"; fi
+    printf 'identical bytes\n' > "$w/dest/notes/same.md"
+    chmod "$2" "$w/A/notes/same.md"; chmod "$3" "$w/dest/notes/same.md"
+    touch -t 202606010000 "$w/A/notes/same.md" "$w/dest/notes/same.md"
+    SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+        bash scripts/sutando-migrate.sh scan --json --source A 2>/dev/null \
+        | python3 -c 'import sys,json;d=sys.stdin.read();j=json.loads(d[d.index("{"):]);r={x["rel"]:x for x in j["notable_collisions"]}.get("notes/same.md",{});print("%s|%s|%s|%s"%(r.get("byte_identical"),r.get("mode_conflict"),j["totals"]["proxy_identical_divergent"],j["totals"]["identical_content"]))'
+}
+_m="$(_scan_case 0 0755 0644)"
+check "mode-only difference: byte_identical is True (no byte differs)" "$(echo "$_m" | cut -d'|' -f1)" "True"
+check "mode-only difference: mode_conflict is True" "$(echo "$_m" | cut -d'|' -f2)" "True"
+check "mode-only difference is NOT proven byte divergence" "$(echo "$_m" | cut -d'|' -f3)" "0"
+check "mode-only difference is NOT drop-safe (identical_content stays 0)" "$(echo "$_m" | cut -d'|' -f4)" "0"
+# Control: real byte divergence must still report as such, or the split above
+# could be satisfied by a scan that simply stopped detecting divergence.
+_d="$(_scan_case 1 0644 0644)"
+check "control: real byte divergence still reports byte_identical False" "$(echo "$_d" | cut -d'|' -f1)" "False"
+check "control: real byte divergence still counts as proven divergence" "$(echo "$_d" | cut -d'|' -f3)" "1"
+# Control: the only drop-safe shape still reads drop-safe.
+_i="$(_scan_case 0 0644 0644)"
+check "control: equal bytes AND equal modes remain drop-safe" "$(echo "$_i" | cut -d'|' -f4)" "1"
+# Presence in notable_collisions cannot show ACTIONABLE (the cap admits ignorable
+# rows); order can. Names make alphabetical the OPPOSITE, so no tie-break pass.
+w6="$j5/ordering"; mkdir -p "$w6/A/notes" "$w6/dest/notes"
+printf 'identical bytes\n' > "$w6/A/notes/aaa-drop-safe.md"
+printf 'identical bytes\n' > "$w6/dest/notes/aaa-drop-safe.md"
+chmod 0644 "$w6/A/notes/aaa-drop-safe.md" "$w6/dest/notes/aaa-drop-safe.md"
+printf 'identical bytes\n' > "$w6/A/notes/zzz-mode-only.md"
+printf 'identical bytes\n' > "$w6/dest/notes/zzz-mode-only.md"
+chmod 0755 "$w6/A/notes/zzz-mode-only.md"; chmod 0644 "$w6/dest/notes/zzz-mode-only.md"
+touch -t 202606010000 "$w6/A/notes"/*.md "$w6/dest/notes"/*.md
+_first="$(SUTANDO_MIGRATE_SRC_A="$w6/A" SUTANDO_MIGRATE_DEST="$w6/dest" \
+    bash scripts/sutando-migrate.sh scan --json --source A 2>/dev/null \
+    | python3 -c 'import sys,json;d=sys.stdin.read();j=json.loads(d[d.index("{"):]);print(j["notable_collisions"][0]["rel"])')"
+check "a mode-only difference still outranks a drop-safe row (stays ACTIONABLE)" \
+      "$_first" "notes/zzz-mode-only.md"
+rm -rf "$j5"
+
+# --- control 6: the sentinel date probe must SURVIVE either stat dialect ---
+# Under `set -e` a bare inline `stat -c` exits before reaching its fallback.
+type mtime_date >/dev/null 2>&1 || { echo "FAIL  mtime_date not extracted — the probes below would pass vacuously"; exit 1; }
+_md="$(mktemp -d -t migrate-mtime.XXXXXX)"; printf 'x\n' > "$_md/f"
+_stubdir="$(mktemp -d -t migrate-stub.XXXXXX)"
+
+_mk_stub() {  # $1 = gnu|bsd|none
+  case "$1" in
+    # HERMETIC: emit fixed output rather than delegating to the host's stat.
+    # Shelling out to /usr/bin/stat made these probes pass on BSD and fail on GNU.
+    gnu)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then echo "2026-01-01 00:00:00.000000000 +0000"; exit 0; fi' 'if [ "$1" = "-f" ]; then echo "  File: fs-info"; exit 1; fi' 'exit 1' > "$_stubdir/stat" ;;
+    bsd)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi' 'if [ "$1" = "-f" ]; then echo "2026-01-01"; exit 0; fi' 'exit 1' > "$_stubdir/stat" ;;
+    none) printf '%s\n' '#!/bin/bash' 'exit 1' > "$_stubdir/stat" ;;
+  esac
+  chmod +x "$_stubdir/stat"
+}
+_probe() {  # $1 = semantics -> prints "<rc>:<value>"
+  _mk_stub "$1"
+  PATH="$_stubdir:$PATH" bash -c 'set -euo pipefail
+'"$(sed -n '/^mtime_date() {/,/^}/p' scripts/sutando-migrate.sh)"'
+v="$(mtime_date "$1")"; printf "%s:%s" "$?" "$v"' _ "$_md/f" 2>/dev/null || printf 'DIED:'
+}
+_g="$(_probe gnu)";  check "sentinel date resolves under GNU stat"        "${_g%%:*}" "0"
+check "  ...and is non-empty under GNU"                                   "$([ -n "${_g#*:}" ] && echo yes || echo no)" "yes"
+_b="$(_probe bsd)";  check "sentinel date resolves under BSD stat"        "${_b%%:*}" "0"
+check "  ...and is non-empty under BSD"                                   "$([ -n "${_b#*:}" ] && echo yes || echo no)" "yes"
+_n="$(_probe none)"; check "neither dialect works -> caller SURVIVES"     "${_n%%:*}" "0"
+check "  ...with an empty value (control: the probe CAN come back empty)" "$([ -z "${_n#*:}" ] && echo yes || echo no)" "yes"
+rm -rf "$_md" "$_stubdir"
+
+# --- control 6b: the REAL scan path, sentinel present — the DISCRIMINATING control ---
+# `set -e` aborts an inline assignment but not one inside $(fn), so the probes above cannot.
+_e2e="$(mktemp -d -t migrate-e2e.XXXXXX)"; mkdir -p "$_e2e/notes"; printf 'x\n' > "$_e2e/notes/a.md"
+_rc_before=0; env SUTANDO_WORKSPACE="$_e2e" bash scripts/sutando-migrate.sh --source C >/dev/null 2>&1 || _rc_before=$?
+check "baseline: scan of a sentinel-free source succeeds" "$_rc_before" "0"
+: > "$_e2e/.legacy-migrated-test"
+_out="$(env SUTANDO_WORKSPACE="$_e2e" bash scripts/sutando-migrate.sh --source C 2>&1)" && _rc_after=0 || _rc_after=$?
+check "a partial-migration sentinel does NOT abort the scan" "$_rc_after" "0"
+check "  ...and the sentinel is actually reported" \
+      "$(printf '%s\n' "$_out" | grep -c 'prior partial migration sentinels')" "1"
+rm -rf "$_e2e"
+
+# --- control 7: newly migrated directories keep their SOURCE mode ---
+# `cp -p` carries a file's mode; `mkdir -p` parents take umask: 0700 -> 0755.
+_dm_probe() {  # $1=src hosts mode  $2=pre-existing dest mode ("" = none) -> "hosts:Test-Host:file"
+  local S D; S="$(mktemp -d)"; D="$(mktemp -d)"
+  mkdir -p "$S/hosts/Test-Host"; printf 'x\n' > "$S/hosts/Test-Host/PERSONAL_CLAUDE.md"
+  chmod 0644 "$S/hosts/Test-Host/PERSONAL_CLAUDE.md"
+  chmod "$1" "$S/hosts" "$S/hosts/Test-Host"
+  if [ -n "$2" ]; then mkdir -p "$D/hosts/Test-Host"; chmod "$2" "$D/hosts" "$D/hosts/Test-Host"; fi
+  env SUTANDO_WORKSPACE="$S" SUTANDO_MIGRATE_DEST="$D" bash scripts/sutando-migrate.sh commit --source C >/dev/null 2>&1
+  printf '%s:%s:%s' "$(mode_of "$D/hosts")" "$(mode_of "$D/hosts/Test-Host")" "$(mode_of "$D/hosts/Test-Host/PERSONAL_CLAUDE.md")"
+  rm -rf "$S" "$D"
+}
+check "a 0700 source dir does NOT land world-readable"        "$(_dm_probe 0700 '')"     "700:700:644"
+check "non-widening: a 0755 source never opens a 0700 dest"   "$(_dm_probe 0755 0700)"   "700:700:644"
+check "control: an ordinary 0755 source stays 0755"           "$(_dm_probe 0755 '')"     "755:755:644"
+
+# --- control 8: a destination leaf that is a SYMLINK is refused before it is read ---
+
+# `touch -r` on the leaf followed the link and stamped a file outside DEST_REAL while
+# commit certified success; the leaf must be refused with no sentinel and the target untouched.
+_mt() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1"; }
+_nl() { stat -c '%h' "$1" 2>/dev/null || stat -f '%l' "$1"; }
+_sl="$(mktemp -d)"; mkdir -p "$_sl/A/scripts" "$_sl/dest/scripts" "$_sl/dest/state" "$_sl/outside"
+printf 'version=3\n' > "$_sl/outside/target"; chmod 0755 "$_sl/outside/target"; touch -t 202608281100 "$_sl/outside/target"
+ln -s "$_sl/outside/target" "$_sl/dest/$SREL"
+printf 'version=3\n' > "$_sl/A/$SREL"; chmod 0755 "$_sl/A/$SREL"; touch -t 202608281300 "$_sl/A/$SREL"
+_sl_before="$(_mt "$_sl/outside/target")"
+_sl_rc=0; SUTANDO_MIGRATE_SRC_A="$_sl/A" SUTANDO_MIGRATE_DEST="$_sl/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _sl_rc=$?
+check "symlink leaf: commit FAILS" "$([ "$_sl_rc" -ne 0 ] && echo failed || echo certified)" "failed"
+check "symlink leaf: no sentinel is written" \
+  "$(ls "$_sl/dest/state"/.migrated-from-A-* 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "symlink leaf: the external target's mtime is untouched" "$(_mt "$_sl/outside/target")" "$_sl_before"
+check "symlink leaf: the leaf is still the symlink (not replaced, not read into)" \
+  "$([ -L "$_sl/dest/$SREL" ] && echo link || echo file)" "link"
+rm -rf "$_sl"
+
+# --- control 9: a HARDLINK leaf gets its own contained inode; the alias is untouched ---
+
+_hl="$(mktemp -d)"; mkdir -p "$_hl/A/scripts" "$_hl/dest/scripts" "$_hl/dest/state" "$_hl/outside"
+printf 'version=3\n' > "$_hl/outside/target"; chmod 0755 "$_hl/outside/target"; touch -t 202608281100 "$_hl/outside/target"
+ln "$_hl/outside/target" "$_hl/dest/$SREL"
+printf 'version=3\n' > "$_hl/A/$SREL"; chmod 0755 "$_hl/A/$SREL"; touch -t 202608281300 "$_hl/A/$SREL"
+_hl_before="$(_mt "$_hl/outside/target")"
+_hl_rc=0; SUTANDO_MIGRATE_SRC_A="$_hl/A" SUTANDO_MIGRATE_DEST="$_hl/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _hl_rc=$?
+check "hardlink leaf: commit succeeds" "$_hl_rc" "0"
+check "hardlink leaf: the external inode's mtime is untouched" "$(_mt "$_hl/outside/target")" "$_hl_before"
+check "hardlink leaf: a contained regular inode landed (link count 1)" "$(_nl "$_hl/dest/$SREL")" "1"
+check "hardlink leaf: the contained copy carries the newer source mtime" \
+  "$(_mt "$_hl/dest/$SREL")" "$(_mt "$_hl/A/$SREL")"
+_hl_v=0; SUTANDO_MIGRATE_SRC_A="$_hl/A" SUTANDO_MIGRATE_DEST="$_hl/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _hl_v=$?
+check "hardlink leaf: verify passes on the contained copy" "$_hl_v" "0"
+rm -rf "$_hl"
+
+# --- control 10: a union write takes the shared directory-mode policy; verify sees the parent ---
+
+# 0700 source parent, 0755 destination parent, 0644 divergent union: before,
+# the union path wrote directly and the parent stayed 0755 while verify passed.
+_up="$(mktemp -d)"; mkdir -p "$_up/A/state" "$_up/dest/state"
+printf '{"allow": ["a@example.org"]}\n' > "$_up/A/$REL";    chmod 0644 "$_up/A/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$_up/dest/$REL"; chmod 0644 "$_up/dest/$REL"
+chmod 0700 "$_up/A/state"; chmod 0755 "$_up/dest/state"
+_up_rc=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _up_rc=$?
+check "union under a 0700 source parent: commit succeeds" "$_up_rc" "0"
+check "union parent takes the non-widening intersection (0755 -> 0700)" "$(mode_of "$_up/dest/state")" "700"
+check "the union still merged (control: the path ran)" "$(grep -c 'a@example.org' "$_up/dest/$REL" | tr -d ' ')" "1"
+_up_v=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _up_v=$?
+check "verify passes with the narrowed parent" "$_up_v" "0"
+chmod 0755 "$_up/dest/state"
+_up_w=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _up_w=$?
+check "verify FAILS once the destination parent is widened past the source's" \
+  "$([ "$_up_w" -ne 0 ] && echo failed || echo certified)" "failed"
+rm -rf "$_up"
+
+if [ "$fails" -gt 0 ]; then echo "$fails FAILURE(S)"; exit 1; fi
+echo "ALL PASS"
