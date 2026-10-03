@@ -273,18 +273,48 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertEqual([p for p in (self.ws / "results").iterdir()], [], "nothing is sent on an unknown count")
 
     def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
+        """The reminder delegates to the core reader's one pass: the adapter is loaded once,
+        reconcile_pass then plain gather(ws), no private keyword."""
+        import pending_questions_reader as reader
         calls = []
-        fake = mock.Mock()
+        fake = mock.Mock(spec=["reconcile_pass", "gather"])
         fake.reconcile_pass.side_effect = lambda ws: calls.append(("reconcile_pass", ws)) or {"errors": ["e1"]}
         fake.gather.side_effect = lambda ws: calls.append(("gather", ws)) or {"waiting": [], "notes": ["n"]}
-        with mock.patch.object(self.cpq.importlib.util, "spec_from_file_location") as sfl:
-            sfl.return_value.loader.exec_module = lambda m: None
-            with mock.patch.object(self.cpq.importlib.util, "module_from_spec", return_value=fake):
-                g = self.cpq.gather(str(self.minimal))
+        with mock.patch.object(reader, "load_adapter", return_value=fake) as load:
+            g = self.cpq.gather(str(self.minimal))
         self.assertEqual([c[0] for c in calls], ["reconcile_pass", "gather"])
-        self.assertEqual({c[1] for c in calls}, {self.cpq.WORKSPACE})
-        self.assertEqual(fake.gather.call_args, mock.call(self.cpq.WORKSPACE), "plain gather(ws): no private keyword")
-        self.assertEqual(g["notes"], ["reconcile: FAILED — e1", "n"])
+        self.assertEqual({c[1] for c in calls}, {Path(self.cpq.WORKSPACE)})
+        self.assertEqual(fake.gather.call_args, mock.call(Path(self.cpq.WORKSPACE)), "plain gather(ws): no private keyword")
+        self.assertEqual(g["notes"][:1], ["reconcile: FAILED — e1"])
+        self.assertEqual({str(c.args[0]) for c in load.call_args_list}, {str(self.minimal)}, "one adapter, loaded through the reader")
+
+    def test_an_adapter_that_refuses_a_second_execution_still_reads_through_the_public_entry(self):
+        """Round 40: the public entry loads the adapter, then the reminder used to execute the file
+        again outside the failure handler. One load now serves both; the full public path exits 0."""
+        once = self.tmp / "once_adapter.py"
+        once.write_text(
+            "from pathlib import Path as _P\n"
+            "_m = _P(__file__).with_suffix('.loaded')\n"
+            "if _m.exists():\n"
+            "    raise ImportError('adapter second load down')\n"
+            "_m.write_text('1')\n" + MINIMAL +
+            "def remind(argv, workspace):\n"
+            "    import pending_questions_remind as reminder\n"
+            "    return reminder.main(list(argv), workspace)\n")
+        (self.ws / "room.json").write_text(json.dumps([{"ask_id": "ask-once", "title": "loaded once?"}]))
+        shim = _load("pq_shim_r37", REPO / "src" / "check-pending-questions.py")
+        import pending_questions_reader as reader
+        import workspace_default
+        reader._LOADED.clear()
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = shim.main(["--store-adapter", str(once), "--notify", "--force"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("second load down", out.getvalue() + err.getvalue())
+        self.assertIn("Notified: 1 pending questions", out.getvalue())
+        [f] = [p for p in (self.ws / "results").iterdir() if p.name.startswith("proactive-pending-q-")]
+        self.assertIn("loaded once?", f.read_text())
 
     def test_the_contract_doc_and_the_shipped_adapter_agree(self):
         contract = (REPO / "skills" / "MANIFEST.md").read_text()

@@ -33,15 +33,23 @@ from skill_roots import declared
 DECLARATION = "pending_questions_store"
 
 
+_LOADED: dict = {}
+
+
 def load_adapter(adapter):
-    """The adapter module from its file; None when there is none."""
+    """The adapter module from its file, executed once per process; None when there is none."""
     if not adapter:
         return None
-    import importlib.util  # noqa: PLC0415
-    spec = importlib.util.spec_from_file_location("pq_store_adapter", str(adapter))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    path = Path(adapter).resolve()
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)  # the same file once; a rewritten file is new
+    if key not in _LOADED:
+        import importlib.util  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("pq_store_adapter", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LOADED[key] = mod
+    return _LOADED[key]
 
 
 NO_ADAPTER = "no pending-questions store adapter installed (no skill declares one)"
@@ -50,6 +58,8 @@ NO_ADAPTER = "no pending-questions store adapter installed (no skill declares on
 def _adapter(adapter=None):
     """(module, path) or (None, why). `adapter` is what the edge injected: a script path, or the
     skill_roots.Declaration it resolved; None, or a declaration of none, is NO_ADAPTER exactly."""
+    if hasattr(adapter, "gather"):  # an already-loaded module: no second execution
+        return adapter, getattr(adapter, "__file__", "<module>")
     path, why = adapter if isinstance(adapter, tuple) else (adapter, None)  # a Declaration is a tuple
     if not path:
         return None, why or NO_ADAPTER
@@ -100,6 +110,15 @@ def reconcile_pass(workspace, adapter=None) -> dict:
         return mod.reconcile_pass(Path(workspace))
     except Exception as e:  # noqa: BLE001
         return {"flushed": [], "moved": [], "closed": [], "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
+
+
+def reconcile_then_gather(workspace, adapter=None) -> dict:
+    """The reminder's pass: `reconcile_pass`, its errors as notes, then `gather` — one load, one
+    failure policy (a raised step is a note or UNKNOWN, never a traceback)."""
+    rec = reconcile_pass(workspace, adapter)
+    g = gather(workspace, adapter)
+    g["notes"] = [f"reconcile: FAILED — {e}" for e in rec.get("errors", [])] + list(g.get("notes", []))
+    return g
 
 
 def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:

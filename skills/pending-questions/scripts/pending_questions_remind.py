@@ -13,7 +13,6 @@ Entry: src/check-pending-questions.py, or `pq.py remind`.
 """
 
 import hashlib
-import importlib.util
 import os
 import subprocess
 import sys
@@ -84,25 +83,10 @@ def gather(adapter=None):
     """The pass's result — `reconcile_pass`, then the read-only `gather`, the contract's two entry
     points — through the sibling adapter, or the injected adapter file (what `pq.py remind`
     passes): {"waiting", "notes", "unavailable", "reason", ...}; a reconcile error is a note."""
-    if adapter:
-        spec = importlib.util.spec_from_file_location("pq_store_adapter_injected", str(adapter))
-        room_db = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(room_db)
-    else:
-        import pending_questions_room_db as room_db  # noqa: PLC0415
-    try:  # a raised replay failure is a note, never a reason to skip the read
-        rec = room_db.reconcile_pass(WORKSPACE)
-    except Exception as e:  # noqa: BLE001 — the adapter is third-party code
-        rec = {"errors": [f"adapter failed: {type(e).__name__}: {e}"]}
-    try:  # a raised read is UNKNOWN, the shape the core reader gives it, never a traceback
-        g = room_db.gather(WORKSPACE)
-    except Exception as e:  # noqa: BLE001 — the adapter is third-party code
-        g = {"waiting": [], "done": None, "pending_close": [], "unavailable": True, "link": None,
-             "reason": f"adapter failed: {type(e).__name__}: {e}", "store": None, "notes": []}
-    g.setdefault("unavailable", False)
-    g.setdefault("reason", None)
-    g["notes"] = [f"reconcile: FAILED — {e}" for e in rec.get("errors", [])] + list(g.get("notes", []))
-    return g
+    import pending_questions_reader as reader  # noqa: PLC0415 — the one owner of adapter failures
+    if not adapter:
+        import pending_questions_room_db as adapter  # noqa: PLC0415 — the sibling, already a module
+    return reader.reconcile_then_gather(WORKSPACE, adapter)
 
 
 def due_for_reminder(questions, now=None):
