@@ -123,14 +123,29 @@ class LongPromptTests(FakeTmuxHarness):
     def _chunks(self):
         return [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
 
-    def _pick_with_chunk_5_dropped(self):
-        """Pick 1 of the resume cases: chunks 1-4 land, 5 never does; the retry within
-        the pick resumes at chunk 5 and loses it again. Returns that pick's run."""
-        self.drop_paste_from_flag.write_text("5")
+    def _boundaries(self, name):
+        """Byte offsets where the notifier's chunks end: PASTE_CHUNK bytes, cut between characters."""
+        out, cur = [], 0
+        for ch in self.expected_prompt(name):
+            n = len(ch.encode())
+            if cur and cur + n > 256:
+                out.append(cur); cur = 0
+            cur += n
+        return out + [cur]
+
+    # Chunks that land before the drop. The prompt embeds the tasks dir and repo path, so
+    # its chunk count depends on the runner; two landed chunks leave at least two to resume.
+    LANDED = 2
+
+    def _pick_with_a_dropped_chunk(self):
+        """Pick 1 of the resume cases: chunks 1..LANDED land, the next never does; the retry
+        within the pick resumes at that chunk and loses it again. Returns that pick's run."""
+        self.assertGreaterEqual(len(self._boundaries(self.LONG)), self.LANDED + 2, self._boundaries(self.LONG))
+        self.drop_paste_from_flag.write_text(str(self.LANDED + 1))
         self.write_task(self.LONG)
         r = self.run_event(self.LONG, timeout=40)
         self.assertNotIn("ENTER", self.sendkeys_log_text())
-        self.assertEqual(len(self._chunks()), 6, self._chunks())
+        self.assertEqual(len(self._chunks()), self.LANDED + 2, self._chunks())
         self.drop_paste_from_flag.unlink()
         return r
 
@@ -141,12 +156,12 @@ class LongPromptTests(FakeTmuxHarness):
                              break_long_words=True, break_on_hyphens=False)
         self.pane_file.write_text("\n".join(rows) + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
 
-    def test_a_dropped_last_chunk_is_never_submitted_and_the_window_is_put_back(self):
+    def test_a_dropped_chunk_is_never_submitted_and_the_window_is_put_back(self):
         # The retry within the pick resumes at the chunk that never landed (typed twice in
         # all), never from the start, and never presses Enter on the partial.
-        r = self._pick_with_chunk_5_dropped()
+        r = self._pick_with_a_dropped_chunk()
         chunks = self._chunks()
-        self.assertEqual(chunks[5], chunks[4], "the resume must retype the dropped chunk, not another")
+        self.assertEqual(chunks[-1], chunks[-2], "the resume must retype the dropped chunk, not another")
         self.assertIn("did not read back", r.stderr)
         self.assertIn("resuming it there", r.stderr)
         self.assertIn("never verifiably staged", r.stderr)
@@ -155,7 +170,7 @@ class LongPromptTests(FakeTmuxHarness):
     def test_a_later_pick_resumes_after_a_dropped_chunk_and_sends_enter_once(self):
         # The live shape: a transient drop on pick 1, then the ~30 s re-pick finds the
         # composer holding exactly the chunks that landed and finishes the paste.
-        self._pick_with_chunk_5_dropped()
+        self._pick_with_a_dropped_chunk()
         before = len(self._chunks())
         t = self._finish_on(self.LONG, lambda log: "ENTER" in log)
         r = self.run_event(self.LONG, timeout=40)
@@ -165,11 +180,12 @@ class LongPromptTests(FakeTmuxHarness):
         log = self.sendkeys_log_text()
         self.assertEqual(log.count("ENTER"), 1, log)
         chunks = self._chunks()
-        self.assertEqual("".join(chunks[:4] + chunks[before:]), self.expected_prompt(self.LONG))
-        self.assertGreater(len(chunks[before:]), 1, "pick 2 must type every chunk from the 5th on")
+        self.assertEqual("".join(chunks[:self.LANDED] + chunks[before:]), self.expected_prompt(self.LONG))
+        self.assertEqual(len(chunks[before:]), len(self._boundaries(self.LONG)) - self.LANDED,
+                         "pick 2 must type every chunk after the ones that landed")
 
     def test_owner_text_in_the_composer_is_still_refused_after_a_dropped_chunk(self):
-        self._pick_with_chunk_5_dropped()
+        self._pick_with_a_dropped_chunk()
         # The owner cleared our partial and typed their own draft; the record alone admits nothing.
         self.pane_file.write_text(_h.DRAFT_FOOTER + "\n")
         (self.bin / "osascript").write_text("#!/bin/bash\nexit 0\n"); (self.bin / "osascript").chmod(0o755)
@@ -184,9 +200,10 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertNotIn("press Enter", blocked[0], "Enter would submit the composer as it is")
 
     def test_a_prefix_not_on_a_chunk_boundary_is_refused(self):
-        self._pick_with_chunk_5_dropped()
-        # Chunk 5 landed short: our prefix plus part of a chunk is not a resume point.
-        self._set_composer(self.expected_prompt(self.LONG)[:1024 + 100])
+        self._pick_with_a_dropped_chunk()
+        # The next chunk landed short: our prefix plus part of a chunk is not a resume point.
+        cut = self._boundaries(self.LONG)[self.LANDED - 1] + 100
+        self._set_composer(self.expected_prompt(self.LONG).encode()[:cut].decode())
         before = len(self._chunks())
         r = self.run_event(self.LONG, timeout=40)
         self.assertEqual(len(self._chunks()), before, "typed over a short-landed chunk")
@@ -195,7 +212,7 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertNotIn("resuming", r.stderr)
 
     def test_a_prefix_left_in_another_core_incarnation_is_refused(self):
-        self._pick_with_chunk_5_dropped()
+        self._pick_with_a_dropped_chunk()
         self.pane_pid_file.write_text("9999")
         before = len(self._chunks())
         r = self.run_event(self.LONG, timeout=40)
