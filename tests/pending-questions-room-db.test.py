@@ -871,7 +871,7 @@ class TestDelegation(unittest.TestCase):
 
     def test_the_reminder_reads_the_siblings_pass_and_writes_no_row(self):
         s = self.src(self.SKILL + "pending_questions_remind.py")
-        self.assertLess(s.index("room_db.reconcile_pass(WORKSPACE)"), s.index("room_db.gather(WORKSPACE)"))
+        self.assertIn("reader.reconcile_then_gather(WORKSPACE, adapter)", s, "one core-owned pass: reconcile_pass, then gather")
         self.assertNotIn("reconcile=True", s, "the contract's two entry points, no private keyword")
         self.assertNotRegex(s, r"(?<!sys\.path)\.(insert|insert_raw|close|clear)\(|PQ_FILE|personal_path|pending-questions\.md")
         self.assertIn('if "--notify" not in argv', s)
