@@ -17,10 +17,10 @@ jobs:
         run: bash debug5081/lost-probe.sh 300 0
       - name: main tree
         run: git worktree add /tmp/main origin/main
-      - name: gating tests at origin/main, 4 copies x 5 rounds, 2 hogs
-        run: bash debug5081/ci-repro.sh /tmp/main 5 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
-      - name: gating tests at HEAD (fix), 4 copies x 5 rounds, 2 hogs
-        run: bash debug5081/ci-repro.sh "$PWD" 5 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
+      - name: gating tests at origin/main, 4 copies x 8 rounds, 2 hogs
+        run: bash debug5081/ci-repro.sh /tmp/main 8 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
+      - name: gating tests at HEAD (fix), 4 copies x 8 rounds, 2 hogs
+        run: bash debug5081/ci-repro.sh "$PWD" 8 4 2 tests/watch-tasks-dispatch-activity.test.sh tests/watch-tasks-stream-announce-survives-failure.test.sh
       - name: new + repointed suites at HEAD, 4 copies x 2 rounds, 2 hogs
         run: bash debug5081/ci-repro.sh "$PWD" 2 4 2 tests/bounded-wait.test.sh tests/watch-tasks-stream-watchdog-trap-race.test.sh tests/watcher-inbox-resolver.test.sh
       - name: sync-workspace at origin/main (expect exit 128 at Test 24) and at HEAD
