@@ -46,7 +46,8 @@ PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
 
 
 def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
-                  launcher: str = "src/agent/claude/cli/start-cli.sh") -> list[str]:
+                  launcher: str = "src/agent/claude/cli/start-cli.sh",
+                  pre_launch=None) -> list[str]:
     """The launcher through its real tmux path on a private socket, from a COPIED
     repo whose sutando-config.sh names a scratch workspace: past its liveness
     poll the launcher clears the shutdown sentinel and ensures the supervisor,
@@ -57,6 +58,12 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
     `launcher` selects the core's own start-cli.sh (default) or the worker's
     own skills/worker-pool/scripts/launch-worker-session.sh — both source the
     same copied src/agent/claude/cli/session-launch.sh.
+
+    `pre_launch`, if given, is called as `pre_launch(root, ws)` after the
+    scratch repo/workspace are built but before the launcher runs, so a test
+    can seed fixture files (e.g. a worker's surface-config.json) under `ws`.
+    `SUTANDO_WORKSPACE_DIR` is always the scratch workspace unless `extra_env`
+    overrides it.
 
     The pgrep stub answers the liveness probe with nothing until the stub claude
     has recorded its pid; every other probe (the monitor guard) still "finds"
@@ -81,9 +88,15 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
             REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
             root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
         )
+        shutil.copy2(
+            REPO / "skills" / "worker-pool" / "scripts" / "worker_surface_config.py",
+            root / "skills" / "worker-pool" / "scripts" / "worker_surface_config.py",
+        )
         delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
         delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "workspace"; (ws / "state").mkdir(parents=True)
+        if pre_launch is not None:
+            pre_launch(root, ws)
         (root / "scripts" / "sutando-config.sh").write_text(
             '#!/bin/bash\ncase "$1" in\n'
             '  workspace) echo "%s";;\n'
@@ -101,6 +114,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)
         env = {"PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
                "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1",
+               "SUTANDO_WORKSPACE_DIR": str(ws),
                **({"SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_script)}
                   if extra_env.get("SUTANDO_INSTANCE_ID") else {}),
                **extra_env}
@@ -154,6 +168,36 @@ class TestLauncherGate(unittest.TestCase):
         self.assertEqual(argv[argv.index("--name") + 1], "sutando-worker-" + "a" * 32)
         self.assertNotIn("sutando-core", argv)
         self.assertEqual(argv[-2:], ["/startup", "--worker"])
+
+    def test_a_worker_opted_into_chrome_gets_it_others_do_not(self):
+        """The default (no entry) stays proven by the test above; this is the one
+        explicit exception -- worker_surface_config.py's own state, keyed on the
+        SAME instance id a recovery/restart reuses, is the only thing that can
+        turn --chrome on for a worker, and it must not leak to a different id."""
+        instance_id = "b" * 32
+        other_id = "c" * 32
+
+        def _seed(root, ws):
+            cfg = ws / "state" / "workers" / instance_id / "surface-config.json"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text('{"chrome": true}')
+
+        argv, _ = _launch_argv(
+            {"SUTANDO_INSTANCE_ID": instance_id, "SUTANDO_TMUX_SESSION": "sutando-worker-" + instance_id,
+             "SUTANDO_TASKS_DIR": "/tmp/never-read", "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+            launcher="skills/worker-pool/scripts/launch-worker-session.sh", pre_launch=_seed)
+        self.assertTrue(argv, "claude was never exec'd")
+        self.assertIn("--chrome", argv, "opted-in worker did not get --chrome: " + str(argv))
+        self.assertNotIn("--remote-control", argv, "opt-in is chrome only, never remote-control")
+
+        # Control: the fixture file exists, but under a DIFFERENT instance id —
+        # a worker must not pick up another worker's opt-in.
+        argv2, _ = _launch_argv(
+            {"SUTANDO_INSTANCE_ID": other_id, "SUTANDO_TMUX_SESSION": "sutando-worker-" + other_id,
+             "SUTANDO_TASKS_DIR": "/tmp/never-read", "SUTANDO_CLAUDE_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+            launcher="skills/worker-pool/scripts/launch-worker-session.sh", pre_launch=_seed)
+        self.assertTrue(argv2, "claude was never exec'd")
+        self.assertNotIn("--chrome", argv2, "a different worker id picked up another worker's opt-in")
 
     def test_control_a_liveness_probe_that_reports_nothing_fails_the_fixture(self):
         """The launcher's poll reads `pgrep -ax claude`; a probe that never names
