@@ -42,6 +42,25 @@ os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(_GW_SCRATCH, "telemetry-i
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 OUTBOUND_SEAMS = (("rgb", "_req"), ("urllib.request", "urlopen"), ("socket", "create_connection"))
+ISOLATED_PATH_KEYS = ("CLAUDE_CONFIG_DIR", "AG2_DEVICE_ENV", "REMOTE_MEDIA_DIR", "AGENT_CONNECT_TASK_DIR",
+                      "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "SUTANDO_STATE_DIR",
+                      "SUTANDO_TELEMETRY_ID_FILE")
+ISOLATED_EXACT = {"REMOTE_TASK_TOKEN": "http://127.0.0.1:9|fake-gateway-token",
+                  "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1"}
+
+
+def assert_isolated(environ, scratch):
+    """Raise AssertionError unless every gateway input in `environ` is contained in
+    `scratch` or holds its exact safe value; checked at runtime, so an override in any
+    form (assignment, update, setdefault, a later line) fails at the point of use."""
+    root = os.path.realpath(scratch)
+    for key in ISOLATED_PATH_KEYS:
+        value = environ.get(key)
+        assert value, f"{key} is unset"
+        real = os.path.realpath(value)
+        assert real == root or real.startswith(root + os.sep), f"{key}={value} is outside the fixture"
+    for key, want in ISOLATED_EXACT.items():
+        assert environ.get(key) == want, f"{key}={environ.get(key)!r}, expected {want!r}"
 
 
 def deny_outbound(targets, attempts):
@@ -333,6 +352,7 @@ class TestRouting(_Workspace):
         import urllib.request
         import task_envelope
         import telemetry
+        assert_isolated(os.environ, _GW_SCRATCH)
         from ag2_sparrow import remote_gateway_bridge as rgb  # env above makes this hermetic
         from ag2_sparrow.local_task_protocol import set_task_stamper
         self.assertEqual(rgb.URL, "http://127.0.0.1:9", "the gateway read a URL from outside the fixture")
@@ -376,6 +396,7 @@ class TestRouting(_Workspace):
                 [f] = self._proactive()
                 redirect = [a.value for a in parse_markers(f.read_text()).actions if a.kind == "redirect"]
                 self.assertEqual(redirect, expect)
+        assert_isolated(os.environ, _GW_SCRATCH)
         self.assertEqual([a for a in attempts if a != "_req"], [], "a request reached a transport")
         self.assertEqual(set(attempts), {"_req"}, "the fleet read is the only outbound call, and it was refused")
         self.assertFalse(Path(os.environ["SUTANDO_TELEMETRY_ID_FILE"]).exists(), "telemetry minted an id")

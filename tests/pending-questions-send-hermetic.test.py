@@ -80,19 +80,48 @@ class Hermetic(unittest.TestCase):
             with self.subTest(key):
                 self.assertEqual(os.environ.get(key), want)
 
-    def test_each_contract_key_is_assigned_exactly_once_and_never_defaulted(self):
+    def test_each_contract_key_is_assigned_exactly_once_and_environ_is_never_mutated_otherwise(self):
         counts = {k: 0 for k in CONTRACT_KEYS}
         for n in ast.walk(self.tree):
             k = _env_key(n)
             if k in counts:
                 counts[k] += 1
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and \
-                    n.func.attr in ("setdefault", "update", "putenv", "pop") and n.args and \
-                    isinstance(n.args[0], ast.Constant) and n.args[0].value in counts:
-                self.fail(f"{n.func.attr}() on contract key {n.args[0].value} at line {n.lineno}")
+            # any mutating call on os.environ, whatever its argument shape, and os.putenv
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                recv = n.func.value
+                if n.func.attr in ("update", "setdefault", "pop", "popitem", "clear", "__setitem__") and \
+                        isinstance(recv, ast.Attribute) and recv.attr == "environ" and \
+                        isinstance(recv.value, ast.Name) and recv.value.id == "os":
+                    self.fail(f"os.environ.{n.func.attr}() at line {n.lineno}")
+                if n.func.attr == "putenv" and isinstance(recv, ast.Name) and recv.id == "os":
+                    self.fail(f"os.putenv() at line {n.lineno}")
         for k, c in counts.items():
             with self.subTest(k):
                 self.assertEqual(c, 1, f"{k} assigned {c} times; a later override would win")
+
+    def test_the_runtime_check_rejects_a_poisoned_environment(self):
+        good = {k: os.environ[k] for k in CONTRACT_KEYS}
+        self.mod.assert_isolated(good, self.mod._GW_SCRATCH)
+        for key, bad in (("REMOTE_MEDIA_DIR", "/tmp/pq-send-outside-scratch"),
+                         ("REMOTE_TASK_TOKEN", "http://127.0.0.1:9|inherited"),
+                         ("SUTANDO_TELEMETRY", "1"), ("AGENT_CONNECT_STATE_DIR", "")):
+            with self.subTest(key):
+                with self.assertRaises(AssertionError):
+                    self.mod.assert_isolated({**good, key: bad}, self.mod._GW_SCRATCH)
+
+    def test_the_importing_test_runs_the_runtime_check_around_the_writes(self):
+        funcs = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)
+                 and any(_imports_gateway(c) for c in ast.walk(n))]
+        self.assertEqual(len(funcs), 1)
+        fn = funcs[0]
+        checks = [c.lineno for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                  and c.func.id == "assert_isolated"]
+        writes = [c.lineno for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                  and c.func.attr == "_write_task"]
+        imports = [c.lineno for c in ast.walk(fn) if _imports_gateway(c)]
+        self.assertTrue(checks and writes and imports)
+        self.assertLess(min(checks), min(imports), "the runtime check must precede the gateway import")
+        self.assertGreater(max(checks), max(writes), "the runtime check must follow the last write")
 
     def test_all_isolation_precedes_the_first_gateway_import(self):
         last_iso = max(n.lineno for n in ast.walk(self.tree) if _env_key(n) in CONTRACT_KEYS)
