@@ -89,7 +89,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     if committed is not None and committed != pr.CORE:
         return 0, [committed], None
     try:
-        raw = pr._load_existing_roster_strict(workspace)
+        raw = pr.routing_roster(workspace)
     except pr.RosterError:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.

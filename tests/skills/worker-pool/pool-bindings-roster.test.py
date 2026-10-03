@@ -27,6 +27,7 @@ SCRIPTS = Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import pool_roster as pr  # noqa: E402
+import util_paths  # noqa: E402
 
 W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 W2 = "b4e02d3c5f6a7b8c9d0e1f2a3b4c5d6e"
@@ -327,6 +328,25 @@ class TestBindRoom(Base):
             pr.bind_room(ws, "!x:ag2.space", W1)
         with self.assertRaises(pr.RosterError):
             pr.unbind_room(ws, "!x:ag2.space")
+
+    def test_a_pin_publishes_the_task_event_handler_config_when_missing(self):
+        """A worker reached only through compile_roster never published the handler
+        config; pinning it to a room must, or the pin has nothing to route through."""
+        cfg = util_paths.task_event_handler_config_path(self.ws / "state")
+        self.assertFalse(cfg.exists(), "precondition: no handler published yet")
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        self.assertTrue(cfg.exists(), "bind_room must publish the handler config, not just the advertisement")
+        self.assertEqual(json.loads(cfg.read_text())["handler"],
+                         str(Path(pr.__file__).resolve().parent / "pool_route_handler.py"))
+
+    def test_a_pin_refreshes_a_stale_handler_config(self):
+        """A config naming some other handler is corrected by the next pin."""
+        cfg = util_paths.task_event_handler_config_path(self.ws / "state")
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(json.dumps({"handler": "/nonexistent/stale-handler.py"}))
+        pr.bind_room(self.ws, "!x:ag2.space", W1)
+        self.assertEqual(json.loads(cfg.read_text())["handler"],
+                         str(Path(pr.__file__).resolve().parent / "pool_route_handler.py"))
 
 
 class TestRosterRowTypes(Base):
