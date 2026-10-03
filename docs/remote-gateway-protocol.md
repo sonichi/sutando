@@ -228,6 +228,42 @@ a slow push is still in flight and an optional push never delays an
 owner-approved publication. A push still running when the next beat arrives is
 left to finish; that beat's push is skipped, not queued.
 
+## Commons working-session context (AG2 Space)
+
+The AG2 Space web client posts small marks into a live working session's thread
+and stamps every message a member sends with the sender's place. The bridge
+reads them (`ag2_sparrow/session_context.py`) so the core gets one task per
+request, not one per navigation:
+
+- **No task** for a move mark (content key `space.ag2.commons.session.at` with
+  `moved: true`; body `<name> moved to <Surface · title>` or `… the chat`) or a
+  Join/Leave mark (`space.ag2.commons.session.member` `{v:1, action}`; body
+  `joined the session` / `left the session`). The bridge records them in
+  `<state>/ag2space-sessions[.<instance>].json` — per room and session thread:
+  each member's latest page, the last five session events, start and last
+  activity — and closes the task with a `[no-send]` result, the same path a
+  card click takes.
+- `page: <surface> · <page id> · <title>` is written above `task:` for a
+  message carrying `space.ag2.commons.session.at` (the sender's current page).
+- `session: <thread_root> | <title> | started <ts>` is written above `task:`,
+  and the body is prefixed `[live session: <title>; <sender> last on <page>;
+  last session message: <first 80 chars>]`, for every task from a room whose
+  session the bridge has seen and that is still live — not ended by the
+  broker's session block, this agent has not left it, and someone spoke in it
+  within the client's two quiet hours. This includes plain room messages
+  outside the thread. `channel_id` and `thread_root` are unchanged.
+- A Reactivate (`space.ag2.commons.session.reactivate` `{v:1, page, by}`) is a
+  task whose body is prefixed `[session reactivated by <name> on <page>: read
+  the session thread first]`.
+
+A broker **may** forward the Matrix event content as `"content"` (an object);
+the bridge reads only the three keys above from it. Without it the bridge
+falls back to the bodies the client writes, matched only inside a thread and
+only against the broker-supplied `sender_name`; the page id is then unknown
+(`-`), and the `page:` header needs `content` to appear at all. The broker's
+own `[AG2 Space working session; …]` body block, when present, seeds the
+session's title, start and live/ended state.
+
 ## Media markers (optional)
 
 Instead of raw bytes, a gateway may hand the task body a media marker:

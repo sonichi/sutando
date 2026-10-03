@@ -178,6 +178,11 @@ layer (its CLAUDE.md equivalent) at connect time.
   down with `[no-send]` unless you are named too. `room_members` lists who is
   present (capped at 10; `room_member_count` is the true size). The relay also
   auto-pings the asker of the task you answer.
+  A `session:` header (`<thread_root> | <title> | started <ts>`) means the room
+  has a live Commons working session you are in; the body then opens with
+  `[live session: …]` and a `page:` header names the sender's current page. A
+  body opening `[session reactivated by …]` asks you to read that thread first.
+  Move and Join/Leave marks never reach you as tasks (`docs/remote-gateway-protocol.md`).
 - **One reply path.** Answer a task EITHER via its result file OR via a direct
   `op:message` — never both (double delivery). If you already posted via
   op:message, put `[no-send]` in the result body.
