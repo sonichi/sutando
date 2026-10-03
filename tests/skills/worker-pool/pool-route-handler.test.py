@@ -261,14 +261,22 @@ class TestIntentionLayer(Base):
 
 
 class TestDelivery(Base):
-    def test_the_real_run_delivers_and_leaves_the_payload(self):
+    def test_the_real_run_delivers_and_moves_the_payload_beside_the_sentinel(self):
+        # The payload leaves tasks/ once every recipient holds it, so no reader of
+        # tasks/*.txt adopts a routed task; the worker reads the body via the resolver.
         self.roster()
         t = self.task_file("task-1", channel_id="!room:x")
+        text = Path(t).read_text()
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
         s = self.ws / "deliveries" / W / "task-1.txt"
         self.assertTrue(s.exists())
         self.assertEqual(s.stat().st_size, 0)
-        self.assertTrue(Path(t).exists(), "the payload is never moved or copied")
+        body = self.ws / "deliveries" / W / "task-1.body"
+        self.assertEqual(body.read_text(), text, "the body sits beside the sentinel")
+        self.assertFalse(Path(t).exists(), "tasks/ no longer lists a routed task")
+        # A replay on the path the watcher saw still settles: the text is read
+        # from the body, the route reports already, rc 0.
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
 
     def test_a_malformed_roster_row_does_not_route_a_bound_task_to_the_core(self):
         """kewei's case: a valid JSON roster whose worker row is a STRING. The
