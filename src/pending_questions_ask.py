@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Optional
 
 import pending_questions_ledger as ledger
-from local_task_protocol import parse_task_headers_lenient
 from pending_questions_md import mask_markup
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename
 from result_markers import neutralize_markers
@@ -133,12 +132,14 @@ def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,
     return drained(results_dir, name)
 
 
-def destination_from_task(text: str) -> Destination:
+def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destination:
     """Where the task's bridge should put the question. The task's own channel
     only for an owner-tier task in the owner's DM; any other bridge task goes to
     the owner's DM on that bridge; a non-bridge source (voice, chat, cron) yields
-    the default."""
-    h = parse_task_headers_lenient(text).headers
+    the default. Headers come only from an attested shape, so a body line cannot
+    supply a missing tier or DM field; unattested, the verdict is the owner's DM."""
+    from task_envelope import attested_task_headers  # noqa: PLC0415
+    h = attested_task_headers(text, workspace).headers
     source = (h.get("source") or "").strip()
     if source not in BRIDGE_CHANNELS:
         return Destination()
@@ -255,7 +256,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     dest = Destination()
     if task_file:
         try:
-            dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"))
+            dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"), ws)
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
     body, routed = proactive_body(question, context, host, dest)

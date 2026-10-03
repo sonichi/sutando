@@ -271,10 +271,7 @@ def authorized_command(path, workspace=None) -> "dict | None":
     above = strict.headers
     if above.get("source") is not None and (above.get("source") or "").strip() != SOURCE:
         return None
-    # Attested content, never a writer guessed from an optional header: only a
-    # verified envelope admits the region below `task:` to the tier decision.
-    verified = te.verify_text(text, workspace).get("verdict") == "verified"
-    parsed = ltp.parse_task_headers_trusted(text) if verified else strict
+    parsed = te.attested_task_headers(text, workspace)
     if (parsed.headers.get("access_tier") or "").strip() != "owner":
         return None
     sentence = (parsed.body or "").split("\n", 1)[0]

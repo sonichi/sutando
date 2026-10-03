@@ -155,6 +155,15 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
             "reason": "stamp does not match file content"}
 
 
+def attested_task_headers(text: str, workspace: Path | None = None):
+    """Headers a tier or routing decision may read: the strict task-last parse, plus the
+    region below `task:` (last-wins) only when the envelope verifies; a body line never fills a gap."""
+    import local_task_protocol as ltp  # noqa: PLC0415
+    if verify_text(text, workspace).get("verdict") == "verified":
+        return ltp.parse_task_headers_trusted(text)
+    return ltp.parse_task_headers(text)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3 or argv[1] not in ("stamp", "verify"):
         print("usage: task_envelope.py stamp|verify <file>", file=sys.stderr)
