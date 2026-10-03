@@ -16,6 +16,11 @@ own. This module is the one place that reads them:
     started and when it was last active. One writer (the bridge), one JSON
     file under the bridge's state dir. Bodies reach it only after the writer's
     secret filter, and no message text is ever copied into another task.
+    Body text is trusted for nothing: the broker's working-session block is
+    prepended INSIDE the body and a member can type the same bytes, so it is
+    read only from an envelope field (`session_context`) the broker would
+    populate outside the body. Without it a session has no title anywhere;
+    a title a member put on a mark is shown only attributed, never in a header.
   * SessionLedger.observe(): the ledger update plus what the task file gets —
     a `page:` header, a `session:` header, a body prefix — or that no task is
     written at all.
@@ -81,8 +86,8 @@ class Observation:
 
 @dataclass
 class _Session:
-    """members are mxids; positions map mxid -> {"name", "page"}; events are {"id", "ts",
-    "sender", "kind"} with no text; agent_in turns false at this agent's own Leave."""
+    """title is the broker's or empty; members are mxids; positions map mxid -> {"name",
+    "surface", "page", "title"}; events are {"id", "ts", "sender", "kind"}, never text."""
     title: str = ""
     started: float = 0.0
     last_ts: float = 0.0
@@ -111,7 +116,8 @@ def strip_blocks(text: str) -> str:
 
 
 def broker_session_block(text: str) -> Optional[dict]:
-    """The broker's working-session JSON when the body opens with that block."""
+    """The working-session JSON a body opens with — for display only, never as
+    attested state: a member can type the same bytes."""
     m = _WS_BLOCK_RE.match(text or "")
     if not m:
         return None
@@ -122,10 +128,16 @@ def broker_session_block(text: str) -> Optional[dict]:
     return value if isinstance(value, dict) and isinstance(value.get("card_id"), str) else None
 
 
-def _place_label(surface: str, title: str) -> str:
+def envelope_session(task: dict) -> Optional[dict]:
+    """The broker-attested session record, from the task envelope (not the body)."""
+    value = task.get("session_context")
+    return value if isinstance(value, dict) and isinstance(value.get("card_id"), str) else None
+
+
+def _surface_label(surface: str, page: str = "") -> str:
     if surface == "chat":
         return "the chat"
-    return f"{surface} · {title}" if title else surface
+    return f"{surface} {page}" if page else (surface or "an unknown page")
 
 
 def _mark_from_content(content: dict) -> Optional[Mark]:
@@ -243,19 +255,23 @@ class SessionLedger:
 
     # -- queries --------------------------------------------------------------- #
 
-    def known(self, room: str, root: str, body: str = "") -> bool:
-        """Is `root` a session this ledger has seen, or one the broker's block names?"""
+    def known(self, room: str, root: str, task: Optional[dict] = None,
+              now: Optional[float] = None) -> bool:
+        """Is `root` a session this ledger has seen that is not ended or quiet past
+        QUIET_S, or the one the broker's envelope record names?"""
         if not root:
             return False
-        if root in self.rooms.get(room, {}):
+        now = time.time() if now is None else now
+        s = self.rooms.get(room, {}).get(root)
+        if s is not None and not s.ended and now - s.last_ts <= QUIET_S:
             return True
-        block = broker_session_block(body)
-        return block is not None and block["card_id"] == root
+        attested = envelope_session(task or {})
+        return attested is not None and attested["card_id"] == root
 
-    def classify(self, task: dict) -> Optional[Mark]:
+    def classify(self, task: dict, now: Optional[float] = None) -> Optional[Mark]:
         """classify() with the text fallback allowed only in a known session thread."""
         room, root = _one_line(task.get("channel_id")), _one_line(task.get("thread_root"))
-        return classify(task, known=self.known(room, root, str(task.get("task") or "")))
+        return classify(task, known=self.known(room, root, task, now))
 
     def live_session(self, room: str, now: float,
                      prefer: str = "") -> "Optional[tuple[str, _Session]]":
@@ -298,9 +314,9 @@ class SessionLedger:
         s.events.append({"id": event_id, "ts": now, "sender": who, "kind": kind})
         del s.events[:-MAX_EVENTS]
 
-    def _absorb_broker_block(self, room: str, body: str, now: float) -> str:
-        """Seed the ledger from the broker's own session block; returns its card id or ''."""
-        block = broker_session_block(body)
+    def _absorb_envelope(self, room: str, task: dict, now: float) -> str:
+        """Seed the ledger from the broker's envelope record; returns its card id or ''."""
+        block = envelope_session(task)
         if block is None:
             return ""
         s = self._session(room, block["card_id"], now)
@@ -329,9 +345,9 @@ class SessionLedger:
         name = _one_line(task.get("sender_name")) or who
         event_id = _one_line(task.get("source_message_id"))
         is_agent = bool(who) and who == _one_line(task.get("agent_mxid"))
-        card = self._absorb_broker_block(room, body, now)
+        card = self._absorb_envelope(room, task, now)
         root = _one_line(task.get("thread_root")) or card
-        mark = classify(task, known=self.known(room, root, body))
+        mark = classify(task, known=self.known(room, root, task, now))
 
         if mark is not None and root:
             s = self._session(room, root, now)
@@ -349,26 +365,26 @@ class SessionLedger:
                 out.consumed = True
                 return out
             if mark.kind == "reactivate":
-                s.title = _one_line(mark.title)[:TITLE_MAX] or s.title
                 s.ended = False
                 self._record(s, event_id, who, "reactivate", now)
-                page = self._page_of(s, who) or _place_label(mark.surface, mark.title) or "the chat"
-                out.body_prefix = (f"[session reactivated by {name} on {_one_line(page)}: "
+                page = self._page_of(s, who) or _surface_label(mark.surface, mark.page)
+                out.body_prefix = (f"[session reactivated by {name} on {page}: "
                                    "read the session thread first]")
                 out.session_header = self._session_header(root, s)
                 return out
             # kind == "at": a session message carrying the sender's place
             self._place(s, who, name, mark)
             s.ended = False
-            out.page_header = f"{mark.surface} · {mark.page or '-'} · {mark.title or '-'}"
+            # The page id only: the title is the member's text, shown attributed in the body.
+            out.page_header = f"{mark.surface} · {mark.page or '-'}"
 
         live = self.live_session(room, now, prefer=root)
         if live is None:
             return out
         root, s = live
         out.session_header = self._session_header(root, s)
-        # Session id, title and the sender's own page only: never another member's words.
-        out.body_prefix = (f"[live session: {s.title or 'session'}; {name} last on "
+        # The broker's title or the thread id, and the sender's own page: no other member's words.
+        out.body_prefix = (f"[live session: {s.title or root}; {name} last on "
                            f"{self._page_of(s, who) or 'an unknown page'}]")
         if root == _one_line(task.get("thread_root")):
             self._record(s, event_id, who, "message", now)
@@ -376,14 +392,21 @@ class SessionLedger:
 
     @staticmethod
     def _place(s: _Session, who: str, name: str, mark: Mark) -> None:
-        s.positions[who] = {"name": name, "page": _place_label(mark.surface, mark.title)}
-        s.title = s.title or _one_line(mark.title)[:TITLE_MAX]
+        s.positions[who] = {"name": name, "surface": mark.surface, "page": mark.page,
+                            "title": _one_line(mark.title)[:TITLE_MAX]}
 
     @staticmethod
     def _page_of(s: _Session, who: str) -> str:
+        """The member's own place; their page title only in quotes and attributed to them."""
         pos = s.positions.get(who)
-        return _one_line(pos.get("page")) if isinstance(pos, dict) else ""
+        if not isinstance(pos, dict):
+            return ""
+        place = _surface_label(_one_line(pos.get("surface")), _one_line(pos.get("page")))
+        title = _one_line(pos.get("title"))
+        return f'{place} ("{title}", title set by {who})' if title else place
 
     @staticmethod
     def _session_header(root: str, s: _Session) -> str:
-        return f"{root} | {s.title or 'session'} | started {_iso(s.started)}"
+        """Title-free unless the broker's block supplied the title."""
+        title = f" | {s.title}" if s.title else ""
+        return f"{root}{title} | started {_iso(s.started)}"
