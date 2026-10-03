@@ -24,9 +24,11 @@ injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 from skill_roots import declared
@@ -37,10 +39,19 @@ DECLARATION = "pending_questions_store"
 
 _LOADED: dict = {}
 _LOAD_LOCK = threading.Lock()
+# A failed execution is served from the cache this long (one operation, the polls right behind
+# it), then the file is executed again: a transient import failure is not process-lifetime state.
+FAILURE_TTL_SEC = 30.0
 
 
 class LoadFailed(RuntimeError):
-    """The adapter file raised when executed; remembered per file identity, like a success."""
+    """The adapter file raised when executed; raised fresh from the remembered reason each time."""
+
+
+class _Failed(NamedTuple):
+    """What the cache holds for a failed execution: the reason and when, never the exception."""
+    reason: str
+    at: float
 
 
 class Resolved(NamedTuple):
@@ -50,29 +61,40 @@ class Resolved(NamedTuple):
     reason: Optional[str]
 
 
+def _execute(path: Path, source: bytes):
+    """The module from one execution of these bytes (compiled here: a stale __pycache__ entry for
+    a same-size same-second rewrite would run the old code), or the failure as a `_Failed`."""
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("pq_store_adapter", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        exec(compile(source, str(path), "exec", dont_inherit=True), mod.__dict__)
+    except Exception as e:  # noqa: BLE001 — third-party code
+        return _Failed(f"{type(e).__name__}: {e}", time.monotonic())
+    return mod
+
+
 def load_adapter(adapter):
-    """The adapter module from its file, executed once per process under a lock — concurrent
-    first reads wait for the one execution; a failure is remembered the same way; None when there
-    is none. A rewritten file (mtime or size changed) is a new file."""
+    """The adapter module from its file, executed once per content under a lock — the identity
+    is the path and the digest of the bytes read under the lock, the bytes then executed, so a
+    file replaced while a reader waits or runs is never served under another version's key;
+    a failure is served for FAILURE_TTL_SEC and then retried; None when there is none."""
     if not adapter:
         return None
     path = Path(adapter).resolve()
-    st = path.stat()
-    key = (str(path), st.st_mtime_ns, st.st_size)
     with _LOAD_LOCK:
-        if key not in _LOADED:
-            import importlib.util  # noqa: PLC0415
-            spec = importlib.util.spec_from_file_location("pq_store_adapter", str(path))
-            mod = importlib.util.module_from_spec(spec)
-            try:
-                spec.loader.exec_module(mod)
-            except Exception as e:  # noqa: BLE001 — third-party code
-                _LOADED[key] = LoadFailed(f"{type(e).__name__}: {e}")
-            else:
-                _LOADED[key] = mod
-        got = _LOADED[key]
-    if isinstance(got, LoadFailed):
-        raise got
+        source = path.read_bytes()
+        key = (str(path), hashlib.sha256(source).hexdigest())
+        got = _LOADED.get(key)
+        if isinstance(got, _Failed) and time.monotonic() - got.at >= FAILURE_TTL_SEC:
+            got = None
+        if got is None:
+            got = _execute(path, source)
+            for stale in [k for k in _LOADED if k[0] == key[0] and k != key]:  # one version per path
+                del _LOADED[stale]
+            _LOADED[key] = got
+    if isinstance(got, _Failed):
+        raise LoadFailed(got.reason)
     return got
 
 
@@ -81,7 +103,7 @@ NO_ADAPTER = "no pending-questions store adapter installed (no skill declares on
 
 def resolve_adapter(adapter=None) -> Resolved:
     """The one resolution of what an edge injected: a `Resolved` is returned as is; a loaded module
-    is wrapped; a script path or skill_roots.Declaration is loaded (once per process); None, or a
+    is wrapped; a script path or skill_roots.Declaration is loaded (`load_adapter`); None, or a
     declaration of none, is NO_ADAPTER exactly."""
     if isinstance(adapter, Resolved):
         return adapter
