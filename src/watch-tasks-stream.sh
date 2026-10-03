@@ -45,6 +45,8 @@ source "$__SCRIPT_DIR/delivery/worker-stage.sh"
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh
 source "$__SCRIPT_DIR/task-emit.sh"
+# shellcheck source=bounded-wait.sh
+source "$__SCRIPT_DIR/bounded-wait.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
@@ -674,7 +676,7 @@ SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
   local task_path="$1" disposition="${2:-fallback}" filename announce handler_rc verdict claim_settled
-  local handler_pid watchdog_pid timeout_flag timed_out
+  local handler_pid timeout_flag timed_out
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
@@ -696,11 +698,8 @@ run_handler_now() {
     echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
     handler_rc=1
   else
-    # Bounded the same way resolve_inbox_entry already bounds a resolver in
-    # this same single-threaded dispatch loop: never plain `timeout`, which
-    # isn't reliably present (this host has neither `timeout` nor
-    # `gtimeout`), and a bare `timeout` with no kill-after leaves a
-    # TERM-resistant handler unbounded anyway. A genuinely hung handler was
+    # Bounded (wait_bounded) the same way resolve_inbox_entry bounds a resolver
+    # in this same single-threaded dispatch loop. A genuinely hung handler was
     # never observed, but is no longer isolated in its own process either
     # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
     # ~250x the measured normal ~35-40ms cost) bounds it regardless.
@@ -712,19 +711,8 @@ run_handler_now() {
       --results-dir "$RESULTS_DIR" \
       --repo "$__REPO_ROOT" >/dev/null &
     handler_pid=$!
-    ( trap 'kill "${_s:-}" 2>/dev/null; exit 0' TERM
-      sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
-      # Reaching here (not cancelled by the handler finishing first) means
-      # the timeout genuinely elapsed -- flag it BEFORE killing, so the
-      # caller can tell "we gave up waiting" apart from a real exit/signal.
-      : > "$timeout_flag"
-      kill -TERM "$handler_pid" 2>/dev/null; sleep 1
-      kill -KILL "$handler_pid" 2>/dev/null ) &
-    watchdog_pid=$!
-    wait "$handler_pid" 2>/dev/null
+    wait_bounded "$handler_pid" "$SUTANDO_HANDLER_RUN_TIMEOUT" "$timeout_flag"
     handler_rc=$?
-    kill -TERM "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null
     if [ -f "$timeout_flag" ]; then
       timed_out=1
       rm -f "$timeout_flag"
