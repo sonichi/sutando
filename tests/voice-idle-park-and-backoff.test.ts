@@ -9,10 +9,25 @@ import { hostOwnsUpstreamRecovery, parkIdleUpstream } from '../src/voice-upstrea
 const quiet = { log: () => {}, error: () => {} };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+type Callbacks = {
+	onopen?: () => void;
+	onmessage: (msg: unknown) => void;
+	onclose?: (e: { code: number; reason: string }) => void;
+};
+type TestSession = {
+	start(): Promise<void>;
+	close?(): Promise<void>;
+	parkUpstream(reason: string): Promise<void>;
+	clientConnected?: boolean;
+	sessionManager: { state: unknown };
+	transport: { disconnect(): Promise<void> };
+};
+const liveProto = Live.prototype as unknown as { connect: (p: { callbacks: Callbacks }) => Promise<unknown> };
+
 let dials = 0;
-let cbs: any = null;
-const realConnect = (Live.prototype as any).connect;
-(Live.prototype as any).connect = async function (params: any) {
+let cbs!: Callbacks;
+const realConnect = liveProto.connect;
+liveProto.connect = async function (params) {
 	dials++;
 	cbs = params.callbacks;
 	const my = cbs;
@@ -22,19 +37,19 @@ const realConnect = (Live.prototype as any).connect;
 		close() { setTimeout(() => my.onclose?.({ code: 1000, reason: '' }), 5); },
 	};
 };
-after(() => { (Live.prototype as any).connect = realConnect; });
+after(() => { liveProto.connect = realConnect; });
 
-const sessions: any[] = [];
-after(async () => { for (const s of sessions) await s.close?.().catch?.(() => {}); });
+const sessions: TestSession[] = [];
+after(async () => { for (const s of sessions) await Promise.resolve(s.close?.()).catch(() => {}); });
 
 async function activeSession(suppress: () => boolean = () => false) {
 	dials = 0;
-	const s: any = new VoiceSession({
+	const s = new VoiceSession({
 		sessionId: `s${sessions.length}`, userId: 'u', apiKey: 'unused', port: 0,
 		agents: [{ name: 'main', instructions: 'x', tools: [] }], initialAgent: 'main',
 		geminiModel: 'gemini-3.1-flash-live-preview', upstreamLossPolicy: 'hold',
 		suppressClientAutoActions: suppress, log: () => {},
-	} as unknown as VoiceSessionConfig);
+	} as unknown as VoiceSessionConfig) as unknown as TestSession;
 	sessions.push(s);
 	await s.start();
 	for (let i = 0; i < 100 && String(s.sessionManager.state) !== 'ACTIVE'; i++) await sleep(10);
@@ -42,7 +57,7 @@ async function activeSession(suppress: () => boolean = () => false) {
 	cbs.onmessage({ sessionResumptionUpdate: { newHandle: 'h-A', resumable: true } });
 	return s;
 }
-const state = (s: any) => String(s.sessionManager.state);
+const state = (s: TestSession) => String(s.sessionManager.state);
 
 describe('idle teardown on bodhi 0.4', () => {
 	it('control: closing the transport makes the engine resume the idle session itself', async () => {
@@ -72,7 +87,7 @@ describe('idle teardown on bodhi 0.4', () => {
 describe('fatal-close backoff gates the engine reconnector', () => {
 	async function fatalClose(withGate: boolean) {
 		let backoffUntil = 0;
-		let s: any = null;
+		let s: TestSession | null = null;
 		s = await activeSession(() => hostOwnsUpstreamRecovery({
 			coordinatorOwns: false, state: s?.sessionManager?.state, now: Date.now(),
 			fatalBackoffUntil: withGate ? backoffUntil : 0,
