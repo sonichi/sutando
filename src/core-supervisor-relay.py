@@ -423,8 +423,27 @@ def resolve_active_target(activity_path):
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
     if _is_deliverable(source) and channel:
+        # Activity says where she was; bindings say whose room it is. A room
+        # bound to a live worker is not the core's to post in.
+        if not _core_may_speak(activity_path, channel):
+            return "", ""
         return source, channel
     return "", ""
+
+
+def _core_may_speak(activity_path, channel) -> bool:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from owner_channel import may_core_speak  # noqa: E402
+    workspace = Path(activity_path).resolve().parent.parent
+    try:
+        allowed, why = may_core_speak(workspace, channel)
+    except (OSError, ValueError) as exc:
+        print(f"core-supervisor-relay: bindings unreadable ({exc}); staying silent", file=sys.stderr)
+        return False
+    if not allowed:
+        print(f"core-supervisor-relay: not posting to {channel}: {why}", file=sys.stderr)
+    return allowed
 
 
 def main(argv=None):
