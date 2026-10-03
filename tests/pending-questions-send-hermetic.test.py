@@ -109,6 +109,38 @@ class Hermetic(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.mod.assert_isolated({**good, key: bad}, self.mod._GW_SCRATCH)
 
+    def test_the_module_check_rejects_a_gateway_that_captured_an_outside_path(self):
+        class Stub:
+            pass
+        inside = os.path.join(self.mod._GW_SCRATCH, "x")
+        good = Stub()
+        for name in self.mod.GATEWAY_DERIVED_PATHS:
+            setattr(good, name, inside)
+        good.URL = "http://127.0.0.1:9"
+        good.TOKEN = "fake-gateway-token"
+        self.mod.assert_gateway_isolated(good, self.mod._GW_SCRATCH)
+        for name in self.mod.GATEWAY_DERIVED_PATHS + ("URL", "TOKEN"):
+            with self.subTest(name):
+                bad = Stub()
+                bad.__dict__.update(good.__dict__)
+                setattr(bad, name, "/tmp/pq-send-outside-scratch" if name not in ("URL", "TOKEN") else "inherited")
+                with self.assertRaises(AssertionError):
+                    self.mod.assert_gateway_isolated(bad, self.mod._GW_SCRATCH)
+
+    def test_the_module_check_follows_the_gateway_import_immediately(self):
+        funcs = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)
+                 and any(_imports_gateway(c) for c in ast.walk(n))]
+        self.assertEqual(len(funcs), 1)
+        body = funcs[0].body
+        for i, stmt in enumerate(body):
+            if _imports_gateway(stmt):
+                nxt = body[i + 1] if i + 1 < len(body) else None
+                call = getattr(getattr(nxt, "value", None), "func", None)
+                self.assertTrue(isinstance(call, ast.Name) and call.id == "assert_gateway_isolated",
+                                "the statement right after the gateway import must be assert_gateway_isolated(rgb, ...)")
+                return
+        self.fail("no gateway import statement in the importing test's body")
+
     def test_the_importing_test_runs_the_runtime_check_around_the_writes(self):
         funcs = [n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)
                  and any(_imports_gateway(c) for c in ast.walk(n))]
@@ -159,8 +191,8 @@ class Hermetic(unittest.TestCase):
         denies = [c.lineno for c in ast.walk(funcs[0]) if isinstance(c, ast.Call)
                   and isinstance(c.func, ast.Name) and c.func.id == "deny_outbound"]
         self.assertTrue(writes and denies and max(denies) < min(writes), "deny must precede the first write")
-        for probe in ("rgb.TOKEN", "telemetry.opted_out()", "SUTANDO_TELEMETRY_ID_FILE",
-                      "a request reached a transport"):
+        for probe in ("assert_gateway_isolated(rgb, _GW_SCRATCH)", "telemetry.opted_out()",
+                      "SUTANDO_TELEMETRY_ID_FILE", "a request reached a transport"):
             self.assertIn(probe, body, f"the behaviour check for {probe} is gone")
 
 

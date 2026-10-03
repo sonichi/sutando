@@ -49,6 +49,22 @@ ISOLATED_EXACT = {"REMOTE_TASK_TOKEN": "http://127.0.0.1:9|fake-gateway-token",
                   "REMOTE_TASK_URL": "http://127.0.0.1:9", "SUTANDO_TELEMETRY": "0", "DO_NOT_TRACK": "1"}
 
 
+GATEWAY_DERIVED_PATHS = ("MEDIA_DIR", "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR", "_STATE", "_LOG_FILE",
+                         "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE", "GATEWAY_STATUS_FILE")
+
+
+def assert_gateway_isolated(rgb, scratch):
+    """Raise AssertionError unless every path the gateway module derived AT IMPORT lies
+    inside `scratch` and its token/URL are the fakes. Read from the module object, so
+    how the environment was spelled, aliased or restored around the import is irrelevant."""
+    root = os.path.realpath(scratch)
+    for name in GATEWAY_DERIVED_PATHS:
+        real = os.path.realpath(str(getattr(rgb, name)))
+        assert real == root or real.startswith(root + os.sep), f"rgb.{name}={getattr(rgb, name)} is outside the fixture"
+    assert rgb.URL == ISOLATED_EXACT["REMOTE_TASK_URL"], f"rgb.URL={rgb.URL!r}"
+    assert rgb.TOKEN == ISOLATED_EXACT["REMOTE_TASK_TOKEN"].split("|", 1)[1], "the gateway holds a token from outside the fixture"
+
+
 def assert_isolated(environ, scratch):
     """Raise AssertionError unless every gateway input in `environ` is contained in
     `scratch` or holds its exact safe value; checked at runtime, so an override in any
@@ -354,13 +370,9 @@ class TestRouting(_Workspace):
         import telemetry
         assert_isolated(os.environ, _GW_SCRATCH)
         from ag2_sparrow import remote_gateway_bridge as rgb  # env above makes this hermetic
+        assert_gateway_isolated(rgb, _GW_SCRATCH)  # what the module captured, whatever the env did
         from ag2_sparrow.local_task_protocol import set_task_stamper
-        self.assertEqual(rgb.URL, "http://127.0.0.1:9", "the gateway read a URL from outside the fixture")
-        self.assertEqual(rgb.TOKEN, "fake-gateway-token", "the gateway read a token from outside the fixture")
         self.assertTrue(telemetry.opted_out(), "telemetry would report the queued tasks")
-        for name in ("_STATE", "_LOG_FILE", "OWNER_ACTIVITY_FILE", "TASK_ROOMS_FILE"):
-            self.assertTrue(str(getattr(rgb, name)).startswith(_GW_SCRATCH),
-                            f"{name}={getattr(rgb, name)} is outside the fixture")
 
         attempts = []
         targets = {"rgb": rgb, "urllib.request": urllib.request, "socket": socket}
