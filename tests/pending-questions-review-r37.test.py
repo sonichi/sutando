@@ -299,6 +299,88 @@ class Finding2ReminderContract(unittest.TestCase):
         self.assertIs(reader.load_adapter(seen[0]), reader.load_adapter(shipped), "one cached load")
         self.assertNotIn("pending_questions_room_db", sys.modules, "no second execution by module name")
 
+    def _counting_adapter(self, name, slow=False, fail=False):
+        """An adapter whose top level counts its executions in a sidecar file."""
+        f = self.tmp / f"{name}.py"
+        f.write_text(
+            "from pathlib import Path as _P\n"
+            "import time as _t\n"
+            "_c = _P(__file__).with_suffix('.count')\n"
+            "_c.write_text(str(int(_c.read_text()) + 1) if _c.exists() else '1')\n"
+            + ("_t.sleep(0.2)\n" if slow else "")
+            + ("raise RuntimeError('adapter executed ' + _c.read_text())\n" if fail else "")
+            + MINIMAL)
+        return f
+
+    def _count(self, f):
+        c = f.with_suffix(".count")
+        return int(c.read_text()) if c.exists() else 0
+
+    def test_concurrent_first_reads_execute_the_adapter_once_and_agree(self):
+        """Round 41: unlocked miss/execute/publish executed one adapter twice under threaded first
+        reads, and one caller saw UNKNOWN. Now the lock serialises the one execution."""
+        import pending_questions_reader as reader
+        import threading
+        reader._LOADED.clear()
+        f = self._counting_adapter("concurrent", slow=True)
+        (self.ws / "room.json").write_text(json.dumps([{"ask_id": "ask-c", "title": "live?"}]))
+        results, start = [], threading.Barrier(16)
+        def read():
+            start.wait()
+            results.append(reader.gather(self.ws, f))
+        ts = [threading.Thread(target=read) for _ in range(16)]
+        for th in ts:
+            th.start()
+        for th in ts:
+            th.join()
+        self.assertEqual(self._count(f), 1, "one execution for sixteen first reads")
+        self.assertEqual([g["unavailable"] for g in results], [False] * 16, "every caller saw the live store")
+        self.assertEqual({len(g["waiting"]) for g in results}, {1})
+
+    def test_a_failed_import_executes_once_per_process_and_once_per_public_invocation(self):
+        """Round 41: a failing adapter was executed again by the public fallback and by the second
+        phase of the pass. The failure is remembered like a success; one operation resolves once."""
+        import pending_questions_reader as reader
+        reader._LOADED.clear()
+        f = self._counting_adapter("failing", fail=True)
+        g = reader.reconcile_then_gather(self.ws, f)
+        self.assertTrue(g["unavailable"])
+        self.assertIn("adapter executed 1", g["reason"], "the first failure is the reported one")
+        self.assertEqual(self._count(f), 1, "reconcile and gather shared one resolution")
+        shim = _load("pq_shim_r41", REPO / "src" / "check-pending-questions.py")
+        import skill_roots
+        import workspace_default
+        loads = mock.Mock(wraps=reader.load_adapter)
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
+             mock.patch.object(shim, "declared", return_value=skill_roots.Declaration(f, None)), \
+             mock.patch.object(reader, "load_adapter", loads), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            rc = shim.main(["--notify", "--force"])
+        self.assertEqual(rc, 0)
+        self.assertIn("UNKNOWN", out.getvalue())
+        self.assertIn("adapter executed 1", out.getvalue(), "the public fallback kept the first failure")
+        self.assertEqual(self._count(f), 1, "no retry of a failed import in the same process")
+        self.assertEqual(loads.call_count, 1, "one resolution per public invocation, cache or not")
+
+    def test_reconcile_then_gather_hands_one_resolved_module_to_both_phases(self):
+        import pending_questions_reader as reader
+        reader._LOADED.clear()
+        f = self._counting_adapter("identity")
+        seen = []
+        real = reader.resolve_adapter
+        def spy(adapter=None):
+            r = real(adapter)
+            seen.append(r)
+            return r
+        loads = mock.Mock(wraps=reader.load_adapter)
+        with mock.patch.object(reader, "resolve_adapter", spy), mock.patch.object(reader, "load_adapter", loads):
+            reader.reconcile_then_gather(self.ws, f)
+        modules = {id(r.module) for r in seen if r.module is not None}
+        self.assertEqual(len(modules), 1, "one module identity across the pass")
+        self.assertEqual(loads.call_count, 1, "the path is resolved once, not once per phase")
+        self.assertEqual(self._count(f), 1)
+        self.assertIs(reader.resolve_adapter(seen[0]), seen[0], "a Resolved is returned as is")
+
     def test_the_pass_calls_reconcile_pass_then_gather_and_no_keyword(self):
         """The reminder delegates to the core reader's one pass: the adapter is loaded once,
         reconcile_pass then plain gather(ws), no private keyword."""
