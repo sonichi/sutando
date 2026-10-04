@@ -33,7 +33,7 @@
  * override. Phone inherits the default, so a fresh install behaves identically.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, copyFileSync } from 'fs';
 
 /** Per-channel override entry. Object-shaped so it stays extensible. */
 export interface VoiceChannelConfig {
@@ -278,4 +278,46 @@ export function loadVoiceConfig(configPath: string): VoiceConfig {
 		console.warn(`[voice-config] failed to parse ${configPath}, using defaults: ${(e as Error).message}`);
 		return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	}
+}
+
+/** The model every install was seeded with before 3.8, and what it moves to. */
+export const LEGACY_SEEDED_MODEL = 'gemini-3.1-flash-live-preview';
+export const MIGRATED_MODEL = 'gemini-3.8-live';
+/** Written once the move is made, so it is made once: a user who switches back to 3.1 keeps it. */
+export const MODEL_MIGRATION_KEY = 'modelMigration';
+
+export interface ModelMigration {
+	migrated: boolean;
+	backup?: string;
+	reason: string;
+}
+
+/**
+ * Move a config still on the old seeded 3.1 model to 3.8, once.
+ *
+ * The config is per-user data that an app update never rewrites, and the template is copied only
+ * when the file is missing, so a new default reaches new installs only. This is the one place an
+ * existing install moves. Only `model` changes; every other key (search, tuning, comments) is kept,
+ * the original is copied beside it first, and a stamp records the move so it never repeats. The
+ * file cannot say whether 3.1 was seeded or chosen, so a user who chose it is moved once and can
+ * switch back; the stamp keeps that choice.
+ */
+export function migrateLegacyModel(configPath: string, now: Date = new Date()): ModelMigration {
+	if (!existsSync(configPath)) return { migrated: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { migrated: false, reason: 'config unreadable; left for loadVoiceConfig to report' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { migrated: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] !== undefined) return { migrated: false, reason: 'already migrated once' };
+	if (raw.model !== LEGACY_SEEDED_MODEL) return { migrated: false, reason: `model is ${String(raw.model)}, not the old default` };
+	const backup = `${configPath}.bak-3.1`;
+	if (!existsSync(backup)) copyFileSync(configPath, backup);
+	const next = { ...raw, model: MIGRATED_MODEL, [MODEL_MIGRATION_KEY]: `${LEGACY_SEEDED_MODEL} -> ${MIGRATED_MODEL} on ${now.toISOString().slice(0, 10)}` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { migrated: true, backup, reason: 'moved from the old seeded default' };
 }

@@ -318,7 +318,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // because the web client's code-heavy workload prefers 3.1 and the (key,
 // 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
 // is true. Phone inherits the package default (2.5+search).
-import { loadVoiceConfig, resolveSessionTuning } from './voice-config.js';
+import { loadVoiceConfig, migrateLegacyModel, resolveSessionTuning } from './voice-config.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -331,6 +331,12 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 		}
 	} catch (e) {
 		console.warn(`${new Date().toISOString().slice(11, 23)} [voice-agent] could not seed config at ${VOICE_AGENT_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+{
+	const _migration = migrateLegacyModel(VOICE_AGENT_CONFIG_PATH);
+	if (_migration.migrated) {
+		console.log(`${new Date().toISOString().slice(11, 23)} [voice-agent] config model moved to 3.8 (once); original kept at ${_migration.backup}`);
 	}
 }
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
