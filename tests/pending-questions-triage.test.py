@@ -34,7 +34,6 @@ sys.path.insert(0, str(REPO / "src"))
 
 import pending_questions_triage as triage  # noqa: E402
 import atomic_replace  # noqa: E402
-from util_paths import _host_label  # noqa: E402 — needs the sys.path above
 
 
 def _load(name: str, path: Path):
@@ -449,22 +448,17 @@ class Dismissal(unittest.TestCase):
         self.assertEqual({"seed", "Q1", "Q2"}, triage.load_dismissed(self.store))
 
 
-PQ_FIXTURE = """# Pending Questions
+def _item(ask_id, title, snippet, asked_at):
+    return {"id": title[:40], "ask_id": ask_id, "title": title, "snippet": snippet, "body": snippet,
+            "asked_at": asked_at, "priority": "medium", "in_room": True}
 
-## 2026-08-01 — Old and unblocked
-Nothing references a PR here.
 
-## 2026-08-20 — Blocked on sonichi/sutando#4242
-This one is waiting on a pull request.
-
-## 2026-08-25 — Blocked on sonichi/sutando#4243
-So is this one.
-
-# Resolved
-
-## 2026-07-01 — Archived
-Must never be offered as open.
-"""
+# What the reader lists: this host's open rows (closed ones never reach it).
+PQ_ITEMS = [
+    _item("ask-old", "Old and unblocked", "Nothing references a PR here.", 1_754_006_400.0),
+    _item("ask-4242", "Blocked on sonichi/sutando#4242", "This one is waiting on a pull request.", 1_755_648_000.0),
+    _item("ask-4243", "Blocked on sonichi/sutando#4243", "So is this one.", 1_756_080_000.0),
+]
 
 
 class ReferenceProbe(unittest.TestCase):
@@ -514,48 +508,33 @@ class ReferenceProbe(unittest.TestCase):
 
 
 class AdapterRows(unittest.TestCase):
-    """The API adapter over a workspace that is provably not the operator's.
-
-    The class docstring's guarantee only holds while `hosts/<host>/` has the
-    file: personal_path() falls through past a MISSING one to the real
-    `$SUTANDO_MEMORY_DIR/machine-<host>/`, which on a host where that env var
-    is set for real (qingyun-wu's review, 2026-09-13) resolves to the
-    operator's own file instead of "nothing" — an unlink-then-resolve test
-    silently reading real, private data instead of failing closed. Neutralize
-    both memory-dir env vars for every test in this class, the same way
-    `tests/util-paths-hosts-resolution.test.py`'s `clear_env()` does.
-    """
+    """The API adapter over the reader's items, in a workspace that is provably not the operator's."""
 
     def setUp(self):
-        self._saved_env = {
-            k: os.environ.pop(k, None) for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR")
-        }
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-triage-ws-"))
-        host = _host_label()
-        # Per-host file FIRST so personal_path's first probe hits: a fresh tmp
-        # otherwise falls through to the operator's vault-synced memory tree.
-        self.pq = self.tmp / "hosts" / host / "pending-questions.md"
-        self.pq.parent.mkdir(parents=True, exist_ok=True)
-        self.pq.write_text(PQ_FIXTURE)
         self._saved_ws = api.WORKSPACE_DIR
         api.WORKSPACE_DIR = self.tmp
-        resolved = Path(api.personal_path("pending-questions.md", self.tmp))
-        assert resolved == self.pq, f"workspace escaped tmp: {resolved} != {self.pq}"
+        self.items = [dict(i) for i in PQ_ITEMS]
+        patcher = mock.patch.object(
+            api.pending_questions_reader, "gather",
+            side_effect=lambda ws, *a, **k: {"waiting": list(self.items), "done": 0, "unavailable": False,
+                                             "reason": None, "link": None, "notes": [], "store": "test"})
+        self.waiting = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         api.WORKSPACE_DIR = self._saved_ws
-        for k, v in self._saved_env.items():
-            if v is not None:
-                os.environ[k] = v
 
-    def test_no_questions_file_yields_no_rows_rather_than_an_error(self):
-        self.pq.unlink()
+    def test_no_items_yield_no_rows_rather_than_an_error(self):
+        self.items.clear()
         self.assertEqual([], api._pending_question_rows())
 
-    def test_rows_are_ranked_and_exclude_the_resolved_section(self):
+    def test_rows_are_the_readers_items_ranked_with_the_ask_id_as_the_id(self):
         rows = api._pending_question_rows()
         self.assertEqual(3, len(rows))
-        self.assertNotIn("Archived", " ".join(r["text"] for r in rows))
+        self.assertEqual({r["id"] for r in rows}, {"ask-old", "ask-4242", "ask-4243"})
+        self.assertEqual(rows[0]["asked"], "2025-08-01T00:00:00Z")
+        self.waiting.assert_called_with(self.tmp, api.skill_roots.declared(api.pending_questions_reader.DECLARATION, self.tmp))
 
     def test_a_dismissed_question_stops_being_offered(self):
         rows = api._pending_question_rows()
@@ -565,11 +544,6 @@ class AdapterRows(unittest.TestCase):
         remaining = api._pending_question_rows()
         self.assertEqual(len(rows) - 1, len(remaining))
         self.assertNotIn(target, [r["id"] for r in remaining])
-
-    def test_dismissing_does_not_write_to_the_questions_file(self):
-        before = self.pq.read_text()
-        api.dismiss_question(api._pending_question_rows()[0]["id"])
-        self.assertEqual(before, self.pq.read_text())
 
     def test_an_empty_id_is_rejected_rather_than_stored(self):
         status, _ = api.dismiss_question("")

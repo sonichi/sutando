@@ -526,6 +526,17 @@ if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   fi
 fi
 
+# A pull can move the voice runtime pin past what node_modules holds; the old one lacks the API now called.
+if [ "$BUNDLED_MODE" != "1" ] && [ -d node_modules ] && command -v npm > /dev/null 2>&1 \
+  && ! npm ls bodhi-realtime-agent > /dev/null 2>&1; then
+  if npm install 2>/dev/null; then
+    echo "  ✓ Dependencies reinstalled (bodhi-realtime-agent did not match package.json)"
+  else
+    echo "  ✗ bodhi-realtime-agent does not match package.json and npm install failed — run: npm install"
+    exit 1
+  fi
+fi
+
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
 # Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is

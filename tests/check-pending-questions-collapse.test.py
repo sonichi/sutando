@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for src/check-pending-questions.py — stable reminder filenames.
+"""Tests for the skill's pending_questions_remind.py — stable reminder filenames.
 
 Discord-DM reminder files (`proactive-pending-q-*.txt`) are named from
 `questions_key()`, a hash of the sorted pending-question set. Covers: the key
@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
-    "check_pending_questions", REPO / "src" / "check-pending-questions.py"
+    "check_pending_questions", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py"
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)

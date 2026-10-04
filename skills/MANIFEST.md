@@ -134,6 +134,31 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 
 **Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
 
+## Pending-questions store adapter (`pending_questions_store`)
+
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
+read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
+`reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
+records a question and `remind(argv, workspace, resolved=None)` runs the reminder — `resolved` is optional:
+the core entry passes its one resolution of the adapter when `remind` accepts the keyword, and a
+two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-manifest.schema.json`
+(a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
+`src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
+skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
+friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
+`declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
+roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+resolve inside its skill), and refuses when more than one installed skill declares it, in one root
+or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
+(`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
+its errors kept as notes, then `gather(workspace)` — a `gather` keyword is not part of the contract.
+With none declared there is no store: readers report `unavailable` with that reason (never a
+zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
+the owner's DM through the proactive path and keeps one generic record under
+`<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
+The outbox, the ask-id grammar and every question schema are the declaring skill's.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).

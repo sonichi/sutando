@@ -6,8 +6,8 @@
 # three channels before any service starts:
 #   1. stderr — the exact remedy (visible in tmux/console/startup log)
 #   2. macOS notification (works even when every bridge is down)
-#   3. per-host pending-questions.md + a results/proactive-*.txt file so the
-#      first bridge that comes up DMs the remedy to the owner
+#   3. a pending question for the owner (scripts/ask-owner.py: the room database,
+#      else the workspace outbox) whose queued DM the first bridge up delivers
 # then exits 2 so the caller (startup.sh) aborts BEFORE launching services —
 # a half-up core (tmux + bridges alive, CLI parked at /login, processing
 # nothing) is strictly worse than a clean loud abort (2026-07-30 outage).
@@ -65,39 +65,12 @@ osascript -e "display notification \"CLI login required — startup aborted. $( 
 _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
 _host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"
 if [ -n "$_ws" ] && [ -n "$_host" ]; then
-  _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  mkdir -p "$_ws/hosts/$_host" "$_ws/results"
-  # Insert at the TOP of the active region, never `>>` at EOF.
-  #
-  # `check-pending-questions.py` (and morning-briefing, agent-api,
-  # friction-detector, dashboard) count only the text ABOVE the file's
-  # top-level `# Resolved` divider — everything after it is the audit trail.
-  # An EOF append therefore lands BELOW the divider and is permanently
-  # uncounted. Measured on this host's real file (2099 lines, divider at 1652):
-  #
-  #     baseline                            21 waiting
-  #     after this block appended with `>>`  21   <- INVISIBLE
-  #     same text placed above the divider   22   <- counted
-  #
-  # It reports success in every cheap way: bytes land, the path is right,
-  # nothing errors, `wc -c` grows. Only calling the reader shows the zero.
-  # And this is the worst case to lose: the gate writes precisely when a boot
-  # was ABORTED, so the record of why is dropped at the moment it matters.
-  #
-  # Top-of-file rather than "just above the divider" deliberately: it needs no
-  # divider regex at all, so it cannot be defeated by the divider-detection
-  # edge cases #2419 catalogues (a quoted `# Resolved` in a comment, a fenced
-  # block, an inline code span). A boot-abort question also belongs first.
-  _pq="$_ws/hosts/$_host/pending-questions.md"
-  # The ledger's one writer (src/pending_questions_ledger.py) locks, inserts and
-  # replaces atomically; it never removes a lock it did not take, and says so.
-  if ! printf '## [%s] BOOT ABORTED — CLI login required (%s)\nauth-preflight-gate stopped startup before services launched.\nRemedy: %s\n\n' \
-      "$_ts" "$_host" "$_remedy" | python3 "$REPO/src/pending_questions_ledger.py" insert "$_pq"; then
-    echo "  auth-preflight-gate: pending-questions.md left untouched (reason above)." >&2
-  fi
-  # --- end pending-question write (unique sentinel; tests extract to here) ---
-  printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
-    "$_host" "$_remedy" > "$_ws/results/proactive-$(date +%s).txt"
+  # ask-owner records the question (room database, else the workspace outbox) and
+  # queues the owner's DM itself; it exits 0 after any failure and prints why.
+  python3 "$REPO/scripts/ask-owner.py" "BOOT ABORTED — CLI login required ($_host)" \
+    --context "auth-preflight-gate stopped startup before services launched. Remedy: $_remedy" \
+    --urgency durable --workspace "$_ws" \
+    || echo "  auth-preflight-gate: the pending question could not be recorded (reason above)." >&2
 fi
 
 exit 2

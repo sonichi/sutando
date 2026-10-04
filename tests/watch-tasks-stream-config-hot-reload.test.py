@@ -10,9 +10,10 @@ this is exactly the live-streaming path a stub fswatch never exercises):
 2. The config file is written WHILE the watcher is already running (the same
    atomic tmp-then-rename write pool_roster.publish_task_event_handler() does):
    the VERY NEXT task is routed through the declared handler. No restart.
-3. A pool worker (SUTANDO_INSTANCE_ID set) never watches or reads the config
-   file at all -- even with one already present, its tasks are always emitted
-   directly. Core-only, unconditionally.
+3. A pool worker (SUTANDO_INSTANCE_ID set, watching its own <ws>/deliveries/<id>
+   inbox) never watches or reads the config file at all -- even with one
+   already present, its tasks are always emitted directly. Core-only,
+   unconditionally.
 
 Run: python3 tests/watch-tasks-stream-config-hot-reload.test.py
 """
@@ -39,7 +40,10 @@ def check(name, cond, detail=""):
                 print("    " + line)
 
 
-def start_watcher(ws, errf, instance=None):
+def start_watcher(ws, errf, instance=None, inbox=None):
+    # `instance` and `inbox` are set together: a worker's own inbox is
+    # <ws>/deliveries/<id>, never the bare <ws>/tasks.
+    inbox = inbox or (ws / "tasks")
     env = dict(os.environ)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     if instance:
@@ -48,15 +52,15 @@ def start_watcher(ws, errf, instance=None):
         env.pop("SUTANDO_INSTANCE_ID", None)
     env.pop("SUTANDO_TASK_EVENT_HANDLER", None)  # no operator pin -- config file only
     return subprocess.Popen(
-        ["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
+        ["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
         env=env, stdout=subprocess.PIPE, stderr=errf,
         text=True, start_new_session=True)
 
 
-def write_task(ws, name, body="probe"):
+def write_task(inbox, name, body="probe"):
     # Rename into place, as every bridge does: an in-place write raises a
     # Created and an Updated event, and the watcher would announce both.
-    final = ws / "tasks" / name
+    final = inbox / name
     tmp = final.with_name(f".{name}.tmp")
     tmp.write_text(f"id: {name}\naccess_tier: owner\ntask: {body}\n")
     tmp.replace(final)
@@ -134,7 +138,7 @@ p = start_watcher(ws, errf)
 out: list[str] = []
 try:
     wait_for_fswatch(p)
-    write_task(ws, "task-one.txt")
+    write_task(ws / "tasks", "task-one.txt")
     ok = wait_for(lambda: (read_available(p, out), any("TASK_FILE" in s for s in out))[1])
     LAST_STDERR[0] = snapshot_stderr(errf_path)
     check("(1) no config file: the task is emitted straight to the live core",
@@ -149,7 +153,7 @@ try:
     # Room for fswatch's -l 0.5 batching window plus FSEvents latency.
     time.sleep(1.5)
     out2: list[str] = []
-    write_task(ws, "task-two.txt")
+    write_task(ws / "tasks", "task-two.txt")
     ok2 = wait_for(lambda: (read_available(p, out2), log.exists() and "handle" in log.read_text())[1])
     LAST_STDERR[0] = snapshot_stderr(errf_path)
     check("(2) config written mid-run: the VERY NEXT task is routed through it, no restart",
@@ -162,13 +166,15 @@ finally:
 # (3) cfg still names `handler` from step (2); log content before this
 # section is the control -- must be byte-identical after, proving no call.
 log_before = log.read_text() if log.exists() else ""
+worker_inbox = ws / "deliveries" / "worker-1"
+worker_inbox.mkdir(parents=True)
 errf2_path = tmp / "watcher-second.err"
 errf2 = open(errf2_path, "w")
-p2 = start_watcher(ws, errf2, instance="worker-1")
+p2 = start_watcher(ws, errf2, instance="worker-1", inbox=worker_inbox)
 out3: list[str] = []
 try:
     wait_for_fswatch(p2)
-    write_task(ws, "task-three.txt")
+    write_task(worker_inbox, "task-three.txt")
     ok3 = wait_for(lambda: (read_available(p2, out3), any("TASK_FILE" in s for s in out3))[1])
     log_after = log.read_text() if log.exists() else ""
     LAST_STDERR[0] = snapshot_stderr(errf2_path)
