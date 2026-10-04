@@ -693,6 +693,7 @@ export const pointAtTool: ToolDefinition = {
 // Re-export recording/video tools from recording-tools
 export {
 	scrollAndDescribeTool,
+	describeNextScreenTool,
 	playVideoTool,
 	resumeVideoTool,
 	replayVideoTool,

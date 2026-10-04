@@ -1537,8 +1537,9 @@ async function main() {
 
 	// Wire recording hooks — enables description push during record_screen_with_narration
 	try {
-		const { setupRecordingHooks } = await import('./recording-tools.js');
+		const { setupRecordingHooks, setModelDrivesNarration, modelDrivesNarration } = await import('./recording-tools.js');
 		setupRecordingHooks(session);
+		setModelDrivesNarration(modelDrivesNarration(VOICE_NATIVE_AUDIO_MODEL));
 		console.log(`${ts()} [RecordingHooks] wired into voice agent`);
 	} catch (e) {
 		console.log(`${ts()} [RecordingHooks] not available: ${e instanceof Error ? e.message : e}`);

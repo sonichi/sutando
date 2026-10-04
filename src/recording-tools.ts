@@ -570,8 +570,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			}, duration_seconds * 1000);
 
 			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
+			_spokenDescs = firstDesc ? [firstDesc] : [];
 			// Start narration controller directly (don't rely on eventBus hook)
-			if (_narrationSession) {
+			if (_narrationSession && !_modelDrives) {
 				setTimeout(() => {
 					if (isRecordingActive()) {
 						console.log(`${ts()} [ScrollAndDescribe] starting narration controller`);
@@ -585,7 +586,9 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				recording_path: recordingPath,
 				narrated_path: narratedPath,
 				subtitled_path: subtitledPath,
-				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". Auto-stops in ${duration_seconds}s. After auto-stop, three files will exist (best→worst): subtitled=${subtitledPath}, narrated=${narratedPath}, raw=${recordingPath}. When the user asks to open "the recording" or "the recording with subtitles", pass subtitled_path to open_file. Only fall back to narrated_path if subtitled doesn't exist (rare — subtitle burn failure on missing libass).`,
+				message: `Recording started. IMMEDIATELY speak this narration — NO filler, NO "okay", NO "should I": "${firstDesc}". ${_modelDrives
+					? 'While you are still speaking it, call describe_next_screen; it scrolls on and returns what is new. Speak each result as a continuation and call it again, until it says at_bottom or done. '
+					: ''}Auto-stops in ${duration_seconds}s. After auto-stop, three files will exist (best→worst): subtitled=${subtitledPath}, narrated=${narratedPath}, raw=${recordingPath}. When the user asks to open "the recording" or "the recording with subtitles", pass subtitled_path to open_file. Only fall back to narrated_path if subtitled doesn't exist (rare — subtitle burn failure on missing libass).`,
 			};
 		} catch (err) {
 			return { error: `record_screen_with_narration failed: ${err instanceof Error ? err.message : err}` };
@@ -597,6 +600,43 @@ export const scrollAndDescribeTool: ToolDefinition = {
 // for QT present mode) is not recording-specific. Recording-flavored side effects
 // (playback-path write, demoStateRef reset) now live where they belong: in
 // `screenRecordTool` stop handler and `playVideoTool`/`startPlayback`.
+
+/** Remaining scroll distance of the page's main scroller, in px; null when Chrome cannot say. */
+function remainingScroll(): number | null {
+	const js = `(function(){var best=document.scrollingElement||document.documentElement,bw=0;document.querySelectorAll('*').forEach(function(el){var d=el.scrollHeight-el.clientHeight;if(d>50&&el.clientHeight>200){var w=el.getBoundingClientRect().width;if(w>bw){best=el;bw=w}}});return best.scrollHeight-best.clientHeight-best.scrollTop})()`;
+	try {
+		const out = execFileSync('/usr/bin/osascript', ['-e', `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/"/g, '\\"')}"`], { timeout: 3_000 }).toString().trim();
+		const n = Number(out);
+		return Number.isFinite(n) ? n : null;
+	} catch { return null; }
+}
+
+/** Model-driven narration (3.8): scroll on, capture, and describe only what is new. */
+export const describeNextScreenTool: ToolDefinition = {
+	name: 'describe_next_screen',
+	description:
+		'During a narrated recording (record_screen_with_narration), scroll to the next part of the page and describe what is new. ' +
+		'Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		if (!isRecordingActive()) return { status: 'done', instruction: 'The recording has ended. Stop narrating.' };
+		try {
+			scrollDown(700);
+			await new Promise(r => setTimeout(r, 500)); // let scroll settle
+			const path = await captureScreen();
+			if (!path) return { error: 'Could not capture the screen.' };
+			const description = await describeScreenshot(path, _spokenDescs);
+			if (description) _spokenDescs.push(description);
+			const left = remainingScroll();
+			const atBottom = left !== null && left <= 5;
+			console.log(`${ts()} [NarrateNext] left=${left ?? '?'}px ${description.slice(0, 80)}`);
+			return { status: 'ok', description, at_bottom: atBottom };
+		} catch (err) {
+			return { error: `describe_next_screen failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
 
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
@@ -935,6 +975,18 @@ export const screenRecordTool: ToolDefinition = {
  */
 let _narrationSession: any = null;
 
+/** Gemini 3.8 Live runs function calls NON_BLOCKING by default, so the model can keep talking
+ *  while a tool runs and fetch the next screen itself. On those models the narration controller
+ *  (timer, speaking flag, injected descriptions) is not started; on blocking models (2.5, 3.1,
+ *  the phone path) it still is. */
+export function modelDrivesNarration(model: string): boolean {
+	return /^gemini-3\.8/.test(String(model ?? ''));
+}
+let _modelDrives = false;
+export function setModelDrivesNarration(on: boolean): void { _modelDrives = on; }
+/** What the model has already said in this recording, so each next screen is narrated as new. */
+let _spokenDescs: string[] = [];
+
 /** Exposed for voice-agent to call when speech finishes and pre-capture is ready */
 export let _tryInjectNow: (() => void) | null = null;
 
@@ -944,6 +996,7 @@ export function setupRecordingHooks(session: any): void {
 	session.eventBus?.subscribe?.('tool.call', (e: any) => {
 		if (e?.toolName === 'record_screen_with_narration') {
 			console.log(`${ts()} [RecordingHooks] tool.call event for record_screen_with_narration`);
+			if (_modelDrives) return;
 			setTimeout(() => {
 				if (isRecordingActive()) startRecordingNarration(session);
 			}, 4000);

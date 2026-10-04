@@ -146,6 +146,18 @@
    }
   },
   {
+   "name": "describe_next_screen",
+   "description": "During a narrated recording (record_screen_with_narration), scroll to the next part of the page and describe what is new. Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
+   "name": "describe_next_screen",
+   "description": "During a narrated recording (record_screen_with_narration), scroll to the next part of the page and describe what is new. Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.",
+   "execution": "inline",
+   "params": {}
+  },
+  {
    "name": "describe_screen",
    "description": "Describe what is currently visible on screen WITHOUT scrolling. Captures ALL connected displays by default. Use this to introduce/narrate the current view to the caller. Pass display=2 for secondary only.",
    "execution": "inline",
