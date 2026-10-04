@@ -11,6 +11,7 @@ closes with no_send.
 Run: python3 tests/gateway-owner-mention.test.py
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -225,7 +226,7 @@ class DeliveryRefusesTheRoom(_DeliveryHarness):
         dm = self.dm_file("om-d8").read_text()
         self.assertEqual(rgb._proactive_route(dm)[:2], ("send", OWNER_DM))
         self.assertIn("Alice asked Chi about the deck", dm)
-        self.assertFalse((rgb._STATE / "withheld-team-results" / "om-d8.json").exists())
+        self.assertFalse(egress.withheld_review_path(rgb._STATE, "om-d8").exists())
         reviews = rgb._STATE / "withheld-team-results"
         self.assertFalse(any("om-d8" in f.read_text() for f in reviews.glob("*.json")) if reviews.is_dir() else False,
                          "no review record whose release target is the shared room")
@@ -234,6 +235,21 @@ class DeliveryRefusesTheRoom(_DeliveryHarness):
         self.run_result("om-d9", "[no-send]", owner_mentioned="true")
         self.assertEqual(self.posts, [("om-d9", "[no-send]", True)])
         self.assertFalse(self.dm_file("om-d9").exists())
+
+
+class DedupReportRefusesTheRoom(_DeliveryHarness):
+    def test_malformed_dedup_report_goes_to_the_owner_dm(self):
+        self.run_result("task-omdq2", "[deduped: not a valid id!]", owner_mentioned="true")
+        self.assertEqual(self.posts, [("task-omdq2", "[no-send]", True)])
+        dm = self.dm_file("task-omdq2").read_text()
+        self.assertEqual(rgb._proactive_route(dm)[:2], ("send", OWNER_DM))
+
+    def test_malformed_dedup_report_on_an_ordinary_task_still_reaches_the_room(self):
+        self.run_result("task-omdq3", "[deduped: not a valid id!]")
+        self.assertEqual(len(self.posts), 1)
+        self.assertFalse(self.posts[0][2], "the canned report is delivered, not suppressed")
+        self.assertNotEqual(self.posts[0][1], "[no-send]")
+        self.assertFalse(self.dm_file("task-omdq3").exists())
 
 
 class OrphanSweepRefusesTheRoom(_DeliveryHarness):
@@ -257,6 +273,10 @@ class OrphanSweepRefusesTheRoom(_DeliveryHarness):
         self.assertEqual(len(self.posts), 1)
         self.assertIn("late answer", self.posts[0][1])
         self.assertFalse(self.posts[0][2])
+
+
+def tearDownModule():
+    shutil.rmtree(TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -296,7 +296,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
-from .result_markers import neutralize_markers, parse_markers, render_skill_prelude
+from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
@@ -4555,8 +4556,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     # The report IS the delivery: archiving before confirm
                     # would strand the ask exactly as the unreported dedup did.
+                    mention = _owner_mention_disposition(tid, payload)
+                    if mention is None:
+                        continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                                  payload):
+                                                  "[no-send]" if mention else payload,
+                                                  no_send=bool(mention)):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
