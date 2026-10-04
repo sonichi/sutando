@@ -620,7 +620,7 @@ export const describeNextScreenTool: ToolDefinition = {
 		'Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — ' +
 		'"describe it while scrolling down", "go through this page to the end" — with no recording and no time limit, ' +
 		'and also during a narrated recording (record_screen_with_narration). ' +
-		'Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.',
+		'Speak each result out loud as a continuation, then call it again. Stop calling when it returns at_bottom or done.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -641,11 +641,12 @@ export const describeNextScreenTool: ToolDefinition = {
 			const left = remainingScroll();
 			const atBottom = left !== null && left <= 5;
 			console.log(`${ts()} [NarrateNext] left=${left ?? '?'}px ${description.slice(0, 80)}`);
-			// The result itself says what comes next: the tool description alone left the model at one call.
+			// The result itself says what comes next: the tool description alone left the model at one call,
+			// and "call again while speaking" made it call without ever speaking (2026-10-04 14:03).
 			return { status: 'ok', description, at_bottom: atBottom,
 				instruction: atBottom
 					? 'This is the end of the page. Speak this description, then stop.'
-					: 'Not at the end yet. Speak this description as a continuation and, while you are speaking it, call describe_next_screen again.' };
+					: 'Not at the end yet. First speak this description out loud as a continuation. Only after you have finished speaking it, call describe_next_screen again.' };
 		} catch (err) {
 			return { error: `describe_next_screen failed: ${err instanceof Error ? err.message : err}` };
 		}

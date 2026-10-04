@@ -147,13 +147,13 @@
   },
   {
    "name": "describe_next_screen",
-   "description": "Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — \"describe it while scrolling down\", \"go through this page to the end\" — with no recording and no time limit, and also during a narrated recording (record_screen_with_narration). Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.",
+   "description": "Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — \"describe it while scrolling down\", \"go through this page to the end\" — with no recording and no time limit, and also during a narrated recording (record_screen_with_narration). Speak each result out loud as a continuation, then call it again. Stop calling when it returns at_bottom or done.",
    "execution": "inline",
    "params": {}
   },
   {
    "name": "describe_next_screen",
-   "description": "Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — \"describe it while scrolling down\", \"go through this page to the end\" — with no recording and no time limit, and also during a narrated recording (record_screen_with_narration). Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.",
+   "description": "Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — \"describe it while scrolling down\", \"go through this page to the end\" — with no recording and no time limit, and also during a narrated recording (record_screen_with_narration). Speak each result out loud as a continuation, then call it again. Stop calling when it returns at_bottom or done.",
    "execution": "inline",
    "params": {}
   },
