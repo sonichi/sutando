@@ -111,6 +111,22 @@ class WriterCarriesTheAttestedHeader(_Base):
         self.assertLess(rgb._TASK_FIELDS.index("owner_mentioned"), rgb._TASK_FIELDS.index("task"))
 
 
+class SharedPolicyInSrc(unittest.TestCase):
+    """The canonical src/ modules the package copies are generated from."""
+
+    def test_refusal_rule(self):
+        task = "id: t\nowner_mentioned: true\ntask: hi\n"
+        self.assertTrue(egress.owner_mention_result_refused_by_room(task, "tell Chi"))
+        self.assertFalse(egress.owner_mention_result_refused_by_room(task, "[no-send]"))
+        self.assertFalse(egress.owner_mention_result_refused_by_room("id: t\ntask: hi\n", "tell Chi"))
+
+    def test_instruction_lines(self):
+        from policy.guardrail import owner_mention_lines
+        lines = owner_mention_lines("results/t.txt")
+        self.assertEqual(lines, rgb.owner_mention_lines("results/t.txt"))
+        self.assertIn("results/t.txt", "\n".join(lines))
+
+
 class WriterAppendsTheInstruction(_Base):
     def test_owner_mention_task_ends_with_the_instruction(self):
         text = self.write("om-ins", owner_mentioned="true")
@@ -209,6 +225,18 @@ class DeliveryRefusesTheRoom(_DeliveryHarness):
         self.assertEqual(self.posts, [("om-d6", "[no-send]", True)])
 
 
+    def test_unreadable_task_file_holds_the_result(self):
+        self.write("om-d10", owner_mentioned="true")
+        (rgb.RESULTS_DIR / "om-d10.txt").write_text("tell Chi")
+        with patch.object(rgb, "find_task_file", lambda d, tid: rgb.TASKS_DIR):  # a directory: read fails
+            rgb._post_ready_results({"om-d10"})
+        self.assertEqual(self.posts, [], "an unreadable task is never assumed to allow the room")
+        self.assertTrue((rgb.RESULTS_DIR / "om-d10.txt").exists())
+
+    def test_a_result_with_no_task_file_is_not_an_owner_mention(self):
+        self.assertIs(rgb._owner_mention_disposition("om-none", "tell Chi"), False)
+        self.assertFalse(self.dm_file("om-none").exists())
+
     def test_dm_file_is_destined_to_the_ag2space_bridge(self):
         import re
         from proactive_routing import proactive_destination
@@ -251,6 +279,12 @@ class DedupReportRefusesTheRoom(_DeliveryHarness):
         self.assertNotEqual(self.posts[0][1], "[no-send]")
         self.assertFalse(self.dm_file("task-omdq3").exists())
 
+    def test_dedup_report_with_no_owner_dm_reading_is_held(self):
+        with patch.object(rgb, "resolve_destination", lambda audience, **kw: ""):
+            self.run_result("task-omdq4", "[deduped: not a valid id!]", owner_mentioned="true")
+        self.assertEqual(self.posts, [])
+        self.assertTrue((rgb.RESULTS_DIR / "task-omdq4.txt").exists())
+
 
 class OrphanSweepRefusesTheRoom(_DeliveryHarness):
     def sweep(self, tid, body, **kw):
@@ -267,6 +301,12 @@ class OrphanSweepRefusesTheRoom(_DeliveryHarness):
                    owner_mentioned="true", access_tier="owner", user_id="@chi:ag2.space")
         self.assertEqual(self.posts, [("task-om-orphan1", "[no-send]", True)])
         self.assertIn("Alice asked about the deck", self.dm_file("task-om-orphan1").read_text())
+
+    def test_aged_owner_mention_result_with_no_owner_dm_reading_is_held(self):
+        with patch.object(rgb, "resolve_destination", lambda audience, **kw: ""):
+            self.sweep("task-om-orphan3", "tell Chi", owner_mentioned="true")
+        self.assertEqual(self.posts, [])
+        self.assertTrue((rgb.RESULTS_DIR / "task-om-orphan3.txt").exists())
 
     def test_aged_ordinary_result_is_still_recovered(self):
         self.sweep("task-om-orphan2", "late answer")
