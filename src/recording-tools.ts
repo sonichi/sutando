@@ -641,7 +641,11 @@ export const describeNextScreenTool: ToolDefinition = {
 			const left = remainingScroll();
 			const atBottom = left !== null && left <= 5;
 			console.log(`${ts()} [NarrateNext] left=${left ?? '?'}px ${description.slice(0, 80)}`);
-			return { status: 'ok', description, at_bottom: atBottom };
+			// The result itself says what comes next: the tool description alone left the model at one call.
+			return { status: 'ok', description, at_bottom: atBottom,
+				instruction: atBottom
+					? 'This is the end of the page. Speak this description, then stop.'
+					: 'Not at the end yet. Speak this description as a continuation and, while you are speaking it, call describe_next_screen again.' };
 		} catch (err) {
 			return { error: `describe_next_screen failed: ${err instanceof Error ? err.message : err}` };
 		}
