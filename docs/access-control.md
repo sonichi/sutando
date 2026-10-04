@@ -119,11 +119,14 @@ above `task:` only for that exact string, so a body line cannot claim it; the
 tier still comes from the sender. It appends an owner-mention instruction after
 any tier block: do not reply in the room; if the owner has not already answered
 the message, DM him the message with a link and propose any next step through
-`scripts/ask-owner.py --task-file`. The delivery side enforces it: an
-owner-mention result other than `[no-send]` / `[REPLIED]` / `[deduped:]` is
-never posted to the room. It goes to the owner's DM through the proactive leg,
-and the room's turn closes with `no_send` (rule:
-`policy/egress/result.owner_mention_result_refused_by_room`).
+`scripts/ask-owner.py --task-file`. The delivery side enforces it on the
+result-file path: before the tier guard, both the live drain and the orphan
+sweep send an owner-mention result other than `[no-send]` / `[REPLIED]` /
+`[deduped:]` to the owner's DM (a `.to-ag2space` proactive file) and close the
+room's turn with `no_send` (rule:
+`policy/egress/result.owner_mention_result_refused_by_room`). The guard covers
+that path only: a core that posts directly through room_ops and then writes
+`[REPLIED]` is bound by the instruction alone.
 
 ## A non-owner asking to report a bug
 

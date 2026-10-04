@@ -298,6 +298,7 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import neutralize_markers, parse_markers, render_skill_prelude
 from . import undelivered_quarantine
+from .proactive_routing import proactive_filename
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
                              owner_mention_lines)
@@ -4468,7 +4469,7 @@ def _owner_mention_refused(tid: str, body: str) -> "bool | None":
 
 
 def _owner_mention_dm_name(tid: str) -> str:
-    return f"proactive-owner-mention-{tid}"
+    return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
 
 
 def _owner_mention_dm_queued(tid: str) -> bool:
@@ -4494,6 +4495,21 @@ def _queue_owner_mention_dm(tid: str, text: str) -> bool:
     return _durable_write(RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt", body)
 
 
+def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
+    """Every result consumer asks this first, before the tier guard.
+
+    True = an owner-mention result the room must not get: its DM is queued and the
+    caller closes the room lease silently. False = deliver as usual. None = retry.
+    """
+    refused = _owner_mention_refused(tid, raw)
+    if not refused:
+        return refused
+    if not _queue_owner_mention_dm(tid, parse_markers(raw).body):
+        return None
+    _log(f"owner mention {tid}: result sent to the owner's DM, not the room")
+    return True
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -4505,9 +4521,13 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
+        # Before the tier guard: a withheld review would name the shared room as its release target.
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # The guard honours suppression on every tier now, so there is no stub
         # to pre-apply; the ordinary guarded path returns the body unchanged.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -4556,12 +4576,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                     inflight.add(payload)
                 changed = True
                 continue
-        refused = False if skip else _owner_mention_refused(tid, body)
-        if refused is None:
-            continue  # task file unreadable this pass: never guess the room is allowed
-        if refused and not _queue_owner_mention_dm(tid, parsed.body):
-            continue
-        if skip or refused:
+        if skip:
             # Skip markers still POST: only add_result closes the server lease;
             # the server suppresses their user-facing delivery.
             _delivery = _delivery_tid(tid)
@@ -4569,7 +4584,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"delivery deferred for {tid} — alias ledger unreadable")
                 continue
             if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                           _lease_close_body(skip) if skip else "[no-send]",
+                                           _lease_close_body(skip),
                                            no_send=True):
                 continue
             _archive_result(rfile, tid)
@@ -4580,8 +4595,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             _forget_task_room(tid)
             _forget_task_media(tid)
             changed = True
-            _why = f"marker {skip.value}" if skip else "owner mention, sent to the owner's DM"
-            _log(f"archived {tid} ({_why}, lease closed, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -4826,9 +4840,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # Recovery is still a delivery: the ordinary path's guard runs BEFORE
         # any marker is interpreted, so tier + suppression cannot be skipped.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
             continue

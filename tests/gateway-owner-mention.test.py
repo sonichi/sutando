@@ -133,7 +133,7 @@ class WriterAppendsTheInstruction(_Base):
         self.assertEqual([ln for ln in lines if header.match(ln)], [])
 
 
-class DeliveryRefusesTheRoom(_Base):
+class _DeliveryHarness(_Base):
     def setUp(self):
         super().setUp()
         self.posts = []
@@ -156,8 +156,10 @@ class DeliveryRefusesTheRoom(_Base):
         return inflight
 
     def dm_file(self, tid):
-        return rgb.RESULTS_DIR / f"proactive-owner-mention-{tid}.txt"
+        return rgb.RESULTS_DIR / f"proactive-owner-mention-{tid}.to-ag2space.txt"
 
+
+class DeliveryRefusesTheRoom(_DeliveryHarness):
     def test_prose_result_goes_to_the_owner_dm_not_the_room(self):
         left = self.run_result("om-d1", "Alice asked about the deck in #shared: link", owner_mentioned="true")
         self.assertEqual(self.posts, [("om-d1", "[no-send]", True)], "room lease closes silently")
@@ -204,6 +206,57 @@ class DeliveryRefusesTheRoom(_Base):
         rgb._post_ready_results({"om-d6"})
         self.assertFalse(first.exists(), "an already-sent DM is not queued again")
         self.assertEqual(self.posts, [("om-d6", "[no-send]", True)])
+
+
+    def test_dm_file_is_destined_to_the_ag2space_bridge(self):
+        import re
+        from proactive_routing import proactive_destination
+        self.run_result("om-d7", "tell Chi", owner_mentioned="true")
+        name = self.dm_file("om-d7").name
+        self.assertTrue(self.dm_file("om-d7").exists())
+        # task-bridge.ts DESTINED_PROACTIVE_RE: the voice drain leaves this file alone.
+        self.assertRegex(name, re.compile(r"^proactive-.*\.to-[a-z0-9_-]+\.txt$"))
+        self.assertEqual(proactive_destination(name), "ag2space")
+
+    def test_team_tier_withheld_redirect_goes_to_the_dm_and_opens_no_room_review(self):
+        self.run_result("om-d8", "[channel: !other:ag2.space]\nAlice asked Chi about the deck",
+                        owner_mentioned="true")
+        self.assertEqual(self.posts, [("om-d8", "[no-send]", True)])
+        dm = self.dm_file("om-d8").read_text()
+        self.assertEqual(rgb._proactive_route(dm)[:2], ("send", OWNER_DM))
+        self.assertIn("Alice asked Chi about the deck", dm)
+        self.assertFalse((rgb._STATE / "withheld-team-results" / "om-d8.json").exists())
+        reviews = rgb._STATE / "withheld-team-results"
+        self.assertFalse(any("om-d8" in f.read_text() for f in reviews.glob("*.json")) if reviews.is_dir() else False,
+                         "no review record whose release target is the shared room")
+
+    def test_team_tier_no_send_still_takes_the_guarded_path(self):
+        self.run_result("om-d9", "[no-send]", owner_mentioned="true")
+        self.assertEqual(self.posts, [("om-d9", "[no-send]", True)])
+        self.assertFalse(self.dm_file("om-d9").exists())
+
+
+class OrphanSweepRefusesTheRoom(_DeliveryHarness):
+    def sweep(self, tid, body, **kw):
+        self.write(tid, **kw)
+        rfile = rgb.RESULTS_DIR / f"{tid}.txt"
+        rfile.write_text(body)
+        old = rfile.stat().st_mtime - 700
+        os.utime(rfile, (old, old))
+        with patch.object(rgb, "_last_orphan_sweep", 0.0):
+            rgb._reconcile_orphan_results(set())
+
+    def test_aged_owner_mention_result_is_not_recovered_into_the_room(self):
+        self.sweep("task-om-orphan1", "Alice asked about the deck in #shared: link",
+                   owner_mentioned="true", access_tier="owner", user_id="@chi:ag2.space")
+        self.assertEqual(self.posts, [("task-om-orphan1", "[no-send]", True)])
+        self.assertIn("Alice asked about the deck", self.dm_file("task-om-orphan1").read_text())
+
+    def test_aged_ordinary_result_is_still_recovered(self):
+        self.sweep("task-om-orphan2", "late answer")
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("late answer", self.posts[0][1])
+        self.assertFalse(self.posts[0][2])
 
 
 if __name__ == "__main__":
