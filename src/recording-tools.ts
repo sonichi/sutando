@@ -571,6 +571,8 @@ export const scrollAndDescribeTool: ToolDefinition = {
 
 			console.log(`${ts()} [ScrollAndDescribe] recording started with first desc`);
 			_spokenDescs = firstDesc ? [firstDesc] : [];
+			_lastNextAt = Date.now();
+			_narratingRecording = true;
 			// Start narration controller directly (don't rely on eventBus hook)
 			if (_narrationSession && !_modelDrives) {
 				setTimeout(() => {
@@ -615,12 +617,20 @@ function remainingScroll(): number | null {
 export const describeNextScreenTool: ToolDefinition = {
 	name: 'describe_next_screen',
 	description:
-		'During a narrated recording (record_screen_with_narration), scroll to the next part of the page and describe what is new. ' +
+		'Scroll to the next part of the page and describe what is new. Use it to walk through a page out loud — ' +
+		'"describe it while scrolling down", "go through this page to the end" — with no recording and no time limit, ' +
+		'and also during a narrated recording (record_screen_with_narration). ' +
 		'Call it while you are still speaking the previous description; speak the result as a continuation. Stop calling when it returns at_bottom or done.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
-		if (!isRecordingActive()) return { status: 'done', instruction: 'The recording has ended. Stop narrating.' };
+		if (_narratingRecording && !isRecordingActive()) {
+			_narratingRecording = false;
+			return { status: 'done', instruction: 'The recording has ended. Stop narrating.' };
+		}
+		const now = Date.now();
+		if (!_narratingRecording && now - _lastNextAt > WALK_GAP_MS) _spokenDescs = [];
+		_lastNextAt = now;
 		try {
 			scrollDown(700);
 			await new Promise(r => setTimeout(r, 500)); // let scroll settle
@@ -984,8 +994,14 @@ export function modelDrivesNarration(model: string): boolean {
 }
 let _modelDrives = false;
 export function setModelDrivesNarration(on: boolean): void { _modelDrives = on; }
-/** What the model has already said in this recording, so each next screen is narrated as new. */
+/** What the model has already said in this walk-through, so each next screen is narrated as new. */
 let _spokenDescs: string[] = [];
+/** Set while a narrated recording is being walked through, so its end also ends the narration. */
+let _narratingRecording = false;
+export function setNarratingRecording(on: boolean): void { _narratingRecording = on; }
+/** A call this long after the previous one starts a new walk-through with nothing said yet. */
+const WALK_GAP_MS = 60_000;
+let _lastNextAt = 0;
 
 /** Exposed for voice-agent to call when speech finishes and pre-capture is ready */
 export let _tryInjectNow: (() => void) | null = null;

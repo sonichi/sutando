@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { describeNextScreenTool, modelDrivesNarration } from '../src/recording-tools.js';
+import { describeNextScreenTool, modelDrivesNarration, setNarratingRecording } from '../src/recording-tools.js';
 
 test('only 3.8 models drive the narration themselves', () => {
 	assert.equal(modelDrivesNarration('gemini-3.8-live'), true);
@@ -16,7 +16,13 @@ test('only 3.8 models drive the narration themselves', () => {
 	assert.equal(modelDrivesNarration(''), false);
 });
 
-test('describe_next_screen outside a recording says done and touches nothing', async () => {
+test('once the recording it was narrating has ended, describe_next_screen says done and touches nothing', async () => {
+	setNarratingRecording(true);
 	const result = await describeNextScreenTool.execute({}, {} as never) as Record<string, unknown>;
 	assert.equal(result.status, 'done');
+});
+
+test('describe_next_screen is offered for walking a page through without recording', () => {
+	assert.match(describeNextScreenTool.description, /no recording and no time limit/);
+	assert.doesNotMatch(describeNextScreenTool.description, /^During a narrated recording/);
 });
