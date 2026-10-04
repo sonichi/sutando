@@ -20,8 +20,8 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-   "last_verified": "2026-09-10"
+   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, AG2 Space owner-mention tasks, ambient taskify provenance",
+   "last_verified": "2026-10-03"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",

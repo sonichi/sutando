@@ -110,6 +110,14 @@ fi
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
+# An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
+# when the inbox is the core's own <workspace>/tasks BY REALPATH -- never by basename alone.
+CANONICAL_CORE_TASKS_DIR="$(canonical_tasks_dir "$WORKSPACE_DIR/tasks")"
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TASKS_DIR" ]; then
+  echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
+  unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
+fi
+
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
@@ -205,8 +213,7 @@ case "$__holders" in
         # An unready live holder is stamped by nobody else; only THIS SEAT's own
         # sentinel may be written, so the inbox must be this identity's own.
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
-           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
-                \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$(basename "$TASKS_DIR_ABS")" = "tasks" \) ] \
+           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o -z "${SUTANDO_INSTANCE_ID:-}" ] \
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
            && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"

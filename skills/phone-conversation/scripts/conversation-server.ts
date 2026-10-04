@@ -223,7 +223,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|channel_kind|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|task_layout)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;

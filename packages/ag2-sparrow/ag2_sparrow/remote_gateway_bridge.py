@@ -50,6 +50,7 @@ Stdlib only (urllib) — no new dependencies.
 from __future__ import annotations
 
 import atexit
+import glob
 import base64
 import hashlib
 import json
@@ -296,9 +297,12 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from .proactive_routing import proactive_filename
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             owner_mention_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -1741,6 +1745,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Declares the task-mid shape (one-line body, writer-owned trailer) so a
                 # verified reader may trust the lines below task:. Above it: a body cannot claim it.
                 "task_layout",
+                # The broker's word that the message mentioned the owner, not this agent.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "owner_mentioned",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -3385,6 +3392,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f == "task_layout":
             lines.append("task_layout: mid")
+        elif f == "owner_mentioned":
+            if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
+                lines.append("owner_mentioned: true")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.
@@ -3444,6 +3454,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
+    # Last, after every tier block: it keeps their limits and replaces their reply step.
+    if task.get("owner_mentioned") == "true":
+        lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
@@ -4443,6 +4456,61 @@ def _result_tier(tid: str) -> "str | None":
         return None
 
 
+def _owner_mention_refused(tid: str, body: str) -> "bool | None":
+    """Whether the room must not get this result (team_result_guard owns the rule).
+    None = the task file exists but could not be read; the caller retries."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    try:
+        text = tfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return team_result_guard.owner_mention_result_refused_by_room(text, body)
+
+
+def _owner_mention_dm_name(tid: str) -> str:
+    return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
+
+
+def _owner_mention_dm_queued(tid: str) -> bool:
+    """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
+    stem = glob.escape(_owner_mention_dm_name(tid))
+    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
+            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+            or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
+            or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
+
+
+def _queue_owner_mention_dm(tid: str, text: str) -> bool:
+    """Hand an owner-mention result to the proactive leg, addressed to the owner's DM.
+    False = not queued (no owner DM reading yet, or the write failed); retried next pass."""
+    if not text.strip() or _owner_mention_dm_queued(tid):
+        return True
+    room = resolve_destination(OWNER_PRIVATE)
+    if not room:
+        _held(f"owner-mention result {tid}")
+        return False
+    # Addressed to a Matrix room, so every other bridge's drain leaves this file alone.
+    body = f"[channel: {room}]\n{neutralize_markers(text).strip()}\n"
+    return _durable_write(RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt", body)
+
+
+def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
+    """Every result consumer asks this first, before the tier guard.
+
+    True = an owner-mention result the room must not get: its DM is queued and the
+    caller closes the room lease silently. False = deliver as usual. None = retry.
+    """
+    refused = _owner_mention_refused(tid, raw)
+    if not refused:
+        return refused
+    if not _queue_owner_mention_dm(tid, parse_markers(raw).body):
+        return None
+    _log(f"owner mention {tid}: result sent to the owner's DM, not the room")
+    return True
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -4454,9 +4522,13 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
+        # Before the tier guard: a withheld review would name the shared room as its release target.
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # The guard honours suppression on every tier now, so there is no stub
         # to pre-apply; the ordinary guarded path returns the body unchanged.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -4484,8 +4556,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     # The report IS the delivery: archiving before confirm
                     # would strand the ask exactly as the unreported dedup did.
+                    mention = _owner_mention_disposition(tid, payload)
+                    if mention is None:
+                        continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                                  payload):
+                                                  "[no-send]" if mention else payload,
+                                                  no_send=bool(mention)):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -4769,9 +4845,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # Recovery is still a delivery: the ordinary path's guard runs BEFORE
         # any marker is interpreted, so tier + suppression cannot be skipped.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
             continue

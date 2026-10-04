@@ -194,6 +194,9 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # Broker attestation that the message @-mentioned the owner, not this agent;
+    # the core reads it to keep out of the room, so the guard defangs a forged copy.
+    "owner_mentioned",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
