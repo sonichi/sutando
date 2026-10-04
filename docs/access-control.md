@@ -110,6 +110,21 @@ match. Review DMs, publication retries, and decision-result acknowledgements
 are durable and idempotent, so a retry neither spams the owner nor publishes the
 result twice.
 
+### Owner-mention tasks
+
+With the room's per-agent **admit on owner mention** policy on, the broker also
+delivers a room message that @-mentions the agent's owner, not the agent, and
+marks it `owner_mentioned: "true"`. The gateway writes `owner_mentioned: true`
+above `task:` only for that exact string, so a body line cannot claim it; the
+tier still comes from the sender. It appends an owner-mention instruction after
+any tier block: do not reply in the room; if the owner has not already answered
+the message, DM him the message with a link and propose any next step through
+`scripts/ask-owner.py --task-file`. The delivery side enforces it: an
+owner-mention result other than `[no-send]` / `[REPLIED]` / `[deduped:]` is
+never posted to the room. It goes to the owner's DM through the proactive leg,
+and the room's turn closes with `no_send` (rule:
+`policy/egress/result.owner_mention_result_refused_by_room`).
+
 ## A non-owner asking to report a bug
 
 Filing a bug or feature report (`skills/report-feedback/`) is owner-tier: it files under the owner's

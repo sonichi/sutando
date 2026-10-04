@@ -50,6 +50,7 @@ Stdlib only (urllib) — no new dependencies.
 from __future__ import annotations
 
 import atexit
+import glob
 import base64
 import hashlib
 import json
@@ -295,10 +296,11 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
-from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import neutralize_markers, parse_markers, render_skill_prelude
 from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             owner_mention_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -1741,6 +1743,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Declares the task-mid shape (one-line body, writer-owned trailer) so a
                 # verified reader may trust the lines below task:. Above it: a body cannot claim it.
                 "task_layout",
+                # The broker's word that the message mentioned the owner, not this agent.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "owner_mentioned",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -3385,6 +3390,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f == "task_layout":
             lines.append("task_layout: mid")
+        elif f == "owner_mentioned":
+            if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
+                lines.append("owner_mentioned: true")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.
@@ -3444,6 +3452,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
+    # Last, after every tier block: it keeps their limits and replaces their reply step.
+    if task.get("owner_mentioned") == "true":
+        lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
@@ -4443,6 +4454,46 @@ def _result_tier(tid: str) -> "str | None":
         return None
 
 
+def _owner_mention_refused(tid: str, body: str) -> "bool | None":
+    """Whether the room must not get this result (team_result_guard owns the rule).
+    None = the task file exists but could not be read; the caller retries."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    try:
+        text = tfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return team_result_guard.owner_mention_result_refused_by_room(text, body)
+
+
+def _owner_mention_dm_name(tid: str) -> str:
+    return f"proactive-owner-mention-{tid}"
+
+
+def _owner_mention_dm_queued(tid: str) -> bool:
+    """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
+    stem = glob.escape(_owner_mention_dm_name(tid))
+    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
+            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+            or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
+            or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
+
+
+def _queue_owner_mention_dm(tid: str, text: str) -> bool:
+    """Hand an owner-mention result to the proactive leg, addressed to the owner's DM.
+    False = not queued (no owner DM reading yet, or the write failed); retried next pass."""
+    if not text.strip() or _owner_mention_dm_queued(tid):
+        return True
+    room = resolve_destination(OWNER_PRIVATE)
+    if not room:
+        _held(f"owner-mention result {tid}")
+        return False
+    # Addressed to a Matrix room, so every other bridge's drain leaves this file alone.
+    body = f"[channel: {room}]\n{neutralize_markers(text).strip()}\n"
+    return _durable_write(RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt", body)
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -4505,7 +4556,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                     inflight.add(payload)
                 changed = True
                 continue
-        if skip:
+        refused = False if skip else _owner_mention_refused(tid, body)
+        if refused is None:
+            continue  # task file unreadable this pass: never guess the room is allowed
+        if refused and not _queue_owner_mention_dm(tid, parsed.body):
+            continue
+        if skip or refused:
             # Skip markers still POST: only add_result closes the server lease;
             # the server suppresses their user-facing delivery.
             _delivery = _delivery_tid(tid)
@@ -4513,7 +4569,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"delivery deferred for {tid} — alias ledger unreadable")
                 continue
             if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                           _lease_close_body(skip),
+                                           _lease_close_body(skip) if skip else "[no-send]",
                                            no_send=True):
                 continue
             _archive_result(rfile, tid)
@@ -4524,7 +4580,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             _forget_task_room(tid)
             _forget_task_media(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
+            _why = f"marker {skip.value}" if skip else "owner mention, sent to the owner's DM"
+            _log(f"archived {tid} ({_why}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
