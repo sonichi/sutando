@@ -1105,6 +1105,12 @@ async function main() {
 		},
 	});
 
+	// Before the session builds its tool declarations: on 3.8 the narration walk-through is
+	// declared non-blocking, so the model fetches the next screen while it speaks.
+	{
+		const { setModelDrivesNarration, modelDrivesNarration } = await import('./recording-tools.js');
+		setModelDrivesNarration(modelDrivesNarration(VOICE_NATIVE_AUDIO_MODEL));
+	}
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -1537,9 +1543,8 @@ async function main() {
 
 	// Wire recording hooks — enables description push during record_screen_with_narration
 	try {
-		const { setupRecordingHooks, setModelDrivesNarration, modelDrivesNarration } = await import('./recording-tools.js');
+		const { setupRecordingHooks } = await import('./recording-tools.js');
 		setupRecordingHooks(session);
-		setModelDrivesNarration(modelDrivesNarration(VOICE_NATIVE_AUDIO_MODEL));
 		console.log(`${ts()} [RecordingHooks] wired into voice agent`);
 	} catch (e) {
 		console.log(`${ts()} [RecordingHooks] not available: ${e instanceof Error ? e.message : e}`);

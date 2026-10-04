@@ -646,7 +646,9 @@ export const describeNextScreenTool: ToolDefinition = {
 			return { status: 'ok', description, at_bottom: atBottom,
 				instruction: atBottom
 					? 'This is the end of the page. Speak this description, then stop.'
-					: 'Not at the end yet. First speak this description out loud as a continuation. Only after you have finished speaking it, call describe_next_screen again.' };
+					: _modelDrives
+						? 'Not at the end yet. Speak this description out loud now as a continuation, and as you start speaking it, call describe_next_screen again; its result waits until you finish this sentence.'
+						: 'Not at the end yet. First speak this description out loud as a continuation. Only after you have finished speaking it, call describe_next_screen again.' };
 		} catch (err) {
 			return { error: `describe_next_screen failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -998,7 +1000,15 @@ export function modelDrivesNarration(model: string): boolean {
 	return /^gemini-3\.8/.test(String(model ?? ''));
 }
 let _modelDrives = false;
-export function setModelDrivesNarration(on: boolean): void { _modelDrives = on; }
+export function setModelDrivesNarration(on: boolean): void {
+	_modelDrives = on;
+	// On 3.8 the walk-through runs while the model speaks: the call does not block it, and its
+	// result waits until the current sentence ends (WHEN_IDLE, sent by bodhi only for a
+	// NON_BLOCKING tool). Blocking models keep the plain declaration they always had.
+	const tool = describeNextScreenTool as ToolDefinition & { behavior?: 'BLOCKING' | 'NON_BLOCKING' };
+	if (on) { tool.behavior = 'NON_BLOCKING'; tool.scheduling = 'when_idle'; }
+	else { delete tool.behavior; delete tool.scheduling; }
+}
 /** What the model has already said in this walk-through, so each next screen is narrated as new. */
 let _spokenDescs: string[] = [];
 /** Set while a narrated recording is being walked through, so its end also ends the narration. */

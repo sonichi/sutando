@@ -26,3 +26,14 @@ test('describe_next_screen is offered for walking a page through without recordi
 	assert.match(describeNextScreenTool.description, /no recording and no time limit/);
 	assert.doesNotMatch(describeNextScreenTool.description, /^During a narrated recording/);
 });
+
+test('on 3.8 the walk-through is declared non-blocking with a when_idle result; otherwise plain', async () => {
+	const { setModelDrivesNarration } = await import('../src/recording-tools.js');
+	const tool = describeNextScreenTool as typeof describeNextScreenTool & { behavior?: string };
+	setModelDrivesNarration(true);
+	assert.equal(tool.behavior, 'NON_BLOCKING');
+	assert.equal(tool.scheduling, 'when_idle');
+	setModelDrivesNarration(false);
+	assert.equal(tool.behavior, undefined);
+	assert.equal(tool.scheduling, undefined);
+});
