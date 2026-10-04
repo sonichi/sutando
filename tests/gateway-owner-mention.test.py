@@ -22,7 +22,11 @@ TMP = Path(tempfile.mkdtemp(prefix="gw-owner-mention-"))
 for p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
     if p not in sys.path:
         sys.path.insert(0, p)
-os.environ["SUTANDO_TEST_WORKSPACE"] = str(TMP)
+# Never the live gateway or telemetry: a shell that runs Sutando exports the real relay token.
+os.environ.update(REMOTE_TASK_TOKEN="test-token-0123456789abcdef", REMOTE_TASK_URL="https://gw.invalid/relay",
+                  DO_NOT_TRACK="1", SUTANDO_TELEMETRY="0", SUTANDO_STATE_DIR=str(TMP / "state"))
+for _k in ("REMOTE_TASK_TOKEN_FILE", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL", "AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR"):
+    os.environ.pop(_k, None)
 from ag2_sparrow._dirs import set_dirs
 
 set_dirs(task_dir=TMP / "tasks", result_dir=TMP / "results", state_dir=TMP / "state")
@@ -49,11 +53,20 @@ class _Base(unittest.TestCase):
     def setUp(self):
         for d in (rgb.TASKS_DIR, rgb.RESULTS_DIR):
             d.mkdir(parents=True, exist_ok=True)
+        self.network = []
         self._p = [patch.object(rgb, "LOCAL_TIER", "owner"),
-                   patch.object(rgb, "_load_tier_map", lambda: {})]
+                   patch.object(rgb, "_load_tier_map", lambda: {}),
+                   patch.object(rgb, "_fleet_agent_ids", lambda: set()),
+                   patch.object(rgb, "URL", "https://gw.invalid/relay"),
+                   patch.object(rgb, "_req", side_effect=self._no_network)]
         for p in self._p:
             p.start()
             self.addCleanup(p.stop)
+        self.addCleanup(lambda: self.assertEqual(self.network, [], "a test reached the gateway"))
+
+    def _no_network(self, method, path, payload=None, timeout=35):
+        self.network.append((method, path))
+        raise OSError("tests never reach the gateway")
 
     def write(self, tid, **kw):
         written = rgb._write_task(_task(tid, **kw))
