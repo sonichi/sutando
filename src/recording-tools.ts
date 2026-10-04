@@ -466,6 +466,20 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		if (!isMacOS()) return macOSOnlyError('scroll_and_describe');
+		// Only her words start a recording. When they cannot be read (no voice session, the
+		// phone path), nothing is blocked: the tool behaves as it always did.
+		// Imported here, not at the top: task-bridge resolves its workspace when first loaded.
+		const { _awaitSpokenTurns } = await import('./task-bridge.js');
+		const said = await _awaitSpokenTurns();
+		if (said.length > 0 && !asksToRecord(said)) {
+			console.log(`${ts()} [ScrollAndDescribe] refused: she did not ask to record (${JSON.stringify(said.join(' ').slice(0, 120))})`);
+			return {
+				status: 'not_recording',
+				instruction: 'She did not ask for a recording, so nothing was recorded. Do not call this tool again for this request. '
+					+ 'To describe the page while scrolling: call scroll to move down, describe what you now see on screen, '
+					+ 'and repeat until the end of the page.',
+			};
+		}
 		const MAX_DURATION = 60;
 		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
 		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
@@ -597,6 +611,13 @@ export const scrollAndDescribeTool: ToolDefinition = {
 // for QT present mode) is not recording-specific. Recording-flavored side effects
 // (playback-path write, demoStateRef reset) now live where they belong: in
 // `screenRecordTool` stop handler and `playVideoTool`/`startPlayback`.
+
+/** Whether her own words this turn ask for a recording. The model picked this tool for "describe
+ *  the screen while scrolling down" (2026-10-04 15:43) and started a 40 s recording she never
+ *  asked for; the tool description alone did not stop it. */
+export function asksToRecord(words: readonly string[]): boolean {
+	return words.some((w) => /\b(record|recording|recorded|video|demo|screencast)\b|录|视频/i.test(w));
+}
 
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
