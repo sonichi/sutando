@@ -66,6 +66,65 @@ The Codex implementation:
   to update when Codex is selected;
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## Externally managed monitor and heartbeat
+
+An embedder that owns both helpers can opt out of the launcher's helper lifecycle:
+
+```bash
+bash src/agent/start-cli.sh --runtime codex --external-helpers "$RECEIPTS"
+```
+
+`$RECEIPTS` must be an existing owner-private directory below the resolved
+workspace's `state/`. Start the real helpers from the selected checkout with
+absolute script paths, the same resolved workspace and the selected
+`SUTANDO_TMUX_SOCKET` / `SUTANDO_TMUX_SESSION`:
+
+```bash
+python3 "$REPO/src/core-input-watch.py" --socket "$SUTANDO_TMUX_SOCKET" \
+  --session "$SUTANDO_TMUX_SESSION" --out "$WORKSPACE/state/core-supervisor.json" \
+  --no-auto-answer --no-chat-escalation --helper-receipt-dir "$RECEIPTS"
+python3 "$REPO/src/core_heartbeat.py" --helper-receipt-dir "$RECEIPTS"
+```
+
+The embedder starts these as its own processes with private log destinations.
+Each helper atomically writes its own `monitor.json` or `heartbeat.json` receipt
+(mode 0600), naming its actual PID/start identity and resolved configuration.
+One-shot or active-monitor modes refuse receipt publication. The launcher checks
+receipt ownership, live kernel argv/start identity, checkout, workspace, socket,
+session and passive policy before changing the core and again after startup.
+The initial process identities are pinned across these checks; a different valid
+helper cannot silently replace one during launch.
+Missing, stale, unreadable or mismatched helpers fail the launch; there is no
+helper spawn, replacement, log redirect or heartbeat stop in this mode, including
+`--restart`. Other runtimes reject this option. Without it, behavior is unchanged.
+
+Receipts are startup identity evidence, not core readiness or a security boundary
+against the same OS user. The embedder must independently observe actual core
+readiness and keep supervising both helper processes. A post-start failure can
+leave the new core running; its owner must stop it. This option does not disable
+schedulers, earned-reset timers, authentication checks or the task notifier, and
+does not isolate the Codex application home. It must not be treated as a general
+sandbox or as permission to fabricate helper state.
+
+### Leave schedule provisioning to the caller
+
+An embedder can independently pass `--no-schedule-reconcile` to skip startup's
+durable-cron reconciliation, Codex scheduler installation and earned-reset timer
+installation for that invocation:
+
+```bash
+bash src/agent/start-cli.sh --runtime codex --external-helpers "$RECEIPTS" \
+  --no-schedule-reconcile
+```
+
+This does not stop, disable or rewrite existing jobs, change their configuration,
+or suppress tasks they already deliver. The caller owns schedule provisioning;
+pending schedules are not installed by this launch. Without the flag, all three
+startup reconciliation paths run as before. The flag is Codex-only, takes no value
+and is not persisted: pass it again on each invocation, including `--restart`.
+Authentication, helper checks, the notifier and core startup remain active.
+The flag does not isolate the Codex home or change helper ownership by itself.
+
 ## Automatic earned resets
 
 On macOS, launching a Codex core or Codex worker installs a five-minute

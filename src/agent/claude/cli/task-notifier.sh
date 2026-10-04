@@ -26,6 +26,8 @@ CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Durable at-most-once record of a submitted prompt, per core incarnation.
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
+# Same marker shape: which core incarnation this notifier left a cut-short paste in.
+PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -137,11 +139,11 @@ clear_composer_block() {
 }
 
 alert_composer_block() {
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer to resume (Enter would submit it as it is)"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" &
+    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
@@ -367,11 +369,39 @@ if cur:
 print(" ".join(map(str, out)))' "$PASTE_CHUNK"
 }
 
+# The ONE test admitting a non-empty composer: exactly the prompt's first chunks (maybe all),
+# AND this notifier recorded a cut-short paste of $1 into this incarnation. Prints the offset.
+composer_resume_offset() {
+  local filename="$1" prompt="$2" incarnation="$3" raw="$4" c i=0 n prefix
+  c="$(composer_text "$raw" | squeeze)"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$PARTIAL_DIR" "$filename" "$incarnation" || return 1
+  for n in $(chunk_lengths "$prompt"); do
+    i=$((i + n))
+    prefix="$(LC_ALL=C; printf '%s' "${prompt:0:$i}")"
+    if [ "$(printf '%s' "$prefix" | squeeze)" = "$c" ]; then printf '%s' "$i"; return 0; fi
+  done
+  return 1
+}
+
+note_partial_paste() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$PARTIAL_DIR" "$1" "$2" \
+    || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
+}
+
+clear_partial_paste() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
+}
+
 # Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
 # EXACTLY before the next; the first chunk that does not read back ends it, and that is final.
+# $3 = byte offset already in the composer (a chunk boundary): typing resumes there.
 type_prompt() {
-  local prompt="$1" filename="$2" i=0 n typed="" chunk arg cap LC_ALL=C
+  local prompt="$1" filename="$2" start="${3:-0}" i=0 n typed="" chunk arg cap LC_ALL=C
+  typed="${prompt:0:$start}"
   for n in $(chunk_lengths "$prompt"); do
+    if [ "$i" -lt "$start" ]; then i=$((i + n)); continue; fi
     chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
     # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
     arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
@@ -425,7 +455,7 @@ deliver_prompt() {
 }
 
 deliver_prompt_grown() {
-  local filename="$1" prompt="$2" type_tries=0 staged=0
+  local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
   local baseline_esc baseline_raw staged_raw="" incarnation=""
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
@@ -453,21 +483,27 @@ deliver_prompt_grown() {
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
       return 1
     fi
+    resume=0
     if ! pane_text_composer_is_empty "$baseline_esc"; then
-      warn_if_capture_truncated "$baseline_raw" "$filename"
-      log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
-      composer_is_cut_prompt "$baseline_raw" "$prompt" \
-        && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
-      note_composer_block "$filename" "$incarnation"
-      return 1
+      if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
+        log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
+      else
+        warn_if_capture_truncated "$baseline_raw" "$filename"
+        log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+        composer_is_cut_prompt "$baseline_raw" "$prompt" \
+          && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
+        note_composer_block "$filename" "$incarnation"
+        return 1
+      fi
     fi
     clear_composer_block
-    if type_prompt "$prompt" "$filename"; then
+    if type_prompt "$prompt" "$filename" "$resume"; then
       staged_raw="$(capture_raw)"
-      if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+      if prompt_is_staged "$staged_raw" "$prompt"; then clear_partial_paste "$filename"; staged=1; break; fi
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
+      note_partial_paste "$filename" "$incarnation"
     fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break

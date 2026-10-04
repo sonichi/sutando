@@ -46,6 +46,29 @@ class Normalization(unittest.TestCase):
         # No blanket digit stripping (owner review): a bare number is content until a trace says otherwise.
         self.assertIn("run 42", n)
 
+    def test_a_compound_duration_is_one_field(self):
+        self.assertEqual(w.normalize("(12s · esc to interrupt)"), w.normalize("(1h 3m 12s · esc to interrupt)"))
+        self.assertEqual(w.normalize("took 3.5s"), "took <dur>")
+
+    def test_spelled_out_durations_are_one_field(self):
+        self.assertEqual(w.normalize("Retrying in 5 seconds"), w.normalize("Retrying in 4 seconds"))
+        self.assertEqual(w.normalize("waited 2 minutes 1 second"), "waited <dur>")
+
+    def test_the_spinner_lines_cycling_glyph_is_not_a_new_state(self):
+        frames = [f"{g} Hatching… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+        self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+        self.assertNotEqual(w.state_id("✻ Hatching… (9s)"), w.state_id("✻ Cooking… (9s)"))
+
+    def test_a_hyphenated_spinner_verb_cycles_its_glyph_without_a_new_state(self):
+        for verb in ("Dilly-dallying", "Re-ticulating", "Topsy-turvying"):
+            with self.subTest(verb=verb):
+                frames = [f"{g} {verb}… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+                self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+
+    def test_a_markdown_bullet_is_content_not_a_spinner(self):
+        self.assertNotEqual(w.state_id("* Fix the parser\n"), w.state_id("· Fix the parser\n"))
+        self.assertIn("* Fix the parser", w.normalize("* Fix the parser"))
+
     def test_semantic_digits_are_progress_not_noise(self):
         self.assertNotEqual(w.state_id("editing migration_41.sql\n"), w.state_id("editing migration_42.sql\n"))
         self.assertNotEqual(w.state_id("processing shard 17\n"), w.state_id("processing shard 18\n"))

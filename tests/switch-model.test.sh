@@ -9,6 +9,8 @@ cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
+# The core has one window, index 0: what the shared core-target lookup asks first.
+case " $* " in *" list-windows "*) echo 0; exit 0;; esac
 # One failed capture, then normal: the first capture-pane call exits 1.
 case " $* " in *" capture-pane "*) n=$(( $(cat "$TMUX_LOG.caps" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMUX_LOG.caps"; [ "${TMUX_FAIL_CAPTURE_N:-0}" = "$n" ] && exit 1;; esac
 case " $* " in *" capture-pane "*)

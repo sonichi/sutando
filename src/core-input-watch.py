@@ -67,6 +67,7 @@ import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
+import cli_wedge  # noqa: E402
 
 import argparse
 import hashlib
@@ -318,7 +319,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -328,6 +329,7 @@ def compose_state(pane, base_health, gateway_alive, process=True):
 
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
+    `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -369,12 +371,21 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         # frozen) still reads hung, preserving genuine wedge detection.
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
+        if pane and _turn_moving(pane, prev_pane):
+            return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
+
+
+def _turn_moving(pane, prev_pane):
+    """A turn in flight whose pane changed since the last poll. Clocks and spinners are
+    normalised away, so a frozen CLI whose timer still ticks is not motion."""
+    return (prev_pane is not None and cli_wedge.frame_working(pane)
+            and cli_wedge.state_id(pane) != cli_wedge.state_id(prev_pane))
 
 
 # ---- Bundled-context probes (NOT part of runtime-health's coarse health). --- #
@@ -473,18 +484,17 @@ def gateway_alive(app_data, state_dir=None):
 
 
 def capture(socket, session):
-    try:
-        out = subprocess.run(["tmux", "-S", socket, "capture-pane", "-p", "-t", f"{session}:0"],
-                             capture_output=True, text=True, timeout=8)
-        return out.stdout if out.returncode == 0 else None
-    except Exception:
-        return None
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target) if target else None
 
 
 def send_keys(socket, session, key):
     """Type one key into the core pane. True only when tmux accepted it."""
+    target = cli_wedge.core_target(socket, session)
+    if not target:
+        return False
     try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
+        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", target, key],
                            capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:
@@ -720,7 +730,14 @@ def main():
                     help="write the supervisor state but never raise a card for a block")
     ap.add_argument("--seat", default="",
                     help="who this pane is, named on every card it raises (default: none)")
+    ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     a = ap.parse_args()
+    if a.helper_receipt_dir:
+        from external_core_helpers import publish
+        from workspace_default import resolve_workspace
+        publish(a.helper_receipt_dir, "monitor", __file__, resolve_workspace(),
+                a.socket, a.session, passive=not (a.once or a.auto_answer or a.chat_escalation),
+                output=a.out)
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
     # else a detached spawn without Homebrew on PATH reads a healthy core as crashed.
@@ -740,13 +757,15 @@ def main():
     answered_prompt = None
     last_answered = None
     idle_ticks = 0
+    prev_pane = None
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True))
+            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
+        prev_pane = pane
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).

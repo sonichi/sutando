@@ -62,10 +62,12 @@ caps this file and refuses date stamps in it).
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
-   when voice is connected, plus a macOS notification.
+2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
+   (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
+   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
+   only when he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
-   record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
+   record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
@@ -107,11 +109,11 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
    (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
-8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
-   placed by importance (only the top 5 render anywhere), and assert with the reader:
-   `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
-   position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
-   Then pivot; never block.
+8. **Ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]`
+   — never hand-edit. It records the row in the owner's Pending questions database (the outbox holds it
+   while the room is unreachable), queues the question to the owner (an owner-DM task's conversation,
+   else his DM) and fires the macOS notification. Read its output: a `FAILED` line is not an ask;
+   confirm the id with `pending_questions_reader.py list --json`. Then pivot; never block.
 9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
    "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
@@ -130,7 +132,7 @@ caps this file and refuses date stamps in it).
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
 10. **Discord.** Check the channels in `reference_discord_channels.md`; forward actionable public items to
     the dev channel. #bot2bot tags: `claim:` `blocked:` `done:` `ping:` `nack:` `opinion-requested:`.
-    First PR opened wins a claim. Bots never merge. Three unresolved round-trips → both positions to
-    `pending-questions.md`, proceed with the cheaper-to-reverse option.
+    First PR opened wins a claim. Bots never merge. Three unresolved round-trips → both positions in one
+    `ask-owner.py` ask, proceed with the cheaper-to-reverse option.
 11. **Heartbeat.** Substantive pass + #bot2bot configured + other bot active → `done: <one line>` via the
     `bot2bot-post` skill. Never fall back to `results/proactive-*.txt`. Never write `contextual-chips.json`.

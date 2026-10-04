@@ -116,11 +116,21 @@ mark_worker_stage() {
   return 0
 }
 
+# The core window as an exact target: its lowest index, whatever base-index says. Empty
+# (non-zero) when the session is absent, so no caller types into a prefix-matched sibling.
+core_target() {
+  local idx
+  idx="$(tmux -S "$TMUX_SOCKET" list-windows -t "=$SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
+  [ -n "$idx" ] || return 1
+  printf '=%s:%s' "$SESSION" "$idx"
+}
+
 # What the pane text MEANS (idle footer, gate signatures, working marker, the
 # empty-composer placeholder) is src/delivery/pane_gate.py's; only the capture is ours.
 pane_state() {
-  local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  local pane target
+  target="$(core_target)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
   # A blank capture is NO information, which is not the same as a pane we read and
   # could not account for; fail here so callers see "" and keep the two apart.
   [ -n "${pane//[[:space:]]/}" ] || return 1
@@ -182,8 +192,9 @@ log_notifier() {
 # pane parser for the current draft: a long task prompt wraps beyond the last
 # eight pane lines, and Codex versions use either › or » as the composer glyph.
 prompt_is_staged() {
-  local pane pending
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  local pane pending target
+  target="$(core_target)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
   pending="$(printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" pending --runtime codex 2>/dev/null)" || return 1
   case "$pending" in
     "Sutando task ready: $1."*) return 0 ;;
@@ -204,11 +215,12 @@ composer_ready() {
 wait_for_composer() {
   # Deadline in SECONDS (a fresh Mac needed ~15s), polled at the caller's
   # cadence — a fast-tuned harness must not be held to human-scale sleeps.
-  local waited=0 pane deadline
+  local waited=0 pane deadline target
   deadline=$(( $(date +%s) + COMPOSER_READY_TIMEOUT ))
   # An empty capture means this pane tells us nothing (no TUI, or unreadable):
   # waiting cannot become true, so skip straight to the send.
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 1
+  target="$(core_target)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$target" 2>/dev/null)" || return 1
   [ -n "$pane" ] || return 1
   while [ "$(date +%s)" -lt "$deadline" ]; do
     composer_ready && { [ "$waited" -gt 0 ] && log_notifier "composer ready after ${waited} polls"; return 0; }
@@ -225,7 +237,7 @@ wait_for_composer() {
 # the second half, so a swallowed paste read as instant success and the
 # notifier slept out its completion timeout on a task Codex never received.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state stage_checks
+  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state stage_checks target
   # Verification is ADVISORY only when the pane hands us NO information at all --
   # a harness or Codex build we cannot read, where wait_for_composer's own poll
   # never had anything to key on (pane_state fails outright: capture-pane errored).
@@ -245,7 +257,8 @@ deliver_prompt() {
     fi
   fi
   while :; do
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
+    target="$(core_target)" || { log_notifier "refusing to type $filename: no core window"; return 1; }
+    tmux -S "$TMUX_SOCKET" send-keys -t "$target" -l -- "$prompt"
     stage_checks=0
     while [ "$stage_checks" -lt 4 ]; do
       sleep "$POLL_INTERVAL"
@@ -260,7 +273,7 @@ deliver_prompt() {
   done
   [ "$staged" = 1 ] && [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+  target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
   # Nothing observable staged: the submit is sent and unverifiable — never
   # re-press C-m blind into a live session.
   [ "$staged" = 1 ] || return 0
@@ -280,7 +293,7 @@ deliver_prompt() {
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+    target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
   done
 }
 

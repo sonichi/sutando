@@ -94,11 +94,15 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
 _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?"), "<ts>"),
     (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp][Mm])?\b"), "<clock>"),
-    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?)\b"), "<dur>"),
+    # A compound duration ("3m 12s") is one field, so 12s and 3m 12s compare equal.
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)"
+                r"(?:\s+\d+(?:\.\d+)?\s*(?:ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h))*\b"), "<dur>"),
     (re.compile(r"\b\d+(?:\.\d+)?[kKmM]?\s*tokens?\b"), "<tokens>"),
     (re.compile(r"\b\d+\s*/\s*\d+\b"), "<count>"),
     (re.compile(r"\b\d+(?:\.\d+)?%"), "<pct>"),
     (re.compile(r"\b(attempt|retry|retries|try|line|col|iteration|round|turn)\s+#?\d+\b", re.IGNORECASE), r"\1 #"),
+    # The CLI cycles its spinner line's leading glyph within one turn ("✢ Hatching…" → "✻ Hatching…").
+    (re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗·*]\s+(?=[A-Z][A-Za-z-]+(?:…|\.\.\.))"), r"\1<spin> "),
     (re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒◴◷◶◵]"), "<spin>"),
     (re.compile(r"(?:\.\s?){2,}|…+"), "<dots>"),
     (re.compile(r"[─━═]{2,}"), "<rule>"),

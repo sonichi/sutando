@@ -2,7 +2,7 @@
 
 One read-only answer to "how is each agent doing?" for the core and every worker. Code:
 `src/health_snapshot.py`; served by agent-api (`src/agent-api.py`, port 7843); tests:
-`tests/health-snapshot.test.py`.
+`tests/health-snapshot.test.py`, `tests/gateway-health-push.test.py`.
 
 It reads files the existing watchers already write. It probes no process or pane and writes
 nothing, so calling it often is safe and it answers even when the core is down.
@@ -33,11 +33,14 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 ```json
 {
   "checked_at": 1790566151.7,
+  "instance": "@mark-desktop.agent:ag2.space",
   "overall": "ok",
+  "suspended": null,
   "agents": [
-    {"id": "core", "role": "core", "label": null, "alive": true,
+    {"id": "core", "role": "core", "label": null, "session": "sutando-core", "alive": true,
      "motion": "idle", "condition": "healthy", "reason": null, "since": null},
-    {"id": "40659240fd884f63bcd19fa684b451f1", "role": "worker", "label": null, "alive": true,
+    {"id": "40659240fd884f63bcd19fa684b451f1", "role": "worker", "label": null,
+     "session": "sutando-worker-40659240fd884f63bcd19fa684b451f1", "alive": true,
      "motion": "idle", "condition": "healthy", "reason": null, "since": null}
   ]
 }
@@ -45,13 +48,16 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 
 | Field | Meaning |
 |---|---|
+| `instance` | the agent id the serving gateway lane signed in as (the `agent_id` it writes to `state/gateway-status[.<lane>].json` while connected). `null` when no lane is serving within 180 s, or two serving lanes name different ids: a wrong id would show this Mac twice |
 | `overall` | `attention` if any agent is abnormal; `ok` if every agent is healthy; otherwise `unknown` |
+| `suspended` | `{"reason", "at"}` while `state/pool-suspended` exists (the app quit and paused the pool); `null` otherwise |
 | `id`, `role` | `core`, or a worker id with role `worker` |
 | `label` | the worker's roster label; `null` when it is only the id |
-| `alive` | `true` beat fresh, `false` beat stale, `null` no beat file (see [Liveness](#liveness)) |
+| `session` | the tmux session to open for this agent, as its beat file (core) or supervisor file names it; `null` when no file names one. Never guessed |
+| `alive` | `true` beat fresh, `false` beat stale or the supervisor saw the session crash, `null` no beat file |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
-| `reason` | why it is abnormal (see [Reasons](#reasons)); `null` otherwise |
+| `reason` | why it is abnormal (see [Reasons](#reasons)), or `suspended` for a worker the pool's suspension took down; `null` otherwise |
 | `since` | epoch seconds the abnormal state was first seen, when the source knows it |
 
 `view=full` adds `sources` to each agent: every input with its workspace-relative `path`,
@@ -65,7 +71,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 
 | Source | File | Freshness |
 |---|---|---|
-| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness |
+| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness. A `crashed` verdict is ignored when a fresh beat written after it recorded a live core pane (its `pid` is the core's, not the beat writer's `heartbeat_pid`) |
 | `cli_wedge` | `state/cli-wedge/window.jsonl`, classified with `cli_wedge.classify_window` | 180 s for health, 30 s for motion |
 | `heartbeat` | `state/cores/<host>.alive` mtime | 90 s |
 | `activity` | tail (256 KB) of `state/agent-activity.jsonl`, plus result files | 120 s since the task's last row |
@@ -137,24 +143,37 @@ state as the reason. `retired` workers are left out of the response.
 
 1. **Offline wins outright.** If any source says `offline`, the agent is `unknown · abnormal ·
    offline`, whatever else it says. A dead agent's files keep their last words (a supervisor
-   file left at `idle-ready`), and those say nothing about now.
+   file left at `idle-ready`), and those say nothing about now. The one exception: when a fresh
+   pool sample says it gave up on the worker, the reason is `not-answering`, since that needs a
+   person and a plain `offline` does not. Its `since` is the pool's first detection, or the
+   beat's when the pool did not record one.
 2. **Abnormal beats healthy.** Condition is `abnormal` if any source says so, else `healthy` if
    any says so, else `unknown`.
 3. **The first abnormal source names the reason**, in the source order above. So the
    supervisor's `needs-login` outranks a `cli_wedge` `retry-loop`.
 4. **Moving beats idle.** Motion is `moving` if any source says so, else `idle` if any says so,
    else `unknown`.
-5. `alive` comes from the beat alone and is reported beside the verdict, not folded into it.
+5. `alive` comes from the beat and is reported beside the verdict, not folded into it. The
+   one exception is a `crashed` verdict that survives the freshness rules above, which makes
+   it `false`: a worker's inbox watcher, and the core's heartbeat writer, run apart from the
+   session and outlive it. For a worker this needs its current incarnation to be readable:
+   without it the verdict cannot be shown to be this run's, so `alive` stays the beat's while
+   the condition still reads `crashed`.
+6. **A worker the suspension took down** (listed in `state/pool-suspended`'s `stopped`) reads
+   `alive: false · unknown · unknown`, reason `suspended`, since the suspension's `at`, whatever
+   its files say. A quit kills the tmux server outright, so no seat records its own end and its
+   beat stays fresh for up to 90 s. The pool's resume lifts this.
 
 ## Reasons
 
 | Reason | Source | Meaning |
 |---|---|---|
 | `offline` | beat | no beat for 90 s: the session is gone or its beat writer stopped |
+| `suspended` | `state/pool-suspended` | the app quit took this worker down; condition stays `unknown` and it never alerts |
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
 | `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |
-| `hung` | supervisor | the session is there but the self-report stopped advancing |
+| `hung` | supervisor | the session is there but the self-report stopped advancing, and the pane shows neither the idle footer nor a turn in flight that changed since the last poll |
 | `crashed` | supervisor | the supervisor found no session |
 | `gateway-down` | supervisor | the core is up but its gateway bridge is not |
 | `retry-loop` | cli_wedge | the pane keeps moving while the CLI retries |
@@ -193,6 +212,14 @@ and the self-report is idle. Result: `alive: true` (fresh heartbeat), `idle · h
   so a dead core monitor's last state stands until the heartbeat goes stale.
 - **Moving can lag** by up to 120 s for a task that never writes a result, and by up to 90 s from
   a stale `running` self-report.
+
+## Reaching AG2 Space
+
+The gateway bridge computes this snapshot in-process, so a Mac or cloud Sutando without agent-api
+still reports. It sends the core's `alive`/`motion`/`condition`/`reason`/`since` on the heartbeat
+and each worker's on the workers report, plus `suspended` (see
+[`remote-gateway-protocol.md`](remote-gateway-protocol.md)). `instance`, `session`, `label` and the
+`full` view stay on the Mac.
 
 ## Privacy
 

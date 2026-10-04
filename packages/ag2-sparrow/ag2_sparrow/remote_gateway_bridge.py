@@ -50,6 +50,7 @@ Stdlib only (urllib) — no new dependencies.
 from __future__ import annotations
 
 import atexit
+import glob
 import base64
 import hashlib
 import json
@@ -296,9 +297,12 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from .proactive_routing import proactive_filename
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             owner_mention_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -313,6 +317,7 @@ from .dedup_recovery import plan_dedup_recovery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import _host_label as _stable_host_label
 
 TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
@@ -1722,6 +1727,7 @@ def _auth_probe() -> bool:
         return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
+_last_core_health: "dict | None" = None
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
@@ -1736,6 +1742,12 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.
                 "source", "channel_id",
+                # Declares the task-mid shape (one-line body, writer-owned trailer) so a
+                # verified reader may trust the lines below task:. Above it: a body cannot claim it.
+                "task_layout",
+                # The broker's word that the message mentioned the owner, not this agent.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "owner_mentioned",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2442,6 +2454,10 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
+# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+WORKERS_REFRESH_S = 20.0
+_workers_pushed_at: "float | None" = None
 _advertisement_unavailable_logged = False
 
 # 404/405/501 are the broker saying "this endpoint does not exist here"; every
@@ -2603,13 +2619,86 @@ def _workers_body(ad: dict) -> dict:
     return ad["workers"]
 
 
+HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
+HEALTH_TTL_S = 15.0
+_health_cache: dict = {"at": None, "value": None, "error": None}
+
+
+def _health_snapshot() -> "dict | None":
+    """The workspace health summary, reused for HEALTH_TTL_S; None where the monorepo
+    src/ is absent or the snapshot fails, so a standalone sparrow reports no health."""
+    at = _health_cache["at"]
+    if at is not None and time.monotonic() - at < HEALTH_TTL_S:
+        return _health_cache["value"]
+    value, error = None, None
+    try:
+        src = _monorepo_src("health_snapshot.py")
+        if src:
+            if src not in sys.path:
+                sys.path.insert(0, src)
+            import health_snapshot
+            value = health_snapshot.snapshot(_STATE.parent)
+    except Exception as e:  # noqa: BLE001 — health is optional; it never breaks a push
+        error = f"{type(e).__name__}: {e}"
+    if error and error != _health_cache["error"]:
+        _log(f"health snapshot unavailable: {error}")
+    _health_cache.update(at=time.monotonic(), value=value, error=error)
+    return value
+
+
+def _health_row(agent: dict) -> dict:
+    """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
+    row = {k: agent.get(k) for k in HEALTH_FIELDS}
+    if row["reason"] is not None:
+        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40].strip("-") or None
+    return row
+
+
+def _core_health(snap: "dict | None") -> "dict | None":
+    core = next((a for a in (snap or {}).get("agents") or [] if a.get("role") == "core"), None)
+    return _health_row(core) if core else None
+
+
+def _with_health(body: dict, snap: "dict | None") -> dict:
+    """The report plus each worker's health and the pool suspension. The legacy body has
+    no worker rows, so it and a missing snapshot pass through unchanged."""
+    if snap is None or not isinstance(body.get("workers"), list):
+        return body
+    health = {a.get("id"): _health_row(a) for a in snap.get("agents") or [] if a.get("role") == "worker"}
+    rows = [{**r, "health": health[r["id"]]} if isinstance(r, dict) and r.get("id") in health else r
+            for r in body["workers"]]
+    return {**body, "workers": rows, "suspended": _suspended_row(snap.get("suspended"))}
+
+
+def _suspended_row(value) -> "dict | None":
+    """The pool suspension as summary fields: its reason a slug like any health reason."""
+    if not isinstance(value, dict):
+        return None
+    reason = _health_row({"reason": value.get("reason")})["reason"]
+    at = value.get("at")
+    numeric = isinstance(at, (int, float)) and not isinstance(at, bool)
+    return {"reason": reason or "suspended", "at": at if numeric else None}
+
+
+def _profile_host_id() -> str:
+    """The host's stable label: gethostname() drifts with the network (a DHCP lease renames
+    it). The monorepo src/ is put on the path first, so the label never depends on call order."""
+    src = _monorepo_src("util_paths.py")
+    if src and src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        return _stable_host_label()
+    except OSError:
+        return "unknown-host"
+
+
 def _maybe_push_workers_snapshot(record) -> bool:
     """Push-on-change relay of the pool's workers snapshot (the worker
     picker's read path). An unavailable advertisement pushes NOTHING and
     leaves the broker holding the last snapshot we sent; an unsupported
     endpoint backs the push off an hour and any other HTTP status 5m;
     nothing here may ever break the task loop."""
-    global _workers_pushed_identity, _workers_push_retry_at
+    global _workers_pushed_identity, _workers_push_retry_at, _workers_pushed_at
     if not _publication_permitted():
         return False
     now = time.time()
@@ -2618,10 +2707,17 @@ def _maybe_push_workers_snapshot(record) -> bool:
     identity, ad = record  # one read per beat, shared with the other publication
     if ad is None:
         return False
-    if identity == _workers_pushed_identity:
+    base = _workers_body(ad)
+    body = _with_health(base, _health_snapshot())
+    if body is not base:
+        # Health changes between advertisements, so it joins the change signal.
+        identity += ":" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    # Only a body carrying health has the broker's 120 s staleness; others keep the 600 s re-push.
+    fresh = body is base or (_workers_pushed_at is not None and _now() - _workers_pushed_at < WORKERS_REFRESH_S)
+    if identity == _workers_pushed_identity and fresh:
         return False
     try:
-        _req("POST", "/v1/workers", _workers_body(ad), timeout=15)
+        _req("POST", "/v1/workers", body, timeout=15)
     except urllib.error.HTTPError as e:
         _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
         return False
@@ -2630,6 +2726,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
         _log(f"workers-snapshot push failed, retrying in 5m: {e}")
         return False
     _workers_pushed_identity = identity
+    _workers_pushed_at = _now()
     _log("workers-snapshot pushed")
     return True
 
@@ -2654,12 +2751,8 @@ def _build_agent_profile(workers: "dict") -> "dict":
     AVAILABLE: the broker REPLACES the profile document, so this function must
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
-    try:
-        host_id = socket.gethostname().split(".")[0]
-    except OSError:
-        host_id = "unknown-host"
     return {"display": {"name": name},
-            "host": {"host_id": host_id, "kind": "local"},
+            "host": {"host_id": _profile_host_id(), "kind": "local"},
             "workers": workers}
 
 
@@ -2790,13 +2883,16 @@ def _reported_core_status() -> tuple[str | None, str | None]:
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at
+    global _heartbeat_disabled, _last_heartbeat_at, _last_core_health
     if _heartbeat_disabled:
         return False
     now = time.time()
-    if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+    health = _core_health(_health_snapshot())
+    changed = health is not None and health != _last_core_health
+    if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
+    _last_core_health = health
     _status, _step = _reported_core_status()
     try:
         payload = {
@@ -2814,6 +2910,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["status"] = _status
         if _step is not None:
             payload["step"] = _step
+        if health is not None:
+            payload["health"] = health
+            payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
         return True
     except urllib.error.HTTPError as e:
@@ -2857,6 +2956,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            # Re-read on every write, so a lane switch or re-login shows at the next poll.
+            "agent_id": (_reenroll_identity() or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
@@ -3289,6 +3390,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "task_layout":
+            lines.append("task_layout: mid")
+        elif f == "owner_mentioned":
+            if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
+                lines.append("owner_mentioned: true")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.
@@ -3348,6 +3454,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
+    # Last, after every tier block: it keeps their limits and replaces their reply step.
+    if task.get("owner_mentioned") == "true":
+        lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
@@ -4347,6 +4456,61 @@ def _result_tier(tid: str) -> "str | None":
         return None
 
 
+def _owner_mention_refused(tid: str, body: str) -> "bool | None":
+    """Whether the room must not get this result (team_result_guard owns the rule).
+    None = the task file exists but could not be read; the caller retries."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    try:
+        text = tfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return team_result_guard.owner_mention_result_refused_by_room(text, body)
+
+
+def _owner_mention_dm_name(tid: str) -> str:
+    return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
+
+
+def _owner_mention_dm_queued(tid: str) -> bool:
+    """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
+    stem = glob.escape(_owner_mention_dm_name(tid))
+    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
+            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+            or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
+            or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
+
+
+def _queue_owner_mention_dm(tid: str, text: str) -> bool:
+    """Hand an owner-mention result to the proactive leg, addressed to the owner's DM.
+    False = not queued (no owner DM reading yet, or the write failed); retried next pass."""
+    if not text.strip() or _owner_mention_dm_queued(tid):
+        return True
+    room = resolve_destination(OWNER_PRIVATE)
+    if not room:
+        _held(f"owner-mention result {tid}")
+        return False
+    # Addressed to a Matrix room, so every other bridge's drain leaves this file alone.
+    body = f"[channel: {room}]\n{neutralize_markers(text).strip()}\n"
+    return _durable_write(RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt", body)
+
+
+def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
+    """Every result consumer asks this first, before the tier guard.
+
+    True = an owner-mention result the room must not get: its DM is queued and the
+    caller closes the room lease silently. False = deliver as usual. None = retry.
+    """
+    refused = _owner_mention_refused(tid, raw)
+    if not refused:
+        return refused
+    if not _queue_owner_mention_dm(tid, parse_markers(raw).body):
+        return None
+    _log(f"owner mention {tid}: result sent to the owner's DM, not the room")
+    return True
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -4358,9 +4522,13 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
+        # Before the tier guard: a withheld review would name the shared room as its release target.
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # The guard honours suppression on every tier now, so there is no stub
         # to pre-apply; the ordinary guarded path returns the body unchanged.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -4388,8 +4556,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     # The report IS the delivery: archiving before confirm
                     # would strand the ask exactly as the unreported dedup did.
+                    mention = _owner_mention_disposition(tid, payload)
+                    if mention is None:
+                        continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                                  payload):
+                                                  "[no-send]" if mention else payload,
+                                                  no_send=bool(mention)):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -4673,9 +4845,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # Recovery is still a delivery: the ordinary path's guard runs BEFORE
         # any marker is interpreted, so tier + suppression cannot be skipped.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
             continue

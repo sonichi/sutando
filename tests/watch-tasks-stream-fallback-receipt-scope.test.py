@@ -28,10 +28,14 @@ REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 
 def run(watcher_instance, receipt_owner, want_state=False):
-    """receipt_owner: None | 'default' | '<instance>' — whose receipt exists."""
+    """receipt_owner: None | 'default' | '<instance>' — whose receipt exists.
+    A worker's own inbox is <ws>/deliveries/<id>, never the bare <ws>/tasks
+    the core alone watches -- using the real shape is what makes
+    watcher_instance a worker case rather than a foreign id on the core's own inbox."""
     tmp = Path(tempfile.mkdtemp(prefix="b4-"))
     ws = tmp / "ws"
-    (ws / "tasks").mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
+    inbox = (ws / "deliveries" / watcher_instance) if watcher_instance else (ws / "tasks")
+    inbox.mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
     (ws / "state").mkdir()
     feed = tmp / "feed"; feed.write_text("")
     b = tmp / "bin"; b.mkdir()
@@ -40,7 +44,7 @@ def run(watcher_instance, receipt_owner, want_state=False):
     h.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && { echo probe >> %s; exit 0; }; done\n'
                  'echo handle >> %s\nexit 0\n' % (log, log)); h.chmod(0o755)
     name = "task-demo.txt"
-    (ws / "tasks" / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
+    (inbox / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
     if receipt_owner is not None:
         env0 = dict(os.environ)
         if receipt_owner != "default": env0["SUTANDO_INSTANCE_ID"] = receipt_owner
@@ -48,7 +52,7 @@ def run(watcher_instance, receipt_owner, want_state=False):
         d = subprocess.run(["python3", str(REPO/"src/util_paths.py"), "handler-fallbacks-dir",
                             str(ws/"state")], capture_output=True, text=True, env=env0).stdout.strip()
         Path(d).mkdir(parents=True, exist_ok=True)
-        (Path(d) / name).write_text(str(ws / "tasks" / name) + "\n")
+        (Path(d) / name).write_text(str(inbox / name) + "\n")
     env = dict(os.environ)
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
@@ -57,7 +61,7 @@ def run(watcher_instance, receipt_owner, want_state=False):
     else: env.pop("SUTANDO_INSTANCE_ID", None)
     # stderr is kept: a probe that fails with nothing to read cannot be diagnosed.
     errf = open(tmp / "watcher.err", "w+")
-    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")], cwd=str(REPO),
+    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
                          env=env, stdout=subprocess.PIPE, stderr=errf,
                          text=True, start_new_session=True)
     out, t0, seen_state = [], time.time(), set()

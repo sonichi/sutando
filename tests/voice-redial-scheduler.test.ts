@@ -218,6 +218,7 @@ describe('shouldEventDial — fire-time preconditions', () => {
 	it('each precondition alone vetoes', () => {
 		assert.equal(shouldEventDial({ ...base, nextDialAt: 0 }), false, 'nothing pending');
 		assert.equal(shouldEventDial({ ...base, now: 199_999 }), false, 'not yet due');
+		assert.equal(shouldEventDial({ ...base, state: 'UPSTREAM_LOST' }), true, 'parked under upstreamLossPolicy hold');
 		assert.equal(shouldEventDial({ ...base, state: 'CONNECTING' }), false, 'dial in flight');
 		assert.equal(shouldEventDial({ ...base, state: 'ACTIVE' }), false, 'session healthy');
 		assert.equal(shouldEventDial({ ...base, clientConnected: false }), false, 'nobody listening');

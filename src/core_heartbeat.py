@@ -271,6 +271,17 @@ def _session_present(sock: str, sess: str) -> bool | None:
     return _LAST_SESSION_PROBE
 
 
+def _session_pane_pid(sock: str, sess: str) -> int | None:
+    """Return a pane PID only from the exact socket/session."""
+    lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
+    if lp is None or lp.returncode != 0:
+        return None
+    for line in lp.stdout.split():
+        if line.strip().isdigit():
+            return int(line.strip())
+    return None
+
+
 def core_pid(socket_path: str | None = None, session: str | None = None) -> int | None:
     """The pid of the CORE process, or None if the core is gone.
 
@@ -299,6 +310,11 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
 
     if not _session_present(sock, sess):
         return None
+
+    runtime = (_session_runtime(sock, sess) or "").lower()
+    # A known non-Claude core cannot be identified by a machine-wide Claude name.
+    if runtime and runtime != "claude":
+        return _session_pane_pid(sock, sess)
 
     # SESSION-SCOPED FIRST, then the process-name sweep as a fallback.
     #
@@ -407,13 +423,7 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     # it, a core in a non-selected window is invisible and this returns None for
     # a live core. Same one-token correction, same guard: `-t "={sess}"` keeps it
     # scoped to the exact session.
-    lp = _tmux(sock, "list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}")
-    if lp is None or lp.returncode != 0:
-        return None
-    for line in lp.stdout.split():
-        if line.strip().isdigit():
-            return int(line.strip())
-    return None
+    return _session_pane_pid(sock, sess)
 
 
 def _session_runtime(sock: str, sess: str) -> "str | None":
@@ -729,11 +739,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     p.add_argument("--stop", action="store_true",
                    help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
+    p.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.helper_receipt_dir:
+        from external_core_helpers import publish
+        publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
+                _socket_path(), _observed_session(_socket_path()),
+                passive=not (args.once or args.stop or args.mark_stopped))
     if args.mark_stopped:
         mark_stopped()
         return 0

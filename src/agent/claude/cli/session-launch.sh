@@ -75,7 +75,7 @@ claude_named_process_running() {
 
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
-  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
 }
 
 claude_named_session_running() {

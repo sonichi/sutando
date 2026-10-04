@@ -100,7 +100,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click',
+	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -735,8 +735,14 @@ export function _shouldFallthrough(file: string): boolean {
 	// Signal Room results belong to the room daemon's `/result` poll, not to
 	// voice. See SIGNAL_TASK_PREFIX and the dedicated branch in the watcher.
 	if (file.startsWith(SIGNAL_TASK_PREFIX)) return false;
+	// A `.to-<bridge>` proactive file is that bridge's to claim (proactive_routing's
+	// grammar); voice must neither speak it nor archive the bridge's only copy.
+	if (DESTINED_PROACTIVE_RE.test(file)) return false;
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
+
+/** Mirrors proactive_routing._DESTINATION_RE on a proactive-* name. */
+export const DESTINED_PROACTIVE_RE = /^proactive-.*\.to-[a-z0-9_-]+\.txt$/;
 
 
 
