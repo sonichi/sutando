@@ -30,7 +30,7 @@ check $? "a child past the bound is TERMed (rc=$rc, ${elapsed}s) and the flag is
 rm -f "$FLAG"
 
 # 3. A TERM-resistant child still dies: KILL follows TERM.
-start=$(date +%s); run_bounded 1 "$FLAG" -- bash -c 'trap "" TERM; sleep 30'; rc=$?; elapsed=$(( $(date +%s) - start ))
+start=$(date +%s); run_bounded 1 "$FLAG" -- bash -c 'trap "" TERM; exec sleep 30'; rc=$?; elapsed=$(( $(date +%s) - start ))
 [ "$rc" = "137" ] && [ -e "$FLAG" ] && [ "$elapsed" -lt 10 ]
 check $? "a TERM-resistant child is KILLed (rc=$rc, ${elapsed}s)"
 rm -f "$FLAG"
@@ -114,7 +114,7 @@ check $? "${N}x exit 0 + ${N}x exit 3: $flags false timeout flags, $badrc wrong 
 
 # 9. The bound does not depend on what the target does with inherited fds:
 #    a target that closes 8 and 9 is still TERMed at the bound.
-start=$(date +%s); run_bounded 1 "$FLAG" -- sh -c 'exec 8>&- 9>&-; sleep 30; exit 42'; rc=$?; elapsed=$(( $(date +%s) - start ))
+start=$(date +%s); run_bounded 1 "$FLAG" -- sh -c 'exec 8>&- 9>&-; exec sleep 30'; rc=$?; elapsed=$(( $(date +%s) - start ))
 [ "$rc" = "143" ] && [ -e "$FLAG" ] && [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 2 ]
 check $? "a target that closed fds 8 and 9 is still TERMed at the bound (rc=$rc, ${elapsed}s, flag=$([ -e "$FLAG" ] && echo present || echo absent))"
 rm -f "$FLAG"
@@ -136,6 +136,23 @@ check $? "the caller's fds 8 and 9 survive a run (writes rc=$w8/$w9; fd9 holds: 
 err="$(run_bounded 08 -- sh -c 'exit 5' 2>&1)"; rc=$?
 [ "$rc" = "5" ] && [ -z "$err" ]
 check $? "run_bounded 08 is accepted (rc=$rc, stderr: ${err:-<empty>})"
+
+# 11b-11d. A malformed configured limit (unit suffix, non-digit, negative) falls
+#     back to the 1 s floor silently and keeps the child's own exit status.
+for bad in "5s" "x" "-3"; do
+  err="$(run_bounded "$bad" -- sh -c 'exit 5' 2>&1)"; rc=$?
+  [ "$rc" = "5" ] && [ -z "$err" ]
+  check $? "a malformed limit ('$bad') falls back silently, child's own status kept (rc=$rc, stderr: ${err:-<empty>})"
+done
+
+# 11e. The fallback is exactly one second: a direct child that would exit 0 at
+#     1.5s is TERMed first with the flag; a floor of 2 would let it finish.
+for bad in "5s" "-3"; do
+  start=$(date +%s); run_bounded "$bad" "$FLAG" -- sleep 1.5; rc=$?; elapsed=$(( $(date +%s) - start ))
+  [ -e "$FLAG" ] && [ "$rc" -ge 128 ] && [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 2 ]
+  check $? "a 1.5s child under a malformed limit ('$bad') is TERMed at the 1s floor (rc=$rc, ${elapsed}s, flag=$([ -e "$FLAG" ] && echo present || echo absent))"
+  rm -f "$FLAG"
+done
 
 # 12. Nothing is left behind in TMPDIR but the suite's own files.
 leftovers="$(find "$TMPDIR" -type f ! -name 'fd8.out' ! -name 'fd9.out' | wc -l | tr -d ' ')"

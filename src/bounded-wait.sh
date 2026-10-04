@@ -6,8 +6,16 @@ run_bounded() {
   shift
   if [ "$1" != "--" ]; then timeout_flag="$1"; shift; fi
   [ "$1" = "--" ] && shift
-  # Whole decimal seconds (08 is 8): a fraction is truncated, never below 1.
-  limit="${limit%%.*}"; limit="$(( 10#${limit:-1} ))" 2>/dev/null; [ "$limit" -ge 1 ] 2>/dev/null || limit=1
+  # Whole decimal seconds (08 is 8), fraction truncated, floor 1. Non-digits never
+  # reach $(( )): its error abandons the enclosing -c string or function, rc 1.
+  limit="${limit%%.*}"
+  case "${limit:-1}" in
+    ''|*[!0-9]*) limit=1 ;;
+    *) limit="$(( 10#${limit:-1} ))" ;;
+  esac
+  [ "$limit" -ge 1 ] 2>/dev/null || limit=1
+  # The token is the job's identity for jobs/kill below; a caller's other
+  # background job must not carry it in its command line.
   ( : sutando_run_bounded; exec "$@" ) &
   pid=$!
   if ! _rb_ended "$limit"; then
