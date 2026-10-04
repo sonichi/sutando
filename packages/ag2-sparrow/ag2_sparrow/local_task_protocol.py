@@ -202,7 +202,7 @@ KNOWN_HEADER_KEYS = (
     "task_layout",
     # Commons working-session context the AG2 Space bridge derives (session_context.py):
     # the sender's page and the live session. Header status defangs a forged body copy.
-    "page", "session",
+    "session_page", "session_ctx",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it

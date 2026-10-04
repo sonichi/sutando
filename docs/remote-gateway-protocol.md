@@ -244,12 +244,12 @@ request, not one per navigation:
   member's latest page keyed by mxid, the last five session events as kind +
   sender (never message text), start and last activity — and closes the task
   with a `[no-send]` result, the same path a card click takes.
-- `page: <surface> · <page id>` is written above `task:` for a message
+- `session_page: <surface> · <page id>` is written above `task:` for a message
   carrying `space.ag2.commons.session.at` (the sender's current page). The
   page title a member put on the mark is never a header: it appears only in
   that member's own body prefix, quoted and attributed (`("<title>", title set
   by <mxid>)`).
-- `session: <thread_root> | started <ts>` is written above `task:`, and the
+- `session_ctx: <thread_root> | started <ts>` is written above `task:`, and the
   body is prefixed `[live session: <thread_root>; <sender> last on <page>]`,
   for every task from a room whose session the bridge has seen and that is
   still live — not ended, this agent has not left it, and someone spoke in it
@@ -274,7 +274,7 @@ ledger already knows as a live session (from a content-bearing mark, or the
 envelope `session_context` naming that thread; a session quiet past two hours
 is no longer known), and only against the broker-supplied `sender_name`.
 Mark-shaped prose in an ordinary thread is an ordinary task. In the fallback
-the page id is unknown (`-`), and the `page:` header needs `content` to appear
+the page id is unknown (`-`), and the `session_page:` header needs `content` to appear
 at all. **Body text is trusted for nothing:** the broker's `[AG2 Space working
 session; …]` block is prepended inside the body and a member can type the same
 bytes, so the bridge never reads a title, a known session or an ended state

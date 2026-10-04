@@ -3421,9 +3421,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             _sess = _observe_session({**task, "task": _filtered.text})
             # Session context the bridge derived, above task: so a body cannot claim it.
             if _sess.page_header:
-                lines.append(f"page: {_one_line(_sess.page_header)}")
+                lines.append(f"session_page: {_one_line(_sess.page_header)}")
             if _sess.session_header:
-                lines.append(f"session: {_one_line(_sess.session_header)}")
+                lines.append(f"session_ctx: {_one_line(_sess.session_header)}")
             _body = _filtered.text
             if _sess.body_prefix:
                 _body = f"{_one_line(_sess.body_prefix)} {_body}"

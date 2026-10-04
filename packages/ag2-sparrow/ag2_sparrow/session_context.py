@@ -22,7 +22,7 @@ own. This module is the one place that reads them:
     populate outside the body. Without it a session has no title anywhere;
     a title a member put on a mark is shown only attributed, never in a header.
   * SessionLedger.observe(): the ledger update plus what the task file gets —
-    a `page:` header, a `session:` header, a body prefix — or that no task is
+    a `session_page:` header, a `session_ctx:` header, a body prefix — or that no task is
     written at all.
 
 Pure stdlib; nothing here knows about the gateway or the task-file writer.
