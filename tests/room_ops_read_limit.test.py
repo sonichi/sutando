@@ -281,6 +281,7 @@ class NormalizeMediaRefTests(unittest.TestCase):
                               "media_ref": "mxc://hs/abc123"}])
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertNotIn("msgtype", out[0])
+        self.assertNotIn("mimetype", out[0])
 
     def test_no_media_ref_key_for_plain_message(self):
         # A text message must not grow a null media_ref — keep the shape additive.
