@@ -410,8 +410,9 @@ if [ -z "$HOST" ]; then
     # Blank-but-set is non-empty to `[ -z ]`, so it would become the label.
     HOST="${HOST#"${HOST%%[![:space:]]*}"}"; HOST="${HOST%"${HOST##*[![:space:]]}"}"
     if [ -z "$HOST" ]; then
-        if command -v scutil >/dev/null 2>&1; then
-            HOST="$(scutil --get LocalHostName 2>/dev/null)"
+        # Absolute path: a restrictive PATH can omit /usr/sbin.
+        if [ -x /usr/sbin/scutil ]; then
+            HOST="$(/usr/sbin/scutil --get LocalHostName 2>/dev/null)"
         fi
         [ -z "$HOST" ] && HOST="$(hostname | sed 's/\..*//')"
     fi

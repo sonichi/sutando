@@ -328,8 +328,9 @@ _host() {
     # py side's non-empty `.strip()` check) — an empty LocalHostName must not
     # win over the hostname fallback.
     local lhn=""
-    if command -v scutil >/dev/null 2>&1; then
-        lhn="$(scutil --get LocalHostName 2>/dev/null)"
+    # Absolute path: a restrictive PATH can omit /usr/sbin.
+    if [ -x /usr/sbin/scutil ]; then
+        lhn="$(/usr/sbin/scutil --get LocalHostName 2>/dev/null)"
     fi
     if [ -n "$lhn" ]; then
         printf '%s\n' "$lhn"
