@@ -319,7 +319,7 @@ carrying `APPROVE` / `REQUEST_CHANGES` — while the owner's standing answer on
 review authority is unresolved. An APPROVE moves a merge gate, and merges are
 the owner's; verifying a change carefully is not authorization to vote on it.
 The mode lives in `<workspace>/state/authority.json`:
-An owner who ruled *verbally* has no file yet, so that ruling reads as `hold` until someone writes it — register the file on the node whose owner already answered.
+An owner who ruled *verbally* has no file yet, so that ruling reads as the default until someone writes it. Record it with `python3 scripts/authority.py set github_formal_review <mode> --source "<where the owner said it>"` (atomic; stamps `granted_at`/`source`, keeps other keys); `python3 scripts/authority.py get` shows the mode in force.
 
 ```json
 {"github_formal_review": "hold" | "findings-only" | "allow"}
