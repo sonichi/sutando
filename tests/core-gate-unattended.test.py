@@ -15,6 +15,7 @@ Run: python3 tests/core-gate-unattended.test.py
 """
 import importlib.util as u
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -31,6 +32,7 @@ import core_gate_notice  # noqa: E402
 import self_opened_gate as G  # noqa: E402
 
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
+from unittest.mock import patch  # noqa: E402
 
 
 def _pane(name):
@@ -139,6 +141,26 @@ class TestSelfOpenedPickerDismissal(unittest.TestCase):
         ticks = _every(T0 + 2, T0 + 200, PICKER) + [(T0 + 203, IDLE)] + _every(T0 + 206, T0 + 400, PICKER)
         self.assertEqual(_run(self.sd, ticks), [], "the second picker was first seen past the claim window")
 
+    def test_a_record_that_does_not_parse_as_numbers_is_no_permission(self):
+        pathlib.Path(G.record_path(self.sd, SESSION)).write_text(json.dumps(
+            {"session": SESSION, "kind": "selection", "opened_at": "soon",
+             "claim_window_s": 70, "dismiss_after_s": 1}))
+        self.assertIsNone(G.load(self.sd, SESSION))
+        pathlib.Path(G.record_path(self.sd, SESSION)).write_text(json.dumps(["not", "a", "record"]))
+        self.assertIsNone(G.load(self.sd, SESSION))
+
+    def test_clearing_twice_is_not_an_error(self):
+        G.clear(self.sd, SESSION)
+        G.clear(self.sd, SESSION)
+        self.assertIsNone(G.load(self.sd, SESSION))
+
+    def test_the_cli_reports_an_unwritable_state_dir(self):
+        blocker = pathlib.Path(self.sd) / "file"
+        blocker.write_text("x")
+        rc = G.main(["record", "--state-dir", str(blocker / "state"), "--session", SESSION,
+                     "--opener", "x", "--dismiss-after", "1"])
+        self.assertEqual(rc, 1, "the shell opener must see the record did not land")
+
     def test_the_cli_writes_and_clears_the_record(self):
         self.assertEqual(G.main(["record", "--state-dir", self.sd, "--session", SESSION,
                                  "--opener", "x", "--dismiss-after", "120"]), 0)
@@ -166,8 +188,9 @@ class TestQueuedTasksHearWhy(unittest.TestCase):
         (self.ws / "results").mkdir()
         self.mgr = HitlManager(HitlStore(self.ws / "state" / "hitl"))
 
-    def _escalate(self, pane):
+    def _escalate(self, pane, **force):
         state, kind, prompt = _gate(pane)
+        state, kind = force.get("state", state), force.get("kind", kind)
         queued = core_gate_notice.queued_count(self.ws)
         req = M.escalate(self.mgr, state, f"awaiting user: {kind}", kind, prompt, SESSION, queued=queued)
         return req, M.notice_queued(self.mgr, req, self.ws, state, kind)
@@ -205,9 +228,117 @@ class TestQueuedTasksHearWhy(unittest.TestCase):
         self.assertEqual(noticed, [])
         self.assertNotIn("queued task", req.message)
 
+    def test_a_signed_out_core_says_so(self):
+        _task(self.ws, 1)
+        self._escalate(_pane("idle-ready"), state="logged-out", kind=None)
+        self.assertIn("it is signed out", _rows(self.ws)[0]["line"])
+
+    def test_an_unreadable_queue_is_no_count_and_no_notice(self):
+        _task(self.ws, 1)
+        with patch.object(core_gate_notice.task_queue, "pending_files", side_effect=PermissionError("denied")):
+            self.assertEqual(core_gate_notice.queued_count(self.ws), 0)
+            req = M.escalate(self.mgr, "blocked-human", "d", "selection", PICKER, SESSION)
+            self.assertEqual(core_gate_notice.notice_queued(self.mgr, req, self.ws, "blocked-human", "selection"), [])
+        self.assertEqual(_rows(self.ws), [])
+
+    def test_no_requirement_no_notice(self):
+        _task(self.ws, 1)
+        self.assertEqual(core_gate_notice.notice_queued(self.mgr, None, self.ws, "blocked-human", "selection"), [],
+                         "escalate() returned None: nothing to dedup against")
+        gone = type("Req", (), {"id": "hitl_gone"})()
+        self.assertEqual(core_gate_notice.notice_queued(self.mgr, gone, self.ws, "blocked-human", "selection"), [])
+        self.assertEqual(_rows(self.ws), [])
+
+    def test_a_notice_that_could_not_be_written_is_retried_next_tick(self):
+        _task(self.ws, 1)
+        _task(self.ws, 2)
+        real = core_gate_notice.activity_rows.append
+
+        def flaky(line, **kw):
+            if kw["task"]["id"] == "task-2":
+                raise OSError("disk full")
+            return real(line, **kw)
+        with patch.object(core_gate_notice.activity_rows, "append", flaky):
+            self.assertEqual(self._escalate(PICKER)[1], ["task-1"])
+        self.assertEqual(self._escalate(PICKER)[1], ["task-2"], "not marked noticed, so tried again")
+        self.assertEqual(len(_rows(self.ws)), 2)
+
     def test_a_notice_failure_never_takes_down_the_monitor(self):
         _task(self.ws, 1)
         self.assertEqual(M.notice_queued(object(), object(), self.ws, "blocked-human", "selection"), [])
+
+
+class _Stop(Exception):
+    pass
+
+
+class _Clock:
+    """The monitor's `time`: sleep advances it, and ends the loop after `ticks` sleeps."""
+
+    def __init__(self, ticks):
+        self.t, self.left = T0, ticks
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.left -= 1
+        if self.left <= 0:
+            raise _Stop()
+        self.t += s
+
+
+class TestMonitorLoop(unittest.TestCase):
+    """main() itself, across ticks, with tmux replaced by a pane that an Escape clears.
+    115 ticks of 3s end inside the 120s the auto-answer stays in the signal file."""
+
+    def _loop(self, with_record, ticks=115):
+        ws = pathlib.Path(tempfile.mkdtemp())
+        (ws / "tasks").mkdir()
+        _task(ws, 1)
+        out = ws / "state" / "core-supervisor.json"
+        out.parent.mkdir()
+        if with_record:
+            G.record(str(out.parent), SESSION, "model-switch", 300.0, claim_window_s=70.0, now=T0)
+        screen, sent = {"pane": PICKER}, []
+
+        def send(sock, sess, key):
+            sent.append(key)
+            if key == "Escape":
+                screen["pane"] = IDLE
+            return True
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "idle"}
+        clock = _Clock(ticks)
+        argv = ["core-input-watch.py", "--socket", "/x.sock", "--session", SESSION, "--out", str(out)]
+        with patch.object(M, "capture", lambda s, sess: screen["pane"]), \
+                patch.object(M, "send_keys", send), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M, "time", clock), patch.object(sys, "argv", argv):
+            with self.assertRaises(_Stop):
+                M.main()
+        return ws, out, sent
+
+    def test_our_picker_is_escaped_and_the_core_and_its_queue_move_on(self):
+        ws, out, sent = self._loop(with_record=True)
+        self.assertEqual(sent, ["Escape"])
+        sig = json.loads(out.read_text())
+        self.assertEqual(sig["state"], "idle-ready")
+        self.assertEqual((sig["auto_answered"]["key"], sig["auto_answered"]["self_opened"]), ("Escape", True))
+        self.assertIsNone(G.load(str(out.parent), SESSION), "the record is spent")
+        self.assertEqual([r["task"]["id"] for r in _rows(ws)], ["task-1"])
+        self.assertEqual(os.listdir(ws / "tasks"), ["task-1.txt"])
+
+    def test_without_a_record_the_loop_never_types(self):
+        ws, out, sent = self._loop(with_record=False)
+        self.assertEqual(sent, [])
+        self.assertEqual(json.loads(out.read_text())["state"], "blocked-human")
 
 
 if __name__ == "__main__":
