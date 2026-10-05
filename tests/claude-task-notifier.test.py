@@ -243,6 +243,36 @@ lines.append(text)
 open(path, "w").write("\\n".join(lines + tail) + "\\n")
 PYEOF
 }}
+# -N <n> BSpace: removes the last n chars of the composer's own typed text
+# (never the glyph), re-wrapping exactly as append_typed does.
+backspace_composer() {{
+  python3 - "$PANE" "$1" {self.WRAP_COLS} "{self.WRAP_STYLE}" <<'PYEOF'
+import re, sys, textwrap
+path, n, wrap, style = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+lines = open(path).read().split("\\n")
+if lines and lines[-1] == "": lines.pop()
+idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("❯")), None)
+if idx is None:
+    sys.exit(0)
+row = lines[idx]
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    row += lines[end].strip() if style == "word" else lines[end]; end += 1
+content = row[2:] if row.startswith("❯ ") else row
+new_content = content[:-n] if 0 < n < len(content) else ""
+new = "❯ " + new_content
+if wrap <= 0:
+    rows = [new]
+elif style == "word":
+    rows = textwrap.wrap(new, width=wrap, subsequent_indent="  ", break_long_words=True,
+                         break_on_hyphens=False) or ["❯ "]
+else:
+    rows = [new[i:i + wrap] for i in range(0, len(new), wrap)] or ["❯ "]
+lines[idx:end] = rows
+open(path, "w").write("\\n".join(lines) + "\\n")
+PYEOF
+}}
 total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
 history_size() {{
   local t; t="$(total_rows)"; local h=$(( t - {self.PANE_HEIGHT} ))
@@ -353,6 +383,9 @@ case "$cmd" in
           append_owner_row "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
         fi
       fi
+    elif [ "${{1:-}}" = -N ] && [ "${{3:-}}" = BSpace ]; then
+      printf 'BSPACE %s\\n' "$2" >> "{self.sendkeys_log}"
+      backspace_composer "$2"
     else
       printf 'ENTER markers=%s\\n' "$(ls "{self.inflight_dir}" 2>/dev/null | grep -vc '^\\.')" >> "{self.sendkeys_log}"
       if [ -f "{self.pid_after_enter_flag}" ]; then

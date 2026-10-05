@@ -385,13 +385,50 @@ composer_resume_offset() {
   return 1
 }
 
+# $3 = the composer's exact (dewrapped, raw) content right after the failed chunk, when
+# the caller has it -- what lets a later attempt prove a non-boundary leftover is this
+# notifier's own typing (see composer_matches_own_leftover), not just that something
+# was cut short.
 note_partial_paste() {
-  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$PARTIAL_DIR" "$1" "$2" \
+  printf '%s' "${3-}" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$PARTIAL_DIR" "$1" "$2" \
     || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
 }
 
 clear_partial_paste() {
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
+}
+
+# True only when the composer's CURRENT content is, whitespace aside, exactly the text
+# note_partial_paste recorded for this filename and incarnation -- i.e. this garbled,
+# non-boundary leftover is provably this notifier's own failed chunk, not a human draft,
+# because nothing else is ever written under this key. A cut box never qualifies: a
+# capture that cannot show the whole composer cannot prove what the whole thing is.
+composer_matches_own_leftover() {
+  local filename="$1" incarnation="$2" raw="$3" c recorded
+  pane_frame_is_cut "$raw" && return 1
+  c="$(composer_text "$raw")"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  recorded="$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$PARTIAL_DIR" "$filename" "$incarnation")" || return 1
+  [ -n "$recorded" ] || return 1
+  [ "$(printf '%s' "$c" | squeeze)" = "$(printf '%s' "$recorded" | squeeze)" ]
+}
+
+# Delete exactly the composer's own current content, one character at a time (never a
+# line-kill or select-all: those are terminal-dependent and some would reach past the
+# composer). Verifies empty afterward; a caller that got here already proved via
+# composer_matches_own_leftover that every one of these characters is this notifier's.
+clear_own_leftover() {
+  local raw="$1" n
+  n="$(composer_text "$raw" | "$NOTIFIER_PY" -c \
+    'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))))')"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -N "$n" BSpace 2>/dev/null || return 1
+  # A dewrapped read can undercount a real multi-line prompt's newlines (composer_text
+  # joins rows with no separator); this is the backstop, not a second guess at the
+  # count -- an incomplete clear is caught here and fails closed, never retyped over.
+  [ -z "$(composer_text "$(capture_raw)")" ]
 }
 
 # Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
@@ -487,6 +524,9 @@ deliver_prompt_grown() {
     if ! pane_text_composer_is_empty "$baseline_esc"; then
       if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
         log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
+      elif composer_matches_own_leftover "$filename" "$incarnation" "$baseline_raw" \
+           && clear_own_leftover "$baseline_raw"; then
+        log_notifier "composer held $filename's own garbled, non-boundary leftover from a failed chunk; cleared it, retyping from the start"
       else
         warn_if_capture_truncated "$baseline_raw" "$filename"
         log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
@@ -503,7 +543,14 @@ deliver_prompt_grown() {
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
-      note_partial_paste "$filename" "$incarnation"
+      # A cut box cannot be read whole; recording its partial view as "the leftover"
+      # would be a wrong record a later attempt could wrongly trust. Record nothing then --
+      # partial_paste_leftover already treats no text as nothing provable to clear against.
+      if pane_frame_is_cut "$staged_raw"; then
+        note_partial_paste "$filename" "$incarnation"
+      else
+        note_partial_paste "$filename" "$incarnation" "$(composer_text "$staged_raw")"
+      fi
     fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break

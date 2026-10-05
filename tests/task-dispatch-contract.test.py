@@ -40,6 +40,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
+    mark_partial_paste, partial_paste_leftover,
     _main,
     find_ready_result,
     find_ready_result_for_filename,
@@ -965,6 +966,68 @@ class InflightRecordTest(unittest.TestCase):
         self.assertEqual(0, run("inflight-clear", str(self.dir), "task-c.txt").returncode)
         self.assertEqual(2, run("inflight-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
         self.assertEqual(2, run("inflight-mark", str(self.dir), "../x.txt", "1").returncode)
+
+
+class PartialPasteLeftoverTest(unittest.TestCase):
+    """The cut-short-paste marker, extended with the garbled text a failed attempt
+    left in the composer -- what proves a non-boundary leftover is the notifier's
+    own, safe to clear, rather than an unrelated human draft."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "partial"
+
+    def test_recorded_text_comes_back_for_the_same_incarnation(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "garbled le")
+        self.assertEqual("garbled le", partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_no_text_given_is_none_not_empty_string(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_a_plain_inflight_mark_record_predates_the_text_field_and_is_none(self):
+        # A record written by the generic inflight-mark CLI (single line, no text)
+        # must not be misread as "an empty leftover was recorded".
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_stale_incarnation_yields_none_and_removes_the_marker(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "leftover")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "9999"))
+        self.assertFalse((self.dir / "task-a.txt").exists())
+
+    def test_no_marker_is_none(self):
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-z.txt", "4242"))
+
+    def test_an_empty_incarnation_is_refused(self):
+        with self.assertRaises(ValueError):
+            mark_partial_paste(self.dir, "task-a.txt", "  ", "x")
+
+    def test_later_mark_replaces_the_earlier_text(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "first attempt")
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "second attempt")
+        self.assertEqual("second attempt", partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_cli_round_trip(self):
+        script = Path(__file__).resolve().parent.parent / "src" / "delivery" / "task_dispatch.py"
+
+        def run(*args, stdin_text=None):
+            return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True,
+                                   input=stdin_text)
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-c.txt", "1").returncode)
+        marked = run("partial-mark", str(self.dir), "task-c.txt", "1", stdin_text="g@rbled")
+        self.assertEqual(0, marked.returncode, marked.stderr)
+        got = run("partial-leftover", str(self.dir), "task-c.txt", "1")
+        self.assertEqual((0, "g@rbled"), (got.returncode, got.stdout))
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-c.txt", "2").returncode,
+                          "a different incarnation never sees another core's leftover")
+        empty_mark = run("partial-mark", str(self.dir), "task-e.txt", "1", stdin_text="")
+        self.assertEqual(0, empty_mark.returncode, empty_mark.stderr)
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-e.txt", "1").returncode,
+                          "no text given is not-found, not an empty match")
+        self.assertEqual(2, run("partial-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
+        self.assertEqual(2, run("partial-mark", str(self.dir), "../x.txt", "1", stdin_text="x").returncode)
 
 
 class OwnedTaskIdsTest(unittest.TestCase):
