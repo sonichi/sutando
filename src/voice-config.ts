@@ -300,7 +300,8 @@ export interface ModelMigration {
  * existing install moves. Only `model` changes; every other key (search, tuning, comments) is kept,
  * the original is copied beside it first, and a stamp records the move so it never repeats. The
  * file cannot say whether 3.1 was seeded or chosen, so a user who chose it is moved once and can
- * switch back; the stamp keeps that choice.
+ * switch back; the stamp keeps that choice. No voice preset yields 3.1 + search, so that config
+ * comes back only from the `.bak-3.1` copy or a hand edit.
  */
 export function migrateLegacyModel(configPath: string, now: Date = new Date()): ModelMigration {
 	if (!existsSync(configPath)) return { migrated: false, reason: 'no config file' };
