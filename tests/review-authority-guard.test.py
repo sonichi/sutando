@@ -249,7 +249,10 @@ def _raw(path):
 
 
 def _rd(path):
-    return json.loads(_raw(path) or "{}")
+    try:
+        return json.loads(_raw(path) or "{}")
+    except ValueError:
+        return {}
 
 
 def hook_in(ws, command=APPROVE):
