@@ -526,6 +526,17 @@ check("derive: CONTROL /startup in the composer but nothing queued -> idle",
 check("derive: CONTROL a Claude draft does not hold its queue -> idle",
       _derive_blocked_case(f"❯ /startup\n{_FOOTER}", queued=1, runtime="claude")["health"] == "idle")
 check("severity_of: blocked is warn", rh.severity_of("blocked") == "warn")
+check("derive: a session that cannot name its runtime is not judged -> idle",
+      _derive_blocked_case(_REJECTED, queued=1, runtime="")["health"] == "idle")
+check("_queued_tasks: an unreadable workspace counts as no queue, never a crash",
+      rh._queued_tasks(None) == 0)
+_ocw = rh.cli_wedge.core_target
+rh.cli_wedge.core_target = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tmux gone"))
+try:
+    check("_pane_blocks_dispatch: a failing pane probe is no verdict, never a crash",
+          rh._pane_blocks_dispatch(tempfile.mkdtemp()) is None)
+finally:
+    rh.cli_wedge.core_target = _ocw
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

@@ -1027,6 +1027,12 @@ class CliInProcess(unittest.TestCase):
         self.assertEqual(self._main(["classify", "--runtime", "codex"], ""), (0, "unknown\n", ""))
         self.assertEqual(self._main(["classify", "--runtime", "claude"], f"❯ x\n{FOOTER}\n"), (0, "pending\n", ""))
 
+    def test_leftover_prints_only_an_automation_leftover(self):
+        self.assertEqual(self._main(["leftover", "--runtime", "codex"], REJECTED_STARTUP), (0, "/startup\n", ""))
+        self.assertEqual(self._main(["leftover", "--runtime", "codex"],
+                                    f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n"), (1, "", ""))
+        self.assertEqual(self._main(["leftover", "--runtime", "claude"], f"❯ /startup\n{FOOTER}\n"), (1, "", ""))
+
     def test_classify_json_is_the_verdict_dict(self):
         rc, out, err = self._main(["classify", "--runtime", "codex", "--json"], "◦ Working (esc to interrupt)\n")
         self.assertEqual((rc, err), (0, ""))
