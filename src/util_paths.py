@@ -143,10 +143,10 @@ def _host_label() -> str:
     if env:
         return env
     try:
-        # Absolute path: a launchd job's restrictive PATH can omit /usr/sbin,
-        # silently falling through to the wrong label below (2026-10-04).
+        # Absolute by default (overridable via $SCUTIL_BIN for tests): a
+        # restrictive launchd PATH can omit /usr/sbin.
         out = subprocess.run(
-            ["/usr/sbin/scutil", "--get", "LocalHostName"],
+            [os.environ.get("SCUTIL_BIN") or "/usr/sbin/scutil", "--get", "LocalHostName"],
             capture_output=True, text=True, timeout=2,
         )
         if out.returncode == 0 and out.stdout.strip():

@@ -72,6 +72,12 @@ class HostLabelPrecedence(unittest.TestCase):
             util_paths._host_label()
             self.assertEqual(run.call_args[0][0][0], "/usr/sbin/scutil")
 
+    def test_scutil_bin_env_overrides_the_default_path(self):
+        with patch.dict(os.environ, {"SCUTIL_BIN": "/opt/stub/scutil"}), \
+             patch.object(util_paths.subprocess, "run", return_value=_scutil(0, "Chis-MacBook-Pro\n")) as run:
+            util_paths._host_label()
+            self.assertEqual(run.call_args[0][0][0], "/opt/stub/scutil")
+
 
 if __name__ == "__main__":
     unittest.main()

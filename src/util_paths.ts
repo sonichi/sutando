@@ -70,8 +70,9 @@ export function memoryDirEnv(): string | undefined {
  */
 function scutilLocalHostName(): string {
 	try {
-		// Absolute path: a restrictive launchd PATH can omit /usr/sbin.
-		return execFileSync('/usr/sbin/scutil', ['--get', 'LocalHostName'], {
+		// Absolute by default (overridable via SCUTIL_BIN for tests): a
+		// restrictive launchd PATH can omit /usr/sbin.
+		return execFileSync(process.env.SCUTIL_BIN || '/usr/sbin/scutil', ['--get', 'LocalHostName'], {
 			timeout: 2000,
 			stdio: ['ignore', 'pipe', 'ignore'],
 		})

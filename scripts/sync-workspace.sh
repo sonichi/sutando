@@ -327,10 +327,11 @@ _host() {
     # Capture scutil ONCE and guard exit-0-but-empty output (parity with the
     # py side's non-empty `.strip()` check) — an empty LocalHostName must not
     # win over the hostname fallback.
-    local lhn=""
-    # Absolute path: a restrictive PATH can omit /usr/sbin.
-    if [ -x /usr/sbin/scutil ]; then
-        lhn="$(/usr/sbin/scutil --get LocalHostName 2>/dev/null)"
+    local lhn="" _scutil="${SCUTIL_BIN:-/usr/sbin/scutil}"
+    # Absolute by default: a restrictive PATH can omit /usr/sbin. Overridable
+    # (SCUTIL_BIN) so a test can point this at a stub instead of a real binary.
+    if [ -x "$_scutil" ]; then
+        lhn="$("$_scutil" --get LocalHostName 2>/dev/null)"
     fi
     if [ -n "$lhn" ]; then
         printf '%s\n' "$lhn"
