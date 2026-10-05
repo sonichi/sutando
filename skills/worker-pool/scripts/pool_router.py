@@ -101,6 +101,11 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
         except OSError as e:
             raise UnreadableEvidence(f"{task_id}: cannot lock {folder}: {e}") from e
         try:
+            marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
+            if marker == "regular":
+                continue
+            if marker != "absent":
+                raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")
             for name in pd.sentinel_names(task_id):
                 state = pd.regular_file_state(name, dir_fd=dfd)     # anchored: never the path again
                 if _between_suffix_checks:

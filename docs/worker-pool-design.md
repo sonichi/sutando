@@ -494,6 +494,8 @@ The name keeps `.txt` because the watcher a worker runs emits for no other exten
 
 Order candidates `urgent > normal > low`, then oldest payload `created_at` first.
 
+**Non-exclusive claim folders.** A folder under `deliveries/` that holds a regular file named `.non-exclusive` (`pool_delivery.NON_EXCLUSIVE_MARKER`) takes claims, not deliveries. A service outside the roster can put `<task-id>.accepted` there while it works on a task, and the core's held-readers (`task_dispatch.worker_holds`, `worker_delivery.holder_of`, the Stop hook) count the task as held, the same as for any recipient folder. The router does not: it never counts that folder as the recipient a task is committed to. So a claim beside a worker's delivery is not "two holders", and it is never adopted as a delivery target. Exclusion between the claimant and a worker is the claimant's own job. A marker that is not a regular file refuses the pass, like any other unreadable evidence.
+
 ### Worker loop
 
 1. Watch `deliveries/<me>/`, plus one sweep of the same folder at boot. The sweep is not optional: a delivery written while the session was down produces no event.
