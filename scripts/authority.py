@@ -74,10 +74,9 @@ def cmd_set(key: str, mode: str, source: str) -> int:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
         os.replace(tmp, path)
-    except BaseException:
+    finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
-        raise
     print(f"{key}: {mode} recorded in {path} (source: {data['source']})")
     return 0
 

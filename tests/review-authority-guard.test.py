@@ -232,12 +232,16 @@ for _cmd, _want in (
 
 print("14. scripts/authority.py is the sanctioned writer: a recorded ruling reaches the hook")
 CLI = str(Path(HOOK).parent.parent / "scripts" / "authority.py")
+# Under the coverage gate, children run through `coverage run` so the CLI and hook lines count.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={Path(HOOK).parent.parent / '.coveragerc'}"]
 
 
 def cli(ws, *args):
     env = dict(os.environ)
     env["SUTANDO_HOOK_WORKSPACE"] = ws
-    return subprocess.run([sys.executable, CLI, *args], capture_output=True, text=True, env=env)
+    return subprocess.run([*PYBASE, CLI, *args], capture_output=True, text=True, env=env)
 
 
 def _raw(path):
@@ -252,7 +256,7 @@ def hook_in(ws, command=APPROVE):
     env = dict(os.environ)
     env["SUTANDO_HOOK_WORKSPACE"] = ws
     env.pop("SUTANDO_ALLOW_FORMAL_GH_REVIEWS", None)
-    p = subprocess.run([sys.executable, HOOK], input=json.dumps(
+    p = subprocess.run([*PYBASE, HOOK], input=json.dumps(
         {"tool_name": "Bash", "tool_input": {"command": command}}),
         capture_output=True, text=True, env=env)
     return '"permissionDecision": "deny"' in p.stdout, p.stdout
@@ -289,6 +293,16 @@ with tempfile.TemporaryDirectory() as ws:
         json.dump({"github_formal_review": "hold", "other_ruling": "keep-me"}, fh)
     cli(ws, "set", "github_formal_review", "allow", "--source", "owner")
     check("set preserves other keys", _rd(state).get("other_ruling"), "keep-me")
+
+with tempfile.TemporaryDirectory() as ws:
+    os.makedirs(os.path.join(ws, "state"))
+    state = os.path.join(ws, "state", "authority.json")
+    Path(state).write_text("{not json")
+    r = cli(ws, "get")
+    check("get on an unreadable file reports hold", (r.returncode, "github_formal_review: hold" in r.stdout), (0, True))
+    r = cli(ws, "set", "github_formal_review", "findings-only", "--source", "owner")
+    check("set over an unreadable file records the ruling", (r.returncode, _rd(state).get("github_formal_review")),
+          (0, "findings-only"))
 
 print("15. the deny message tells the agent to look for, and record, the owner's ruling")
 with tempfile.TemporaryDirectory() as ws:
