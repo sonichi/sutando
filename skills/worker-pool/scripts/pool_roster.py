@@ -220,8 +220,10 @@ def _load_existing_roster_strict(workspace):
     p = roster_path(workspace)
     try:
         text = p.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+    except FileNotFoundError as e:
+        if not os.path.lexists(p):
+            return None
+        raise RosterError(f"roster entry exists but cannot be followed: {p}: {e}") from e
     except OSError as e:
         raise RosterError(f"roster unreadable, refusing to touch it: {p}: {e}") from e
     try:
@@ -359,6 +361,34 @@ def publish_task_event_handler(workspace):
     return cfg
 
 
+def routing_roster(workspace):
+    """The roster exactly as the router admits a task against it: None when
+    absent (no pool), the roster otherwise. Raises RosterError when unreadable,
+    which means a pool nobody can read, never no pool."""
+    return _load_existing_roster_strict(workspace)
+
+
+def ensure_task_event_handler(workspace) -> "Path | None":
+    """Backfill for a pool that predates this file (register_worker() is its
+    only writer, so an install that upgraded without a new registration since
+    never gets it written) or whose declaration has gone stale. Republishes
+    only when needed, so a healthy sweep costs one read. None only when the
+    router would read no pool at all: any roster it could route against,
+    including an unreadable one it must fail closed on, gets the declaration.
+    """
+    try:
+        if routing_roster(workspace) is None:
+            return None
+    except RosterError:
+        pass
+    handler = Path(__file__).resolve().parent / "pool_route_handler.py"
+    cfg = task_event_handler_config_path(Path(workspace) / "state")
+    current = _read(cfg, None)
+    if isinstance(current, dict) and current.get("handler") == str(handler):
+        return cfg
+    return publish_task_event_handler(workspace)
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
@@ -395,7 +425,8 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
 def bind_room(workspace, room: str, target: str) -> dict:
     """Bind one room to one worker, named by id or by a unique label — the one
     production writer for a pin, and it publishes: the compile it ends in writes
-    the advertisement too. Same locked read-merge-write as `register_worker`; an
+    the advertisement too, and the pin (re)publishes the task-event handler
+    config, which only `register_worker` wrote before. Same locked read-merge-write as `register_worker`; an
     unknown or ambiguous name is refused BEFORE the declaration is saved, so
     bindings.json never names a target the roster would reject on its next
     compile."""
@@ -407,6 +438,7 @@ def bind_room(workspace, room: str, target: str) -> dict:
         wid = resolve_label(raw, target)
         if wid != CORE and wid not in workers:
             raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        publish_task_event_handler(workspace)
         bindings = dict(load_bindings(workspace))
         bindings[room] = wid
         save_bindings(workspace, bindings)
