@@ -8,9 +8,11 @@
 // the same directory.
 //
 // Resolution order (v0.8):
-//   1. sutando.config.local.json (per-clone override, gitignored)
-//   2. sutando.config.json (tracked defaults at repo root)
-//   3. Baked-in default ({repoRoot}/workspace)
+//   1. <workspace>/sutando.config.local.json (per-user, survives an engine tree
+//      replaced on app update; its `workspace` key is dropped with a warning)
+//   2. sutando.config.local.json (per-clone override, gitignored)
+//   3. sutando.config.json (tracked defaults at repo root)
+//   4. Baked-in default ({repoRoot}/workspace)
 //
 // $SUTANDO_WORKSPACE is no longer honored in production. If set, a one-time
 // warning points at scripts/sutando-migrate.sh. SUTANDO_TEST_MODE=1 preserves
@@ -138,6 +140,7 @@ enum SutandoConfig {
     nonisolated(unsafe) private static var cacheRepoRoot: String?
     nonisolated(unsafe) private static var legacyEnvWarnPrinted = false
     nonisolated(unsafe) private static var dotenvDriftWarnPrinted = false
+    nonisolated(unsafe) private static var wsLayerWorkspaceKeyWarnPrinted = false
 
     /// Load + merge sutando config from disk. Memoized per-process.
     ///
@@ -167,8 +170,10 @@ enum SutandoConfig {
         }
         let defaults = try loadJson(at: (r as NSString).appendingPathComponent(configFilename))
         let overrides = try loadJson(at: (r as NSString).appendingPathComponent(localFilename))
-        let merged = deepMerge(defaults, overrides)
-        let expanded = expandVars(merged, repoDir: r) as? [String: Any] ?? [:]
+        let repoCfg = expandVars(deepMerge(defaults, overrides), repoDir: r) as? [String: Any] ?? [:]
+        let layer = expandVars(try loadWorkspaceLayer(repoCfg, root: r), repoDir: r)
+            as? [String: Any] ?? [:]
+        let expanded = deepMerge(repoCfg, layer)
         cache = expanded
         cacheRepoRoot = r
         return expanded
@@ -180,6 +185,58 @@ enum SutandoConfig {
         cacheRepoRoot = nil
         legacyEnvWarnPrinted = false
         dotenvDriftWarnPrinted = false
+        wsLayerWorkspaceKeyWarnPrinted = false
+    }
+
+    /// The workspace a repo-merged config names. Pure: no warnings, no disk reads.
+    /// Shared by `resolveWorkspace` and the workspace config layer.
+    private static func workspaceFrom(_ cfg: [String: Any], root: String?) -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let t = env["SUTANDO_WORKSPACE"]?.trimmingCharacters(in: .whitespaces),
+           !t.isEmpty, env["SUTANDO_TEST_MODE"] == "1" {
+            return (t as NSString).expandingTildeInPath
+        }
+        // An embedder (e.g. a desktop app whose repo root is read-only) names the full
+        // workspace path; it fills the default slot only, below explicit config.
+        let embedderDefault = env["SUTANDO_DEFAULT_WORKSPACE"]?
+            .trimmingCharacters(in: .whitespaces)
+        if let ws = cfg["workspace"] as? [String: Any],
+           let path = ws["path"] as? String, !path.isEmpty {
+            return (path as NSString).expandingTildeInPath
+        }
+        if let emb = embedderDefault, !emb.isEmpty {
+            return (emb as NSString).expandingTildeInPath
+        }
+        if let r = root {
+            return (r as NSString).appendingPathComponent(hardcodedWorkspaceDefaultRel)
+        }
+        // No repo root: last-ditch default outside a checkout, deliberately not the
+        // removed `.sutando/workspace/`. Mirrors src/sutando_config.py.
+        return NSHomeDirectory() + "/sutando-workspace"
+    }
+
+    /// `<workspace>/sutando.config.local.json`, minus any `workspace` key. A parse
+    /// error throws as the repo-local file does; a workspace AT the repo root is read once.
+    private static func loadWorkspaceLayer(
+        _ repoCfg: [String: Any], root: String
+    ) throws -> [String: Any] {
+        let path = (workspaceFrom(repoCfg, root: root) as NSString)
+            .appendingPathComponent(localFilename)
+        let repoLocal = (root as NSString).appendingPathComponent(localFilename)
+        if (path as NSString).resolvingSymlinksInPath
+            == (repoLocal as NSString).resolvingSymlinksInPath {
+            return [:]
+        }
+        var layer = try loadJson(at: path)
+        if layer.removeValue(forKey: "workspace") != nil, !wsLayerWorkspaceKeyWarnPrinted {
+            wsLayerWorkspaceKeyWarnPrinted = true
+            FileHandle.standardError.write(Data((
+                "sutando config: <workspace>/sutando.config.local.json sets 'workspace', " +
+                "which it cannot change (that file is found BY the workspace). Ignoring " +
+                "the key; set workspace.path in the repo's sutando.config.local.json.\n"
+            ).utf8))
+        }
+        return layer
     }
 
     // ---------------------------------------------------------------------
@@ -220,31 +277,7 @@ enum SutandoConfig {
 
         let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
         let root = explicitRoot ?? cacheRepoRoot
-        // Optional embedder-provided default workspace (mirrors sutando_config.py):
-        // an embedder (e.g. the AG2 Space desktop app) passes the FULL workspace
-        // path via $SUTANDO_DEFAULT_WORKSPACE. Fills the default slot only —
-        // explicit workspace.path config wins. Parity keeps the native app side in
-        // the same workspace as the Python core + TS services.
-        let embedderDefault = ProcessInfo.processInfo
-            .environment["SUTANDO_DEFAULT_WORKSPACE"]?
-            .trimmingCharacters(in: .whitespaces)
-        let resolved: String
-        if let ws = cfg["workspace"] as? [String: Any],
-           let path = ws["path"] as? String, !path.isEmpty {
-            resolved = (path as NSString).expandingTildeInPath
-        } else if let emb = embedderDefault, !emb.isEmpty {
-            resolved = (emb as NSString).expandingTildeInPath
-        } else if let r = root {
-            resolved = (r as NSString).appendingPathComponent(hardcodedWorkspaceDefaultRel)
-        } else {
-            // Last-ditch fallback for ad-hoc invocations outside a checkout.
-            // Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06), the legacy
-            // `.sutando/workspace/` namespace is gone; use the unhidden
-            // `~/sutando-workspace/` default instead so the deprecated
-            // `.sutando/` alias doesn't live on indefinitely. Mirrors
-            // `src/sutando_config.py`'s no-config-no-repo-root branch.
-            resolved = NSHomeDirectory() + "/sutando-workspace"
-        }
+        let resolved = workspaceFrom(cfg, root: root)
 
         // .env drift warning (mirrors the Python + TS twins)
         if !dotenvDriftWarnPrinted {

@@ -20,7 +20,7 @@ That's it for a fresh clone — no setup, no env var, no config file. The direct
 
 `${REPO_DIR}` in any config string expands to the directory containing the config file (== git toplevel for a sane checkout).
 
-## The two config files
+## The config files
 
 **`sutando.config.json`** — tracked, shared across all clones. Defines the contract + defaults:
 
@@ -45,6 +45,8 @@ That's it for a fresh clone — no setup, no env var, no config file. The direct
 ```
 
 A sample is shipped as `sutando.config.local.json.example`. Copy + edit, or start from scratch — the loader tolerates any subset of fields.
+
+**`<workspace>/sutando.config.local.json`** — optional, per-user, highest layer. Same shape as the repo-local file, deep-merged over it (precedence: workspace file > repo `sutando.config.local.json` > `sutando.config.json`). Use it for settings that must survive an engine tree that is replaced on update (a desktop install): `vault.remote_url`, `vault.sync.exclude_extra`, `core.*`, and so on. It is read from the workspace the repo files resolve, so it **cannot set `workspace`** — that key is dropped with a one-time stderr warning; keep `workspace.path` in the repo-local file. Malformed JSON fails loudly, exactly as it does in the repo-local file. All three loaders (`src/sutando_config.{py,ts}`, `src/Sutando/SutandoConfig.swift`) apply it, so `bash scripts/sutando-config.sh <key>` and every script built on it see the merged value. The vault does not carry the file unless your `vault.sync.include` names it.
 
 Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation, so the `.example` file can carry inline documentation without affecting runtime.
 

@@ -8,9 +8,11 @@
  * task-bridge) land in the same workspace.
  *
  * Resolution order (highest layer wins, v0.8 — env override removed):
- *   1. `sutando.config.local.json` (per-clone override, gitignored)
- *   2. `sutando.config.json` (tracked defaults at repo root)
- *   3. Baked-in default (`{repo_root}/workspace`)
+ *   1. `<workspace>/sutando.config.local.json` (per-user, survives an engine
+ *      tree replaced on app update; its `workspace` key is dropped with a warning)
+ *   2. `sutando.config.local.json` (per-clone override, gitignored)
+ *   3. `sutando.config.json` (tracked defaults at repo root)
+ *   4. Baked-in default (`{repo_root}/workspace`)
  *
  * `$SUTANDO_WORKSPACE` is no longer honored. If set in the environment,
  * a one-time stderr warning fires pointing at `scripts/sutando-migrate.sh`
@@ -217,6 +219,7 @@ let _cacheRepoRoot: string | undefined;
 let _legacyEnvWarnPrinted = false;
 let _dotenvDriftWarnPrinted = false;
 let _unknownKeysWarnPrinted = false;
+let _wsLayerWorkspaceKeyWarnPrinted = false;
 
 /**
  * Wrap `msg` in bold-red ANSI when stderr is a TTY; pass through otherwise.
@@ -244,6 +247,7 @@ export function resetCacheForTests(): void {
 	_legacyEnvWarnPrinted = false;
 	_dotenvDriftWarnPrinted = false;
 	_unknownKeysWarnPrinted = false;
+	_wsLayerWorkspaceKeyWarnPrinted = false;
 }
 
 function warnUnknownTopLevelKeys(cfg: { [k: string]: Json }, path: string): void {
@@ -269,6 +273,7 @@ function warnUnknownTopLevelKeys(cfg: { [k: string]: Json }, path: string): void
  *
  * Throws only for parse errors (malformed JSON) or structurally-invalid
  * top-level (non-object). Missing files are tolerated and yield `{}`.
+ * The `<workspace>/sutando.config.local.json` layer goes on top.
  */
 export function loadConfig(repoRoot?: string): { [k: string]: Json } {
 	if (_cache !== undefined && (repoRoot === undefined || repoRoot === _cacheRepoRoot)) {
@@ -282,8 +287,9 @@ export function loadConfig(repoRoot?: string): { [k: string]: Json } {
 	}
 	const defaults = loadJsonFile(join(root, CONFIG_FILENAME));
 	const overrides = loadJsonFile(join(root, LOCAL_FILENAME));
-	const merged = deepMerge(defaults, overrides);
-	const expanded = expandVars(merged, root) as { [k: string]: Json };
+	const repoCfg = expandVars(deepMerge(defaults, overrides), root) as { [k: string]: Json };
+	const layer = expandVars(loadWorkspaceLayer(repoCfg, root), root) as { [k: string]: Json };
+	const expanded = deepMerge(repoCfg, layer);
 	_cache = expanded;
 	_cacheRepoRoot = root;
 	warnUnknownTopLevelKeys(expanded, join(root, CONFIG_FILENAME));
@@ -298,6 +304,60 @@ const HARDCODED_WORKSPACE_DEFAULT_REL = 'workspace';
 /** Home-relative last-ditch when no repo root is found (src/ installed outside a
  *  checkout). MUST equal workspace_default.py's _DEFAULT_SUBPATH. */
 export const LAST_DITCH_WORKSPACE_REL = 'sutando-workspace';
+
+/** `$SUTANDO_WORKSPACE` under `SUTANDO_TEST_MODE=1` only; production ignores it. */
+function testModeWorkspace(): string | undefined {
+	const envVal = process.env.SUTANDO_WORKSPACE?.trim();
+	if (envVal && process.env.SUTANDO_TEST_MODE === '1') return resolve(envVal.replace(/^~/, homedir()));
+	return undefined;
+}
+
+/**
+ * The workspace a repo-merged config names. Pure: no warnings, no disk reads.
+ * Shared by `resolveWorkspace` and the workspace config layer.
+ */
+function workspaceFrom(cfg: { [k: string]: Json }, root: string | undefined): string {
+	const testWs = testModeWorkspace();
+	if (testWs !== undefined) return testWs;
+	const ws = (cfg.workspace as { [k: string]: Json } | undefined)?.path;
+	// An embedder (e.g. a desktop app whose repo root is read-only) names the full
+	// workspace path; it fills the default slot only, below explicit config.
+	const embedderDefault = process.env.SUTANDO_DEFAULT_WORKSPACE?.trim();
+	if (typeof ws === 'string' && ws) return resolve(ws.replace(/^~/, homedir()));
+	if (embedderDefault) return resolve(embedderDefault.replace(/^~/, homedir()));
+	if (root === undefined) return resolve(join(homedir(), LAST_DITCH_WORKSPACE_REL));
+	return resolve(join(root, HARDCODED_WORKSPACE_DEFAULT_REL));
+}
+
+function realOrResolved(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return resolve(p);
+	}
+}
+
+/**
+ * `<workspace>/sutando.config.local.json`, minus any `workspace` key. Malformed
+ * JSON throws as the repo-local file does; a workspace AT the repo root is read once.
+ */
+function loadWorkspaceLayer(repoCfg: { [k: string]: Json }, root: string): { [k: string]: Json } {
+	const path = join(workspaceFrom(repoCfg, root), LOCAL_FILENAME);
+	if (realOrResolved(path) === realOrResolved(join(root, LOCAL_FILENAME))) return {};
+	const layer = { ...loadJsonFile(path) };
+	if ('workspace' in layer) {
+		delete layer.workspace;
+		if (!_wsLayerWorkspaceKeyWarnPrinted) {
+			_wsLayerWorkspaceKeyWarnPrinted = true;
+			process.stderr.write(
+				"sutando config: <workspace>/sutando.config.local.json sets 'workspace', " +
+					'which it cannot change (that file is found BY the workspace). Ignoring ' +
+					"the key; set workspace.path in the repo's sutando.config.local.json.\n",
+			);
+		}
+	}
+	return layer;
+}
 
 /**
  * Resolve the workspace directory per the canonical contract.
@@ -323,9 +383,8 @@ export function resolveWorkspace(repoRoot?: string): string {
 	// end users (no env override; warning + ignore) while letting the test
 	// suite redirect workspace to per-test tmp dirs without rewriting every
 	// test fixture. Production code MUST NOT set `SUTANDO_TEST_MODE`.
-	if (envVal && process.env.SUTANDO_TEST_MODE === '1') {
-		return resolve(envVal.replace(/^~/, homedir()));
-	}
+	const testWs = testModeWorkspace();
+	if (testWs !== undefined) return testWs;
 
 	if (envVal && !_legacyEnvWarnPrinted) {
 		_legacyEnvWarnPrinted = true;
@@ -347,23 +406,7 @@ export function resolveWorkspace(repoRoot?: string): string {
 
 	const cfg = loadConfig(repoRoot);
 	const root = repoRoot ?? _cacheRepoRoot;
-	const ws = (cfg.workspace as { [k: string]: Json } | undefined)?.path;
-	// Optional embedder-provided default workspace (mirrors sutando_config.py):
-	// an embedder (e.g. the AG2 Space desktop app) passes the FULL workspace path
-	// via $SUTANDO_DEFAULT_WORKSPACE. Fills the default slot only — explicit
-	// workspace.path config wins. Parity here keeps TS services (task-bridge,
-	// voice-agent, web-client) in the same workspace as the Python core.
-	const embedderDefault = process.env.SUTANDO_DEFAULT_WORKSPACE?.trim();
-	let resolved: string;
-	if (typeof ws === 'string' && ws) {
-		resolved = resolve(ws.replace(/^~/, homedir()));
-	} else if (embedderDefault) {
-		resolved = resolve(embedderDefault.replace(/^~/, homedir()));
-	} else if (root === undefined) {
-		resolved = resolve(join(homedir(), LAST_DITCH_WORKSPACE_REL));
-	} else {
-		resolved = resolve(join(root, HARDCODED_WORKSPACE_DEFAULT_REL));
-	}
+	const resolved = workspaceFrom(cfg, root);
 
 	// .env-drift warning: if `.env` still carries a stale SUTANDO_WORKSPACE line,
 	// surface it once per process so the operator can clean it up.
