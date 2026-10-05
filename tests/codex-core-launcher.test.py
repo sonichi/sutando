@@ -1806,7 +1806,7 @@ exit 0
         self.assertNotIn("send-keys", calls)
         self.assertFalse(done.exists())
 
-    # The #5006 frame: Codex rejected /startup, left it in the composer, idle footer below.
+    # Codex rejected /startup, left it in the composer, idle footer below.
     _REJECTED_STARTUP = (
         "\\342\\226\\240 Unrecognized command '/startup'. Type \"/\" for a list of supported commands.\\n\\n"
         "\\033[1m\\302\\273\\033[0m {composer}\\n\\n"

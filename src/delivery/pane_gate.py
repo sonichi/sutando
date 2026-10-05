@@ -128,7 +128,7 @@ CODEX = RuntimeAdapter(
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,
-    # Codex rejects Claude's /startup and leaves it in the composer (#5006).
+    # Codex rejects Claude's /startup and leaves it in the composer.
     automation_leftovers=("/startup",),
     pending_blocks_dispatch=True,
 )

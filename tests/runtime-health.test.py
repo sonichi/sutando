@@ -458,7 +458,7 @@ finally:
     rh._tmux_has_session = _oh
     rh._tmux_socket = _ot
 
-# 8) #5006: core-status says idle, but the Codex pane holds the queue behind a rejected
+# 8) core-status says idle, but the Codex pane holds the queue behind a rejected
 #    /startup. Driven through a stubbed tmux on PATH so the real capture + pane_gate run.
 _bt = tempfile.mkdtemp()
 _bin = os.path.join(_bt, "bin")

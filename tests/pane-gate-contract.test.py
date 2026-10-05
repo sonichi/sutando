@@ -910,7 +910,7 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         self.assertEqual((out.status, out.code), ("pending", 5), out.message)
 
 
-# #5006: Codex rejects /startup and leaves it in the composer above an idle footer.
+# Codex rejects /startup and leaves it in the composer above an idle footer.
 REJECTED_STARTUP = ("■ Unrecognized command '/startup'. Type \"/\" for a list of supported commands.\n\n"
                     f"\x1b[1m»\x1b[0m /startup\n\n{CODEX_157_FOOTER}\n")
 
