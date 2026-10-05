@@ -58,7 +58,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1485,7 +1485,7 @@ async function main() {
 				notify: (message) => {
 					console.error(`${ts()} [VoiceFailure] ${message}`);
 					try {
-						writeFileSync(join(WORKSPACE_DIR, 'results', `proactive-voice-model-reverted-${Date.now()}.txt`), message);
+						publishResultFile(`proactive-voice-model-reverted-${Date.now()}.txt`, message);
 					} catch (e) {
 						console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 					}
