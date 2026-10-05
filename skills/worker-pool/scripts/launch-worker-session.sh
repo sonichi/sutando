@@ -49,8 +49,18 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SESSION (spawn_worker.py always sets it)}"
 : "${SUTANDO_INSTANCE_ID:?launch-worker-session.sh needs SUTANDO_INSTANCE_ID (spawn_worker.py always sets it)}"
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
-# those are the canonical core's alone.
+# those are the canonical core's alone by default (multiple pool workers
+# sharing one Chrome/CDP session would race for the same tabs/profile). An
+# explicit per-instance opt-in (worker_surface_config.py, keyed on this same
+# SUTANDO_INSTANCE_ID that a recovery/restart reuses) is the one exception —
+# never a change to the default for workers in general.
 SURFACE_ARGS=()
+if [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
+  _wants_chrome="$("$PY" "$REPO/skills/worker-pool/scripts/worker_surface_config.py" wants-chrome \
+    "$SUTANDO_WORKSPACE_DIR" "$SUTANDO_INSTANCE_ID" 2>/dev/null)"
+  [ "$_wants_chrome" = "true" ] && SURFACE_ARGS+=(--chrome)
+  unset _wants_chrome
+fi
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
