@@ -322,6 +322,8 @@ export function migrateLegacyModel(configPath: string, now: Date = new Date()): 
 	return { migrated: true, backup, reason: 'moved from the old seeded default' };
 }
 
+/** Written by the voice switch tool: a model the user picked is never reverted. */
+export const MODEL_CHOSEN_KEY = 'modelChosenBySwitch';
 /** Written when a migrated install is put back on 3.1, so the revert also happens at most once. */
 export const MODEL_REVERT_KEY = 'modelMigrationReverted';
 
@@ -334,8 +336,8 @@ export interface ModelRevert {
 /**
  * Put a config the migration moved to 3.8 back on its old model, once, when 3.8 is unavailable.
  *
- * Only a config carrying the migration stamp and still on the migrated model is touched, so a
- * user who chose 3.8 themselves is never moved. The model comes from the `.bak-3.1` copy when it
+ * Only a config carrying the migration stamp and still on the migrated model is touched, and not
+ * one whose model the voice switch tool wrote, so a user who chose 3.8 themselves is not moved. The model comes from the `.bak-3.1` copy when it
  * names one; every other current key is kept. The migration stamp stays, so it never re-runs.
  */
 export function revertModelMigration(configPath: string, now: Date = new Date()): ModelRevert {
@@ -350,6 +352,7 @@ export function revertModelMigration(configPath: string, now: Date = new Date())
 	if (raw[MODEL_MIGRATION_KEY] === undefined) return { reverted: false, reason: 'not moved by the migration' };
 	if (raw[MODEL_REVERT_KEY] !== undefined) return { reverted: false, reason: 'already reverted once' };
 	if (raw.model !== MIGRATED_MODEL) return { reverted: false, reason: `model is ${String(raw.model)}, not the migrated one` };
+	if (raw[MODEL_CHOSEN_KEY] === raw.model) return { reverted: false, reason: 'model was chosen with the voice switch' };
 	let model = LEGACY_SEEDED_MODEL;
 	try {
 		const backupModel = JSON.parse(readFileSync(`${configPath}.bak-3.1`, 'utf-8'))?.model;

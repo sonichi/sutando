@@ -37,6 +37,18 @@ test('fireGuardedRestart spawns the guarded wrapper, detached', () => {
 	assert.ok(unrefd, 'child must be unref()d so the agent can exit');
 });
 
+test('fireGuardedRestart reports the wrapper exit code when asked', () => {
+	let exitHandler: ((code: number | null) => void) | undefined;
+	const fakeSpawn = (() => ({
+		unref: () => {},
+		on: (ev: string, cb: (code: number | null) => void) => { if (ev === 'exit') exitHandler = cb; },
+	})) as unknown as typeof spawn;
+	const seen: Array<number | null> = [];
+	fireGuardedRestart(fakeSpawn, (code) => seen.push(code));
+	exitHandler!(5);
+	assert.deepEqual(seen, [5]);
+});
+
 test('the wrapper path is the repo restart-voice-agent.sh and it exists', () => {
 	assert.match(GUARDED_RESTART_SCRIPT, /scripts[\\/]restart-voice-agent\.sh$/);
 	assert.ok(existsSync(GUARDED_RESTART_SCRIPT), `${GUARDED_RESTART_SCRIPT} missing`);

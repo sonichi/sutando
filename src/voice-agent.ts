@@ -320,7 +320,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // claim a new code-heavy workload benchmark. Phone inherits the
 // package default (2.5+search) unless its own config overrides it.
 import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning } from './voice-config.js';
-import { fireGuardedRestart } from './voice-config-switch.js';
+import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -1478,17 +1478,20 @@ async function main() {
 		const revertMigrationAndRestart = (): void => {
 			const r = revertModelMigration(VOICE_AGENT_CONFIG_PATH);
 			if (!r.reverted) return;
-			console.error(`${ts()} [VoiceFailure] ${VOICE_NATIVE_AUDIO_MODEL} unavailable; config put back on ${r.model} — restarting voice-agent`);
 			notifiedCategories.add('model_not_found');
-			try {
-				writeFileSync(
-					join(WORKSPACE_DIR, 'results', `proactive-voice-model-reverted-${Date.now()}.txt`),
-					`Voice model ${VOICE_NATIVE_AUDIO_MODEL} isn't available for your Gemini key, so voice went back to ${r.model} and is restarting.`,
-				);
-			} catch (e) {
-				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
-			}
-			fireGuardedRestart();
+			const outcome = restartAfterModelRevert(r, VOICE_NATIVE_AUDIO_MODEL, {
+				launchdManaged: isVoiceAgentLaunchdManaged(),
+				restart: (onExit) => fireGuardedRestart(undefined, onExit),
+				notify: (message) => {
+					console.error(`${ts()} [VoiceFailure] ${message}`);
+					try {
+						writeFileSync(join(WORKSPACE_DIR, 'results', `proactive-voice-model-reverted-${Date.now()}.txt`), message);
+					} catch (e) {
+						console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
+					}
+				},
+			});
+			console.error(`${ts()} [VoiceFailure] config put back on ${r.model}; ${outcome}`);
 		};
 		transport.onClose = (code?: number, reason?: string) => {
 			if (origOnClose) {
