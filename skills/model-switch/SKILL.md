@@ -29,6 +29,16 @@ persist every `/model` pick, so the file can lag the live session), else null.
 day on a live core: the send alone exited 0 while the CLI sat at the confirm dialog and the model had
 not changed — which is why the send is treated as initiation and the record follows acceptance.
 
+**A picker left on screen.** Right before the send the script writes an attribution record through
+`src/self_opened_gate.py` (`<workspace>/state/self-opened-gate.<session>.json`) and clears it once the
+CLI accepted or the script cancelled its own dialog. On exit 8 the record stays: if the send left a
+picker up (e.g. *"Enter to set as default · s to use this session only · Esc to cancel"*), the core
+supervisor (`src/core-input-watch.py`) presses Escape once after it has sat unchanged for
+`MODEL_SWITCH_PICKER_DISMISS_AFTER_S` (manifest default 300; env, then `--picker-dismiss-after`,
+override; 0 = never). A picker first seen outside the record's claim window, one someone is moving
+through, a picker with no record (a human opened it) and any usage/spend gate are never touched; until
+then the owner's chat card can still answer it.
+
 Defaults come from the runtime descriptor (`sutando-config.sh runtime`: `brain`, `socket`,
 `session`); `--brain/--socket/--session/--descriptor-file` and `SUTANDO_TMUX_*` are explicit
 overrides.

@@ -123,4 +123,17 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 33 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- #4389: a picker the switch may leave on screen is attributed to it, and only while it can be
+GREC="$T/state/self-opened-gate.sutando-core.json"; rm -f "$GREC"
+rc=$(run haiku); [ "$rc" = 0 ] && [ ! -e "$GREC" ] && ok "34 accepted: the picker attribution is cleared" || fail "34" "rc=$rc $(ls "$T/state")"
+rc=$(TMUX_DIALOG=1 run opus); [ "$rc" = 6 ] && [ ! -e "$GREC" ] && ok "35 dialog cancelled by the script itself: attribution cleared" || fail "35" "rc=$rc"
+rc=$(TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1); R=$(python3 -c "import json;d=json.load(open('$GREC'));print(d['opener'],d['kind'],d['dismiss_after_s'],d['claim_window_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "model-switch selection 300.0 32.0" ] && grep -q "dismissed after 300s" "$T/err" \
+  && ok "36 no acceptance (picker may remain): attribution kept, delay from the manifest (300s)" || fail "36" "rc=$rc R=$R"
+rc=$(MODEL_SWITCH_PICKER_DISMISS_AFTER_S=90 TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1); R=$(python3 -c "import json;print(json.load(open('$GREC'))['dismiss_after_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "90.0" ] && ok "37 env overrides the manifest delay" || fail "37" "rc=$rc R=$R"
+rc=$(MODEL_SWITCH_PICKER_DISMISS_AFTER_S=90 TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1 --picker-dismiss-after 0); R=$(python3 -c "import json;print(json.load(open('$GREC'))['dismiss_after_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "0.0" ] && ok "38 --picker-dismiss-after overrides env (0 = never dismiss)" || fail "38" "rc=$rc R=$R"
+rm -f "$GREC"; rc=$(run haiku --dry-run); [ "$rc" = 0 ] && [ ! -e "$GREC" ] && ok "39 --dry-run writes no attribution" || fail "39" "rc=$rc"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 39 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
