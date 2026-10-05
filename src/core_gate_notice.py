@@ -42,7 +42,7 @@ def card_line(queued: int) -> str:
 
 def queued_count(workspace: Path) -> int:
     try:
-        return len(task_queue.pending(workspace))
+        return len(task_queue.pending_files(workspace))
     except OSError:
         return 0
 
@@ -52,7 +52,9 @@ def notice_queued(manager, req, workspace: Path, state: str, kind: Optional[str]
     if manager is None or req is None:
         return []
     try:
-        pending = task_queue.pending(workspace)
+        files = {}
+        for p in task_queue.pending_files(workspace):
+            files.setdefault(activity_rows.task_from_file(p)[0]["id"], p)
     except OSError:
         return []
     with manager.store.locked():
@@ -60,15 +62,9 @@ def notice_queued(manager, req, workspace: Path, state: str, kind: Optional[str]
         if cur is None:
             return []
         seen = list((cur.subject or {}).get("queued_noticed") or [])
-        fresh = [t["id"] for t in pending if t["id"] not in seen]
+        fresh = [tid for tid in files if tid not in seen]
         if not fresh:
             return []
-        files = {}
-        for p in (workspace / "tasks").glob("task-*.txt"):
-            try:
-                files[activity_rows.task_from_file(p)[0]["id"]] = p
-            except OSError:
-                continue
         done = []
         for tid in fresh:
             try:
