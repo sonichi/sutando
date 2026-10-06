@@ -163,7 +163,12 @@ def parse_iso(value: str) -> float | None:
 
 
 def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]:
-    """(epoch, how) — header timestamp, else id epoch-ms, else mtime."""
+    """(epoch, how) — header timestamp, else id epoch-ms, else mtime.
+
+    Callers pass the STRICT (pre-`task:`) headers and the physical filename
+    stem here, never the lenient/body-fallback equivalents: a forged future
+    `timestamp` or epoch-bearing `id` reaching either fallback keeps a real
+    orphan permanently `fresh`, never reported (#4399, kewei-red, round 4)."""
     ts = parse_iso(headers.get("timestamp", ""))
     if ts is not None:
         return ts, "timestamp"
@@ -272,17 +277,26 @@ def _safe_line(build, *raw_parts: str) -> str:
     raise ValueError(f"could not make a safe line from {raw_parts!r}")
 
 
-def recovery_line(task_id: str, tier: str, label: str, age_s: int, text_preview: str) -> str:
+def recovery_line(file: str, task_id: str, tier: str, label: str, age_s: int,
+                  text_preview: str) -> str:
     """The exact preview bullet step 3 prints verbatim -- never reconstructed from raw
-    headers. `task_id` and `tier` come straight from a legacy/missing-header task's own
-    body (parse_task_headers_lenient's body-line fallback, canonical_access_tier's
-    pass-through of an unknown value); `label` and `preview` are already neutralized by
-    their own builders. `task_id` already carries its own `task-` prefix when the task
-    file has one (the `id:` header / filename stem) -- never add a second one."""
+    headers. `file` is the row's own `Path.name` -- a real glob result, so it is the one
+    identity nothing in the task's own content can forge, and it is what the re-queue
+    instruction (SKILL.md "Re-queueing") actually moves. `task_id` and `tier` come
+    straight from a legacy/missing-header task's own body (parse_task_headers_lenient's
+    body-line fallback, canonical_access_tier's pass-through of an unknown value) and are
+    shown alongside `file` only when they disagree with it (#4399, kewei-red 2026-10-06,
+    fourth round: the bullet never showed `file` at all, so the DM's own instruction to
+    requeue by it pointed the owner at nothing) -- `label` and `preview` are already
+    neutralized by their own builders."""
     age_m = max(0, age_s // 60)
-    return _safe_line(
-        lambda tid, t: f"- {tid} [{t}, {label}, {age_m}m ago]: {text_preview}",
-        task_id, tier)
+
+    def build(f: str, tid: str, t: str) -> str:
+        stem = f[:-len(".txt")] if f.endswith(".txt") else f
+        ident = f if tid == stem else f"{f} (claimed id: {tid})"
+        return f"- {ident} [{t}, {label}, {age_m}m ago]: {text_preview}"
+
+    return _safe_line(build, file, task_id, tier)
 
 
 def stalled_line(task_id: str, phase: str, idle_human: str) -> str:
@@ -352,10 +366,19 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
     parsed = ltp.parse_task_headers_lenient(text)
     headers = parsed.headers
+    # Headers found strictly before `task:` -- a missing-header task's own
+    # body cannot promote itself into this set the way the union parser does.
+    strict_headers = ltp.parse_task_headers(text).headers
     task_id = (headers.get("id") or path.stem).strip()
-    queued_at, age_from = task_queued_at(headers, task_id, path)
+    # Nothing in the task's own content can forge this. Every lookup that can
+    # archive, suppress, or bind a task uses it, never the header `task_id`.
+    physical_id = path.stem
+    queued_at, age_from = task_queued_at(strict_headers, physical_id, path)
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
+    # Same split for the silent-archive gate: only a header found before
+    # `task:` may route a task to silent, unreported destruction.
+    trusted_source = (strict_headers.get("source") or "").strip()
     tier = ltp.canonical_access_tier(headers.get("access_tier") or "owner")
     label = channel_label(headers)
     task_preview = preview(parsed.body)
@@ -363,16 +386,17 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         "file": path.name,
         "id": task_id,
         "source": source,
+        "trusted_source": trusted_source,
         "access_tier": tier,
         "channel_id": headers.get("channel_id") or headers.get("chat_id") or "",
         "label": label,
         "preview": task_preview,
         "age_s": age_s,
-        "recovery_line": recovery_line(task_id, tier, label, age_s, task_preview),
+        "recovery_line": recovery_line(path.name, task_id, tier, label, age_s, task_preview),
         "age_from": age_from,
         "import": False,
     }
-    marker = completion_marker(workspace / "results", task_id)
+    marker = completion_marker(workspace / "results", physical_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
         return row
@@ -380,7 +404,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     # holder_of raises on any stat failure but ENOENT; an unreadable deliveries/
     # must not read as "nobody holds it".
     try:
-        holder = _holder_of(workspace, task_id)
+        holder = _holder_of(workspace, physical_id)
     except OSError as exc:
         row["unknown_line"] = unknown_line(task_id, str(exc))
         row.update(verdict="unknown",
@@ -403,8 +427,9 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         present = updated is not None
         if present:
             row["import_task_id"] = status_task
-        # The status is THIS task's run only by identity, never by timestamp.
-        bound = present and status_task is not None and status_task == task_id
+        # Bound by physical identity, never the header `task_id`: a forged
+        # `id` equal to another request's real id must not bind its status.
+        bound = present and status_task is not None and status_task == physical_id
         # A status with no task_id that post-dates the task may be its run or
         # another's: not enough to archive, enough to report.
         unbound = present and status_task is None and updated >= queued_at
@@ -415,7 +440,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         if bound and phase in IMPORT_TERMINAL_PHASES:
             row.update(verdict="done",
                        reason=f"import run ended: data/claude-import/status.json phase {phase} "
-                              f"(terminal), bound to this task (task_id {task_id})")
+                              f"(terminal), bound to this task (task_id {physical_id})")
             return row
         if bound and idle_s >= IMPORT_STALL_S:
             row["stalled_line"] = stalled_line(task_id, phase, idle_human(idle_s))
@@ -482,8 +507,8 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
             # Unreadable headers mean no tier/preview; path.name is the one safe fact.
             # "owner" matches the documented default for an absent/unknown tier.
             row = {"file": path.name, "id": path.stem, "access_tier": "owner",
-                   "source": "", "label": "DM", "age_s": 0,
-                   "recovery_line": recovery_line(path.stem, "owner", "DM", 0,
+                   "source": "", "trusted_source": "", "label": "DM", "age_s": 0,
+                   "recovery_line": recovery_line(path.name, path.stem, "owner", "DM", 0,
                                                   neutralize(f"(unreadable: {exc})")),
                    "verdict": "orphan",
                    "reason": f"unreadable task file ({exc}); treated as orphan"}
@@ -535,7 +560,9 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
         if verdict == "done":
             archive.append(row["file"])
         elif verdict == "orphan":
-            if (row.get("source") or "").strip() in ("voice", "phone"):
+            # `trusted_source`, never the forgeable display `source`: this
+            # gate silently destroys the task, with no DM and no requeue line.
+            if (row.get("trusted_source") or "").strip() in ("voice", "phone"):
                 silent_archive.append(row["file"])
             else:
                 deferred.append(row)

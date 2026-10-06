@@ -763,10 +763,12 @@ class TestRecoveryLineIdTierNeutralization(ClassifyBase):
         parse_markers = _parse_markers()
         for keyword in ("file", "send", "attach", "deduped", "channel", "no-send", "reply"):
             with self.subTest(field="access_tier", keyword=keyword):
-                line = self.mod.recovery_line("task-1", f"{keyword}: /tmp/x]", "DM", 900, "hi")
+                line = self.mod.recovery_line("task-1.txt", "task-1", f"{keyword}: /tmp/x]",
+                                              "DM", 900, "hi")
                 self.assertEqual(parse_markers(line).actions, [], line)
             with self.subTest(field="id", keyword=keyword):
-                line = self.mod.recovery_line(f"[{keyword}: /tmp/x]", "owner", "DM", 900, "hi")
+                line = self.mod.recovery_line("task-1.txt", f"[{keyword}: /tmp/x]", "owner",
+                                              "DM", 900, "hi")
                 self.assertEqual(parse_markers(line).actions, [], line)
 
     def test_recovery_line_is_what_classify_task_actually_returns(self):
@@ -778,11 +780,12 @@ class TestRecoveryLineIdTierNeutralization(ClassifyBase):
                      f"timestamp: {iso(NOW - 900)}\nsource: chat\nchannel_id: 149041\n"
                      "task: hello there\n")
         row = self.one()
-        expected = self.mod.recovery_line(row["id"], row["access_tier"], row["label"],
-                                          row["age_s"], row["preview"])
+        expected = self.mod.recovery_line(row["file"], row["id"], row["access_tier"],
+                                          row["label"], row["age_s"], row["preview"])
         self.assertEqual(row["recovery_line"], expected)
-        # `id` already carries its own `task-` prefix; never a second one.
-        self.assertTrue(row["recovery_line"].startswith("- task-1700000000002 [owner, "))
+        # `file` (not the bare `id`) leads the bullet when they agree -- the
+        # physical name is what "Re-queueing" tells the owner to move back.
+        self.assertTrue(row["recovery_line"].startswith("- task-1700000000002.txt [owner, "))
 
     def test_empty_preview_does_not_crash_the_classifier(self):
         """kewei-red (2026-10-06): a line ending `": "` had its trailing space
@@ -790,8 +793,8 @@ class TestRecoveryLineIdTierNeutralization(ClassifyBase):
         matched and recovery_line() raised on every retry -- aborting the
         whole classify_workspace() pass, even for an orphan with an empty ask
         and a completion marker already recorded."""
-        self.assertEqual(self.mod.recovery_line("task-1", "owner", "DM", 900, ""),
-                         "- task-1 [owner, DM, 15m ago]: ")
+        self.assertEqual(self.mod.recovery_line("task-1.txt", "task-1", "owner", "DM", 900, ""),
+                         "- task-1.txt [owner, DM, 15m ago]: ")
         self.ws.task("task-empty.txt",
                      "id: task-empty\naccess_tier: owner\n"
                      f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask:\n")
@@ -830,14 +833,14 @@ class TestImportLineNeutralization(ClassifyBase):
                          f"attachment action reached the unbound line: {row['unbound_line']!r}")
 
     def test_forged_id_through_import_stalled_is_inert(self):
-        # Bound (status.json's task_id matches the task's own forged id) and
-        # frozen past the stall bound.
+        # Bound by the task's PHYSICAL filename, never its forged header
+        # `id` (#4399 round 4) -- and frozen past the stall bound.
         stall_s = self.mod.IMPORT_STALL_S
         self.ws.task("task-legacy-stalled.txt",
                      f"timestamp: {iso(NOW - stall_s - 70)}\nsource: chat\n"
                      f"channel_id: {self.mod.IMPORT_CHANNEL}\ntask: onboarding\n"
                      f"id: {self.FORGED_ID}\n")
-        self.ws.status("scanning", NOW - stall_s - 60, task_id=self.FORGED_ID)
+        self.ws.status("scanning", NOW - stall_s - 60, task_id="task-legacy-stalled")
         row = self.one()
         self.assertEqual(row["verdict"], "import-stalled", row)
         parse_markers = _parse_markers()
@@ -1092,6 +1095,25 @@ class TestCli(unittest.TestCase):
         self.assertEqual(out["counts"], {"orphan": 1, "total": 1})
         self.assertEqual(out["tasks"][0]["import_task_id"], OLDER_RUN_ID)
 
+    def test_plan_flag_end_to_end_matches_recovery_plan_exactly(self):
+        """Item 3 (kewei-red, round 4): nothing exercised `--plan` end to end
+        through the real CLI process SKILL.md step 3 actually invokes -- she
+        changed only that line from `classify.py --plan` to `classify.py` and
+        all 93 classifier tests (plus 16 import/skill tests) stayed green.
+        This shells out to the real script, the way the skill does, and pins
+        its JSON against `recovery_plan()` itself -- the behavioral half of
+        the pair (TestSkillInvokesPlanMode pins the doc's own text)."""
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 1801))
+        self.ws.status("staged", NOW - 1701, task_id=OLDER_RUN_ID)  # -> deferred (orphan)
+        res = self.run_cli("--workspace", str(self.ws.root), "--now", str(NOW), "--plan")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cli_out = json.loads(res.stdout)
+        self.assertEqual(set(cli_out), {"archive", "silent_archive", "body"})
+        direct = _load().recovery_plan(self.ws.root, NOW)
+        self.assertEqual(cli_out, direct)
+        self.assertEqual(cli_out["archive"], [f"{IMPORT_ID}.txt"])
+        self.assertIsNotNone(cli_out["body"])
+
     def test_workspace_resolved_through_sutando_config(self):
         mod = _load()
         fake = types.SimpleNamespace(stdout=f"{self.ws.root}\n", returncode=0)
@@ -1186,6 +1208,201 @@ class TestWorkerHeld(ClassifyBase):
         self.held_task()
         self.assertFalse((self.ws.root / "deliveries").exists())
         self.assertEqual(self.one()["verdict"], "orphan")
+
+
+class TestTrustedIdentityNotBodyForgeable(ClassifyBase):
+    """#4399 blocker, fourth round (kewei-red, exact head ed9881b93): the
+    round-3 fix made `recovery_plan()` archive by the row's own `file`, but
+    `classify_task()` still fed the HEADER-derived `task_id` -- forgeable on
+    any legacy/missing-header task via `parse_task_headers_lenient`'s own
+    documented body-line fallback -- into the completion-marker lookup,
+    `worker_delivery.holder_of`, and the import status binding, all BEFORE
+    recovery_plan's file-based logic ever runs. Same for the display `source`
+    field feeding the silent-archive gate, and the lenient `timestamp`/`id`
+    feeding the age computation. Each test below reproduces her exact repro
+    against the FIXED code (verdict must no longer be silently destroyed/
+    suppressed/hidden), paired with a positive control proving the forged
+    field really would have done so under the pre-fix recipe."""
+
+    def test_forged_id_cannot_shadow_an_unrelated_results_file(self):
+        """Her repro 1: physical `tasks/task-victim.txt`, body fallback
+        `id: task-already-done`, an unrelated real `results/task-already-done.txt`.
+        Pre-fix: marker found -> DONE -> silently archived, the real request
+        never answered. Fixed: the marker lookup keys on the physical name."""
+        self.ws.task("task-victim.txt",
+                     f"timestamp: {iso(NOW - 900)}\nsource: chat\n"
+                     "task: please answer me\nid: task-already-done\n")
+        (self.ws.root / "results" / "task-already-done.txt").write_text("done\n")
+        row = self.one()
+        self.assertEqual(row["id"], "task-already-done", "precondition: the forge reached the raw field")
+        self.assertEqual(row["verdict"], "orphan", row)
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["archive"], ["task-victim.txt"])
+        self.assertIsNotNone(plan["body"], "the victim must reach the recovery DM, never vanish")
+
+    def test_control_the_forged_id_really_does_match_an_unrelated_marker(self):
+        """Positive control: completion_marker() keyed on the forgeable field
+        (what the pre-fix call site passed) really does find the shadow
+        marker -- the fixed test above is a finding, not a vacuous zero."""
+        (self.ws.root / "results" / "task-already-done.txt").write_text("done\n")
+        self.assertTrue(self.mod.completion_marker(self.ws.root / "results", "task-already-done"))
+
+    def test_traversal_shaped_id_cannot_reach_worker_delivery(self):
+        """Her repro 2: body fallback `id: ../../notes/secret`, one real
+        `deliveries/worker-a/` directory, and an unrelated real
+        `notes/secret.txt`. Pre-fix: worker_delivery.holder_of's filesystem
+        check resolved the forged id outside deliveries/ onto that file ->
+        worker-held -> suppressed from the recovery DM entirely. Fixed: the
+        holder lookup keys on the physical name."""
+        (self.ws.root / "notes").mkdir()
+        (self.ws.root / "deliveries" / "worker-a").mkdir(parents=True)
+        self.ws.task("task-traversal2.txt",
+                     f"timestamp: {iso(NOW - 900)}\nsource: chat\n"
+                     "task: please answer me\nid: ../../notes/secret\n")
+        (self.ws.root / "notes" / "secret.txt").write_text("do not suppress me")
+        row = self.one()
+        self.assertEqual(row["id"], "../../notes/secret", "precondition: the forge reached the raw field")
+        self.assertEqual(row["verdict"], "orphan", row)
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["archive"], ["task-traversal2.txt"])
+        self.assertIsNotNone(plan["body"])
+
+    def test_control_the_traversal_id_really_does_resolve_through_holder_of(self):
+        """Positive control: worker_delivery.holder_of() keyed on the
+        forgeable field (what the pre-fix call site passed) really does
+        resolve outside deliveries/ onto the unrelated file."""
+        pool_scripts = REPO / "skills" / "worker-pool" / "scripts"
+        sys.path.insert(0, str(pool_scripts))
+        try:
+            import worker_delivery  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(pool_scripts))
+        (self.ws.root / "notes").mkdir()
+        (self.ws.root / "notes" / "secret.txt").write_text("x")
+        (self.ws.root / "deliveries" / "worker-a").mkdir(parents=True)
+        self.assertEqual(worker_delivery.holder_of(self.ws.root, "../../notes/secret"), "worker-a")
+
+    def test_forged_source_cannot_silently_destroy_an_orphan(self):
+        """Her repro 3: no real `source:` header anywhere (it only appears
+        after `task:`, so the lenient fallback -- not a real header -- is
+        what supplied it); recovery_plan used to read the display `source`
+        field and silently archive a "voice"/"phone" orphan with no DM and
+        no requeue line. Fixed: the gate reads the STRICT (pre-`task:`-only)
+        source, which is empty here, so the row is reported, not destroyed."""
+        self.ws.task("task-source-forged.txt",
+                     f"timestamp: {iso(NOW - 900)}\n"
+                     "task: please answer me\nsource: voice\n")
+        row = self.one()
+        self.assertEqual(row["source"], "voice", "precondition: the forge reached the display field")
+        self.assertEqual(row["trusted_source"], "", "no real header exists before `task:`")
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["silent_archive"], [], "must not be silently destroyed")
+        self.assertEqual(plan["archive"], ["task-source-forged.txt"])
+        self.assertIsNotNone(plan["body"])
+
+    def test_control_the_display_source_alone_would_have_silently_archived_it(self):
+        """Positive control: the exact pre-fix predicate (`row["source"]` in
+        ("voice", "phone")) really does match the forged row above."""
+        self.ws.task("task-source-forged.txt",
+                     f"timestamp: {iso(NOW - 900)}\n"
+                     "task: please answer me\nsource: voice\n")
+        row = self.one()
+        self.assertIn((row["source"] or "").strip(), ("voice", "phone"),
+                     "the oracle failed to fire on a known-unsafe predicate")
+
+    def test_forged_future_timestamp_cannot_keep_a_real_orphan_fresh_forever(self):
+        """Her repro 4: no real `timestamp:` header before `task:`; a body
+        line claims a future stamp instead. Pre-fix: the lenient parse
+        trusted it, giving age_s == 0 and verdict `fresh` forever, however
+        old the file really is. Fixed: a timestamp found only after `task:`
+        is not trusted, so age falls back to mtime (set here to 3 real days
+        old) and the task is correctly flagged an orphan."""
+        future = iso(NOW + 3600)
+        p = self.ws.task("task-future.txt",
+                         f"source: chat\ntask: please answer me\ntimestamp: {future}\n")
+        os.utime(p, (NOW - 3 * 86400, NOW - 3 * 86400))
+        row = self.one()
+        self.assertEqual(row["age_from"], "mtime",
+                        "no real header exists before `task:` -- the forged stamp must not be trusted")
+        self.assertEqual(row["age_s"], 3 * 86400)
+        self.assertEqual(row["verdict"], "orphan")
+
+    def test_control_the_lenient_timestamp_alone_reads_as_fresh_forever(self):
+        """Positive control: the lenient (body-fallback) header dict the
+        pre-fix call site passed to task_queued_at() really does hand back
+        the forged future stamp as the age source."""
+        future = iso(NOW + 3600)
+        text = f"source: chat\ntask: please answer me\ntimestamp: {future}\n"
+        lenient = self.mod.ltp.parse_task_headers_lenient(text)
+        epoch, how = self.mod.task_queued_at(lenient.headers, "task-future", Path("/nonexistent"))
+        self.assertEqual(how, "timestamp")
+        self.assertEqual(epoch, NOW + 3600,
+                         "the oracle failed to fire on a known-unsafe predicate")
+
+    def test_recovery_line_shows_the_physical_file_not_just_the_forged_id(self):
+        """Item 2 (kewei-red, round 4): the DM's own instruction says to
+        requeue by the filename shown in the preview line, but the bullet
+        never rendered `file` at all -- only the (forgeable) `id`. Pin that
+        the bullet now carries the real, movable filename, and keeps the
+        claimed id visible (never silently dropped) when it disagrees."""
+        self.ws.task("task-mismatch.txt",
+                     f"timestamp: {iso(NOW - 900)}\nsource: chat\n"
+                     "task: hello\nid: ../../notes/secret\n")
+        row = self.one()
+        self.assertTrue(row["recovery_line"].startswith("- task-mismatch.txt "), row["recovery_line"])
+        self.assertIn("claimed id: ../../notes/secret", row["recovery_line"])
+
+    def test_recovery_line_omits_the_claimed_id_when_it_agrees_with_the_file(self):
+        """Control: the common, well-formed case (id matches the file's own
+        stem) shows just the filename -- no redundant "(claimed id: ...)"."""
+        self.ws.task("task-ok.txt",
+                     f"id: task-ok\ntimestamp: {iso(NOW - 900)}\nsource: chat\ntask: hello\n")
+        row = self.one()
+        self.assertEqual(row["recovery_line"],
+                        "- task-ok.txt [owner, DM, 15m ago]: hello")
+
+
+class TestSkillInvokesPlanMode(unittest.TestCase):
+    """Item 3 (kewei-red, round 4): the `--plan` delegation had no pin --
+    changing SKILL.md step 3's command from `classify.py --plan` to
+    `classify.py` left all 93 classifier tests and the 16 import/skill tests
+    green, because nothing read the doc's own text. This is a DATA pin
+    (REVIEW.md criterion 14's structural-duplication exception, labeled as
+    one): it asserts on SKILL.md's literal content, never on behavior, and is
+    paired with TestCli.test_plan_flag_end_to_end_matches_recovery_plan_exactly
+    -- the behavioral test of the unit this doc delegates to."""
+
+    SKILL_MD = REPO / "skills" / "task-orphan-check" / "SKILL.md"
+
+    def setUp(self):
+        self.text = self.SKILL_MD.read_text()
+        self.step3 = self.text.split("### Step 3", 1)[1].split("### Step 4", 1)[0]
+        self.step4 = self.text.split("### Step 4", 1)[1].split("### Step 5", 1)[0]
+
+    def test_step_3_invokes_plan_mode(self):
+        self.assertIn("classify.py --plan", self.step3)
+        self.assertIn("do not construct an archive move or the recovery body by hand", self.step3)
+
+    def test_step_3_consumes_archive_silent_archive_and_body_without_rederiving(self):
+        for key in ("`archive`", "`silent_archive`", "`body`"):
+            self.assertIn(key, self.step3, key)
+
+    def test_step_3_writes_the_result_before_any_archive_move(self):
+        """Item 2's ordering fix: the result write must be listed (and
+        therefore performed) before either archive move, so a write failure
+        never strands an already-archived, notification-dependent orphan."""
+        write_pos = self.step3.index("proactive-orphan-recovery-${ts}")
+        archive_pos = self.step3.index('mv "$WS/tasks/$name" "$WS/tasks/archive/$name"')
+        silent_pos = self.step3.index("same move, no result write")
+        self.assertLess(write_pos, archive_pos)
+        self.assertLess(write_pos, silent_pos)
+
+    def test_step_3_and_step_4_resolve_paths_under_the_workspace(self):
+        """Item 2's path fix: every move target is resolved under `$WS`,
+        never the bare `tasks/...` that only works when cwd == workspace."""
+        self.assertIn('mv "$WS/tasks/$name" "$WS/tasks/archive/$name"', self.step3)
+        self.assertNotIn('mv "tasks/$name"', self.step3)
+        self.assertIn("$WS/tasks/archive/", self.step4)
 
 
 if __name__ == "__main__":
