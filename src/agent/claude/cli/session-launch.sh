@@ -75,7 +75,7 @@ claude_named_process_running() {
 
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
-  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
 }
 
 claude_named_session_running() {
@@ -304,6 +304,15 @@ resolve_claude_credential_proxy() {
       echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
+}
+
+# Appends --plugin-dir for each enabled skill's Claude plugin to SURFACE_ARGS.
+# Reads REPO, PY.
+add_skill_claude_plugins() {
+  declare -F skill_manifest_claude_plugins >/dev/null || return 0
+  while IFS= read -r -d '' _plugin_dir; do
+    SURFACE_ARGS+=(--plugin-dir "$_plugin_dir")
+  done < <(skill_manifest_claude_plugins "$REPO" "$PY")
 }
 
 # Any installed skill's manifest.json "config" block, forwarded the same way

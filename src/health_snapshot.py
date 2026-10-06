@@ -23,6 +23,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
+import gateway_serving
+import pool_suspension
+import runtime_observation
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
 
@@ -41,6 +44,15 @@ WEDGE_MOTION_FRESH_S = 30.0
 POOL_STALE_S = 900.0
 ACTIVITY_LIVE_S = 120.0
 ACTIVITY_TAIL_BYTES = 256 * 1024
+# health-check's window for a gateway-status sidecar; the bridge rewrites it on every poll.
+GATEWAY_STALE_S = 180.0
+
+# Pane-derived claims a later completed model request disproves; every other reason stands.
+PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
+                               "api-error", "network-error"})
+
+# Observation phases with no model request in flight.
+RETRY_DISPROVING_PHASES = frozenset({"idle", "waiting", "failed"})
 
 # core-input-watch states → (motion, condition, reason). A blocked-human reason is refined from `kind`.
 SUPERVISOR = {
@@ -111,6 +123,17 @@ def _heartbeat_source(ws: Path, now: float, path: Path | None = None) -> dict:
     if now - mtime > HEARTBEAT_STALE_S or mtime - now > BEAT_FUTURE_TOLERANCE_S:
         return {**src, "value": "stale", "opinion": _opinion(None, ABNORMAL, "offline", mtime)}
     return {**src, "value": "fresh", "opinion": None}
+
+
+def _core_seen_since(ws: Path, supervisor: dict, heartbeat: dict) -> bool:
+    """True when a fresh beat written after a `crashed` verdict saw a live core pane: the
+    beat records the core's pid only when tmux shows one, else its own pid."""
+    if ((supervisor.get("opinion") or {}).get("reason") != "crashed" or heartbeat.get("value") != "fresh"
+            or supervisor["age_s"] is None or supervisor["age_s"] <= heartbeat["age_s"]):
+        return False
+    beat, _ = _read_json(ws / heartbeat["path"])
+    return (isinstance(beat, dict) and isinstance(beat.get("pid"), int)
+            and beat.get("pid") != beat.get("heartbeat_pid"))
 
 
 def _status_source(ws: Path, now: float) -> dict:
@@ -225,8 +248,62 @@ def _pool_source(entry, sampled_at, now: float) -> dict:
     return {**src, "opinion": None}
 
 
-def _alive(beat: dict):
-    """True / False from a beat source, None when there is no beat to judge."""
+def _observation(ws: Path, now: float, seat: str, session, started=None):
+    """(source, record): the record only when it counts as evidence about this seat's current run."""
+    path = runtime_observation.record_path(ws, seat)
+    src = {"path": _rel(path, ws), "age_s": None, "value": None, "opinion": None}
+    rec, _why = runtime_observation.load(ws, seat, now)
+    if rec is None:
+        return src, None
+    src["age_s"] = _age(rec["heartbeat_at"], now)
+    # A record from another tmux session, or from before this worker's current incarnation, is not about this run.
+    if session and rec["session"] != session:
+        return src, None
+    if started is not None and rec["observer_started_at"] < started:
+        return {**src, "value": {"previous_run": True}}, None
+    abnormal = rec["condition"] == ABNORMAL
+    last_success = rec["last_success_at"]
+    value = {"phase": rec["phase"], "observer": rec["observer"], "observer_version": rec["observer_version"],
+             "seq": rec["seq"], "heartbeat_age_s": src["age_s"],
+             "last_success_age_s": None if last_success is None else _age(last_success, now)}
+    op = _opinion(None if rec["motion"] == UNKNOWN else rec["motion"],
+                  None if rec["condition"] == UNKNOWN else rec["condition"],
+                  rec["reason"] if abnormal else None,
+                  rec["condition_since"] if abnormal else None)
+    return {**src, "value": value, "opinion": op}, rec
+
+
+def _supersede(sources: dict, rec, now: float) -> dict:
+    """A completed model request after a pane-derived claim disproves the claim."""
+    if rec is None:
+        return sources
+    out = dict(sources)
+    for name in ("supervisor", "cli_wedge"):
+        src = out.get(name)
+        op = src.get("opinion") if src else None
+        if not op or op["condition"] != ABNORMAL:
+            continue
+        claimed = op["since"] if op["since"] is not None else (
+            None if src.get("age_s") is None else now - src["age_s"])
+        newer_success = (rec["last_success_at"] is not None and claimed is not None
+                         and claimed < rec["last_success_at"])
+        # A retry loop needs a request in flight. Its claim time is the window's run start, not
+        # when retry text appeared, so a newer success proves nothing about it.
+        if name == "cli_wedge" and op["reason"] == "retry-loop":
+            drop = rec["phase"] in RETRY_DISPROVING_PHASES
+        else:
+            drop = op["reason"] in PANE_SUPERSEDABLE and newer_success
+        if drop:
+            out[name] = {**src, "value": {**(src["value"] if isinstance(src["value"], dict) else {}),
+                                          "superseded_by": "observation"}, "opinion": None}
+    return out
+
+
+def _alive(beat: dict, supervisor: dict | None = None):
+    """True / False from a beat source, None when there is no beat to judge. A current
+    `crashed` verdict is False: the beat's writer can outlive the session it vouches for."""
+    if ((supervisor or {}).get("opinion") or {}).get("reason") == "crashed":
+        return False
     return {"fresh": True, "stale": False}.get(beat.get("value"))
 
 
@@ -237,7 +314,10 @@ def _verdict(agent: dict, sources: dict) -> dict:
     # A dead agent's last words (e.g. a supervisor file left at idle-ready) say nothing now.
     offline = next((o for o in ops if o["reason"] == "offline"), None)
     if offline:
-        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": "offline", "since": offline["since"]}
+        # The pool giving up is fresher news about the same death, and it needs a person.
+        dead = next((o for o in ops if o["reason"] == "not-answering"), offline)
+        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": dead["reason"],
+                "since": dead["since"] if dead["since"] is not None else offline["since"]}
     motions = {o["motion"] for o in ops if o["motion"]}
     bad = [o for o in ops if o["condition"] == ABNORMAL]
     good = [o for o in ops if o["condition"] == HEALTHY]
@@ -291,6 +371,45 @@ def _worker_supervisor_paths(ws: Path) -> dict:
     return out
 
 
+def _instance(ws: Path, now: float):
+    """The identity a serving gateway lane signed in as; None when no lane is serving or serving
+    lanes disagree, since a wrong identity would show this Mac twice."""
+    ids = set()
+    for path in (ws / "state").glob("gateway-status*.json"):
+        value, _ = _read_json(path)
+        verdict = gateway_serving.verdict_from_record(value, now=now, max_age=GATEWAY_STALE_S)
+        agent_id = value.get("agent_id") if isinstance(value, dict) else None
+        if verdict and verdict.serving and isinstance(agent_id, str) and agent_id:
+            ids.add(agent_id)
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _suspension(ws: Path):
+    try:
+        return pool_suspension.read(ws)
+    except OSError:
+        return None
+
+
+def _suspended(rec):
+    """{reason, at} while the worker pool is suspended, else None."""
+    return {"reason": rec["reason"], "at": rec["at"]} if rec else None
+
+
+def _stopped_by_suspension(row: dict, rec) -> dict:
+    """A worker the suspension took down is not alive, whatever its files last said:
+    a quit kills the tmux server before any seat can record its own end."""
+    return {**row, "alive": False, "motion": UNKNOWN, "condition": UNKNOWN,
+            "reason": "suspended", "since": rec["at"]}
+
+
+def _session(path):
+    """The tmux session a beat or supervisor file names, or None."""
+    value, _ = _read_json(path) if path else (None, None)
+    session = value.get("session") if isinstance(value, dict) else None
+    return session if isinstance(session, str) and session else None
+
+
 def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=None) -> dict:
     """The health snapshot. `agent`: all | core | workers | <worker id>. `view`: summary | full."""
     if view not in VIEWS:
@@ -298,19 +417,30 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
     ws = Path(workspace) if workspace is not None else Path(resolve_workspace())
     now = time.time() if now is None else now
     workers = _workers(ws)
+    suspension = _suspension(ws)
+    stopped = set(suspension["stopped"]) if suspension else set()
     activity = _activity_by_agent(ws, now, [w[0] for w in workers])
     agents = []
 
     if agent in ("all", "core"):
-        sources = {
-            "supervisor": _supervisor_source(Path(status_read_path("core-supervisor.json", ws)), ws, now),
+        supervisor = _supervisor_source(Path(status_read_path("core-supervisor.json", ws)), ws, now)
+        heartbeat = _heartbeat_source(ws, now)
+        if _core_seen_since(ws, supervisor, heartbeat):
+            supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "superseded": True},
+                          "opinion": None}
+        session = (_session(ws / "state" / "cores" / f"{_host_label()}.alive")
+                   or _session(Path(status_read_path("core-supervisor.json", ws))))
+        observation, obs_rec = _observation(ws, now, "core", session)
+        sources = _supersede({
+            "supervisor": supervisor,
+            "observation": observation,
             "cli_wedge": _wedge_source(ws, now),
-            "heartbeat": _heartbeat_source(ws, now),
+            "heartbeat": heartbeat,
             "activity": _activity_source("core", activity, now),
             "self_report": _status_source(ws, now),
-        }
-        agents.append((_verdict({"id": "core", "role": "core", "label": None,
-                                 "alive": _alive(sources["heartbeat"])}, sources), sources))
+        }, obs_rec, now)
+        agents.append((_verdict({"id": "core", "role": "core", "label": None, "session": session,
+                                 "alive": _alive(sources["heartbeat"], sources["supervisor"])}, sources), sources))
 
     if agent != "core":
         pool, pool_mtime = _read_json(ws / "state" / "pool-supervision.json")
@@ -329,22 +459,28 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             if seat and started is not None and supervisor["age_s"] is not None and now - supervisor["age_s"] < started:
                 supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "previous_run": True},
                               "opinion": None}
-            sources = {
+            observation, obs_rec = _observation(ws, now, wid, _session(seat), started)
+            sources = _supersede({
                 "supervisor": supervisor,
+                "observation": observation,
                 "watcher_beat": _heartbeat_source(ws, now, ws / "state" / "watchers" / f"{wid}.alive"),
                 "pool": _pool_source((pool_rows or {}).get(wid), sampled, now),
                 "roster": {"path": "state/roster.json", "age_s": None, "value": {"state": state},
                            "opinion": (None if state in (None, "live") else
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
-            }
-            agents.append((_verdict({"id": wid, "role": "worker", "label": label,
-                                     "alive": _alive(sources["watcher_beat"])}, sources), sources))
+            }, obs_rec, now)
+            # Only a verdict known to be this incarnation's may override the beat's alive.
+            current = sources["supervisor"] if started is not None else None
+            row = _verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),
+                            "alive": _alive(sources["watcher_beat"], current)}, sources)
+            agents.append((_stopped_by_suspension(row, suspension) if wid in stopped else row, sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else
                "ok" if agents and conditions == {HEALTHY} else "unknown")
-    out = {"checked_at": round(now, 1), "overall": overall,
+    out = {"checked_at": round(now, 1), "instance": _instance(ws, now), "overall": overall,
+           "suspended": _suspended(suspension),
            "agents": [a if view == "summary" else {**a, "sources": s} for a, s in agents]}
     return out
 

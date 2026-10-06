@@ -40,10 +40,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      # bodhi-realtime-agent ships a prebuilt dist, but its git dependency
-      # postinstall uses POSIX `[ ... ]` syntax that cmd.exe cannot parse.
-      # Skipping lifecycle scripts is the Windows clean-install path; the next
-      # step fails closed if the required prebuilt package is absent.
+      # bodhi-realtime-agent ships a prebuilt dist from npm; lifecycle scripts stay
+      # skipped and the next step fails closed if that dist is absent.
       - name: Install dependencies (Windows)
         run: npm ci --ignore-scripts
 

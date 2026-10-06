@@ -68,13 +68,16 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_chunk_that_lands_short_is_never_submitted_or_typed_over(self):
-        self.cut_paste_over_flag.write_text("100")  # a limit below even one chunk
+        # Every attempt lands the same garbled bytes; the retry clears its own leftover.
+        self.cut_paste_over_flag.write_text("100")
         self.write_task(self.LONG)
         r = self.run_event(self.LONG, timeout=40)
         log = self.sendkeys_log_text()
         self.assertNotIn("ENTER", log)
-        self.assertEqual(log.count("TYPE "), 1, "typed over what landed")
-        self.assertIn("composer not empty", r.stderr)
+        self.assertEqual(log.count("TYPE "), 2, "one clean attempt per retry, not typed over")
+        self.assertEqual(log.count("BSPACE "), 1, "the garbled leftover was cleared exactly once")
+        self.assertIn("own garbled, non-boundary leftover", r.stderr)
+        self.assertIn("never verifiably staged", r.stderr)
 
     def test_the_window_is_grown_for_the_paste_and_put_back_before_the_result_wait(self):
         self.composer_view_rows_flag.write_text("6")  # the 29-row box shows its last 6 rows
@@ -120,15 +123,105 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertIn("ENTER", self.sendkeys_log_text())
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_a_dropped_last_chunk_is_never_submitted_and_the_window_is_put_back(self):
-        self.drop_paste_from_flag.write_text("5")
+    def _chunks(self):
+        return [l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE ")]
+
+    def _boundaries(self, name):
+        """Byte offsets where the notifier's chunks end: PASTE_CHUNK bytes, cut between characters."""
+        out, cur = [], 0
+        for ch in self.expected_prompt(name):
+            n = len(ch.encode())
+            if cur and cur + n > 256:
+                out.append(cur); cur = 0
+            cur += n
+        return out + [cur]
+
+    # Chunks that land before the drop. The prompt embeds the tasks dir and repo path, so
+    # its chunk count depends on the runner; two landed chunks leave at least two to resume.
+    LANDED = 2
+
+    def _pick_with_a_dropped_chunk(self):
+        """Pick 1 of the resume cases: chunks 1..LANDED land, the next never does; the retry
+        within the pick resumes at that chunk and loses it again. Returns that pick's run."""
+        self.assertGreaterEqual(len(self._boundaries(self.LONG)), self.LANDED + 2, self._boundaries(self.LONG))
+        self.drop_paste_from_flag.write_text(str(self.LANDED + 1))
         self.write_task(self.LONG)
         r = self.run_event(self.LONG, timeout=40)
-        log = self.sendkeys_log_text()
-        self.assertNotIn("ENTER", log)
-        self.assertEqual(log.count("TYPE "), 5, "kept typing past the chunk that never landed")
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertEqual(len(self._chunks()), self.LANDED + 2, self._chunks())
+        self.drop_paste_from_flag.unlink()
+        return r
+
+    def _set_composer(self, text):
+        """The composer holds `text` under the idle footer, wrapped as the fake pane wraps."""
+        import textwrap
+        rows = textwrap.wrap("❯ " + text, self.WRAP_COLS, subsequent_indent="  ",
+                             break_long_words=True, break_on_hyphens=False)
+        self.pane_file.write_text("\n".join(rows) + "\n" + IDLE_FOOTER.split("\n", 1)[1] + "\n")
+
+    def test_a_dropped_chunk_is_never_submitted_and_the_window_is_put_back(self):
+        # The retry within the pick resumes at the chunk that never landed (typed twice in
+        # all), never from the start, and never presses Enter on the partial.
+        r = self._pick_with_a_dropped_chunk()
+        chunks = self._chunks()
+        self.assertEqual(chunks[-1], chunks[-2], "the resume must retype the dropped chunk, not another")
         self.assertIn("did not read back", r.stderr)
+        self.assertIn("resuming it there", r.stderr)
+        self.assertIn("never verifiably staged", r.stderr)
         self.assertEqual(self._sizes()[-1], 29, self._resizes())
+
+    def test_a_later_pick_resumes_after_a_dropped_chunk_and_sends_enter_once(self):
+        # The live shape: a transient drop on pick 1, then the ~30 s re-pick finds the
+        # composer holding exactly the chunks that landed and finishes the paste.
+        self._pick_with_a_dropped_chunk()
+        before = len(self._chunks())
+        t = self._finish_on(self.LONG, lambda log: "ENTER" in log)
+        r = self.run_event(self.LONG, timeout=40)
+        t.join()
+        self.assertIn("resuming it there", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.sendkeys_log_text()
+        self.assertEqual(log.count("ENTER"), 1, log)
+        chunks = self._chunks()
+        self.assertEqual("".join(chunks[:self.LANDED] + chunks[before:]), self.expected_prompt(self.LONG))
+        self.assertEqual(len(chunks[before:]), len(self._boundaries(self.LONG)) - self.LANDED,
+                         "pick 2 must type every chunk after the ones that landed")
+
+    def test_owner_text_in_the_composer_is_still_refused_after_a_dropped_chunk(self):
+        self._pick_with_a_dropped_chunk()
+        # The owner cleared our partial and typed their own draft; the record alone admits nothing.
+        self.pane_file.write_text(_h.DRAFT_FOOTER + "\n")
+        (self.bin / "osascript").write_text("#!/bin/bash\nexit 0\n"); (self.bin / "osascript").chmod(0o755)
+        before = len(self._chunks())
+        r = self.run_event(self.LONG, timeout=40, env_extra={"SUTANDO_NOTIFIER_COMPOSER_BLOCK_ESCALATE_AFTER": "1"})
+        self.assertEqual(len(self._chunks()), before, "typed over the owner's draft")
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
+        blocked = [l for l in r.stderr.splitlines() if "delivery blocked" in l]
+        self.assertEqual(len(blocked), 1, r.stderr)
+        self.assertIn("clear the composer", blocked[0])
+        self.assertNotIn("press Enter", blocked[0], "Enter would submit the composer as it is")
+
+    def test_a_prefix_not_on_a_chunk_boundary_is_refused(self):
+        self._pick_with_a_dropped_chunk()
+        # The next chunk landed short: our prefix plus part of a chunk is not a resume point.
+        cut = self._boundaries(self.LONG)[self.LANDED - 1] + 100
+        self._set_composer(self.expected_prompt(self.LONG).encode()[:cut].decode())
+        before = len(self._chunks())
+        r = self.run_event(self.LONG, timeout=40)
+        self.assertEqual(len(self._chunks()), before, "typed over a short-landed chunk")
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
+        self.assertNotIn("resuming", r.stderr)
+
+    def test_a_prefix_left_in_another_core_incarnation_is_refused(self):
+        self._pick_with_a_dropped_chunk()
+        self.pane_pid_file.write_text("9999")
+        before = len(self._chunks())
+        r = self.run_event(self.LONG, timeout=40)
+        self.assertEqual(len(self._chunks()), before)
+        self.assertNotIn("ENTER", self.sendkeys_log_text())
+        self.assertIn("composer not empty", r.stderr)
 
     def test_a_dropped_chunk_under_a_cut_box_is_never_submitted(self):
         # The reviewer's case: cut box, pastes 5+ never land. Grown, the box shows what
@@ -213,6 +306,31 @@ class LongPromptTests(FakeTmuxHarness):
         self.assertEqual("".join(c[:-2] + ";" if c.endswith(r"\;") else c for c in chunks), self.expected_prompt(name))
         self.assertIn("ENTER", self.sendkeys_log_text())
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_an_embedded_newline_is_typed_literally_and_submitted_whole(self):
+        # #4811: type_prompt()/chunk_lengths() must handle a real embedded newline
+        # byte-exact, for any future caller even though task_prompt() has none today.
+        import re
+        import subprocess
+        name = "task-multiline.txt"
+        prompt = "line one of the prompt\n" + ("x" * 300) + "\nline three, after a long middle line"
+        # Source only the function defs (never the live file's standby side effects);
+        # $0 stays the real path since the script derives REPO from `dirname "$0"`.
+        dispatch_line = next(i for i, l in enumerate(_h.NOTIFIER.read_text().splitlines(), 1)
+                              if l.startswith('if [ "${1:-}" = "--event" ]'))
+        script = f'sed -n "1,{dispatch_line - 1}p" "$0" > "$TMPDIR_SRC"; source "$TMPDIR_SRC"; deliver_prompt "$1" "$2"'
+        env = self._env({"TMPDIR_SRC": str(self.root / "notifier-funcs.sh")})
+        r = subprocess.run(["/bin/bash", "-c", script, str(_h.NOTIFIER), name, prompt],
+                            env=env, cwd=str(self.root), capture_output=True, text=True, timeout=40)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ENTER", self.sendkeys_log_text())
+        # A chunk's own embedded newline defeats a naive splitlines() scan of the log;
+        # split on "TARGET " lines instead, which a chunk's content can't forge here.
+        records = re.split(r"(?m)^TARGET .*\n", self.sendkeys_log_text())[1:]
+        chunks = [m.group(1) for m in (re.match(r"CAPTURES@\d+\nTYPE (.*)\n\Z", p, re.S) for p in records) if m]
+        self.assertGreater(len(chunks), 1, chunks)
+        self.assertTrue(all(len(c.encode()) <= 256 for c in chunks), [len(c.encode()) for c in chunks])
+        self.assertEqual("".join(chunks), prompt, "the newline must survive chunking byte-for-byte")
 
 
 if __name__ == "__main__":

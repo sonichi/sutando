@@ -81,6 +81,17 @@ if [ ! -x "$launcher" ]; then
   exit 1
 fi
 
+for _arg in "$@"; do
+  case "${_arg%%=*}" in
+    --external-helpers|--no-schedule-reconcile)
+      if [ "$runtime" != "codex" ]; then
+        echo "start-cli: ${_arg%%=*} is supported only for Codex" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 export SUTANDO_CORE_RUNTIME="$runtime"
 
 # A config switch may find the other runtime still occupying the canonical
