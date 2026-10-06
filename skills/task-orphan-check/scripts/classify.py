@@ -234,13 +234,34 @@ def channel_label(headers: dict) -> str:
 _KEYWORD_COLON_RE = re.compile(r"(?i)\b(file|send|attach|deduped|channel|reply)(:)")
 
 
-def _escalate(task_id: str, tier: str) -> tuple[str, str]:
-    """One more round of defanging on both untrusted fields: the keyword's colon,
-    not just the template's brackets, is what lets a forged value hijack the
-    template's OWN surrounding `[...]` -- escaping only `[`/`]` leaves `file:`/
-    `send:`/`attach:` (and the other leading markers) still readable as themselves."""
-    sub = lambda s: _KEYWORD_COLON_RE.sub(r"\1ː", s)  # ':' -> MODIFIER LETTER TRIANGULAR COLON
-    return sub(task_id), sub(tier)
+def _defang(text: str) -> str:
+    """One more round on an already bracket-neutralized field: the recognized
+    keyword's colon, not just the template's brackets, is what lets a forged value
+    hijack the template's OWN surrounding `[...]` -- escaping only `[`/`]` leaves
+    `file:`/`send:`/`attach:` (and the other leading markers) still readable as
+    themselves."""
+    return _KEYWORD_COLON_RE.sub(r"\1ː", text)  # ':' -> MODIFIER LETTER TRIANGULAR COLON
+
+
+def _safe_line(build, *raw_parts: str) -> str:
+    """`build(*parts)` with every `raw_parts` entry neutralized, checked against the
+    PRODUCTION marker parser, and escalated (bracket, then keyword-colon) until the
+    result is proven to carry zero actions -- the one property that actually matters,
+    never a guessed-sufficient escaping scheme. Any per-row line interpolating
+    untrusted text (a legacy/missing-header task's own body can forge `id` or
+    `access_tier`) goes through this, not a hand-built f-string.
+
+    Does NOT require the parser's returned body to equal the input: parse_markers()
+    strips surrounding whitespace even on a fully safe line (an empty preview makes
+    the bullet end in ": ", which it trims), and that is not a security property --
+    only `actions == []` is."""
+    parts = [neutralize(p) for p in raw_parts]
+    for _ in range(4):
+        line = build(*parts)
+        if not result_markers.parse_markers(line).actions:
+            return line
+        parts = [_defang(p) for p in parts]
+    raise ValueError(f"could not make a safe line from {raw_parts!r}")
 
 
 def recovery_line(task_id: str, tier: str, label: str, age_s: int, text_preview: str) -> str:
@@ -248,20 +269,59 @@ def recovery_line(task_id: str, tier: str, label: str, age_s: int, text_preview:
     headers. `task_id` and `tier` come straight from a legacy/missing-header task's own
     body (parse_task_headers_lenient's body-line fallback, canonical_access_tier's
     pass-through of an unknown value); `label` and `preview` are already neutralized by
-    their own builders. Bracket-neutralizing these two is not enough on its own -- a
-    forged tier starting `file: ...]` closes through the TEMPLATE's own trailing `]`
-    even with its own bracket escaped, so the real, fully assembled line is checked
-    against the production marker parser itself and further defanged until proven
-    inert, rather than trusting a guessed-sufficient escaping scheme."""
+    their own builders. `task_id` already carries its own `task-` prefix when the task
+    file has one (the `id:` header / filename stem) -- never add a second one."""
     age_m = max(0, age_s // 60)
-    task_id, tier = neutralize(task_id), neutralize(tier)
-    for _ in range(4):
-        line = f"- task-{task_id} [{tier}, {label}, {age_m}m ago]: {text_preview}"
-        parsed = result_markers.parse_markers(line)
-        if not parsed.actions and parsed.body == line:
-            return line
-        task_id, tier = _escalate(task_id, tier)
-    raise ValueError(f"could not make a safe recovery line for task_id={task_id!r} tier={tier!r}")
+    return _safe_line(
+        lambda tid, t: f"- {tid} [{t}, {label}, {age_m}m ago]: {text_preview}",
+        task_id, tier)
+
+
+def stalled_line(task_id: str, phase: str, idle_human: str) -> str:
+    """The exact line step 3 prints verbatim for an `import-stalled` row."""
+    return _safe_line(
+        lambda tid, ph: f"Import stalled at phase {ph or 'unknown'} since {idle_human} "
+                        f"({tid}, still in tasks/ — it resumes on the next sweep; say "
+                        '"import my Claude history" to resume it now, or '
+                        "`/import-claude-context --discard` to drop the run).",
+        task_id, phase)
+
+
+def unbound_line(task_id: str, phase: str, idle_human: str) -> str:
+    """The exact line step 3 prints verbatim for an `import-unbound` row."""
+    return _safe_line(
+        lambda tid, ph: f"An import run started (phase {ph or 'unknown'}, last moved "
+                        f"{idle_human} ago) but cannot be matched to this request ({tid}, "
+                        'still in tasks/ — its status carries no task id); say "import my '
+                        'Claude history" to re-run it, or `/import-claude-context --discard` '
+                        "to drop the run.",
+        task_id, phase)
+
+
+def unknown_line(task_id: str, error_text: str) -> str:
+    """The exact line step 3 prints verbatim for an `unknown` (deliveries/
+    unreadable) row."""
+    return _safe_line(
+        lambda tid, err: f"Could not read deliveries/ for {tid} ({err}), so whether a "
+                         "worker holds it is unknown — left in tasks/, not archived; if "
+                         "it is yours it will be answered by the next sweep, otherwise check "
+                         "the host's file permissions (TCC on ~/Documents is the known cause).",
+        task_id, error_text)
+
+
+def idle_human(idle_s: int) -> str:
+    """`idle_s` as "<N>d <N>h" / "<N>h <N>m" / "<N>m" -- the step-3 prose's own
+    "3d 2h" shape, now computed once in code rather than left for an agent to
+    eyeball `import_idle_s` and write by hand."""
+    idle_s = max(0, int(idle_s))
+    days, rem = divmod(idle_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 PREVIEW_CHARS = 100
@@ -314,6 +374,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     try:
         holder = _holder_of(workspace, task_id)
     except OSError as exc:
+        row["unknown_line"] = unknown_line(task_id, str(exc))
         row.update(verdict="unknown",
                    reason=f"deliveries/ unreadable ({exc}); cannot tell whether a worker holds "
                           "this task — left in tasks/, never archived, list it in the recovery DM")
@@ -349,6 +410,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
                               f"(terminal), bound to this task (task_id {task_id})")
             return row
         if bound and idle_s >= IMPORT_STALL_S:
+            row["stalled_line"] = stalled_line(task_id, phase, idle_human(idle_s))
             row.update(verdict="import-stalled",
                        reason=f"consented import started but stalled at phase {phase or 'unknown'}: "
                               f"status.json (bound to this task) last moved {idle_s}s ago "
@@ -362,6 +424,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
                               "left in tasks/ for the watcher's sweep, never archived")
             return row
         if unbound:
+            row["unbound_line"] = unbound_line(task_id, phase, idle_human(idle_s))
             row.update(verdict="import-unbound",
                        reason=f"an import run started after this task was queued (phase "
                               f"{phase or 'unknown'}, moved {idle_s}s ago) but status.json carries "

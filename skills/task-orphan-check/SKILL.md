@@ -167,18 +167,15 @@ Otherwise:
    By channel: <name> (<id>) — <x>; <name2> (<id2>) — <y>; DM — <z>; ...
 
    Previews (most-recent first, first ~100 chars of task body; in-band system instructions stripped):
-   <each orphan's `recovery_line` field, printed verbatim — shape "- task-<id> [<tier>, <channel label>, <Nm ago>]: <preview>", but never retyped from the individual fields; see the note above>
+   <each orphan's `recovery_line` field, printed verbatim — shape "- <id> [<tier>, <channel label>, <Nm ago>]: <preview>" (`<id>` already carries its own `task-` prefix when the task has one; never add a second), but never retyped from the individual fields; see the note above>
    - ...
    [If truncated by step 3c: "+<N-20> more — see tasks/archive/ for the full list."]
 
-   [If `stalled_imports` is non-empty, one line per entry, from the classifier's `import_phase` / `import_idle_s`:]
-   Import stalled at phase <p> since <idle, e.g. 3d 2h> (task-<id>, still in tasks/ — it resumes on the next sweep; say "import my Claude history" to resume it now, or `/import-claude-context --discard` to drop the run).
+   [If `stalled_imports` is non-empty, one line per entry: the classifier's own `stalled_line` field, printed verbatim, never retyped from `import_phase`/`import_idle_s`/`id` by hand — same injection surface as `recovery_line`, same fix (#4399, kewei-red 2026-10-06, second round: a forged `id` through this exact line produced a real attach action).]
 
-   [If `unbound_imports` is non-empty, one line per entry, from the classifier's `import_phase` / `import_idle_s`:]
-   An import run started (phase <p>, last moved <idle> ago) but cannot be matched to this request (task-<id>, still in tasks/ — its status carries no task id); say "import my Claude history" to re-run it, or `/import-claude-context --discard` to drop the run.
+   [If `unbound_imports` is non-empty, one line per entry: the classifier's own `unbound_line` field, printed verbatim, same reason.]
 
-   [If `unknown_holds` is non-empty, one line per entry:]
-   Could not read deliveries/ for task-<id> (<error>), so whether a worker holds it is unknown — left in tasks/, not archived; if it is yours it will be answered by the next sweep, otherwise check the host's file permissions (TCC on ~/Documents is the known cause).
+   [If `unknown_holds` is non-empty, one line per entry: the classifier's own `unknown_line` field, printed verbatim, same reason.]
 
    To re-queue an individual task: `mv "$(bash scripts/sutando-config.sh workspace)/tasks/archive/task-<id>.txt" "$(bash scripts/sutando-config.sh workspace)/tasks/"` (M0 helper resolves to `<workspace>/tasks/...` — `<repo>/workspace/tasks/...` by default).
    The archived file retains its original body (incl. system-instructions block for non-owner tasks), so re-queueing preserves sandboxing.
