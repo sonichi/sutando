@@ -181,18 +181,13 @@ EOF
 **When done:**
 Write a result file using the same task ID (re-use the `WORKSPACE` from above).
 **Write it atomically** — a drain can claim `results/task-*.txt` the moment it appears, so a file
-built in place is published half-written:
+built in place is published half-written. Use the publisher every in-repo writer uses (body on
+stdin; staged beside the target, fsynced, renamed whole):
 ```bash
-_out="$WORKSPACE/results/task-chat-${_ts}.txt"
-_tmp="$(mktemp "$WORKSPACE/results/.task-chat-${_ts}.XXXXXX")"
-cat > "$_tmp" << EOF
+python3 src/result_publish.py "$WORKSPACE/results/task-chat-${_ts}.txt" << EOF
 <result summary>
 EOF
-mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
-                         # matches a name without `.txt` (pathlib `*` sees dotfiles)
 ```
-Equivalent, and the same publisher every in-repo writer uses: `python3 src/result_publish.py "$_out" <<EOF … EOF`
-(body on stdin; staged beside the target, fsynced, renamed whole).
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 
