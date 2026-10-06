@@ -1748,6 +1748,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                # A Commons hook fire's context, as one JSON line. Above "task":
+                # the agent's safe parser must see which hook, row and fire it serves.
+                "hook",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -1768,6 +1771,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
 _PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
+
+# A hook context is written only when it names what it is the context of.
+_HOOK_CONTEXT_KEYS = ("hook_id", "fire_id", "caused_by")
 
 # Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
 # values outside this set degrade to "message" rather than passing through.
@@ -3406,6 +3412,13 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                     lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
                 else:
                     lines.append(f"picker_args: {'' if pa is None else _one_line(pa)}")
+        elif f == "hook":
+            # The broker's structured hook context passes through whole as one compact
+            # JSON line; anything but an object naming its hook and fire is dropped.
+            hook = task.get("hook")
+            if isinstance(hook, dict) and all(isinstance(hook.get(k), str) and hook[k]
+                                              for k in _HOOK_CONTEXT_KEYS):
+                lines.append(f"hook: {json.dumps(hook, separators=(',', ':'), default=str)}")
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never
