@@ -46,6 +46,13 @@ def _resend_epoch(backend, item_id: str) -> int:
     return int(fn(item_id)) if callable(fn) else 0
 
 
+def _read_receipt(receipt):
+    """(outcome, destination, provider_ref, detail) of one receipt."""
+    return (receipt.outcome, getattr(receipt, "destination", None),
+            getattr(receipt, "provider_ref", None),
+            str(getattr(receipt, "detail", "") or ""))
+
+
 class DeliveryCore:
     def __init__(self, backend: ClaimBackend, provider: DeliveryProvider,
                  policy: RetryPolicy | None = None,
@@ -55,19 +62,18 @@ class DeliveryCore:
         self.policy = policy or RetryPolicy()
         self.worker = worker
 
-    def _attempt(self, item_id: str, payload: bytes,
-                 key: str) -> DeliveryOutcome:
+    def _attempt(self, item_id: str, payload: bytes, key: str):
         """One provider call, classified by the typed failure taxonomy.
         Only a boundary-crossing failure is UNKNOWN; a refusal is
         NOT_DELIVERED; anything else (programming, config, capability
         violation) propagates rather than masquerading as ambiguity."""
         try:
             receipt = self.provider.deliver(item_id, payload, key)
-            return receipt.outcome, getattr(receipt, "destination", None)
-        except ProviderIndeterminate:
-            return DeliveryOutcome.OUTCOME_UNKNOWN, None
-        except ProviderRefused:
-            return DeliveryOutcome.NOT_DELIVERED, None
+            return _read_receipt(receipt)
+        except ProviderIndeterminate as e:
+            return DeliveryOutcome.OUTCOME_UNKNOWN, None, None, str(e)
+        except ProviderRefused as e:
+            return DeliveryOutcome.NOT_DELIVERED, None, None, str(e)
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
         """Resolve a prior ambiguity, or None when reconciliation resolved
@@ -87,7 +93,7 @@ class DeliveryCore:
             return None
         if resolved is None:
             return None
-        return resolved.outcome, getattr(resolved, "destination", None)
+        return _read_receipt(resolved)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
         """Claim -> deliver -> classify -> complete, with retry accounting."""
@@ -101,7 +107,7 @@ class DeliveryCore:
         # A requeued item must present a NEW logical side effect, or the
         # provider dedupes the re-send against the attempt that parked it.
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
-        outcome, destination = self._attempt(item_id, payload, key)
+        outcome, destination, ref, detail = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
@@ -109,9 +115,10 @@ class DeliveryCore:
                 if resolved is not None:
                     # The reconciliation receipt is the statement about THIS
                     # item; its destination replaces the ambiguous attempt's.
-                    outcome, destination = resolved
+                    outcome, destination, ref, detail = resolved
             elif caps.idempotent_send:
-                outcome, destination = self._attempt(item_id, payload, key)
+                outcome, destination, ref, detail = self._attempt(
+                    item_id, payload, key)
                 if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                     # Retryable by license: parking would strand an item a
                     # later safe re-send could still deliver.
@@ -122,7 +129,8 @@ class DeliveryCore:
                               park_at_attempts=self.policy.max_attempts,
                               provider=type(self.provider).__name__,
                               destination=destination)
-        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
+        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome,
+                           provider_ref=ref, detail=detail)
 
     def recover(self) -> RecoverReport:
         return self.backend.recover()

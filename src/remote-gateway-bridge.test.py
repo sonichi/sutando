@@ -45,7 +45,9 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
          "force_heartbeat_404": False, "force_media_redirect": False,
-         "force_results_502_once": False, "force_results_400": False}
+         "force_results_502_once": False, "force_results_400": False,
+         # GET /v1/results/<id>/delivery: None = a pre-route broker (404)
+         "delivery": {"status": "delivered", "terminal": True}}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -79,6 +81,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers(); self.wfile.write(body); return
+        m = re.fullmatch(r"/v1/results/([^/]+)/delivery", self.path)
+        if m:
+            posted = any(r.get("id") == m.group(1) for r in STATE["results"])
+            if STATE["delivery"] is None or not posted:
+                self.send_response(404); self.end_headers(); return
+            body = json.dumps({"id": m.group(1), **STATE["delivery"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -101,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
+            if STATE["delivery"] is not None:
+                self.wfile.write(b'{"ok": true, "delivery_readable": true}')
         elif self.path.startswith("/v1/tasks/") and self.path.endswith("/ack"):
             if STATE["force_ack_404"]:
                 self.send_response(404); self.end_headers(); return
@@ -772,6 +785,61 @@ def main() -> int:
     STATE["results"].pop()
     (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+
+    # The broker accepts the POST, then dead-letters the room send. The
+    # accept must not be logged or archived as a delivery.
+    _before = len(STATE["results"])
+    STATE["delivery"] = {"status": "dead", "terminal": True,
+                         "reason": "send-failed:permanent-masquerade-failure"}
+    (rtc.TASKS_DIR / "task-DEAD1.txt").write_text(
+        "id: task-DEAD1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-DEAD1.txt").write_text("lost answer")
+    _cap = _io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        rtc._post_ready_results({"task-DEAD1"})
+    _out = _cap.getvalue()
+    print(_out, end="")
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-DEAD1",
+          "the dead-lettered result was accepted by the broker (POST 200)")
+    check("delivered" not in _out.replace("not_delivered", "")
+          and "send-failed:permanent-masquerade-failure" in _out,
+          "an accepted-then-dead-lettered result is never logged delivered, "
+          "and the broker's reason is surfaced")
+    check((rtc.RESULTS_DIR / "task-DEAD1.txt").exists()
+          and not list(rtc.ARCHIVE_RESULTS_DIR.glob("task-DEAD1*")),
+          "...nor archived as a success: the result file stays for retry")
+    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 1):
+        rtc._post_ready_results({"task-DEAD1"})
+    _quar = list(rtc.UNDELIVERABLE_RESULTS_DIR.glob("task-DEAD1*"))
+    check(bool(_quar) and not (rtc.RESULTS_DIR / "task-DEAD1.txt").exists()
+          and not list(rtc.ARCHIVE_RESULTS_DIR.glob("task-DEAD1*")),
+          "at the outbox ceiling it is quarantined to undelivered/, not archived")
+    del STATE["results"][_before:]
+    for _q in _quar:
+        _q.unlink(missing_ok=True)
+    (rtc.TASKS_DIR / "task-DEAD1.txt").unlink(missing_ok=True)
+
+    # A broker without the delivery route: the accept stands, but is logged as
+    # unconfirmed rather than delivered.
+    STATE["delivery"] = None
+    (rtc.TASKS_DIR / "task-OLDB1.txt").write_text(
+        "id: task-OLDB1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-OLDB1.txt").write_text("answer")
+    _cap = _io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        rtc._post_ready_results({"task-OLDB1"})
+    _out = _cap.getvalue()
+    print(_out, end="")
+    check("room delivery unconfirmed" in _out
+          and "delivered" not in _out.replace("room delivery", "")
+          and not (rtc.RESULTS_DIR / "task-OLDB1.txt").exists(),
+          "no delivery read (older broker): accepted + archived, logged unconfirmed")
+    STATE["delivery"] = {"status": "delivered", "terminal": True}
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-OLDB1.txt").unlink(missing_ok=True)
+    for _a in rtc.ARCHIVE_RESULTS_DIR.glob("task-OLDB1*"):
+        _a.unlink(missing_ok=True)
     # Destined filenames outrank the gate's activity/grace logic entirely.
     check(rtc._ag2space_proactive_claim_gate(
               Path("proactive-1.to-ag2space.txt")) is True,
