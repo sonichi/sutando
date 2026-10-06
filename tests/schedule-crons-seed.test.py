@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The per-host crons.json seed: source precedence, no overwrite, atomic publish."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -10,6 +12,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "skills/schedule-crons/scripts/seed_crons.py"
@@ -226,6 +229,190 @@ class FirstInstallOnlyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         # The CLI uses the shipped skill dir, whose example carries the full starter set.
         self.assertEqual([e["name"] for e in self._entries()], ["main-loop"])
+
+
+
+class SeedErrorPathTests(unittest.TestCase):
+    """The refusals: no source, a starter that is not JSON, a starter that is not a list."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "ws"
+        self.skill = root / "skill"
+        self.skill.mkdir()
+        self.target = self.ws / "hosts" / "h1" / "crons.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_seed_source_raises_and_writes_nothing(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            seed_crons.seed(self.ws, "h1", self.skill)
+        self.assertIn(str(self.skill), str(ctx.exception))
+        self.assertFalse((self.ws / "hosts").exists())
+
+    def test_invalid_json_example_is_refused_under_the_filter(self):
+        (self.skill / "crons.example.json").write_text("{not json")
+        with self.assertRaises(ValueError):
+            seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertFalse(self.target.exists())
+
+    def test_invalid_json_example_is_copied_verbatim_without_the_filter(self):
+        (self.skill / "crons.example.json").write_text("{not json")
+        self.assertEqual(seed_crons.seed(self.ws, "h1", self.skill)[0], "seeded")
+        self.assertEqual(self.target.read_text(), "{not json")
+
+    def test_non_list_starter_is_refused_under_the_filter(self):
+        (self.skill / "crons.example.json").write_text('{"name": "main-loop"}')
+        with self.assertRaisesRegex(ValueError, "not a JSON list"):
+            seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertFalse(self.target.exists())
+
+    def test_unreadable_starter_makes_a_legacy_file_established(self):
+        # An example that does not parse cannot match, so the legacy file is copied whole.
+        (self.skill / "crons.example.json").write_text("{not json")
+        (self.skill / "crons.json").write_text('[{"name": "a"}, {"name": "main-loop"}]')
+        seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertEqual([e["name"] for e in json.loads(self.target.read_text())], ["a", "main-loop"])
+
+    def test_invalid_json_legacy_is_copied_whole_under_the_filter(self):
+        (self.skill / "crons.example.json").write_text('[{"name": "main-loop"}]')
+        (self.skill / "crons.json").write_text("{broken")
+        _, _, source = seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertEqual(source, self.skill / "crons.json")
+        self.assertEqual(self.target.read_text(), "{broken")
+
+    def test_non_dict_entries_are_dropped_by_the_filter(self):
+        (self.skill / "crons.example.json").write_text('["main-loop", {"name": "main-loop"}, {"name": "x"}]')
+        seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertEqual(json.loads(self.target.read_text()), [{"name": "main-loop"}])
+
+    def test_seed_sources_order_is_interim_then_legacy_then_example(self):
+        self.assertEqual(seed_crons.seed_sources(self.ws, "h1", self.skill), [
+            self.ws / "crons" / "h1.json",
+            self.skill / "crons.json",
+            self.skill / "crons.example.json",
+        ])
+
+
+class MainInProcessTests(unittest.TestCase):
+    """main() called in-process, with the seed pinned to a temp skill dir and config stubbed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "ws"
+        self.skill = root / "skill"
+        self.skill.mkdir()
+        (self.skill / "crons.example.json").write_text(
+            '[{"name": "main-loop"}, {"name": "morning-briefing"}, {"name": "other"}]')
+        self.config = {"workspace": str(self.ws), "host-label": "h1"}
+        self.config_calls = []
+        real_seed = seed_crons.seed
+        real_config = seed_crons._config
+
+        def fake_config(key):
+            self.config_calls.append(key)
+            value = self.config[key]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        seed_crons.seed = lambda *a, **kw: real_seed(*a, skill_dir=self.skill, **kw)
+        seed_crons._config = fake_config
+        self.addCleanup(setattr, seed_crons, "seed", real_seed)
+        self.addCleanup(setattr, seed_crons, "_config", real_config)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["seed_crons.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seed_crons.main()
+        return rc, out.getvalue(), err.getvalue()
+
+    def _target(self):
+        return self.ws.resolve() / "hosts" / "h1" / "crons.json"
+
+    def _names(self):
+        return [e["name"] for e in json.loads(self._target().read_text())]
+
+    def test_explicit_flags_seed_without_consulting_config(self):
+        rc, out, err = self._main("--workspace", str(self.ws), "--host-label", "h1")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(out, f"seeded {self._target()} from {self.skill / 'crons.example.json'}\n")
+        self.assertEqual(self._names(), ["main-loop", "morning-briefing", "other"])
+        self.assertEqual(self.config_calls, [])
+
+    def test_second_run_reports_exists_without_a_source(self):
+        self._main("--workspace", str(self.ws), "--host-label", "h1")
+        rc, out, _ = self._main("--workspace", str(self.ws), "--host-label", "h1")
+        self.assertEqual((rc, out), (0, f"exists {self._target()}\n"))
+
+    def test_missing_flags_fall_back_to_config(self):
+        rc, out, _ = self._main()
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.startswith(f"seeded {self._target()}"), out)
+        self.assertEqual(self.config_calls, ["workspace", "host-label"])
+
+    def test_blank_flags_fall_back_to_config(self):
+        rc, _, _ = self._main("--workspace", "  ", "--host-label", " ")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.config_calls, ["workspace", "host-label"])
+        self.assertTrue(self._target().exists())
+
+    def test_first_install_only_is_repeatable(self):
+        rc, _, _ = self._main("--workspace", str(self.ws), "--host-label", "h1",
+                              "--first-install-only", "main-loop",
+                              "--first-install-only", "other")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._names(), ["main-loop", "other"])
+
+    def test_unresolved_workspace_fails_with_a_message(self):
+        self.config["workspace"] = ""
+        rc, out, err = self._main("--host-label", "h1")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err, "seed-crons: workspace did not resolve\n")
+        self.assertFalse(self.ws.exists())
+
+    def test_unresolved_host_label_fails_with_a_message(self):
+        self.config["host-label"] = ""
+        rc, _, err = self._main("--workspace", str(self.ws))
+        self.assertEqual(rc, 1)
+        self.assertEqual(err, "seed-crons: host label did not resolve\n")
+        self.assertFalse((self.ws / "hosts").exists())
+
+    def test_config_helper_failure_fails_with_a_message(self):
+        self.config["workspace"] = subprocess.CalledProcessError(2, ["bash", "sutando-config.sh"])
+        rc, _, err = self._main()
+        self.assertEqual(rc, 1)
+        self.assertTrue(err.startswith("seed-crons: Command"), err)
+
+    def test_missing_seed_source_fails_with_a_message(self):
+        (self.skill / "crons.example.json").unlink()
+        rc, out, err = self._main("--workspace", str(self.ws), "--host-label", "h1")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("no crons seed source", err)
+
+    def test_non_list_starter_under_the_filter_fails_with_a_message(self):
+        (self.skill / "crons.example.json").write_text('{"name": "main-loop"}')
+        rc, _, err = self._main("--workspace", str(self.ws), "--host-label", "h1",
+                                "--first-install-only", "main-loop")
+        self.assertEqual(rc, 1)
+        self.assertIn("not a JSON list", err)
+
+
+class ConfigHelperTests(unittest.TestCase):
+    def test_config_runs_the_repo_helper_and_strips_output(self):
+        done = subprocess.CompletedProcess([], 0, stdout="/some/ws\n", stderr="")
+        with mock.patch.object(seed_crons.subprocess, "run", return_value=done) as run:
+            self.assertEqual(seed_crons._config("workspace"), "/some/ws")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["bash", str(seed_crons.REPO / "scripts" / "sutando-config.sh"), "workspace"])
+        self.assertTrue(run.call_args.kwargs["check"])
 
 
 if __name__ == "__main__":
