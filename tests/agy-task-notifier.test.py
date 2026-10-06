@@ -681,9 +681,9 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
-    def test_spawned_watcher_gets_a_distinct_sentinel_not_the_canonical_one(self):
-        # Without a bound instance id the agy watcher's sentinel collides with
-        # a canonical watcher's on the same host (both resolve to the bare name).
+    def test_spawned_watcher_stamps_the_sentinel_the_launcher_polls(self):
+        # The watcher clears any instance id on the core's canonical inbox; a launcher
+        # deriving its sentinel from one would poll a file nobody writes.
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         env = self._env()
@@ -714,10 +714,11 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     break
                 time.sleep(0.2)
             self.assertTrue(sentinels, "watcher never wrote a sentinel")
-            self.assertNotEqual(
-                sentinels, [canonical_sentinel],
-                "agy watcher's only sentinel is the bare canonical name — "
-                "it would collide with a real canonical watcher on this host")
+            polled = subprocess.run(["/bin/bash", str(NOTIFIER), "--sentinel-path"], env=env,
+                                    cwd=str(self.root), capture_output=True, text=True, timeout=15)
+            self.assertEqual(sentinels, [canonical_sentinel])
+            self.assertEqual(Path(polled.stdout.strip()).resolve(), canonical_sentinel.resolve(),
+                             polled.stdout + polled.stderr)
         finally:
             if proc.poll() is None:
                 try:
@@ -734,8 +735,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 proc.wait(timeout=5)
 
     def test_a_foreign_nonempty_inherited_instance_id_is_overridden_not_kept(self):
-        # A bare fallback (`${SUTANDO_INSTANCE_ID:-agy-task-notifier}`) misses a
-        # NON-empty inherited value; it must be replaced, never kept.
+        # An inherited worker id must never name the core's sentinel.
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         env = self._env()
@@ -744,7 +744,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
         env["SUTANDO_INSTANCE_ID"] = "shared-worker"
         state_dir = self.tasks_dir.parent / "state"
         foreign_sentinel = state_dir / "watch-tasks-stream-local-agent+shared-worker.pid"
-        expected_sentinel = state_dir / "watch-tasks-stream-local-agent+agy-task-notifier.pid"
+        expected_sentinel = state_dir / "watch-tasks-stream.pid"
         proc = subprocess.Popen(
             ["/bin/bash", str(NOTIFIER)],
             env=env,
@@ -1002,7 +1002,8 @@ esac
                          if "new-session" in ln and "task-notifier.sh" in ln]
         self.assertEqual(len(watcher_lines), 1, self.tmux_log.read_text())
         line = watcher_lines[0]
-        self.assertIn("SUTANDO_INSTANCE_ID=agy-task-notifier", line)
+        self.assertIn("-e SUTANDO_INSTANCE_ID= ", line,
+                      "the core's watcher must not inherit an instance id from the tmux env")
         self.assertIn("-e SUTANDO_TASKS_DIR=", line,
                        "TASKS_DIR must be explicitly bound (even empty), never omitted")
         self.assertIn("-e SUTANDO_RESULTS_DIR=", line,

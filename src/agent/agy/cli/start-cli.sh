@@ -62,7 +62,7 @@ ensure_task_notifier() {
   fi
   # Bind every queue-related var explicitly, never omit -e: the tmux server's
   # global env can carry a foreign value that only an explicit -e overrides.
-  NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION" -e "SUTANDO_INSTANCE_ID=agy-task-notifier")
+  NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION" -e "SUTANDO_INSTANCE_ID=")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=${SUTANDO_TASKS_DIR:-}")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=${SUTANDO_RESULTS_DIR:-}")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=${SUTANDO_WORKSPACE_DIR:-}")

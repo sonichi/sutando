@@ -46,7 +46,7 @@ sentinel_path() {
   # The sentinel this notifier's own watcher stamps once ready; the launcher
   # polls it, so the two must derive one path from one inbox and one identity.
   . "$REPO/src/tasks-dir-resolve.sh"
-  SUTANDO_INSTANCE_ID="agy-task-notifier" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
+  env -u SUTANDO_INSTANCE_ID "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
     watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
 }
 # One receipt file per launch, named by its nonce: no generation can read or remove another's.
@@ -144,13 +144,13 @@ next_pending_task() {
 # and "? for shortcuts" once fully idle — never both, so one check suffices.
 core_pane_is_busy() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null)" || return 0
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "=$SESSION:" 2>/dev/null)" || return 0
   printf '%s\n' "$pane" | tail -6 | grep -Fq 'esc to cancel'
 }
 
 core_pane_is_idle_ready() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "=$SESSION:" 2>/dev/null)" || return 1
   printf '%s\n' "$pane" | tail -6 | grep -Fq '? for shortcuts' || return 1
   ! printf '%s\n' "$pane" | tail -6 | grep -Fq 'esc to cancel'
 }
@@ -168,7 +168,7 @@ wait_for_core_idle() {
 }
 
 pane_capture() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION" -S "-$PANE_HISTORY_LINES" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -t "=$SESSION:" -S "-$PANE_HISTORY_LINES" 2>/dev/null
 }
 
 # `capture-pane -p` returns the pane's fixed row count regardless of typed
@@ -194,7 +194,7 @@ deliver_prompt() {
   wait_for_core_idle || { log_notifier "core not idle -- refusing to send for $filename"; return 1; }
   while :; do
     baseline="$(pane_capture)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" -l -- "$prompt"
+    tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" -l -- "$prompt"
     waited=0
     while [ "$waited" -lt "$TYPE_CONFIRM_TIMEOUT_TICKS" ]; do
       if prompt_is_staged "$filename" "$baseline"; then staged=1; break 2; fi
@@ -205,7 +205,7 @@ deliver_prompt() {
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; retyping"
   done
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" Enter
+  tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" Enter
   [ "$staged" = 1 ] || { log_notifier "prompt for $filename sent unverified (never observed staged)"; return 0; }
   # Confirmed by the pane going BUSY, not by the marker vanishing — it stays
   # visible as sent history, so that check always read "still staged."
@@ -218,7 +218,7 @@ deliver_prompt() {
     waited=$((waited + 1))
   done
   log_notifier "prompt not yet submitted after Enter for $filename; re-pressing once"
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION" Enter
+  tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" Enter
 }
 
 submit_task() {
@@ -255,10 +255,10 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
-# Bind RESULTS_DIR (never an env var itself) and FORCE the instance id —
-# never fall back on it, or an inherited tmux-global value collides here.
+# Bind RESULTS_DIR (never an env var itself). The core's watcher carries no instance id:
+# watch-tasks-stream.sh clears one on the canonical inbox, so the sentinel must not use it.
 export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
-export SUTANDO_INSTANCE_ID="agy-task-notifier"
+unset SUTANDO_INSTANCE_ID
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 # The launch nonce rides the watcher's own ready event (<sentinel>.token), so readiness can
