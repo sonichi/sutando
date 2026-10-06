@@ -36,6 +36,12 @@ class TestSerializeTaskLast(unittest.TestCase):
         with self.assertRaises(ValueError):
             serialize_task_last([("evil_key", "v")], "x")
 
+    def test_writer_only_key_raises(self):
+        # task_layout belongs to the task-mid writer; a task-last file carrying it
+        # would hand its multi-line body to the trusted scan.
+        with self.assertRaises(ValueError):
+            serialize_task_last([("id", "task-x"), ("task_layout", "mid")], "body")
+
     def test_task_as_header_raises(self):
         with self.assertRaises(ValueError):
             serialize_task_last([("task", "smuggled")], "x")

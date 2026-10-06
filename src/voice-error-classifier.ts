@@ -105,6 +105,14 @@ export function classifyTransportClose(
 	};
 }
 
+/**
+ * The configured model itself was refused (unknown or not served for Live), as opposed to a bad
+ * key (1007) or a network drop. Gemini sends this as close code 1008 with the model path in the reason.
+ */
+export function isModelUnavailableClose(code: number | undefined, reason: string | undefined): boolean {
+	return code === 1008 && classifyTransportClose(code, reason).category === 'model_not_found';
+}
+
 // ---------------------------------------------------------------------------
 // `agent.state` protocol mapping (design 1a′; impl plan WS1 Step 12,
 // amendment R8).

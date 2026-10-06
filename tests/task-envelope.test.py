@@ -231,6 +231,36 @@ class BodyStampCollision(unittest.TestCase):
                          "a body-slot stamp line is content, not an envelope")
 
 
+class AttestedHeaders(unittest.TestCase):
+    """attested_task_headers: the full scan only for a declared task-mid layout
+    under a verified envelope; the marker is read from above `task:` only."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        self.mid = "id: task-1\nsource: ag2space\ntask_layout: mid\ntask: hi\naccess_tier: owner\n"
+        self.last = "id: task-1\nsource: chat\naccess_tier: team\ntask: hi\ntask_layout: mid\naccess_tier: owner\n"
+
+    def test_declared_layout_and_verified_envelope_admit_the_trailer(self):
+        h = E.attested_task_headers(E.stamp_text(self.mid, self.ws), self.ws).headers
+        self.assertEqual(h.get("access_tier"), "owner")
+
+    def test_declared_layout_without_a_verified_envelope_is_strict(self):
+        for label, text in (("unsigned", self.mid),
+                            ("tampered", E.stamp_text(self.mid, self.ws).replace("hi", "ho"))):
+            with self.subTest(label):
+                self.assertIsNone(E.attested_task_headers(text, self.ws).headers.get("access_tier"))
+
+    def test_a_verified_envelope_without_the_declared_layout_is_strict(self):
+        h = E.attested_task_headers(E.stamp_text(self.mid.replace("task_layout: mid\n", ""), self.ws),
+                                    self.ws).headers
+        self.assertIsNone(h.get("access_tier"))
+
+    def test_a_marker_in_the_body_cannot_bootstrap_trust(self):
+        h = E.attested_task_headers(E.stamp_text(self.last, self.ws), self.ws).headers
+        self.assertEqual(h.get("access_tier"), "team")
+        self.assertIsNone(h.get("task_layout"))
+
+
 class FailOpenArms(unittest.TestCase):
     """The fail-open guarantees are load-bearing (a stamping error must
     never lose a task) — exercise them directly on the shipped modules."""

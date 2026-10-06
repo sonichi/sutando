@@ -50,6 +50,12 @@ Payload schema:
  "tmux_verified": true, "tmux_candidates": ["/opt/homebrew/bin/tmux"], "schema_version": 4}
 ```
 
+For an explicitly selected non-Claude runtime, `pid` comes only from the panes
+of the recorded socket and exact session; a same-named Claude process elsewhere
+cannot supply it. Claude and unknown-runtime resolution retain the existing
+name-identity fallback, which is not socket attestation. `heartbeat_pid` remains
+the writer's PID, separate from the core PID.
+
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
@@ -97,7 +103,11 @@ user-facing reply instead of N separate ones:
 
 - `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance — see `src/task-bridge.ts:527`).
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
-- `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
+- `[REPLIED]` — skip delivery because the answer was already sent through another path.
+  A dedup holder with this marker counts as answered; it must not trigger a
+  "delivered nothing" requeue or warning. This trusts the marker assertion,
+  not an independently verified receipt. `[no-send]`, missing/empty results,
+  and chained `[deduped:]` holders still require recovery; sender checks still apply.
 - `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.

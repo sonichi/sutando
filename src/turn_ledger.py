@@ -16,8 +16,8 @@ reason}` for a deliberate decision not to speak. Writers append with O_APPEND
 and a single `write()` so concurrent workers cannot interleave a line; nothing
 here read-modify-writes the log.
 
-WHAT COUNTS AS "THE TURN SPOKE". Two surfaces, because there are two ways a
-reply leaves this agent, and only one of them is instrumented:
+WHAT COUNTS AS "THE TURN SPOKE". Three surfaces, one per way a reply leaves
+this agent:
 
   • a ledger entry newer than the previous Stop — `room_ops say`, or an explicit
     `record_no_send`;
@@ -25,7 +25,17 @@ reply leaves this agent, and only one of them is instrumented:
     previous Stop — the result-file protocol, delivered by whichever bridge owns
     the task. Readiness is `delivery.readiness`, the same policy the bridges
     apply, so this agrees with what will actually be sent rather than counting a
-    half-written file as a reply.
+    half-written file as a reply;
+  • a line in `<workspace>/state/room-actions.jsonl` newer than the previous
+    Stop — written by the desktop app's ag2-space MCP proxy after each
+    SUCCESSFUL `room.action.execute`. The proxy serves Claude and Codex alike
+    and knows nothing of this rule; it records facts, this module decides what
+    they mean. Reads never land there, and neither do failed calls. Every
+    action counts except a reaction (`NOT_A_REPLY`): the 🫡 pickup
+    acknowledgement is a reaction, and counting it would pass a turn that
+    acknowledged a task and then said nothing. The proxy owns that file's bound: it rotates it to
+    `room-actions.jsonl.1`, so both are read. Its lines carry no session and
+    therefore count for every session, like an untagged ledger line.
 
 The results surface is deliberately NOT recursive. A delivered result is
 archived into `results/archive/YYYY-MM/` within seconds, so an archived result
@@ -65,7 +75,9 @@ only session-aware callers gain isolation. An entry with no `session` key
 (written before this change, or by an unscoped caller) still counts for
 everyone, so the fix does not require a flag day.
 
-NOT SCOPED: the result-file evidence surface (`_result_after`). A delivered
+NOT SCOPED: the result-file evidence surface (`_result_after`), nor the
+room-action surface (`_room_action_after`), whose writer has no session id.
+A delivered
 `results/` file carries no session identity anywhere in the result-file
 protocol — it is written by whichever process handles the task and delivered
 by a bridge independent of any session — so there is nothing to filter it by.
@@ -93,11 +105,15 @@ from workspace_default import resolve_workspace, status_read_path, write_status 
 __all__ = [
     "LEDGER_NAME", "STOP_NAME", "ledger_path", "record_send", "record_no_send",
     "last_action_after", "delivery_after", "last_stop_ts", "mark_stop", "stop_gate",
+    "ROOM_ACTIONS_NAME", "room_actions_path",
 ]
 
 LEDGER_NAME = "turn-ledger.jsonl"
 STOP_NAME = "turn-stop.json"
 TURN_NAME = "turn-reminder.json"
+# Written by the desktop's MCP proxy, not by this module; see the docstring.
+ROOM_ACTIONS_NAME = "room-actions.jsonl"
+NOT_A_REPLY = frozenset({"room.message.react", "room.message.unreact"})
 
 # An entry is ~90 bytes and the only question ever asked of this file is "since
 # the last Stop", so the cap is about unbounded growth, not retention depth.
@@ -120,6 +136,11 @@ def _workspace(workspace: Path | str | None) -> Path:
 def ledger_path(workspace: Path | str | None = None) -> Path:
     """Absolute path of the ledger. `state/` per the workspace contract."""
     return _workspace(workspace) / "state" / LEDGER_NAME
+
+
+def room_actions_path(workspace: Path | str | None = None) -> Path:
+    """Absolute path of the MCP proxy's room-action log."""
+    return _workspace(workspace) / "state" / ROOM_ACTIONS_NAME
 
 
 def _scoped_name(base: str, session: str | None) -> str:
@@ -275,7 +296,10 @@ def record_no_send(reason: str, workspace: Path | str | None = None,
 
 def read_entries(workspace: Path | str | None = None) -> list[dict]:
     """Every parseable entry, oldest first. A damaged line is skipped, not fatal."""
-    path = ledger_path(workspace)
+    return _read_jsonl(ledger_path(workspace))
+
+
+def _read_jsonl(path: Path) -> list[dict]:
     out: list[dict] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -355,16 +379,30 @@ def _result_after(ts: float, workspace: Path | str | None = None) -> dict | None
     return best
 
 
+def _room_action_after(ts: float, workspace: Path | str | None = None) -> dict | None:
+    """The newest successful MCP room action newer than `ts`, or None."""
+    path = room_actions_path(workspace)
+    newer = [e for p in (path.with_name(path.name + ".1"), path) for e in _read_jsonl(p)
+             if e.get("kind") == "room-action" and e.get("action")
+             and e["action"] not in NOT_A_REPLY and float(e["ts"]) > ts]
+    if not newer:
+        return None
+    last = max(newer, key=lambda e: float(e["ts"]))
+    return {"ts": float(last["ts"]), "kind": "room-action",
+            "target": str(last.get("room_id") or "")}
+
+
 def delivery_after(ts: float, workspace: Path | str | None = None,
                     session: str | None = None) -> dict | None:
-    """The turn's newest outbound message since `ts`, over either surface.
+    """The turn's newest outbound message since `ts`, over any surface.
 
-    Only the ledger side is session-filtered; `_result_after` carries no
-    session identity to filter by (see the module docstring's NOT SCOPED note).
+    Only the ledger side is session-filtered; the result and room-action surfaces
+    carry no session identity to filter by (see the module docstring's NOT SCOPED note).
     """
     session = _resolve_session(session)
     candidates = [c for c in (last_action_after(ts, workspace, session),
-                              _result_after(ts, workspace)) if c]
+                              _result_after(ts, workspace),
+                              _room_action_after(ts, workspace)) if c]
     return max(candidates, key=lambda e: float(e["ts"])) if candidates else None
 
 
@@ -432,13 +470,17 @@ def spend_reminder(workspace: Path | str | None = None, session: str | None = No
 ENDED_ON_A_MESSAGE_S = 20.0
 
 
-def stop_gate(workspace: Path | str | None = None, session: str | None = None) -> str | None:
+def stop_gate(workspace: Path | str | None = None, session: str | None = None,
+              commit: bool = True) -> str | None:
     """None when the turn may end; otherwise the reason it must not.
 
     Allowing a stop RECORDS it, so the decision and the next turn's starting
     boundary cannot disagree. A refusal deliberately leaves the boundary alone:
     the turn has not ended, and the message the agent is about to send must still
     count against the boundary it began from.
+
+    `commit=False` answers the same question and writes nothing — no boundary,
+    no spent reminder — for a diagnostic run that is not a real turn ending.
 
     `session`, when known (explicitly, or via `$CLAUDE_CODE_SESSION_ID`),
     scopes the boundary/reminder to a per-session file and the ledger checks to
@@ -448,28 +490,34 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None) -
     """
     session = _resolve_session(session)
     ws = _workspace(workspace)
+    reason = _refusal(ws, session)
+    if commit:
+        if reason is None:
+            mark_stop(ws, session)
+        else:
+            spend_reminder(ws, session)
+    return reason
+
+
+def _refusal(ws: Path, session: str | None) -> str | None:
+    """`stop_gate`'s decision alone; it writes nothing."""
     # An absent ledger means nothing was ever sent, which is what this gate
     # catches. Only a missing boundary below is genuinely unjudgeable.
     since = last_stop_ts(ws, session)
     if since is None:
-        mark_stop(ws, session)
         return None
     # An explicit no-send is a decision ABOUT this turn, so its age cannot make it
     # stale; only a message is judged on whether the turn ended on it.
     if any(e.get("kind") == "no-send" and _entry_matches_session(e, session)
            for e in read_entries(ws) if float(e["ts"]) > since):
-        mark_stop(ws, session)
         return None
     last = delivery_after(since, ws, session)
     if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
-        mark_stop(ws, session)
         return None
     if reminder_spent(ws, session):
         # One nudge per turn. A turn that was already reminded ends regardless:
         # refusing twice is how a gate that is wrong becomes a loop.
-        mark_stop(ws, session)
         return None
-    spend_reminder(ws, session)
     return ("This turn is ending without a message and without an explicit "
             "no-send. Reply — post to the room (`room_ops.py say`) or write the "
             "result file the task expects — or, if silence is right, record it: "
@@ -478,7 +526,8 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None) -
 
 
 def main(argv: list[str]) -> int:
-    """`stop-gate` (exit 1 + reason on stdout when the turn must not end),
+    """`stop-gate [--commit]` (exit 1 + reason on stdout when the turn must not
+    end; only `--commit` records the stop, so a hand run changes nothing),
     `send KIND TARGET`, `no-send REASON`. `--workspace` pins the directory for a
     caller that already resolved it. `--session ID` overrides the session used
     to scope the reminder/boundary/ledger checks — mainly for tests simulating
@@ -495,12 +544,15 @@ def main(argv: list[str]) -> int:
         i = args.index("--session")
         session = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
+    commit = "--commit" in args
+    if commit:
+        args.remove("--commit")
     cmd = args[0] if args else ""
     if cmd == "turn-start":
         begin_turn(ws, session)
         return 0
     if cmd == "stop-gate":
-        reason = stop_gate(ws, session)
+        reason = stop_gate(ws, session, commit=commit)
         if reason:
             print(reason)
             return 1
@@ -512,7 +564,7 @@ def main(argv: list[str]) -> int:
         record_no_send(" ".join(args[1:]), ws, session)
         return 0
     print(f"usage: {Path(__file__).name} [--workspace DIR] [--session ID] "
-          "turn-start | stop-gate | send KIND TARGET | no-send REASON",
+          "turn-start | stop-gate [--commit] | send KIND TARGET | no-send REASON",
           file=sys.stderr)
     return 2
 

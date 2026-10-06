@@ -29,6 +29,8 @@ FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 CODEX_DIM_IDLE = "\x1b[1m›\x1b[0m \x1b[2mImprove documentation in @filename\x1b[0m\n"
 CODEX_PICKER = "  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven previous-generation model\n"
 CODEX_IDLE = f"\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n{FOOTER}\n"
+CODEX_157_FOOTER = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+CODEX_157_IDLE = f"\x1b[1m»\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n{CODEX_157_FOOTER}\n"
 CLAUDE_IDLE = f"❯ \n{FOOTER}\n"
 # (gate kind, prose a finished turn may print, the live dialog of that kind)
 BROAD_SIGNATURES = [
@@ -159,6 +161,33 @@ class ClaudeClassification(unittest.TestCase):
 
 
 class CodexClassification(unittest.TestCase):
+    def test_model_footer_without_a_composer_is_not_permission_to_type(self):
+        self.assertEqual(pg.classify_pane(CODEX_157_FOOTER, pg.CODEX).state, "unknown")
+
+    def test_current_codex_composer_and_model_footer_are_idle_ready(self):
+        for capture in (CODEX_157_IDLE, "› stale startup draft\n" + CODEX_157_IDLE):
+            v = pg.classify_pane(capture, pg.CODEX)
+            self.assertEqual((v.state, v.pending), ("idle-ready", ""))
+        self.assertEqual(pg.pending_text(CODEX_157_IDLE, pg.CODEX), "")
+        self.assertEqual(pg.composer_text(CODEX_157_IDLE, pg.CODEX), "")
+        self.assertEqual(pg.after_prompt(CODEX_157_IDLE, pg.CODEX), f"\n{CODEX_157_FOOTER.strip()}")
+
+    def test_current_codex_glyph_with_a_typed_draft_is_pending(self):
+        capture = f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n"
+        v = pg.classify_pane(capture, pg.CODEX)
+        self.assertEqual((v.state, v.pending), ("pending", "half typed"))
+        self.assertEqual(pg.composer_text(capture, pg.CODEX), "half typed")
+
+    def test_both_codex_glyphs_are_recognized_when_the_prompt_changes(self):
+        capture = "› stale draft\n\x1b[1m»\x1b[0m current draft\n"
+        self.assertEqual(pg.pending_text(capture, pg.CODEX), "current draft")
+        self.assertEqual(pg.composer_text(capture, pg.CODEX), "current draft")
+        self.assertEqual(pg.after_prompt(capture, pg.CODEX), "")
+
+    def test_current_codex_picker_row_is_busy(self):
+        v = pg.classify_pane("  Select Model and Effort\n» 4. gpt-5.5 (current)\n", pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+
     def test_dim_placeholder_is_idle_ready_not_pending(self):
         v = pg.classify_pane(CODEX_DIM_IDLE, pg.CODEX)
         self.assertEqual((v.state, v.pending), ("idle-ready", ""))
@@ -403,6 +432,101 @@ class ComposerTextStripsTheWholeFooterNotJustOneRow(unittest.TestCase):
             code = pg.main(["composer-text", "--runtime", "claude"])
         self.assertEqual(code, pg.EXIT_UNSAFE)
         self.assertEqual(out.getvalue(), "")
+
+
+class ComposerTextEndsAtTheClosingRule(unittest.TestCase):
+    """The recurrence of #4320 round 5 with a new trailing row (2026-09-25, two
+    deliveries the owner had to press Enter on himself): Claude Code boxes the
+    composer, and below the closing rule it now also draws an attachment strip
+    ("⧉ <artifact>") after the status row. The trailing-row pops matched neither
+    that strip nor the status row behind it, so the rule, the status row and the
+    strip were all glued onto the staged text and EXACT equality never held.
+    The composer ends at its closing rule; everything after it is frame."""
+
+    REAL = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
+
+    def test_the_real_capture_reads_as_exactly_the_staged_prompt(self):
+        text = pg.composer_text(self.REAL.read_text())
+        self.assertTrue(text.startswith("Sutando task ready: task-325dc8f4149e103d54.txt."), text[:80])
+        self.assertTrue(text.rstrip().endswith('--inbox  "/Users/wangchi/stando-ui/sutando/workspace/deliveries/17c6c3222a4a483b8c68652d58018ad7"'), text[-120:])
+        for frame in ("⏵⏵", "⧉", "─", "bypass permissions"):
+            self.assertNotIn(frame, text)
+
+    def test_a_status_row_and_an_attachment_strip_below_the_rule_are_frame(self):
+        capture = ("❯ Sutando task ready: task-x.txt\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells, 1 monitor · 1 feedback draft\n"
+                   "  ⧉  errand-deck\n")
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
+
+    def test_owner_rows_above_the_rule_survive_even_when_they_look_like_frame(self):
+        capture = ("❯ first line\n"
+                   "  ⧉ this is what I typed\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells\n")
+        self.assertEqual(pg.composer_text(capture), "first line  ⧉ this is what I typed")
+
+    def test_an_interior_rule_row_is_typed_text_and_the_owner_draft_after_it_survives(self):
+        # An interior rule is typed text: the draft after it must stay in the text, so
+        # EXACT equality with the prompt cannot hold (a first-rule cut hid it: fail-open).
+        capture = ("❯ Sutando task ready: task-x.txt\n"
+                   "  ────────────\n"
+                   "  owner draft\n"
+                   "────────────────────────────\n"
+                   "  ⏵⏵ bypass permissions on · 3 shells\n")
+        text = pg.composer_text(capture)
+        self.assertIn("owner draft", text)
+        self.assertNotEqual(text.replace(" ", ""), "Sutandotaskready:task-x.txt")
+
+    def test_no_rule_still_strips_the_one_row_footer(self):
+        capture = f"❯ Sutando task ready: task-x.txt\n{FOOTER}\n"
+        self.assertEqual(pg.composer_text(capture), "Sutando task ready: task-x.txt")
+
+    CUT = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-cut-whole-paste.txt"
+
+    def test_a_whole_paste_cut_to_its_tail_parses_to_the_tail_never_the_prompt(self):
+        # One tmux write past the CLI's input limit lands as its tail only; the reader
+        # must report that tail as-is, so EXACT equality cannot hold and Enter is refused.
+        text = pg.composer_text(self.CUT.read_text())
+        self.assertEqual(text, '/scratchpad/witness-4795/ws/tasks"')
+        prompt = 'Sutando task ready: task-witness-4795.txt. Read it and reply. --inbox "/x/scratchpad/witness-4795/ws/tasks"'
+        self.assertNotEqual(text, prompt)
+        self.assertTrue(prompt.endswith(text))
+        for frame in ("⏵⏵", "⧉", "─", "Spinning"):
+            self.assertNotIn(frame, text)
+
+
+class ComposerFrameVisibility(unittest.TestCase):
+    """composer_frame_visible: the closing rule or the idle footer below the prompt line
+    means the box's end is on screen; neither means the screen bottom cut the box."""
+
+    REAL = Path(__file__).resolve().parent / "fixtures" / "pane-claude-composer-staged-with-artifact-strip.txt"
+
+    def test_the_real_capture_shows_its_frame(self):
+        self.assertIs(pg.composer_frame_visible(self.REAL.read_text()), True)
+
+    def test_a_box_running_off_the_screen_bottom_is_cut(self):
+        capture = ("❯ Sutando task ready: task-x.txt. Read /some/where/task-x.txt, follow\n"
+                   "  CLAUDE.md, complete the task, and write the result to /some/where/results\n")
+        self.assertIs(pg.composer_frame_visible(capture), False)
+
+    def test_no_prompt_line_is_unknown(self):
+        self.assertIsNone(pg.composer_frame_visible("just transcript\n"))
+
+    def test_the_cli_prints_visible_cut_or_refuses(self):
+        import contextlib
+        import io
+        cases = [(self.REAL.read_text(), "visible\n", 0), ("❯ typed text\n  more typed text\n", "cut\n", 0),
+                 ("just transcript\n", "", pg.EXIT_UNSAFE)]
+        for capture, want, want_code in cases:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                sys.stdin = io.StringIO(capture)
+                try:
+                    code = pg.main(["composer-frame", "--runtime", "claude"])
+                finally:
+                    sys.stdin = sys.__stdin__
+            self.assertEqual((out.getvalue(), code), (want, want_code), err.getvalue())
 
 
 class TheAbnormalVerdictIsCliWedgesNotTheGatesOwn(unittest.TestCase):

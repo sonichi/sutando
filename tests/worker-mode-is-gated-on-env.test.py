@@ -81,6 +81,8 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
             REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
             root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
         )
+        delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
+        delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "workspace"; (ws / "state").mkdir(parents=True)
         (root / "scripts" / "sutando-config.sh").write_text(
             '#!/bin/bash\ncase "$1" in\n'
@@ -98,7 +100,10 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
             (bind / stub).write_text("#!/bin/bash\n" + body); (bind / stub).chmod(0o755)
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)
         env = {"PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
-               "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1", **extra_env}
+               "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1",
+               **({"SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_script)}
+                  if extra_env.get("SUTANDO_INSTANCE_ID") else {}),
+               **extra_env}
         try:
             run = subprocess.run(["/bin/bash", str(root / launcher)],
                                  env=env, capture_output=True, text=True, timeout=60)

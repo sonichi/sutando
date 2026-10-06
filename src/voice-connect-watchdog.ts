@@ -5,6 +5,8 @@
  * that imported the predicate from there would boot a voice agent.
  */
 
+import { onConnectingTick, type RecoveryLog, type RecoverySurface } from './voice-upstream-recovery.js';
+
 export const DEFAULT_STUCK_CONNECTING_MS = 120_000;
 
 /** Lower bound for a positive override. bodhi bounds a dial at 30s
@@ -76,4 +78,25 @@ export function nextConnectingTick(o: {
 	if (o.state !== 'CONNECTING') return { connectingSince: 0, forceClose: false };
 	if (o.connectingSince === 0) return { connectingSince: o.now, forceClose: false };
 	return { connectingSince: o.connectingSince, forceClose: shouldForceClosed(o) };
+}
+
+/**
+ * One health tick of the CONNECTING watchdog: advances the hang clock and replaces a hung dial.
+ * Returns the next stuck-since clock, zeroed only once the hang was handled.
+ */
+export function connectingWatchdogTick(
+	args: {
+		connectingSince: number; state: string; clientConnected: boolean; now: number;
+		lastReconnectAt: number; fatalBackoffUntil: number; session: RecoverySurface; thresholdMs?: number;
+	} & RecoveryLog,
+): number {
+	const tick = nextConnectingTick(args);
+	const handled = onConnectingTick({
+		forceClose: tick.forceClose,
+		session: args.session,
+		stuckForS: Math.round((args.now - tick.connectingSince) / 1000),
+		log: args.log,
+		error: args.error,
+	});
+	return handled ? 0 : tick.connectingSince;
 }

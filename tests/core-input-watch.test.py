@@ -335,6 +335,105 @@ class TestComposeState(unittest.TestCase):
         self.assertEqual(st2, "hung")
 
 
+# A turn in flight, as Claude Code renders it: output above, the spinner line below.
+_TURN_A = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "✻ Perambulating… (12s · ↓ 1.2k tokens · esc to interrupt)")
+_TURN_B = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "⏺ Read(src/health_snapshot.py)\n  ⎿  Read 400 lines\n"
+           "✻ Perambulating… (15s · ↓ 1.9k tokens · esc to interrupt)")
+# The same frame three minutes later: only the clock and the token count moved.
+_TURN_A_TICKED = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+                  "✻ Perambulating… (3m 12s · ↓ 4.8k tokens · esc to interrupt)")
+
+
+class TestMovingTurnIsNotHung(unittest.TestCase):
+    """A stale self-report is not a wedge when the pane shows a turn in flight AND it
+    changed since the last poll; a frozen turn still reads hung."""
+
+    def test_a_moving_working_pane_reads_running(self):
+        st, detail, prompt, _k = compose_state(_TURN_B, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual((st, detail, prompt), ("running", "actively processing", None))
+
+    def test_a_frozen_working_pane_stays_hung(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_the_first_poll_has_no_motion_to_see(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True)
+        self.assertEqual(st, "hung")
+
+    def test_only_the_spinner_clock_moving_is_still_hung(self):
+        st, *_ = compose_state(_TURN_A_TICKED, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_only_the_spinner_glyph_cycling_is_still_hung(self):
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(_TURN_A.replace("✻ ", glyph + " "), "unknown", True, prev_pane=_TURN_A)
+                self.assertEqual(st, "hung")
+
+    def test_a_hyphenated_spinner_verb_cycling_its_glyph_is_still_hung(self):
+        prev = _TURN_A.replace("Perambulating", "Dilly-dallying")
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(prev.replace("✻ ", glyph + " "), "unknown", True, prev_pane=prev)
+                self.assertEqual(st, "hung")
+
+    def test_a_real_captured_turn_reads_as_in_flight_and_its_glyph_cycle_is_not_motion(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                            "pane-claude-turn-in-flight.txt")
+        with open(path, encoding="utf-8") as f:
+            real = f.read()
+        self.assertTrue(_mod.cli_wedge.frame_working(real))
+        cycled = real.replace("✢ Transmogrifying…", "✻ Transmogrifying…")
+        self.assertNotEqual(cycled, real)
+        st, *_ = compose_state(cycled, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "hung")
+        grown = real.replace("⏺\n", "⏺ Rain on the roof,\n")
+        st, *_ = compose_state(grown, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "running")
+
+    def test_a_changing_pane_without_a_turn_in_flight_stays_hung(self):
+        st, *_ = compose_state("Running step 4...", "unknown", True, prev_pane="Running step 3...")
+        self.assertEqual(st, "hung")
+
+    def test_the_idle_footer_override_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        st, *_ = compose_state(idle, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "idle-ready")
+
+    def test_the_watcher_carries_the_previous_capture_between_polls(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        panes, states = iter([_TURN_A, _TURN_B]), []
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+
+        class _Stop(Exception):
+            pass
+
+        def _sleep(_s):
+            with open(out) as f:
+                states.append(json.load(f)["state"])
+            if len(states) == 2:
+                raise _Stop
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
+        with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(sys, "argv", argv), self.assertRaises(_Stop):
+            main()
+        self.assertEqual(states, ["hung", "running"])
+
+
 class TestRefusedTurn(unittest.TestCase):
     """#4015: a turn the CLI refuses is a FINISHED turn at the idle footer — no gate, no
     affordance — so classify() cannot see it and every base health reads idle-ready.
@@ -353,12 +452,14 @@ class TestRefusedTurn(unittest.TestCase):
             self.assertIn("turn-rejected", detail)
 
     def test_a_bare_done_line_counts(self):
-        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py).
+        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py). A refused
+        # LOGIN is the signed-out state itself, whatever the shared health made of the pane.
         pane = ("❯ /startup\n  ⎿  OAuth access token has expired · Please run /login\n"
                 "✻ Worked for 0s\n" + _IDLE_FOOTER)
-        st, _d, prompt, kind = compose_state(pane, "idle", True)
-        self.assertEqual((st, kind), ("blocked-human", "turn-rejected"))
-        self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
+        for base in ("idle", "working", "unknown", "needs_login"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind), ("logged-out", "login"), base)
+            self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
 
     def test_a_successful_last_turn_stays_idle_ready(self):
         for base in ("idle", "unknown"):
@@ -407,11 +508,16 @@ class TestRefusedTurn(unittest.TestCase):
 
     def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
         for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
-                     "not logged in", "Run /login first: not logged in"):
+                     "Run /login first: not logged in"):
             pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
             st, _d, prompt, kind = compose_state(pane, "idle", True)
-            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), line)
+            self.assertEqual((st, kind), ("logged-out", "login"), line)
             self.assertEqual(prompt, line)
+        # The bare three words with no /login token are not the signed-out state: the shared
+        # banner grammar (cli_wedge needs-login) keeps prose clean; the turn is still refused.
+        pane = "❯ /startup\n  ⎿  not logged in\n✻ Worked for 0s\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", "not logged in"))
 
     def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
         # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
@@ -462,6 +568,61 @@ class TestRefusedTurn(unittest.TestCase):
     def test_a_refused_turn_is_never_auto_answered(self):
         self.assertIsNone(auto_answer("turn-rejected"))
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
+
+
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+
+
+class TestLoginExpiredStands(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): four workers on a six-seat pool host printed
+    "Login expired · Please run /login" in a 0 s turn, and every "session expired" card was
+    edited to Resolved within 30 s. The refusal was no longer the LAST completed turn (the
+    seat had been typed at again, or a turn was spinning), so `refused_turn` stood down and
+    the tick read idle-ready — and on a worker seat the shared health reads the CORE's fresh
+    status file and calls the pane's login marker a false positive. The pane's own refusal
+    is the signed-out state until the pane shows a turn that ran."""
+
+    def test_a_refused_login_under_a_newer_typed_prompt_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + _IDLE_FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        for base in ("idle", "working", "unknown"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED), base)
+
+    def test_a_refused_login_under_a_spinning_turn_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + "❯ try again\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_refused_login_repeated_by_a_re_armed_seat_is_one_episode(self):
+        # Two refusals, same line: the card's episode key is the line, so one card.
+        pane = _LOGIN_REFUSED + _LOGIN_REFUSED + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_signed_in_turn_after_the_refusal_is_idle_ready(self):
+        st, _d, prompt, kind = compose_state(_LOGIN_REFUSED + _STARTUP_OK_TURN + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("idle-ready", None, None))
+
+    def test_login_successful_after_the_refusal_is_idle_ready(self):
+        st, *_ = compose_state(_LOGIN_REFUSED + "  ⎿  Login successful\n" + _IDLE_FOOTER, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_credits_refusal_is_still_a_rejected_turn_not_a_login(self):
+        # Only the login family is the signed-out state; the spend/wait refusal keeps its kind.
+        st, _d, prompt, kind = compose_state(_REFUSED_TURNS + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", _REFUSAL_LINE))
+
+    def test_a_live_login_menu_still_outranks_the_refusal_in_scrollback(self):
+        st, _d, _p, kind = compose_state(_LOGIN_REFUSED + _LOGIN_MENU, "idle", True)
+        self.assertEqual((st, kind), ("blocked-human", "login"))
+
+    def test_the_words_inside_a_turn_that_ran_are_not_a_login_refusal(self):
+        pane = ("❯ check auth\n⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_LOGIN_EXPIRED}\n● The diagnostic was read successfully.\n"
+                "✻ Worked for 1s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
 
 
 class TestNovelPromptBesideAnOldFooter(unittest.TestCase):
@@ -767,7 +928,8 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n" + script + "\n")
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+                    + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
 
@@ -778,7 +940,7 @@ class TestSendKeys(unittest.TestCase):
             self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "sutando-core:0", "Enter"])
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
@@ -788,7 +950,8 @@ class TestSendKeys(unittest.TestCase):
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
-        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=sutando-core:0"), \
+                patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
             self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
@@ -848,6 +1011,83 @@ class TestMainOnce(unittest.TestCase):
                 sig = json.load(f)
         self.assertEqual(sig["state"], "crashed")
         self.assertEqual(sig["session"], "sutando-core")
+
+    def test_a_dead_seat_whose_input_session_lives_on_is_crashed(self):
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "sock")
+            seat = "sutando-worker-" + "a" * 32
+            subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", seat + "-input", "sleep 60"],
+                           check=True)
+            out = os.path.join(td, "state", f"core-supervisor.{seat}.json")
+            old, old_sock = sys.argv, os.environ.get("SUTANDO_TMUX_SOCKET")
+            sys.argv = ["core-input-watch.py", f"--socket={sock}", f"--session={seat}",
+                        f"--out={out}", "--no-chat-escalation", "--once"]
+            try:
+                main()
+            finally:
+                sys.argv = old
+                if old_sock is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = old_sock
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+            with open(out) as f:
+                self.assertEqual(json.load(f)["state"], "crashed")
+
+    def test_capture_reads_the_core_on_a_base_index_1_host(self):
+        import shutil
+        import subprocess
+        import tempfile
+        import time
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            conf, sock = os.path.join(td, "base1.conf"), os.path.join(td, "sock")
+            with open(conf, "w") as f:
+                f.write("set -g base-index 1\n")
+            subprocess.run([tmux, "-f", conf, "-S", sock, "new-session", "-d", "-s", "sutando-core",
+                            "printf 'core pane here\\n'; sleep 60"], check=True)
+            try:
+                frame = ""
+                for _ in range(20):
+                    frame = _mod.capture(sock, "sutando-core") or ""
+                    if "core pane here" in frame:
+                        break
+                    time.sleep(0.1)
+                self.assertIn("core pane here", frame)
+            finally:
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+
+    def test_capture_and_keys_target_the_lowest_window_exactly(self):
+        from unittest.mock import patch
+        seen = []
+
+        class R:
+            returncode, stdout = 0, ""
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=seat:1") as target, \
+                patch.object(_mod.cli_wedge, "capture_pane", return_value="frame") as cap, \
+                patch.object(_mod.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or R()):
+            self.assertEqual(_mod.capture("s.sock", "seat"), "frame")
+            self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
+        self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
+        cap.assert_called_once_with("s.sock", "=seat:1")
+        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+
+    def test_no_core_window_means_no_capture_and_no_keys(self):
+        from unittest.mock import patch
+        with patch.object(_mod.cli_wedge, "core_target", return_value=None), \
+                patch.object(_mod.subprocess, "run") as run:
+            self.assertIsNone(_mod.capture("s.sock", "seat"))
+            self.assertFalse(_mod.send_keys("s.sock", "seat", "Enter"))
+        run.assert_not_called()
 
     def test_once_blocked_prompt_debounces_on_first_tick(self):
         """A fresh gate with --stable 2 must NOT escalate on the first tick — the

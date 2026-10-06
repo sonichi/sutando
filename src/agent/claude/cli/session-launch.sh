@@ -75,7 +75,7 @@ claude_named_process_running() {
 
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
-  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
 }
 
 claude_named_session_running() {
@@ -149,6 +149,13 @@ if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
+# Claude Code's "Flicker-free output" upsell shows until this counter reaches 3
+# (what "Not now" writes); a headless core cannot take the trial (P1-24).
+upsell_seeded = False
+if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
+    cfg["fullscreenUpsellSeenCount"] = 3
+    changed = True
+    upsell_seeded = True
 # Trust-seed for the explicitly-configured working dir. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
 # scoped config lacks it for a custom cwd, so a detached session would hang on
@@ -198,6 +205,8 @@ if changed:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    if upsell_seeded:
+        print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
     fi
   else
@@ -237,7 +246,7 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
@@ -295,6 +304,15 @@ resolve_claude_credential_proxy() {
       echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
+}
+
+# Appends --plugin-dir for each enabled skill's Claude plugin to SURFACE_ARGS.
+# Reads REPO, PY.
+add_skill_claude_plugins() {
+  declare -F skill_manifest_claude_plugins >/dev/null || return 0
+  while IFS= read -r -d '' _plugin_dir; do
+    SURFACE_ARGS+=(--plugin-dir "$_plugin_dir")
+  done < <(skill_manifest_claude_plugins "$REPO" "$PY")
 }
 
 # Any installed skill's manifest.json "config" block, forwarded the same way

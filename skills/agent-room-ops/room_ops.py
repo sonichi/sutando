@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops — an agent's room-participation capability collection (one skill).
 
 A single gateway-only client surface for everything an agent does in a room beyond
@@ -20,6 +22,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py events list
     python3 room_ops.py events pull [--cursor N] [--wait S]
     python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
+    python3 room_ops.py capabilities                                 # supported commands + say flags
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
@@ -271,9 +274,18 @@ def _main(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
+                                        "copy supports, so a caller can pick a capable copy")
+
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
+    if a.cmd == "capabilities":
+        say_flags = sorted(o for act in sub.choices["say"]._actions for o in act.option_strings
+                           if o.startswith("--") and o != "--help")
+        print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
+                          "say_extra_content_checked": True}, indent=2))
+        return 0
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
                               oldest_first=a.oldest_first)
@@ -324,9 +336,16 @@ def _main(argv):
         if a.worker:
             _kw["worker"] = a.worker
         if a.extra_content:
-            _extra = json.loads(a.extra_content)
-            if not isinstance(_extra, dict):
-                raise SystemExit("room-ops: --extra-content must be a JSON object")
+            try:
+                _extra = json.loads(a.extra_content)
+            except ValueError as e:
+                refusal = f"--extra-content is not valid JSON: {e}"
+            else:
+                refusal = _say.extra_content_problem(_extra)
+            if refusal:
+                # A malformed payload is the caller's bug, never a transient no-op: exit 1.
+                print(json.dumps(_say._result(False, room_id=a.room_id, reason=refusal), indent=2))
+                return 1
             _kw["extra_content"] = _extra
         if a.thread_root:
             _kw["thread_root"] = a.thread_root

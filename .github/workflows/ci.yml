@@ -170,7 +170,7 @@ jobs:
       # was pure indirection. Still required after the test:ts split: the out-of-tree
       # Python steps above need these deps, even though this job no longer runs test:py.
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       - name: Typecheck
         run: npm run typecheck
@@ -227,7 +227,7 @@ jobs:
         run: npm ci
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # Python tests that live OUTSIDE tests/ and so are invisible to the
       # `find tests -name '*.test.py'` discovery. Same reason the skill-manifest
@@ -246,6 +246,8 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
@@ -316,7 +318,7 @@ jobs:
         run: npm ci
 
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # Run standalone shell tests (*.test.sh). Fixes issue #1934: these suites
       # existed but were never wired into CI (the discovery glob only covered
@@ -338,7 +340,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Python test deps
-        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
       - name: Run shell standalone tests (serial tail)
         run: bash scripts/run-shell-suites.sh tail
 
@@ -377,7 +379,7 @@ jobs:
 
 
       - name: Install Python test deps
-        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3' -r skills/room-collab/requirements.txt
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # watch-tasks-stream-config-hot-reload.test.py exercises the real
       # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship

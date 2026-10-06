@@ -152,6 +152,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 import re
 import shutil
 import subprocess
@@ -174,6 +175,7 @@ MEMORY_ROW_LINK = f"]({MEMORY_FILE})"
 NOTES_SUBDIR = ("notes", "claude-import")
 OVERVIEW = "overview.md"
 PEOPLE_CAP = 25
+PEOPLE_LIST_SHOWN = 50          # names listed per People list in the digest; the rest is a count
 PEOPLE_MIN_CITATIONS = 2
 PUBLISHED_FIELD_LIMITS = {"role": 80, "company": 80, "relationship": 200}   # as the dossier prints them
 DIFF_FULL_VALUE = 120      # a field diff shows both values whole up to this; longer: prefix elided
@@ -197,6 +199,10 @@ HELD_BY_OWNER = "held by you"
 STALE_ROLLUP_TEXT = ("(roll-up pending regeneration — a session was held, included or forgotten "
                      "after it was written; nothing from it is shown until it is re-run)")
 REVIEW_MAX_ITEMS = 12
+# The AG2 Space bridge dead-letters a proactive body over 48 KiB (never delivered, no retry).
+# A part of this many characters stays under that even at 4 bytes per character.
+DIGEST_PART_CHARS = 12_000
+DIGEST_PART_HEADER = "Claude Code import — part {i}/{n}\n\n"
 REVIEW_FOOTER = ("Reply 'bring it in' to save this to your Sutando, 'bring in <slug>' "
                  "for one project, or 'forget <slug>' to drop one.")
 
@@ -1511,9 +1517,11 @@ def _people_section(candidates, ambiguous, below_floor: int, merged, known_check
                  "People store, so nothing is upserted until it can be read._\n\n")
     else:
         text += f"Already in your People store — will gain new interactions ({len(existing)}):\n"
-        for p, cites, m in existing:
+        for p, cites, m in existing[:PEOPLE_LIST_SHOWN]:
             text += (f"- {_one_line(p['name'], 80)} — matched on {m.get('matched_on')} "
                      f"({_n(len(cites), 'citation')})\n")
+        if len(existing) > PEOPLE_LIST_SHOWN:
+            text += f"- …and {len(existing) - PEOPLE_LIST_SHOWN} more\n"
         text += "- none\n" if not existing else ""
         text += "\n"
     text += f"New — will be added ({len(new)}):\n"
@@ -1662,6 +1670,49 @@ def render_review(*, slugs, rollups: dict, index_doc: dict, entities: dict, cand
     text += _held_section(held_rows)
     text += f"\n---\n{REVIEW_FOOTER}\n"
     return text
+
+
+def digest_parts(text: str, max_chars: int = DIGEST_PART_CHARS) -> list:
+    """The digest as ordered proactive bodies the bridge will deliver. One part
+    when it fits; otherwise line-bounded parts (code fences kept whole) with a
+    part header, the reply footer only on the last one."""
+    if len(text) <= max_chars:
+        return [text]
+    sys.path.insert(0, str(REPO / "src"))
+    from message_chunking import chunk_message  # noqa: PLC0415
+    body = text
+    footer = ""
+    marker = f"\n---\n{REVIEW_FOOTER}\n"
+    if body.endswith(marker):
+        body, footer = body[: -len(marker)], marker
+    reserve = len(DIGEST_PART_HEADER.format(i=99, n=99)) + len(footer)
+    parts = [c for c in chunk_message(body, max_len=max_chars - reserve) if c.strip()]
+    n = len(parts)
+    out = [DIGEST_PART_HEADER.format(i=i + 1, n=n) + c.rstrip("\n") + "\n" for i, c in enumerate(parts)]
+    out[-1] += footer
+    return out
+
+
+def write_digest_files(*, data_dir: Path, results_dir: Path) -> dict:
+    """Post staged/review.md to the owner DM as proactive files, in parts the
+    bridge can carry. Names sort in the order the parts were cut, and each file
+    is renamed into place whole."""
+    review = data_dir / STAGED_DIR / STAGED_REVIEW
+    if not review.is_file():
+        raise SystemExit("nothing is staged: no staged/review.md to post")
+    text = review.read_text(encoding="utf-8")
+    parts = digest_parts(text)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000)
+    files = []
+    for i, part in enumerate(parts, 1):
+        name = f"proactive-{stamp}.txt" if len(parts) == 1 else f"proactive-{stamp}-{i:02d}.txt"
+        tmp = results_dir / f".{name}.tmp"
+        tmp.write_text(part, encoding="utf-8")
+        os.replace(tmp, results_dir / name)
+        files.append(name)
+    return {"parts": len(parts), "bytes": len(text.encode("utf-8")),
+            "largest_part_bytes": max(len(p.encode("utf-8")) for p in parts), "files": files}
 
 
 # ------------------------------------------------------------------------- stage
@@ -2230,6 +2281,9 @@ def main(argv=None) -> int:
     action.add_argument("--forget-session", default=None, metavar="DATE|UUID",
                         help="delete that session's summary, dumps and state entry")
     action.add_argument("--forget", default=None, metavar="SLUG")
+    action.add_argument("--digest-files", action="store_true",
+                        help="write staged/review.md to <results-dir> as proactive files in deliverable parts")
+    ap.add_argument("--results-dir", default=None, metavar="DIR", help="--digest-files: default <workspace>/results")
     ap.add_argument("--known-people", default=None, metavar="FILE",
                     help="the station's people__list_people output (JSON array) for --stage / --people-json")
     ap.add_argument("--existing-doc", default=None, metavar="FILE", help="--people-doc-merge: the current dossier")
@@ -2298,6 +2352,12 @@ def main(argv=None) -> int:
             r["purged_files"] = purge_dumps(data_dir)
         print(json.dumps(r, sort_keys=True) if a.json else
               f"forgot {a.forget}: " + ", ".join(f"{k}={v}" for k, v in r.items()))
+        return 0
+    if a.digest_files:
+        r = write_digest_files(data_dir=data_dir,
+                               results_dir=Path(a.results_dir) if a.results_dir else ws / "results")
+        print(json.dumps(r, sort_keys=True) if a.json else
+              f"posted the digest as {r['parts']} part(s) ({r['bytes']} B): " + ", ".join(r["files"]))
         return 0
     if a.commit:
         c = commit(data_dir=data_dir, ws=ws, memory_dir=memory_dir, projects=projects)

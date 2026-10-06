@@ -70,14 +70,33 @@ def _spawned(ws, repo, runner, label="alpha"):
                     runner=runner, require_sentinel=False)
 
 
-class ResumeKeepsIdentity(unittest.TestCase):
+class HermeticSpawnTest(unittest.TestCase):
     def setUp(self):
-        self.ws = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        self.la = self.ws / "LaunchAgents"
         self.repo = REPO
+        real_ensure = sw.ensure_remedy_timer
+
+        def ensure_in_temp(workspace, repo, **kw):
+            return real_ensure(workspace, repo, launch_agents=self.la, **kw)
+
+        patcher = mock.patch.object(sw, "ensure_remedy_timer", side_effect=ensure_in_temp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class ResumeKeepsIdentity(HermeticSpawnTest):
 
     def test_resume_reuses_the_worker_id_and_inbox(self):
         t = FakeTmux()
         first = _spawned(self.ws, self.repo, t)
+        if sys.platform == "darwin":
+            self.assertEqual(Path(first["remedy_timer"]["plist"]).parent, self.la,
+                             "a resume test wrote a timer under the real LaunchAgents directory")
+        else:
+            self.assertEqual(first["remedy_timer"]["why"], "launchd is macOS-only")
         t.existing.clear()          # the reboot: records survive, processes do not
 
         again = sw.spawn(self.ws, self.repo, cwd=str(self.repo), socket="/tmp/t.sock",
@@ -195,14 +214,10 @@ class FailingLauncher(FakeTmux):
         return super().__call__(argv, **kw)
 
 
-class AFailedResumeLeavesNoOpenRun(unittest.TestCase):
+class AFailedResumeLeavesNoOpenRun(HermeticSpawnTest):
     """A run that never started must not stay open: an open incarnation is what a
     liveness probe reads as "this worker has a run", pointing at a session that
     was never created."""
-
-    def setUp(self):
-        self.ws = Path(tempfile.mkdtemp())
-        self.repo = REPO
 
     def _fail_a_resume(self):
         t = FailingLauncher(fail_from=2)

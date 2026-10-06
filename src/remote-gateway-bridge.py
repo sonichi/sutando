@@ -85,6 +85,31 @@ for _root in (
 # (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+_WORKER_LABEL_SCRIPT = (_REPO / "skills" / "worker-pool" / "scripts"
+                        / "apply_profile_label_overrides.py")
+
+
+def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
+                                          profile_mxid: str) -> dict:
+    """Hand validated owner labels to the optional worker-pool skill."""
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, str(_WORKER_LABEL_SCRIPT), "--workspace", str(WS),
+         "--config-version", str(config_version), "--profile-mxid", profile_mxid],
+        input=json.dumps(labels), text=True, capture_output=True, timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"worker label apply failed (rc={result.returncode}): "
+                           f"{result.stderr.strip()[:240]}")
+    return json.loads(result.stdout)
+
+
+# An install without worker-pool has no callback and makes no profile read.
+_SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
+                                 if _WORKER_LABEL_SCRIPT.is_file() else None)
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).

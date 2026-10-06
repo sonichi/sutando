@@ -104,5 +104,31 @@ env -i HOME="$HOME" PATH="$STUB_PATH" bash "$WORKERCLI" --print-env > "$TMP/fwd-
 [ $? -ne 0 ]
 check $? "an install with no worker env refuses rather than guessing a session name"
 
+# A worker with an instance ID must have a usable delivery writer. The probe
+# above can inspect incomplete env, but an actual launch must fail before tmux
+# creates a session that cannot acknowledge pending tasks.
+cat > "$TMP/bin/tmux" <<'SH'
+#!/bin/sh
+touch "$SUTANDO_TEST_TMUX_CALLED"
+exit 99
+SH
+chmod +x "$TMP/bin/tmux"
+for writer in unset "$TMP/missing-pool-delivery.py"; do
+  if [ "$writer" = unset ]; then
+    env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_TEST_TMUX_CALLED="$TMP/tmux-called" \
+      SUTANDO_TMUX_SESSION="sutando-test-worker" SUTANDO_INSTANCE_ID="$WID" \
+      bash "$WORKERCLI" > "$TMP/launch-without-writer.out" 2>&1
+  else
+    env -i HOME="$HOME" PATH="$STUB_PATH" SUTANDO_TEST_TMUX_CALLED="$TMP/tmux-called" \
+      SUTANDO_TMUX_SESSION="sutando-test-worker" SUTANDO_INSTANCE_ID="$WID" \
+      SUTANDO_POOL_DELIVERY_SCRIPT="$writer" \
+      bash "$WORKERCLI" > "$TMP/launch-without-writer.out" 2>&1
+  fi
+  rc=$?
+  [ "$rc" -eq 2 ] && grep -q 'SUTANDO_POOL_DELIVERY_SCRIPT.*readable file' "$TMP/launch-without-writer.out" \
+    && [ ! -e "$TMP/tmux-called" ]
+  check $? "an actual worker launch refuses a $writer delivery writer before tmux"
+done
+
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

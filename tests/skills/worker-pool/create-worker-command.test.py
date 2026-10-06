@@ -175,6 +175,55 @@ class TestFailuresAreLoud(Base):
         sw.spawn = boom
         self.assertEqual(self.run_cli(), cw.REFUSED)
 
+    def test_a_timer_repo_conflict_warns_a_non_json_user(self):
+        fake_spawn = sw.spawn
+
+        def conflicted(*a, **kw):
+            return {**fake_spawn(*a, **kw), "remedy_timer": {
+                "ensured": False, "conflict": True,
+                "why": "timer belongs to another checkout"}}
+
+        sw.spawn = conflicted
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.run_cli("--label", "reviewer")
+        self.assertEqual(rc, 0)
+        self.assertIn("worker ", out.getvalue())
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("unattended recovery is unavailable", err.getvalue())
+        self.assertIn("another checkout", err.getvalue())
+
+    def test_a_timer_bootstrap_failure_warns_a_non_json_user(self):
+        fake_spawn = sw.spawn
+
+        def failed(*a, **kw):
+            return {**fake_spawn(*a, **kw), "remedy_timer": {
+                "ensured": False, "why": "RuntimeError: launchctl bootstrap failed"}}
+
+        sw.spawn = failed
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.run_cli("--label", "reviewer")
+        self.assertEqual(rc, 0)
+        self.assertIn("worker ", out.getvalue())
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("unattended recovery is unavailable", err.getvalue())
+        self.assertIn("bootstrap failed", err.getvalue())
+
+    def test_an_existing_timer_or_non_macos_no_op_stays_quiet(self):
+        fake_spawn = sw.spawn
+        for why in ("already installed", "launchd is macOS-only"):
+            with self.subTest(why=why):
+                def unchanged(*a, **kw):
+                    return {**fake_spawn(*a, **kw), "remedy_timer": {
+                        "ensured": False, "why": why}}
+
+                sw.spawn = unchanged
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(self.run_cli(), 0)
+                self.assertNotIn("WARNING", err.getvalue())
+
     def test_a_worker_created_but_unrostered_fails_loudly(self):
         # The worst outcome: the worker exists and routing cannot see it. It
         # must not exit 0, or the caller believes the worker is usable.
@@ -249,21 +298,15 @@ class TestDryRunPredictsTheSameRuntimeAsTheRealRun(Base):
         self.assertEqual(self.run_cli(), 0)
         self.assertEqual(planned, "claude")
 
-    def test_omitted_runtime_with_an_unsupported_core_refuses_both_ways(self):
+    def test_omitted_runtime_with_a_codex_core_matches(self):
         sw.core_runtime = lambda repo, runner=None: "codex"
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            dry_rc = self.run_cli("--dry-run")
-        self.assertEqual(dry_rc, cw.REFUSED)
-        self.assertIn("worker mode", err.getvalue())
-        self.assertEqual(self.spawned, [])
-
-        err2 = io.StringIO()
-        with contextlib.redirect_stderr(err2):
-            real_rc = self.run_cli()
-        self.assertEqual(real_rc, cw.REFUSED)
-        self.assertIn("worker mode", err2.getvalue())
-        self.assertEqual(self.spawned, [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--dry-run"), 0)
+        self.assertEqual(json.loads(out.getvalue())["runtime"], "codex")
+        self.assertEqual(self.run_cli(), 0)
+        self.assertEqual(pr.load_roster(self.ws)["workers"][self.spawned[-1]]["runtime"],
+                         "codex")
 
     def test_explicit_supported_runtime_is_honored(self):
         out = io.StringIO()

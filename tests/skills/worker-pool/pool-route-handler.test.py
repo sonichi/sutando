@@ -64,7 +64,7 @@ class TestPickerReplayAcrossRestart(Base):
         import task_envelope as te
         p = self.ws / "tasks" / f"{name}.txt"
         raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\n"
-               f"task: {sentence}\nsource: ag2space\n"
+               f"task_layout: mid\ntask: {sentence}\nsource: ag2space\n"
                f"wire_source: worker-picker\nchannel_id: {self.ROOM}\n"
                f"user_id: @q:b\naccess_tier: owner\n")
         p.write_text(te.stamp_text(raw, self.ws))
@@ -446,12 +446,13 @@ class TestPickerAppliedAtTheEdge(Base):
     """An owner's pin is bound and advertised by the handler itself, before the
     core sees the task; the task still goes to the core (DECLINE)."""
 
-    def picker_file(self, name, sentence, tier="owner", *, stamped=True):
-        # The gateway writes the tier BELOW task:, so only an attested file can
-        # show it; `stamped=False` is the unattested install, which fails closed.
+    def picker_file(self, name, sentence, tier="owner", *, stamped=True, layout=True):
+        # The gateway writes the tier BELOW task:, so only a file that declares the
+        # task-mid layout AND is attested can show it; either missing fails closed.
         import task_envelope as te
         p = self.ws / "tasks" / f"{name}.txt"
-        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
+        marker = "task_layout: mid\n" if layout else ""
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\n{marker}task: {sentence}\n"
                f"source: ag2space\nwire_source: worker-picker\n"
                f"channel_id: !other:x\naccess_tier: {tier}\n")
         p.write_text(te.stamp_text(raw, self.ws) if stamped else raw)
@@ -493,6 +494,14 @@ class TestPickerAppliedAtTheEdge(Base):
                              h.DECLINE)
         self.assertEqual(self.bindings(), {"!other:x": W})
 
+    def test_a_signed_file_without_the_declared_layout_is_not_applied(self):
+        # The envelope proves bytes, not shape: without the writer's marker the
+        # tier below task: is body text, so the pin is refused.
+        self.roster(bindings={})
+        t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", layout=False)
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), h.DECLINE)
+        self.assertIsNone(self.bindings(), "a signed task-last file applied a pin")
+
     def test_a_team_pin_is_not_applied(self):
         self.roster(bindings={})
         t = self.picker_file("task-1", f"Pin room !other:x to {W} (worker picker)", tier="team")
@@ -528,7 +537,7 @@ class TestMalformedRosterRowAtTheEdge(Base):
     def picker_file(self, name, sentence):
         import task_envelope as te
         p = self.ws / "tasks" / f"{name}.txt"
-        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask: {sentence}\n"
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask_layout: mid\ntask: {sentence}\n"
                f"source: ag2space\nwire_source: worker-picker\n"
                f"channel_id: {self.ROOM}\naccess_tier: owner\n")
         p.write_text(te.stamp_text(raw, self.ws))

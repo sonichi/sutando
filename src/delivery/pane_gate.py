@@ -103,19 +103,26 @@ class RuntimeAdapter:
     idle_ready: "re.Pattern[str]"
     gate_signatures: Tuple[Tuple[str, "re.Pattern[str]"], ...]
     await_hint: "re.Pattern[str]" = AWAIT_HINT
+    alternate_glyphs: Tuple[str, ...] = ()
+    idle_requires_prompt: bool = False
 
 
 CLAUDE = RuntimeAdapter(
     name="claude", glyph="❯", idle_ready=CLAUDE_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES),
 )
-# Codex prints the same footer when launched with Sutando's flags; a selected
-# picker row is its own glyph followed by a number, and is itself the affordance.
-CODEX_PICKER_ROW = re.compile(r"›\s*\d+\.")
+# Codex's composer glyph varies by CLI version; its model row is the idle footer.
+CODEX_IDLE = re.compile(
+    rf"{CLAUDE_IDLE.pattern}|^[ \t]*(?:gpt-[\w.-]+|codex[\w.-]*|o[1-9][\w.-]*)\b[^\n]*[·•]",
+    re.I | re.M,
+)
+CODEX_PICKER_ROW = re.compile(r"[›»]\s*\d+\.")
 CODEX = RuntimeAdapter(
-    name="codex", glyph="›", idle_ready=CLAUDE_IDLE,
+    name="codex", glyph="›", idle_ready=CODEX_IDLE,
     gate_signatures=tuple(CLAUDE_GATE_SIGNATURES) + (("selection", CODEX_PICKER_ROW),),
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
+    alternate_glyphs=("»",),
+    idle_requires_prompt=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -143,6 +150,12 @@ class Outcome:
     message: str
 
 
+def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
+    plain = _SGR.sub("", raw).lstrip(" \t")
+    return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
+                 if plain.startswith(glyph)), None)
+
+
 def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Optional[PromptLine]:
     """The LAST line starting with the runtime's glyph (scrollback holds old ones):
     its input is what follows the glyph and one optional space/nbsp, with any
@@ -152,10 +165,10 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
     lines_ = capture.splitlines()
     last_i, found = -1, None
     for i, raw in enumerate(lines_):
-        plain = _SGR.sub("", raw).lstrip(" \t")
-        if not plain.startswith(adapter.glyph):
+        glyph = _prompt_glyph(raw, adapter)
+        if glyph is None:
             continue
-        rest_raw = raw[raw.find(adapter.glyph) + len(adapter.glyph):]
+        rest_raw = raw[raw.find(glyph) + len(glyph):]
         rest_ghostless, n = _GHOST.subn("", rest_raw)
         rest = _SGR.sub("", rest_ghostless)
         placeholder = n > 0
@@ -170,7 +183,7 @@ def prompt_line(capture: str, adapter: RuntimeAdapter, width: int = 0) -> Option
         if not prev_full:
             break
         plain = _SGR.sub("", nxt)
-        if plain.lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(nxt, adapter) is not None:
             break
         raw_parts.append(nxt)
         prev_full = len(plain) >= width
@@ -198,7 +211,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
     lines_ = capture.splitlines()
     last_i = -1
     for i, raw in enumerate(lines_):
-        if _SGR.sub("", raw).lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(raw, adapter) is not None:
             last_i = i
     if last_i < 0:
         return ""
@@ -211,7 +224,7 @@ def after_prompt(capture: str, adapter: RuntimeAdapter, width: int = 0) -> str:
             if not prev_full:
                 break
             plain = _SGR.sub("", lines_[j])
-            if plain.lstrip(" \t").startswith(adapter.glyph):
+            if _prompt_glyph(lines_[j], adapter) is not None:
                 break
             end = j
             prev_full = len(plain) >= width
@@ -240,17 +253,24 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     row, at most one hint/tip row -- so the strip removes exactly those, once each,
     from the back. It never re-classifies an interior row: an owner's own typed
     line that happens to read one of those rows' words survives, because only the
-    LAST matching row of each kind is ever popped, and never a second time.
+    LAST matching row of each kind is ever popped, and never a second time. The cut
+    at the closing rule follows the same rule: the LAST rule row, never an interior one.
     """
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip(" \t").startswith(adapter.glyph):
+        if _prompt_glyph(lines[i], adapter) is not None:
             start = i
             break
     if start is None:
         return None
     block = lines[start:]
+    # The CLI boxes the composer: everything past its closing rule is frame (footer, tip,
+    # "⧉ <artifact>" strip). The LAST rule is the closing one; an interior rule is typed text.
+    for i in range(len(block) - 1, 0, -1):
+        if BORDER_LINE.match(block[i]):
+            block = block[:i]
+            break
 
     def _pop_borders():
         while len(block) > 1 and BORDER_LINE.match(block[-1]):
@@ -267,8 +287,26 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     _pop_borders()
     if not block or (len(block) == 1 and COMPOSER_PLACEHOLDER.match(block[0])):
         return ""
-    block[0] = block[0].lstrip().lstrip(adapter.glyph).lstrip()
+    block[0] = prompt_line(block[0], adapter).text
     return "".join(block)
+
+
+def composer_frame_visible(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[bool]:
+    """Whether the CLI's frame below the composer (its closing rule, the idle footer) is
+    on screen; None with no <glyph> line. False = the box is cut by the screen bottom, so
+    its last rows are unseen and no capture can show where the typed text ends."""
+    lines = [ln for ln in capture.splitlines() if ln.strip()]
+    start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _prompt_glyph(lines[i], adapter) is not None:
+            start = i
+            break
+    if start is None:
+        return None
+    for row in lines[start + 1:]:
+        if BORDER_LINE.match(row) or adapter.idle_ready.search(row):
+            return True
+    return False
 
 
 def _tail_lines(capture: str) -> List[str]:
@@ -362,7 +400,9 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
         return Verdict("busy", "working")
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
-    if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
+    if ((adapter.idle_ready.search(tail) and
+         (not adapter.idle_requires_prompt or line is not None))
+            or (line is not None and line.placeholder)):
         return Verdict("idle-ready", "idle footer or empty composer", "" if line else None)
     return Verdict("unknown", "no idle affordance")
 
@@ -431,6 +471,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    cf = sub.add_parser("composer-frame")
+    cf.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp = sub.add_parser("healthy")
     hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     hp.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
@@ -486,6 +528,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("pane_gate: no prompt line found — prompt unknown", file=sys.stderr)
             return EXIT_UNSAFE
         print(text)
+        return 0
+    if a.cmd == "composer-frame":
+        seen = composer_frame_visible(_read_stdin(), adapter)
+        if seen is None:
+            print("pane_gate: no prompt line found — frame unknown", file=sys.stderr)
+            return EXIT_UNSAFE
+        print("visible" if seen else "cut")
         return 0
     if a.cmd == "safe":
         v = classify_pane(_read_stdin(), adapter, getattr(a, "workspace", None),

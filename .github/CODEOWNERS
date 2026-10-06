@@ -1,0 +1,72 @@
+# CODEOWNERS -- sonichi/sutando
+#
+# Evidence-based, derived from the full git history (2,787 commits since the
+# first one on 2026-03-28 -- the repo is only 184 days old, so a 90-day
+# lookback would miss roughly half its life; full history is used instead.
+# Measured with `git log origin/main --no-merges --format=%an -- <path> |
+# sort | uniq -c`. Full methodology and the areas considered and left out:
+# the "Sutando codeowners" doc (ww room) and its Product-core copy.
+#
+# GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
+# @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
+# singleton owner below is a hard block on their own PRs, and on anyone
+# else's if they're unavailable; the default recovery path is a bypass merge
+# by @sonichi or @qingyun-wu. A second name is added to a line only where
+# there's real, evidence-based signal for it (a genuine 2nd-place contributor,
+# same bar as every other line here) -- never invented purely to dodge the
+# self-approval/availability gate.
+#
+# ROLLOUT: GitHub evaluates CODEOWNERS from the base branch, so once this
+# merges the gate applies to every open PR into main -- including ones opened
+# before it -- the next time their review state is checked, same as any PR
+# opened after. If its author is the sole owner of a touched path, or that
+# owner is unavailable, recovery is a bypass merge by @sonichi or @qingyun-wu.
+
+# Repo-wide fallback: the project owner (@sonichi) and @qingyun-wu, who is
+# top-2 by commit volume in every top-level area checked (src, skills, docs,
+# tests, scripts, .github, hooks, packages); @sonichi is top-2 in 7 of 8 (3rd
+# in hooks/, behind @qingyun-wu and Rui Wang).
+* @sonichi @qingyun-wu
+
+# Core: both dominant authors, and docs/architecture-boundaries.md already flags
+# core as eventually needing dedicated code owners. Placed right after the `*`
+# fallback (not last) because CODEOWNERS is last-match-wins: a broad /src/ line
+# at the end of the file would override every more-specific /src/... entry below.
+/src/ @sonichi @qingyun-wu
+
+# Clear per-area leader over the full history (90-day leader in parentheses where it differs).
+/skills/agent-room-ops/    @qingyun-wu
+/skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
+/skills/task-progress/     @qingyun-wu
+/skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun)
+/packages/                 @qingyun-wu
+
+# Susan: areas she leads or co-leads over the full history.
+# (no line for skills/discord-voice/ -- zero currently-tracked files, same
+# dead-path reasoning as the room-collab exclusion note below.)
+/skills/screen-companion/  @liususan091219                # Susan 6, Qingyun 4, James 3, Chi 2
+/skills/screen-record/     @liususan091219 @sonichi       # Susan 8, Chi 8
+/src/browser-tools.ts      @sonichi @liususan091219       # Chi 27, Susan 18
+/src/voice-agent.ts        @sonichi @liususan091219 @yixuan-ag2       # Chi 56, Susan 14, yixuan 13, Qingyun 12
+/src/inline-tools.ts       @sonichi @liususan091219       # Chi 66, Susan 12
+
+# Kewei: areas he designed or co-leads (his 12 commits are large features; review load is not measured from git).
+/src/runtime-api/          @qingyun-wu @keweichen        # Qingyun 4, Kewei 2 (#4488 idempotent submission), Chi 2
+/skills/task-workstream-grouping/  @keweichen @john-the-dev   # still on main (checked origin/main 7:01PM); Kewei wrote #2586/#2602 (the design); Rui 4, Qingyun 4, Kewei 2 since
+/src/agent/codex/          @sonichi @john-the-dev @keweichen   # owner-assigned 2026-09-28 (Chi, in ww): had no clear owner by git history (Chi 21, Rui 9, Kewei 4)
+# (task-workstream-sessions moved to sonichi/sutando-workstream-sessions on 2026-08-19, #3148: no line)
+
+# Bassil: uncontested leader (real, not invented -- 0 competing commits on each).
+/skills/connect-apps/      @bassilkhilo-ag2      # 9 commits, sole contributor
+/skills/marketplace/       @bassilkhilo-ag2      # 4 commits, sole contributor
+
+# John Marshall (jsun-m): clear leader by commit count. Rui and Qingyun added
+# as backup co-owners (owner-assigned) -- real 2nd places (3 vs 8, 2 vs 7).
+# These lines override `* @sonichi @qingyun-wu` above (last match wins,
+# positionally -- not about pattern specificity), so the owners listed here
+# are the only owners of these two paths.
+/src/observability/        @jsun-m @john-the-dev # jsun-m 8, Rui 3, Susan/Qingyun/Mark/Chi 1 each
+/tests/observability/      @jsun-m @qingyun-wu   # jsun-m 7, Qingyun 2, Rui/Mark/Chi 1 each
+
+# Mark: co-owner where he's clear 2nd place (added 2026-09-28, owner-assigned: 'add Mark for areas he's 2nd').
+/skills/call-diagnostics/  @liususan091219 @marklysze     # Susan 4, Mark 3, Qingyun 2

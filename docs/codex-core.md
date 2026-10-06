@@ -66,6 +66,110 @@ The Codex implementation:
   to update when Codex is selected;
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## Externally managed monitor and heartbeat
+
+An embedder that owns both helpers can opt out of the launcher's helper lifecycle:
+
+```bash
+bash src/agent/start-cli.sh --runtime codex --external-helpers "$RECEIPTS"
+```
+
+`$RECEIPTS` must be an existing owner-private directory below the resolved
+workspace's `state/`. Start the real helpers from the selected checkout with
+absolute script paths, the same resolved workspace and the selected
+`SUTANDO_TMUX_SOCKET` / `SUTANDO_TMUX_SESSION`:
+
+```bash
+python3 "$REPO/src/core-input-watch.py" --socket "$SUTANDO_TMUX_SOCKET" \
+  --session "$SUTANDO_TMUX_SESSION" --out "$WORKSPACE/state/core-supervisor.json" \
+  --no-auto-answer --no-chat-escalation --helper-receipt-dir "$RECEIPTS"
+python3 "$REPO/src/core_heartbeat.py" --helper-receipt-dir "$RECEIPTS"
+```
+
+The embedder starts these as its own processes with private log destinations.
+Each helper atomically writes its own `monitor.json` or `heartbeat.json` receipt
+(mode 0600), naming its actual PID/start identity and resolved configuration.
+One-shot or active-monitor modes refuse receipt publication. The launcher checks
+receipt ownership, live kernel argv/start identity, checkout, workspace, socket,
+session and passive policy before changing the core and again after startup.
+The initial process identities are pinned across these checks; a different valid
+helper cannot silently replace one during launch.
+Missing, stale, unreadable or mismatched helpers fail the launch; there is no
+helper spawn, replacement, log redirect or heartbeat stop in this mode, including
+`--restart`. Other runtimes reject this option. Without it, behavior is unchanged.
+
+Receipts are startup identity evidence, not core readiness or a security boundary
+against the same OS user. The embedder must independently observe actual core
+readiness and keep supervising both helper processes. A post-start failure can
+leave the new core running; its owner must stop it. This option does not disable
+schedulers, earned-reset timers, authentication checks or the task notifier, and
+does not isolate the Codex application home. It must not be treated as a general
+sandbox or as permission to fabricate helper state.
+
+### Leave schedule provisioning to the caller
+
+An embedder can independently pass `--no-schedule-reconcile` to skip startup's
+durable-cron reconciliation, Codex scheduler installation and earned-reset timer
+installation for that invocation:
+
+```bash
+bash src/agent/start-cli.sh --runtime codex --external-helpers "$RECEIPTS" \
+  --no-schedule-reconcile
+```
+
+This does not stop, disable or rewrite existing jobs, change their configuration,
+or suppress tasks they already deliver. The caller owns schedule provisioning;
+pending schedules are not installed by this launch. Without the flag, all three
+startup reconciliation paths run as before. The flag is Codex-only, takes no value
+and is not persisted: pass it again on each invocation, including `--restart`.
+Authentication, helper checks, the notifier and core startup remain active.
+The flag does not isolate the Codex home or change helper ownership by itself.
+
+## Automatic earned resets
+
+On macOS, launching a Codex core or Codex worker installs a five-minute
+LaunchAgent for its configured `CODEX_HOME`. It reads the live Codex App Server
+quota and automatically redeems one available earned reset only when the Codex
+weekly window reports at least 99.9% used and its next reset is at least 24
+hours away. One timer serves sessions that share a Codex home. The job runs
+without an active agent session and checks the account again before spending
+a credit. API-key-only accounts and accounts without earned reset credits are
+left alone.
+
+The Codex CLI must return `workspaceRouting.chatgptAccountId` from
+`account/read` so Sutando can tie redemption state to the authenticated
+account. This works with Codex CLI 0.157.0; 0.154.0 does not return that field.
+When it is missing, the timer reports `unsupported-codex-cli` and skips
+redemption without spending a credit. The timer keeps the stable Codex and
+Python executable paths, so CLI and package-manager updates can replace their
+symlink targets without waiting for another core or worker launch.
+
+The CLI currently reports `usedPercent` as a whole number. In practice the
+99.9% rule fires when it reports **100% used**; Sutando cannot detect exactly
+0.1% remaining until the API returns finer precision. A successful redemption
+is followed by a fresh quota read, and the timer keeps the same idempotency key
+when retrying an uncertain request.
+
+The redemption state is shared by Codex cores and workers in one Sutando
+workspace, including sessions with different Codex homes. Separate Sutando
+workspaces logged into the same ChatGPT account do not share that state; run
+automatic redemption from only one of those workspaces.
+
+This feature is enabled by the proactive-loop skill's
+`SUTANDO_CODEX_AUTO_RESET_ENABLED=1` manifest setting. Set
+`SUTANDO_CODEX_AUTO_RESET_ENABLED=0` in the launcher's environment to disable
+redemption; restart the Codex core or worker so the timer captures the change.
+An installed timer then wakes but exits without requesting a reset. An unset
+value preserves a prior explicit disable; set `SUTANDO_CODEX_AUTO_RESET_ENABLED=1`
+and restart to re-enable it. Check the timer
+with:
+
+```bash
+python3 skills/proactive-loop/scripts/codex-auto-reset-timer.py status \
+  --workspace "$(bash scripts/sutando-config.sh workspace)" \
+  --codex-home "$(bash scripts/sutando-config.sh core-config-dir-value codex)"
+```
+
 `SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses either runtime's early authentication
 check for one startup. The runtime launcher still performs its own defensive
 authentication check before replacing the core session.

@@ -40,7 +40,7 @@ CONFIG_DIR="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="sutando-core"
 CORE_RUNNING=false
-if command -v tmux >/dev/null 2>&1 && tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+if command -v tmux >/dev/null 2>&1 && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
   CORE_RUNNING=true
 fi
 GATEWAY_RUNNING=false

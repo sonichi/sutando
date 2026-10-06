@@ -26,6 +26,8 @@ CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Durable at-most-once record of a submitted prompt, per core incarnation.
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
+# Same marker shape: which core incarnation this notifier left a cut-short paste in.
+PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -35,6 +37,9 @@ PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 # leading marker into scrollback -- capture-pane -p alone never sees it.
 CAPTURE_SCROLLBACK_LINES="${SUTANDO_NOTIFIER_CAPTURE_SCROLLBACK_LINES:-2000}"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
+# One tmux write past ~1 KB reaches the CLI as only its tail (measured: 1022 bytes),
+# so a paste goes in chunks well below that, each read back before the next.
+PASTE_CHUNK=256
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # Submit verification: re-press C-m while the prompt is still staged in the
@@ -94,6 +99,7 @@ cleanup_notifier() {
   stop_watcher
   # Only the hand-off waits (the standby yields before the session watcher has
   # stamped); asking once elsewhere keeps this notifier's own exit prompt.
+  restore_window
   [ -n "${STANDBY_LOGGED:-}" ] || { STANDBY_LOGGED=1
     standby_end_log "${STANDBY_END_WHY:-notifier exiting}" "${STANDBY_END_TRIES:-1}"; }
   if [ -n "$event_dir" ]; then
@@ -103,6 +109,8 @@ cleanup_notifier() {
   fi
 }
 trap cleanup_notifier EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 log_notifier() {
   local msg="task-notifier: $*" dir
   dir="$WORKSPACE_DIR/logs"
@@ -131,11 +139,11 @@ clear_composer_block() {
 }
 
 alert_composer_block() {
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer to resume (Enter would submit it as it is)"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" &
+    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
@@ -290,23 +298,122 @@ composer_text() {
   printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-text --runtime claude 2>/dev/null || true
 }
 
-# Staged = the composer holds EXACTLY our prompt (not merely our marker as a
-# substring -- interleaved owner text would still match that).
-# Whitespace is ignored on both sides: the input box word-wraps at the pane width and
-# indents continuation rows, so a dewrapped capture differs from the prompt only in spaces.
-prompt_is_staged() {
-  local raw="$1" prompt="$2"
-  [ "$(composer_text "$raw" | tr -d '[:space:]')" = "$(printf '%s' "$prompt" | tr -d '[:space:]')" ]
+squeeze() { tr -d '[:space:]'; }
+
+# The frame below the box (closing rule, footer) is off screen: the box is cut by the screen.
+pane_frame_is_cut() {
+  [ "$(printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-frame --runtime claude 2>/dev/null)" = "cut" ]
 }
 
-# The composer still carries our prompt at all (exactly, or with owner text
-# mixed in). False once it left: submitted, or queued behind a running turn.
+# Claude Code lays the composer box out inside the window; a tall prompt on a short window
+# runs off the screen, unseen. Grow the window for a paste and its confirmation, then put it back.
+# resize-window also pins the window's window-size option to manual; the option is put back too.
+WINDOW_GROWN=0; WINDOW_ROWS=""; WINDOW_SIZE_OPT=""
+grow_window() {
+  [ "$WINDOW_GROWN" = 1 ] && return 0
+  WINDOW_ROWS="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" '#{window_height}' 2>/dev/null)"
+  case "$WINDOW_ROWS" in ''|*[!0-9]*) return 1 ;; esac
+  WINDOW_SIZE_OPT="$(tmux -S "$TMUX_SOCKET" show-window-options -t "$TARGET" -v window-size 2>/dev/null)"
+  tmux -S "$TMUX_SOCKET" resize-window -t "$TARGET" -y $((WINDOW_ROWS + $1)) 2>/dev/null || return 1
+  WINDOW_GROWN=1
+  sleep "$POLL_INTERVAL"
+}
+restore_window() {
+  [ "$WINDOW_GROWN" = 1 ] || return 0
+  tmux -S "$TMUX_SOCKET" resize-window -t "$TARGET" -y "$WINDOW_ROWS" 2>/dev/null
+  if [ -n "$WINDOW_SIZE_OPT" ]; then
+    tmux -S "$TMUX_SOCKET" set-window-option -t "$TARGET" window-size "$WINDOW_SIZE_OPT" 2>/dev/null
+  else
+    tmux -S "$TMUX_SOCKET" set-window-option -t "$TARGET" -u window-size 2>/dev/null
+  fi
+  WINDOW_GROWN=0
+}
+# Rows a prompt needs beyond the window: its own wrapped rows at the narrowest sane pane, plus frame.
+rows_for() { printf '%s' $(( ${#1} / 40 + 12 )); }
+
+# Staged = the composer holds EXACTLY our prompt (never our marker as a substring: owner
+# text mixed in would match that); whitespace ignored (the box word-wraps and indents).
+prompt_is_staged() {
+  [ "$(composer_text "$1" | squeeze)" = "$(printf '%s' "$2" | squeeze)" ]
+}
+
+# The composer still carries our prompt at all (exactly, or with owner text mixed in).
+# False once it left: submitted, or queued behind a running turn.
 composer_holds_prompt() {
-  local raw="$1" prompt="$2"
-  case "$(composer_text "$raw" | tr -d '[:space:]')" in
-    *"$(printf '%s' "$prompt" | tr -d '[:space:]')"*) return 0 ;;
-  esac
+  case "$(composer_text "$1" | squeeze)" in *"$(printf '%s' "$2" | squeeze)"*) return 0 ;; esac
   return 1
+}
+
+# A paste cut short: the composer holds a proper tail of our prompt shorter than one
+# chunk. Not ours to submit; typing over it would only append.
+composer_is_cut_prompt() {
+  local c p
+  c="$(composer_text "$1" | squeeze)"; p="$(printf '%s' "$2" | squeeze)"
+  [ "${#c}" -ge 12 ] && [ "${#c}" -lt "$PASTE_CHUNK" ] && [ "$c" != "$p" ] || return 1
+  case "$p" in *"$c") return 0 ;; esac
+  return 1
+}
+
+# Byte lengths of the chunks: at most PASTE_CHUNK bytes each, cut only between characters.
+chunk_lengths() {
+  printf '%s' "$1" | "$NOTIFIER_PY" -c '
+import sys
+cap = int(sys.argv[1]); out = []; cur = 0
+for ch in sys.stdin.buffer.read().decode("utf-8", "surrogateescape"):
+    n = len(ch.encode("utf-8", "surrogateescape"))
+    if cur and cur + n > cap:
+        out.append(cur); cur = 0
+    cur += n
+if cur:
+    out.append(cur)
+print(" ".join(map(str, out)))' "$PASTE_CHUNK"
+}
+
+# The ONE test admitting a non-empty composer: exactly the prompt's first chunks (maybe all),
+# AND this notifier recorded a cut-short paste of $1 into this incarnation. Prints the offset.
+composer_resume_offset() {
+  local filename="$1" prompt="$2" incarnation="$3" raw="$4" c i=0 n prefix
+  c="$(composer_text "$raw" | squeeze)"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$PARTIAL_DIR" "$filename" "$incarnation" || return 1
+  for n in $(chunk_lengths "$prompt"); do
+    i=$((i + n))
+    prefix="$(LC_ALL=C; printf '%s' "${prompt:0:$i}")"
+    if [ "$(printf '%s' "$prefix" | squeeze)" = "$c" ]; then printf '%s' "$i"; return 0; fi
+  done
+  return 1
+}
+
+note_partial_paste() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-mark "$PARTIAL_DIR" "$1" "$2" \
+    || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
+}
+
+clear_partial_paste() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
+}
+
+# Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
+# EXACTLY before the next; the first chunk that does not read back ends it, and that is final.
+# $3 = byte offset already in the composer (a chunk boundary): typing resumes there.
+type_prompt() {
+  local prompt="$1" filename="$2" start="${3:-0}" i=0 n typed="" chunk arg cap LC_ALL=C
+  typed="${prompt:0:$start}"
+  for n in $(chunk_lengths "$prompt"); do
+    if [ "$i" -lt "$start" ]; then i=$((i + n)); continue; fi
+    chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
+    # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
+    arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$arg"
+    sleep "$POLL_INTERVAL"
+    cap="$(capture_raw)" || cap=""
+    if pane_frame_is_cut "$cap"; then
+      log_notifier "the composer box runs off the screen for $filename even after growing the window; its end cannot be read (failing closed)"
+      return 1
+    fi
+    prompt_is_staged "$cap" "$typed" || return 1
+  done
 }
 
 # No marker in a capture whose retained history (#{history_size}, else the RAW row
@@ -337,8 +444,18 @@ warn_if_capture_truncated() {
 # Type + verify staged, then C-m + verify submitted; both halves retry.
 # A running turn is not a gate: the line queues behind it, as the Monitor
 # tool's own notification does. Only an unhealthy pane or a draft holds.
+# The paste and its confirmation run with the window grown; it is put back before the
+# result wait, so the owner sees the resize only for those seconds.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 staged=0
+  local rc=0
+  grow_window "$(rows_for "$2")" || log_notifier "could not grow the window for $1; a prompt taller than the box will not verify"
+  deliver_prompt_grown "$@" || rc=$?
+  restore_window
+  return $rc
+}
+
+deliver_prompt_grown() {
+  local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
   local baseline_esc baseline_raw staged_raw="" incarnation=""
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
@@ -366,17 +483,28 @@ deliver_prompt() {
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
       return 1
     fi
+    resume=0
     if ! pane_text_composer_is_empty "$baseline_esc"; then
-      warn_if_capture_truncated "$baseline_raw" "$filename"
-      log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
-      note_composer_block "$filename" "$incarnation"
-      return 1
+      if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
+        log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
+      else
+        warn_if_capture_truncated "$baseline_raw" "$filename"
+        log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+        composer_is_cut_prompt "$baseline_raw" "$prompt" \
+          && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
+        note_composer_block "$filename" "$incarnation"
+        return 1
+      fi
     fi
     clear_composer_block
-    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
-    sleep "$POLL_INTERVAL"
-    staged_raw="$(capture_raw)"
-    if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    if type_prompt "$prompt" "$filename" "$resume"; then
+      staged_raw="$(capture_raw)"
+      if prompt_is_staged "$staged_raw" "$prompt"; then clear_partial_paste "$filename"; staged=1; break; fi
+    else
+      staged_raw="$(capture_raw)"
+      log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
+      note_partial_paste "$filename" "$incarnation"
+    fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; re-typing (2/2)"
@@ -467,6 +595,78 @@ task_prompt() {
     "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
+# The nudge (supervisor --nudge): restore the session's OWN watcher instead of
+# running the external standby. No task is delivered, so the prompt asks it to
+# drain any backlog and re-arm the same watcher the standby would otherwise be.
+nudge_prompt() {
+  printf 'No session-role watcher holds %s and your Monitor task watcher is not running. Check for any pending deliveries in %s, then re-arm your watcher via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
+    "$TASKS_DIR" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
+}
+
+# One nudge injection into an idle, healthy, clean-composer session, reusing the
+# same paste safety as a task delivery: core healthy, composer empty, prompt
+# verifiably staged before Enter, never typed over a draft. A nudge has no result
+# file, so "done" is the prompt LEAVING the composer (submitted or queued behind a
+# turn), not a result appearing. Returns 0 when submitted, 1 when it could not be
+# delivered (unhealthy, dirty composer, or an unverifiable paste); on 1 the
+# supervisor arms the standby instead.
+nudge_deliver() {
+  local rc=0
+  grow_window "$(rows_for "$(nudge_prompt)")" || log_notifier "nudge: could not grow the window"
+  nudge_deliver_grown || rc=$?
+  restore_window
+  return $rc
+}
+
+nudge_deliver_grown() {
+  local prompt type_tries=0 staged=0 baseline_esc baseline_raw staged_raw="" waited=0 cap
+  prompt="$(nudge_prompt)"
+  if ! wait_for_core_healthy; then
+    log_notifier "nudge: core did not become healthy; not nudging"
+    return 1
+  fi
+  baseline_esc="$(capture_view_esc)"
+  baseline_raw="$(printf '%s\n' "$baseline_esc" | strip_sgr)"
+  if ! pane_text_is_healthy "$baseline_raw"; then
+    log_notifier "nudge: core not healthy at the paste; not nudging (failing closed)"
+    return 1
+  fi
+  if ! pane_text_composer_is_empty "$baseline_esc"; then
+    log_notifier "nudge: composer not empty; not nudging (the supervisor arms the standby instead)"
+    return 1
+  fi
+  while :; do
+    if type_prompt "$prompt" nudge; then
+      staged_raw="$(capture_raw)"
+      if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+    fi
+    type_tries=$((type_tries + 1))
+    [ "$type_tries" -ge 2 ] && break
+    log_notifier "nudge: typed prompt did not stage; re-typing (2/2)"
+    sleep "$POLL_INTERVAL"
+  done
+  if [ "$staged" != 1 ]; then
+    log_notifier "nudge: prompt never verifiably staged after $((type_tries + 1)) attempts; not pressing Enter (failing closed)"
+    return 1
+  fi
+  # Same guard as a task paste: the composer must hold EXACTLY the nudge at Enter.
+  if ! prompt_is_staged "$(capture_raw)" "$prompt"; then
+    log_notifier "nudge: composer changed since staged; not pressing Enter (failing closed)"
+    return 1
+  fi
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
+    if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
+      log_notifier "nudge submitted for $TASKS_DIR"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log_notifier "nudge: submit not confirmed; prompt may still be staged (core may need attention)"
+  return 1
+}
+
 # Whitespace is not identity in a wrapped composer: when another pending task's
 # prompt also reads as staged, the composer cannot say whose it is.
 staged_prompt_is_ambiguous() {
@@ -479,6 +679,13 @@ staged_prompt_is_ambiguous() {
 }
 
 submit_task() {
+  local rc=0
+  submit_task_grown "$@" || rc=$?
+  restore_window
+  return $rc
+}
+
+submit_task_grown() {
   local filename="$1" prompt started raw incarnation live_rc
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
@@ -491,6 +698,7 @@ submit_task() {
   fi
   log_notifier "delivering $filename as the standby: no session-role watcher holds $TASKS_DIR"
   # A capture can fail (the pane is gone); the liveness wait below is what decides that.
+  grow_window "$(rows_for "$prompt")" || log_notifier "could not grow the window for $filename; a staged prompt taller than the box will not verify"
   raw="$(capture_raw)" || raw=""
   incarnation="$(core_incarnation)"
   # 0 live, 1 not live, anything else undecidable (an unreadable marker): a
@@ -517,12 +725,16 @@ submit_task() {
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
+  elif composer_is_cut_prompt "$raw" "$prompt"; then
+    log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); leaving it queued (failing closed, core may need attention)"
+    return 0
   elif composer_holds_prompt "$raw" "$prompt"; then
     log_notifier "composer holds $filename's prompt with other text; leaving it queued (failing closed, core may need attention)"
     return 0
   else
     deliver_prompt "$filename" "$prompt" || return 0
   fi
+  restore_window
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
@@ -538,6 +750,14 @@ if [ "${1:-}" = "--event" ]; then
   [ -n "${2:-}" ] || { echo "task-notifier: --event requires a filename" >&2; exit 2; }
   submit_task "$2"
   exit 0
+fi
+
+# One-shot: nudge the session to re-arm its own watcher, then exit with the
+# delivery outcome (0 submitted, 1 could-not-deliver). The supervisor calls this
+# in place of arming when the pane is idle-ready and the session is live.
+if [ "${1:-}" = "--nudge" ]; then
+  nudge_deliver
+  exit $?
 fi
 
 # A new notifier starts a new episode; a record left by the previous one is not its history.

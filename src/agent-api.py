@@ -11,6 +11,7 @@ Endpoints:
   GET  /tasks/history     — authenticated archive-backed task history
   POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
+  GET  /health            — per-agent health snapshot (?agent=all|core|workers|<id>&view=summary|full)
   GET  /ping              — alive check
   POST /twilio/voice      — inbound call webhook (Twilio)
   POST /twilio/sms        — inbound SMS webhook (Twilio)
@@ -43,7 +44,6 @@ set the token BEFORE exposing this port by any route.
 For remote access: use ngrok or SSH tunnel.
 """
 
-import hashlib
 import http.server
 import ipaddress
 import json
@@ -61,7 +61,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 
 
 def _safe_id(raw: str) -> str:
@@ -111,7 +111,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 #               files like src/health-check.py, running `git -C` against the
 #               checkout, loading .env, etc. Stays anchored to the checkout.
 # - WORKSPACE_DIR = runtime state (resolve_workspace()) — for tasks/, results/,
-#               core-status.json, pending-questions.md, contextual-chips.json,
+#               core-status.json, the pending-questions outbox, contextual-chips.json,
 #               etc. Honors SUTANDO_WORKSPACE when set so watcher + bridges
 #               stay aligned with these writes.
 REPO_DIR = Path(__file__).parent.parent
@@ -122,6 +122,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+import health_snapshot  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
@@ -140,8 +141,10 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
-from pending_questions_md import active_region  # noqa: E402
+import local_record  # noqa: E402
+import pending_questions_reader  # noqa: E402
 import pending_questions_triage as pq_triage  # noqa: E402
+import skill_roots  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
@@ -239,112 +242,6 @@ def _remember_done_result_file(result_file: Path) -> None:
             entry["text"] = task_line
         if source_line and not entry.get("source"):
             entry["source"] = source_line
-
-
-# --- pending-questions.md ---------------------------------------------------
-# ONE parser, shared by GET /status (lists the questions, mints their ids) and
-# POST /answer (resolves an id back to a section). They used to walk the file
-# separately, and drifted: the reader took the free-form format (post-#1265, no
-# **Status:** markers) while the writer still required a **Status:**/**Options:**
-# line, so every free-form question was listed but unanswerable — POST /answer
-# 404'd on every id. Both paths stay on this function.
-PQ_SECTION_RE = re.compile(r'^## ', re.MULTILINE)
-PQ_ANSWERED_RE = re.compile(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', re.IGNORECASE)
-PQ_STATUS_RE = re.compile(r'\*\*Status:\*\*.*')
-PQ_FIELD_RE = re.compile(r'\*\*(?:Status|Options|Asked|Question):\*\*')
-PQ_OPTIONS_RE = re.compile(r'\*\*Options:\*\*\s*(.+)')
-PQ_DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}(?::\d{2})?Z)?')
-
-
-def _parse_asked_date(title: str) -> tuple[Optional[str], Optional[datetime]]:
-    """Leading date on a section's `## ` heading, e.g. '2026-08-22 — ...' or
-    '2026-08-20T02:20Z — ...'. (None, None) when the heading carries no date.
-    """
-    m = PQ_DATE_RE.match(title)
-    if not m:
-        return None, None
-    asked = m.group(0)
-    formats = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ") if m.group(2) else ("%Y-%m-%d",)
-    for fmt in formats:
-        try:
-            # Headings are UTC; a naive parse against a local now() reports a question
-            # asked minutes ago as -1 days, which the age sort then ranks first.
-            return asked, datetime.strptime(asked, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None, None
-
-
-def parse_pending_questions(content: str) -> list[dict]:
-    """Open questions in pending-questions.md, in file order.
-
-    Ids are derived from the section's own content, not its title or its
-    position. The agent rewrites this file continuously, so a positional id
-    minted by one GET points at a different — or already-archived — section by
-    the time the owner clicks answer on it. Each dict carries the section's
-    `start`/`end` offsets into `content` so the writer can splice it in place.
-
-    Hashing the *whole section* (not just the title) is what makes an id stable
-    when two open sections share a title. A title-hash plus an occurrence-count
-    suffix (`-2`, `-3`) renumbers the survivors as soon as an earlier duplicate
-    is answered or reordered, so a stale id the UI still holds would silently
-    resolve to a *neighbour* (#2103 review). A content hash is tied to that one
-    section: siblings appearing, being answered, or moving around it don't
-    change it, so a stale id resolves to its original section — or, if that
-    section's own text has since changed, cleanly 404s — but never a neighbour.
-    Two sections with an identical title *and* body are the same question and
-    share an id by design.
-
-    Sections below the `# Resolved` divider are the audit trail, not open
-    questions (same cut as check-pending-questions.py:95).
-    """
-    active = active_region(content)
-    starts = [m.start() for m in PQ_SECTION_RE.finditer(active)]
-    questions: list[dict] = []
-    for n, start in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(active)
-        section = active[start:end]
-        head, _, body = section.partition('\n')
-        title = head[3:].strip()  # drop the '## '
-        if not title or title.startswith('RESOLVED') or title.startswith('[RESOLVED'):
-            continue
-        if PQ_ANSWERED_RE.search(body):
-            continue
-        # Whitespace-normalised so a reflow of the same prose keeps the id.
-        qid = "Q" + hashlib.sha1(" ".join(section.split()).encode()).hexdigest()[:12]
-        asked, asked_dt = _parse_asked_date(title)
-        q = {
-            "id": qid,
-            "text": title,
-            "detail": PQ_FIELD_RE.split(body)[0].strip() or title,
-            "asked": asked,
-            "age_days": max(0, (datetime.now(timezone.utc) - asked_dt).days) if asked_dt else None,
-            "start": start,
-            "end": end,
-        }
-        opts = PQ_OPTIONS_RE.search(body)
-        if opts:
-            q["options"] = [o.strip() for o in opts.group(1).split("|")]
-        questions.append(q)
-    return questions
-
-
-def answer_pending_question(content: str, question: dict, answer: str) -> str:
-    """Return `content` with `question`'s section marked answered.
-
-    The resolution has to land on a **Status:** line: check-pending-questions.py
-    treats a status-less section as unanswered (its free-form convention), so a
-    [RESOLVED] title prefix alone would silence this API's own reader while the
-    notifier kept re-asking the owner hourly.
-    """
-    section = content[question["start"]:question["end"]]
-    status = f"**Status:** Answered {datetime.now().strftime('%Y-%m-%d')} — {' '.join(answer.split())}"
-    if PQ_STATUS_RE.search(section):
-        # A function repl, not a string: a raw answer may contain \1-style escapes.
-        new_section = PQ_STATUS_RE.sub(lambda _m: status, section, count=1)
-    else:
-        new_section = section.rstrip("\n") + f"\n{status}\n\n"
-    return content[:question["start"]] + new_section + content[question["end"]:]
 
 
 def get_status() -> dict:
@@ -540,19 +437,43 @@ def _probe_ref_states(refs: list) -> dict:
     return states
 
 
-def _pending_question_rows(recheck: bool = False) -> list[dict]:
+def _question_row(item: dict) -> dict:
+    """One reader item as the triage queue's row shape."""
+    asked_at = item.get("asked_at")
+    asked_dt = datetime.fromtimestamp(asked_at, tz=timezone.utc) if asked_at else None
+    return {
+        "id": item["ask_id"],
+        "text": item["title"],
+        "detail": item.get("snippet") or item["title"],
+        "asked": asked_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if asked_dt else None,
+        "age_days": max(0, (datetime.now(timezone.utc) - asked_dt).days) if asked_dt else None,
+        "in_room": item.get("in_room", True),
+    }
+
+
+def _pending_store():
+    """The store adapter this edge injects: the one an installed skill declares, across the roots."""
+    return skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+
+
+def _pending_gather() -> dict:
+    """The reader's gather; `unavailable` is carried to the payload so a client never
+    renders an unreachable room as an empty queue."""
+    return pending_questions_reader.gather(WORKSPACE_DIR, _pending_store())
+
+
+def _questions_unavailable(g: dict) -> Optional[str]:
+    return (g["reason"] or "room unreachable") if g["unavailable"] else None
+
+
+def _pending_question_rows(recheck: bool = False, gathered: Optional[dict] = None) -> list[dict]:
     """Open questions, dismissed ones removed, ordered for the triage queue.
 
     `recheck` probes the referenced PRs first, so a question whose blocker has since
     merged is labelled at the moment it is shown rather than carried for weeks.
     """
-    pending_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-    if not pending_file.exists():
-        return []
-    rows = [
-        {key: value for key, value in question.items() if key not in ("start", "end")}
-        for question in parse_pending_questions(pending_file.read_text())
-    ]
+    g = _pending_gather() if gathered is None else gathered
+    rows = [_question_row(item) for item in g["waiting"]]
     rows = pq_triage.without_dismissed(
         rows, pq_triage.load_dismissed(_dismissed_questions_path())
     )
@@ -573,7 +494,56 @@ def _pending_question_rows(recheck: bool = False) -> list[dict]:
 
 def _questions_queue_payload() -> dict:
     """Triage queue, re-checked live at the moment it is asked for."""
-    return {"questions": _pending_question_rows(recheck=True)}
+    g = _pending_gather()
+    return {"questions": _pending_question_rows(recheck=True, gathered=g), "questions_unavailable": _questions_unavailable(g)}
+
+
+def _file_answer_task(qid: str, answer: str) -> tuple:
+    """(task path, None) once the owner's answer is published whole under tasks/, else (None, why).
+    The name is unique per call (local_record.new_name) and the file is created exclusively, so
+    two answers to one question in the same millisecond are two files, never one overwritten."""
+    safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
+    if not safe_qid:
+        return None, "the id has no file-safe characters"
+    # realpath + startswith: the CodeQL-recognised path-injection
+    # sanitizer pair (Path::PathNormalization + SafeAccessCheck).
+    task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
+    body = f"User answered {safe_qid}: {confine_user_content(answer)}"
+    for _ in range(8):
+        try:
+            name = local_record.new_name("answer-" + safe_qid)
+        except ValueError as e:
+            return None, str(e)
+        task_file_str = os.path.realpath(os.path.join(task_dir_real, f"{name}.txt"))
+        if not task_file_str.startswith(task_dir_real + os.sep):
+            return None, "the id does not name a file under tasks/"
+        try:
+            local_record.create_text_whole(Path(task_file_str), body)
+        except FileExistsError:
+            continue  # another answer took this name a moment ago; its file is left as it is
+        except OSError as e:
+            return None, str(e)
+        return task_file_str, None
+    return None, "no free task name after 8 tries"
+
+
+def answer_question(qid: str, answer: str) -> tuple:
+    """(status, body) for POST /answer. The answer task is published whole BEFORE the close is
+    asked for: a close with no durable answer loses the owner's word; the reverse is at worst
+    a question answered twice. A failed publish leaves the question open."""
+    if not qid or not answer:
+        return 400, {"error": "id and answer required"}
+    g = _pending_gather()
+    if not g["unavailable"] and qid not in {w["ask_id"] for w in g["waiting"]}:
+        return 404, {"error": f"question {qid} is not waiting (answered, dismissed or unknown)"}
+    task_path, err = _file_answer_task(qid, answer)
+    if err:
+        return 500, {"error": f"answer not kept ({err}); the question stays open", "id": qid, "recorded": False}
+    closed, why = pending_questions_reader.resolve(WORKSPACE_DIR, qid, "Answered", _pending_store())
+    if not closed:
+        return 503, {"error": f"answer kept as a task; the question could not be closed: {why}",
+                     "id": qid, "recorded": True, "task": task_path}
+    return 200, {"ok": True, "id": qid, "answer": answer, "task": task_path}
 
 
 def dismiss_question(qid: str) -> tuple:
@@ -586,11 +556,13 @@ def dismiss_question(qid: str) -> tuple:
 
 def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
+    g = _pending_gather()
     return {
         "tasks": _active_task_rows(),
         "watcher": watcher_ok,
         "claude": core_ok,
-        "questions": _pending_question_rows(),
+        "questions": _pending_question_rows(gathered=g),
+        "questions_unavailable": _questions_unavailable(g),
     }
 
 
@@ -990,6 +962,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
             self.send_json(200, get_status())
+        elif path == "/health":
+            query = parse_qs(urlparse(self.path).query)
+            agent = (query.get("agent") or ["all"])[0]
+            view = (query.get("view") or ["summary"])[0]
+            if view not in health_snapshot.VIEWS:
+                self.send_private_json(400, {"error": f"view must be one of {', '.join(health_snapshot.VIEWS)}"})
+                return
+            # `full` carries paths and account detail, so it gets the history routes' loopback gate.
+            if not (self.check_private_history_auth() if view == "full" else self.check_auth()):
+                return
+            self.send_private_json(200, health_snapshot.snapshot(WORKSPACE_DIR, agent=agent, view=view))
         elif path == "/tasks/history":
             if not self.check_private_history_auth():
                 return
@@ -1416,38 +1399,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
-                qid = data.get("id", "")
-                answer = data.get("answer", "")
-                if not qid or not answer:
-                    self.send_json(400, {"error": "id and answer required"})
-                    return
-                pq_file = Path(personal_path("pending-questions.md", WORKSPACE_DIR))
-                if pq_file.exists():
-                    content = pq_file.read_text()
-                    # Same parser the ids were minted by — see parse_pending_questions.
-                    match = next(
-                        (q for q in parse_pending_questions(content) if q["id"] == qid),
-                        None,
-                    )
-                    if match:
-                        pq_file.write_text(answer_pending_question(content, match, answer))
-                        ts = int(datetime.now().timestamp() * 1000)
-                        safe_qid = re.sub(r'[^a-zA-Z0-9_\-.]', '', qid)
-                        if safe_qid:
-                            # os.path.realpath + str.startswith is the CodeQL-recognized
-                            # path-injection sanitizer pair (Path::PathNormalization
-                            # + Path::SafeAccessCheck in semmle.python).
-                            task_dir_real = os.path.realpath(WORKSPACE_DIR / "tasks")
-                            task_file_str = os.path.realpath(
-                                os.path.join(task_dir_real, f"answer-{safe_qid}-{ts}.txt")
-                            )
-                            if task_file_str.startswith(task_dir_real + os.sep):
-                                Path(task_file_str).write_text(f"User answered {safe_qid}: {confine_user_content(answer)}")
-                        self.send_json(200, {"ok": True, "id": qid, "answer": answer})
-                    else:
-                        self.send_json(404, {"error": f"question {qid} not found or already answered"})
-                else:
-                    self.send_json(404, {"error": "no pending questions"})
+                self.send_json(*answer_question(str(data.get("id", "")), str(data.get("answer", ""))))
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
             return

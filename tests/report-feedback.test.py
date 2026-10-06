@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,6 +44,26 @@ class TestReportFeedbackRedaction(unittest.TestCase):
         self.assertNotIn(token, redacted)
         self.assertIn("<redacted-token>", redacted)
 
+    def _assert_scrubbed(self, value):
+        self.assertEqual(report_feedback._redact(f"excerpt {value} end"), "excerpt <redacted-token> end")
+
+    def test_redacts_slack_browser_session_token(self):
+        self._assert_scrubbed("xoxc-" + "1234567890-1234567890-1234567890123-" + "a0" * 16)
+
+    def test_redacts_slack_browser_cookie_token(self):
+        self._assert_scrubbed("xoxd-" + "1" + "A0" * 20)
+
+    def test_redacts_underscore_slack_lookalike(self):
+        self._assert_scrubbed("xoxb_" + "1234567890-abcdefghij")
+
+    def test_redacts_letter_first_slack_lookalike(self):
+        self._assert_scrubbed("xoxb-" + "AbCdEfGhIjKl")
+
+    def test_stays_broad_for_a_prose_shaped_slack_lookalike(self):
+        # The excerpt leaves the machine, so unlike the bridges' narrow family this
+        # scrub keeps the pre-#4892 broad rule and takes prose-shaped values too.
+        self._assert_scrubbed("xoxo-Samantha")
+
     def test_redacts_google_api_key(self):
         key = "AIza" + "Sy" + "A" * 33
         redacted = report_feedback._redact(f"google api key {key}")
@@ -55,6 +76,119 @@ class TestReportFeedbackRedaction(unittest.TestCase):
 
         self.assertIn("key=<redacted>&alt=sse", redacted)
         self.assertNotIn("future-secret", redacted)
+
+
+class TestBuildVersions(unittest.TestCase):
+    def test_packaged_install_without_git(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine = Path(td) / "engine"
+            engine.mkdir()
+            repo = engine / "sutando"
+            repo.mkdir()
+            (repo / "package.json").write_text('{"version":"0.1.0"}')
+            (engine / "ENGINE_MANIFEST.json").write_text(json.dumps({
+                "sha": "a" * 40, "dirty": True, "builder": "private-host", "branch": "private-branch",
+            }))
+            (engine / "build-id.txt").write_text("b" * 40 + "\n")
+            versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["sutando"]["commit"], "a" * 40)
+            self.assertEqual(versions["sutando"]["version"], "unknown")
+            self.assertEqual(versions["sutando"]["build"], "a" * 40 + "-dirty")
+            self.assertEqual(versions["ag2space"]["commit"], "b" * 40)
+            self.assertEqual(versions["ag2space"]["version"], "unknown")
+            self.assertNotIn("private", json.dumps(versions))
+            (engine / "ag2space-version.txt").write_text("0.6.19\n")
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["version"], "0.6.19")
+            (engine / "build-id.txt").write_text("dev-1234")
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["commit"], "unknown")
+
+    def test_checkout_uses_own_commit_and_marks_local_edits(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", td, *args],
+                                               stderr=subprocess.DEVNULL, text=True).strip()
+            git("init")
+            (repo / "package.json").write_text('{"version":"0.1.0"}')
+            git("add", "package.json")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
+            git("tag", "v0.8.1")
+            (repo / "package.json").write_text('{"version":"0.1.1"}')
+            versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["sutando"]["commit"], git("rev-parse", "HEAD"))
+            self.assertEqual(versions["sutando"]["version"], "v0.8.1-dirty")
+            self.assertEqual(versions["ag2space"]["version"], "unknown")
+
+    def test_missing_or_malformed_metadata_does_not_prevent_reporting(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "engine" / "sutando"
+            repo.mkdir(parents=True)
+            for contents in ("{bad", '[]', '{"sha":42,"dirty":null}'):
+                (repo.parent / "ENGINE_MANIFEST.json").write_text(contents)
+                versions = report_feedback.build_versions(repo)
+                self.assertEqual(versions["sutando"]["commit"], "unknown")
+                self.assertEqual(versions["ag2space"]["version"], "unknown")
+
+    def test_desktop_checkout_reports_host_version_and_separate_commits(self):
+        with tempfile.TemporaryDirectory() as td:
+            desktop = Path(td)
+            repo = desktop / "engine" / "sutando"
+            (repo / ".git").mkdir(parents=True)
+            (desktop / ".git").mkdir()
+            (desktop / "src-tauri").mkdir()
+            (desktop / "src-tauri" / "tauri.conf.json").write_text('{"version":"0.5.2"}')
+            (repo.parent / "ENGINE_MANIFEST.json").write_text(json.dumps({"sha": "a" * 40, "dirty": True}))
+            def git(source, *args):
+                prefix = "sutando" if source == repo else "desktop"
+                return prefix + ("-sha" if args[0] == "rev-parse" else "-build")
+            with mock.patch.object(report_feedback, "_git", side_effect=git):
+                versions = report_feedback.build_versions(repo)
+            self.assertEqual(versions["ag2space"]["version"], "0.5.2")
+            self.assertEqual(versions["ag2space"]["commit"], "desktop-sha")
+            self.assertEqual(versions["sutando"]["commit"], "sutando-sha")
+            self.assertEqual(versions["sutando"]["bundled_commit"], "a" * 40)
+            self.assertIn("bundled build: " + "a" * 40 + "-dirty", report_feedback.body_with_versions("", versions))
+
+    def test_standalone_ignores_unrelated_neighbor_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "sutando"
+            repo.mkdir()
+            (repo.parent / "ENGINE_MANIFEST.json").write_text(json.dumps({
+                "ag2space": {"version": "8.8.8", "commit": "foreign"},
+            }))
+            self.assertEqual(report_feedback.build_versions(repo)["ag2space"]["version"], "unknown")
+
+    def test_git_uses_resolver_and_skips_unavailable_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".git").mkdir()
+            with mock.patch.object(report_feedback, "git_argv", side_effect=OSError("no runnable git")), \
+                    mock.patch.object(subprocess, "check_output") as run:
+                self.assertIsNone(report_feedback._git(repo, "rev-parse", "HEAD"))
+                run.assert_not_called()
+            with mock.patch.object(report_feedback, "git_argv", return_value=["resolved-git", "arg"]), \
+                    mock.patch.object(subprocess, "check_output", return_value="abc") as run:
+                self.assertEqual(report_feedback._git(repo, "rev-parse", "HEAD"), "abc")
+                self.assertEqual(run.call_args.args[0], ["resolved-git", "arg"])
+                self.assertEqual(run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_git_never_inherits_a_parent_repository(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(subprocess, "check_output") as run:
+            self.assertIsNone(report_feedback._git(Path(td), "rev-parse", "HEAD"))
+            run.assert_not_called()
+
+    def test_body_tolerates_incomplete_old_draft_versions(self):
+        body = report_feedback.body_with_versions("details", {"sutando": {"version": "v1"}})
+        self.assertIn("Sutando: v1 (commit: unknown)", body)
+        self.assertIn("AG2Space: unknown (commit: unknown)", body)
+
+    def test_git_failure_does_not_prevent_reporting(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".git").mkdir()
+            with mock.patch.object(subprocess, "check_output", side_effect=OSError("missing git")):
+                self.assertEqual(report_feedback.build_versions(repo)["sutando"]["commit"], "unknown")
 
 
 class TestReportFeedbackCloudAuth(unittest.TestCase):
@@ -294,7 +428,10 @@ class TestAskFirst(unittest.TestCase):
             posted.append((req.full_url, json.loads(req.data.decode()))); return _FakeResp()
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td, {"sendLogs": False})
-            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True})
+            incident_versions = {"sutando": {"version": "v1", "commit": "abc"},
+                                 "ag2space": {"version": "v2", "commit": "def"}}
+            with mock.patch.object(report_feedback, "build_versions", return_value=incident_versions):
+                did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "high", "title": "relay down", "body": "details", "auto": True})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", side_effect=_capture):
@@ -302,6 +439,9 @@ class TestAskFirst(unittest.TestCase):
             self.assertEqual(posted[0][0], "https://x/api/feedback")
             body = posted[0][1]
             self.assertEqual((body["title"], body["severity"], body["context"]["owner_approved"]), ("relay down", "high", True))
+            self.assertIn("- Sutando: v1 (commit: abc)", body["body"])
+            self.assertIn("- AG2Space: v2 (commit: def)", body["body"])
+            self.assertEqual(body["context"]["versions"], incident_versions)
             self.assertTrue(body["context"]["logs_opted_out"])
             self.assertEqual(report_feedback.list_drafts(ws), [])
 
@@ -933,10 +1073,39 @@ class _FakeResp:
         return False
 
 
+class _FakeRespWithId(_FakeResp):
+    status = 201
+
+    def read(self):
+        return b'{"ok":true,"id":"0b9c7e1a-feedback"}'
+
+
 class TestMain(unittest.TestCase):
     def _run(self, argv):
         with mock.patch.object(sys, "argv", ["report-feedback.py", *argv]):
             report_feedback.main()
+
+    def test_a_filed_report_prints_the_reference_the_api_returned(self):
+        """The agent replies with this id; before, the answer's body was never read."""
+        out = io.StringIO()
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                contextlib.redirect_stdout(out):
+            self._run(["--title", "hello", "--no-logs"])
+        self.assertIn("OK: filed bug report (201). Reference: 0b9c7e1a-feedback.", out.getvalue())
+
+    def test_a_parked_draft_filed_later_prints_its_reference_too(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
+                    mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeRespWithId()), \
+                    contextlib.redirect_stdout(out):
+                self._run(["--decide", did, "file"])
+        self.assertIn(f"from draft {did}. Reference: 0b9c7e1a-feedback.", out.getvalue())
 
     def test_blank_title_exits_1(self):
         with self.assertRaises(SystemExit) as cm:
@@ -954,6 +1123,13 @@ class TestMain(unittest.TestCase):
                 mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
             self._run(["--title", "hello", "--no-logs"])
         self.assertEqual(uo.call_count, 1)
+        payload = json.loads(uo.call_args.args[0].data)
+        self.assertIn("### Build versions", payload["body"])
+        self.assertIn("- Sutando:", payload["body"])
+        self.assertIn("- AG2Space:", payload["body"])
+        ctx = payload["context"]
+        self.assertIn("sutando", ctx["versions"])
+        self.assertIn("ag2space", ctx["versions"])
 
     def _posted_context(self, argv, ws):
         seen = {}

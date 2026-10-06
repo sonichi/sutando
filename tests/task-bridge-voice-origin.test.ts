@@ -72,7 +72,7 @@ describe('forwardVoiceResultToOrigin — the result reaches its origin, and voic
 		const file = forwardVoiceResultToOrigin('task-1700000000000', 'Three listings.\nSecond line.', origin('place-1'), 1_800_000_000);
 		assert.equal(file, 'proactive-result-task-1700000000000-1800000000.to-fakechan.txt');
 		assert.equal(readFileSync(join(RESULT_DIR, file), 'utf-8'), '[channel: place-1]\nThree listings.\nSecond line.');
-		assert.equal(_shouldFallthrough(file), true, 'the drain would otherwise speak this file on its next tick');
+		assert.equal(_shouldFallthrough(file), false, 'a .to-<bridge> file is that bridge\'s to claim; voice never speaks or archives it');
 		assert.equal(_shouldRegisterTaskRow(file), false);
 		assert.equal(_isDeliveredResult(file), true);
 		const py = spawnSync('python3', ['-c', `import sys; sys.path.insert(0, "src")\nfrom proactive_routing import proactive_destination\nprint(proactive_destination(${JSON.stringify(file)}))`], { cwd: process.cwd(), encoding: 'utf-8' });

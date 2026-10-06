@@ -140,11 +140,25 @@ body: {
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
+When the gateway runs inside a Sutando checkout it adds the core's health row
+from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
+
+```
+"health": {"alive": true|false|null, "motion": "idle|moving|unknown",
+           "condition": "healthy|abnormal|unknown", "reason": "<slug>"|null,
+           "since": <unix seconds>|null}
+```
+
+`reason` is a slug of `[a-z0-9-]{1,40}`, not a closed set. `since` is for display;
+the broker times freshness by when it received the heartbeat. A change in the row
+sends the heartbeat at once, without waiting for the interval. A gateway with no
+Sutando checkout around it sends neither field.
+
 ### `POST /v1/workers` *(optional)*
 
 The worker pool this gateway fronts, pushed when the local advertisement's
-content changes and re-sent every 600 s so a relay that restarted with an empty
-copy heals without an operator. Sent only when the gateway finds a readable
+content changes and re-sent unchanged every 600 s (every 20 s when it carries
+health, see below), so a relay that restarted with an empty copy heals without an operator. Sent only when the gateway finds a readable
 advertisement; a gateway with no pool never calls it.
 
 ```
@@ -158,11 +172,23 @@ body: {
 success: 2xx, body ignored
 ```
 
+When the advertisement carries the per-worker report (`workers: [{id, state, …}]`),
+a gateway that sends `worker_health.v1` adds each non-retired worker's `health`
+row (the heartbeat's shape) and a top-level `suspended: {"reason", "at"} | null`,
+set while the owner has quit the app and the pool is paused. A health change
+pushes the report again even when the advertisement has not changed.
+
+A report carrying health is also re-sent, changed or not, whenever the last one
+is 20 s old, checked between polls. That keeps gaps under 60 s: the broker requires
+a health report at least every 60 s and marks worker rows stale 120 s after the
+last one it received. A body without health (the legacy snapshot, or a standalone
+sparrow with no health snapshot) keeps the 600 s re-send.
+
 ### `PUT /v1/agents/<mxid>/profile` *(optional)*
 
-The instance's identity card, pushed on the same change signal and cadence as
-the workers snapshot, from the same single read, so the two can never describe
-different revisions. `<mxid>` is percent-encoded as one path segment.
+The instance's identity card, pushed on the same change signal as the workers
+snapshot and from the same single read, so the two can never describe different
+revisions. Unchanged, it is re-sent every 600 s, not at the workers' 20 s refresh. `<mxid>` is percent-encoded as one path segment.
 
 ```
 body: {
@@ -177,10 +203,26 @@ success: 2xx, body ignored
 The broker REPLACES the profile document, so the gateway sends this only from
 an advertisement it could read in full.
 
-**Unsupported is not an error.** A relay that does not implement either route
+### `GET /v1/agents/<mxid>/profile` *(optional worker labels)*
+
+After a successful profile PUT, the Sutando adapter may read the owner's
+display-name overrides for its workers. The broker response must identify the
+same `<mxid>` and provide `schema_version: 1`, a nonnegative integer
+`config.version`, and `display.worker_labels` as a map from stable worker IDs
+to nonempty display names. An empty map explicitly clears all overrides.
+`workers[]` in this response is an effective presentation projection; the
+adapter never treats it as rename intent.
+
+Sutando stores these names separately from its own routing aliases. The
+worker ID remains the routing and attribution key, and clearing an owner
+override reveals the original local label. The read and local application run
+off the task poll path. An unsupported, unavailable, or invalid response keeps
+the last local state and cannot delay task delivery.
+
+**Unsupported is not an error.** A relay that does not implement an optional route
 answers `404`, `405` or `501`; the gateway logs once and stops trying for an
 hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
-Neither call can fail the task loop: both are handed to a background thread
+These calls cannot fail the task loop: all run in a background thread
 AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
 a slow push is still in flight and an optional push never delays an
 owner-approved publication. A push still running when the next beat arrives is

@@ -35,6 +35,9 @@ esac
 REPO="$(cd "$_self_dir/../../.." && pwd)"
 unset _self_dir
 cd "$REPO"
+if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
+  exec bash "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$@"
+fi
 # shellcheck source=../../../src/agent/claude/cli/session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
@@ -48,6 +51,7 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
+add_skill_claude_plugins
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -125,6 +129,16 @@ fi
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   exit 0
+fi
+
+# The watcher sees SUTANDO_INSTANCE_ID in every worker session and therefore
+# requires the pool delivery writer. Fail before creating a session that could
+# receive tasks but cannot safely acknowledge them.
+if [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
+   [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
+   [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; then
+  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
+  exit 2
 fi
 
 # Same onboarding/hooks treatment a core launch gets: a worker is also
