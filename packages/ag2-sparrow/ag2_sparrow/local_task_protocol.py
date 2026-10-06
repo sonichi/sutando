@@ -203,6 +203,9 @@ KNOWN_HEADER_KEYS = (
     # A Commons hook fire's context (one-line JSON object: hook_id, fire_id, caused_by, rows,
     # trigger, ...). Written by the trusted bridge; the guard defangs a forged body copy.
     "hook",
+    # A Commons Summon's context (one-line JSON object: task_id, caused_by, room_id, database,
+    # row_id, changed_by, changes, ...). Same trust and guard as `hook`.
+    "summon",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
