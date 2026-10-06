@@ -517,6 +517,60 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_canonical_launch_clears_full_foreign_routing_env_not_just_empty_instance_id(self):
+        # An empty (not unset) SUTANDO_INSTANCE_ID must clear the routing block too --
+        # not only a nonempty one -- or a stale resolver silently drops every task.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        env = self._env({
+            "SUTANDO_INBOX_KIND": "deliveries",
+            "SUTANDO_INBOX_RESOLVER": str(REPO / "skills/worker-pool/scripts/resolve-inbox-entry"),
+            "SUTANDO_INBOX_RESOLVER_TIMEOUT": "5",
+            "SUTANDO_POOL_DELIVERY_SCRIPT": str(REPO / "skills/worker-pool/scripts/pool_delivery.py"),
+        })
+        # No SUTANDO_INSTANCE_ID here: left to the notifier's own resolved_instance_id(),
+        # which exports "" for this canonical inbox -- the empty-but-present case.
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=env,
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            self.wait_for_watcher_ready()
+            self.write_task("task-routing-env.txt")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-routing-env.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail(
+                    "a plain task on the canonical inbox was never dispatched -- the "
+                    "inherited worker-routing env was not cleared just because "
+                    "SUTANDO_INSTANCE_ID itself arrived empty:\n" + self.sendkeys_log_text())
+            self.write_result("task-routing-env.txt")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
     def test_an_older_refused_name_does_not_stall_the_newer_plain_task(self):
         # The queue head is chosen by next-pending: a refused name sorting first
         # must be skipped there, or every wake re-offers it and nothing behind it runs.
@@ -780,8 +834,8 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 proc.wait(timeout=5)
 
     def test_tasks_agy_shaped_inbox_never_touches_the_canonical_sentinel(self):
-        # Regression for sonichi#5161: an unconditional id-clear made the agy
-        # watcher's sentinel collide with (then delete) a live core's sentinel.
+        # Regression: an unconditional id-clear made the agy watcher's
+        # sentinel collide with (then delete) a live core's sentinel.
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         state_dir = self.tasks_dir.parent / "state"

@@ -45,7 +45,7 @@ fi
 # shellcheck source=../../../tasks-dir-resolve.sh
 . "$REPO/src/tasks-dir-resolve.sh"
 
-# Cleared only on the core's own canonical inbox (shared rule, sonichi#5161);
+# Cleared only on the core's own canonical inbox (shared rule in tasks-dir-resolve.sh);
 # forced to "agy-task-notifier" on any other inbox so its sentinel never collides.
 resolved_instance_id() {
   if inbox_is_canonical_core_tasks_dir "$TASKS_DIR"; then
