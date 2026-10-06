@@ -574,11 +574,13 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
-if ! pgrep -q caffeinate; then
+# Only a caffeinate holding -s keeps a lid-closed Mac on AC awake; short-lived `-i -t N` ones must not count.
+SLEEP_GUARD_PATTERN='(^|/)caffeinate( [^ ]+)* -[a-zA-Z]*s( |$)'
+if ! pgrep -qf "$SLEEP_GUARD_PATTERN"; then
   caffeinate -d -i -s &
-  echo "  ✓ caffeinate started (prevents display sleep)"
+  echo "  ✓ caffeinate started (prevents display and system sleep on AC)"
 else
-  echo "  ✓ caffeinate already running"
+  echo "  ✓ caffeinate -s already running"
 fi
 
 echo "Checking permissions..."
