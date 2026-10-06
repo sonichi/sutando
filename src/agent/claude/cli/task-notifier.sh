@@ -385,21 +385,42 @@ composer_resume_offset() {
   return 1
 }
 
-# True only when $1 is a subsequence of $2 (every char of $1 appears in $2, in
-# order, gaps allowed) -- dropped bytes pass this, foreign (owner) text does not.
-squeezed_is_subsequence() {
+# True only when $1 is an exact prefix of $2 through a verified chunk boundary,
+# plus a CONTIGUOUS slice of the next chunk -- not a scattered subsequence, which a short foreign string can satisfy by luck.
+leftover_is_dropped_bytes() {
   "$NOTIFIER_PY" -c '
 import sys
-needle, hay = sys.argv[1], sys.argv[2]
-i = 0
-for ch in hay:
-    if i < len(needle) and needle[i] == ch:
-        i += 1
-sys.exit(0 if i == len(needle) else 1)
-' "$1" "$2"
+leftover_raw, prompt_raw, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def squeeze(s):
+    return "".join(c for c in s if not c.isspace())
+
+bounds = [0]
+cur = 0
+for ch in prompt_raw:
+    n = len(ch.encode("utf-8", "surrogateescape"))
+    if cur and cur + n > cap:
+        bounds.append(bounds[-1] + cur)
+        cur = 0
+    cur += n
+bounds.append(bounds[-1] + cur)
+
+leftover = squeeze(leftover_raw)
+ok = False
+for k in range(len(bounds) - 1):
+    a, b = bounds[k], bounds[k + 1]
+    exact_prefix = squeeze(prompt_raw[:a])
+    if not leftover.startswith(exact_prefix):
+        continue
+    rest = leftover[len(exact_prefix):]
+    if rest == "" or rest in squeeze(prompt_raw[a:b]):
+        ok = True
+        break
+sys.exit(0 if ok else 1)
+' "$1" "$2" "$3"
 }
 
-# $3 = composer text the caller already proved is ours (squeezed_is_subsequence);
+# $3 = composer text the caller already proved is ours (leftover_is_dropped_bytes);
 # never pass through unchecked composer text.
 note_partial_paste() {
   printf '%s' "${3-}" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$PARTIAL_DIR" "$1" "$2" \
@@ -559,7 +580,7 @@ deliver_prompt_grown() {
       # character in it is provably ours; otherwise record nothing (fails closed as before).
       leftover_now="$(composer_text "$staged_raw")"
       if pane_frame_is_cut "$staged_raw" || [ -z "$leftover_now" ] \
-         || ! squeezed_is_subsequence "$(printf '%s' "$leftover_now" | squeeze)" "$(printf '%s' "$prompt" | squeeze)"; then
+         || ! leftover_is_dropped_bytes "$leftover_now" "$prompt" "$PASTE_CHUNK"; then
         note_partial_paste "$filename" "$incarnation"
       else
         note_partial_paste "$filename" "$incarnation" "$leftover_now"
