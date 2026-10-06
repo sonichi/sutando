@@ -380,6 +380,8 @@ esac
             "SUTANDO_AGY_TMUX_SESSION": "sutando-agy-test",
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.onboarding_path),
             "HOME": str(self.root),
+            # The stub tmux never runs the notifier, so no sentinel can appear.
+            "SUTANDO_WATCHER_READY_TIMEOUT": "0",
         })
         if extra:
             env.update(extra)
