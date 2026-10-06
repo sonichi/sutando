@@ -31,10 +31,15 @@ require_arg() {
   [[ -n "$value" ]] || fail "missing value for $flag"
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The shipped skills tree (an installed link points into it) comes first: an install
+# refreshed after the agy rename has no agy link yet. The installed dir is the fallback.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILLS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if [[ ! -f "$SKILLS_DIR/agy/scripts/gemini-run.sh" ]]; then
+  SKILLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
 CODEX_WRAPPER="$SKILLS_DIR/claude-codex/scripts/codex-run.sh"
-GEMINI_WRAPPER="$SKILLS_DIR/claude-gemini/scripts/gemini-run.sh"
+GEMINI_WRAPPER="$SKILLS_DIR/agy/scripts/gemini-run.sh"
 PI_WRAPPER="$SKILLS_DIR/claude-pi/scripts/pi-run.sh"
 
 CHECK=0

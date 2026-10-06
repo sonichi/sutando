@@ -8,6 +8,10 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 - Codex cores and workers on macOS automatically redeem an available earned reset when the weekly allowance is exhausted at least 24 hours before renewal. This is on by default; set `SUTANDO_CODEX_AUTO_RESET_ENABLED=0` and restart to disable it. The Codex API currently reports whole-number usage, so the 99.9% threshold fires at a reported 100% used. ([#4829](https://github.com/sonichi/sutando/pull/4829))
 
+### Changed
+
+- The `claude-gemini` skill is renamed to `agy` (`skills/agy/`, `/agy [prompt]`): it drives the Antigravity CLI `agy`, and the old name described the `gemini` CLI Google folded into Antigravity. `/claude-gemini [prompt]` and the old `skills/claude-gemini/scripts/` paths keep working through a stub and forwarding shims; both are removed in the next release. ([#4994](https://github.com/sonichi/sutando/pull/4994))
+
 ## [v0.10.0] — 2026-08-12
 
 316 PRs since v0.9.0: 60 features, 202 fixes. Full curated notes live on the
