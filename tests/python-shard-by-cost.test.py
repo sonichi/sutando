@@ -5,9 +5,12 @@
 stdin and prints one leg. Across all legs every file must appear exactly once
 (a file assigned twice runs twice; one assigned nowhere never runs), the same
 input must give the same legs on every call (a leg must not depend on timing),
-a file missing from the table must still be assigned (it costs 1), and the
+a file missing from the table must still be assigned (it costs 1), the
 heaviest leg must not exceed the even share by more than one suite's cost — the
-bound longest-first-onto-lightest guarantees.
+bound longest-first-onto-lightest guarantees — each leg must come out heaviest
+first (the lane's FIFO workers start the longest suites first), and files
+measured at 0 must spread across legs instead of all landing on one (a 0 never
+changes a leg's load, so without a floor the lightest leg never moves).
 
 Run: python3 tests/python-shard-by-cost.test.py
 """
@@ -52,6 +55,17 @@ def main() -> int:
             fails.append(f"balance: heaviest leg {max(loads)} exceeds even share {even:.0f} by more than one suite")
         if not all(any(f in leg for leg in a) for f in files[-3:]):
             fails.append("a file absent from the table was left unassigned")
+        for i, leg in enumerate(a, 1):
+            seq = [cost(f) for f in leg]
+            if seq != sorted(seq, reverse=True):
+                fails.append(f"order: leg {i} is not heaviest-first: {seq[:8]}...")
+                break
+
+        zeros = [f"tests/z{i:03d}.test.py" for i in range(30)]
+        table.write_text("".join(f"0 {f}\n" for f in zeros))
+        sizes = [len(leg) for leg in legs(3, zeros, table)]
+        if sizes != [10, 10, 10]:
+            fails.append(f"floor: 30 zero-cost files split {sizes} across 3 legs, expected 10 each")
         r = subprocess.run(["bash", str(SCRIPT), "3", "4", str(table)], input="x\n", capture_output=True, text=True)
         if r.returncode == 0:
             fails.append("shard 4 of 3 was accepted")
