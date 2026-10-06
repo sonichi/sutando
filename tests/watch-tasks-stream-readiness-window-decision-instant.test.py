@@ -414,8 +414,10 @@ def scenario_replacement_between_parse_and_stamp():
     # The interpreter the watcher is told to use: the real python, except that the
     # first config parse is followed by the atomic replacement A -> C.
     shim = tmp / "py-shim.sh"
+    # The event relay streams for the watcher's lifetime, so it is passed straight through.
     shim.write_text(
         '#!/bin/bash\n'
+        'case "$1" in *line_relay.py) exec ' + real_py + ' "$@" ;; esac\n'
         'out="$(' + real_py + ' "$@")"; rc=$?\n'
         'case "$*" in *json*handler*)\n'
         f'  if [ ! -e {swapped} ]; then touch {swapped}; cp {cfg_c} {cfg}.tmp && mv {cfg}.tmp {cfg}; fi ;;\n'

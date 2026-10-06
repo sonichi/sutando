@@ -51,6 +51,9 @@ class Harness:
         self.inbox = self.ws / "deliveries" / W
         for d in (self.ws / "tasks" / "archive", self.ws / "results" / "archive", self.ws / "state", self.inbox):
             d.mkdir(parents=True, exist_ok=True)
+        # A workspace already migrated: these pointers stand for ones the archive step missed.
+        (self.ws / "state" / "migrations").mkdir()
+        (self.ws / "state" / "migrations" / "retire-archived-pointers.v1.done").write_text("{}\n")
         self.feed = self.tmp / "feed"
         self.feed.write_text("")
         (self.tmp / "bin").mkdir()

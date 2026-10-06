@@ -49,6 +49,8 @@ source "$__SCRIPT_DIR/task-emit.sh"
 source "$__SCRIPT_DIR/bounded-wait.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
+# shellcheck source=inbox-events.sh
+source "$__SCRIPT_DIR/inbox-events.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
 source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
 # shellcheck source=tasks-dir-resolve.sh
@@ -661,7 +663,8 @@ handler_result_is_answer() {
   ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$ready" || first=""
+  # A last line with no newline still fills $first; read's EOF status must not clear it.
+  IFS= read -r first < "$ready" || true
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }
@@ -1062,10 +1065,25 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
+
+# Once per workspace, before the first plan: retire pointers archived before the archive
+# step retired them. Idempotent and per-inbox locked, so a racing watcher is harmless.
+retire_archived_pointers_once() {
+  local marker="$STATE_DIR/migrations/retire-archived-pointers.v1.done" out tmp
+  [ -e "$marker" ] && return 0
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || return 0
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/task_archive.py" retire-archived-pointers "$WORKSPACE_DIR" 2>&1)" || {
+    echo "watch-tasks-stream: pointer migration failed; it retries on the next start: $out" >&2
+    return 0
+  }
+  case "$out" in *'"retired": 0,'*) ;; *) echo "watch-tasks-stream: pointer migration: $out" >&2 ;; esac
+  tmp="$(mktemp "$marker.XXXXXX")" && printf '%s\n' "$out" > "$tmp" && mv -f "$tmp" "$marker"
+}
 # One process plans the whole inbox; a plan without its done line falls back to every
-# entry. One printf per line, so fswatch's writes to the same FIFO never split a line.
+# entry. One printf per line, the relay's shape too, keeps each line whole on the FIFO.
 sweep_entries() {
   local plan line
+  retire_archived_pointers_once
   plan="$(mktemp "$WATCH_RUNTIME_DIR/sweep-plan.XXXXXX")" || plan=""
   if [ -n "$plan" ] && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sweep-plan \
        "$TASKS_DIR_ABS" "$RESULTS_DIR" --workspace "$WORKSPACE_DIR" \
@@ -1129,12 +1147,7 @@ fi
 FSWATCH_READER_OPEN=""
 FSWATCH_STARTED_AT=0
 launch_fswatch() {
-  fswatch \
-    -l 0.5 \
-    --event Created \
-    --event Renamed \
-    --event Updated \
-    "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  start_inbox_events "$SUTANDO_PY_BIN" "$WATCH_RUNTIME_DIR/events" "${fswatch_paths[@]}"
   FSWATCH_PID=$!
   FSWATCH_STARTED_AT="$(date +%s)"
   if [ -z "$FSWATCH_READER_OPEN" ]; then
