@@ -143,8 +143,10 @@ def _host_label() -> str:
     if env:
         return env
     try:
+        # Absolute by default (overridable via $SCUTIL_BIN for tests): a
+        # restrictive launchd PATH can omit /usr/sbin.
         out = subprocess.run(
-            ["scutil", "--get", "LocalHostName"],
+            [os.environ.get("SCUTIL_BIN") or "/usr/sbin/scutil", "--get", "LocalHostName"],
             capture_output=True, text=True, timeout=2,
         )
         if out.returncode == 0 and out.stdout.strip():
@@ -152,6 +154,11 @@ def _host_label() -> str:
     except (OSError, subprocess.SubprocessError):
         pass
     return socket.gethostname().split(".")[0]
+
+
+def host_label() -> str:
+    """Public name for the per-host segment (`hosts/<host>/`)."""
+    return _host_label()
 
 
 def _private_machine_dir() -> Path | None:

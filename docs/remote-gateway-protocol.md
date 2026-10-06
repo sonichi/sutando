@@ -140,11 +140,25 @@ body: {
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
+When the gateway runs inside a Sutando checkout it adds the core's health row
+from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
+
+```
+"health": {"alive": true|false|null, "motion": "idle|moving|unknown",
+           "condition": "healthy|abnormal|unknown", "reason": "<slug>"|null,
+           "since": <unix seconds>|null}
+```
+
+`reason` is a slug of `[a-z0-9-]{1,40}`, not a closed set. `since` is for display;
+the broker times freshness by when it received the heartbeat. A change in the row
+sends the heartbeat at once, without waiting for the interval. A gateway with no
+Sutando checkout around it sends neither field.
+
 ### `POST /v1/workers` *(optional)*
 
 The worker pool this gateway fronts, pushed when the local advertisement's
-content changes and re-sent every 600 s so a relay that restarted with an empty
-copy heals without an operator. Sent only when the gateway finds a readable
+content changes and re-sent unchanged every 600 s (every 20 s when it carries
+health, see below), so a relay that restarted with an empty copy heals without an operator. Sent only when the gateway finds a readable
 advertisement; a gateway with no pool never calls it.
 
 ```
@@ -158,11 +172,23 @@ body: {
 success: 2xx, body ignored
 ```
 
+When the advertisement carries the per-worker report (`workers: [{id, state, …}]`),
+a gateway that sends `worker_health.v1` adds each non-retired worker's `health`
+row (the heartbeat's shape) and a top-level `suspended: {"reason", "at"} | null`,
+set while the owner has quit the app and the pool is paused. A health change
+pushes the report again even when the advertisement has not changed.
+
+A report carrying health is also re-sent, changed or not, whenever the last one
+is 20 s old, checked between polls. That keeps gaps under 60 s: the broker requires
+a health report at least every 60 s and marks worker rows stale 120 s after the
+last one it received. A body without health (the legacy snapshot, or a standalone
+sparrow with no health snapshot) keeps the 600 s re-send.
+
 ### `PUT /v1/agents/<mxid>/profile` *(optional)*
 
-The instance's identity card, pushed on the same change signal and cadence as
-the workers snapshot, from the same single read, so the two can never describe
-different revisions. `<mxid>` is percent-encoded as one path segment.
+The instance's identity card, pushed on the same change signal as the workers
+snapshot and from the same single read, so the two can never describe different
+revisions. Unchanged, it is re-sent every 600 s, not at the workers' 20 s refresh. `<mxid>` is percent-encoded as one path segment.
 
 ```
 body: {

@@ -75,6 +75,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -1570,6 +1571,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
@@ -6330,7 +6332,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install` (installs the package.json pin)
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
@@ -6405,7 +6407,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install`."
         )
     return check
 
@@ -8331,18 +8333,13 @@ def check_pool_suspended() -> dict:
     """A pool suspension never expires; only resuming the pool lifts it. One still present
     while a core runs means the host never resumed it, and no worker is being healed."""
     name = "pool-suspended"
-    path = WORKSPACE_DIR / "state" / "pool-suspended"
     try:
-        text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+        rec = pool_suspension.read(WORKSPACE_DIR)
     except OSError as e:
         return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
-    try:
-        rec = json.loads(text)
-    except ValueError:
-        rec = None
-    what = (f"{rec.get('reason')} since {rec.get('at')}" if isinstance(rec, dict) else text[:80])
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
     if not _any_core_alive():
         return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
     return {"name": name, "status": "warn",
@@ -14669,13 +14666,14 @@ def _default_cron_nudge(
     env = _resolve_launch_env()
     try:
         has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", f"={session}"],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+            # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
+            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
             env=env, capture_output=True, timeout=15,
         )
         return send.returncode == 0

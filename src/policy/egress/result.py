@@ -33,10 +33,10 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
-    from .local_task_protocol import canonical_access_tier
+    from .local_task_protocol import canonical_access_tier, parse_task_headers
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
-    from local_task_protocol import canonical_access_tier
+    from local_task_protocol import canonical_access_tier, parse_task_headers
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -235,6 +235,24 @@ def is_suppression_only(body: str) -> bool:
     """
     actions = parse_markers(body or "").actions
     return bool(actions) and all(action.kind == "skip" for action in actions)
+
+
+OWNER_MENTION_HEADER = "owner_mentioned"
+
+
+def is_owner_mention_task(task_text) -> bool:
+    """True when the task's writer attested an owner mention above `task:`.
+
+    The strict parse stops at `task:`, so a body line can never claim it.
+    """
+    headers = parse_task_headers(task_text or "")
+    return (headers.get(OWNER_MENTION_HEADER) or "").strip() == "true"
+
+
+def owner_mention_result_refused_by_room(task_text, body: str) -> bool:
+    """An owner-mention task may close its room turn silently and nothing more:
+    any other result goes to the owner's DM, never to the room that mentioned him."""
+    return is_owner_mention_task(task_text) and not is_suppression_only(body)
 
 
 VERDICT_DELIVER = "deliver"

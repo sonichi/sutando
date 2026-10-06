@@ -35,6 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+import cli_wedge  # noqa: E402 — owns the core pane target and its capture
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
 SESSION = "sutando-core"
@@ -267,7 +268,7 @@ def _gateway_running():
     if rc == 0:
         return True
     # Fallback: a window named "gateway" in the core session.
-    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", SESSION, "-F", "#{window_name}"])
+    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", f"={SESSION}", "-F", "#{window_name}"])
     if rc2 == 0 and any(w.strip() == "gateway" for w in out.splitlines()):
         return True
     # Neither probe confirmed the gateway. Only report "down" if at least one
@@ -505,8 +506,9 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
 
 
 def _pane_text():
-    rc, out = _run(["tmux", "-S", _tmux_socket(), "capture-pane", "-p", "-t", SESSION])
-    return out if rc == 0 else ""
+    sock = _tmux_socket()
+    target = cli_wedge.core_target(sock, SESSION)
+    return (cli_wedge.capture_pane(sock, target) or "") if target else ""
 
 
 def needs_login(pane_text):

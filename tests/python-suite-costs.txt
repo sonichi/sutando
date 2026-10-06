@@ -18,12 +18,10 @@
 2 tests/agent-activity.test.py
 1 tests/agent-api-active-rows-vanish.test.py
 1 tests/agent-api-active-tasks-payload.test.py
-5 tests/agent-api-answer-e2e.test.py
 9 tests/agent-api-delegation.test.py
 6 tests/agent-api-guest-routes.test.py
 0 tests/agent-api-pending-questions.test.py
 0 tests/agent-api-port-override.test.py
-4 tests/agent-api-question-queue-e2e.test.py
 0 tests/agent-api-result-archive-layouts.test.py
 7 tests/agent-api-result-auth.test.py
 0 tests/agent-api-scan-text.test.py
@@ -84,7 +82,6 @@
 0 tests/bridges-envelope-stamp.test.py
 0 tests/bridges-sending-orphan-recovery.test.py
 0 tests/briefing-all-clear-verified.test.py
-0 tests/briefing-pending-status.test.py
 10 tests/browser-persistent.test.py
 0 tests/built-in-tools-model-quota.test.py
 0 tests/call-diagnostics-analysis.test.py
@@ -96,10 +93,7 @@
 0 tests/channel-token-relay-quoting.test.py
 1 tests/channel-token-vault-fallback.test.py
 2 tests/chat-secret-persistence.test.py
-1 tests/check-pending-questions-bullet.test.py
 0 tests/check-pending-questions-collapse.test.py
-0 tests/check-pending-questions-open-status.test.py
-0 tests/check-pending-questions-snippet.test.py
 2 tests/check-python39-compat.test.py
 0 tests/ci-covers-every-python-test.test.py
 1 tests/ci-triage-incomplete-gate.test.py
@@ -113,8 +107,10 @@
 0 tests/claude-md-conduct-rules.test.py
 1 tests/claude-md-tier-summary.test.py
 0 tests/claude-pi-wrapper.test.py
+78 tests/claude-task-notifier-gate.test.py
 97 tests/claude-task-notifier-inflight.test.py
-78 tests/claude-task-notifier.test.py
+80 tests/claude-task-notifier-submit.test.py
+60 tests/claude-task-notifier.test.py
 6 tests/cli-wedge-health-probe.test.py
 3 tests/cli-wedge.test.py
 1 tests/cloud-auth.test.py
@@ -306,7 +302,6 @@
 14 tests/file-lock.test.py
 2 tests/find-pids.test.py
 0 tests/friction-detector-every-check-is-registered.test.py
-0 tests/friction-detector-pending-questions.test.py
 0 tests/friction-github-probe-is-not-capped.test.py
 0 tests/friction-pending-questions-collapse.test.py
 1 tests/friction-unchecked-probes.test.py
@@ -558,7 +553,6 @@
 0 tests/morning-briefing-next-not-first.test.py
 1 tests/morning-briefing-overnight-window.test.py
 1 tests/morning-briefing-pending-extract.test.py
-0 tests/morning-briefing-pending-single-source.test.py
 0 tests/morning-briefing-src-dir-wiring.test.py
 0 tests/morning-briefing-stale-reminders.test.py
 0 tests/morning-briefing-weather-location.test.py
@@ -608,17 +602,12 @@
 3 tests/pane-gate-contract.test.py
 1 tests/pathless-file-marker-controls.test.py
 0 tests/peer-watch-verdict.test.py
-1 tests/pending-questions-body-field.test.py
-1 tests/pending-questions-bullet-snippet.test.py
 0 tests/pending-questions-divider-anchor.test.py
-0 tests/pending-questions-h3-is-not-a-question.test.py
 0 tests/pending-questions-honest-notify.test.py
 0 tests/pending-questions-masked-divider-warns.test.py
 1 tests/pending-questions-notify-key.test.py
-1 tests/pending-questions-readers-agree.test.py
 0 tests/pending-questions-stamp-under-state.test.py
 2 tests/pending-questions-triage.test.py
-0 tests/pending-questions-zero-is-explained.test.py
 0 tests/personal-claude-compact-hook.test.py
 1 tests/personal-path-workspace-isolation.test.py
 1 tests/plist-template-render.test.py
@@ -806,7 +795,6 @@
 0 tests/session-cron-config-drift.test.py
 1 tests/session-handoff-atomic-write.test.py
 29 tests/session-handoff-compaction-log.test.py
-0 tests/session-handoff-pending-questions.test.py
 0 tests/session-handoff-repo-ok-non-git.test.py
 0 tests/session-handoff-stage-cleanup.test.py
 0 tests/session-recap-extract.test.py

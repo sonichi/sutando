@@ -564,6 +564,20 @@ def build_requeued_task(
     return "\n".join(lines) + note
 
 
+# Every bracket word the patterns above act on; the inverse of the grammar lives
+# beside it so a new marker is added to both at once.
+_MARKER_OPEN_RE = re.compile(
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|reply:|dm-only|file:|send:|attach:))",
+    re.IGNORECASE)
+
+
+def neutralize_markers(text: str) -> str:
+    """Quoted form of `text` for a body that EMBEDS it: a space after each marker's
+    opening bracket keeps the words readable and takes the token out of every
+    pattern in this module, so parse_markers emits no action for it."""
+    return _MARKER_OPEN_RE.sub("[ ", text or "")
+
+
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
     """Convenience: return the first action of the given kind, or None.
 

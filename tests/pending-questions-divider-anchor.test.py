@@ -34,7 +34,7 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
 from pending_questions_md import (  # noqa: E402
     DIVIDER_OR_DONE_RE, active_region, mask_html_comments, mask_markup)
 
@@ -125,21 +125,6 @@ sample = BANNER + "\n## q1\n\nbody\n"
 masked = mask_html_comments(sample)
 check("masking preserves length (offsets stay valid for slicing)", len(masked) == len(sample))
 check("masking preserves line count", masked.count("\n") == sample.count("\n"))
-
-# --- The shipped predicate end-to-end, through the real notifier.
-spec = importlib.util.spec_from_file_location(
-    "cpq", REPO / "src" / "check-pending-questions.py")
-cpq = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cpq)
-with tempfile.TemporaryDirectory() as td:
-    pq = pathlib.Path(td) / "pending-questions.md"
-    pq.write_text(BANNER + "\n## Open one\n\nprose\n\n## Open two\n\nprose\n\n"
-                           "# Resolved\n\n## Old\n\nprose\n")
-    cpq.PQ_FILE = pq
-    got = cpq.get_waiting_questions()
-titles = [q.get("title", "") for q in got]
-check(f"notifier sees both open questions through the banner (got {len(got)})", len(got) == 2)
-check("resolved section excluded", not any("old" in t.lower() for t in titles))
 
 # --- RATCHET: exactly ONE definition of the divider. Four independent copies is what
 #     produced this outage; a fifth would go dark the same way.

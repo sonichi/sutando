@@ -739,11 +739,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     p.add_argument("--stop", action="store_true",
                    help="stop every other heartbeat writer of this checkout and wait for it to exit (restart handoff)")
+    p.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.helper_receipt_dir:
+        from external_core_helpers import publish
+        publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
+                _socket_path(), _observed_session(_socket_path()),
+                passive=not (args.once or args.stop or args.mark_stopped))
     if args.mark_stopped:
         mark_stopped()
         return 0

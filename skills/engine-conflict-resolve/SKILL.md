@@ -114,12 +114,12 @@ python3 skills/engine-conflict-resolve/scripts/propose.py --scratch "<scratch>"
      shared. When a room resolves, the post goes through the
      `agent-room-ops` gateway module (`op:message`). **When no room is
      configured, or the post fails for any reason**, deliver.py always
-     executes the Pending-decisions fallback: a macOS notification plus a
-     question section inserted into the per-host
-     `<workspace>/hosts/<hostname>/pending-questions.md` (above the
-     `# Resolved` divider, via the shared `src/pending_questions_md.py`
-     locator). Its JSON output tells you which path ran — put that in the
-     result file per point 1.
+     executes the Pending-decisions fallback: the proposal is asked of the
+     owner through `scripts/ask-owner.py` (a row of his Pending questions
+     room database, held in the workspace outbox until the room is
+     reachable; it queues the DM and the macOS notification itself). Its
+     JSON output tells you which path ran — put that in the result file per
+     point 1.
 
 ### 4. WAIT for explicit confirmation
 
