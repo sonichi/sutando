@@ -389,12 +389,13 @@ resolve_schedule_host() {
 
 ensure_crons_seeded() {
   # Codex never runs /schedule-crons step 1, so a fresh install would have no
-  # per-host crons.json and therefore no proactive loop. Same seeder, same policy.
+  # per-host crons.json and therefore no proactive loop. A first install gets only
+  # the main loop; the seeder decides what counts as one.
   local ws host
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   host="$(resolve_schedule_host)" || return 0
   if ! python3 "$REPO/skills/schedule-crons/scripts/seed_crons.py" \
-      --workspace "$ws" --host-label "$host" >/dev/null; then
+      --workspace "$ws" --host-label "$host" --first-install-only main-loop >/dev/null; then
     echo "  ⚠ Could not seed the per-host crons.json; run: python3 $REPO/skills/schedule-crons/scripts/seed_crons.py" >&2
   fi
 }

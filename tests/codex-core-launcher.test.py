@@ -582,8 +582,10 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
 
         self.assertEqual(result.returncode, 0, result.stderr)
         entries = json.loads(config.read_text())
-        main_loop = [e for e in entries if e.get("name") == "main-loop"]
-        self.assertEqual(len(main_loop), 1, entries)
+        # First install: main-loop only, so the desktop's morning catch-up
+        # (ag2space-cinny-desktop#741) has nothing to fire on (#5157).
+        self.assertEqual([e.get("name") for e in entries], ["main-loop"], entries)
+        main_loop = entries
         self.assertEqual(main_loop[0]["prompt_skill"], "proactive-loop")
         self.assertNotIn("launchd", main_loop[0])
         seen = json.loads(probe.read_text())

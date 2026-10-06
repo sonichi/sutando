@@ -6,11 +6,17 @@ The single owner of the first-run seed policy, called by every runtime: the
 precedence: the interim ``<workspace>/crons/<host>.json``, else the legacy
 ``skills/schedule-crons/crons.json``, else ``crons.example.json``. An existing
 file is never touched.
+
+``--first-install-only NAME`` (Codex) seeds only the named entries when the
+source is the shipped starter: ``crons.example.json`` itself, or an interim or
+legacy file whose JSON equals it (``src/init.sh`` copies the example into the
+legacy path). Any other source is an established schedule and is copied whole.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -35,7 +41,31 @@ def seed_sources(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR) 
     ]
 
 
-def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR) -> tuple[str, Path, Path | None]:
+def _load(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def seed_bytes(source: Path, example: Path, first_install_only: tuple[str, ...] | None) -> bytes:
+    """The seeded content: ``source`` whole, unless it is the starter and a filter is given."""
+    raw = source.read_bytes()
+    if not first_install_only:
+        return raw
+    if source != example:
+        starter = _load(example)
+        if starter is None or _load(source) != starter:
+            return raw
+    entries = json.loads(raw)
+    if not isinstance(entries, list):
+        raise ValueError(f"{source} is not a JSON list of cron entries")
+    keep = [e for e in entries if isinstance(e, dict) and e.get("name") in first_install_only]
+    return (json.dumps(keep, indent=2) + "\n").encode()
+
+
+def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
+         first_install_only: tuple[str, ...] | None = None) -> tuple[str, Path, Path | None]:
     """Return ("exists"|"seeded", target, source). Never overwrites ``target``."""
     if not host_label.strip():
         raise ValueError("host label did not resolve")
@@ -45,9 +75,10 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR) -> tuple
     source = next((p for p in seed_sources(workspace, host_label, skill_dir) if p.is_file()), None)
     if source is None:
         raise FileNotFoundError(f"no crons seed source under {workspace} or {skill_dir}")
+    content = seed_bytes(source, skill_dir / "crons.example.json", first_install_only)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    tmp.write_bytes(source.read_bytes())
+    tmp.write_bytes(content)
     try:
         # link() refuses an existing name, so a concurrent seeder or the owner
         # cannot be clobbered between the exists() check and the publish.
@@ -63,6 +94,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace")
     parser.add_argument("--host-label")
+    parser.add_argument("--first-install-only", action="append", metavar="NAME",
+                        help="on a first install, seed only this entry (repeatable)")
     args = parser.parse_args()
     try:
         raw_ws = (args.workspace or "").strip() or _config("workspace")
@@ -70,7 +103,9 @@ def main() -> int:
             raise ValueError("workspace did not resolve")
         workspace = Path(raw_ws).resolve()
         host_label = (args.host_label or "").strip() or _config("host-label")
-        status, target, source = seed(workspace, host_label)
+        status, target, source = seed(
+            workspace, host_label,
+            first_install_only=tuple(args.first_install_only) if args.first_install_only else None)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"seed-crons: {exc}", file=sys.stderr)
         return 1
