@@ -136,9 +136,9 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
                 raise UnreadableEvidence(
                     f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
             try:
-                pr.validate_workers(r.get("workers") if isinstance(r, dict) else r)
-                if not isinstance(r, dict):
-                    raise pr.RosterError(f"roster must be an object, got {type(r).__name__}")
+                if not isinstance(r, dict) or not isinstance(r.get("workers"), dict):
+                    raise pr.RosterError("roster 'workers' must be an object")
+                pr.validate_workers(r["workers"])
             except pr.RosterError as e:
                 raise UnreadableEvidence(
                     f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is malformed ({e}); refusing to decide") from e
@@ -232,10 +232,11 @@ def _attribute(workspace, recipient: str, task_id: str) -> None:
         pa.record(workspace, task_id, recipient)
 
 
-def route(workspace, task: dict, roster=None, _between_suffix_checks=None, _arbitration_seams=None) -> dict:
+def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, _arbitration_seams=None) -> dict:
     """One task through one pass.
 
-    `roster=None` loads it; an absent or unreadable roster REFUSES the pass
+    An omitted `roster` loads it; an explicit None is an admitted "no roster".
+    An absent or unreadable roster REFUSES the pass
     rather than defaulting to the core, which would aim every task at one
     recipient the moment the file is unwritable.
     """
@@ -247,11 +248,11 @@ def route(workspace, task: dict, roster=None, _between_suffix_checks=None, _arbi
     # the roster is needed, so a replay finishes it even if the roster is gone.
     with task_arbitration(workspace, task_id):
         committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams,
-                                        roster=roster if roster is not None else FROM_DISK)
+                                        roster=roster)
         if committed is not None:
-            targets, unknown, r = [committed], [], (roster if roster is not None else {})
+            targets, unknown, r = [committed], [], (roster if isinstance(roster, dict) else {})
         else:
-            r = roster if roster is not None else pr.load_roster(workspace)
+            r = pr.load_roster(workspace) if roster is FROM_DISK else roster
             if r is None:
                 raise RouterRefused("roster is absent or unreadable — refusing the pass")
             source = task.get("channel_id") or task.get("source") or ""

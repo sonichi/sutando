@@ -312,7 +312,8 @@ def scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker() -> 
     import pool_route_handler as h
     for workers, want, why in (({A: {"state": "live"}, B: {"state": "live"}}, h.MUST_HANDLE, "well-formed: a roster worker"),
                                ([], h.MUST_HANDLE, "workers: [] is malformed, not an empty roster"),
-                               ({A: "live"}, h.MUST_HANDLE, "a non-object worker row is malformed")):
+                               ({A: "live"}, h.MUST_HANDLE, "a non-object worker row is malformed"),
+                               (None, h.MUST_HANDLE, "workers: null is malformed, not an empty roster")):
         ws = workspace(A)
         seed(ws, A, ".txt", None)
         (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
@@ -324,6 +325,29 @@ def scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker() -> 
     (ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": [], "bindings": {}}))
     rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
     check("control: same malformed roster, no marker: the committed sentinel settles it (rc 0)", rc == 0, str(rc))
+
+
+def scenario_an_admitted_absent_roster_is_not_reread_by_route() -> None:
+    print("\nscenario: no roster, residue in A; classify admits the replay with no roster; then A gains a marker and a roster binds B")
+    import pool_route_handler as h
+    ws = workspace(A)
+    (ws / "state" / "roster.json").unlink()
+    seed(ws, A, ".txt", None)
+    real_route = h.rt.route
+
+    def changing_route(workspace_, task_dict, roster=rt.FROM_DISK, **kw):
+        (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 2, "workers": {B: {"state": "live"}}, "bindings": {ROOM: B}}))
+        return real_route(workspace_, task_dict, roster, **kw)
+    h.rt.route = changing_route
+    try:
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    finally:
+        h.rt.route = real_route
+    check("the run fails closed (MUST_HANDLE)", rc == h.MUST_HANDLE, str(rc))
+    check("...no sentinel was written for B", not any((ws / "deliveries" / B).glob("task-r*")), str(sentinels(ws)))
+    check("...and no attribution was written", not pa.attribution_path(ws, "task-r").exists())
 
 
 def scenario_handler_settles_by_the_routes_targets() -> None:
@@ -568,6 +592,7 @@ def main() -> int:
     scenario_unrelated_marker_leaves_replay_roster_free()
     scenario_marker_is_judged_against_the_admitted_roster()
     scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker()
+    scenario_an_admitted_absent_roster_is_not_reread_by_route()
     scenario_handler_settles_by_the_routes_targets()
     scenario_release_race_is_serialised_by_the_folder_lock()
     scenario_aliased_recipient_directory_refuses()

@@ -79,9 +79,8 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
-    # A replay follows the delivery already committed to a worker, whatever the
-    # bindings say now; the roster still decides for a task nobody holds yet.
-    # One roster read for the whole run: the replay check below and the route both use it.
+    # A replay follows the committed delivery, whatever the bindings say now; one roster
+    # read serves the replay check and the route, and decides for a task nobody holds yet.
     try:
         raw, unreadable = pr._load_existing_roster_strict(workspace), False
     except pr.RosterError:
