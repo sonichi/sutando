@@ -5102,6 +5102,10 @@ def _abort_if_poll_stalled(last_ok: float) -> None:
                  "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
         return
     _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+    # sys.exit's message reaches only stderr; the bridge log is where the backoff
+    # lines that preceded this live, so the stall must be stated there too.
+    _log(f"stalled: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+         f"while the process stayed alive -- exiting so {POLL_STALL_RESTART_OWNER} restarts it")
     sys.exit(f"FATAL: no successful poll in {stalled_s}s "
              f"(limit {POLL_STALL_EXIT_S:g}s) -- exiting so {POLL_STALL_RESTART_OWNER} "
              "restarts the bridge.")
@@ -5214,6 +5218,9 @@ def main() -> None:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
                     backoff = 1
+                    # The wait was on a human, not a stall: resume with the same
+                    # fresh anchor a newly started bridge gets.
+                    last_poll_ok = time.time()
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
