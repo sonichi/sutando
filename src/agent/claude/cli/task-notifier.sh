@@ -386,7 +386,7 @@ composer_resume_offset() {
 }
 
 # True only when $1 is an exact prefix of $2 through a verified chunk boundary,
-# plus a CONTIGUOUS slice of the next chunk -- not a scattered subsequence, which a short foreign string can satisfy by luck.
+# plus a trailing SUFFIX of the next chunk -- never a match anywhere inside it.
 leftover_is_dropped_bytes() {
   "$NOTIFIER_PY" -c '
 import sys
@@ -414,7 +414,7 @@ for k in range(len(bounds) - 1):
     if not leftover.startswith(exact_prefix):
         continue
     rest = leftover[len(exact_prefix):]
-    if rest == "" or (len(rest) >= MIN_TAIL and rest in squeeze(prompt_raw[a:b])):
+    if rest == "" or (len(rest) >= MIN_TAIL and squeeze(prompt_raw[a:b]).endswith(rest)):
         ok = True
         break
 sys.exit(0 if ok else 1)
