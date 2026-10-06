@@ -353,7 +353,7 @@ let _resultStageCounter = 0;
 
 /** Publish a result file whole: staged as a dotfile (no drain glob matches one), then renamed
  *  into place, so a drain claiming within the second never reads a body still being written. */
-function publishResultFile(file: string, body: string): void {
+export function publishResultFile(file: string, body: string): void {
 	const staged = join(RESULT_DIR, `.${file}.${process.pid}.${++_resultStageCounter}`);
 	_resultFileOps.write(staged, body);
 	_resultFileOps.rename(staged, join(RESULT_DIR, file));

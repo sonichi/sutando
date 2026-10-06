@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
 import gateway_serving
 import pool_suspension
+import runtime_observation
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
 
@@ -45,6 +46,10 @@ ACTIVITY_LIVE_S = 120.0
 ACTIVITY_TAIL_BYTES = 256 * 1024
 # health-check's window for a gateway-status sidecar; the bridge rewrites it on every poll.
 GATEWAY_STALE_S = 180.0
+
+# Pane-derived claims a later completed model request disproves; every other reason stands.
+PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
+                               "api-error", "network-error"})
 
 # core-input-watch states → (motion, condition, reason). A blocked-human reason is refined from `kind`.
 SUPERVISOR = {
@@ -240,6 +245,49 @@ def _pool_source(entry, sampled_at, now: float) -> dict:
     return {**src, "opinion": None}
 
 
+def _observation(ws: Path, now: float, seat: str, session, started=None):
+    """(source, record): the record only when it counts as evidence about this seat's current run."""
+    path = runtime_observation.record_path(ws, seat)
+    src = {"path": _rel(path, ws), "age_s": None, "value": None, "opinion": None}
+    rec, _why = runtime_observation.load(ws, seat, now)
+    if rec is None:
+        return src, None
+    src["age_s"] = _age(rec["heartbeat_at"], now)
+    # A record from another tmux session, or from before this worker's current incarnation, is not about this run.
+    if session and rec["session"] != session:
+        return src, None
+    if started is not None and rec["observer_started_at"] < started:
+        return {**src, "value": {"previous_run": True}}, None
+    abnormal = rec["condition"] == ABNORMAL
+    last_success = rec["last_success_at"]
+    value = {"phase": rec["phase"], "observer": rec["observer"], "observer_version": rec["observer_version"],
+             "seq": rec["seq"], "heartbeat_age_s": src["age_s"],
+             "last_success_age_s": None if last_success is None else _age(last_success, now)}
+    op = _opinion(None if rec["motion"] == UNKNOWN else rec["motion"],
+                  None if rec["condition"] == UNKNOWN else rec["condition"],
+                  rec["reason"] if abnormal else None,
+                  rec["condition_since"] if abnormal else None)
+    return {**src, "value": value, "opinion": op}, rec
+
+
+def _supersede(sources: dict, rec, now: float) -> dict:
+    """A completed model request after a pane-derived claim disproves the claim."""
+    if rec is None or rec["last_success_at"] is None:
+        return sources
+    out = dict(sources)
+    for name in ("supervisor", "cli_wedge"):
+        src = out.get(name)
+        op = src.get("opinion") if src else None
+        if not op or op["condition"] != ABNORMAL or op["reason"] not in PANE_SUPERSEDABLE:
+            continue
+        claimed = op["since"] if op["since"] is not None else (
+            None if src.get("age_s") is None else now - src["age_s"])
+        if claimed is not None and claimed < rec["last_success_at"]:
+            out[name] = {**src, "value": {**(src["value"] if isinstance(src["value"], dict) else {}),
+                                          "superseded_by": "observation"}, "opinion": None}
+    return out
+
+
 def _alive(beat: dict, supervisor: dict | None = None):
     """True / False from a beat source, None when there is no beat to judge. A current
     `crashed` verdict is False: the beat's writer can outlive the session it vouches for."""
@@ -369,15 +417,17 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
         if _core_seen_since(ws, supervisor, heartbeat):
             supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "superseded": True},
                           "opinion": None}
-        sources = {
+        session = (_session(ws / "state" / "cores" / f"{_host_label()}.alive")
+                   or _session(Path(status_read_path("core-supervisor.json", ws))))
+        observation, obs_rec = _observation(ws, now, "core", session)
+        sources = _supersede({
             "supervisor": supervisor,
+            "observation": observation,
             "cli_wedge": _wedge_source(ws, now),
             "heartbeat": heartbeat,
             "activity": _activity_source("core", activity, now),
             "self_report": _status_source(ws, now),
-        }
-        session = (_session(ws / "state" / "cores" / f"{_host_label()}.alive")
-                   or _session(Path(status_read_path("core-supervisor.json", ws))))
+        }, obs_rec, now)
         agents.append((_verdict({"id": "core", "role": "core", "label": None, "session": session,
                                  "alive": _alive(sources["heartbeat"], sources["supervisor"])}, sources), sources))
 
@@ -398,15 +448,17 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             if seat and started is not None and supervisor["age_s"] is not None and now - supervisor["age_s"] < started:
                 supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "previous_run": True},
                               "opinion": None}
-            sources = {
+            observation, obs_rec = _observation(ws, now, wid, _session(seat), started)
+            sources = _supersede({
                 "supervisor": supervisor,
+                "observation": observation,
                 "watcher_beat": _heartbeat_source(ws, now, ws / "state" / "watchers" / f"{wid}.alive"),
                 "pool": _pool_source((pool_rows or {}).get(wid), sampled, now),
                 "roster": {"path": "state/roster.json", "age_s": None, "value": {"state": state},
                            "opinion": (None if state in (None, "live") else
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
-            }
+            }, obs_rec, now)
             # Only a verdict known to be this incarnation's may override the beat's alive.
             current = sources["supervisor"] if started is not None else None
             row = _verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),

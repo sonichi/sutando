@@ -1,0 +1,1 @@
+{"name": "sutando-observer", "version": "0.3.0", "author": {"name": "Sutando"}, "description": "Observes the Claude main loop for HealthStatus and draws a compact status band above the prompt"}

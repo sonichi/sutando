@@ -32,7 +32,7 @@
  * package default unless its own config overrides it.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, copyFileSync } from 'fs';
 
 /** Per-channel override entry. Object-shaped so it stays extensible. */
 export interface VoiceChannelConfig {
@@ -277,4 +277,90 @@ export function loadVoiceConfig(configPath: string): VoiceConfig {
 		console.warn(`[voice-config] failed to parse ${configPath}, using defaults: ${(e as Error).message}`);
 		return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	}
+}
+
+/** The model every install was seeded with before 3.8, and what it moves to. */
+export const LEGACY_SEEDED_MODEL = 'gemini-3.1-flash-live-preview';
+export const MIGRATED_MODEL = 'gemini-3.8-live';
+/** Written once the move is made, so it is made once: a user who switches back to 3.1 keeps it. */
+export const MODEL_MIGRATION_KEY = 'modelMigration';
+
+export interface ModelMigration {
+	migrated: boolean;
+	backup?: string;
+	reason: string;
+}
+
+/**
+ * Move a config still on the old seeded 3.1 model to 3.8, once.
+ *
+ * The config is per-user data that an app update never rewrites, and the template is copied only
+ * when the file is missing, so a new default reaches new installs only. This is the one place an
+ * existing install moves. Only `model` changes; every other key (search, tuning, comments) is kept,
+ * the original is copied beside it first, and a stamp records the move so it never repeats. The
+ * file cannot say whether 3.1 was seeded or chosen, so a user who chose it is moved once and can
+ * switch back; the stamp keeps that choice. No voice preset yields 3.1 + search, so that config
+ * comes back only from the `.bak-3.1` copy or a hand edit.
+ */
+export function migrateLegacyModel(configPath: string, now: Date = new Date()): ModelMigration {
+	if (!existsSync(configPath)) return { migrated: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { migrated: false, reason: 'config unreadable; left for loadVoiceConfig to report' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { migrated: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] !== undefined) return { migrated: false, reason: 'already migrated once' };
+	if (raw.model !== LEGACY_SEEDED_MODEL) return { migrated: false, reason: `model is ${String(raw.model)}, not the old default` };
+	const backup = `${configPath}.bak-3.1`;
+	if (!existsSync(backup)) copyFileSync(configPath, backup);
+	const next = { ...raw, model: MIGRATED_MODEL, [MODEL_MIGRATION_KEY]: `${LEGACY_SEEDED_MODEL} -> ${MIGRATED_MODEL} on ${now.toISOString().slice(0, 10)}` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { migrated: true, backup, reason: 'moved from the old seeded default' };
+}
+
+/** Written by the voice switch tool: a model the user picked is never reverted. */
+export const MODEL_CHOSEN_KEY = 'modelChosenBySwitch';
+/** Written when a migrated install is put back on 3.1, so the revert also happens at most once. */
+export const MODEL_REVERT_KEY = 'modelMigrationReverted';
+
+export interface ModelRevert {
+	reverted: boolean;
+	model?: string;
+	reason: string;
+}
+
+/**
+ * Put a config the migration moved to 3.8 back on its old model, once, when 3.8 is unavailable.
+ *
+ * Only a config carrying the migration stamp and still on the migrated model is touched, and not
+ * one whose model the voice switch tool wrote, so a user who chose 3.8 themselves is not moved. The model comes from the `.bak-3.1` copy when it
+ * names one; every other current key is kept. The migration stamp stays, so it never re-runs.
+ */
+export function revertModelMigration(configPath: string, now: Date = new Date()): ModelRevert {
+	if (!existsSync(configPath)) return { reverted: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { reverted: false, reason: 'config unreadable' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { reverted: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] === undefined) return { reverted: false, reason: 'not moved by the migration' };
+	if (raw[MODEL_REVERT_KEY] !== undefined) return { reverted: false, reason: 'already reverted once' };
+	if (raw.model !== MIGRATED_MODEL) return { reverted: false, reason: `model is ${String(raw.model)}, not the migrated one` };
+	if (raw[MODEL_CHOSEN_KEY] === raw.model) return { reverted: false, reason: 'model was chosen with the voice switch' };
+	let model = LEGACY_SEEDED_MODEL;
+	try {
+		const backupModel = JSON.parse(readFileSync(`${configPath}.bak-3.1`, 'utf-8'))?.model;
+		if (typeof backupModel === 'string' && backupModel && backupModel !== MIGRATED_MODEL) model = backupModel;
+	} catch { /* no usable backup: the migration only ever moved the legacy model */ }
+	const next = { ...raw, model, [MODEL_REVERT_KEY]: `${MIGRATED_MODEL} -> ${model} on ${now.toISOString().slice(0, 10)} (model unavailable)` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { reverted: true, model, reason: 'migrated model unavailable' };
 }

@@ -2,7 +2,8 @@
 
 One read-only answer to "how is each agent doing?" for the core and every worker. Code:
 `src/health_snapshot.py`; served by agent-api (`src/agent-api.py`, port 7843); tests:
-`tests/health-snapshot.test.py`, `tests/gateway-health-push.test.py`.
+`tests/health-snapshot.test.py`, `tests/gateway-health-push.test.py`; observation records:
+`src/runtime_observation.py`, `tests/runtime-observation.test.py`.
 
 It reads files the existing watchers already write. It probes no process or pane and writes
 nothing, so calling it often is safe and it answers even when the core is down.
@@ -72,6 +73,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 | Source | File | Freshness |
 |---|---|---|
 | `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness. A `crashed` verdict is ignored when a fresh beat written after it recorded a live core pane (its `pid` is the core's, not the beat writer's `heartbeat_pid`) |
+| `observation` | `state/runtime-observations/core.json` (see [Runtime observation](#runtime-observation)) | 45 s lease on the record's own heartbeat |
 | `cli_wedge` | `state/cli-wedge/window.jsonl`, classified with `cli_wedge.classify_window` | 180 s for health, 30 s for motion |
 | `heartbeat` | `state/cores/<host>.alive` mtime | 90 s |
 | `activity` | tail (256 KB) of `state/agent-activity.jsonl`, plus result files | 120 s since the task's last row |
@@ -82,6 +84,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 | Source | File | Freshness |
 |---|---|---|
 | `supervisor` | `state/core-supervisor.<session>.json` whose `session` is `<name>-<worker id>` (exact id match) | ignored if written before the worker's current incarnation started (`state/workers/<id>/current.json` + `incarnations.json`) |
+| `observation` | `state/runtime-observations/<id>.json` | 45 s lease; ignored if the observer started before the worker's current incarnation |
 | `watcher_beat` | `state/watchers/<id>.alive` mtime | 90 s |
 | `pool` | the worker's entry in `state/pool-supervision.json` | 900 s since `last_sample_at` (3 missed 300 s samples) |
 | `roster` | the worker's `state` in `state/roster.json` | none |
@@ -120,6 +123,8 @@ opinion may be empty.
 | `unknown`, `cadence-too-sparse` | no opinion | | |
 
 `since` is the start of the current observation run.
+
+**Observation** (core and worker): see [Runtime observation](#runtime-observation).
 
 **Beats** (`heartbeat`, `watcher_beat`): missing → no opinion (a desktop core has no heartbeat
 for about 2 minutes after boot); older than 90 s, or more than 5 s in the future → abnormal,
@@ -164,6 +169,43 @@ state as the reason. `retired` workers are left out of the response.
    its files say. A quit kills the tmux server outright, so no seat records its own end and its
    beat stays fresh for up to 90 s. The pool's resume lifts this.
 
+## Runtime observation
+
+Whatever watches a seat's CLI from inside it can publish one record per seat, validated and
+written atomically by `src/runtime_observation.py` (`python3 src/runtime_observation.py write`,
+one JSON record on stdin). The record carries `phase`, `motion`, `condition`, `reason`,
+`condition_since`, `last_success_at` and its own `heartbeat_at`. The snapshot names no observer and
+its wire shape does not change: the record only feeds the same five fields.
+
+The `observation` source gives **no opinion** when the record is:
+
+- missing, invalid, or past its 45 s lease (`heartbeat_at`), or dated more than 5 s ahead;
+- from a different tmux session than the one the seat's beat or supervisor file names (when one is);
+- for a worker, from an observer that started before the worker's current incarnation (the source
+  value reads `previous_run`).
+
+Otherwise its opinion is the record's motion and condition (`unknown` gives none); when abnormal,
+the reason is the record's and `since` is `condition_since`. Its `full` value is `phase`,
+`observer`, `observer_version`, `seq`, `heartbeat_age_s` and `last_success_age_s`; no session ids.
+
+**Positive recovery.** A completed model request disproves an earlier pane-derived claim. When
+the observation is valid and has `last_success_at`, a `supervisor` or `cli_wedge` opinion is
+dropped (its value gains `"superseded_by": "observation"`) if it is abnormal, its reason is one of
+`needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
+`network-error`, and its claim time (`since`, else the source's mtime) is older than
+`last_success_at`. Nothing else is ever dropped: `crashed`, `hung`, `offline`, `gateway-down`,
+`retry-loop`, the pool and roster states, and `suspended` stand regardless, and `alive` is
+untouched.
+
+A record is abnormal exactly when it carries a reason; the writer rejects anything else. The core
+has no incarnation record, so for it only the session match and the lease apply. An observed
+failure does not age: a seat whose last request failed stays abnormal, its lease renewed, until a
+request completes or the observer stops.
+
+Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record:
+their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains
+an empty `observation` source.
+
 ## Reasons
 
 | Reason | Source | Meaning |
@@ -180,6 +222,7 @@ state as the reason. `retired` workers are left out of the response.
 | `quota-limit`, `out-of-credits` | cli_wedge | a provider limit stopped the CLI |
 | `compacting`, `api-error`, `network-error` | cli_wedge | parked on that text |
 | `not-answering`, `wedged`, `watcher-down` | pool | the pool supervisor escalated the worker |
+| `needs-login`, `quota-limit`, `out-of-credits`, `api-error`, `permission`, `awaiting-input` | observation | what the observer saw the CLI report |
 | `recovering`, `abandoned` | roster | the roster's own state for the worker |
 
 ## Worked example

@@ -58,7 +58,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -72,6 +72,7 @@ import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voi
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import {
 	classifyTransportClose,
+	isModelUnavailableClose,
 	recordTerminalClassification,
 	lastTerminalClassification,
 	clearTerminalClassification,
@@ -318,7 +319,8 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // googleSearch=false for low-latency voice conversations; this PR does not
 // claim a new code-heavy workload benchmark. Phone inherits the
 // package default (2.5+search) unless its own config overrides it.
-import { loadVoiceConfig, resolveSessionTuning } from './voice-config.js';
+import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning } from './voice-config.js';
+import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -331,6 +333,12 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 		}
 	} catch (e) {
 		console.warn(`${new Date().toISOString().slice(11, 23)} [voice-agent] could not seed config at ${VOICE_AGENT_CONFIG_PATH}: ${(e as Error).message} — using built-in defaults`);
+	}
+}
+{
+	const _migration = migrateLegacyModel(VOICE_AGENT_CONFIG_PATH);
+	if (_migration.migrated) {
+		console.log(`${new Date().toISOString().slice(11, 23)} [voice-agent] config model moved to 3.8 (once); original kept at ${_migration.backup}`);
 	}
 }
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
@@ -1465,11 +1473,36 @@ async function main() {
 				platformNotify(safe, 'Sutando — voice offline');
 			} catch {}
 		};
+		// A model the startup migration chose can be unavailable for this key; the process holds its
+		// model for life, so only a restart on the reverted config brings voice back.
+		const revertMigrationAndRestart = (): void => {
+			const r = revertModelMigration(VOICE_AGENT_CONFIG_PATH);
+			if (!r.reverted) return;
+			notifiedCategories.add('model_not_found');
+			const outcome = restartAfterModelRevert(r, VOICE_NATIVE_AUDIO_MODEL, {
+				launchdManaged: isVoiceAgentLaunchdManaged(),
+				restart: (onExit) => fireGuardedRestart(undefined, onExit),
+				notify: (message) => {
+					console.error(`${ts()} [VoiceFailure] ${message}`);
+					try {
+						publishResultFile(`proactive-voice-model-reverted-${Date.now()}.txt`, message);
+					} catch (e) {
+						console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
+					}
+				},
+			});
+			console.error(`${ts()} [VoiceFailure] config put back on ${r.model}; ${outcome}`);
+		};
 		transport.onClose = (code?: number, reason?: string) => {
 			if (origOnClose) {
 				try { origOnClose(code, reason); } catch (e) {
 					console.error(`${ts()} [VoiceFailure] origOnClose threw: ${(e as Error)?.message ?? e}`);
 				}
+			}
+			try {
+				if (isModelUnavailableClose(code, reason)) revertMigrationAndRestart();
+			} catch (e) {
+				console.error(`${ts()} [VoiceFailure] model revert threw: ${(e as Error)?.message ?? e}`);
 			}
 			try {
 				const c = classifyTransportClose(code, reason);
