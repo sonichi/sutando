@@ -110,6 +110,14 @@ def _holder_of(workspace: Path, task_id: str) -> str | None:
     import worker_delivery  # noqa: E402
     return worker_delivery.holder_of(workspace, task_id)
 
+# "By tier" line buckets; anything else is counted under "other", never dropped.
+TIER_BUCKETS = ("owner", "team", "guest", "ambient")
+
+
+def tier_bucket(tier: str) -> str:
+    return tier if tier in TIER_BUCKETS else "other"
+
+
 FRESH_AGE_S = 300
 IMPORT_FRESH_AGE_S = 1800
 # A started import whose status.json has not moved for this long is reported
@@ -471,7 +479,12 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
         try:
             row = classify_task(path, workspace, now)
         except OSError as exc:  # unreadable file: conservative, surface it
-            row = {"file": path.name, "id": path.stem, "verdict": "orphan",
+            # Unreadable headers mean no tier/preview; path.name is the one safe fact.
+            row = {"file": path.name, "id": path.stem, "access_tier": "unknown",
+                   "source": "", "label": "DM", "age_s": 0,
+                   "recovery_line": recovery_line(path.stem, "unknown", "DM", 0,
+                                                  neutralize(f"(unreadable: {exc})")),
+                   "verdict": "orphan",
                    "reason": f"unreadable task file ({exc}); treated as orphan"}
         out["tasks"].append(row)
     counts: dict = {}
@@ -480,6 +493,124 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
     counts["total"] = len(out["tasks"])
     out["counts"] = counts
     return out
+
+
+# Step 3c bomb-guard: the preview list is truncated past this many deferred
+# orphans; the per-tier/per-channel counts stay accurate over the full set.
+PREVIEW_CAP = 30
+PREVIEW_SHOWN = 20
+
+
+def recovery_plan(workspace: Path, now: float | None = None) -> dict:
+    """Step 3/3b/3c, owned in code: which files this pass archives -- always by
+    the row's own `file` (a real `Path.name` off a real glob, so it cannot
+    name anything outside `tasks/`) -- and the complete proactive-recovery
+    body text, already verified inert.
+
+    `id` is display/marker data a legacy or missing-header task's own BODY
+    can forge to anything, including a path-traversal shape (`../x`) or one
+    naming an unrelated real file; it is never a filesystem path here or
+    anywhere this plan is acted on. The skill performs exactly the moves this
+    returns and prints exactly the body this returns -- it does not derive
+    either from `id`, and it does not reconstruct the body from individual
+    rows by hand.
+
+    Returns `{"archive": [...], "silent_archive": [...], "body": str|None}`;
+    `archive`/`silent_archive` are bare filenames under `tasks/`.
+    """
+    now = time.time() if now is None else now
+    result = classify_workspace(workspace, now)
+    tasks = result.get("tasks") or []
+
+    archive: list[str] = []
+    silent_archive: list[str] = []
+    deferred: list[dict] = []
+    stalled: list[dict] = []
+    unbound: list[dict] = []
+    unknown: list[dict] = []
+
+    for row in tasks:
+        verdict = row.get("verdict")
+        if verdict == "done":
+            archive.append(row["file"])
+        elif verdict == "orphan":
+            if (row.get("source") or "").strip() in ("voice", "phone"):
+                silent_archive.append(row["file"])
+            else:
+                deferred.append(row)
+                archive.append(row["file"])
+        elif verdict == "import-stalled":
+            stalled.append(row)
+        elif verdict == "import-unbound":
+            unbound.append(row)
+        elif verdict == "unknown":
+            unknown.append(row)
+
+    body = None
+    if deferred or stalled or unbound or unknown:
+        body = _recovery_body(deferred, stalled, unbound, unknown)
+
+    return {"archive": archive, "silent_archive": silent_archive, "body": body}
+
+
+def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict],
+                   unknown: list[dict]) -> str:
+    deferred = sorted(deferred, key=lambda r: r.get("age_s", 0))  # most-recent (youngest) first
+    tier_counts: dict[str, int] = {}
+    channel_counts: dict[str, int] = {}
+    for row in deferred:
+        tb = tier_bucket(row.get("access_tier") or "")
+        tier_counts[tb] = tier_counts.get(tb, 0) + 1
+        label = row.get("label") or "DM"
+        channel_counts[label] = channel_counts.get(label, 0) + 1
+
+    ages = [row.get("age_s", 0) for row in deferred]
+    oldest_m = max(ages) // 60 if ages else 0
+    newest_m = min(ages) // 60 if ages else 0
+
+    lines = [
+        f"Orphan recovery — {len(deferred)} stale tasks from a prior session "
+        f"(oldest {oldest_m}m, newest {newest_m}m, no completion markers).",
+        "",
+        "By tier: " + ", ".join(
+            f"{tb} ({tier_counts.get(tb, 0)})" for tb in (*TIER_BUCKETS, "other")
+        ) + ".",
+        "By channel: " + "; ".join(
+            f"{label} — {count}" for label, count in channel_counts.items()
+        ) + ("." if channel_counts else "(none)."),
+        "",
+        "Previews (most-recent first, first ~100 chars of task body; in-band system "
+        "instructions stripped):",
+    ]
+    shown = deferred[:PREVIEW_SHOWN] if len(deferred) > PREVIEW_CAP else deferred
+    lines += [row["recovery_line"] for row in shown]
+    if len(deferred) > PREVIEW_CAP:
+        lines.append(f"+{len(deferred) - PREVIEW_SHOWN} more — see tasks/archive/ for the "
+                     "full list.")
+
+    for row in stalled:
+        lines += ["", row["stalled_line"]]
+    for row in unbound:
+        lines += ["", row["unbound_line"]]
+    for row in unknown:
+        lines += ["", row["unknown_line"]]
+
+    lines += [
+        "",
+        "To re-queue a task: move its file from tasks/archive/ back to tasks/ -- use the "
+        "filename shown in its preview line above (the task's `file`), never a name built "
+        "from its `id`, which can differ.",
+        "The archived file retains its original body (incl. system-instructions block for "
+        "non-owner tasks), so re-queueing preserves sandboxing.",
+        "If none still matter: no action needed — they're already archived.",
+    ]
+    body = "\n".join(lines) + "\n"
+    parsed = result_markers.parse_markers(body)
+    if parsed.actions or parsed.body.strip() != body.strip():
+        raise ValueError("recovery body is not inert against the production marker parser "
+                         "despite every row's own line being verified -- a composition bug, "
+                         "not a per-row escaping gap")
+    return body
 
 
 def resolve_workspace() -> Path | None:
@@ -496,12 +627,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--workspace", help="workspace dir (default: scripts/sutando-config.sh workspace)")
     ap.add_argument("--now", type=float, help="epoch seconds to age against (tests)")
+    ap.add_argument("--plan", action="store_true",
+                    help="print step 3/3b/3c's plan (archive filenames + the complete "
+                         "recovery body) instead of the raw per-task classification")
     args = ap.parse_args(argv)
     ws = Path(args.workspace) if args.workspace else resolve_workspace()
     if ws is None:
         print("orphan-check: workspace could not be resolved", file=sys.stderr)
         return 2
-    print(json.dumps(classify_workspace(ws, args.now), indent=2))
+    out = recovery_plan(ws, args.now) if args.plan else classify_workspace(ws, args.now)
+    print(json.dumps(out, indent=2))
     return 0
 
 

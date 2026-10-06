@@ -84,113 +84,48 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
 
    **The "never orphaned" guarantee is bounded, and here is the window.** `index.py` writes `status.json` (`indexed`) *after* the index files and state (`index.py` line ~482–490), so the durable "started" flag lands after step 1's effect, not before it. An import that dies mid-index — between the acknowledgement and that write — leaves no marker, gets the 30-minute line above, and is then orphaned like any other task: archived, listed in the DM with its re-queue line, restartable by the owner saying "import my Claude history". That outcome is recoverable, so the write is not reordered; but a started import is only never-orphaned from the `indexed` write onward.
 
-4. **Classify outcome**:
-   - **DONE** → archive the task file: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Log: `done: completion marker found at <path>`.
+4. **Classify outcome** (step 3 performs every move and every write this implies — never act on a verdict by hand):
+   - **DONE** → archived. Log: `done: completion marker found at <path>`.
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
-   - **WORKER-HELD** → leave alone; never archive, never list in step 3b's DM (see step 2c). Log: `worker-held: sentinel held by <holder>`.
-   - **UNKNOWN** → leave alone, but append it to the in-pass `unknown_holds` list so step 3b names it in the DM (see step 2c). Log: `unknown: deliveries/ unreadable (<error>)`.
+   - **WORKER-HELD** → leave alone; never archived, never in the recovery DM (see step 2c). Log: `worker-held: sentinel held by <holder>`.
+   - **UNKNOWN** → leave alone, named in the recovery DM (see step 2c). Log: `unknown: deliveries/ unreadable (<error>)`.
    - **IMPORT-RESUME** → leave alone (see step 3a). Log: `import-resume: consented import already started (phase <p>)`.
-   - **IMPORT-STALLED** → leave alone, but append it to the in-pass `stalled_imports` list so step 3b names it in the DM (see step 3a). Log: `import-stalled: consented import stalled at phase <p>, status.json last moved <idle>s ago`.
-   - **IMPORT-UNBOUND** → leave alone, but append it to the in-pass `unbound_imports` list so step 3b names it in the DM (see step 3a). Log: `import-unbound: import run at phase <p> cannot be matched to this request (status.json has no task_id)`.
-   - **ORPHAN** → write a recovery result: see step 3.
+   - **IMPORT-STALLED** → leave alone, named in the recovery DM (see step 3a). Log: `import-stalled: consented import stalled at phase <p>, status.json last moved <idle>s ago`.
+   - **IMPORT-UNBOUND** → leave alone, named in the recovery DM (see step 3a). Log: `import-unbound: import run at phase <p> cannot be matched to this request (status.json has no task_id)`.
+   - **ORPHAN** → archived (voice/phone silently; everything else into the aggregated recovery DM) — see step 3.
 
-### Step 3 — Recover orphan tasks (tier-aware)
+### Step 3 — Recover orphan tasks (tier-aware), owned in code
 
-ORPHAN handling depends on `source` because text-side recovery only makes sense for surfaces where the owner can still see and act on the DM. Voice/phone conversations don't replay in text. The flat per-task sentinel that v0.1.1 used was the wrong default for high-volume team-tier orphans whose conversation threads had moved on — see `feedback_orphan_check_tier_classify_before_sentinel` for the 2026-05-26 post-mortem (22-message blast across 5 channels, 13 of them into one active episode thread).
+**Run the plan; do not construct an archive move or the recovery body by hand:**
 
-**Invocation contract.** orphan-check runs once at `/startup` step 1 (PR #1072), BEFORE the task watcher attaches. Under that contract the deferred branch (row 2 of the table below) has no race window — the watcher isn't running between step 3's defer-decision and step 3b's archive mv. If you invoke `/task-orphan-check` standalone with a live watcher already attached, the deferred branch is racy: the watcher may pick up the un-archived `tasks/<id>.txt` between step 3 and step 3b and re-classify it as FRESH or ORPHAN on its own pass (no `results/<id>.txt` exists yet, so the completion-marker check in step 2.2 won't catch it). Safe workaround for standalone invocation: rename `tasks/<id>.txt` → `tasks/<id>.txt.deferred` at defer-time so the watcher's `task-*.txt` glob skips it, then have step 3b mv `tasks/<id>.txt.deferred` → `tasks/archive/<id>.txt` atomically. Verify the watcher's glob actually excludes the suffix on your installation before relying on it.
+```bash
+python3 skills/task-orphan-check/scripts/classify.py --plan        # add --workspace DIR to override
+```
 
-**Decision table — apply per orphan, first match wins:**
+It prints one JSON object: `archive` (bare filenames under `tasks/` to move to `tasks/archive/` — DONE rows and every non-voice/phone ORPHAN), `silent_archive` (bare filenames to move the same way, but silently — voice/phone ORPHANs, no result write), and `body` (the complete `proactive-orphan-recovery-*.txt` text, or `null` when there is nothing to report). **Every entry in `archive`/`silent_archive` is the row's own `file` field — a real `Path.name` off a real glob, structurally incapable of naming anything outside `tasks/` — never the task's logical `id`.** `id` is display/marker data: a legacy or missing-header task's own BODY can forge it to anything via `parse_task_headers_lenient`'s body-line fallback (`canonical_access_tier`'s pass-through does the same for `access_tier`), including a path-traversal shape (`id: ../notes/secret`) or the name of an unrelated real file. On exact head `6a985c100` such a task classified as `{'file': 'task-traversal.txt', 'id': '../notes/secret', 'verdict': 'orphan'}`; building the move from `<id>` as earlier revisions of this prose instructed resolved the source OUTSIDE `tasks/` entirely — moving an unrelated real file and leaving the actual orphan task live for the next boot to report again (#4399, kewei-red 2026-10-06, third round). `recovery_plan()`'s own tests (`TestRecoveryPlan`) pin `id != file`, a traversal-shaped `id`, and no-replay after executing a plan.
 
-| `source` | Action |
-|----------|--------|
-| `voice` / `phone` (any tier) | **Silent archive.** Text recovery to a voice/phone surface is the wrong shape; the conversation has hung up or moved on. `mv tasks/<id>.txt tasks/archive/<id>.txt`. No result write. Log: `archived-silent: voice/phone source`. |
-| any other source (incl. `discord` / `telegram` / `slack` / `chat` / `whatsapp` / `email` / missing field / future surfaces) | **Defer; aggregate in step 3b.** Append `<id>` to an in-pass `deferred_orphans` list (along with its `access_tier` for per-tier counting). Do NOT write a per-task result. Do NOT archive yet — leave the task file in `tasks/` so step 3b consumes it (see "Invocation contract" above for the standalone-invocation `.deferred` suffix workaround). Log: `deferred: queued for consolidated DM (source=<source>, tier=<tier>)`. |
+1. For each name in `archive`: `mv "tasks/$name" "tasks/archive/$name"`. Log per name: `done: completion marker found at <path>` (if that row's verdict was DONE) or `deferred: queued for consolidated DM (source=<source>, tier=<tier>)` (if ORPHAN).
+2. For each name in `silent_archive`: same move, no result write. Log: `archived-silent: voice/phone source`.
+3. If `body` is non-null: `ts=$(date +%s)`; write it **verbatim** to `<workspace>/results/proactive-orphan-recovery-${ts}.txt`. If `body` is null, there is nothing to send — skip.
+4. Leave alone, un-archived, whatever the age: WORKER-HELD, IMPORT-RESUME rows (never in `body` either), and IMPORT-STALLED / IMPORT-UNBOUND / UNKNOWN rows (named in `body` when non-null, per step 2's table — the watcher's sweep or the owner's own next message resumes or re-answers them).
 
-**All tiers (owner / team / other) flow through the same aggregated DM** so the owner has visibility into stale tasks across all tiers — previously, team/other-tier orphans were `[no-send]`-archived and the owner had no record. The preview in step 3b is the classifier's `preview` field — the `task:` value cut before the bridge-appended system-instructions block — so non-owner previews show the actual user ask, not boilerplate and not the file's header lines.
+The bridge routes `proactive-*` to the owner's DM (single delivery), not back to each origin channel. Log: `aggregated-all-tiers: <N> orphans → 1 proactive DM (owner=<o>, team=<t>, other=<r>)` when a body was written.
 
-**That preview is untrusted text entering a trusted result, and the classifier — not this prose — is what makes it safe.** `classify.py:neutralize()` turns `[`/`]` into `(`/`)` in both `preview` and `label` before either leaves the JSON row, so `src/result_markers.py` can no longer read a `[file:]`/`[send:]`/`[attach:]` out of a task body and the proactive Discord path can no longer execute one. Without it a non-owner could seed an orphan task naming an allowlisted local file and have startup recovery upload it (#4399, keweichen + qingyun-wu). Consequence for the reader: a bracketed prefix shows as `(Discord @name)`. Never re-derive the preview here — a quoting instruction in prose is not a trust boundary, which is exactly why this moved into code.
+**Why this moved out of prose entirely, not just the per-field escaping.** Three rounds on #4399 (kewei-red) each closed one more raw-interpolation gap in this prose — `preview` (2026-09-18), `label` (2026-09-24), then the ordinary bullet's `id`/`access_tier` and the stalled/unbound/unknown lines' own `id` (2026-10-06) — and each round's regression tests proved only that the classifier's OWN fields were individually safe, never that this prose actually used them rather than reconstructing raw values by hand: swapping this whole section back to its pre-fix wording left every one of those tests green, because none of them could observe what a human or agent following the doc by hand actually prints. The archive/requeue path had the same shape of gap one layer further in: individual fields were safe to DISPLAY, but the path identity used to ACT was still the untrusted `id`. `recovery_plan()` now owns both — which files move, under which name, and the complete body text — verified against `result_markers.parse_markers()` itself before it returns, so there is no reconstruction step left in this prose for a future edit to get wrong. Re-deriving any of `archive`, `silent_archive`, or `body` here from the per-task JSON fields directly, instead of calling `--plan`, reopens exactly this class of gap — regardless of how carefully any single field looks escaped in isolation.
 
-#### Step 3b — Aggregate deferred orphans into ONE proactive DM
+**Tiers.** `By tier:` counts every canonical tier explicitly (`owner`, `team`, `guest`, `ambient`) plus `other` for anything outside that set — including a forged or future-surface value, counted rather than silently dropped or mis-bucketed. (`other` here means "uncategorized"; it is not the legacy `other`→`guest` alias `canonical_access_tier` already resolves.) All tiers flow through the same aggregated DM so the owner has visibility into stale tasks across all of them — previously, team/other-tier orphans were `[no-send]`-archived and the owner had no record.
 
-Run once at the end of the orphan pass, after every orphan has been classified by the table above. If `deferred_orphans`, `stalled_imports`, `unbound_imports` **and** `unknown_holds` are all empty, skip. (A stalled or unbound import alone still earns the DM — it is the only surface that run reaches.)
+**Re-queueing.** The DM's own instruction says to move a task's file back from `tasks/archive/` using the filename shown in ITS preview line (the row's `file`), never a name built from its `id` — the same reason the archive step itself never builds one. The archived file retains its original body (incl. system-instructions block for non-owner tasks), so re-queueing preserves sandboxing.
 
-Otherwise:
+**Invocation contract.** orphan-check runs once at `/startup` step 1 (PR #1072), BEFORE the task watcher attaches. Under that contract the deferred branch has no race window — the watcher isn't running between the classify-plan call and the moves in step 3.1 above. If you invoke `/task-orphan-check` standalone with a live watcher already attached, that branch is racy: the watcher may pick up an un-moved `tasks/<file>` between the plan and the move and re-classify it as FRESH or ORPHAN on its own pass (no `results/<id>.txt` exists yet, so step 2's completion-marker check won't catch it). Safe workaround for standalone invocation: rename the file to add a `.deferred` suffix immediately after computing the plan, so the watcher's `task-*.txt` glob skips it, then perform the real archive move from that renamed path. Verify the watcher's glob actually excludes the suffix on your installation before relying on it.
 
-1. `ts=$(date +%s)`.
-
-2. **Take each orphan's preview from the classifier's `preview` field** (step 2's JSON row). Do not slice the file yourself: the bridges write `task:` as the LAST header and append the `===SUTANDO SYSTEM INSTRUCTIONS …===` block AFTER the ask (`src/discord-bridge.py`), so the first 100 chars of the raw file are `id: task-… envelope_hmac: v1:…` — the header, never the ask. The 2026-09-18 boot delivered a 28-orphan recovery DM whose every preview read that way, because the prose here still described the block as injected at the FRONT and the snippet sliced the body after it. `classify.py:preview()` computes it from the same lenient parse the verdict uses: the `task:` value up to the system-instructions marker (or EOF), whitespace collapsed, first `PREVIEW_CHARS` (100) characters. A task-mid file (the desktop's import writer) gets the same treatment — the parser's body is the `task:` value in both shapes.
-
-   The block is only **absent from the preview** — the archived task file body remains intact (see step 5), so re-queueing via `mv tasks/archive/<id>.txt tasks/` preserves sandboxing for non-owner tiers.
-
-3. Take each orphan's **channel label from the classifier's `label` field** (step 2's JSON row) — never
-   recompute it from the raw header. `classify.py` builds `label` from `room_name` / `channel_name` /
-   `channel_id` / `chat_id` and runs it through `neutralize()` alongside `preview` before either leaves
-   the row (see step 2's schema line above), which is what turns a `[`/`]` in an attacker-controlled
-   room or channel name into `(`/`)` before it can read as a `[file:]`/`[send:]`/`[attach:]` action.
-   Re-deriving `label` here from `header.get("room_name") or header.get("channel_name")` — as this
-   prose used to instruct — rebuilds the exact untrusted string outside `neutralize()`'s reach: the
-   marker-injection path #4399 closed in `preview` was still open in `label` on this prose-driven path,
-   because a human or agent following the doc by hand (rather than reading classify.py's own JSON)
-   never passed the raw name through the gate (#4399, qingyun-wu 2026-09-24).
-
-   Use `label` everywhere the report shows a channel. Keep the id: it is what
-   `contextNotFrom` and re-queue commands key on, so dropping it trades one
-   unreadable report for an unactionable one. Group `deferred_orphans` by
-   `access_tier` (owner / team / other) → per-tier counts; and by `label` →
-   per-channel counts.
-
-   **Each Previews bullet is the classifier's own `recovery_line` field, printed verbatim —
-   never reconstructed from `id` / `access_tier` / `label` / `preview` by hand.** A
-   legacy or missing-header task lets its BODY supply `id` or `access_tier`
-   (`parse_task_headers_lenient`'s body-line fallback, `canonical_access_tier`'s
-   pass-through of an unknown value) — raw, attacker-shaped text, the same class of
-   gap `label`/`preview` closed on 2026-09-24. `recovery_line` is where the complete
-   row is assembled and verified against `result_markers.parse_markers()` itself
-   (`classify.py:recovery_line`/`_escalate`) before this prose ever sees it; rebuilding
-   the bullet from the individual fields here — even using the already-neutralized
-   `label`/`preview` — puts the raw `id`/`access_tier` back in the body unescaped
-   (#4399, kewei-red 2026-10-06: a forged `access_tier: file: ...]` or `id: [send: ...]`
-   body line, with no real header of that name, produced a real attach action through
-   the production marker parser; bracket-escaping alone is not enough, because the
-   forged text's own keyword — not its bracket — hijacks the TEMPLATE's surrounding
-   `[...]`).
-
-4. Apply step 3c bomb-guard (see below) to decide whether to truncate the preview list.
-
-5. Write `<workspace>/results/proactive-orphan-recovery-${ts}.txt`:
-
-   ```
-   Orphan recovery — N stale tasks from a prior session (oldest <Nm>, newest <Nm>, no completion markers).
-
-   By tier: owner (<o>), team (<t>), other (<r>).
-   By channel: <name> (<id>) — <x>; <name2> (<id2>) — <y>; DM — <z>; ...
-
-   Previews (most-recent first, first ~100 chars of task body; in-band system instructions stripped):
-   <each orphan's `recovery_line` field, printed verbatim — shape "- <id> [<tier>, <channel label>, <Nm ago>]: <preview>" (`<id>` already carries its own `task-` prefix when the task has one; never add a second), but never retyped from the individual fields; see the note above>
-   - ...
-   [If truncated by step 3c: "+<N-20> more — see tasks/archive/ for the full list."]
-
-   [If `stalled_imports` is non-empty, one line per entry: the classifier's own `stalled_line` field, printed verbatim, never retyped from `import_phase`/`import_idle_s`/`id` by hand — same injection surface as `recovery_line`, same fix (#4399, kewei-red 2026-10-06, second round: a forged `id` through this exact line produced a real attach action).]
-
-   [If `unbound_imports` is non-empty, one line per entry: the classifier's own `unbound_line` field, printed verbatim, same reason.]
-
-   [If `unknown_holds` is non-empty, one line per entry: the classifier's own `unknown_line` field, printed verbatim, same reason.]
-
-   To re-queue an individual task: `mv "$(bash scripts/sutando-config.sh workspace)/tasks/archive/task-<id>.txt" "$(bash scripts/sutando-config.sh workspace)/tasks/"` (M0 helper resolves to `<workspace>/tasks/...` — `<repo>/workspace/tasks/...` by default).
-   The archived file retains its original body (incl. system-instructions block for non-owner tasks), so re-queueing preserves sandboxing.
-   If none still matter: no action needed — they're already archived.
-   ```
-
-6. For each `<id>` in `deferred_orphans`: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Entries of `stalled_imports`, `unbound_imports` and `unknown_holds` are **not** moved — they stay in `tasks/` so the watcher's sweep can resume or re-run them.
-
-The bridge routes `proactive-*` to the owner's DM (single delivery), not back to each origin channel. Log: `aggregated-all-tiers: <N> orphans → 1 proactive DM (owner=<o>, team=<t>, other=<r>)`.
+**History, for why the tier design looks the way it does.** The flat per-task sentinel v0.1.1 used was the wrong default for high-volume team-tier orphans whose conversation threads had moved on — see `feedback_orphan_check_tier_classify_before_sentinel` for the 2026-05-26 post-mortem (22-message blast across 5 channels, 13 of them into one active episode thread). Voice/phone orphans are silently archived (never the aggregated DM) because text recovery to a surface whose conversation already hung up or moved on is the wrong shape, not because voice/phone is lower-tier.
 
 #### Step 3c — Bomb-guard (defense in depth)
 
 Two layers:
 
-1. **Total-deferred-count cap.** If `len(deferred_orphans) > 30`, truncate the preview list in step 3b's DM body to the 20 most-recent orphans and add a footer: `+<N-20> more — see tasks/archive/ for the full list.` The per-tier and per-channel count lines remain accurate (they reflect the full set, not the truncated preview list). This bounds DM size when a long crash (multi-day) leaves dozens of stale tasks.
+1. **Total-deferred-count cap**, owned by `recovery_plan()` (`PREVIEW_CAP` / `PREVIEW_SHOWN` in `classify.py`): past 30 deferred orphans, `body`'s preview list is already truncated to the 20 most recent, with a footer `+<N-20> more — see tasks/archive/ for the full list.` The per-tier and per-channel count lines stay accurate over the full set — nothing to do here, this is pinned by `TestRecoveryPlan`'s bomb-guard test, not something this prose still computes.
 
 2. **Per-channel-delivery guard (future-proofing).** If any future code path adds per-channel result writes (e.g., a 3rd table row that bypasses both silent-archive and the aggregated DM), tally per-channel deliveries; collapse any single `channel_id` receiving >5 into one summary post. Today the table emits zero per-channel posts (voice silent, everything else aggregated into one owner DM), so this branch is a no-op — defense so the next person who adds a 3rd row can't accidentally re-create the v0.1.1 noise-bomb.
 
