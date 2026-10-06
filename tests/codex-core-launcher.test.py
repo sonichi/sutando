@@ -105,11 +105,13 @@ class CodexCoreLauncherTests(unittest.TestCase):
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REAL_REPO / rel, target)
-        reconciler = REAL_REPO / "skills/schedule-crons/scripts/reconcile_launchd.py"
-        if reconciler.exists():
-            target = self.root / "skills/schedule-crons/scripts/reconcile_launchd.py"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(reconciler, target)
+        for rel in ("skills/schedule-crons/scripts/reconcile_launchd.py",
+                    "skills/schedule-crons/scripts/seed_crons.py",
+                    "skills/schedule-crons/crons.example.json"):
+            if (REAL_REPO / rel).exists():
+                target = self.root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REAL_REPO / rel, target)
         monitor = self.root / "src/core-input-watch.py"
         monitor.write_text(
             "import os, sys\n"
@@ -557,6 +559,49 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
             "installed",
         )
         self.assertIn("durable schedules", result.stdout)
+
+    def _scheduler_that_records_crons(self):
+        probe = Path(self.tmp.name) / "scheduler-saw.json"
+        script = self.root / "probe-codex-scheduler.py"
+        script.write_text(
+            "import json, os, pathlib, sys\n"
+            "a = sys.argv[1:]\n"
+            "p = pathlib.Path(a[a.index('--workspace') + 1]) / 'hosts' / "
+            "a[a.index('--host-label') + 1] / 'crons.json'\n"
+            "pathlib.Path(os.environ['PROBE']).write_text("
+            "p.read_text() if p.exists() else 'MISSING')\n"
+        )
+        return probe, {"SUTANDO_CODEX_SCHEDULER_SCRIPT": str(script), "PROBE": str(probe)}
+
+    def test_missing_per_host_crons_is_seeded_before_codex_scheduler(self):
+        config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"
+        self.assertFalse(config.exists())
+        probe, env = self._scheduler_that_records_crons()
+
+        result = self.run_launcher(env_extra=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = json.loads(config.read_text())
+        main_loop = [e for e in entries if e.get("name") == "main-loop"]
+        self.assertEqual(len(main_loop), 1, entries)
+        self.assertEqual(main_loop[0]["prompt_skill"], "proactive-loop")
+        self.assertNotIn("launchd", main_loop[0])
+        seen = json.loads(probe.read_text())
+        self.assertIn("main-loop", [e.get("name") for e in seen])
+
+    def test_existing_per_host_crons_is_not_reseeded(self):
+        config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([{"name": "owner-only", "prompt": "keep",
+                                       "execution": "codex-task", "cron": "0 9 * * *"}]))
+        before = config.read_bytes()
+        probe, env = self._scheduler_that_records_crons()
+
+        result = self.run_launcher(env_extra=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual(probe.read_bytes(), before)
 
     def test_failed_runner_install_does_not_transfer_schedule_ownership(self):
         workspace = self.root / "workspace"

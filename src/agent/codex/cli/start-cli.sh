@@ -379,15 +379,30 @@ ensure_durable_schedules() {
   esac
 }
 
+resolve_schedule_host() {
+  local host="${SUTANDO_HOST_LABEL:-}"
+  # Blank-but-set passes `[ -z ]`; trim so it falls through to the resolver.
+  host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
+  [ -n "$host" ] || host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 1
+  printf '%s\n' "$host"
+}
+
+ensure_crons_seeded() {
+  # Codex never runs /schedule-crons step 1, so a fresh install would have no
+  # per-host crons.json and therefore no proactive loop. Same seeder, same policy.
+  local ws host
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  host="$(resolve_schedule_host)" || return 0
+  if ! python3 "$REPO/skills/schedule-crons/scripts/seed_crons.py" \
+      --workspace "$ws" --host-label "$host" >/dev/null; then
+    echo "  ⚠ Could not seed the per-host crons.json; run: python3 $REPO/skills/schedule-crons/scripts/seed_crons.py" >&2
+  fi
+}
+
 ensure_codex_scheduler() {
   local ws host scheduler
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  host="${SUTANDO_HOST_LABEL:-}"
-  # Blank-but-set passes `[ -z ]`; trim so it falls through to the resolver.
-  host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
-  if [ -z "$host" ]; then
-    host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
-  fi
+  host="$(resolve_schedule_host)" || return 0
   scheduler="${SUTANDO_CODEX_SCHEDULER_SCRIPT:-$REPO/skills/schedule-crons/scripts/codex-scheduler.py}"
   if ! python3 "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
     echo "  ⚠ Could not reconcile the durable Codex scheduler; run: python3 $scheduler install" >&2
@@ -410,7 +425,9 @@ ensure_codex_auto_reset_timer() {
   fi
 }
 
-# Codex has no session CronCreate surface. Two complementary reconcilers run on
+# ensure_crons_seeded first creates a missing per-host crons.json (the seed
+# /schedule-crons step 1 does on Claude). Codex has no session CronCreate
+# surface, so two complementary reconcilers then run on
 # each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
 # fixed crons.json entries onto the OS-backed cron-runner (skipping main-loop,
@@ -419,6 +436,7 @@ ensure_codex_auto_reset_timer() {
 # five-minute main loop while this runtime is selected.
 resolve_heartbeat_python
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
+  ensure_crons_seeded
   ensure_durable_schedules
   ensure_codex_scheduler
   ensure_codex_auto_reset_timer
