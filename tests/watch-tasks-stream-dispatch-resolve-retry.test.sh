@@ -37,6 +37,7 @@ run_sweep() {
 #    dispatch used to lose permanently -- one failed resolve, no retry.
 COUNT1="$TMP/count1"
 FLAKY="$(mk flaky.sh "#!/bin/sh
+[ \"\$1\" = --batch ] && exit 2
 n=0
 [ -f '$COUNT1' ] && n=\$(cat '$COUNT1')
 n=\$((n+1))
@@ -68,6 +69,7 @@ check $? "...and the retries were spaced out (backoff), not a tight spin (elapse
 #    rather than being dispatched against a payload that was never resolved.
 COUNT2="$TMP/count2"
 NEVER="$(mk never.sh "#!/bin/sh
+[ \"\$1\" = --batch ] && exit 2
 n=0
 [ -f '$COUNT2' ] && n=\$(cat '$COUNT2')
 n=\$((n+1))

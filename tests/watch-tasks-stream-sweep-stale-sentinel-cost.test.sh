@@ -30,6 +30,8 @@ COUNT="$TMP/count"; TCOUNT="$TMP/tcount"
 RESOLVER="$TMP/resolver.sh"
 cat > "$RESOLVER" <<EOF
 #!/bin/sh
+# No --batch: this pins the per-entry path a resolver without it still takes.
+[ "\$1" = --batch ] && exit 2
 n=0; [ -f '$COUNT' ] && n=\$(cat '$COUNT'); n=\$((n+1)); printf '%s' "\$n" > '$COUNT'
 case "\$1" in
   */task-transient.txt)

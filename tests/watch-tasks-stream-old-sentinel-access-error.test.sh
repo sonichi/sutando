@@ -26,7 +26,7 @@ COUNT="$TMP/count"; RESOLVER="$TMP/resolver.sh"
 cat > "$RESOLVER" <<EOF
 #!/bin/bash
 n=0; [ -f '$COUNT' ] && n=\$(cat '$COUNT'); n=\$((n+1)); printf '%s' "\$n" > '$COUNT'
-'$REPO/skills/worker-pool/scripts/resolve-inbox-entry' "\$@"; rc=\$?
+'$REPO/skills/worker-pool/scripts/resolve-inbox-entry' "\$@" | tee -a '$TMP/resolver.out'; rc=\${PIPESTATUS[0]}
 [ "\$n" -eq 1 ] && chmod 600 '$PAYLOAD'
 exit \$rc
 EOF
@@ -50,7 +50,8 @@ grep -q "TASK_FILE: $PAYLOAD" "$OUT"
 check $? "an old sentinel whose payload was unreadable once is dispatched (not final on the access error)"
 [ "$calls" = "2" ]
 check $? "...on the second resolver call"
-grep -q '(rc=1, first line: <empty>)' "$ERR"
+# The first call is the sweep's one --batch run; its verdict line for the entry is the rc.
+grep -q "^1	.*task-locked.txt\$" "$TMP/resolver.out"
 check $? "...and the first call came back as the retryable rc 1, never the typed 3"
 ! grep -q 'names no payload' "$ERR"
 check $? "...so the typed verdict was never given for a payload that exists"
