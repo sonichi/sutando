@@ -666,12 +666,58 @@ class Observation(Base):
         self.obs(last_success_at=NOW - 3600)
         self.assertEqual(self.core()["reason"], "quota-limit")
 
-    def test_retry_loop_is_not_superseded(self):
+    def retry_loop(self):
         self.wedge([], patterns=["retrying"], static=False)
-        self.obs(last_success_at=NOW - 1)
+
+    def test_retry_loop_with_an_idle_observation_is_superseded(self):
+        self.retry_loop()
+        self.obs(phase="idle")
+        c = self.core(view="full")
+        self.assertEqual((c["condition"], c["reason"]), ("healthy", None))
+        self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation")
+        self.assertIsNone(c["sources"]["cli_wedge"]["opinion"])
+
+    def test_retry_loop_with_a_waiting_or_failed_observation_is_superseded(self):
+        self.retry_loop()
+        for seq, (phase, reason) in enumerate((("waiting", "permission"), ("failed", "api-error")), 10):
+            self.obs(phase=phase, seq=seq, condition="abnormal", reason=reason, condition_since=NOW - 5)
+            c = self.core(view="full")
+            self.assertEqual((c["condition"], c["reason"]), ("abnormal", reason), phase)
+            self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation", phase)
+
+    def test_retry_loop_with_a_request_in_flight_and_no_newer_success_stands(self):
+        self.retry_loop()
+        self.obs(phase="requesting", motion="moving", last_success_at=NOW - 3600)
         self.assertEqual(self.core()["reason"], "retry-loop")
 
-    def test_a_claim_with_no_time_is_never_superseded(self):
+    def test_a_newer_success_does_not_drop_a_retry_loop_in_flight(self):
+        self.retry_loop()
+        self.obs(phase="requesting", motion="moving", last_success_at=NOW - 1)
+        c = self.core(view="full")
+        self.assertEqual(c["reason"], "retry-loop")
+        self.assertNotIn("superseded_by", c["sources"]["cli_wedge"]["value"])
+
+    def test_retry_loop_with_no_observation_stands(self):
+        self.retry_loop()
+        self.assertEqual(self.core()["reason"], "retry-loop")
+
+    def test_retry_loop_while_compacting_or_in_a_tool_stands(self):
+        self.retry_loop()
+        for seq, phase in enumerate(("compacting", "tool", "unknown"), 10):
+            self.obs(phase=phase, motion="moving", seq=seq)
+            self.assertEqual(self.core()["reason"], "retry-loop", phase)
+
+    def test_retry_loop_with_an_expired_observation_stands(self):
+        self.retry_loop()
+        self.obs(phase="idle", heartbeat_at=NOW - ro.LEASE_S - 1)
+        self.assertEqual(self.core()["reason"], "retry-loop")
+
+    def test_an_idle_observation_does_not_drop_other_pane_reasons(self):
+        self.wedge(["quota-limit"])
+        self.obs(phase="idle")
+        self.assertEqual(self.core()["reason"], "quota-limit")
+
+    def test_a_claim_with_no_time_is_never_superseded_by_a_success(self):
         claim = {"path": "x", "age_s": None, "value": {"kind": "provider-limit"},
                  "opinion": hs._opinion("idle", hs.ABNORMAL, "quota-limit", None)}
         out = hs._supersede({"cli_wedge": claim}, {"last_success_at": NOW - 1}, NOW)

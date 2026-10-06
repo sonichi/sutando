@@ -156,7 +156,7 @@
    ],
    "status": "canonical",
    "canonical_for": "the per-agent health snapshot served at GET /health: its sources, how each source's opinion is derived and combined, reasons, and blind spots",
-   "last_verified": "2026-10-04"
+   "last_verified": "2026-10-06"
   },
   "docs/design-credential-capability-resolver.md": {
    "title": "Credential resolution by capability, not key (G8)",
