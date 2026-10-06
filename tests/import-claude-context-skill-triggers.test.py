@@ -134,14 +134,14 @@ class TestOrphanCheckExemption(unittest.TestCase):
                         f"summary defines {sorted(defined - terms)} that the formula never adds")
 
     def test_recovery_dm_lists_unbound_and_stalled_imports_without_moving_them(self):
-        self.assertIn("`unbound_imports`", self.text)
         self.assertIn("cannot be matched to this request", self.text)
-        # The non-moved set must name every list step 4 parks; a new hold that
-        # is not listed here would be archived by step 3b's mv loop.
-        moved = re.search(r"Entries of ([^.]+?) are \*\*not\*\* moved", self.text)
-        self.assertIsNotNone(moved, "step 6 still says which lists are not moved")
-        for lst in ("stalled_imports", "unbound_imports"):
-            self.assertIn(lst, moved.group(1), f"{lst} must stay in the not-moved set")
+        # The never-archived set must name every verdict step 3's plan leaves
+        # alone; a new hold not listed here would be archived by its mv loop.
+        left_alone = re.search(r"Leave alone, un-archived, whatever the age: ([^.]+)\.",
+                               self.text)
+        self.assertIsNotNone(left_alone, "step 3 still says which verdicts are never archived")
+        for verdict in ("IMPORT-STALLED", "IMPORT-UNBOUND"):
+            self.assertIn(verdict, left_alone.group(1), f"{verdict} must stay in the never-archived set")
 
 
 class TestIndexIsToldItsTask(unittest.TestCase):

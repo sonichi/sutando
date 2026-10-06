@@ -480,9 +480,10 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
             row = classify_task(path, workspace, now)
         except OSError as exc:  # unreadable file: conservative, surface it
             # Unreadable headers mean no tier/preview; path.name is the one safe fact.
-            row = {"file": path.name, "id": path.stem, "access_tier": "unknown",
+            # "owner" matches the documented default for an absent/unknown tier.
+            row = {"file": path.name, "id": path.stem, "access_tier": "owner",
                    "source": "", "label": "DM", "age_s": 0,
-                   "recovery_line": recovery_line(path.stem, "unknown", "DM", 0,
+                   "recovery_line": recovery_line(path.stem, "owner", "DM", 0,
                                                   neutralize(f"(unreadable: {exc})")),
                    "verdict": "orphan",
                    "reason": f"unreadable task file ({exc}); treated as orphan"}
