@@ -14,13 +14,12 @@
  */
 
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, publishResultFile } from './task-bridge.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -133,9 +132,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
 					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
 					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
-					writeFileSync(proactivePath, dmBody);
+					publishResultFile(`proactive-voice-stuck-${proactiveTs}.txt`, dmBody);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
 				}

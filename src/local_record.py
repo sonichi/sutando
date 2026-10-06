@@ -45,8 +45,8 @@ def iso(now: Optional[float] = None) -> str:
 
 
 def write_text_whole(path: Path, text: str) -> Path:
-    """Appear whole in one rename; a crash mid-write leaves nothing half-written."""
-    return publish_text(path, text)
+    """Appear whole in one rename; a crash mid-write leaves nothing half-written. Owner-only (0600)."""
+    return publish_text(path, text, mode=0o600)
 
 
 def write_whole(path: Path, record: dict) -> Path:

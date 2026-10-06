@@ -16,6 +16,7 @@ import importlib
 import io
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,18 @@ class PublisherContract(unittest.TestCase):
             plain.write_text("x")
             published = result_publish.publish_text(Path(td) / "task-1.txt", "x")
             self.assertEqual(published.stat().st_mode & 0o777, plain.stat().st_mode & 0o777)
+
+    def test_local_record_stays_owner_only(self):
+        import local_record
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                rec = local_record.write_whole(Path(td) / "q-1.json", {"a": 1})
+                self.assertEqual(rec.stat().st_mode & 0o777, 0o600)
+                body = local_record.write_text_whole(Path(td) / "proactive-1.txt", "x")
+                self.assertEqual(body.stat().st_mode & 0o777, 0o600)
+        finally:
+            os.umask(old)
 
     def test_cli_publishes_stdin_whole(self):
         with tempfile.TemporaryDirectory() as td:
@@ -208,6 +221,10 @@ WRITERS = {
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
     "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
+    "src/launchd/channel-bridge-wrapper.sh": "result_publish.py",
+    "src/voice-agent.ts": "publishResultFile(`proactive-voice-${c.category}-",
+    "src/live-agent-runtime.ts": "publishResultFile(`proactive-voice-stuck-",
+    "src/task-bridge.ts": "publishResultFile(`proactive-timeout-",
 }
 # Writers that publish through local_record.write_text_whole, which delegates.
 VIA_LOCAL_RECORD = {
@@ -219,6 +236,74 @@ HAND_ROLLED = (
     "result_file.write_text(", "output_path.write_text(", "(RESULTS_DIR / name).write_text(",
     "tmp.write_text(part", 'f.write_text(clean_body', "path.write_text(\n        f\"You have",
 )
+
+
+_SH_TARGET = re.compile(r"(?<![0-9&])(?:>>?|\btee(?:\s+-a)?)\s*([^\s;|&)<>]+)")
+_SH_ASSIGN = re.compile(r"^\s*(?:local\s+|export\s+|readonly\s+)?([A-Za-z_]\w*)=(\S*results/\S*)", re.M)
+_TS_ASSIGN = re.compile(r"\b(?:const|let|var)\s+(\w+)\s*(?::[^=;]+)?=\s*([^;]+);")
+_TS_WRITE = re.compile(r"\b(?:writeFileSync|appendFileSync|writeFile|createWriteStream)\(\s*([^,)]+)")
+_TS_RESULTS = re.compile(r"""['"`]results['"`/]|/results/|\bRESULTS?_DIR\b|\bresultsDir\b|\bresultDir\b""")
+# Not result bodies a drain delivers: a smoke test's backdated fixture.
+_SCAN_EXEMPT = {"skills/self-diagnose/scripts/test-gather.sh"}
+
+
+def shell_results_writes(text: str) -> list:
+    """`>`, `>>` or `tee` whose target is a results/ path, literally or via a variable."""
+    names = {m.group(1) for m in _SH_ASSIGN.finditer(text)}
+    hits = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for m in _SH_TARGET.finditer(line):
+            target = m.group(1).strip("\"'")
+            var = re.match(r"^\$\{?(\w+)\}?$", target)
+            if "results/" in target or (var and var.group(1) in names):
+                hits.append((n, line.strip()))
+    return hits
+
+
+def ts_results_writes(text: str) -> list:
+    """A node fs write whose path argument is, or was assigned from, a results/ path."""
+    names = {m.group(1) for m in _TS_ASSIGN.finditer(text) if _TS_RESULTS.search(m.group(2))}
+    hits = []
+    for m in _TS_WRITE.finditer(text):
+        arg = m.group(1).strip()
+        if _TS_RESULTS.search(arg) or arg in names:
+            hits.append((text.count("\n", 0, m.start()) + 1, arg))
+    return hits
+
+
+def scan_results_writes(root: Path = REPO) -> list:
+    hits = []
+    for top in ("src", "skills", "scripts"):
+        for p in sorted((root / top).rglob("*")):
+            rel = p.relative_to(root).as_posix()
+            if not p.is_file() or "node_modules" in p.parts or ".test." in p.name or rel in _SCAN_EXEMPT:
+                continue
+            if p.suffix in (".sh", ".bash"):
+                found = shell_results_writes(p.read_text(encoding="utf-8", errors="replace"))
+            elif p.suffix in (".ts", ".mts", ".js", ".mjs") and not p.name.endswith(".d.ts"):
+                found = ts_results_writes(p.read_text(encoding="utf-8", errors="replace"))
+            else:
+                continue
+            hits += [(rel, n, what) for n, what in found]
+    return hits
+
+
+# The pre-publisher shapes, verbatim from the writers this PR converted.
+_OLD_GATEWAY_WRAPPER = (
+    'printf \'%s\\n\' "The gateway bridge exited and was automatically restarted." > '
+    '"$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"\n')
+_OLD_CHANNEL_WRAPPER = (
+    '  RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"\n'
+    '  printf \'%s\\n\' "The $CHANNEL bridge exited and was automatically restarted." > "$RESULT"\n')
+_OLD_TS_VOICE = (
+    "const path = join(WORKSPACE_DIR, 'results', `proactive-voice-${c.category}-${tsMs}.txt`);\n"
+    "writeFileSync(path, body);\n")
+_OLD_TS_TIMEOUT = (
+    "const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);\n"
+    "writeFileSync(proactivePath, dmBody);\n")
+_OLD_TS_CANCEL = "writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.');\n"
 
 
 class DelegationTest(unittest.TestCase):
@@ -236,11 +321,22 @@ class DelegationTest(unittest.TestCase):
             for shape in HAND_ROLLED:
                 self.assertNotIn(shape, src, f"{rel}: writes a result body directly ({shape!r})")
 
-    def test_shell_writers_do_not_redirect_into_results(self):
-        for rel in ("src/notify.sh", "src/launchd/gateway-bridge-wrapper.sh"):
-            for line in (REPO / rel).read_text(encoding="utf-8").splitlines():
-                if "results/" in line and not line.lstrip().startswith("#"):
-                    self.assertNotRegex(line, r">\s*\"?\$\w+/results/", f"{rel}: `>` into results/: {line.strip()}")
+    def test_no_shell_or_ts_file_writes_into_results_directly(self):
+        hits = [f"{rel}:{n}: {what}" for rel, n, what in scan_results_writes()]
+        self.assertEqual(hits, [], "writes into results/ that bypass the publisher:\n" + "\n".join(hits))
+
+    def test_scan_flags_the_pre_publisher_shapes(self):
+        # Controls: each shape a converted writer used to have must be caught.
+        self.assertTrue(shell_results_writes(_OLD_GATEWAY_WRAPPER))
+        self.assertTrue(shell_results_writes(_OLD_CHANNEL_WRAPPER))
+        self.assertTrue(ts_results_writes(_OLD_TS_VOICE))
+        self.assertTrue(ts_results_writes(_OLD_TS_TIMEOUT))
+        self.assertTrue(ts_results_writes(_OLD_TS_CANCEL))
+        self.assertFalse(shell_results_writes(
+            'printf x | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-1.txt"\n'
+            'echo hi >&2; cmd 2>/dev/null\n'))
+        self.assertFalse(ts_results_writes("publishResultFile(`proactive-1.txt`, body);\n"
+                                           "writeFileSync(join(TASK_DIR, `${id}.txt`), body);\n"))
 
     def test_bridge_stage_and_publish_delegate(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text(encoding="utf-8")

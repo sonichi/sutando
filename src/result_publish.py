@@ -24,8 +24,10 @@ __all__ = ["STAGED_SUFFIX", "stage_text", "publish_staged", "publish_text", "mai
 STAGED_SUFFIX = ".tmp"
 
 
-def stage_text(path: str | Path, text: str) -> Path:
+def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
     """Write `text` to a fresh sibling of `path` and fsync it; returns the staged file.
+
+    `mode` is filtered by the umask, as `open()` would; pass 0o600 for a private record.
 
     Staging is separate from publishing because a sidecar the published file
     refers to may have to commit in between (the gateway's task media record).
@@ -34,7 +36,7 @@ def stage_text(path: str | Path, text: str) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     # O_EXCL on a per-call name: honours the umask like a plain write would (mkstemp forces 0600).
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}{STAGED_SUFFIX}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -59,9 +61,9 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
     return target
 
 
-def publish_text(path: str | Path, text: str) -> Path:
+def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
     """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix."""
-    tmp = stage_text(path, text)
+    tmp = stage_text(path, text, mode)
     try:
         return publish_staged(tmp, path)
     except BaseException:

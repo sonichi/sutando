@@ -1457,11 +1457,10 @@ async function main() {
 			// task feed and the Discord/Telegram bridges if configured.
 			try {
 				const tsMs = Date.now();
-				const path = join(WORKSPACE_DIR, 'results', `proactive-voice-${c.category}-${tsMs}.txt`);
 				const body = c.userActionUrl
 					? `${c.userMessage} ${c.userActionUrl}`
 					: c.userMessage;
-				writeFileSync(path, body);
+				publishResultFile(`proactive-voice-${c.category}-${tsMs}.txt`, body);
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}

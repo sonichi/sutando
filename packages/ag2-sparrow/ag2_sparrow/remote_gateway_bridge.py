@@ -3910,21 +3910,23 @@ def _post_proactive() -> None:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
             continue
-        # Re-read and re-route AFTER the claim, and act only on THIS result.
-        # The peek above can observe a writer mid-write (file created, body not
-        try:
-            route, room_override, routed_body = _proactive_route(
-                claim.read_text(encoding="utf-8"))
-        except OSError as exc:
-            # A TRANSIENT post-claim read failure must not strand the nudge: the
-            # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
+        # Re-read and re-route AFTER the claim, and act only on THIS result: the
+        # peek may have seen a writer mid-write, so the read goes through the readiness gate.
+        raw = read_ready_result(claim)
+        if raw is None:
+            # Unreadable, empty, or still growing: hand back, never post a prefix.
+            if f.name not in _EMPTY_LOGGED:
+                _EMPTY_LOGGED.add(f.name)
+                _log(f"proactive {f.name} not ready (empty, unreadable or still "
+                     f"being written) — handing back for a later pass")
             try:
                 claim.rename(f)
             except OSError as restore_exc:
-                _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
-                     f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
-                     f"owner nudge stranded under live pid until restart")
+                _log(f"CRITICAL: proactive {claim.name} was not ready AND restore "
+                     f"to {f.name} failed ({restore_exc}) — owner nudge stranded "
+                     f"under live pid until restart")
             continue
+        route, room_override, routed_body = _proactive_route(raw)
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
