@@ -382,6 +382,9 @@ esac
             "HOME": str(self.root),
             # The stub tmux never runs the notifier, so no sentinel can appear.
             "SUTANDO_WATCHER_READY_TIMEOUT": "0",
+            # Slice-1 scope (the bare launcher); a missing script keeps
+            # ensure_task_notifier a no-op regardless of the host's real PATH.
+            "SUTANDO_AGY_NOTIFIER_SCRIPT": str(self.root / "no-such-notifier.sh"),
         })
         if extra:
             env.update(extra)
