@@ -391,6 +391,7 @@ leftover_is_dropped_bytes() {
   "$NOTIFIER_PY" -c '
 import sys
 leftover_raw, prompt_raw, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+MIN_TAIL = 8  # a fuzzy tail shorter than this matches almost any chunk by luck (measured: 1-3 chars do)
 
 def squeeze(s):
     return "".join(c for c in s if not c.isspace())
@@ -413,7 +414,7 @@ for k in range(len(bounds) - 1):
     if not leftover.startswith(exact_prefix):
         continue
     rest = leftover[len(exact_prefix):]
-    if rest == "" or rest in squeeze(prompt_raw[a:b]):
+    if rest == "" or (len(rest) >= MIN_TAIL and rest in squeeze(prompt_raw[a:b])):
         ok = True
         break
 sys.exit(0 if ok else 1)
