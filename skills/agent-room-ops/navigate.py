@@ -89,8 +89,8 @@ def _post(url, token, body=None, headers=None, method="POST"):
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
             return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, \
-            (exc.read() if exc.fp is not None else b"")
+        with exc:
+            return exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, exc.read()
     except (urllib.error.URLError, OSError) as exc:
         raise Refused(f"{urllib.parse.urlsplit(url).netloc} unreachable: {exc}", "UNREACHABLE")
 
@@ -517,8 +517,8 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
 
 
 def _spawn_flush(at):
-    me = os.path.abspath(__file__)
-    subprocess.Popen([sys.executable, me, "flush", "--not-before", str(at)],
+    room_ops = os.path.join(os.path.dirname(os.path.abspath(__file__)), "room_ops.py")
+    subprocess.Popen([sys.executable, room_ops, "navigate", "flush", "--not-before", str(at)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -586,9 +586,3 @@ def run(a):
         time.sleep(delay)
     return flush(ws, window=window_seconds(a.window))
 
-
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(prog="navigate")
-    add_arguments(ap)
-    print(json.dumps(run(ap.parse_args(sys.argv[1:])), indent=2))
