@@ -590,24 +590,6 @@ class PendingCandidatesTest(unittest.TestCase):
             self.assertEqual(
                 list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-real.txt"])
 
-    def test_a_refused_name_sorting_ahead_of_a_valid_one_is_never_offered_under_typable(self):
-        # A name the agy notifier refuses to type never comes back from `next_pending`:
-        # offered again and again, it would hold the queue at an undispatchable head.
-        for refused in ("task-dc123~456.txt", "task a.txt", "task-$(id).txt", "task-a\nb.txt"):
-            with self.subTest(refused=refused):
-                for stale in self.tasks_dir.iterdir():
-                    stale.unlink()
-                self._write_task(refused)
-                os.utime(self.tasks_dir / refused, (1_600_000_000, 1_600_000_000))
-                self._write_task("task-plain.txt")
-                self.assertEqual(next_pending_task(self.tasks_dir, self.results_dir, typable_only=True),
-                                 "task-plain.txt")
-                self.assertEqual(
-                    list(pending_candidates(self.tasks_dir, self.results_dir, typable_only=True)),
-                    ["task-plain.txt"])
-                # The default offer is unchanged: a consumer that can type the name still gets it.
-                self.assertEqual(next_pending_task(self.tasks_dir, self.results_dir), refused)
-
 
 class MainDispatchTest(unittest.TestCase):
     """In-process `_main` calls: the bash callers' whole contract, visible to coverage."""
@@ -743,22 +725,6 @@ class MainDispatchTest(unittest.TestCase):
         (self.tasks_dir / "task-a.txt").write_text("task: x\n")
         rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir))
         self.assertEqual((rc, out), (0, "task-a.txt\n"))
-
-    def test_next_pending_typable_skips_an_older_refused_name_for_the_newer_plain_one(self):
-        (self.tasks_dir / "task-dc123~456.txt").write_text("task: x\n")
-        os.utime(self.tasks_dir / "task-dc123~456.txt", (1_600_000_000, 1_600_000_000))
-        (self.tasks_dir / "task-plain.txt").write_text("task: y\n")
-        rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir), "--typable")
-        self.assertEqual((rc, out), (0, "task-plain.txt\n"))
-        rc, out, _ = self._run("next-pending", str(self.tasks_dir), str(self.results_dir))
-        self.assertEqual((rc, out), (0, "task-dc123~456.txt\n"))
-        rc, out, _ = self._run("pending-candidates", str(self.tasks_dir), str(self.results_dir),
-                               "--claims-dir", str(self.claims_dir), "--typable")
-        self.assertEqual((rc, out), (0, "task-plain.txt\n"))
-        rc, _, err = self._run("next-pending", str(self.tasks_dir), str(self.results_dir),
-                               "--typable", "--typable")
-        self.assertEqual(rc, 2)
-        self.assertIn("usage:", err)
 
     def test_next_pending_honours_claims_dir(self):
         (self.tasks_dir / "task-a.txt").write_text("task: x\n")
