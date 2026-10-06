@@ -28,6 +28,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
+- [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
@@ -71,6 +72,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
+- [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)

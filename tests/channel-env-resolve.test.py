@@ -39,16 +39,21 @@ import channel_env_resolve as m  # noqa: E402
 TOKEN_LINE = 'REMOTE_TASK_TOKEN="real-token"\n'
 
 
+_AMBIENT = ("SUTANDO_APP_SUPPORT", "AG2_DEVICE_ENV")
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
-        self._saved = os.environ.get("SUTANDO_APP_SUPPORT")
-        os.environ.pop("SUTANDO_APP_SUPPORT", None)
+        self._saved = {k: os.environ.get(k) for k in _AMBIENT}
+        for k in _AMBIENT:
+            os.environ.pop(k, None)
 
     def tearDown(self):
-        if self._saved is None:
-            os.environ.pop("SUTANDO_APP_SUPPORT", None)
-        else:
-            os.environ["SUTANDO_APP_SUPPORT"] = self._saved
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def _tmpdir(self) -> Path:
         d = Path(tempfile.mkdtemp())
@@ -152,6 +157,74 @@ class TestNonEmptyToken(_Base):
                          chan / "a-client.env")
 
 
+class TestDeviceEnv(_Base):
+    """`$AG2_DEVICE_ENV` is the file the desktop launcher names. It is tried
+    first and trusted because the launcher names it, not because it is
+    contained; a blank, missing or unset one falls through to the tree."""
+
+    def _device_file(self, body: str = 'REMOTE_TASK_TOKEN="fake-device-token"\n') -> Path:
+        f = self._tmpdir() / "space.ag2.app" / "channels" / "ag2space" / ".env"
+        f.parent.mkdir(parents=True)
+        f.write_text(body)
+        return f
+
+    def test_desktop_layout_selects_the_launcher_named_file(self):
+        channels = self._tmpdir() / "channels"
+        dev = self._device_file()
+        os.environ["AG2_DEVICE_ENV"] = str(dev)
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), dev)
+
+    def test_launcher_named_file_is_trusted_outside_every_containment_root(self):
+        """The trust rule is explicit: the same path fails containment."""
+        channels, _ = self._channel()
+        dev = self._device_file()
+        os.environ["AG2_DEVICE_ENV"] = str(dev)
+        self.assertFalse(m.channel_env_is_contained(dev, channels, "ag2space"))
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), dev)
+
+    def test_launcher_named_file_outranks_the_channels_tree(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text('REMOTE_TASK_TOKEN="fake-tree-token"\n')
+        dev = self._device_file()
+        os.environ["AG2_DEVICE_ENV"] = str(dev)
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), dev)
+
+    def test_blank_launcher_named_file_falls_through_to_the_tree(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = str(self._device_file("REMOTE_TASK_TOKEN=\n"))
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), chan / ".env")
+
+    def test_missing_launcher_named_file_falls_through_to_the_tree(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = str(self._tmpdir() / "absent.env")
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), chan / ".env")
+
+    def test_directory_is_not_a_regular_file(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = str(self._tmpdir())
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), chan / ".env")
+
+    def test_blank_variable_falls_through_to_the_tree(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = "  "
+        self.assertEqual(m.resolve_channel_env(channels, "ag2space"), chan / ".env")
+
+    def test_other_sources_ignore_the_launcher_named_file(self):
+        channels, chan = self._channel("discord")
+        (chan / ".env").write_text(TOKEN_LINE)
+        os.environ["AG2_DEVICE_ENV"] = str(self._device_file())
+        self.assertEqual(m.resolve_channel_env(channels, "discord"), chan / ".env")
+
+    def test_blank_launcher_file_and_no_tree_resolves_to_none(self):
+        channels = self._tmpdir() / "channels"
+        os.environ["AG2_DEVICE_ENV"] = str(self._device_file("REMOTE_TASK_TOKEN=''\n"))
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+
+
 class TestCli(_Base):
     """`main()` in-process. The wrapper cases below cover the same paths through
     bash, but only as a subprocess — which no coverage run can see."""
@@ -199,7 +272,8 @@ class TestShellWrapper(_Base):
     def _run(self, config_dir: Path, source: str = "ag2space", **env):
         environ = dict(os.environ)
         environ["CLAUDE_CONFIG_DIR"] = str(config_dir)
-        environ.pop("SUTANDO_APP_SUPPORT", None)
+        for k in _AMBIENT:
+            environ.pop(k, None)
         environ.update(env)
         return subprocess.run(
             ["bash", str(REPO / "scripts" / "channel-env.sh"), source],
@@ -235,6 +309,42 @@ class TestShellWrapper(_Base):
         r = self._run(cfg)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), str(chan / "relay-client.env"))
+
+    def _device_file(self, body: str = 'REMOTE_TASK_TOKEN="fake-device-token"\n') -> Path:
+        f = self._tmpdir() / "space.ag2.app" / "channels" / "ag2space" / ".env"
+        f.parent.mkdir(parents=True)
+        f.write_text(body)
+        return f
+
+    def test_desktop_layout_with_no_channel_dir_prints_the_launcher_file(self):
+        dev = self._device_file()
+        r = self._run(self._tmpdir(), AG2_DEVICE_ENV=str(dev))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(dev))
+
+    def test_desktop_layout_with_empty_channel_dir_prints_the_launcher_file(self):
+        cfg = self._tmpdir()
+        (cfg / "channels" / "ag2space").mkdir(parents=True)
+        dev = self._device_file()
+        r = self._run(cfg, AG2_DEVICE_ENV=str(dev))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(dev))
+
+    def test_blank_launcher_file_falls_through_to_the_channel_env(self):
+        cfg = self._tmpdir()
+        chan = cfg / "channels" / "ag2space"
+        chan.mkdir(parents=True)
+        (chan / ".env").write_text(TOKEN_LINE)
+        r = self._run(cfg, AG2_DEVICE_ENV=str(self._device_file("REMOTE_TASK_TOKEN=\n")))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(chan / ".env"))
+
+    def test_blank_launcher_file_and_no_channel_dir_prints_nothing(self):
+        r = self._run(self._tmpdir(),
+                      AG2_DEVICE_ENV=str(self._device_file("REMOTE_TASK_TOKEN=\n")))
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout.strip(), "")
+        self.assertIn("no channel dir", r.stderr)
 
     def test_invalid_source_is_still_rejected_before_any_resolution(self):
         r = self._run(self._tmpdir(), source="../etc")

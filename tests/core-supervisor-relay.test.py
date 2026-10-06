@@ -283,6 +283,70 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("refuses every turn", m)
         self.assertIn("where the core is running", m)
 
+    _PICKER = "Select model\n  1. Opus\n❯ 2. Sonnet\n  3. Haiku\n  Enter to confirm · Esc to cancel"
+    _YESNO = "Allow Bash(rm -rf build)?\n❯ 1. Yes\n  2. No\n  Esc to cancel"
+
+    def test_a_selection_or_permission_gate_names_the_choice_card_first_on_ag2space(self):
+        """A numbered picker or a permission dialog is projected to the owner's AG2 Space DM
+        as a HITL card whose buttons type the answer; the notice says so before the
+        terminal. A typed reply still cannot answer it."""
+        for kind, prompt in (("selection", self._PICKER), ("permission", self._YESNO)):
+            sig = {"state": "blocked-human", "detail": f"awaiting user: {kind}", "prompt": prompt, "kind": kind}
+            with _no_backend():
+                m = compose_message(sig, surface="ag2space")
+            self.assertIn("choice card in our DM", m, kind)
+            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
+            self.assertIn("A typed chat reply can't answer it", m)
+        sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
+        with _no_backend():
+            self.assertNotIn("choice card", compose_message(sig, surface="ag2space"))
+
+    def test_the_choice_card_is_named_only_where_a_card_with_buttons_exists(self):
+        """No card on discord/slack/telegram or macOS-only; a trust/bypass/limit dialog and an
+        unparseable prompt get the button-less card, so the notice names the terminal instead."""
+        base = {"state": "blocked-human", "detail": "awaiting user: selection", "kind": "selection"}
+        for surface in ("discord", "slack", "telegram", ""):
+            with _no_backend():
+                m = compose_message({**base, "prompt": self._PICKER}, surface=surface)
+            self.assertNotIn("choice card", m, surface or "macos-only")
+            self.assertIn("answer it where the core is running", m, surface or "macos-only")
+        never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
+                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
+                 "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
+        for prompt in never:
+            with _no_backend():
+                m = compose_message({**base, "prompt": prompt}, surface="ag2space")
+            self.assertNotIn("choice card", m, prompt.splitlines()[0])
+            self.assertIn("answer it where the core is running", m)
+        with _no_backend():
+            m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
+        self.assertNotIn("choice card", m, "no numbered options: no buttons")
+        # A permission gate keyed on a Yes/No pair is a card on a configured homeserver bridge too.
+        with _no_backend():
+            m = compose_message({**base, "kind": "permission", "prompt": self._YESNO}, surface="dev-ag2space")
+        self.assertIn("choice card", m)
+
+    def test_a_card_lookup_failure_falls_back_to_the_terminal_wording(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend(), patch.dict(sys.modules, {"hitl": None, "hitl.tui_gate": None}):
+            m = compose_message(sig, surface="ag2space")
+        self.assertNotIn("choice card", m)
+        self.assertIn("answer it where the core is running", m)
+        # Run as a script, src/ is not on sys.path yet: the lookup puts it there itself.
+        src = os.path.dirname(os.path.abspath(_SRC))
+        with patch.object(sys, "path", [p for p in sys.path if os.path.abspath(p) != src]):
+            self.assertTrue(_mod._card_projected(sig, "ag2space"))
+
+    def test_run_cycle_hands_the_delivery_surface_to_the_composer(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend():
+            on_space = run_cycle(sig, "", macos=False, source="ag2space", channel="!r:x", dry_run=True)
+            on_discord = run_cycle(sig, "", macos=False, source="discord", channel="1", dry_run=True)
+        self.assertIn("choice card", on_space)
+        self.assertNotIn("choice card", on_discord)
+
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
         nor the app can answer it, so the remedy must name the terminal."""

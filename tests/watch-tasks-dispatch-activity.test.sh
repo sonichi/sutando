@@ -13,9 +13,11 @@ via="$(printf '%s\n' "$body" | grep -c 'emit_dispatch_task_file')"
 [ "$via" -ge 4 ] && echo "PASS dispatch_task emits through emit_dispatch_task_file ($via sites)" || { echo "FAIL expected >=4 owner emits, got $via"; fail=1; }
 q="$(printf '%s\n' "$body" | grep -cE 'queued_activity_row "\$[A-Za-z_]+"')"
 [ "$q" -eq 1 ] && echo "PASS dispatch_task marks QUEUED exactly once" || { echo "FAIL QUEUED marked $q times"; fail=1; }
-# The handler path: launching a worker is the pickup, so drain_dispatch_queue marks RUNNING there.
-drain="$(awk '/^drain_dispatch_queue\(\) \{/,/^\}/' "$SRC/watch-tasks-stream.sh")"
-printf '%s\n' "$drain" | grep -qE 'activity_transition RUNNING "\$[A-Za-z_]+"' && echo "PASS a launched handler marks RUNNING" || { echo "FAIL drain_dispatch_queue does not mark RUNNING on handler launch"; fail=1; }
+# The handler path: launching a worker is the pickup, so run_handler_now marks
+# RUNNING there. drain_dispatch_queue() (the old async-runner reap-loop) is
+# retired; run_handler_now() is its synchronous successor and owns this now.
+drain="$(awk '/^run_handler_now\(\) \{/,/^\}/' "$SRC/watch-tasks-stream.sh")"
+printf '%s\n' "$drain" | grep -qE 'activity_transition RUNNING "\$[A-Za-z_]+"' && echo "PASS a launched handler marks RUNNING" || { echo "FAIL run_handler_now does not mark RUNNING on handler launch"; fail=1; }
 # Behaviour: emit_dispatch_task_file prints the line and marks RUNNING through the bus (stubbed).
 tmp="$(mktemp -d)"; log="$tmp/bus.log"
 cat > "$tmp/py" << PY
@@ -84,7 +86,7 @@ set -m
 # startup and overwrites the caller's, so only SUTANDO_PY overrides it.
 SUTANDO_INBOX_RESOLVER="$resolver" SUTANDO_WORKSPACE_DIR="$ws" \
   SUTANDO_RESULTS_DIR="$ws/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp2/py" \
-  bash "$SRC/watch-tasks-stream.sh" "$inbox" > "$outfile" 2>"$tmp2/sweep.err" &
+  bash "$SRC/watch-tasks-stream.sh" "$inbox" --role standby --inbox "$inbox" > "$outfile" 2>"$tmp2/sweep.err" &
 sweep_pid=$!
 set +m
 for _ in $(seq 1 40); do grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && break; sleep 0.25; done
@@ -127,7 +129,7 @@ printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$payload3" > "$resolver3"; chmod +x 
 set -m
 SUTANDO_INBOX_RESOLVER="$resolver3" SUTANDO_TASK_EVENT_HANDLER="$tmp3/handler.sh" SUTANDO_WORKSPACE_DIR="$ws3" \
   SUTANDO_RESULTS_DIR="$ws3/results" SUTANDO_INSTANCE=w-test SUTANDO_PY="$tmp3/py" \
-  bash "$SRC/watch-tasks-stream.sh" "$inbox3" > "$tmp3/sweep.out" 2>"$tmp3/sweep.err" &
+  bash "$SRC/watch-tasks-stream.sh" "$inbox3" --role standby --inbox "$inbox3" > "$tmp3/sweep.out" 2>"$tmp3/sweep.err" &
 sweep3=$!
 set +m
 for _ in $(seq 1 60); do grep -q 'transition FAILED' "$log3" 2>/dev/null && break; sleep 0.25; done

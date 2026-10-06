@@ -69,6 +69,38 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Session hooks: `setup(ctx)` and `voiceSurface()`
+
+A tools entry point may export two optional hooks besides `tools`. Both are
+product-neutral: the host names no skill, and works unchanged when none exports them.
+
+**`setup(ctx)`** runs once per voice session, synchronously, after the session
+exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
+
+| Member | Purpose |
+|---|---|
+| `session`, `injectText(session, text)` | the live session and the realtime text inject |
+| `clientAttached()` | true while a client is attached |
+| `sendClientFrame(frame)` | send one JSON frame to the attached client; `false` when none took it |
+| `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
+| `onClientDisconnected(handler)` | the client left: drop per-client state |
+| `injectContext(text)` | a framed system line the model should know, retried until the session is live |
+| `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
+| `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
+
+A handler that throws or rejects is logged and never reaches another skill's handler.
+
+**`voiceSurface()`** is evaluated once at load and returns what the skill adds to
+the **web voice session only** (`VoiceSurfaceContribution`):
+
+| Field | Effect |
+|---|---|
+| `tools` | declared on the voice session and listed in its prompt; never on the phone tool table. Return `[]` when the install cannot serve them, so the tool is gated at exposure |
+| `promptRules` | lines added to the voice prompt's RULES block |
+| `contextLines()` | lines added to the voice context, re-evaluated at every prompt build |
+
+With no contribution the voice prompt is byte-identical to the default.
+
 ## Config-only manifests (non-tools skills)
 
 A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).
@@ -82,6 +114,57 @@ CLI arg  >  env override  >  manifest.json config[key]  >  another config file (
 ```
 
 Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
+
+## Supervised workers (`supervised_worker`)
+
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+
+```json
+"supervised_worker": {
+  "name": "example-presence",
+  "script": "scripts/presence_daemon.py",
+  "interpreter": { "config": "EXAMPLE_PYTHON", "needs": "pycrdt + websockets" }
+}
+```
+
+- `name` — the supervisor's worker name; a plain name, not a path (it reaches a state dir and a log line).
+- `script` — relative to the skill directory, and it must resolve **inside** it. A manifest is attacker-adjacent (`skills/trusted-capabilities` installs third-party skills), so traversal is refused rather than trusted.
+- `interpreter.config` — the config key naming the interpreter, read **env first, then this manifest's `config` block**. It is required and never guessed: these loops may import packages the core's own python does not have, and started under the wrong one the worker crash-loops under the supervisor, which reads as a broken daemon rather than a missing setting. Unset is a skipped worker with a reason on stderr.
+- `interpreter.needs` — optional; quoted back in that reason so the operator knows what the interpreter must provide.
+
+**Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
+
+## Pending-questions store adapter (`pending_questions_store`)
+
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
+read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
+`reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
+records a question and `remind(argv, workspace, resolved=None)` runs the reminder — `resolved` is optional:
+the core entry passes its one resolution of the adapter when `remind` accepts the keyword, and a
+two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-manifest.schema.json`
+(a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
+`src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
+skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
+friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
+`declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
+roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+resolve inside its skill), and refuses when more than one installed skill declares it, in one root
+or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
+(`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
+its errors kept as notes, then `gather(workspace)` — a `gather` keyword is not part of the contract.
+With none declared there is no store: readers report `unavailable` with that reason (never a
+zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
+the owner's DM through the proactive path and keeps one generic record under
+`<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
+The outbox, the ask-id grammar and every question schema are the declaring skill's.
+
+## Claude plugin (`claude_plugin`)
+
+`"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude
+launchers (core and Claude pool workers) pass each enabled skill's directory as `--plugin-dir`.
+The path must resolve to a real directory inside the skill folder and the manifest must be
+`"enabled": true`; anything else is skipped with a note on stderr. Codex seats ignore it.
 
 ## Currently active manifest skills
 

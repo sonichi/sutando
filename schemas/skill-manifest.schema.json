@@ -121,6 +121,11 @@
       "type": "object",
       "description": "Manifest-loaded skills: env defaults exported at startup, only if the var is not already set (user override wins).",
       "additionalProperties": { "type": "string" }
+    },
+    "pending_questions_store": {
+      "type": "string",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",
+      "description": "The script that IS the store of owner pending questions (room_store, gather, waiting, count, reconcile_pass, resolve, ask_owner, remind), relative to the skill directory and resolving inside it. Core reaches it only through src/pending_questions_reader.py, by this field alone; at most one installed skill may declare it (skills/MANIFEST.md)."
     }
   },
   "allOf": [

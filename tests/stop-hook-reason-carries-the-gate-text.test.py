@@ -32,9 +32,14 @@ import tempfile
 # The hook's gate is session-scoped; unset so this suite drives its own ledger
 # rather than whatever session happens to be running it.
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+# The watcher-coverage gate has its own suite; a temp inbox nobody watches would
+# block before the ledger gate's text under test is reached.
+os.environ["SUTANDO_STOP_HOOK_WATCHER_GATE"] = "0"
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 HOOK = REPO / "src" / "check-pending-tasks.sh"
+# The hook gates only the launcher-marked core (or an enrolled worker); this suite is the core.
+os.environ["SUTANDO_CORE_SESSION"] = "1"
 RESOLVE = 'WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"'
 REPO_LINE = 'REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"'
 
@@ -66,8 +71,12 @@ def _decision(hook_src: str) -> dict:
         stub.write_text(
             hook_src.replace(REPO_LINE, f'REPO_DIR="{REPO}"').replace(RESOLVE, f'WORKSPACE="{ws}"')
         )
-        out = subprocess.run(["/bin/bash", str(stub)], capture_output=True, text=True,
-                             stdin=subprocess.DEVNULL)
+        out = subprocess.run(
+            ["/bin/bash", str(stub)],
+            capture_output=True,
+            text=True,
+            input='{"hook_event_name":"Stop"}',
+        )
         assert out.returncode == 0, f"hook exited {out.returncode}: {out.stderr}"
         return json.loads(out.stdout or "{}")
 

@@ -23,6 +23,8 @@ _spec = importlib.util.spec_from_file_location(
 )
 rh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rh)
+sys.path.insert(0, os.path.join(REPO, "src"))
+import worker_auth_state as was  # noqa: E402
 
 fails = 0
 
@@ -52,6 +54,57 @@ WORKING_PANE = """\
 """
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
+
+# 2b) An old marker left on screen after the CLI signed back in is not a logout.
+#     Captured 2026-09-28: a refused turn, a successful /login, then real work.
+RECOVERED_PANE = """\
+❯ /proactive-loop
+  ⎿  Not logged in · Please run /login
+✻ Crunched for 0s · done 12:05 PM · 1 monitor still running
+❯ /login
+  ⎿  Login interrupted
+❯ /login
+  ⎿  Login successful
+  Ran 3 shell commands
+⏺ This pass was quiet: no tasks are waiting.
+✻ Crunched for 41s · done 12:06 PM · 1 monitor still running
+"""
+check("needs_login: false once a later /login succeeded", rh.needs_login(RECOVERED_PANE) is False)
+check("needs_login: false once a later turn did real work",
+      rh.needs_login("  ⎿  Not logged in · Please run /login\n✻ Worked for 0s\n❯ hi\n✻ Cooked for 1m 3s · done\n") is False)
+check("needs_login: a 0-1 s turn after the marker is the refusal itself, still logged out",
+      rh.needs_login("  ⎿  Not logged in · Please run /login\n✻ Crunched for 0s · done 12:05 PM\n") is True)
+check("needs_login: a marker after the success line counts again",
+      rh.needs_login("  ⎿  Login successful\n✻ Worked for 20s\n  ⎿  Not logged in · Please run /login\n") is True)
+
+# 2c) "Signed in after the marker" is worker_auth_state's reading, not a copy here:
+#     a refusal then a tool call or the agent's own line is signed in for both readers.
+_REFUSED_THEN_TOOL = "❯ /startup\n  ⎿  Login expired · Please run /login\n✻ Worked for 0s\n❯ go\n⏺ Bash(ls)\n"
+check("needs_login: false once a tool call ran after the marker",
+      rh.needs_login(_REFUSED_THEN_TOOL) is False)
+check("needs_login: false once the agent answered after the marker",
+      rh.needs_login("  ⎿  Login expired · Please run /login\n❯ go\n● Done.\n") is False)
+check("needs_login: reads through worker_auth_state.signed_in_since",
+      rh.signed_in_since is was.signed_in_since and not hasattr(rh, "_LOGGED_IN_AGAIN")
+      and not hasattr(rh, "_REAL_TURN"))
+_FOOTER = "────────\n❯ \n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+_REFUSED = "❯ /startup\n  ⎿  Login expired · Please run /login\n✻ Worked for 0s\n"
+for _name, _pane in (
+        ("refusal alone", _REFUSED + _FOOTER),
+        ("refusal under a newer typed prompt", _REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1)),
+        ("refusal under a spinner", _REFUSED + "❯ try again\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _FOOTER),
+        ("refusal then a tool call", _REFUSED_THEN_TOOL + _FOOTER),
+        ("refusal then the agent's line", _REFUSED + "❯ go\n● Hello.\n" + _FOOTER),
+        ("refusal then Login successful", _REFUSED + "❯ /login\n  ⎿  Login successful\n" + _FOOTER),
+        ("refusal then a turn that outran it", _REFUSED + "❯ hi\n✻ Cooked for 1m 3s · done 1:00 PM\n" + _FOOTER),
+        ("refusal then another 0 s turn", _REFUSED + "❯ hi\n  ⎿  Unknown slash command: /hi\n✻ Worked for 0s\n" + _FOOTER),
+        ("a refusal after Login successful", "  ⎿  Login successful\n✻ Worked for 20s\n" + _REFUSED + _FOOTER),
+        ("the recovered pane", RECOVERED_PANE),
+        ("no marker at all", WORKING_PANE)):
+    # Agreement holds wherever the marker line is one both readers name (the CLI's own
+    # `… /login` line); runtime-health's extra markers (keychain, API key) are its own.
+    check(f"needs_login agrees with worker_auth_state.auth_expired: {_name}",
+          rh.needs_login(_pane) is was.auth_expired(_pane))
 
 # 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
 #     import-time default reports a live core as offline. Prefer the recorded socket.
@@ -282,7 +335,7 @@ try:
         check("_gateway_running: unconfigured host -> None", rh._gateway_running() is None)
     finally:
         rh._gateway_configured = _ogc
-    check("real _pane_text returns a str", isinstance(rh._pane_text(), str))
+    check("real _pane_text: no session on the socket -> empty", rh._pane_text() == "")
     check("real _resolve_workspace returns a path", rh._resolve_workspace(REPO).startswith("/"))
     d = rh.derive()
     check("real derive: offline on bogus socket", d["health"] == "offline")
@@ -292,6 +345,64 @@ try:
 finally:
     rh.TMUX_SOCKET = _orig_socket
     rh._tmux_socket = _orig_tmux_socket
+
+# 6b) The real pane read against a real core session: capture-pane needs a pane target, and a
+#     bare `=session` is refused by tmux, which would silently read every pane as "".
+_tmux = shutil.which("tmux")
+if _tmux is None:
+    print("  skip  real _pane_text against a scratch session (tmux not installed)")
+else:
+    _td = tempfile.mkdtemp()
+    _sock = os.path.join(_td, "sock")
+    subprocess.run([_tmux, "-S", _sock, "new-session", "-d", "-s", rh.SESSION,
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    subprocess.run([_tmux, "-S", _sock, "new-session", "-d", "-s", rh.SESSION + "-watcher",
+                    "printf 'watcher pane\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock
+    try:
+        for _ in range(20):
+            _pane = rh._pane_text()
+            if "Please run /login" in _pane:
+                break
+            time.sleep(0.1)
+        check("real _pane_text returns the core pane's own text", "Please run /login" in _pane
+              and "watcher pane" not in _pane)
+        check("real _pane_text feeds needs_login", rh.needs_login(_pane))
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock, "kill-server"], check=False)
+
+    # 6c) A host whose ~/.tmux.conf sets base-index 1: the core window is :1, not :0.
+    _conf = os.path.join(_td, "base1.conf")
+    with open(_conf, "w") as _fh:
+        _fh.write("set -g base-index 1\n")
+    _sock1 = os.path.join(_td, "sock1")
+    subprocess.run([_tmux, "-f", _conf, "-S", _sock1, "new-session", "-d", "-s", rh.SESSION,
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock1
+    try:
+        for _ in range(20):
+            _pane = rh._pane_text()
+            if "Please run /login" in _pane:
+                break
+            time.sleep(0.1)
+        check("real _pane_text reads the core on a base-index-1 host", "Please run /login" in _pane)
+        check("real _pane_text feeds needs_login on a base-index-1 host", rh.needs_login(_pane))
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock1, "kill-server"], check=False)
+
+    # 6d) Only the watcher lives: the core is gone, and its pane must not be read as the core's.
+    _sock2 = os.path.join(_td, "sock2")
+    subprocess.run([_tmux, "-S", _sock2, "new-session", "-d", "-s", rh.SESSION + "-watcher",
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock2
+    try:
+        time.sleep(0.3)
+        check("real _pane_text never reads the watcher when the core is gone", rh._pane_text() == "")
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock2, "kill-server"], check=False)
 
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a

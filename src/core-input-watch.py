@@ -66,6 +66,8 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
+import cli_wedge  # noqa: E402
 
 import argparse
 import hashlib
@@ -317,7 +319,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -327,6 +329,7 @@ def compose_state(pane, base_health, gateway_alive, process=True):
 
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
+    `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -340,6 +343,12 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         if kind in _HUMAN_GATES:
             return "blocked-human", f"awaiting user: {kind}", excerpt, kind
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
+    # A refused login leaves no gate and the idle footer, and the shared health can read a
+    # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
+    expired = login_expired(pane) if pane else None
+    if expired:
+        return ("logged-out", "core not authenticated (login expired; no signed-in turn since)",
+                expired, "login")
     if base_health == "needs_login":
         return "logged-out", _BASE_TO_STATE["needs_login"][1], None, None
     # A refused turn leaves the core at its idle footer, which every branch below reads
@@ -362,12 +371,21 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         # frozen) still reads hung, preserving genuine wedge detection.
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
+        if pane and _turn_moving(pane, prev_pane):
+            return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
+
+
+def _turn_moving(pane, prev_pane):
+    """A turn in flight whose pane changed since the last poll. Clocks and spinners are
+    normalised away, so a frozen CLI whose timer still ticks is not motion."""
+    return (prev_pane is not None and cli_wedge.frame_working(pane)
+            and cli_wedge.state_id(pane) != cli_wedge.state_id(prev_pane))
 
 
 # ---- Bundled-context probes (NOT part of runtime-health's coarse health). --- #
@@ -466,18 +484,17 @@ def gateway_alive(app_data, state_dir=None):
 
 
 def capture(socket, session):
-    try:
-        out = subprocess.run(["tmux", "-S", socket, "capture-pane", "-p", "-t", f"{session}:0"],
-                             capture_output=True, text=True, timeout=8)
-        return out.stdout if out.returncode == 0 else None
-    except Exception:
-        return None
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target) if target else None
 
 
 def send_keys(socket, session, key):
     """Type one key into the core pane. True only when tmux accepted it."""
+    target = cli_wedge.core_target(socket, session)
+    if not target:
+        return False
     try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
+        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", target, key],
                            capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:
@@ -548,7 +565,20 @@ def _hitl_manager(out_path):
         return None
 
 
-def escalate(manager, state, detail, kind, prompt, session):
+def _name_seat(req, session, seat):
+    """Say which seat is asking: a card from one of several watched panes must
+    name its own, and its terminal jump must name that pane's session."""
+    from hitl.schema import Action
+    req.title = f"{seat} · {req.title}"
+    req.message = f"{seat} (tmux session {session})\n\n{req.message}"
+    req.device = {"id": session, "name": seat}
+    req.subject = {**(req.subject or {}), "seat": seat}
+    req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
+                   if a.kind == "open_terminal" else a for a in req.actions]
+    return req
+
+
+def escalate(manager, state, detail, kind, prompt, session, seat=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -561,27 +591,52 @@ def escalate(manager, state, detail, kind, prompt, session):
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt))
+        if seat:
+            req = _name_seat(req, session, seat)
         return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None
 
 
-def resolve_escalations(manager, session):
+def card_step(pane_present, state, idle_ticks, stable, settling=False):
+    """One tick's verdict for the session's cards: ("hold"|"escalate"|"resolve", idle_ticks).
+    A failed capture is no evidence (hold); a prompt still settling (a dialog re-rendering
+    under the entry debounce) is blocked, not idle (hold); leaving the blocked set resolves
+    only after `stable` consecutive ticks, the same debounce entering it needs (P1-24)."""
+    if not pane_present or settling:
+        return "hold", idle_ticks
+    if state in _CHAT_ESCALATE_STATES:
+        return "escalate", 0
+    idle_ticks += 1
+    return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
+
+
+def resolve_escalations(manager, session, pane=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
     Scoped by session: one worker recovering must not clear a sibling's card.
+    A signed-out card clears only on positive proof in `pane` that a turn ran
+    (worker_auth_state.authenticated_turn): a newer prompt, a spinner, an empty
+    capture or a health verdict read off another session's status file is not
+    "Sutando has continued its work".
     """
     if manager is None:
         return []
     try:
-        mine = [r.id for r in manager.active()
-                if (r.subject or {}).get("source") == _TUI_SOURCE
-                and (r.subject or {}).get("session") == session]
-        for req_id in mine:
-            manager.resolve(req_id)   # returns blocked task ids, not a verdict
-        return mine
+        from hitl.manager import AUTH_KIND
+        signed_in = authenticated_turn(pane)
+        done = []
+        for r in manager.active():
+            subj = r.subject or {}
+            if subj.get("source") != _TUI_SOURCE or subj.get("session") != session:
+                continue
+            if r.kind == AUTH_KIND and not signed_in:
+                continue
+            manager.resolve(r.id)   # returns blocked task ids, not a verdict
+            done.append(r.id)
+        return done
     except Exception as exc:  # noqa: BLE001
         print(f"hitl resolve failed: {exc}", file=_sys.stderr)
         return []
@@ -673,7 +728,16 @@ def main():
                     help="report allowlisted gates without typing their safe answer")
     ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
                     help="write the supervisor state but never raise a card for a block")
+    ap.add_argument("--seat", default="",
+                    help="who this pane is, named on every card it raises (default: none)")
+    ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     a = ap.parse_args()
+    if a.helper_receipt_dir:
+        from external_core_helpers import publish
+        from workspace_default import resolve_workspace
+        publish(a.helper_receipt_dir, "monitor", __file__, resolve_workspace(),
+                a.socket, a.session, passive=not (a.once or a.auto_answer or a.chat_escalation),
+                output=a.out)
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
     # else a detached spawn without Homebrew on PATH reads a healthy core as crashed.
@@ -692,20 +756,25 @@ def main():
     last_prompt = None
     answered_prompt = None
     last_answered = None
+    idle_ticks = 0
+    prev_pane = None
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True))
+            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
+        prev_pane = pane
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
+        settling = False
         if state in ("blocked-human", "blocked-known"):
             stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
             last_prompt = prompt
             if stable_prompt < a.stable:
+                settling = True
                 state, detail, prompt, kind = "running", "processing (prompt settling)", None, None
         else:
             stable_prompt = 0
@@ -733,12 +802,15 @@ def main():
         # The Manager owns per-episode dedup; leaving the blocked set resolves
         # the card, so the owner sees it close without clicking anything.
         if a.chat_escalation:
-            if state in _CHAT_ESCALATE_STATES:
+            # A blank capture is no evidence either: "" is what a capture of an
+            # emptied pane returns, and it must not resolve a card nobody answered.
+            verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
+            if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
-                escalate(hitl, state, detail, kind, prompt, a.session)
-            else:
-                resolve_escalations(hitl, a.session)
+                escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None)
+            elif verdict == "resolve":
+                resolve_escalations(hitl, a.session, pane)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

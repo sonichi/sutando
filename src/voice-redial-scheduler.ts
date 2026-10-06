@@ -104,14 +104,19 @@ export function noteLifecycle(
 	}
 }
 
+/** States where the upstream is down and only a host dial brings it back:
+ *  CLOSED, and UPSTREAM_LOST (where upstreamLossPolicy 'hold' parks). */
+export function isUpstreamDown(state: string): boolean {
+	return state === 'CLOSED' || state === 'UPSTREAM_LOST';
+}
 /** Fire-time gate for the event-driven dial — same preconditions as the
- *  tick's CLOSED guard, minus its 60s throttle (fast redial is the point). */
+ *  tick's upstream-down guard, minus its 60s throttle (fast redial is the point). */
 export function shouldEventDial(o: {
 	state: string; clientConnected: boolean; now: number;
 	nextDialAt: number; fatalBackoffUntil: number;
 }): boolean {
 	if (o.nextDialAt === 0 || o.now < o.nextDialAt) return false;
-	if (o.state !== 'CLOSED' || !o.clientConnected) return false;
+	if (!isUpstreamDown(o.state) || !o.clientConnected) return false;
 	return o.now > o.fatalBackoffUntil;
 }
 

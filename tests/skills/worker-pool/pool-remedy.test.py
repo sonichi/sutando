@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The remedy resumes a dead worker on its OWN session, and does nothing else.
+"""The remedy recovers a dead worker under its OWN identity and inbox.
 
 What is pinned here is what a timer with nobody watching must get right: it uses
 the socket the worker last ran on rather than an environment it does not have,
@@ -14,11 +14,14 @@ import contextlib
 import io
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
@@ -35,19 +38,30 @@ class FakeTmux:
 
     def __init__(self, runtime="claude", launcher_fails=False):
         self.calls, self.envs, self.live = [], [], set()
+        self.loaded = set()
         self.runtime, self.launcher_fails = runtime, launcher_fails
 
     def __call__(self, argv, **kw):
         cp = subprocess.CompletedProcess
         self.calls.append(argv)
         self.envs.append(dict(kw.get("env") or {}))
+        if argv[0] == "launchctl":
+            if argv[1] == "print":
+                return cp(argv, 0 if argv[2] in self.loaded else 113, "", "")
+            if argv[1] == "bootout":
+                self.loaded.discard(argv[2])
+            if argv[1] == "bootstrap":
+                with open(argv[3], "rb") as fh:
+                    label = plistlib.load(fh)["Label"]
+                self.loaded.add(f"gui/{os.getuid()}/{label}")
+            return cp(argv, 0, "", "")
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return cp(argv, 0, self.runtime + "\n", "")
         if len(argv) > 2 and argv[2] == "watcher-sentinel":
             # The spawner's per-instance-sentinel safety check stays ON in the code
             # under test, so the fake answers it: one path per instance identity.
             return cp(argv, 0, "sentinel-" + (kw.get("env") or {})["SUTANDO_INSTANCE_ID"], "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             if self.launcher_fails:
                 return cp(argv, 1, "", "claude: not logged in")
             self.live.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
@@ -60,7 +74,7 @@ class FakeTmux:
 
     def launches(self):
         return [(a, e) for a, e in zip(self.calls, self.envs)
-                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+                if a[0] == "bash" and a[1].endswith("launch-worker-session.sh")]
 
     def probes(self):
         return [a for a in self.calls if len(a) > 3 and a[3] == "has-session"]
@@ -68,12 +82,24 @@ class FakeTmux:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.ws = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        self.la = self.ws / "LaunchAgents"
+        real_ensure = sw.ensure_remedy_timer
+        patcher = mock.patch.object(
+            sw, "ensure_remedy_timer",
+            side_effect=lambda ws, repo, **kw: real_ensure(ws, repo, launch_agents=self.la, **kw))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.t = FakeTmux()
         first = sw.spawn(self.ws, REPO, cwd=str(REPO), socket=SOCK, label="alpha",
                          runner=self.t, require_sentinel=False)
+        if sys.platform == "darwin":
+            self.assertEqual(Path(first["remedy_timer"]["plist"]).parent, self.la)
         self.wid, self.session, self.inbox = (first["worker_id"], first["runtime_session_id"],
                                               first["delivery_dir"])
+        sup.pr.register_worker(self.ws, self.wid, "alpha", runtime="claude")
         self.t.live.clear()                       # the worker died
         self.launched_before = len(self.t.launches())
 
@@ -112,6 +138,97 @@ class ItResumesTheSameWorker(Base):
                          "launches on a tmux server the worker never ran on")
 
 
+class CodexRecovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.la = self.ws / "LaunchAgents"
+        real_ensure = sw.ensure_remedy_timer
+        patcher = mock.patch.object(
+            sw, "ensure_remedy_timer",
+            side_effect=lambda ws, repo, **kw: real_ensure(ws, repo, launch_agents=self.la, **kw))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cwd = self.ws / "project"
+        self.cwd.mkdir()
+        self.t = FakeTmux(runtime="codex")
+        first = sw.spawn(self.ws, REPO, runtime="codex", cwd=str(self.cwd),
+                         socket=SOCK, label="Codex reviewer", runner=self.t,
+                         require_sentinel=False)
+        if sys.platform == "darwin":
+            self.assertEqual(Path(first["remedy_timer"]["plist"]).parent, self.la)
+        self.wid = first["worker_id"]
+        self.inbox = first["delivery_dir"]
+        sup.pr.register_worker(self.ws, self.wid, "Codex reviewer", runtime="codex")
+        self.t.live.clear()
+
+    def test_dead_codex_worker_gets_fresh_run_with_same_identity_and_inbox(self):
+        self.assertEqual(wi.sessions(self.ws, self.wid), [])
+        self.assertIsNone(wi.current(self.ws, self.wid)["session_id"])
+        before = len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.RECOVERED)
+        self.assertIsNone(out["session_id"])
+        self.assertEqual(len(self.t.launches()), before + 1)
+        self.assertEqual([p.name for p in (self.ws / "state/workers").iterdir()
+                          if p.is_dir()], [self.wid])
+        self.assertTrue(Path(self.inbox).is_dir())
+        self.assertEqual(wi.sessions(self.ws, self.wid), [])
+        runs = wi.incarnations(self.ws, self.wid)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0]["end_reason"], "crashed")
+        self.assertIsNone(runs[1]["ended_at"])
+        self.assertIsNone(runs[1]["session_id"])
+        self.assertEqual(runs[1]["cwd"], str(self.cwd))
+        _, env = self.t.launches()[-1]
+        self.assertEqual(env["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertEqual(env["SUTANDO_TMUX_SOCKET"], SOCK)
+        self.assertEqual(env["SUTANDO_TASKS_DIR"], self.inbox)
+        self.assertEqual(env["SUTANDO_CODEX_WORKING_DIR"], str(self.cwd))
+        self.assertNotIn("SUTANDO_CLAUDE_RESUME", env)
+
+    def test_a_live_codex_worker_is_not_relaunched(self):
+        self.t.live.add(wi.tmux_session_name(self.wid))
+        before_runs = wi.incarnations(self.ws, self.wid)
+        before_launches = len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.ALREADY_RUNNING)
+        self.assertEqual(wi.incarnations(self.ws, self.wid), before_runs)
+        self.assertEqual(len(self.t.launches()), before_launches)
+
+    def test_a_codex_worker_without_a_recorded_run_is_not_relaunched(self):
+        # The last incarnation identifies the tmux socket and folder;
+        # recovery cannot choose a target without it.
+        wi.incarnations_path(self.ws, self.wid).write_text(
+            json.dumps({"incarnations": []}))
+        before = len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.NO_SESSION)
+        self.assertEqual(len(self.t.launches()), before)
+
+    def test_a_failed_codex_relaunch_leaves_no_open_incarnation(self):
+        self.t.launcher_fails = True
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertEqual([r for r in wi.incarnations(self.ws, self.wid)
+                          if r["ended_at"] is None], [])
+
+    def test_watcher_rearm_carries_codex_runtime_and_clears_core_handler(self):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append((argv, kw["env"]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        out = rem.ensure_supervisor(self.ws, REPO, self.wid, runner=run)
+        self.assertEqual(out["outcome"], rem.SUPERVISED)
+        env = seen[0][1]
+        self.assertEqual(env["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertEqual(env["SUTANDO_TASK_EVENT_HANDLER"], "")
+        self.assertEqual(env["SUTANDO_TMUX_SOCKET"], SOCK)
+
+
 class ItLeavesHonestRunRecords(Base):
     def test_every_dead_run_is_closed_and_exactly_one_is_open_after(self):
         wi.start_incarnation(self.ws, self.wid, self.session, tmux_socket=SOCK,
@@ -134,6 +251,37 @@ class ItLeavesHonestRunRecords(Base):
 
 
 class WhatItRefusesToTouch(Base):
+    def test_an_unreadable_roster_blocks_recovery_and_supervisor_rearm(self):
+        before = wi.incarnations_path(self.ws, self.wid).read_bytes()
+        launched = len(self.t.launches())
+        with mock.patch.object(sw.pr, "load_roster", return_value=None):
+            recovered = self.recover()
+            rearmed = rem.ensure_supervisor(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(recovered["outcome"], rem.INDETERMINATE)
+        self.assertIn("absent from the readable roster", recovered["why"])
+        self.assertEqual(rearmed["outcome"], rem.INDETERMINATE)
+        self.assertIn("absent from the readable roster", rearmed["why"])
+        self.assertEqual(wi.incarnations_path(self.ws, self.wid).read_bytes(), before)
+        self.assertEqual(len(self.t.launches()), launched)
+        self.assertFalse(any(c[0] == "bash" and c[1].endswith("worker-watcher-supervisor.sh")
+                             for c in self.t.calls))
+
+    def test_an_unknown_roster_runtime_blocks_recovery_and_supervisor_rearm(self):
+        roster = {"workers": {self.wid: {"runtime": "unrecognised"}}}
+        before = wi.incarnations_path(self.ws, self.wid).read_bytes()
+        launched = len(self.t.launches())
+        with mock.patch.object(sw.pr, "load_roster", return_value=roster):
+            recovered = self.recover()
+            rearmed = rem.ensure_supervisor(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(recovered["outcome"], rem.INDETERMINATE)
+        self.assertIn("unknown worker runtime", recovered["why"])
+        self.assertEqual(rearmed["outcome"], rem.INDETERMINATE)
+        self.assertIn("unknown worker runtime", rearmed["why"])
+        self.assertEqual(wi.incarnations_path(self.ws, self.wid).read_bytes(), before)
+        self.assertEqual(len(self.t.launches()), launched)
+        self.assertFalse(any(c[0] == "bash" and c[1].endswith("worker-watcher-supervisor.sh")
+                             for c in self.t.calls))
+
     def test_a_paused_worker_is_never_relaunched(self):
         (wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER).touch()
         self.assertEqual(self.recover()["outcome"], rem.PAUSED)
@@ -228,6 +376,87 @@ class ApplyingATick(Base):
         self.assertEqual(done["recoveries"][self.wid]["outcome"], rem.RECOVERED)
         after = sup.observe(self.ws, 1100.0, runner=self.t)[self.wid]
         self.assertIs(after.session_alive, True, "the worker is not back after a 'recovered'")
+
+
+LOGIN_PANE = ("❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n"
+              "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+API_PANE = ("  ⎿  API Error: 500 internal server error\n❯ \n"
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+
+class TheSweepOnALoggedOutWorker(Base):
+    """The user's report (2026-09-29): `--sweep --dry-run` said "nothing" for four
+    workers whose panes read "Login expired · Please run /login". The session is
+    alive, so the death ladder is silent; the finding has to come from the pane."""
+
+    def setUp(self):
+        super().setUp()
+        sup.pr.register_worker(self.ws, self.wid, "alpha")
+        for name, value in (("probe_session", True), ("session_watcher_holds", False),
+                            ("observe_pane", (ps.PANE_LOGGED_OUT, "f1"))):
+            p = mock.patch.object(sup, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(rem.wc, "capture", return_value=LOGIN_PANE)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = rem.main(["--workspace", str(self.ws), "--repo", str(REPO), *argv])
+        return rc, json.loads(out.getvalue())
+
+    def test_a_dry_run_reports_the_login_card_it_would_raise(self):
+        rc, out = self._run("--sweep", "--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["decisions"][self.wid], ps.CARD_LOGIN)
+        self.assertEqual(out["auth_expired"], [self.wid])
+        self.assertEqual(out["cards"], {}, "a dry run raises nothing")
+        self.assertFalse(sup.state_path(self.ws).exists())
+
+    def test_the_real_run_cards_the_owner_and_restarts_nothing(self):
+        rc, out = self._run("--sweep")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["recoveries"], {}, "a logged-out session is never respawned")
+        self.assertEqual(out["escalations"], [])
+        self.assertEqual(out["cards"][self.wid]["outcome"], "carded")
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        req = rem.wc.manager_for(self.ws).get(out["cards"][self.wid]["hitl_id"])
+        self.assertIn("Login expired · Please run /login", req.message)
+        self.assertIn("Run /login", req.message)
+        self.assertEqual(req.subject["wedge"], ps.CARD_LOGIN)
+        self.assertNotIn(req.id, out["cards_closed"])
+        # Raised once: the next sweep still reports the finding, without a second card.
+        rc, again = self._run("--sweep")
+        self.assertEqual((rc, again["decisions"][self.wid], again["cards"], again["auth_expired"]),
+                         (0, ps.NOTHING, {}, [self.wid]))
+        self.assertEqual(len(rem.wc.manager_for(self.ws).active()), 1)
+
+    def test_a_pane_that_moves_on_to_another_wedge_retires_the_login_card(self):
+        """One decision per (episode, kind): the acknowledged login card neither
+        silences the API error that follows it nor stays up once the pane stops
+        showing the expired login."""
+        clock = [5000.0]
+        with mock.patch.object(rem, "time", types.SimpleNamespace(time=lambda: clock[0])):
+            _, first = self._run("--sweep")
+            login_id = first["cards"][self.wid]["hitl_id"]
+            with mock.patch.object(sup, "observe_pane", return_value=(ps.PANE_ABNORMAL, "f2")), \
+                    mock.patch.object(sup, "work_outstanding", return_value=True), \
+                    mock.patch.object(rem.wc, "capture", return_value=API_PANE), \
+                    mock.patch.object(rem.wc.qa, "seat_env_base_url",
+                                      return_value=rem.wc.qa.SeatEnv(False, None)):
+                clock[0] += 300.0
+                _, second = self._run("--sweep")
+                clock[0] += 300.0
+                _, third = self._run("--sweep")
+        self.assertEqual((second["decisions"][self.wid], second["cards_closed"]),
+                         (ps.NOTHING, [login_id]), "the stale login card is retired at once")
+        self.assertEqual((third["decisions"][self.wid], third["cards"][self.wid]["outcome"]),
+                         (ps.CARD_CAUSE, "carded"))
+        active = rem.wc.manager_for(self.ws).active()
+        self.assertEqual([r.subject["wedge"] for r in active], [ps.CARD_CAUSE])
+        self.assertIn("API Error: 500", active[0].message)
 
 
 class OneCopyOfEachModule(unittest.TestCase):

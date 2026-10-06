@@ -52,7 +52,11 @@ queue_line() {
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local q="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task_queue.py"
 	[ -f "$q" ] || return 0
-	n="$("${SUTANDO_PY_BIN:-python3}" "$q" waiting --task-file "$task_file" 2>/dev/null)" || return 0
+	# The count is what waits in THIS watcher's inbox: a worker's delivery folder holds its own
+	# queue, while the payload it resolved to lives in the core's tasks/ beside everyone's.
+	local inbox=()
+	[ -z "${TASKS_DIR_ABS:-}" ] || inbox=(--inbox "$TASKS_DIR_ABS")
+	n="$("${SUTANDO_PY_BIN:-python3}" "$q" waiting --task-file "$task_file" ${inbox[@]+"${inbox[@]}"} 2>/dev/null)" || return 0
 	case "$n" in ''|*[!0-9]*) return 0 ;; esac
 	[ "$n" -gt 0 ] && printf 'QUEUE: %s pending after this\n' "$n"
 	return 0

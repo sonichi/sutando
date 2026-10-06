@@ -171,6 +171,32 @@ class BridgeWrapperTest(unittest.TestCase):
                 finally:
                     mod.RESULTS_DIR, mod.TASKS_DIR = saved
 
+    def test_replied_holder_respects_each_adapter_destination(self):
+        seen = set()
+        for name, mod in self._each():
+            seen.add(name)
+            field, asking, other = (("chat_id", "-1001", "-1002") if name == "telegram"
+                                     else ("channel_id", "C1", "C2"))
+            for destination in (asking, other):
+                with self.subTest(bridge=name, destination=destination):
+                    saved = (mod.RESULTS_DIR, mod.TASKS_DIR)
+                    try:
+                        with tempfile.TemporaryDirectory() as td:
+                            _, tasks = self._seed(
+                                mod, td, "[REPLIED]", ORIG + f"{field}: {asking}\nuser_id: alice\n")
+                            (tasks / "archive").mkdir()
+                            (tasks / "archive" / f"{HOLDER}.txt").write_text(
+                                f"{field}: {destination}\nuser_id: alice\n")
+                            self._call(name, mod, asking)
+                            written = [p for p in tasks.glob("task-*.txt") if p.stem != TID]
+                            self.assertEqual(len(written), int(destination != asking))
+                            if written:
+                                self.assertIn(f"{field}: {asking}", written[0].read_text())
+                                self.assertIn("DIFFERENT channel", written[0].read_text())
+                    finally:
+                        mod.RESULTS_DIR, mod.TASKS_DIR = saved
+        self.assertEqual(seen, set(BRIDGES), "every affected adapter must be exercised")
+
     def test_wrapper_never_raises_into_the_delivery_loop(self):
         """A recovery failure must not take the poll loop down with it."""
         for name, mod in self._each():

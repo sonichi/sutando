@@ -48,6 +48,11 @@ HARNESS="$TMPDIR_T/harness.sh"
   # the function undefined and the file is never removed, which reads as the
   # trap being broken rather than the harness being incomplete.
   echo "source \"$REPO/src/watcher_sentinel.sh\""
+  # cleanup() also calls settle_own_claims_on_shutdown() (added to fix a real
+  # reviewer-found interruption-settlement gap). Extract it too so cleanup()
+  # runs complete, not "command not found" -- its own guard (CLAIMS_DIR unset
+  # here) makes it a safe no-op without pulling in its further dependencies.
+  awk '/^settle_own_claims_on_shutdown\(\) \{/,/^\}/' "$WATCHER"
   # Pull the exact cleanup()/trap lines out of the real script so this test
   # breaks if the fix is ever reverted or edited incompatibly.
   sed -n '/^cleanup()/,/^trap .*HUP INT TERM$/p' "$WATCHER"

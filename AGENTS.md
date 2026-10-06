@@ -238,25 +238,23 @@ Tier dispatch, always in force: `access_tier: owner` (or a missing field) gets f
 
 ## Community support routing
 
-When the user reports a Sutando problem you cannot resolve (setup failures, bugs needing upstream fixes, behavior you can't explain), recommend the official Discord — https://discord.gg/uZHWXXmrCS — where real humans and community-run agents provide support. Include it alongside, not instead of, whatever diagnosis you can offer. Don't recommend it for questions you can answer yourself.
+Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop app, in a DM or a room, use the `report-feedback` skill, never a chat post or another agent; reply with the reference id it returns. For a Sutando problem you cannot resolve, also recommend the official Discord, https://discord.gg/uZHWXXmrCS, beside your diagnosis; not for questions you can answer.
 
 ## Pending decisions
 
-When you need user input on a decision or are blocked:
-1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
-2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
-4. Continue working on other things — don't block
+When you need the owner's word or are blocked:
+1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records it as a row of the owner's Pending questions database, via the store an installed skill declares (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next reconcile files it), queues it as `results/proactive-*.txt` (the task's conversation when that is the owner's DM; else his DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is history only.
+2. Continue with other work; don't block.
 
-On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
+`python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists; `--notify` reminds, on demand only; nothing is scheduled or surfaced per pass.
 
 ## Task progress notifications
 
 **Call notify BEFORE doing any work** — the notification must be the first thing the user sees
 after sending a task, not silence followed by a result minutes later.
 
-AG2 Space is the exception: there the 🫡 reaction on the source message is the
-pickup acknowledgement and no notify message is sent.
+AG2 Space is the exception: the platform shows each agent's pickup and working
+status under the message, so no notify message is sent.
 
 **Voice message tasks:** notify BEFORE calling the transcription script. Transcription takes
 10–30 seconds — the user should never wait in silence while you transcribe.
@@ -278,7 +276,7 @@ python3 skills/task-progress/scripts/notify.py \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). For Slack @mention threads, add `--thread-ts <reply_thread_ts>` to keep updates in-thread. An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). To thread it, add `--thread-ts <reply_thread_ts>` (Slack @mention) or `--thread-root '<thread_root>'` (AG2 Space). An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
 pending, the first line to that task's conversation names the position: one ahead, "Got it, right
@@ -302,10 +300,10 @@ with `python3 skills/agent-activity/scripts/activity.py append "<line>" --kind t
 
 ## Workspace layout
 
-- Vision + docs: `README.md` (this directory)
+- Vision + docs: `README.md`
 - Voice agent: `src/voice-agent.ts`
 - Task bridge: `src/task-bridge.ts`
-- Skills: `skills/`
+- Skills: `skills/`; yours: `<workspace>/skills/`
 
 **Looking for where an existing module lives?** [`docs/src-map.md`](docs/src-map.md)
 indexes every agent-facing source module under `src/` with a one-line purpose
@@ -335,7 +333,8 @@ answered in that room, threaded to `source_message_id`. Two tests apply:
   room asked for. What the owner asked for themselves (research, findings, errands, agent
   debugging, anything about the owner the others would not know) goes to the owner's DM even when
   asked in the room or by voice while docked in it; nothing goes in the room unless it was waiting
-  for it.
+  for it. By voice while docked, a task whose answer is for the owner starts its result with
+  `[dm-only]`: the task bridge keeps it to the DM, not the room.
 - **Data origin, on top.** Data read from the owner's connected accounts or device
   (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
   health or financial records) goes to the DM whatever the audience.
@@ -343,12 +342,12 @@ answered in that room, threaded to `source_message_id`. Two tests apply:
 When you move an answer the room was waiting for, post it in the DM and exactly one line in the
 room: 'I sent it to you in our DM.' Never move silently.
 
-**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Use them when multiple related tasks should produce ONE user-facing reply instead of N separate ones. Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially (several related tasks, ONE reply). Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
 - `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.
 - `[no-send]` — skip delivery (still archives); internally handled, no user-visible reply.
 - `[REPLIED]` — skip delivery (already sent through another path).
 - `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
-- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere in the body, stripped only when standing alone on its line.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
 
 **Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`; history in [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
@@ -360,9 +359,9 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past every existing consumer, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
 
-**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
+**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. Pass `timeout_ms: 1800000` and re-arm on the expiry or early-exit notice (`Monitor` has no `persistent` option).
 
-If you notice the stream watcher has stopped, re-arm it yourself via the `Monitor` tool as described above.
+If the watcher stops, start it again the same way; a start on a watched inbox exits 0 by itself. See [`docs/task-watcher-hosting-modes.md`](docs/task-watcher-hosting-modes.md).
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 

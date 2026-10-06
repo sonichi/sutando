@@ -64,13 +64,25 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import (body_claimable_by, claims_unless_routed_elsewhere,  # noqa: E402
+                               other_bridges_configured)
 
 
-def _slack_claims_name(name: str) -> bool:
+def _other_bridges_configured() -> bool:
+    """Another bridge installed beside Slack on this host (channels/<bridge>/)."""
+    try:
+        return other_bridges_configured("slack", claude_home_path("channels"))
+    except Exception:
+        return False
+
+
+def _slack_claims_name(name: str, body=None) -> bool:
     """Filename-level claim decision — the policy lives in proactive_routing;
-    this adapter only binds its channel."""
-    return fallback_claims_name(name, "slack")
+    this adapter only binds its channel. A tag outranks; a body addressed to
+    Slack outranks activity routing; an untagged file is Slack's when the
+    owner was last active here, or with no record on a Slack-only install."""
+    return claims_unless_routed_elsewhere(name, OWNER_ACTIVITY_FILE, "slack",
+                                          body=body, other_bridges_configured=_other_bridges_configured())
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
 
@@ -604,7 +616,8 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
         _pop_pending_reply(task_id)
         raise
 
-# Per-task timeout. Mirrors task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (10 min):
+# Per-task NUDGE timer, NOT task-bridge.ts's DEFAULT_TASK_TIMEOUT_MS (which
+# abandons a task at its deadline; this keeps waiting, hence still 10 min):
 # if the core session wedges (e.g. hits the 1M-context usage-credit gate and
 # loops on the API error), no result file is ever written and the Slack user
 # gets silence. After this many seconds we post a one-time "still working /
@@ -1782,8 +1795,8 @@ def result_watcher():
                         continue
                     if not body_claimable_by(peek, "slack"):
                         continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    # Tag, then a Slack address in the body, then activity routing.
+                    if not _slack_claims_name(f.name, peek):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

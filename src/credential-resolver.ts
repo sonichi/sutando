@@ -36,13 +36,14 @@
  * honors the quarantine marker — quarantine is about revoking managed
  * credentials after logout, not about source choice.
  *
- * 'gemini-image' (the image-generation skill) walks the slots text THEN voice
- * in each tier: any Gemini key generates images, and a managed-key install
- * holds only the voice entry. It is not a voice surface, so a 'managed'
- * preference never blocks its env fallback; a 'byok' preference skips only the
- * managed VOICE slot (the owner chose their own key for voice, so that managed
- * entry is not theirs to spend), and quarantine hides every managed entry as
- * always. Twin: src/credential_resolver.py.
+ * 'gemini-image' (the image-generation skill) walks text THEN voice in the ENV
+ * tier: any real Gemini key generates images. In the MANAGED tier it reads the
+ * text slot only: the managed voice entry is a cloud-minted Gemini Live
+ * ephemeral token (`auth_tokens/...`), accepted by the Live API alone, so
+ * spending it on `generateContent` is rejected as an invalid API key. It is
+ * not a voice surface, so a 'managed' preference never blocks its env fallback,
+ * and quarantine hides every managed entry as always.
+ * Twin: src/credential_resolver.py.
  *
  * With no managed file present (every pre-managed install), resolution is
  * byte-for-byte identical to the legacy env chain — this module changes where
@@ -90,7 +91,14 @@ export interface ResolvedCredential {
 }
 
 /** Per-capability lookup order within a tier (voice falls back to text). */
-const CAPABILITY_FALLBACKS: Record<Capability, string[]> = {
+// Per-capability lookup order per tier (voice falls back to text). The managed
+// voice entry is a Live-only ephemeral token: only the voice capability may spend it.
+const MANAGED_SLOTS: Record<Capability, string[]> = {
+	'gemini-voice': ['gemini-voice', 'gemini-text'],
+	'gemini-text': ['gemini-text'],
+	'gemini-image': ['gemini-text'],
+};
+const ENV_SLOTS: Record<Capability, string[]> = {
 	'gemini-voice': ['gemini-voice', 'gemini-text'],
 	'gemini-text': ['gemini-text'],
 	'gemini-image': ['gemini-text', 'gemini-voice'],
@@ -140,15 +148,12 @@ export function resolveCredential(
 	capability: Capability,
 	opts?: { managedPath?: string },
 ): ResolvedCredential {
-	const slots = CAPABILITY_FALLBACKS[capability];
 	const managed = readManaged(opts?.managedPath ?? managedCredentialsPath());
 	// S1: the preference governs the VOICE capability; quarantine hides
 	// managed entries from every capability in every mode.
 	const preference = capability === 'gemini-voice' ? managed.voicePreference : undefined;
 	if (preference !== 'byok' && !managed.quarantined) {
-		for (const slot of slots) {
-			// The managed voice entry is not the image capability's to spend under a byok voice preference.
-			if (capability === 'gemini-image' && slot === 'gemini-voice' && managed.voicePreference === 'byok') continue;
+		for (const slot of MANAGED_SLOTS[capability]) {
 			const entry = managed.caps[slot];
 			const key = entry?.key;
 			if (typeof key === 'string' && key) {
@@ -171,7 +176,7 @@ export function resolveCredential(
 		// logout-quarantine bypass the design closes). Fail actionably.
 		return { key: '', source: 'none' };
 	}
-	for (const slot of slots) {
+	for (const slot of ENV_SLOTS[capability]) {
 		const key = process.env[ENV_VARS[slot]];
 		if (key) {
 			// S3/U4: for the voice capability the launcher injects

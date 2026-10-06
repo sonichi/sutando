@@ -306,11 +306,37 @@ def parse_markers(text: str) -> ParseResult:
     return ParseResult(body=body, actions=actions)
 
 
-_TASK_CHANNEL_RE = re.compile(r"^channel_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)\s*$", re.MULTILINE)
+_TASK_SOURCE_RE = re.compile(r"^source:\s*(\S+)\s*$", re.MULTILINE)
 _TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
 
 
-def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
+def task_channel_id(task_text: str | None) -> str | None:
+    """Read the task destination, including Telegram's chat_id spelling."""
+    match = _TASK_CHANNEL_RE.search(task_text or "")
+    return match.group(1).strip() if match else None
+
+
+def task_source(task_text: str | None) -> str | None:
+    """Provider namespace for task destinations; provider names are case-insensitive."""
+    match = _TASK_SOURCE_RE.search(task_text or "")
+    return match.group(1).casefold() if match else None
+
+
+def dedup_destination_mismatch(asking_channel, holder_channel,
+                               asking_source=None, holder_source=None) -> bool:
+    """Known destinations differ by room/chat ID OR by provider namespace.
+
+    Missing metadata keeps the existing unknown-route policy. Provider IDs
+    are not globally unique: Discord channel 4242 is not Telegram chat 4242.
+    """
+    if asking_source and holder_source and str(asking_source).casefold() != str(holder_source).casefold():
+        return True
+    return bool(asking_channel and holder_channel and str(asking_channel) != str(holder_channel))
+
+
+def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None,
+                               asking_source: str | None = None) -> str | None:
     """Channel-aware dedup support.
 
     A `[deduped: task-X]` result silently archives the deduped task and
@@ -320,22 +346,15 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     is left silent while the answer lands elsewhere (observed 2026-06-22: an
     owner question in #workspace-revamp folded into a #design holder).
 
-    Returns the holder's `channel_id` when it is known AND differs from the
-    deduped task's own channel — a cross-channel dedup, which is INVALID
-    (dedup is per-channel only). The bridge rejects it and re-queues the
-    original task to be re-answered in its own channel. Returns None (→ keep
-    the silent-archive behavior) when the holder text is missing, has no
-    channel_id, or is the SAME channel (the common, correct intra-channel
-    consolidation case).
+    Returns the holder's destination (or provider if its room is unknown)
+    when known room IDs or known provider names differ. The bridge rejects
+    the fold and re-queues the original task to its own destination. Missing
+    dimensions do not establish a mismatch; unknown-route policy is separate.
     """
-    if not holder_task_text:
-        return None
-    m = _TASK_CHANNEL_RE.search(holder_task_text)
-    if not m:
-        return None
-    holder_channel = m.group(1).strip()
-    if holder_channel and str(holder_channel) != str(deduped_channel_id):
-        return holder_channel
+    holder_channel = task_channel_id(holder_task_text)
+    if dedup_destination_mismatch(deduped_channel_id, holder_channel,
+                                  asking_source, task_source(holder_task_text)):
+        return holder_channel or task_source(holder_task_text)
     return None
 
 
@@ -378,22 +397,14 @@ def dedup_cross_sender_target(deduped_user_id, holder_task_text: str | None) -> 
 
 
 def dedup_holder_delivered(holder_result_text: str | None) -> bool:
-    """Whether a `[deduped: task-X]` holder actually produced a user-facing reply.
-
-    A dedup is only valid if the holder answered. When the holder's own result
-    was empty or was itself a skip marker, honouring the dedup archives the
-    asking task against a delivery that never happened, and every retry carrying
-    the same marker is archived the same way — the ask can never be answered.
-
-    Pure: the caller supplies the holder's archived result text (None when the
-    archive has no record of it).
-    """
+    """Accept reply bodies or REPLIED; empty and other skip results promise no answer."""
     if holder_result_text is None:
         return False
     body = holder_result_text.strip()
     if not body:
         return False
-    return not any(a.kind == "skip" for a in parse_markers(body).actions)
+    return not any(a.kind == "skip" and a.value != "REPLIED"
+                   for a in parse_markers(body).actions)
 
 
 _REQUEUE_COUNT_RE = re.compile(r"^dedup_requeue_count:\s*(\d+)\s*$", re.MULTILINE)
@@ -485,8 +496,8 @@ def render_skill_prelude(
             "confidence is exactly the signal that fails. The only exception is a "
             'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
         _step += 1
-        # No notify step here: the broker's status glyph already shows
-        # received/working, and pickup is the 🫡 reaction, not a chat message.
+        # No notify step here: the broker's delivery status already shows
+        # pickup and working, so no notify message is sent.
     _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
     return _skill
 
@@ -551,6 +562,20 @@ def build_requeued_task(
         + "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
     )
     return "\n".join(lines) + note
+
+
+# Every bracket word the patterns above act on; the inverse of the grammar lives
+# beside it so a new marker is added to both at once.
+_MARKER_OPEN_RE = re.compile(
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|reply:|dm-only|file:|send:|attach:))",
+    re.IGNORECASE)
+
+
+def neutralize_markers(text: str) -> str:
+    """Quoted form of `text` for a body that EMBEDS it: a space after each marker's
+    opening bracket keeps the words readable and takes the token out of every
+    pattern in this module, so parse_markers emits no action for it."""
+    return _MARKER_OPEN_RE.sub("[ ", text or "")
 
 
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:

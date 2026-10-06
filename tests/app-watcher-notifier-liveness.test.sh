@@ -30,9 +30,16 @@ if grep -A 12 '^watcher_process_alive() {' "$SRC" | grep -qE '^\s*pgrep -f "watc
 else
   ok "2 watcher_process_alive does not use a bare unscoped pgrep"
 fi
-grep -A 12 '^watcher_process_alive() {' "$SRC" | grep -q "sentinel_path_for" \
-  && ok "3 watcher_process_alive is scoped via the established per-instance sentinel mechanism" \
-  || fail "3" "no sentinel_path_for scoping found -- liveness check may not be instance-scoped"
+# Per-instance scoping: the sentinel (a watcher child) or, since the session
+# idles in standby with no watcher by design, the session's own supervisor pane.
+if grep -A 12 '^watcher_process_alive() {' "$SRC" | grep -q "sentinel_path_for"; then
+  ok "3 watcher_process_alive is scoped via the established per-instance sentinel mechanism"
+elif grep -A 12 '^watcher_process_alive() {' "$SRC" | grep -q 'WATCHER_SESSION' \
+  && grep -A 12 '^watcher_process_alive() {' "$SRC" | grep -q 'pane_pid'; then
+  ok "3 watcher_process_alive is scoped to this instance's own watcher session (its supervisor pane)"
+else
+  fail "3" "no per-instance scoping found -- liveness check may not be instance-scoped"
+fi
 
 # --- Behavioral: the sentinel_path_for + kill-0 mechanism itself, isolated --
 # Extract sentinel_path_for from the real, shared watcher_sentinel.sh (the

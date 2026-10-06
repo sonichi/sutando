@@ -17,8 +17,14 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`,
+2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `timeout_ms: 1800000`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Re-arm it on the expiry notice and on any notice that it exited early (on macOS Claude Code reports a
+   SIGTERM death as `exit code 144`); the inbox is unwatched until the standby's grace elapses.
+   `Monitor` has no `persistent` option: it kills the command at `timeout_ms` (30 min is the maximum) and
+   sends one expiry notice. On that notice, re-arm the watcher the same way (a start on a watched inbox
+   exits 0); until you do, the external standby announces tasks through the pane after a 45 s grace.
    Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
@@ -56,10 +62,12 @@ caps this file and refuses date stamps in it).
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
-   when voice is connected, plus a macOS notification.
+2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
+   (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
+   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
+   only when he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
-   record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
+   record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
    token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
 3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
@@ -101,21 +109,30 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
    (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
-8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
-   placed by importance (only the top 5 render anywhere), and assert with the reader:
-   `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
-   position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
-   Then pivot; never block.
-9. **Watcher.** Act only on the `task-watcher` probe from step 3. Stop pids only when the probe presents
-   owned and ownerless as two separately labelled groups; one undifferentiated list means change nothing.
-   Not running with no trees → `Monitor` `bash src/watch-tasks-stream.sh` persistent. A missing sentinel
-   is UNKNOWN, not dead; never hand-roll a process check.
+8. **Ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]`
+   — never hand-edit. It records the row in the owner's Pending questions database (the outbox holds it
+   while the room is unreachable), queues the question to the owner (an owner-DM task's conversation,
+   else his DM) and fires the macOS notification. Read its output: a `FAILED` line is not an ask;
+   confirm the id with `pending_questions_reader.py list --json`. Then pivot; never block.
+9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
+   "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
+   if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
+   duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
+   change nothing and say so. A re-arm that prints `WATCHER_HELD:` on stdout did not start: it names
+   the holder (pid, role, whether its output is read) and the `--force-restart` command; report that
+   line and do not re-arm again. `--force-restart` replaces a holder; use it only on the owner's word.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
+   untagged watcher is invisible to the verdict above and to the supervisor.
 9.5. **PR thread gate**, chained so a refusal cannot be skipped:
    `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
    (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
 10. **Discord.** Check the channels in `reference_discord_channels.md`; forward actionable public items to
     the dev channel. #bot2bot tags: `claim:` `blocked:` `done:` `ping:` `nack:` `opinion-requested:`.
-    First PR opened wins a claim. Bots never merge. Three unresolved round-trips → both positions to
-    `pending-questions.md`, proceed with the cheaper-to-reverse option.
+    First PR opened wins a claim. Bots never merge. Three unresolved round-trips → both positions in one
+    `ask-owner.py` ask, proceed with the cheaper-to-reverse option.
 11. **Heartbeat.** Substantive pass + #bot2bot configured + other bot active → `done: <one line>` via the
     `bot2bot-post` skill. Never fall back to `results/proactive-*.txt`. Never write `contextual-chips.json`.

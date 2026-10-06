@@ -28,10 +28,14 @@ REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 
 def run(watcher_instance, receipt_owner, want_state=False):
-    """receipt_owner: None | 'default' | '<instance>' — whose receipt exists."""
+    """receipt_owner: None | 'default' | '<instance>' — whose receipt exists.
+    A worker's own inbox is <ws>/deliveries/<id>, never the bare <ws>/tasks
+    the core alone watches -- using the real shape is what makes
+    watcher_instance a worker case rather than a foreign id on the core's own inbox."""
     tmp = Path(tempfile.mkdtemp(prefix="b4-"))
     ws = tmp / "ws"
-    (ws / "tasks").mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
+    inbox = (ws / "deliveries" / watcher_instance) if watcher_instance else (ws / "tasks")
+    inbox.mkdir(parents=True); (ws / "results" / "archive").mkdir(parents=True)
     (ws / "state").mkdir()
     feed = tmp / "feed"; feed.write_text("")
     b = tmp / "bin"; b.mkdir()
@@ -40,7 +44,7 @@ def run(watcher_instance, receipt_owner, want_state=False):
     h.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = "--probe" ] && { echo probe >> %s; exit 0; }; done\n'
                  'echo handle >> %s\nexit 0\n' % (log, log)); h.chmod(0o755)
     name = "task-demo.txt"
-    (ws / "tasks" / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
+    (inbox / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
     if receipt_owner is not None:
         env0 = dict(os.environ)
         if receipt_owner != "default": env0["SUTANDO_INSTANCE_ID"] = receipt_owner
@@ -48,20 +52,25 @@ def run(watcher_instance, receipt_owner, want_state=False):
         d = subprocess.run(["python3", str(REPO/"src/util_paths.py"), "handler-fallbacks-dir",
                             str(ws/"state")], capture_output=True, text=True, env=env0).stdout.strip()
         Path(d).mkdir(parents=True, exist_ok=True)
-        (Path(d) / name).write_text(str(ws / "tasks" / name) + "\n")
+        (Path(d) / name).write_text(str(inbox / name) + "\n")
     env = dict(os.environ)
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
     if watcher_instance: env["SUTANDO_INSTANCE_ID"] = watcher_instance
     else: env.pop("SUTANDO_INSTANCE_ID", None)
-    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(ws / "tasks")], cwd=str(REPO),
-                         env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    # stderr is kept: a probe that fails with nothing to read cannot be diagnosed.
+    errf = open(tmp / "watcher.err", "w+")
+    p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)], cwd=str(REPO),
+                         env=env, stdout=subprocess.PIPE, stderr=errf,
                          text=True, start_new_session=True)
     out, t0, seen_state = [], time.time(), set()
+    # The sentinel lands only after fswatch is confirmed up, so a loaded runner
+    # can take longer than a probe that stops at TASK_FILE; give it a real budget.
+    budget = 30 if want_state else 8
     try:
         os.set_blocking(p.stdout.fileno(), False)
-        while time.time() - t0 < 8:
+        while time.time() - t0 < budget:
             time.sleep(0.3)
             try:
                 c = p.stdout.read()
@@ -69,23 +78,40 @@ def run(watcher_instance, receipt_owner, want_state=False):
             except Exception: pass
             # Sample WHILE the watcher lives: its cleanup trap unlinks the
             # sentinel on exit, so a post-hoc listing is always empty.
-            seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            if want_state and not seen_state:
+                seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+                if seen_state:
+                    print(f"  sentinel landed {time.time() - t0:.1f}s after launch")
+            else:
+                seen_state.update(q.name for q in (ws / "state").glob("watch-tasks-stream*.pid"))
+            # The sweep announces before the sentinel is stamped (the stamp
+            # waits for fswatch to be confirmed up), so keep sampling for it.
+            if want_state and not seen_state: continue
             if log.exists() and "handle" in log.read_text(): break
             if any("TASK_FILE" in c for c in out): break
     finally:
         try: os.killpg(os.getpgid(p.pid), 15)
         except Exception: pass
         p.wait(timeout=5)
+        errf.seek(0); LAST_STDERR[0] = errf.read(); errf.close()
     _res = "".join(out).strip().splitlines(), (log.read_text().split() if log.exists() else [])
     return (sorted(seen_state), _res) if want_state else _res
+
+LAST_STDERR = [""]
 
 def check(name, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
+        if LAST_STDERR[0].strip():
+            print("  watcher stderr:")
+            for line in LAST_STDERR[0].strip().splitlines()[-20:]:
+                print("    " + line)
 
 
-HANDLED = ["probe", "probe", "handle"]  # enqueue-time probe, then drain's own re-probe
+# Single probe now: no queue between probe and run to guard against a stale
+# enqueue-time handler reference (see PR body for the old async shape).
+HANDLED = ["probe", "handle"]
 BYPASSED = ["probe"]
 NO_HANDLER_CALL = []  # a worker never probes: not even a bare "probe" entry
 

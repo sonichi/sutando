@@ -4,6 +4,19 @@ The explicit ``vault set KEY VALUE`` path stores named values in Keychain.
 This module covers the other common case: somebody pastes a token into ordinary
 Discord/Slack prose. Known values are replaced before task files, owner-activity
 state, prompt scratch files, or bridge logs are written.
+
+Slack's token family is defined once here, as ``SLACK_TOKEN_PATTERN``, and
+every other reader imports it (``secret_scanner`` for whole-secret redaction
+and the vault value classifier, the report-feedback log scrub). The family is
+wider than the bot/user tokens most scanners key on: ``xoxb-``/``xoxp-``/
+``xoxa-``/``xoxs-``/``xoxo-`` bot, user, workspace, session and legacy tokens,
+``xoxc-``/``xoxd-`` browser session tokens, ``xoxe-`` refresh tokens, ``xoxr-``
+config refresh tokens, the rotated ``xoxe.xoxb-``/``xoxe.xoxp-`` access tokens,
+and ``xapp-`` app-level (Socket Mode) tokens. A private ``xox[abps]`` copy let
+a pasted app-level token reach a task file in plaintext while the bot token
+beside it was redacted (user feedback, P1-43). Every kind carries a digit
+right after its dash, so the family requires one: a ``xoxo-<name>`` sign-off
+in prose is left alone.
 """
 
 from __future__ import annotations
@@ -13,6 +26,10 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
+
+SLACK_TOKEN_PATTERN = re.compile(
+    r"(?:xoxe\.)?xox[abcdeoprs]-\d[A-Za-z0-9-]*|xapp-\d[A-Za-z0-9-]*"
+)
 
 _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
@@ -39,7 +56,7 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
         r"https?://(?:(?!%7[Cc])[^\s|])+(?:\||%7[Cc])[A-Za-z0-9_+/=-]{20,}"
     )),
     ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
-    ("Slack Token", re.compile(r"xox[abps]-[A-Za-z0-9-]+")),
+    ("Slack Token", SLACK_TOKEN_PATTERN),
     ("OpenAI Token", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
     ("Stripe Access Key", re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}")),
     ("Discord Bot Token", re.compile(
