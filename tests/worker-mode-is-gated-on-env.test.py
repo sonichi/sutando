@@ -24,6 +24,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -175,7 +177,7 @@ def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
     shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     ws = td / "ws"; ws.mkdir()
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
-    env = {**os.environ, "SUTANDO_RESULTS_DIR": str(ws / "results"), **extra_env}
+    env = {**clean_env(), "SUTANDO_RESULTS_DIR": str(ws / "results"), **extra_env}
     if "SUTANDO_TASKS_DIR" not in extra_env:
         env.pop("SUTANDO_TASKS_DIR", None)
     # The --inbox tag names the same directory the env resolves to.
@@ -209,7 +211,7 @@ def _state_root(extra_env: dict, td: Path):
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
     handler = td / "handler.sh"; handler.write_text("#!/bin/bash\nexit 3\n"); handler.chmod(0o755)
     inbox = td / "deliveries" / ("b" * 32)
-    env = {**os.environ, "SUTANDO_RESULTS_DIR": str(ws / "results"), "SUTANDO_TASKS_DIR": str(inbox),
+    env = {**clean_env(), "SUTANDO_RESULTS_DIR": str(ws / "results"), "SUTANDO_TASKS_DIR": str(inbox),
            "SUTANDO_TASK_EVENT_HANDLER": str(handler), **extra_env}
     env.pop("SUTANDO_WORKSPACE_DIR", None) if "SUTANDO_WORKSPACE_DIR" not in extra_env else None
     p = subprocess.Popen(["bash", str(root / "src" / "watch-tasks-stream.sh"), "--role", "standby", "--inbox", str(inbox)],

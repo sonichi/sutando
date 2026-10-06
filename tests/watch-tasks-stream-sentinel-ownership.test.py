@@ -46,6 +46,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -103,7 +105,7 @@ class Watcher:
     def __init__(self, workspace: Path, bin_dir: Path, args=()):
         # No fswatch relaunch: this test drives cleanup() through the EOF a
         # killed fswatch leaves, so the first EOF must end the watcher.
-        env = dict(os.environ,
+        env = dict(clean_env(),
                    SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1",
                    SUTANDO_FSWATCH_RESTART_MAX="0",
                    PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH','')}")

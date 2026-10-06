@@ -18,11 +18,14 @@ Run: python3 tests/watch-tasks-stream-bare-directory-event.test.py
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -66,7 +69,7 @@ class Harness:
         return p
 
     def start(self, **extra_env: str) -> None:
-        env = dict(os.environ)
+        env = clean_env()
         env["PATH"] = f"{self.tmp/'bin'}:{env['PATH']}"
         env.update(extra_env)
         env["TMPDIR"] = str(self.tmp)
