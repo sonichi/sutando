@@ -579,6 +579,13 @@ def composer_block_path(state_dir, instance=None, agent=None) -> Path:
     return Path(state_dir) / f"task-notifier-composer-block{suffix}"
 
 
+def turn_failure_path(state_dir, instance=None, agent=None) -> Path:
+    """Where THIS instance's core records its last API-error turn (delivery/turn_failure.py);
+    the notifier typing into that core reads the same file."""
+    key = instance_scope_key(state_dir, instance, agent)
+    return Path(state_dir) / "core-turn-failure" / f"{key or 'core'}.json"
+
+
 def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
     """Where THIS instance records "my optional handler declined this task".
 

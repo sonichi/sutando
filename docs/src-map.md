@@ -203,6 +203,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
+- **`stop-failure.sh`** — StopFailure hook: an API error ended the turn, so the prompt it was running is lost.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
@@ -341,6 +342,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`task_dispatch.py`** — Consumer-side dispatch policy shared by every external task-notifier.
+- **`turn_failure.py`** — Re-deliver a task whose prompt an API-error turn consumed.
 - **`worker-stage.sh`** — One pool delivery stage writer for the Claude watcher and Codex notifier.
 
 ## `src/hitl/`
