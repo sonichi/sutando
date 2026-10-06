@@ -974,6 +974,21 @@ class TestRecoveryPlan(ClassifyBase):
         self.assertEqual(plan["archive"], [])
         self.assertIn("Import stalled at phase scanning", plan["body"])
 
+    def test_unbound_row_is_never_archived_and_names_its_line_in_the_body(self):
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 379))
+        self.ws.status("indexed", NOW - 300)  # no task_id -> unbound
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["archive"], [])
+        self.assertIn("An import run started", plan["body"])
+
+    def test_unknown_row_is_never_archived_and_names_its_line_in_the_body(self):
+        self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: hi\n")
+        with unittest.mock.patch.object(self.mod, "_holder_of",
+                                        side_effect=PermissionError(1, "Operation not permitted")):
+            plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["archive"], [])
+        self.assertIn("Could not read deliveries/", plan["body"])
+
     def test_the_whole_body_is_independently_inert(self):
         self.ws.task("task-1.txt",
                      f"timestamp: {iso(NOW - 900)}\nsource: chat\n"
