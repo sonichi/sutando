@@ -12,6 +12,9 @@ Mocks the agy/gemini binaries and verifies:
      --add-dir). A wrapper that requires agy fails this in any environment lacking it.
   4. An unknown --approval-mode is rejected regardless of backend.
   5. Prompt is required unless --check is used.
+  6. In agy's Gemini-key mode with no GEMINI_API_KEY in the env, the key is read from
+     the vault and reaches agy only through its env; an env key wins, a vault miss
+     is not fatal, and the vault is never consulted outside that mode.
 
 Run: python3 tests/agy-wrapper.test.py
 """
@@ -129,6 +132,72 @@ def test_prompt_required(tmp: Path) -> None:
     assert "prompt required" in out, f"missing guard message: {out}"
 
 
+FAKE_VAULT = """#!/usr/bin/env python3
+import os, sys
+open(os.environ["VAULT_CALLS"], "a").write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:] == ["get", "GEMINI_API_KEY"] and os.environ.get("VAULT_HAS_KEY") == "1":
+    print("vault-secret-123")
+    sys.exit(0)
+sys.exit(1)
+"""
+
+KEY_MOCK = "#!/bin/bash\nprintf '%s' \"${GEMINI_API_KEY:-<unset>}\" >\"$MOCK_OUT\"\n"
+
+
+def run_vault_case(tmp: Path, name: str, provider: bool, env_key: str | None, vault_has: bool) -> tuple[int, str, str, str]:
+    tree = tmp / f"tree_{name}"
+    (tree / "skills" / "agy" / "scripts").mkdir(parents=True)
+    (tree / "skills" / "secret-vault").mkdir(parents=True)
+    script = tree / "skills" / "agy" / "scripts" / "gemini-run.sh"
+    script.write_text(SCRIPT.read_text())
+    (tree / "skills" / "secret-vault" / "secret-vault.py").write_text(FAKE_VAULT)
+    home = tmp / f"home_{name}"
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"modelProvider": "gemini"}' if provider else "{}")
+    bin_dir = tmp / f"bin_{name}"
+    bin_dir.mkdir()
+    agy = bin_dir / "agy"
+    agy.write_text(KEY_MOCK)
+    agy.chmod(0o755)
+    mock_out, calls = tmp / f"{name}.key", tmp / f"{name}.calls"
+    calls.write_text("")
+    env = os.environ.copy()
+    env.update(HOME=str(home), MOCK_OUT=str(mock_out), VAULT_CALLS=str(calls),
+               VAULT_HAS_KEY="1" if vault_has else "0",
+               PATH=":".join([str(bin_dir), os.path.dirname(os.path.realpath(__import__("sys").executable)), "/usr/bin", "/bin"]))
+    env.pop("GEMINI_API_KEY", None)
+    if env_key is not None:
+        env["GEMINI_API_KEY"] = env_key
+    proc = subprocess.run(["bash", str(script), "--", "hi"], env=env, capture_output=True, text=True)
+    return proc.returncode, proc.stdout + proc.stderr, mock_out.read_text() if mock_out.exists() else "", calls.read_text()
+
+
+def test_vault_key_in_gemini_mode(tmp: Path) -> None:
+    rc, out, seen, calls = run_vault_case(tmp, "vault", provider=True, env_key=None, vault_has=True)
+    assert rc == 0, out
+    assert seen == "vault-secret-123", f"agy did not get the vault key: {seen!r}"
+    assert "vault-secret-123" not in out, "the key leaked to the wrapper's output"
+    assert calls.strip() == "get GEMINI_API_KEY", calls
+
+
+def test_env_key_wins(tmp: Path) -> None:
+    rc, out, seen, calls = run_vault_case(tmp, "envwins", provider=True, env_key="from-env", vault_has=True)
+    assert rc == 0 and seen == "from-env", (rc, seen, out)
+    assert calls == "", f"vault consulted although the env had a key: {calls!r}"
+
+
+def test_vault_miss_not_fatal(tmp: Path) -> None:
+    rc, out, seen, calls = run_vault_case(tmp, "miss", provider=True, env_key=None, vault_has=False)
+    assert rc == 0 and seen == "<unset>", (rc, seen, out)
+
+
+def test_no_vault_outside_gemini_mode(tmp: Path) -> None:
+    rc, out, seen, calls = run_vault_case(tmp, "nomode", provider=False, env_key=None, vault_has=True)
+    assert rc == 0 and seen == "<unset>", (rc, seen, out)
+    assert calls == "", f"vault consulted outside Gemini-key mode: {calls!r}"
+
+
 def main() -> None:
     assert SCRIPT.exists(), f"missing: {SCRIPT}"
     with tempfile.TemporaryDirectory() as raw:
@@ -140,6 +209,10 @@ def main() -> None:
             test_neither_backend_fails,
             test_unknown_approval_mode_rejected,
             test_prompt_required,
+            test_vault_key_in_gemini_mode,
+            test_env_key_wins,
+            test_vault_miss_not_fatal,
+            test_no_vault_outside_gemini_mode,
         ):
             fn(tmp)
             print(f"PASS {fn.__name__}")

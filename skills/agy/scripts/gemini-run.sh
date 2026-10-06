@@ -164,6 +164,14 @@ PROMPT="${PROMPT_ARGS[*]-}"
 [[ -n "$PROMPT" ]] || fail "prompt required unless --check is used"
 
 if [[ "$BACKEND" == "agy" ]]; then
+  # agy's Gemini-key mode reads the key only from its env; the owner keeps it in the vault, not a file.
+  if [[ -z "${GEMINI_API_KEY:-}" ]] && grep -q '"modelProvider"[[:space:]]*:[[:space:]]*"gemini"' "${HOME}/.gemini/antigravity-cli/settings.json" 2>/dev/null; then
+    vault_cli="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/../../secret-vault/secret-vault.py"
+    if [[ -f "$vault_cli" ]] && vault_key="$(python3 "$vault_cli" get GEMINI_API_KEY 2>/dev/null)" && [[ -n "$vault_key" ]]; then
+      export GEMINI_API_KEY="$vault_key"
+    fi
+    unset vault_key
+  fi
   cmd=("$AGY_BIN" --prompt "$PROMPT" --output-format "$OUTPUT_FORMAT")
   case "$APPROVAL_MODE" in
     plan) cmd+=(--mode plan) ;;
