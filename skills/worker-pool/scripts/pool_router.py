@@ -208,6 +208,11 @@ def deliver_one(workspace, recipient: str, task_id: str,
     # Check-of-both-names and create are ONE transition under the folder's lock,
     # through its directory fd: an accept between them cannot slip a rename in.
     with pd.arbitration(workspace, recipient, **(_arbitration_seams or {})) as dfd:
+        # A marked folder takes claims, never deliveries: no write and no adoption into it.
+        marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
+        if marker != "absent":
+            raise ConflictingDelivery(
+                f"{task_id}: {recipient} carries {pd.NON_EXCLUSIVE_MARKER} ({marker}); refusing to deliver into it")
         if pd.find_in(dfd, task_id) is not None:
             _attribute(workspace, recipient, task_id)
             return "already"
@@ -247,12 +252,14 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
     # One per-task lock around the whole decision; the commit is resolved before
     # the roster is needed, so a replay finishes it even if the roster is gone.
     with task_arbitration(workspace, task_id):
+        # One snapshot for the whole pass: marker eligibility and target choice must agree.
+        snapshot = pr.load_roster(workspace) if roster is FROM_DISK else roster
         committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams,
-                                        roster=roster)
+                                        roster=snapshot)
         if committed is not None:
-            targets, unknown, r = [committed], [], (roster if isinstance(roster, dict) else {})
+            targets, unknown, r = [committed], [], (snapshot if isinstance(snapshot, dict) else {})
         else:
-            r = pr.load_roster(workspace) if roster is FROM_DISK else roster
+            r = snapshot
             if r is None:
                 raise RouterRefused("roster is absent or unreadable — refusing the pass")
             source = task.get("channel_id") or task.get("source") or ""
