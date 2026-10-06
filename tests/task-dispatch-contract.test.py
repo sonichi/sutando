@@ -40,6 +40,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
+    mark_partial_paste, partial_paste_leftover,
     _main,
     find_ready_result,
     find_ready_result_for_filename,
@@ -965,6 +966,116 @@ class InflightRecordTest(unittest.TestCase):
         self.assertEqual(0, run("inflight-clear", str(self.dir), "task-c.txt").returncode)
         self.assertEqual(2, run("inflight-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
         self.assertEqual(2, run("inflight-mark", str(self.dir), "../x.txt", "1").returncode)
+
+
+class PartialPasteLeftoverTest(unittest.TestCase):
+    """The cut-short-paste marker, extended with the garbled text a failed attempt
+    left in the composer -- what proves a non-boundary leftover is the notifier's
+    own, safe to clear, rather than an unrelated human draft."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "partial"
+
+    def test_recorded_text_comes_back_for_the_same_incarnation(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "garbled le")
+        self.assertEqual("garbled le", partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_no_text_given_is_none_not_empty_string(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_a_plain_inflight_mark_record_predates_the_text_field_and_is_none(self):
+        # A record written by the generic inflight-mark CLI (single line, no text)
+        # must not be misread as "an empty leftover was recorded".
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_stale_incarnation_yields_none_and_removes_the_marker(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "leftover")
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "9999"))
+        self.assertFalse((self.dir / "task-a.txt").exists())
+
+    def test_no_marker_is_none(self):
+        self.assertIsNone(partial_paste_leftover(self.dir, "task-z.txt", "4242"))
+
+    def test_an_empty_incarnation_is_refused(self):
+        with self.assertRaises(ValueError):
+            mark_partial_paste(self.dir, "task-a.txt", "  ", "x")
+
+    def test_later_mark_replaces_the_earlier_text(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "first attempt")
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "second attempt")
+        self.assertEqual("second attempt", partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_a_failed_replace_cleans_up_its_temp_file_and_reraises(self):
+        with mock.patch("delivery.task_dispatch.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mark_partial_paste(self.dir, "task-a.txt", "4242", "x")
+        self.assertEqual([], list(self.dir.glob(".task-a.txt.*")), "temp file left behind")
+        self.assertFalse((self.dir / "task-a.txt").exists())
+
+    def test_the_marker_vanishing_between_the_liveness_check_and_the_read_is_none(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "x")
+        with mock.patch("delivery.task_dispatch.inflight_is_live", return_value=True):
+            (self.dir / "task-a.txt").unlink()
+            self.assertIsNone(partial_paste_leftover(self.dir, "task-a.txt", "4242"))
+
+    def test_cli_round_trip(self):
+        script = Path(__file__).resolve().parent.parent / "src" / "delivery" / "task_dispatch.py"
+
+        def run(*args, stdin_text=None):
+            return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True,
+                                   input=stdin_text)
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-c.txt", "1").returncode)
+        marked = run("partial-mark", str(self.dir), "task-c.txt", "1", stdin_text="g@rbled")
+        self.assertEqual(0, marked.returncode, marked.stderr)
+        got = run("partial-leftover", str(self.dir), "task-c.txt", "1")
+        self.assertEqual((0, "g@rbled"), (got.returncode, got.stdout))
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-c.txt", "2").returncode,
+                          "a different incarnation never sees another core's leftover")
+        empty_mark = run("partial-mark", str(self.dir), "task-e.txt", "1", stdin_text="")
+        self.assertEqual(0, empty_mark.returncode, empty_mark.stderr)
+        self.assertEqual(1, run("partial-leftover", str(self.dir), "task-e.txt", "1").returncode,
+                          "no text given is not-found, not an empty match")
+        self.assertEqual(2, run("partial-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
+        self.assertEqual(2, run("partial-mark", str(self.dir), "../x.txt", "1", stdin_text="x").returncode)
+
+    def _run_main(self, argv, stdin_text=""):
+        out, err = StringIO(), StringIO()
+        with mock.patch("sys.stdin", StringIO(stdin_text)), \
+             mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            rc = _main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_cli_arms_in_process(self):
+        # The subprocess round trip above proves the exit codes; this hits the
+        # same arms under the coverage tracer.
+        self.assertEqual(2, self._run_main(["partial-mark", str(self.dir), "task-g.txt"])[0], "arity")
+        rc, _, _ = self._run_main(["partial-mark", str(self.dir), "task-g.txt", "1"], stdin_text="g@rbled")
+        self.assertEqual(0, rc)
+        rc, out, _ = self._run_main(["partial-leftover", str(self.dir), "task-g.txt", "1"])
+        self.assertEqual((0, "g@rbled"), (rc, out))
+        self.assertEqual(1, self._run_main(["partial-leftover", str(self.dir), "task-g.txt", "2"])[0],
+                          "a different incarnation never sees another core's leftover")
+        self.assertEqual(1, self._run_main(["partial-leftover", str(self.dir), "task-z.txt", "1"])[0],
+                          "no marker at all")
+        rc, _, err = self._run_main(["partial-mark", str(self.dir), "task-g.txt", "  "], stdin_text="x")
+        self.assertEqual(2, rc)
+        self.assertIn("incarnation", err)
+
+    def test_an_unreadable_marker_is_cannot_decide_for_the_cli_too(self):
+        if os.geteuid() == 0:
+            self.skipTest("root cannot be denied a read")
+        mark_partial_paste(self.dir, "task-u.txt", "1", "leftover")
+        (self.dir / "task-u.txt").chmod(0o000)
+        try:
+            rc, _, err = self._run_main(["partial-leftover", str(self.dir), "task-u.txt", "1"])
+            self.assertEqual(2, rc)
+            self.assertIn("cannot read the marker", err)
+        finally:
+            (self.dir / "task-u.txt").chmod(0o644)
 
 
 class OwnedTaskIdsTest(unittest.TestCase):

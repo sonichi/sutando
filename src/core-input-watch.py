@@ -67,6 +67,9 @@ import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
+import cli_wedge  # noqa: E402
+import core_gate_notice  # noqa: E402
+import self_opened_gate  # noqa: E402
 
 import argparse
 import hashlib
@@ -318,7 +321,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -328,6 +331,7 @@ def compose_state(pane, base_health, gateway_alive, process=True):
 
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
+    `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -369,12 +373,21 @@ def compose_state(pane, base_health, gateway_alive, process=True):
         # frozen) still reads hung, preserving genuine wedge detection.
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
+        if pane and _turn_moving(pane, prev_pane):
+            return "running", _BASE_TO_STATE["working"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
         if process is None:  # no session observed = no wedge evidence; never RECOVER
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
+
+
+def _turn_moving(pane, prev_pane):
+    """A turn in flight whose pane changed since the last poll. Clocks and spinners are
+    normalised away, so a frozen CLI whose timer still ticks is not motion."""
+    return (prev_pane is not None and cli_wedge.frame_working(pane)
+            and cli_wedge.state_id(pane) != cli_wedge.state_id(prev_pane))
 
 
 # ---- Bundled-context probes (NOT part of runtime-health's coarse health). --- #
@@ -473,18 +486,17 @@ def gateway_alive(app_data, state_dir=None):
 
 
 def capture(socket, session):
-    try:
-        out = subprocess.run(["tmux", "-S", socket, "capture-pane", "-p", "-t", f"{session}:0"],
-                             capture_output=True, text=True, timeout=8)
-        return out.stdout if out.returncode == 0 else None
-    except Exception:
-        return None
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target) if target else None
 
 
 def send_keys(socket, session, key):
     """Type one key into the core pane. True only when tmux accepted it."""
+    target = cli_wedge.core_target(socket, session)
+    if not target:
+        return False
     try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
+        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", target, key],
                            capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:
@@ -500,6 +512,28 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
     if not enabled or state != "blocked-known" or prompt == answered_prompt:
         return None
     return auto_answer(kind)
+
+
+def gate_clock(clock, state, prompt, now):
+    """(first_seen, prompt_since, prompt) for the gate on screen: when it appeared, and
+    since when it has been unchanged. Any other state resets it; a changed prompt (a
+    caret moved, a dialog replaced) restarts only the second clock."""
+    if state not in ("blocked-human", "blocked-known"):
+        return (None, None, None)
+    first, since, last = clock
+    if first is None:
+        return (now, now, prompt)
+    return (first, since if prompt == last else now, prompt)
+
+
+def dismiss_step(state_dir, session, state, kind, prompt, clock, now, enabled=True):
+    """The key to dismiss a picker Sutando opened itself (self_opened_gate), or None.
+    No attribution record, no key: a picker a human opened is never touched."""
+    if not enabled:
+        return None
+    return self_opened_gate.dismiss_key(
+        self_opened_gate.load(state_dir, session), session=session, state=state, kind=kind,
+        prompt=prompt, gate_first_seen=clock[0], prompt_since=clock[1], now=now)
 
 
 #: How long a completed auto-answer stays in the signal file, so a relay that
@@ -568,7 +602,7 @@ def _name_seat(req, session, seat):
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -581,6 +615,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None):
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt))
+        if queued:
+            req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
             req = _name_seat(req, session, seat)
         return manager.create(req)
@@ -696,6 +732,15 @@ def drive_escalations(manager, session, prompt, state, send):
     return acted
 
 
+def notice_queued(manager, req, workspace, state, kind):
+    """Tell each queued task why it is on hold (core_gate_notice); never fatal to the monitor."""
+    try:
+        return core_gate_notice.notice_queued(manager, req, workspace, state, kind)
+    except Exception as exc:  # noqa: BLE001
+        print(f"queued-task notice failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -720,7 +765,14 @@ def main():
                     help="write the supervisor state but never raise a card for a block")
     ap.add_argument("--seat", default="",
                     help="who this pane is, named on every card it raises (default: none)")
+    ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
     a = ap.parse_args()
+    if a.helper_receipt_dir:
+        from external_core_helpers import publish
+        from workspace_default import resolve_workspace
+        publish(a.helper_receipt_dir, "monitor", __file__, resolve_workspace(),
+                a.socket, a.session, passive=not (a.once or a.auto_answer or a.chat_escalation),
+                output=a.out)
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
     # else a detached spawn without Homebrew on PATH reads a healthy core as crashed.
@@ -740,13 +792,19 @@ def main():
     answered_prompt = None
     last_answered = None
     idle_ticks = 0
+    prev_pane = None
+    clock = (None, None, None)
+    state_dir = os.path.dirname(os.path.abspath(a.out))
+    workspace = _Path(os.path.dirname(state_dir))
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True))
+            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
+        prev_pane = pane
+        clock = gate_clock(clock, state, prompt, time.time())
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -768,6 +826,10 @@ def main():
         if key and send_keys(a.socket, a.session, key):
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
+        dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
+        if dkey and send_keys(a.socket, a.session, dkey):
+            self_opened_gate.clear(state_dir, a.session)
+            last_answered = {"kind": kind, "key": dkey, "at": time.time(), "self_opened": True}
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
@@ -789,9 +851,15 @@ def main():
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
-                escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None)
+                # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
+                queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
+                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None, queued=queued)
+                if not a.seat:
+                    notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
                 resolve_escalations(hitl, a.session, pane)
+                if not a.seat:
+                    core_gate_notice.end_outage(workspace)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

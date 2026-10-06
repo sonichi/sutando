@@ -45,6 +45,8 @@ source "$__SCRIPT_DIR/delivery/worker-stage.sh"
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh
 source "$__SCRIPT_DIR/task-emit.sh"
+# shellcheck source=bounded-wait.sh
+source "$__SCRIPT_DIR/bounded-wait.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
@@ -109,6 +111,14 @@ fi
 # inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
+
+# An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
+# when the inbox is the core's own <workspace>/tasks BY REALPATH -- never by basename alone.
+CANONICAL_CORE_TASKS_DIR="$(canonical_tasks_dir "$WORKSPACE_DIR/tasks")"
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TASKS_DIR" ]; then
+  echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
+  unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
+fi
 
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"
@@ -205,8 +215,7 @@ case "$__holders" in
         # An unready live holder is stamped by nobody else; only THIS SEAT's own
         # sentinel may be written, so the inbox must be this identity's own.
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
-           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o \
-                \( -z "${SUTANDO_INSTANCE_ID:-}" -a "$(basename "$TASKS_DIR_ABS")" = "tasks" \) ] \
+           && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o -z "${SUTANDO_INSTANCE_ID:-}" ] \
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
            && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"
@@ -674,7 +683,7 @@ SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
   local task_path="$1" disposition="${2:-fallback}" filename announce handler_rc verdict claim_settled
-  local handler_pid watchdog_pid timeout_flag timed_out
+  local timeout_flag timed_out
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
@@ -696,35 +705,20 @@ run_handler_now() {
     echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
     handler_rc=1
   else
-    # Bounded the same way resolve_inbox_entry already bounds a resolver in
-    # this same single-threaded dispatch loop: never plain `timeout`, which
-    # isn't reliably present (this host has neither `timeout` nor
-    # `gtimeout`), and a bare `timeout` with no kill-after leaves a
-    # TERM-resistant handler unbounded anyway. A genuinely hung handler was
+    # Bounded (run_bounded) the same way resolve_inbox_entry bounds a resolver
+    # in this same single-threaded dispatch loop. A genuinely hung handler was
     # never observed, but is no longer isolated in its own process either
     # now that this call is inline -- SUTANDO_HANDLER_RUN_TIMEOUT (10s,
     # ~250x the measured normal ~35-40ms cost) bounds it regardless.
     timeout_flag="$(mktemp -u "${TMPDIR:-/tmp}/sutando-handler-timeout.XXXXXX")"
-    "$CURRENT_HANDLER" \
+    run_bounded "$SUTANDO_HANDLER_RUN_TIMEOUT" "$timeout_flag" -- \
+      "$CURRENT_HANDLER" \
       --runtime "${SUTANDO_CORE_RUNTIME:-}" \
       --workspace "$WORKSPACE_DIR" \
       --task-file "$task_path" \
       --results-dir "$RESULTS_DIR" \
-      --repo "$__REPO_ROOT" >/dev/null &
-    handler_pid=$!
-    ( trap 'kill "${_s:-}" 2>/dev/null; exit 0' TERM
-      sleep "$SUTANDO_HANDLER_RUN_TIMEOUT" & _s=$!; wait "$_s"
-      # Reaching here (not cancelled by the handler finishing first) means
-      # the timeout genuinely elapsed -- flag it BEFORE killing, so the
-      # caller can tell "we gave up waiting" apart from a real exit/signal.
-      : > "$timeout_flag"
-      kill -TERM "$handler_pid" 2>/dev/null; sleep 1
-      kill -KILL "$handler_pid" 2>/dev/null ) &
-    watchdog_pid=$!
-    wait "$handler_pid" 2>/dev/null
+      --repo "$__REPO_ROOT" >/dev/null
     handler_rc=$?
-    kill -TERM "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null
     if [ -f "$timeout_flag" ]; then
       timed_out=1
       rm -f "$timeout_flag"
@@ -976,7 +970,11 @@ TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 _tmux_wake() {
   # Poke the idle CLI session so it processes the new task without waiting
   # for the next 5-min proactive-loop cron tick (sutando-skills#27 / #1289).
-  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
+  # The core's lowest window, exactly: a bare name prefix-matches `<session>-watcher`.
+  local idx
+  idx="$(tmux -S "$TMUX_SOCK" list-windows -t "=$TMUX_SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
+  [ -n "$idx" ] || return 0
+  tmux -S "$TMUX_SOCK" send-keys -t "=$TMUX_SESSION:$idx" '[watcher-ping]' Enter 2>/dev/null || true
 }
 
 # Clean up on exit:

@@ -1,36 +1,24 @@
 #!/usr/bin/env python3
-"""Behavioural tests for agent-api.py's pending-questions parser + answer path.
-
-History of the bug these guard:
-
-  #1265 moved pending-questions.md to a free-form format (prose sections, no
-  **Status:** markers). A 2026-06-07 fix taught GET /status to read it, but left
-  the *writer* (POST /answer) requiring a **Status:**/**Options:** line to
-  recognise a section — so every free-form question was listed in the UI and
-  then 404'd with "question Q1 not found or already answered" when answered.
-  The two paths also minted/consumed ids positionally, so any rewrite of the
-  file between the poll and the click re-pointed an id at another section.
-
-  The earlier version of this file asserted on the *source text* of agent-api.py
-  and explicitly permitted the writer-side gate to remain ("intentional"). It
-  passed for the entire time POST /answer was 100% broken. These tests drive the
-  parser instead.
+"""agent-api.py's pending-questions surface reads and resolves ONLY through
+src/pending_questions_reader.py: rows are the reader's items in the triage shape,
+dismissal and ranking still apply, and POST /answer closes through the reader's
+`resolve` and writes the agent's answer task file. No file is read.
 
 Run: python3 tests/agent-api-pending-questions.test.py
-Exit: 0 = all pass, 1 = failure
 """
-from __future__ import annotations
-
-import contextlib
+import http.server
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-import subprocess
-from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -38,51 +26,104 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 
-def _load(name: str, path: Path):
+def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
     spec.loader.exec_module(m)
     return m
 
 
 api = _load("agent_api", REPO / "src" / "agent-api.py")
-cpq = _load("check_pending_questions", REPO / "src" / "check-pending-questions.py")
+NOW = time.time()
 
 
-class _FrozenClock:
-    """Stands in for agent-api's `datetime`, pinned to one aware UTC instant."""
-
-    def __init__(self, instant):
-        self._instant = instant
-
-    def now(self, tz=None):
-        if tz is None:
-            return self._instant.astimezone().replace(tzinfo=None)
-        return self._instant.astimezone(tz)
-
-    def __getattr__(self, name):
-        return getattr(datetime, name)
+def _item(ask_id, title, asked_at, snippet="", in_room=True):
+    return {"id": title[:40], "ask_id": ask_id, "title": title, "snippet": snippet, "body": snippet,
+            "asked_at": asked_at, "priority": "medium", "in_room": in_room}
 
 
-@contextlib.contextmanager
-def _frozen_utc_clock():
-    """Pin the module's clock to one aware UTC instant and yield it.
+ITEMS = [
+    _item("ask-alpha", "ALPHA, oldest and blocking nothing", NOW - 40 * 86400, "Prose only."),
+    _item("ask-bravo", "BRAVO, blocked on sonichi/sutando#4242", NOW - 2 * 86400),
+    _item("ask-held", "HELD, not yet in the room", None, in_room=False),
+]
 
-    `age_days` floors, so a test that reads a *different* instant than production
-    disagrees by a whole day whenever the two straddle a UTC calendar boundary.
-    """
-    instant = datetime.now(timezone.utc)
-    with mock.patch.object(api, "datetime", _FrozenClock(instant)):
-        yield instant
+
+def _g(items, unavailable=False, reason=None):
+    """The reader's gather shape."""
+    return {"waiting": items, "done": None if unavailable else 0, "unavailable": unavailable, "reason": reason,
+            "link": None, "notes": [], "store": None}
+
+
+class Rows(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agentapi-pq-"))
+        self.saved = api.WORKSPACE_DIR
+        api.WORKSPACE_DIR = self.tmp
+        os.environ.pop("SUTANDO_MEMORY_DIR", None)
+        os.environ.pop("SUTANDO_PRIVATE_DIR", None)
+
+    def tearDown(self):
+        api.WORKSPACE_DIR = self.saved
+
+    def test_rows_come_from_the_reader_in_the_triage_shape(self):
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)) as w:
+            rows = api._pending_question_rows()
+        w.assert_called_once_with(self.tmp, api.skill_roots.declared(api.pending_questions_reader.DECLARATION, self.tmp))
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(set(by_id), {"ask-alpha", "ask-bravo", "ask-held"})
+        self.assertEqual(by_id["ask-alpha"]["text"], "ALPHA, oldest and blocking nothing")
+        self.assertEqual(by_id["ask-alpha"]["detail"], "Prose only.")
+        self.assertEqual(by_id["ask-bravo"]["detail"], by_id["ask-bravo"]["text"])
+        self.assertEqual(by_id["ask-alpha"]["age_days"], 40)
+        self.assertRegex(by_id["ask-alpha"]["asked"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertIsNone(by_id["ask-held"]["asked"])
+        self.assertIsNone(by_id["ask-held"]["age_days"])
+        self.assertFalse(by_id["ask-held"]["in_room"])
+
+    def test_rows_are_oldest_first_undated_sorts_last(self):
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
+            rows = api._pending_question_rows()
+        self.assertEqual([r["id"] for r in rows], ["ask-alpha", "ask-bravo", "ask-held"])
+
+    def test_dismissed_rows_are_removed(self):
+        api.pq_triage.dismiss(api._dismissed_questions_path(), "ask-alpha")
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
+            rows = api._pending_question_rows()
+        self.assertEqual([r["id"] for r in rows], ["ask-bravo", "ask-held"])
+
+    def test_recheck_labels_a_merged_blocker_stale_and_keeps_it(self):
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)), \
+                mock.patch.object(api, "_probe_ref_states", return_value={("sonichi/sutando", 4242): "MERGED"}):
+            rows = api._pending_question_rows(recheck=True)
+        stale = [r for r in rows if r.get("recheck")]
+        self.assertEqual([r["id"] for r in stale], ["ask-bravo"])
+        self.assertEqual(stale[0]["recheck"]["status"], "stale")
+
+    def test_the_module_reads_no_file_for_questions(self):
+        src = (REPO / "src" / "agent-api.py").read_text()
+        for needle in ("parse_pending_questions", "answer_pending_question", "pending_questions_md",
+                       "pending_questions_ledger", 'personal_path("pending-questions.md"'):
+            self.assertNotIn(needle, src, needle)
+        self.assertIn("pending_questions_reader.gather(", src)
+        self.assertIn("pending_questions_reader.resolve(", src)
+        self.assertNotIn("pending_questions_reader.waiting(", src, "waiting() hides `unavailable`; the payload needs it")
+
+    def test_an_unreachable_room_is_flagged_in_the_payload_not_an_empty_queue(self):
+        held = [i for i in ITEMS if not i["in_room"]]
+        with mock.patch.object(api.pending_questions_reader, "gather",
+                               return_value=_g(held, unavailable=True, reason="room down")):
+            payload = api._active_tasks_payload(True, True)
+            queue = api._questions_queue_payload()
+        self.assertEqual(payload["questions_unavailable"], "room down")
+        self.assertEqual([q["id"] for q in payload["questions"]], ["ask-held"])
+        self.assertEqual(queue["questions_unavailable"], "room down")
+        with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)):
+            self.assertIsNone(api._active_tasks_payload(True, True)["questions_unavailable"])
 
 
 def _floor_interpreter():
-    """This host's 3.9 floor interpreter, or None if it has none.
-
-    Resolved by name or explicit configuration, never a literal path: the stock
-    macOS 3.9 sits behind an Xcode-CLT stub REVIEW.md criterion 7 forbids naming.
-    """
+    """This host's 3.9 floor interpreter, or None; by name or $SUTANDO_PY39, never a literal path."""
     cand = os.environ.get("SUTANDO_PY39") or shutil.which("python3.9")
     if not cand or not Path(cand).exists():
         return None
@@ -91,182 +132,14 @@ def _floor_interpreter():
     return Path(cand) if ver == "3.9" else None
 
 
-# The format the agent actually writes today: prose under a `## ` heading, no
-# metadata fields, resolved items parked below a `# Resolved` divider.
-FREE_FORM = """# Pending Questions
-
-_Open decisions awaiting owner input._
-
-## ❓ Re-auth the Station Gmail connector?
-The connector returns HTTP 410. Reconnect, or say "drop it" and I'll use the MCP.
-
-## ❓ Rebuild the Swift menu-bar app?
-Dead since Jul 6. It owns the watcher auto-restart safety net.
-
-## [RESOLVED 2026-07-01] ❓ Enable cross-machine sync?
-Closed in place with the title-prefix convention, above the divider.
-
-# Resolved & archived detail
-
-## ❓ An old question that was already dealt with
-Archived — must never be offered as open.
-"""
-
-STRUCTURED = """# Pending Questions
-
-## Ship the timer tool?
-- **Status:** unanswered
-- **Options:** Yes | No | Later
-"""
-
-
-class TestParse(unittest.TestCase):
-    def test_free_form_questions_are_listed(self):
-        """No **Status:**/**Options:** markers — still open questions."""
-        qs = api.parse_pending_questions(FREE_FORM)
-        self.assertEqual([q["text"] for q in qs], [
-            "❓ Re-auth the Station Gmail connector?",
-            "❓ Rebuild the Swift menu-bar app?",
-        ])
-
-    def test_archive_below_resolved_divider_is_excluded(self):
-        """Sections under `# Resolved` are audit trail, not open questions."""
-        titles = [q["text"] for q in api.parse_pending_questions(FREE_FORM)]
-        self.assertNotIn("❓ An old question that was already dealt with", titles)
-
-    def test_resolved_title_prefix_is_excluded(self):
-        """The free-form format closes a question in place with a [RESOLVED] prefix."""
-        titles = [q["text"] for q in api.parse_pending_questions(FREE_FORM)]
-        self.assertFalse([t for t in titles if "Enable cross-machine sync" in t])
-
-    def test_ids_are_stable_when_the_file_is_rewritten(self):
-        """The agent rewrites this file constantly. An id minted by one GET must
-        still name the same question after unrelated sections move around it —
-        a positional id silently re-points at its neighbour."""
-        before = {q["text"]: q["id"] for q in api.parse_pending_questions(FREE_FORM)}
-        shifted = FREE_FORM.replace(
-            "## ❓ Re-auth",
-            "## ❓ A brand-new question jumped the queue\nBody.\n\n## ❓ Re-auth",
-            1,
-        )
-        after = {q["text"]: q["id"] for q in api.parse_pending_questions(shifted)}
-        self.assertEqual(before["❓ Rebuild the Swift menu-bar app?"],
-                         after["❓ Rebuild the Swift menu-bar app?"])
-
-    def test_duplicate_titles_get_distinct_ids(self):
-        dupes = "# Q\n\n## Same title\nOne.\n\n## Same title\nTwo.\n"
-        ids = [q["id"] for q in api.parse_pending_questions(dupes)]
-        self.assertEqual(len(set(ids)), 2, f"ids collided: {ids}")
-
-    def test_duplicate_id_survives_resolving_an_earlier_duplicate(self):
-        """The #2103 review's blocking case: a stale duplicate-title id must
-        never migrate to a neighbour.
-
-        Three open sections share a title. The UI is handed an id for the
-        *second* section; the agent then answers the *first*, rewriting the
-        file. The id the UI still holds must resolve the same (second) section
-        — never the third — or, at worst, 404. It must not silently record the
-        owner's answer against a different question.
-
-        This is the guarantee an occurrence-count suffix (`-2`/`-3`) breaks:
-        answering the first section renumbers the survivors, so `...-2` slides
-        from the second section onto the third.
-        """
-        dupes = (
-            "# Pending Questions\n\n"
-            "## Same title\nFirst — ALPHA.\n\n"
-            "## Same title\nSecond — BRAVO.\n\n"
-            "## Same title\nThird — CHARLIE.\n"
-        )
-        before = api.parse_pending_questions(dupes)
-        self.assertEqual(len(before), 3)
-        id_for_second = before[1]["id"]
-        id_for_third = before[2]["id"]
-
-        # The agent resolves the first duplicate and rewrites the file.
-        rewritten = api.answer_pending_question(dupes, before[0], "done with the first")
-        after = api.parse_pending_questions(rewritten)
-
-        # The originally-issued ids still name their own sections, unchanged.
-        second = next((q for q in after if q["id"] == id_for_second), None)
-        self.assertIsNotNone(second, "the second section's id stopped resolving")
-        self.assertIn("BRAVO", second["detail"])
-        self.assertNotIn("CHARLIE", second["detail"])  # never the neighbour
-
-        third = next((q for q in after if q["id"] == id_for_third), None)
-        self.assertIsNotNone(third)
-        self.assertIn("CHARLIE", third["detail"])
-
-        # And answering through the stale id lands on BRAVO, leaving CHARLIE open.
-        final = api.answer_pending_question(rewritten, second, "picked BRAVO")
-        still_open = api.parse_pending_questions(final)
-        self.assertEqual([q["detail"] for q in still_open], ["Third — CHARLIE."])
-
-    def test_ids_are_independent_of_sibling_count(self):
-        """A section's id must not depend on how many same-title siblings are
-        currently open. Removing an earlier duplicate must leave every survivor's
-        id byte-for-byte identical (no renumbering)."""
-        dupes = (
-            "# Q\n\n"
-            "## Same title\nAlpha body.\n\n"
-            "## Same title\nBravo body.\n\n"
-            "## Same title\nCharlie body.\n"
-        )
-        by_detail = {q["detail"]: q["id"] for q in api.parse_pending_questions(dupes)}
-        # Drop the first duplicate entirely (not just answer it).
-        pruned = dupes.replace("## Same title\nAlpha body.\n\n", "", 1)
-        after = {q["detail"]: q["id"] for q in api.parse_pending_questions(pruned)}
-        self.assertEqual(after["Bravo body."], by_detail["Bravo body."])
-        self.assertEqual(after["Charlie body."], by_detail["Charlie body."])
-
-    def test_structured_format_still_parses(self):
-        qs = api.parse_pending_questions(STRUCTURED)
-        self.assertEqual(len(qs), 1)
-        self.assertEqual(qs[0]["options"], ["Yes", "No", "Later"])
-
-    def test_explicitly_answered_section_is_not_open(self):
-        answered = STRUCTURED.replace("**Status:** unanswered", "**Status:** Answered — yes")
-        self.assertEqual(api.parse_pending_questions(answered), [])
-
-
-    def test_dated_heading_parses_asked_and_age_days(self):
-        """`## YYYY-MM-DD — ...` gives a bare-date `asked` and a non-negative age."""
-        dated = "# Q\n\n## 2020-01-01 — sutando-life CI: something old\nBody.\n"
-        with _frozen_utc_clock() as now_utc:
-            q = api.parse_pending_questions(dated)[0]
-        self.assertEqual(q["asked"], "2020-01-01")
-        expected_age = (now_utc - datetime(2020, 1, 1, tzinfo=timezone.utc)).days
-        self.assertEqual(q["age_days"], expected_age)
-
-    def test_datetime_heading_t_z_form_parses_asked_and_age_days(self):
-        """`## YYYY-MM-DDTHH:MMZ — ...` is the other heading shape in the wild."""
-        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
-        with _frozen_utc_clock() as now_utc:
-            q = api.parse_pending_questions(dated)[0]
-        self.assertEqual(q["asked"], "2020-01-01T02:20Z")
-        expected_age = (now_utc - datetime(2020, 1, 1, 2, 20, tzinfo=timezone.utc)).days
-        self.assertEqual(q["age_days"], expected_age)
-
-    def test_undated_heading_gives_null_asked_and_age(self):
-        """No leading date on the heading — must not fabricate an age."""
-        q = api.parse_pending_questions(FREE_FORM)[0]
-        self.assertIsNone(q["asked"])
-        self.assertIsNone(q["age_days"])
-
-
-class TestPython39AndTimezones(unittest.TestCase):
-    """agent-api.py has no `from __future__ import annotations`, so annotations are
-    evaluated at def time — a PEP 604 union breaks import on the supported 3.9."""
+class Python39(unittest.TestCase):
+    """agent-api.py has no `from __future__ import annotations`: a PEP 604 union breaks 3.9."""
 
     def test_the_module_carries_no_39_breaking_annotations(self):
-        """The always-on arm: delegates to the repo-wide gate for this one file so
-        the floor stays checked on hosts that have no 3.9 to run the arm below."""
         lint = _load("py39_union_lint", REPO / "tests" / "python39-union-annotations.test.py")
         self.assertIsNone(lint.check_file(Path(api.__file__)))
 
     def test_the_real_module_imports_on_the_floor_interpreter(self):
-        """Import the actual module under 3.9. A source-text fragment can only show
-        that a copied helper compiles, never that the real import succeeds."""
         py39 = _floor_interpreter()
         if py39 is None:
             self.skipTest("no python3.9 on PATH and $SUTANDO_PY39 unset")
@@ -275,154 +148,106 @@ class TestPython39AndTimezones(unittest.TestCase):
                 f"spec = importlib.util.spec_from_file_location('agent_api_39', {str(REPO / 'src' / 'agent-api.py')!r})\n"
                 "m = importlib.util.module_from_spec(spec)\n"
                 "spec.loader.exec_module(m)\n"
-                "print(m._parse_asked_date('2020-01-01T02:20Z x')[0])\n")
+                "print(m._question_row({'ask_id': 'a', 'title': 't', 'asked_at': None})['id'])\n")
         r = subprocess.run([str(py39), "-c", prog], capture_output=True, text=True)
         self.assertEqual(0, r.returncode, f"3.9 rejected the module: {r.stderr[-300:]}")
-        self.assertEqual("2020-01-01T02:20Z", r.stdout.strip())
+        self.assertEqual("a", r.stdout.strip())
 
-    def test_a_shaped_but_impossible_date_is_not_an_age(self):
-        """`2026-13-45` matches the heading regex and no strptime format — the branch
-        must fall through to (None, None) rather than raise or invent an age."""
-        asked, dt = api._parse_asked_date("2026-13-45 — not a real date")
-        self.assertIsNone(asked)
-        self.assertIsNone(dt)
-        q = api.parse_pending_questions("# Q\n\n## 2026-13-45 — not a real date\nBody.\n")[0]
-        self.assertIsNone(q["asked"])
-        self.assertIsNone(q["age_days"])
 
-    def test_a_Z_heading_is_utc_not_local(self):
-        """Parsed naive and compared to a local now(), a just-asked question reports -1."""
-        _, dt = api._parse_asked_date("2020-01-01T02:20Z — x")
-        self.assertIsNotNone(dt.tzinfo, "a Z heading must parse as aware UTC")
-        self.assertEqual(0, dt.utcoffset().total_seconds())
+class AnswerRoute(unittest.TestCase):
+    """POST /answer over a real server: closes through the reader and files the task."""
 
-    def test_age_is_identical_across_host_timezones(self):
-        """The age must be a property of the heading, not of the host's $TZ. Pins the
-        production side: a naive local now() there diverges by a day away from UTC."""
-        dated = "# Q\n\n## 2020-01-01T02:20Z — should this host do X?\nBody.\n"
-        saved = os.environ.get("TZ")
-        ages = {}
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="agentapi-answer-"))
+        (cls.tmp / "tasks").mkdir()
+        cls.saved = (api.WORKSPACE_DIR, api.TASK_DIR, api.API_TOKEN)
+        api.WORKSPACE_DIR, api.TASK_DIR, api.API_TOKEN = cls.tmp, cls.tmp / "tasks", "test-token-123"
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
+        cls.server.timeout = 0.5
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.server_close()
+        api.WORKSPACE_DIR, api.TASK_DIR, api.API_TOKEN = cls.saved
+
+    def _raw(self, method, path, body=None):
+        r = urllib.request.Request(f"{self.base}{path}", method=method,
+                                   data=None if body is None else json.dumps(body).encode())
+        r.add_header("Authorization", "Bearer test-token-123")
+        r.add_header("Content-Type", "application/json")
         try:
-            for zone in ("UTC", "Etc/GMT+12", "Etc/GMT-14"):
-                os.environ["TZ"] = zone
-                time.tzset()
-                with _frozen_utc_clock():
-                    ages[zone] = api.parse_pending_questions(dated)[0]["age_days"]
-        finally:
-            if saved is None:
-                os.environ.pop("TZ", None)
-            else:
-                os.environ["TZ"] = saved
-            time.tzset()
-        self.assertEqual(1, len(set(ages.values())), f"age varies with host timezone: {ages}")
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
 
-    def test_a_future_dated_heading_does_not_sort_first(self):
-        """Clock skew or a typo gives a negative age, which -(age) would rank ahead of all."""
-        ahead = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%MZ")
-        q = api.parse_pending_questions(f"# Q\n\n## {ahead} — from the future\nBody.\n")[0]
-        self.assertEqual(0, q["age_days"], "a future heading must clamp to 0, never go negative")
+    def req(self, method, path, body=None):
+        out = {}
+        t = threading.Thread(target=lambda: out.update(zip(("code", "data"), self._raw(method, path, body))),
+                             daemon=True)
+        t.start()
+        while t.is_alive():
+            self.server.handle_request()
+        t.join()
+        return out["code"], out["data"]
 
+    def test_listing_answer_and_404s(self):
+        closed = []
 
-class TestPendingQuestionRows(unittest.TestCase):
-    """`_pending_question_rows()` orders by age — oldest first — with undated
-    questions sorted last (never defaulted to age 0, which would put them
-    first instead)."""
+        def _resolve(ws, ask_id, status, store=None):
+            if ask_id in [c[0] for c in closed] or ask_id not in {i["ask_id"] for i in ITEMS}:
+                return False, f"no open row for {ask_id}"
+            closed.append((ask_id, status))
+            return True, "closed"
 
-    def _rows(self, content: str) -> list[dict]:
-        with tempfile.TemporaryDirectory() as tmp:
-            pending = Path(tmp) / "pending-questions.md"
-            pending.write_text(content)
-            with mock.patch.object(api, "personal_path", return_value=pending):
-                return api._pending_question_rows()
+        def _gather(ws, store=None):
+            return _g([i for i in ITEMS if i["ask_id"] not in [c[0] for c in closed]])
 
-    def test_rows_are_oldest_first_undated_sorts_last(self):
-        with _frozen_utc_clock() as today:
-            self._assert_oldest_first(today)
+        with mock.patch.object(api.pending_questions_reader, "gather", _gather), \
+                mock.patch.object(api.pending_questions_reader, "resolve", _resolve):
+            code, data = self.req("GET", "/tasks/active")
+            self.assertEqual(code, 200)
+            ids = [q["id"] for q in data["questions"]]
+            self.assertEqual(ids, ["ask-alpha", "ask-bravo", "ask-held"])
+            code, data = self.req("POST", "/answer", {"id": "ask-alpha", "answer": "drop it"})
+            self.assertEqual(code, 200, data)
+            self.assertEqual(closed, [("ask-alpha", "Answered")])
+            tasks = list((self.tmp / "tasks").glob("answer-ask-alpha-*.txt"))
+            self.assertEqual(len(tasks), 1)
+            self.assertIn("drop it", tasks[0].read_text())
+            code, data = self.req("GET", "/tasks/active")
+            self.assertNotIn("ask-alpha", [q["id"] for q in data["questions"]])
+            code, data = self.req("POST", "/answer", {"id": "ask-alpha", "answer": "again"})
+            self.assertEqual(code, 404)
+            self.assertIn("is not waiting", data["error"])
+            code, _ = self.req("POST", "/answer", {"id": "Q1", "answer": "stale"})
+            self.assertEqual(code, 404)
+            code, _ = self.req("POST", "/answer", {"id": "ask-bravo"})
+            self.assertEqual(code, 400)
+            self.assertEqual(len(list((self.tmp / "tasks").glob("answer-*.txt"))), 1)
 
-    def _assert_oldest_first(self, today):
-        just_now = today.strftime("%Y-%m-%d")  # age_days == 0
-        mid = (today - timedelta(days=10)).strftime("%Y-%m-%d")
-        old = (today - timedelta(days=40)).strftime("%Y-%m-%d")
-        # Undated BEFORE the age-0 heading: the one order in which defaulting
-        # undated to 0 would survive a stable sort and pass anyway.
-        mixed = (
-            "# Pending Questions\n\n"
-            "## Undated question\nBody.\n\n"
-            f"## {just_now} — asked just now\nBody.\n\n"
-            f"## {old} — asked weeks ago\nBody.\n\n"
-            f"## {mid} — asked a while ago\nBody.\n"
-        )
-        texts = [row["text"] for row in self._rows(mixed)]
-        self.assertEqual(texts, [
-            f"{old} — asked weeks ago",
-            f"{mid} — asked a while ago",
-            f"{just_now} — asked just now",
-            "Undated question",
-        ])
-
-    def test_rows_carry_asked_and_age_days_after_stripping_offsets(self):
-        rows = self._rows("# Q\n\n## 2020-01-01 — old one\nBody.\n")
-        self.assertNotIn("start", rows[0])
-        self.assertNotIn("end", rows[0])
-        self.assertEqual(rows[0]["asked"], "2020-01-01")
-        self.assertIsInstance(rows[0]["age_days"], int)
-
-
-class TestAnswer(unittest.TestCase):
-    def test_free_form_question_is_answerable(self):
-        """The regression: listed by GET /status, then 404 on POST /answer."""
-        qs = api.parse_pending_questions(FREE_FORM)
-        updated = api.answer_pending_question(FREE_FORM, qs[0], "drop it")
-        self.assertIn("drop it", updated)
-        still_open = [q["text"] for q in api.parse_pending_questions(updated)]
-        self.assertNotIn(qs[0]["text"], still_open)
-        # The other question, and the archive, are untouched.
-        self.assertEqual(still_open, ["❓ Rebuild the Swift menu-bar app?"])
-        self.assertIn("## ❓ An old question that was already dealt with", updated)
-
-    def test_answer_silences_the_notifier_too(self):
-        """check-pending-questions.py treats a status-less section as unanswered.
-        If the answer doesn't land on a **Status:** line it keeps DMing the owner
-        hourly about a question they already answered."""
-        with tempfile.TemporaryDirectory() as tmp:
-            pq = Path(tmp) / "pending-questions.md"
-            qs = api.parse_pending_questions(FREE_FORM)
-            pq.write_text(api.answer_pending_question(FREE_FORM, qs[0], "drop it"))
-            cpq.PQ_FILE = pq
-            waiting = [q["title"] for q in cpq.get_waiting_questions()]
-            self.assertNotIn(qs[0]["text"], waiting)
-            self.assertIn("❓ Rebuild the Swift menu-bar app?", waiting)
-
-    def test_structured_status_line_is_updated_in_place(self):
-        qs = api.parse_pending_questions(STRUCTURED)
-        updated = api.answer_pending_question(STRUCTURED, qs[0], "Later")
-        self.assertIn("- **Status:** Answered", updated)  # bullet preserved
-        self.assertNotIn("unanswered", updated)
-        self.assertIn("- **Options:** Yes | No | Later", updated)  # options preserved
-        self.assertEqual(api.parse_pending_questions(updated), [])
-
-    def test_answer_with_regex_escapes_is_written_literally(self):
-        """A raw answer goes into an re.sub replacement — \\1 must not expand."""
-        qs = api.parse_pending_questions(STRUCTURED)
-        updated = api.answer_pending_question(STRUCTURED, qs[0], r"use \1 and \g<0>")
-        self.assertIn(r"use \1 and \g<0>", updated)
-
-    def test_multiline_answer_cannot_forge_a_heading(self):
-        """Answers are collapsed to one line — otherwise '## ' in an answer would
-        inject a new question section."""
-        qs = api.parse_pending_questions(FREE_FORM)
-        updated = api.answer_pending_question(FREE_FORM, qs[0], "yes\n## ❓ injected?\nbody")
-        titles = [q["text"] for q in api.parse_pending_questions(updated)]
-        self.assertNotIn("❓ injected?", titles)
+    def test_an_answer_during_an_outage_is_kept_and_a_local_close_counts_as_closed(self):
+        """The owner's typed answer never drops: a local close record (resolve True) is a 200
+        with the task written; only UNRECORDED is a failure, and even then the task is written."""
+        for why, code in (("recorded locally as Answered in x (room unreachable)", 200),
+                          ("UNRECORDED: room unreachable; and the local close record failed", 503)):
+            with self.subTest(why=why):
+                for f in (self.tmp / "tasks").glob("answer-*.txt"):
+                    f.unlink()
+                with mock.patch.object(api.pending_questions_reader, "gather", return_value=_g(ITEMS)), \
+                        mock.patch.object(api.pending_questions_reader, "resolve",
+                                          return_value=(code == 200, why)):
+                    got, data = self.req("POST", "/answer", {"id": "ask-bravo", "answer": "ship it"})
+                self.assertEqual(got, code, data)
+                [task] = list((self.tmp / "tasks").glob("answer-ask-bravo-*.txt"))
+                self.assertIn("ship it", task.read_text())
+                if code == 503:
+                    self.assertIn("could not be closed", data["error"])
+                    self.assertTrue(data["recorded"])
+                task.unlink()  # the class shares one tasks/ dir
 
 
 if __name__ == "__main__":
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite([
-        loader.loadTestsFromTestCase(TestParse),
-        loader.loadTestsFromTestCase(TestPython39AndTimezones),
-        loader.loadTestsFromTestCase(TestPendingQuestionRows),
-        loader.loadTestsFromTestCase(TestAnswer),
-    ])
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    sys.exit(0 if result.wasSuccessful() else 1)
+    unittest.main()
