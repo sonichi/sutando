@@ -36,6 +36,11 @@ top of that. Remove the directory and the engine boots, types and tests unchange
   `[dm-only]` delivery note, and a `verify` that re-asks the gateway bridge when the
   result is delivered. Results therefore land as
   `results/proactive-result-<task>-<ts>.to-ag2space.txt` with `[channel: <room>]` first.
+- **In-flight work** keeps the origin and recent context from when the `work` call
+  began, including across a room switch or disconnect/reconnect. A pending
+  transcription is omitted if the origin, provider, or logical session changes;
+  the new session's words never fill that old task. Delivery still re-checks the
+  original room's membership and honors `[dm-only]`.
 - **Prompt**: a `ROOM:` context line while docked, and one system notice per actual
   room change.
 - **`navigate.ts` / `navigate-protocol.ts`** — the `navigate_ui` tool ("let's talk in my
