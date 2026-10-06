@@ -67,9 +67,10 @@ plan:
 - **No crash-restart supervision for the notifier**, unlike Codex's dedicated
   supervisor wrapper (`task-notifier-supervisor.sh`) — a dead watcher session
   is simply recreated on the next `start-cli.sh` invocation, not resurrected
-  mid-session. Every invocation (launch or attach) also retires a leftover
-  `<session>-watcher` of exactly that name first, so an old notifier can never
-  outlive a `start-cli.sh` that no longer manages it.
+  mid-session. `ensure_task_notifier` preserves a live watcher across a plain
+  reattach and only recycles one when the core session itself is fresh; a
+  watcher it cannot currently manage at all (notifier script or `fswatch`
+  missing) is retired instead of left running unaccounted-for.
 - **No scheduler/cron integration.**
 - **No health-check integration, no `--restart` flag, no signal handling**
   beyond tmux's own. Not feature parity with the Claude/Codex launchers —

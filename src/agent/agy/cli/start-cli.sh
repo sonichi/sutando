@@ -97,8 +97,8 @@ ensure_task_notifier() {
   echo "  ⚠ agy task notifier's watcher did not report ready within $(( ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))s — tasks may not reach this session" >&2
 }
 
-# Task injection was removed, but an update leaves a running "<session>-watcher" from it;
-# retire it on every run, since the early return below skips everything else.
+# A watcher nothing below can manage (notifier or fswatch missing) is retired
+# here instead of left running unaccounted-for; the caller gates when this runs.
 retire_stale_watcher() {
   local watcher="${SESSION}-watcher"
   tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null || return 0
@@ -171,7 +171,11 @@ if ! tmux_available; then
   exit 127
 fi
 
-retire_stale_watcher
+# Only when nothing below could manage a watcher anyway: ensure_task_notifier's
+# own tested recycle/preserve rules own every case where it actually can.
+if [ ! -x "$NOTIFIER" ] || ! command -v fswatch >/dev/null 2>&1; then
+  retire_stale_watcher
+fi
 
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.
