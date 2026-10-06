@@ -12,7 +12,8 @@ it ("refusing to choose"), so the watcher published a terminal failure for it. W
 - the handler's run returns 0 for it, not MUST_HANDLE;
 - the held-readers still count the claim as held;
 - an UNMARKED folder still conflicts, exactly as before;
-- a marker in a roster worker's folder or in `core/`, or while the roster is unreadable, refuses;
+- a marker in a roster worker's folder or in `core/`, or while the roster is unreadable, refuses when that
+  folder holds the task; a marked folder that does not hold the task is never read;
 - a marker that is a symlink, even to a regular file, refuses (it is read without following).
 """
 from __future__ import annotations
@@ -148,10 +149,25 @@ def scenario_marker_on_a_roster_recipient_refuses() -> None:
     core = ws / "deliveries" / "core"
     core.mkdir(exist_ok=True)
     (core / pd.NON_EXCLUSIVE_MARKER).write_text("")
-    refuses(ws, "marker in core/")
+    (core / "task-desk.txt").write_text("")
+    refuses(ws, "marker in core/ holding the task")
     ws = workspace(marked=True)
     (ws / "state" / "roster.json").write_text("{not json")
     refuses(ws, "marker while the roster is unreadable")
+
+
+def scenario_marker_without_this_task_is_ignored() -> None:
+    print("\nscenario: a marked folder that does not hold this task is not read at all")
+    ws = workspace(marked=False)
+    (ws / "deliveries" / CLAIMS / "task-desk.accepted").unlink()
+    (ws / "deliveries" / CLAIMS / pd.NON_EXCLUSIVE_MARKER).mkdir()
+    (ws / "deliveries" / W / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    (ws / "state" / "roster.json").write_text("{not json")
+    try:
+        held = rt.holders(ws, "task-other")
+        check("an unrelated bad marker and a roster marker, roster unreadable: no refusal", held == [], str(held))
+    except rt.RouterRefused as e:
+        check("an unrelated bad marker and a roster marker, roster unreadable: no refusal", False, repr(e))
 
 
 def scenario_symlinked_marker_refuses() -> None:
@@ -169,5 +185,6 @@ if __name__ == "__main__":
     scenario_unreadable_marker_refuses()
     scenario_marker_on_a_roster_recipient_refuses()
     scenario_symlinked_marker_refuses()
+    scenario_marker_without_this_task_is_ignored()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all passed'}")
     sys.exit(1 if FAILURES else 0)

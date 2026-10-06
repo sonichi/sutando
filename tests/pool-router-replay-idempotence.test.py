@@ -254,6 +254,28 @@ def scenario_commit_outlives_the_roster() -> None:
     check("the handler's run settles (rc 0), judged by the route's committed target", rc == 0, str(rc))
 
 
+def scenario_unrelated_marker_leaves_replay_roster_free() -> None:
+    print("\nscenario: a marked claim folder holding only ANOTHER task's claim; the roster goes missing, then corrupt")
+    import pool_delivery as pd
+    import pool_route_handler as h
+    for broken in ("missing", "corrupt"):
+        ws = workspace(A)
+        rt.route(ws, task(ws))
+        side = ws / "deliveries" / "side-claims"
+        side.mkdir()
+        (side / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (side / "task-other.accepted").write_text("")
+        roster = ws / "state" / "roster.json"
+        if broken == "missing":
+            roster.unlink()
+        else:
+            roster.write_text("{not json")
+        code, targets, _ = h.classify(ws, task(ws))
+        check(f"roster {broken}: the probe accepts for A", (code, targets) == (0, [A]), str((code, targets)))
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+        check(f"roster {broken}: the handler's run settles (rc 0)", rc == 0, str(rc))
+
+
 def scenario_handler_settles_by_the_routes_targets() -> None:
     print("\nscenario: the probe saw B bound and nothing committed; A commits INSIDE the run's window; the run settles on A")
     import pool_route_handler as h
@@ -493,6 +515,7 @@ def main() -> int:
     scenario_every_arbitration_body_is_fd_relative()
     scenario_unreadable_and_malformed_evidence_refuse()
     scenario_commit_outlives_the_roster()
+    scenario_unrelated_marker_leaves_replay_roster_free()
     scenario_handler_settles_by_the_routes_targets()
     scenario_release_race_is_serialised_by_the_folder_lock()
     scenario_aliased_recipient_directory_refuses()

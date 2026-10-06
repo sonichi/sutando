@@ -102,28 +102,32 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
         except OSError as e:
             raise UnreadableEvidence(f"{task_id}: cannot lock {folder}: {e}") from e
         try:
-            marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
-            if marker == "regular":
-                # A marker may only mean "outside the roster": on a real recipient it would hide its deliveries.
-                roster = roster if roster is not None else pr.load_roster(workspace)
-                if roster is None:
-                    raise UnreadableEvidence(
-                        f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
-                if not pr.unknown_targets(roster, [folder.name]):
-                    raise UnreadableEvidence(
-                        f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} marks roster recipient {folder.name!r}; refusing to decide")
-                continue
-            if marker != "absent":
-                raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")
+            holds = False
             for name in pd.sentinel_names(task_id):
                 state = pd.regular_file_state(name, dir_fd=dfd)     # anchored: never the path again
                 if _between_suffix_checks:
                     _between_suffix_checks(folder / name, state)
                 if state == "regular":
-                    held.append(folder.name)
+                    holds = True
                     break
                 if state != "absent":
                     raise UnreadableEvidence(f"{task_id}: {folder / name} is {state}; refusing to decide")
+            if not holds:
+                continue    # a marker only matters where this task is held: no roster read otherwise
+            marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
+            if marker == "absent":
+                held.append(folder.name)
+                continue
+            if marker != "regular":
+                raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")
+            # A marker may only mean "outside the roster": on a real recipient it would hide its deliveries.
+            roster = roster if roster is not None else pr.load_roster(workspace)
+            if roster is None:
+                raise UnreadableEvidence(
+                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
+            if not pr.unknown_targets(roster, [folder.name]):
+                raise UnreadableEvidence(
+                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} marks roster recipient {folder.name!r}; refusing to decide")
         finally:
             lock.__exit__(None, None, None)
     return held
