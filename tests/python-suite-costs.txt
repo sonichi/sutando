@@ -107,8 +107,10 @@
 0 tests/claude-md-conduct-rules.test.py
 1 tests/claude-md-tier-summary.test.py
 0 tests/claude-pi-wrapper.test.py
+78 tests/claude-task-notifier-gate.test.py
 97 tests/claude-task-notifier-inflight.test.py
-78 tests/claude-task-notifier.test.py
+80 tests/claude-task-notifier-submit.test.py
+60 tests/claude-task-notifier.test.py
 6 tests/cli-wedge-health-probe.test.py
 3 tests/cli-wedge.test.py
 1 tests/cloud-auth.test.py
