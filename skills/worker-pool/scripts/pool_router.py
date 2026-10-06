@@ -92,6 +92,7 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
     except OSError as e:
         raise UnreadableEvidence(f"{task_id}: cannot read the recipient folders under {root}: {e}") from e
     held = []
+    roster = None
     for name_ in names:
         folder = root / name_
         seams = _arbitration_seams or {}
@@ -103,6 +104,14 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
         try:
             marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
             if marker == "regular":
+                # A marker may only mean "outside the roster": on a real recipient it would hide its deliveries.
+                roster = roster if roster is not None else pr.load_roster(workspace)
+                if roster is None:
+                    raise UnreadableEvidence(
+                        f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
+                if not pr.unknown_targets(roster, [folder.name]):
+                    raise UnreadableEvidence(
+                        f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} marks roster recipient {folder.name!r}; refusing to decide")
                 continue
             if marker != "absent":
                 raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")

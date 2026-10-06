@@ -11,7 +11,9 @@ it ("refusing to choose"), so the watcher published a terminal failure for it. W
   pass over that task and another room's task routes both;
 - the handler's run returns 0 for it, not MUST_HANDLE;
 - the held-readers still count the claim as held;
-- an UNMARKED folder still conflicts, exactly as before.
+- an UNMARKED folder still conflicts, exactly as before;
+- a marker in a roster worker's folder or in `core/`, or while the roster is unreadable, refuses;
+- a marker that is a symlink, even to a regular file, refuses (it is read without following).
 """
 from __future__ import annotations
 
@@ -126,9 +128,46 @@ def scenario_unreadable_marker_refuses() -> None:
         check("holders refuses", "refusing to decide" in str(e), str(e))
 
 
+def refuses(ws, label: str) -> None:
+    try:
+        held = rt.holders(ws, "task-desk")
+        check(f"{label}: holders refuses", False, f"no refusal, holders={held}")
+    except rt.UnreadableEvidence as e:
+        print(f"       refused: {e}")
+        check(f"{label}: holders refuses", "refusing to decide" in str(e), str(e))
+    rc = h.main(["--workspace", str(ws), "--task-file", str(ws / "tasks" / "task-desk.txt")])
+    check(f"{label}: the handler's run returns MUST_HANDLE", rc == h.MUST_HANDLE, f"rc={rc}")
+
+
+def scenario_marker_on_a_roster_recipient_refuses() -> None:
+    print("\nscenario: a marker in a roster worker's folder or in core/ never hides that recipient")
+    ws = workspace(marked=True)
+    (ws / "deliveries" / W / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    refuses(ws, "marker in the bound worker's folder")
+    ws = workspace(marked=True)
+    core = ws / "deliveries" / "core"
+    core.mkdir(exist_ok=True)
+    (core / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    refuses(ws, "marker in core/")
+    ws = workspace(marked=True)
+    (ws / "state" / "roster.json").write_text("{not json")
+    refuses(ws, "marker while the roster is unreadable")
+
+
+def scenario_symlinked_marker_refuses() -> None:
+    print("\nscenario: a marker that is a symlink to a regular file is not a marker")
+    ws = workspace(marked=False)
+    target = ws / "state" / "marker-target"
+    target.write_text("")
+    (ws / "deliveries" / CLAIMS / pd.NON_EXCLUSIVE_MARKER).symlink_to(target)
+    refuses(ws, "symlinked marker")
+
+
 if __name__ == "__main__":
     scenario_marked_folder_is_not_a_holder()
     scenario_unmarked_folder_still_conflicts()
     scenario_unreadable_marker_refuses()
+    scenario_marker_on_a_roster_recipient_refuses()
+    scenario_symlinked_marker_refuses()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all passed'}")
     sys.exit(1 if FAILURES else 0)
