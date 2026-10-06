@@ -21,6 +21,7 @@ from typing import List, Optional
 
 import activity_rows
 import task_queue
+from workspace_default import status_path
 
 _USAGE = frozenset({"turn-rejected", "session-limit", "fable-limit-unfocused"})
 _SIGN_IN = frozenset({"login"})
@@ -52,7 +53,7 @@ def queued_count(workspace: Path) -> int:
 
 
 def ledger_path(workspace: Path) -> Path:
-    return Path(workspace) / "state" / "core-gate-noticed.json"
+    return status_path("core-gate-noticed.json", Path(workspace))
 
 
 def _noticed(workspace: Path) -> List[str]:
