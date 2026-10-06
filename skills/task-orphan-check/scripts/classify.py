@@ -93,6 +93,7 @@ if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
 import local_task_protocol as ltp  # noqa: E402
+import result_markers  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
 # hold a task. Any stat failure but ENOENT propagates — unreadable is not absent.
@@ -230,6 +231,39 @@ def channel_label(headers: dict) -> str:
     return neutralize(f"{name} ({cid})" if name else (cid or "DM"))
 
 
+_KEYWORD_COLON_RE = re.compile(r"(?i)\b(file|send|attach|deduped|channel|reply)(:)")
+
+
+def _escalate(task_id: str, tier: str) -> tuple[str, str]:
+    """One more round of defanging on both untrusted fields: the keyword's colon,
+    not just the template's brackets, is what lets a forged value hijack the
+    template's OWN surrounding `[...]` -- escaping only `[`/`]` leaves `file:`/
+    `send:`/`attach:` (and the other leading markers) still readable as themselves."""
+    sub = lambda s: _KEYWORD_COLON_RE.sub(r"\1ː", s)  # ':' -> MODIFIER LETTER TRIANGULAR COLON
+    return sub(task_id), sub(tier)
+
+
+def recovery_line(task_id: str, tier: str, label: str, age_s: int, text_preview: str) -> str:
+    """The exact preview bullet step 3 prints verbatim -- never reconstructed from raw
+    headers. `task_id` and `tier` come straight from a legacy/missing-header task's own
+    body (parse_task_headers_lenient's body-line fallback, canonical_access_tier's
+    pass-through of an unknown value); `label` and `preview` are already neutralized by
+    their own builders. Bracket-neutralizing these two is not enough on its own -- a
+    forged tier starting `file: ...]` closes through the TEMPLATE's own trailing `]`
+    even with its own bracket escaped, so the real, fully assembled line is checked
+    against the production marker parser itself and further defanged until proven
+    inert, rather than trusting a guessed-sufficient escaping scheme."""
+    age_m = max(0, age_s // 60)
+    task_id, tier = neutralize(task_id), neutralize(tier)
+    for _ in range(4):
+        line = f"- task-{task_id} [{tier}, {label}, {age_m}m ago]: {text_preview}"
+        parsed = result_markers.parse_markers(line)
+        if not parsed.actions and parsed.body == line:
+            return line
+        task_id, tier = _escalate(task_id, tier)
+    raise ValueError(f"could not make a safe recovery line for task_id={task_id!r} tier={tier!r}")
+
+
 PREVIEW_CHARS = 100
 # The bridge appends its sandbox block AFTER the ask; the parsed body carries both.
 _SYSTEM_BLOCK_RE = re.compile(r"^===\s*SUTANDO SYSTEM INSTRUCTIONS\b", re.M)
@@ -255,15 +289,18 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
     tier = ltp.canonical_access_tier(headers.get("access_tier") or "owner")
+    label = channel_label(headers)
+    task_preview = preview(parsed.body)
     row = {
         "file": path.name,
         "id": task_id,
         "source": source,
         "access_tier": tier,
         "channel_id": headers.get("channel_id") or headers.get("chat_id") or "",
-        "label": channel_label(headers),
-        "preview": preview(parsed.body),
+        "label": label,
+        "preview": task_preview,
         "age_s": age_s,
+        "recovery_line": recovery_line(task_id, tier, label, age_s, task_preview),
         "age_from": age_from,
         "import": False,
     }
