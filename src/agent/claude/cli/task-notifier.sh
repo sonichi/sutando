@@ -385,10 +385,22 @@ composer_resume_offset() {
   return 1
 }
 
-# $3 = the composer's exact (dewrapped, raw) content right after the failed chunk, when
-# the caller has it -- what lets a later attempt prove a non-boundary leftover is this
-# notifier's own typing (see composer_matches_own_leftover), not just that something
-# was cut short.
+# True only when $1 is a subsequence of $2 (every char of $1 appears in $2, in
+# order, gaps allowed) -- dropped bytes pass this, foreign (owner) text does not.
+squeezed_is_subsequence() {
+  "$NOTIFIER_PY" -c '
+import sys
+needle, hay = sys.argv[1], sys.argv[2]
+i = 0
+for ch in hay:
+    if i < len(needle) and needle[i] == ch:
+        i += 1
+sys.exit(0 if i == len(needle) else 1)
+' "$1" "$2"
+}
+
+# $3 = composer text the caller already proved is ours (squeezed_is_subsequence);
+# never pass through unchecked composer text.
 note_partial_paste() {
   printf '%s' "${3-}" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$PARTIAL_DIR" "$1" "$2" \
     || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
@@ -493,7 +505,7 @@ deliver_prompt() {
 
 deliver_prompt_grown() {
   local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
-  local baseline_esc baseline_raw staged_raw="" incarnation=""
+  local baseline_esc baseline_raw staged_raw="" incarnation="" leftover_now
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
@@ -543,13 +555,14 @@ deliver_prompt_grown() {
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
-      # A cut box cannot be read whole; recording its partial view as "the leftover"
-      # would be a wrong record a later attempt could wrongly trust. Record nothing then --
-      # partial_paste_leftover already treats no text as nothing provable to clear against.
-      if pane_frame_is_cut "$staged_raw"; then
+      # Record the leftover only when it's unreadable-whole (nothing to check) or every
+      # character in it is provably ours; otherwise record nothing (fails closed as before).
+      leftover_now="$(composer_text "$staged_raw")"
+      if pane_frame_is_cut "$staged_raw" || [ -z "$leftover_now" ] \
+         || ! squeezed_is_subsequence "$(printf '%s' "$leftover_now" | squeeze)" "$(printf '%s' "$prompt" | squeeze)"; then
         note_partial_paste "$filename" "$incarnation"
       else
-        note_partial_paste "$filename" "$incarnation" "$(composer_text "$staged_raw")"
+        note_partial_paste "$filename" "$incarnation" "$leftover_now"
       fi
     fi
     type_tries=$((type_tries + 1))
