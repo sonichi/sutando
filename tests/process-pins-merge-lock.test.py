@@ -287,9 +287,8 @@ class InProcess(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             pp.merge_into(self.dst, self.src)
         self.assertIn("destination", str(cm.exception))
-        # a `stat` that exists but never prints a parseable value (every
-        # candidate form rejected by the character/shape guard) is the same
-        # "unavailable" outcome through a different internal branch
+        # an unparseable `stat` value (rejected by the character/shape guard)
+        # is the same "unavailable" outcome through a different branch
         self._write(self.src, [_pin("discord-bridge", self.me, self.my_lstart, "s")], base)
         self._stat_shim("printf 'not-a-timestamp\\n'")
         with self.assertRaises(ValueError) as cm:
