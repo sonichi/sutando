@@ -112,7 +112,8 @@ namesake.
 tasks/task-123.txt                                              the payload: immutable, never copied, never moved until finish
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
-tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+tasks/archive/task-123.txt                                      finish (payload archived; the same step moves the sentinel)
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  ...into its inbox's archive/, never re-swept
 ```
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
@@ -287,11 +288,10 @@ a live process is the double-arm the ladder exists to prevent. A session-role
 watcher stamps its sentinel and starts its beat before its startup sweep, so
 inside the sweep it reads as live and events queue rather than drop; its only
 held-and-beatless window is the readiness round-trip, a few seconds the
-three-tick sustain absorbs. A watcher on the non-session order sweeps before it
-subscribes and is deaf for as long as a stale-sentinel backlog stalls that sweep
-(#4588); it is not a session-role holder, so its stale beat counts as a lost
-watcher and the rung acts on it after the sustain, which is the right outcome
-for a watcher that cannot hear. A holder check that could not be told is not
+three-tick sustain absorbs. Every watcher subscribes before it sweeps, and the
+sweep is planned by one process (`task_dispatch.py sweep-plan`, one `--batch`
+resolver run) and fed into the event FIFO, so a task that arrives mid-sweep is
+read in arrival order rather than after the backlog. A holder check that could not be told is not
 evidence either way.
 
 **A live session that will not progress is the third rung.** A seat's session can
