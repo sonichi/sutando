@@ -175,6 +175,9 @@ CODEX_ARGS=(
   --ask-for-approval never
   --search
   --no-alt-screen
+  # The core runs headless: an interactive "Update available" menu at startup
+  # blocks it until someone answers, so the startup update check stays off.
+  -c check_for_update_on_startup=false
 )
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
