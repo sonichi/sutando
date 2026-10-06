@@ -6,12 +6,16 @@ task waiting in the core's queue gets ONE notice row under its own message (the 
 projection, room audience) saying the core is stopped at a gate that needs the owner and that
 the task is kept. The task is NOT answered or closed: it runs once the gate clears.
 
-The dedup ledger is the requirement itself (`subject.queued_noticed`): one requirement is one
-blocked episode, so a task arriving later in the same episode is noticed on the next tick and
-a new episode notices again. The room sees only a gate category, never the prompt text.
+The dedup ledger is the outage, not the requirement: a changed prompt mints a new requirement
+but the same outage, so the ledger (<workspace>/state/core-gate-noticed.json) lives until the
+monitor sees the core leave the blocked set (`end_outage`). A task arriving later in the same
+outage is noticed on the next tick; a new outage notices again. The room sees only a gate
+category, never the prompt text.
 """
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -47,8 +51,36 @@ def queued_count(workspace: Path) -> int:
         return 0
 
 
+def ledger_path(workspace: Path) -> Path:
+    return Path(workspace) / "state" / "core-gate-noticed.json"
+
+
+def _noticed(workspace: Path) -> List[str]:
+    try:
+        ids = json.loads(ledger_path(workspace).read_text()).get("tasks")
+        return [t for t in ids if isinstance(t, str)] if isinstance(ids, list) else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _save_noticed(workspace: Path, ids: List[str]) -> None:
+    path = ledger_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"tasks": ids}))
+    os.replace(tmp, path)
+
+
+def end_outage(workspace: Path) -> None:
+    """The core left the blocked set: the next outage notices every queued task again."""
+    try:
+        ledger_path(workspace).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def notice_queued(manager, req, workspace: Path, state: str, kind: Optional[str]) -> List[str]:
-    """Write the notice for every pending task `req` has not noticed yet; returns their ids."""
+    """Write the notice for every pending task this outage has not noticed yet; returns their ids."""
     if manager is None or req is None:
         return []
     try:
@@ -58,10 +90,9 @@ def notice_queued(manager, req, workspace: Path, state: str, kind: Optional[str]
     except OSError:
         return []
     with manager.store.locked():
-        cur = manager.get(req.id)
-        if cur is None:
+        if manager.get(req.id) is None:
             return []
-        seen = list((cur.subject or {}).get("queued_noticed") or [])
+        seen = _noticed(workspace)
         fresh = [tid for tid in files if tid not in seen]
         if not fresh:
             return []
@@ -75,6 +106,6 @@ def notice_queued(manager, req, workspace: Path, state: str, kind: Optional[str]
             except (KeyError, OSError, ValueError):
                 continue  # vanished or unreadable: picked up or archived meanwhile
             done.append(tid)
-        cur.subject = {**(cur.subject or {}), "queued_noticed": seen + done}
-        manager.store.save(cur)
+        if done:
+            _save_noticed(workspace, [t for t in seen if t in files] + done)
     return done

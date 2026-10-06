@@ -100,14 +100,15 @@ case "$VERDICT" in
   DIALOG)
     if [ -n "$CONFIRM" ]; then
       VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; CONFIRMED=true
-      [ "$VERDICT" = ACCEPTED ] || { echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
+      [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
     else
       bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
       echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
     fi;;
-  *) echo "switch-model: sent '/model $MODEL' but saw no acceptance OF THAT MODEL within ${ACCEPT_TIMEOUT}s; nothing recorded. A picker it left on screen is dismissed after ${DISMISS_AFTER:-0}s unless someone answers it (0 = never)" >&2; exit 8;;
+  *) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+     echo "switch-model: sent '/model $MODEL' but saw no acceptance OF THAT MODEL within ${ACCEPT_TIMEOUT}s; nothing recorded. A picker it left on screen is dismissed after ${DISMISS_AFTER:-0}s unless someone answers it (0 = never)" >&2; exit 8;;
 esac
 # Record only now, with the previous model snapshotted before the send.
 OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" <<'PYEOF'

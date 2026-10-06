@@ -14,8 +14,13 @@ credits is never eligible whatever the record says.
 Record: <state_dir>/self-opened-gate.<session>.json
   {"session", "opener", "kind": "selection", "opened_at", "claim_window_s", "dismiss_after_s"}
 
+An opener that gives up without knowing whether its picker is up `close`s the record: the
+claim window then ends a few seconds after that moment, so a picker a human opens later is
+first seen outside it and is never attributed to the opener.
+
 CLI (for shell openers):
   self_opened_gate.py record --state-dir D --session S --opener NAME --dismiss-after S [--claim-window S]
+  self_opened_gate.py close  --state-dir D --session S
   self_opened_gate.py clear  --state-dir D --session S
 """
 from __future__ import annotations
@@ -32,7 +37,7 @@ from typing import Optional
 DISMISSABLE_KINDS = frozenset({"selection"})
 DISMISS_KEY = "Escape"
 DEFAULT_CLAIM_WINDOW_S = 60.0
-#: The picker can paint a moment before the record's clock reads it opened.
+#: Slack either side: a picker paints before `opened_at` is read, and the monitor sights it a poll late.
 _SKEW_S = 5.0
 _SPEND = re.compile(r"\bcredits?\b|spend limit|extra usage|usage limit", re.I)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -47,11 +52,26 @@ def record(state_dir: str, session: str, opener: str, dismiss_after_s: float,
     rec = {"session": session, "opener": opener, "kind": "selection",
            "opened_at": time.time() if now is None else now,
            "claim_window_s": float(claim_window_s), "dismiss_after_s": float(dismiss_after_s)}
+    _write(state_dir, session, rec)
+    return rec
+
+
+def _write(state_dir: str, session: str, rec: dict) -> None:
     os.makedirs(state_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".self-opened-gate.")
     with os.fdopen(fd, "w") as f:
         json.dump(rec, f)
     os.replace(tmp, record_path(state_dir, session))
+
+
+def close(state_dir: str, session: str, now: Optional[float] = None) -> Optional[dict]:
+    """End the record's claim window at `now` (plus the monitor's sighting lag); never widens it."""
+    rec = load(state_dir, session)
+    if rec is None:
+        return None
+    now = time.time() if now is None else now
+    rec["claim_window_s"] = max(0.0, min(rec["claim_window_s"], now - rec["opened_at"] + _SKEW_S))
+    _write(state_dir, session, rec)
     return rec
 
 
@@ -100,7 +120,8 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("record")
     c = sub.add_parser("clear")
-    for p in (r, c):
+    k = sub.add_parser("close")
+    for p in (r, c, k):
         p.add_argument("--state-dir", required=True)
         p.add_argument("--session", required=True)
     r.add_argument("--opener", required=True)
@@ -110,6 +131,8 @@ def main(argv=None) -> int:
     try:
         if a.cmd == "record":
             record(a.state_dir, a.session, a.opener, a.dismiss_after, a.claim_window)
+        elif a.cmd == "close":
+            close(a.state_dir, a.session)
         else:
             clear(a.state_dir, a.session)
     except OSError as exc:

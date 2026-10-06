@@ -124,6 +124,36 @@ class TestSelfOpenedPickerDismissal(unittest.TestCase):
         spendy = PICKER.replace("Haiku 4.5 · Fastest for quick answers", "uses usage credits")
         self.assertEqual(_run(self.sd, _every(T0 + 2, T0 + 3600, spendy)), [])
 
+    def test_only_a_selection_gate_is_eligible(self):
+        """The kind check on its own: a record, a settled gate, no spend words, wrong kind."""
+        self._record()
+        args = dict(session=SESSION, state="blocked-human", prompt="Select login method",
+                    gate_first_seen=T0 + 2, prompt_since=T0 + 2, now=T0 + 900)
+        rec = G.load(self.sd, SESSION)
+        self.assertEqual(G.dismiss_key(rec, kind="selection", **args), "Escape", "positive control")
+        for kind in ("login", "session-limit", "trust", None):
+            self.assertIsNone(G.dismiss_key(rec, kind=kind, **args), kind)
+
+    def test_a_closed_record_does_not_cover_a_picker_the_owner_opens_later(self):
+        """The opener gave up at T0+40 with no picker up; the owner opens /model at T0+50."""
+        self._record()
+        G.close(self.sd, SESSION, now=T0 + 40)
+        self.assertEqual(G.load(self.sd, SESSION)["claim_window_s"], 45.0)
+        self.assertEqual(_run(self.sd, _every(T0 + 50, T0 + 900, PICKER)), [])
+
+    def test_a_closed_record_still_covers_the_picker_it_left_up(self):
+        self._record()
+        G.close(self.sd, SESSION, now=T0 + 40)
+        self.assertEqual(len(_run(self.sd, _every(T0 + 2, T0 + 900, PICKER))), 1)
+
+    def test_closing_never_widens_the_window_and_needs_a_record(self):
+        self._record()
+        G.close(self.sd, SESSION, now=T0 + 500)
+        self.assertEqual(G.load(self.sd, SESSION)["claim_window_s"], 70.0)
+        G.clear(self.sd, SESSION)
+        self.assertIsNone(G.close(self.sd, SESSION, now=T0))
+        self.assertIsNone(G.load(self.sd, SESSION), "close does not create a record")
+
     def test_off_switches_and_bad_records_send_nothing(self):
         self._record(dismiss_after=0)
         self.assertEqual(_run(self.sd, _every(T0 + 2, T0 + 3600, PICKER)), [], "0 = never")
@@ -166,6 +196,8 @@ class TestSelfOpenedPickerDismissal(unittest.TestCase):
                                  "--opener", "x", "--dismiss-after", "120"]), 0)
         rec = G.load(self.sd, SESSION)
         self.assertEqual((rec["opener"], rec["dismiss_after_s"], rec["kind"]), ("x", 120.0, "selection"))
+        self.assertEqual(G.main(["close", "--state-dir", self.sd, "--session", SESSION]), 0)
+        self.assertLessEqual(G.load(self.sd, SESSION)["claim_window_s"], 60.0)
         self.assertEqual(G.main(["clear", "--state-dir", self.sd, "--session", SESSION]), 0)
         self.assertIsNone(G.load(self.sd, SESSION))
 
@@ -222,6 +254,35 @@ class TestQueuedTasksHearWhy(unittest.TestCase):
         self.assertEqual(self._escalate(PICKER)[1], ["task-3"])
         self.assertEqual(len(_rows(self.ws)), 2)
         self.assertNotIn("Haiku", _rows(self.ws)[0]["line"])
+
+    def test_one_notice_per_task_per_outage_even_when_the_prompt_changes(self):
+        """A changed prompt mints a new card but is the same outage: the task hears once."""
+        _task(self.ws, 1)
+        first, noticed = self._escalate(PICKER)
+        self.assertEqual(noticed, ["task-1"])
+        second, again = self._escalate(REFUSED)
+        self.assertNotEqual(first.id, second.id, "a new requirement for the new prompt")
+        self.assertEqual(again, [])
+        self.assertEqual(len(_rows(self.ws)), 1)
+        core_gate_notice.end_outage(self.ws)
+        core_gate_notice.end_outage(self.ws)
+        self.assertEqual(self._escalate(REFUSED)[1], ["task-1"], "a new outage notices again")
+
+    def test_the_ledger_forgets_tasks_that_left_the_queue(self):
+        _task(self.ws, 1)
+        _task(self.ws, 2)
+        self._escalate(PICKER)
+        (self.ws / "tasks" / "task-1.txt").unlink()
+        _task(self.ws, 3)
+        self._escalate(PICKER)
+        ledger = json.loads(core_gate_notice.ledger_path(self.ws).read_text())["tasks"]
+        self.assertEqual(sorted(ledger), ["task-2", "task-3"])
+
+    def test_an_unreadable_ledger_notices_rather_than_stays_silent(self):
+        _task(self.ws, 1)
+        core_gate_notice.ledger_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        core_gate_notice.ledger_path(self.ws).write_text("{not json")
+        self.assertEqual(self._escalate(PICKER)[1], ["task-1"])
 
     def test_no_queue_no_rows_and_no_count_on_the_card(self):
         req, noticed = self._escalate(PICKER)
@@ -292,7 +353,7 @@ class TestMonitorLoop(unittest.TestCase):
     """main() itself, across ticks, with tmux replaced by a pane that an Escape clears.
     115 ticks of 3s end inside the 120s the auto-answer stays in the signal file."""
 
-    def _loop(self, with_record, ticks=115):
+    def _loop(self, with_record, ticks=115, seat=None):
         ws = pathlib.Path(tempfile.mkdtemp())
         (ws / "tasks").mkdir()
         _task(ws, 1)
@@ -315,6 +376,8 @@ class TestMonitorLoop(unittest.TestCase):
                 return {"health": "idle"}
         clock = _Clock(ticks)
         argv = ["core-input-watch.py", "--socket", "/x.sock", "--session", SESSION, "--out", str(out)]
+        if seat:
+            argv += ["--seat", seat]
         with patch.object(M, "capture", lambda s, sess: screen["pane"]), \
                 patch.object(M, "send_keys", send), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
@@ -334,6 +397,18 @@ class TestMonitorLoop(unittest.TestCase):
         self.assertIsNone(G.load(str(out.parent), SESSION), "the record is spent")
         self.assertEqual([r["task"]["id"] for r in _rows(ws)], ["task-1"])
         self.assertEqual(os.listdir(ws / "tasks"), ["task-1.txt"])
+        self.assertFalse(core_gate_notice.ledger_path(ws).exists(), "the outage ended with the gate")
+
+    def test_a_worker_seat_posts_no_notices_and_counts_no_queue(self):
+        """tasks/ is the core's queue; a worker pane blocked on its own gate must not speak for it."""
+        ws, out, sent = self._loop(with_record=False, ticks=10, seat="worker-1")
+        self.assertEqual(json.loads(out.read_text())["state"], "blocked-human")
+        self.assertEqual(_rows(ws), [])
+        self.assertFalse(core_gate_notice.ledger_path(ws).exists())
+        cards = M._hitl_manager(str(out)).active()
+        self.assertEqual(len(cards), 1, "the worker's card is still raised")
+        self.assertIn("worker-1", cards[0].title)
+        self.assertNotIn("queued task", cards[0].message)
 
     def test_without_a_record_the_loop_never_types(self):
         ws, out, sent = self._loop(with_record=False)

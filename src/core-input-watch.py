@@ -858,6 +858,8 @@ def main():
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
                 resolve_escalations(hitl, a.session, pane)
+                if not a.seat:
+                    core_gate_notice.end_outage(workspace)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
