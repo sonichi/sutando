@@ -113,9 +113,8 @@ WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
-# when the inbox is the core's own <workspace>/tasks BY REALPATH -- never by basename alone.
-CANONICAL_CORE_TASKS_DIR="$(canonical_tasks_dir "$WORKSPACE_DIR/tasks")"
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TASKS_DIR" ]; then
+# on the core's own canonical inbox -- via the ONE check every such caller shares.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && inbox_is_canonical_core_tasks_dir "$TASKS_DIR"; then
   echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
   unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
 fi

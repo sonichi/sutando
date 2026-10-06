@@ -42,11 +42,23 @@ if [ -z "$NOTIFIER_PY" ]; then
   exit 1
 fi
 
+# shellcheck source=../../../tasks-dir-resolve.sh
+. "$REPO/src/tasks-dir-resolve.sh"
+
+# Cleared only on the core's own canonical inbox (shared rule, sonichi#5161);
+# forced to "agy-task-notifier" on any other inbox so its sentinel never collides.
+resolved_instance_id() {
+  if inbox_is_canonical_core_tasks_dir "$TASKS_DIR"; then
+    printf ''
+  else
+    printf 'agy-task-notifier'
+  fi
+}
+
 sentinel_path() {
   # The sentinel this notifier's own watcher stamps once ready; the launcher
   # polls it, so the two must derive one path from one inbox and one identity.
-  . "$REPO/src/tasks-dir-resolve.sh"
-  env -u SUTANDO_INSTANCE_ID "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
+  SUTANDO_INSTANCE_ID="$(resolved_instance_id)" "$NOTIFIER_PY" "$REPO/src/util_paths.py" \
     watcher-sentinel "$(workspace_dir_for_inbox "$TASKS_DIR")/state"
 }
 # One receipt file per launch, named by its nonce: no generation can read or remove another's.
@@ -255,10 +267,10 @@ if [ "${1:-}" = "--event" ]; then
   exit 0
 fi
 
-# Bind RESULTS_DIR (never an env var itself). The core's watcher carries no instance id:
-# watch-tasks-stream.sh clears one on the canonical inbox, so the sentinel must not use it.
+# Bind RESULTS_DIR (never an env var itself); the spawned watcher inherits this
+# exact instance id, so it and this notifier's sentinel lookup agree.
 export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
-unset SUTANDO_INSTANCE_ID
+export SUTANDO_INSTANCE_ID="$(resolved_instance_id)"
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 # The launch nonce rides the watcher's own ready event (<sentinel>.token), so readiness can

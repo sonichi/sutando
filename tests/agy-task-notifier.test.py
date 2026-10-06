@@ -779,6 +779,101 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_tasks_agy_shaped_inbox_never_touches_the_canonical_sentinel(self):
+        # Regression for sonichi#5161: an unconditional id-clear made the agy
+        # watcher's sentinel collide with (then delete) a live core's sentinel.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        state_dir = self.tasks_dir.parent / "state"
+        canonical_sentinel = state_dir / "watch-tasks-stream.pid"
+        agy_sentinel = state_dir / "watch-tasks-stream-local-agent+agy-task-notifier.pid"
+
+        core_env = self._env()
+        for var in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
+            core_env.pop(var, None)
+        core_proc = subprocess.Popen(
+            ["/bin/bash", str(REPO / "src/watch-tasks-stream.sh"), str(self.tasks_dir),
+             "--role", "session", "--inbox", str(self.tasks_dir)],
+            env=core_env,
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not canonical_sentinel.exists():
+                time.sleep(0.2)
+            self.assertTrue(canonical_sentinel.exists(), "core watcher never stamped its sentinel")
+            core_pid_text = canonical_sentinel.read_text()
+            core_mtime = canonical_sentinel.stat().st_mtime
+
+            agy_tasks_dir = self.tasks_dir.parent / "tasks-agy"
+            agy_tasks_dir.mkdir()
+            agy_env = self._env({
+                "SUTANDO_TASKS_DIR": str(agy_tasks_dir),
+                "SUTANDO_RESULTS_DIR": str(self.tasks_dir.parent / "results-agy"),
+            })
+            for var in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
+                agy_env.pop(var, None)
+            agy_proc = subprocess.Popen(
+                ["/bin/bash", str(NOTIFIER)],
+                env=agy_env,
+                cwd=str(self.root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                deadline = time.time() + 15
+                while time.time() < deadline and not agy_sentinel.exists():
+                    time.sleep(0.2)
+                self.assertTrue(
+                    agy_sentinel.exists(),
+                    "agy's own watcher never stamped its distinct sentinel (state dir has: "
+                    f"{[p.name for p in state_dir.glob('watch-tasks-stream*.pid')]})")
+                self.assertEqual(canonical_sentinel.read_text(), core_pid_text,
+                                  "the agy watcher overwrote the core's canonical sentinel")
+                self.assertEqual(canonical_sentinel.stat().st_mtime, core_mtime,
+                                  "the agy watcher re-stamped the core's canonical sentinel "
+                                  "(its content is unchanged, but mtime proves a touch)")
+            finally:
+                if agy_proc.poll() is None:
+                    try:
+                        os.killpg(agy_proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    agy_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(agy_proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    agy_proc.wait(timeout=5)
+
+            # Must be byte- and mtime-identical to before agy ever ran: never touched.
+            self.assertTrue(canonical_sentinel.exists(),
+                             "the core's canonical sentinel was removed by the agy watcher's exit")
+            self.assertEqual(canonical_sentinel.read_text(), core_pid_text)
+            self.assertEqual(canonical_sentinel.stat().st_mtime, core_mtime)
+        finally:
+            if core_proc.poll() is None:
+                try:
+                    os.killpg(core_proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                core_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(core_proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                core_proc.wait(timeout=5)
+
 
 class RestartHandoffTest(FakeTmuxHarness):
     """A stranded task (dispatched, never completed, because the core it was
