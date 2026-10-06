@@ -453,7 +453,7 @@ composer_matches_own_leftover() {
 # composer). Verifies empty afterward; a caller that got here already proved via
 # composer_matches_own_leftover that every one of these characters is this notifier's.
 clear_own_leftover() {
-  local filename="$1" raw="$2" n text
+  local filename="$1" raw="$2" n text waited=0
   text="$(composer_text "$raw")"
   n="$(printf '%s' "$text" | "$NOTIFIER_PY" -c \
     'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))))')"
@@ -461,10 +461,13 @@ clear_own_leftover() {
   [ "$n" -gt 0 ] || return 0
   log_notifier "erasing $n char(s) recorded as $filename's own leftover, about to clear: $text"
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -N "$n" BSpace 2>/dev/null || return 1
-  # A dewrapped read can undercount a real multi-line prompt's newlines (composer_text
-  # joins rows with no separator); this is the backstop, not a second guess at the
-  # count -- an incomplete clear is caught here and fails closed, never retyped over.
-  [ -z "$(composer_text "$(capture_raw)")" ]
+  # A real CLI renders N backspaces over several redraws, not instantly (measured
+  # live) -- polls instead of reading once; still fails closed past the budget.
+  while [ -n "$(composer_text "$(capture_raw)")" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] || return 1
+    sleep "$POLL_INTERVAL"
+  done
 }
 
 # Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
