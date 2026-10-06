@@ -33,8 +33,10 @@ this preflight prints. The session that delegates owns the step:
    state, not something the delegate re-derives.
 3. Verify any finding you will post as a blocker before posting it.
 
-The preflight reads `<repo>/REVIEW.md` and exits non-zero where there is none, so for a PR in a repo
-without one, write the brief from the PR itself.
+The preflight reads the `REVIEW.md` of the Sutando checkout it lives in, not of the PR's repo, so for a
+PR in another repo it exits 0 and prints Sutando's criteria. There, pass `--repo <owner/name>` for that
+repo's gate state and `--guide <path>` to that repo's own review guide if it has one; with no guide,
+write the brief from the PR itself rather than pasting Sutando's lessons.
 
 `review-preflight.py` resolves the repo root via `git rev-parse --show-toplevel`, falling back to three
 levels above its own file. `ci-triage.py` is advisory (exit 0), and is the module review-preflight will
