@@ -78,6 +78,14 @@ bearer discovers the hosted MCP on its relay, mints a delegation there, and runs
 `room.action.execute` with `operation_id` derived from the target, so a repeated
 call is the same operation.
 
+The owner DM is the room whose members are exactly {this agent, its owner} (owner
+from the gateway's `/v1/agents` row): the only room the Action accepts. The
+gateway's `owner_dm_room` reading is not used as-is, because it can hold other
+members. With several such rooms, the one with the most recent owner message wins
+(else the lowest room id); the pick is logged to `logs/owner-mention-navigate.log`
+and cached for a day in `state/owner-mention-dm.json`. A room the Action refuses
+as the DM is excluded from later picks; a refusal about the target keeps it.
+
 **When `room_ops.py` is still the path (fallback)**
 - The MCP is not connected or unreachable, or an Action returns a server error.
 - `events subscribe` / `unsubscribe` / `list` / `pull` / `stream`: MCP event

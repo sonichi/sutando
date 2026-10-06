@@ -198,7 +198,7 @@ def navigate(owner_dm, arguments, door_factory=open_door):
     return {"ok": True, "event_id": out.get("event_id")}
 
 
-# Workspace state: owner DM reading, the per-mention ledger
+# Workspace state: the owner DM, the per-mention ledger
 def _workspace():
     if not _gw._core_src_on_path():
         raise RuntimeError("core src/ not found; cannot resolve the workspace")
@@ -211,16 +211,120 @@ def _instance_suffix():
     return f".{inst}" if inst else ""
 
 
-def owner_dm_room(workspace, gateway_base):
-    """The gateway bridge's persisted owner-DM reading, only when it is for this gateway."""
+class Rooms:
+    """What the owner-DM resolution reads, through the room-ops gateway."""
+
+    def agents(self):
+        base, headers = _gw.gateway()
+        _status, res = _gw.http_json("GET", f"{base}/v1/agents", headers)
+        return res.get("agents") or [] if isinstance(res, dict) else []
+
+    def joined(self):
+        import rooms as _rooms
+        return [r for r in _rooms.joined_rooms().get("rooms") or [] if isinstance(r, str)]
+
+    def members(self, room_id):
+        import members as _members
+        res = _members.room_members(room_id)
+        return {m["user_id"] for m in res["members"]} if res.get("ok") else None
+
+    def last_message_by(self, room_id, sender):
+        import read as _read
+        res = _read.read_room(room_id, limit=OWNER_DM_HISTORY)
+        stamps = [float(m.get("ts") or 0) for m in res.get("messages") or []
+                  if m.get("sender") == sender]
+        return max(stamps) if stamps else None
+
+
+OWNER_DM_TTL_S = 86400.0
+OWNER_DM_HISTORY = 50
+OWNER_DM_SCAN_WORKERS = 8
+
+
+def _routing(workspace, gateway_base):
     path = Path(workspace) / "state" / f"owner-routing{_instance_suffix()}.json"
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return {}
+    ok = isinstance(d, dict) and str(d.get("gateway") or "") == (gateway_base or "")
+    return d if ok else {}
+
+
+def _dm_cache(workspace):
+    return Path(workspace) / "state" / f"owner-mention-dm{_instance_suffix()}.json"
+
+
+def _read_dm_cache(workspace):
+    try:
+        c = json.loads(_dm_cache(workspace).read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_dm_cache(workspace, data):
+    cache = _dm_cache(workspace)
+    tmp = cache.with_name(f".{cache.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, cache)
+
+
+def is_dm_refusal(res):
+    """The Action refused the room it was sent in, not the target ("...only into the DM...")."""
+    return not res.get("ok") and " DM " in f" {res.get('reason') or ''} "
+
+
+def forget_owner_dm(workspace, refused_room=""):
+    """Drop the cached DM; a room the Action refused as the owner DM is never picked again."""
+    c = _read_dm_cache(workspace)
+    refused = [r for r in c.get("refused") or [] if r != refused_room][-49:]
+    _write_dm_cache(workspace, {"refused": refused + ([refused_room] if refused_room else [])})
+
+
+def pick_owner_dm(candidates, last_owner_ts):
+    """The candidate with the most recent owner message; with none, the lowest room id."""
+    spoken = [(ts, r) for r in candidates if (ts := last_owner_ts(r)) is not None]
+    if spoken:
+        return max(spoken)[1], "most recent owner message"
+    return (min(candidates), "no owner message in reach; lowest room id") if candidates else ("", "")
+
+
+def owner_dm_room(workspace, gateway_base, rooms=None, now=None):
+    """The DM whose members are exactly {this agent, its owner}: the only room `room.navigate`
+    accepts. The gateway's owner_dm_room reading is not used as-is; it may hold others."""
+    now = time.time() if now is None else now
+    routing = _routing(workspace, gateway_base)
+    agent = os.environ.get("AGENT_MXID") or str(routing.get("identity") or "")
+    if not agent:
         return ""
-    if not isinstance(d, dict) or str(d.get("gateway") or "") != (gateway_base or ""):
+    c = _read_dm_cache(workspace)
+    try:
+        if (c.get("agent"), c.get("gateway")) == (agent, gateway_base) \
+                and now - float(c.get("at") or 0) < OWNER_DM_TTL_S and c.get("room"):
+            return c["room"]
+    except (ValueError, TypeError):
+        pass
+    refused = set(c.get("refused") or [])
+    rooms = rooms or Rooms()
+    row = next((r for r in rooms.agents() if isinstance(r, dict) and r.get("id") == agent), {})
+    owner = str(row.get("owner") or "")
+    if not owner.startswith("@"):
         return ""
-    return str(d.get("owner_dm") or "")
+    want = {agent, owner}
+    from concurrent.futures import ThreadPoolExecutor
+    joined = rooms.joined()
+    with ThreadPoolExecutor(OWNER_DM_SCAN_WORKERS) as pool:
+        got = list(pool.map(rooms.members, joined))
+    candidates = sorted(r for r, m in zip(joined, got) if m == want and r not in refused)
+    room, why = pick_owner_dm(candidates, lambda r: rooms.last_message_by(r, owner))
+    if room:
+        _log(workspace, f"owner DM for {agent}: {room} ({why}; {len(candidates)} candidate(s): "
+                        f"{', '.join(candidates)})")
+        _write_dm_cache(workspace, {"agent": agent, "gateway": gateway_base, "room": room,
+                                    "at": now, "candidates": candidates,
+                                    "refused": sorted(refused)})
+    return room
 
 
 def window_seconds(explicit=None):
@@ -352,6 +456,8 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
     """Apply the owner-mention rule to one mention; a JSON-able outcome."""
     now = time.time() if now is None else now
     window = window_seconds() if window is None else window
+    if m is None:
+        return {"ok": True, "navigated": False, "skipped": "not an owner-mention task"}
     if owner_dm is None:
         owner_dm = owner_dm_room(workspace, _gw.gateway()[0])
     with Ledger(workspace) as led:
@@ -374,6 +480,8 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
     res = navigate(owner_dm, _arguments(m), door_factory)
     if not res["ok"]:
         _log(workspace, f"navigate refused for {m.event_id}: {res['reason']}")
+        if is_dm_refusal(res):
+            forget_owner_dm(workspace, owner_dm)
         res["dm_line"] = _fallback_line(m, res["reason"])
     return {**res, "navigated": res["ok"]}
 
@@ -402,6 +510,8 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
     res = navigate(owner_dm, _arguments(m, folded), door_factory)
     if not res["ok"]:
         _log(workspace, f"trailing navigate refused for {m.event_id}: {res['reason']}")
+        if is_dm_refusal(res):
+            forget_owner_dm(workspace, owner_dm)
         (dm_writer or _write_dm_line)(workspace, _fallback_line(m, res["reason"]))
     return {**res, "navigated": res["ok"]}
 

@@ -234,6 +234,75 @@ class AppliesTheRule(unittest.TestCase):
         self.assertEqual(self.spawned, [1120.0, 1620.0])
 
 
+AGENT, OWNER, GW = "@me.agent:hs", "@owner:hs", "https://hs.example/relay"
+
+
+class FakeRooms:
+    def __init__(self, members, owner_ts):
+        self.m, self.ts, self.scans = members, owner_ts, 0
+
+    def agents(self):
+        return [{"id": AGENT, "owner": OWNER}, {"id": "@other:hs", "owner": "@x:hs"}]
+
+    def joined(self):
+        self.scans += 1
+        return list(self.m)
+
+    def members(self, room):
+        return self.m[room]
+
+    def last_message_by(self, room, sender):
+        assert sender == OWNER
+        return self.ts.get(room)
+
+
+class ResolvesTheOwnerDM(unittest.TestCase):
+    """Only a room whose members are exactly {agent, owner}; the gateway reading is not trusted."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="nav-dm-"))
+        (self.ws / "state").mkdir()
+        (self.ws / "state" / "owner-routing.json").write_text(json.dumps(
+            {"identity": AGENT, "gateway": GW, "owner_dm": "!three:hs"}))
+        os.environ.pop("AGENT_MXID", None)
+        self.rooms = FakeRooms({"!three:hs": {AGENT, OWNER, "@air.agent:hs"},
+                                "!old:hs": {AGENT, OWNER}, "!main:hs": {AGENT, OWNER},
+                                "!quiet:hs": {AGENT, OWNER}, "!group:hs": {AGENT, OWNER, "@a:hs"}},
+                               {"!old:hs": 100.0, "!main:hs": 900.0})
+
+    def test_picks_the_two_member_dm_with_the_latest_owner_message(self):
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0), "!main:hs")
+
+    def test_cached_for_a_day_then_rescanned(self):
+        nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0)
+        nav.owner_dm_room(self.ws, GW, self.rooms, now=2000.0)
+        self.assertEqual(self.rooms.scans, 1)
+        nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0 + 86400)
+        self.assertEqual(self.rooms.scans, 2)
+
+    def test_no_owner_message_falls_back_to_the_lowest_room_id(self):
+        self.rooms.ts = {}
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0), "!main:hs")
+
+    def test_a_room_refused_as_the_dm_is_never_picked_again(self):
+        nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0)
+        door = FakeDoor(fail="a focus is sent only into the DM between this agent and its owner")
+        nav.on_mention(nav.Mention("!x:hs", "$1"), self.ws, now=1000.0, owner_dm="!main:hs",
+                       window=120, door_factory=door)
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms, now=1001.0), "!old:hs")
+
+    def test_a_target_refusal_keeps_the_dm(self):
+        nav.owner_dm_room(self.ws, GW, self.rooms, now=1000.0)
+        door = FakeDoor(fail="your owner has not joined that room")
+        nav.on_mention(nav.Mention("!x:hs", "$1"), self.ws, now=1000.0, owner_dm="!main:hs",
+                       window=120, door_factory=door)
+        self.assertEqual(nav.owner_dm_room(self.ws, GW, self.rooms, now=1001.0), "!main:hs")
+        self.assertEqual(self.rooms.scans, 1)
+
+    def test_another_gateways_reading_names_no_agent(self):
+        self.assertEqual(nav.owner_dm_room(self.ws, "https://other/relay", self.rooms), "")
+
+
 class WindowConfig(unittest.TestCase):
     def test_manifest_declares_the_window(self):
         cfg = json.loads((REPO / "skills/agent-room-ops/manifest.json").read_text())["config"]
