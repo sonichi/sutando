@@ -18,7 +18,7 @@ mkdirSync(RESULT_DIR, { recursive: true });
 const {
 	setVoiceSessionOrigin, getVoiceSessionOrigin, voiceTaskOrigin, resolveVoiceResultOrigin, forwardVoiceResultToOrigin, forwardVoiceResultToOwnerDm,
 	keepVoiceResultToDm, forwardOfflineVoiceResult, startResultWatcher, workTool, DM_ONLY_DELIVERY_NOTE, LEADING_REDIRECT_RE, DM_ONLY_RE,
-	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult,
+	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult, setVoiceTurnsProvider,
 } = await import('../src/task-bridge.js');
 
 after(() => {
@@ -64,6 +64,24 @@ describe('setVoiceSessionOrigin — one origin per live client, opaque to the br
 		assert.match(readFileSync(join(TASK_DIR, `${t1.taskId}.txt`), 'utf-8'), /^channel_id: place-1$/m);
 		assert.match(readFileSync(join(TASK_DIR, `${t3.taskId}.txt`), 'utf-8'), /^channel_id: local-voice$/m);
 		for (const t of [t1, t2, t3]) rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+	});
+
+	it('a task keeps the origin it was asked from when the session moves during the spoken-turn wait', async () => {
+		// The owner spoke just now and no utterance has landed, so the call waits; the session moves 300 ms in.
+		setVoiceTurnsProvider(() => ({ items: [{ role: 'assistant', content: 'On it.' }], pendingInput: '', lastUserSpeechAt: Date.now() }));
+		setVoiceSessionOrigin(origin('place-a'));
+		try {
+			const pending = delegate('origin probe across a move');
+			await new Promise((r) => setTimeout(r, 300));
+			setVoiceSessionOrigin(origin('place-b'));
+			const t = await pending;
+			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
+			assert.match(readFileSync(join(TASK_DIR, `${t.taskId}.txt`), 'utf-8'), /^channel_id: place-a$/m);
+			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+		} finally {
+			setVoiceTurnsProvider(null);
+			setVoiceSessionOrigin(null);
+		}
 	});
 });
 

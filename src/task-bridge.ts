@@ -931,6 +931,8 @@ export const workTool: ToolDefinition = {
 		// must meet this entry in the dedup check above, not write a second task file.
 		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
 		_pendingTasks.set(taskId, pendingEntry());
+		// The origin is read here too: the session can move to another origin during that wait.
+		const origin = _voiceSessionOrigin;
 		try {
 			const timestamp = new Date().toISOString();
 			const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
@@ -970,7 +972,6 @@ export const workTool: ToolDefinition = {
 			} catch { /* best effort — never block delegation on context attach */ }
 			// An origin-bound session addresses the task to its origin and adds the adapter's
 			// guidance line; without one the task keeps `channel_id: local-voice`.
-			const origin = _voiceSessionOrigin;
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
