@@ -51,6 +51,9 @@ GATEWAY_STALE_S = 180.0
 PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
                                "api-error", "network-error"})
 
+# Observation phases with no model request in flight.
+RETRY_DISPROVING_PHASES = frozenset({"idle", "waiting", "failed"})
+
 # core-input-watch states → (motion, condition, reason). A blocked-human reason is refined from `kind`.
 SUPERVISOR = {
     "running": (MOVING, HEALTHY, None),
@@ -272,17 +275,25 @@ def _observation(ws: Path, now: float, seat: str, session, started=None):
 
 def _supersede(sources: dict, rec, now: float) -> dict:
     """A completed model request after a pane-derived claim disproves the claim."""
-    if rec is None or rec["last_success_at"] is None:
+    if rec is None:
         return sources
     out = dict(sources)
     for name in ("supervisor", "cli_wedge"):
         src = out.get(name)
         op = src.get("opinion") if src else None
-        if not op or op["condition"] != ABNORMAL or op["reason"] not in PANE_SUPERSEDABLE:
+        if not op or op["condition"] != ABNORMAL:
             continue
         claimed = op["since"] if op["since"] is not None else (
             None if src.get("age_s") is None else now - src["age_s"])
-        if claimed is not None and claimed < rec["last_success_at"]:
+        newer_success = (rec["last_success_at"] is not None and claimed is not None
+                         and claimed < rec["last_success_at"])
+        # A retry loop needs a request in flight. Its claim time is the window's run start, not
+        # when retry text appeared, so a newer success proves nothing about it.
+        if name == "cli_wedge" and op["reason"] == "retry-loop":
+            drop = rec["phase"] in RETRY_DISPROVING_PHASES
+        else:
+            drop = op["reason"] in PANE_SUPERSEDABLE and newer_success
+        if drop:
             out[name] = {**src, "value": {**(src["value"] if isinstance(src["value"], dict) else {}),
                                           "superseded_by": "observation"}, "opinion": None}
     return out

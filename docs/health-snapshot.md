@@ -188,14 +188,22 @@ Otherwise its opinion is the record's motion and condition (`unknown` gives none
 the reason is the record's and `since` is `condition_since`. Its `full` value is `phase`,
 `observer`, `observer_version`, `seq`, `heartbeat_age_s` and `last_success_age_s`; no session ids.
 
-**Positive recovery.** A completed model request disproves an earlier pane-derived claim. When
-the observation is valid and has `last_success_at`, a `supervisor` or `cli_wedge` opinion is
-dropped (its value gains `"superseded_by": "observation"`) if it is abnormal, its reason is one of
-`needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
-`network-error`, and its claim time (`since`, else the source's mtime) is older than
-`last_success_at`. Nothing else is ever dropped: `crashed`, `hung`, `offline`, `gateway-down`,
-`retry-loop`, the pool and roster states, and `suspended` stand regardless, and `alive` is
-untouched.
+**Positive recovery.** A valid observation can disprove a pane-derived claim; the dropped source's
+value gains `"superseded_by": "observation"`. Two rules:
+
+- A completed model request disproves an earlier claim. When the record has `last_success_at`, a
+  `supervisor` or `cli_wedge` opinion is dropped if it is abnormal, its reason is one of
+  `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
+  `network-error`, and its claim time (`since`, else the source's mtime) is older than
+  `last_success_at`.
+- A `cli_wedge` `retry-loop` needs a model request in flight, so it is dropped when the record's
+  `phase` is `idle`, `waiting` or `failed`. A newer success does not drop it: its claim time is the
+  start of the window's observation run, not when retry text appeared. A loop in a `requesting`,
+  `tool`, `compacting` or `unknown` phase stands.
+
+Nothing else is ever dropped: `crashed`, `hung`, `offline`, `gateway-down`, the
+`supervisor`'s reasons outside that list, the pool and roster states, and `suspended` stand
+regardless, and `alive` is untouched.
 
 A record is abnormal exactly when it carries a reason; the writer rejects anything else. The core
 has no incarnation record, so for it only the session match and the lease apply. An observed
