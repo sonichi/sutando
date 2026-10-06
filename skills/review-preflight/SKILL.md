@@ -22,6 +22,20 @@ python3 skills/review-preflight/scripts/review-preflight.py <PR>      # run befo
 python3 skills/review-preflight/scripts/ci-triage.py <PR> [--repo o/n] # a red check is a pointer into the record: search its SUBJECT, not its name
 ```
 
+## Delegated reviews
+
+When the review itself is handed to another model (Codex via `claude-codex`, Gemini via
+`claude-router`), that model never loads `CLAUDE.md` or `REVIEW.md`, so it cannot see the lessons
+this preflight prints. The session that delegates owns the step:
+
+1. Run `review-preflight.py <PR>` first and paste its criteria into the delegate's brief.
+2. Check the gate items it reports (prior art, stale approvals) yourself; they are live GitHub
+   state, not something the delegate re-derives.
+3. Verify any finding you will post as a blocker before posting it.
+
+The preflight reads `<repo>/REVIEW.md` and exits non-zero where there is none, so for a PR in a repo
+without one, write the brief from the PR itself.
+
 `review-preflight.py` resolves the repo root via `git rev-parse --show-toplevel`, falling back to three
 levels above its own file. `ci-triage.py` is advisory (exit 0), and is the module review-preflight will
 fold in so a red check maps to a filed issue on every preflight run.
