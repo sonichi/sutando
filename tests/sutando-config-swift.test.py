@@ -276,6 +276,35 @@ class TestWorkspaceLayerSwift(unittest.TestCase):
         self.assertEqual(runtime, "codex")
         self.assertEqual(workspace, str(self.repo / "workspace"))
         self.assertIn("sets 'workspace', which it cannot change", proc.stderr)
+    def _custom_workspace(self) -> Path:
+        custom = self.tmp / "custom-ws"
+        custom.mkdir()
+        (self.repo / "sutando.config.local.json").write_text(
+            json.dumps({"workspace": {"path": str(custom)}}))
+        return custom
+
+    def test_malformed_layer_keeps_the_workspace_and_names_the_file(self) -> None:
+        custom = self._custom_workspace()
+        (custom / "sutando.config.local.json").write_text("{ not json")
+        proc = self._run()
+        runtime, workspace = proc.stdout.splitlines()
+        self.assertEqual(workspace, str(custom), "a bad layer must not move the workspace")
+        self.assertEqual(runtime, "nil", "no guessed runtime from a config that failed to load")
+        self.assertIn(f"sutando config: failed to parse {custom / 'sutando.config.local.json'}", proc.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a chmod 000 file")
+    def test_unreadable_layer_keeps_the_workspace_and_names_the_file(self) -> None:
+        custom = self._custom_workspace()
+        layer = custom / "sutando.config.local.json"
+        layer.write_text(json.dumps({"core": {"runtime": "codex"}}))
+        layer.chmod(0)
+        try:
+            proc = self._run()
+        finally:
+            layer.chmod(0o600)
+        self.assertEqual(proc.stdout.splitlines()[1], str(custom))
+        self.assertIn(f"sutando config: cannot read {layer}", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

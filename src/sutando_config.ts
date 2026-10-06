@@ -130,7 +130,13 @@ function stripComments(obj: Json): Json {
  */
 function loadJsonFile(path: string): { [k: string]: Json } {
 	if (!existsSync(path)) return {};
-	const text = readFileSync(path, 'utf8').trim();
+	let text: string;
+	try {
+		text = readFileSync(path, 'utf8').trim();
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		throw new Error(`sutando config: cannot read ${path}: ${msg}`);
+	}
 	if (!text) return {};
 	let data: Json;
 	try {
@@ -250,19 +256,21 @@ export function resetCacheForTests(): void {
 	_wsLayerWorkspaceKeyWarnPrinted = false;
 }
 
-function warnUnknownTopLevelKeys(cfg: { [k: string]: Json }, path: string): void {
+function warnUnknownTopLevelKeys(sources: Array<[string, { [k: string]: Json }]>): void {
 	if (_unknownKeysWarnPrinted) return;
-	const extras = Object.keys(cfg)
-		.filter((k) => !KNOWN_TOP_LEVEL_KEYS.has(k))
-		.sort();
-	if (extras.length === 0) return;
-	_unknownKeysWarnPrinted = true;
-	process.stderr.write(
-		`sutando config: ${path} has top-level keys the loader does not read: ` +
-			`${extras.map((k) => `'${k}'`).join(', ')}. Known keys: ` +
-			`${[...KNOWN_TOP_LEVEL_KEYS].sort().join(', ')}. Typo? Or experimental key — ` +
-			`the loader will ignore it either way.\n`,
-	);
+	for (const [path, cfg] of sources) {
+		const extras = Object.keys(cfg)
+			.filter((k) => !KNOWN_TOP_LEVEL_KEYS.has(k))
+			.sort();
+		if (extras.length === 0) continue;
+		_unknownKeysWarnPrinted = true;
+		process.stderr.write(
+			`sutando config: ${path} has top-level keys the loader does not read: ` +
+				`${extras.map((k) => `'${k}'`).join(', ')}. Known keys: ` +
+				`${[...KNOWN_TOP_LEVEL_KEYS].sort().join(', ')}. Typo? Or experimental key — ` +
+				`the loader will ignore it either way.\n`,
+		);
+	}
 }
 
 /**
@@ -292,7 +300,11 @@ export function loadConfig(repoRoot?: string): { [k: string]: Json } {
 	const expanded = deepMerge(repoCfg, layer);
 	_cache = expanded;
 	_cacheRepoRoot = root;
-	warnUnknownTopLevelKeys(expanded, join(root, CONFIG_FILENAME));
+	warnUnknownTopLevelKeys([
+		[join(root, CONFIG_FILENAME), defaults],
+		[join(root, LOCAL_FILENAME), overrides],
+		[join(workspaceFrom(repoCfg, root), LOCAL_FILENAME), layer],
+	]);
 	return expanded;
 }
 

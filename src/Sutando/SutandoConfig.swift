@@ -72,17 +72,31 @@ enum SutandoConfig {
         return obj
     }
 
+    private static func configError(_ message: String) -> NSError {
+        NSError(domain: "SutandoConfig", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
     /// Read + parse a JSON file, strip comment keys, return the dict.
     /// Empty/missing file → empty dict. Parse error → throws.
     private static func loadJson(at path: String) throws -> [String: Any] {
         guard FileManager.default.fileExists(atPath: path) else { return [:] }
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let data: Data
+        do {
+            data = try Data(contentsOf: URL(fileURLWithPath: path))
+        } catch {
+            throw configError("sutando config: cannot read \(path): \(error.localizedDescription)")
+        }
         guard !data.isEmpty else { return [:] }
         guard let trimmed = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else { return [:] }
         guard let trimmedData = trimmed.data(using: .utf8) else { return [:] }
-        let parsed = try JSONSerialization.jsonObject(with: trimmedData, options: [])
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: trimmedData, options: [])
+        } catch {
+            throw configError("sutando config: failed to parse \(path): \(error.localizedDescription)")
+        }
         guard let dict = parsed as? [String: Any] else {
             throw NSError(
                 domain: "SutandoConfig", code: 1,
@@ -153,30 +167,33 @@ enum SutandoConfig {
         if let c = cache, explicitRoot == nil || explicitRoot == cacheRepoRoot {
             return c
         }
-        let root: String?
-        if let r = explicitRoot {
-            root = r
-        } else {
-            // Walk up from the executable, matching AppDelegate.repoRoot.
-            let exe = URL(fileURLWithPath: CommandLine.arguments[0])
-                .resolvingSymlinksInPath()
-                .deletingLastPathComponent().path
-            root = findRepoRoot(start: exe)
-        }
-        guard let r = root else {
+        guard let r = explicitRoot ?? executableRepoRoot() else {
             cache = [:]
             cacheRepoRoot = nil
             return [:]
         }
-        let defaults = try loadJson(at: (r as NSString).appendingPathComponent(configFilename))
-        let overrides = try loadJson(at: (r as NSString).appendingPathComponent(localFilename))
-        let repoCfg = expandVars(deepMerge(defaults, overrides), repoDir: r) as? [String: Any] ?? [:]
+        let repoCfg = try repoConfig(root: r)
         let layer = expandVars(try loadWorkspaceLayer(repoCfg, root: r), repoDir: r)
             as? [String: Any] ?? [:]
         let expanded = deepMerge(repoCfg, layer)
         cache = expanded
         cacheRepoRoot = r
         return expanded
+    }
+
+    /// Walk up from the executable, matching AppDelegate.repoRoot.
+    private static func executableRepoRoot() -> String? {
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath()
+            .deletingLastPathComponent().path
+        return findRepoRoot(start: exe)
+    }
+
+    /// The two repo files merged and expanded, without the workspace layer.
+    private static func repoConfig(root r: String) throws -> [String: Any] {
+        let defaults = try loadJson(at: (r as NSString).appendingPathComponent(configFilename))
+        let overrides = try loadJson(at: (r as NSString).appendingPathComponent(localFilename))
+        return expandVars(deepMerge(defaults, overrides), repoDir: r) as? [String: Any] ?? [:]
     }
 
     /// Test-only: clear the per-process cache.
@@ -275,8 +292,19 @@ enum SutandoConfig {
             }
         }
 
-        let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
-        let root = explicitRoot ?? cacheRepoRoot
+        let cfg: [String: Any]
+        let root: String?
+        do {
+            cfg = try loadConfig(repoRoot: explicitRoot)
+            root = explicitRoot ?? cacheRepoRoot
+        } catch {
+            // The workspace layer cannot move the workspace, so a bad one must not either:
+            // resolve from the repo files, the same path Python and TS reach before they raise.
+            FileHandle.standardError.write(Data(
+                "\(error.localizedDescription) (the workspace is resolved from the repo config files)\n".utf8))
+            root = explicitRoot ?? executableRepoRoot()
+            cfg = root.flatMap { try? repoConfig(root: $0) } ?? [:]
+        }
         let resolved = workspaceFrom(cfg, root: root)
 
         // .env drift warning (mirrors the Python + TS twins)
@@ -413,7 +441,13 @@ enum SutandoConfig {
         if !env.isEmpty {
             configured = env
         } else {
-            let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
+            let cfg: [String: Any]
+            do {
+                cfg = try loadConfig(repoRoot: explicitRoot)
+            } catch {
+                FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+                return nil
+            }
             let core = cfg["core"] as? [String: Any] ?? [:]
             configured = ((core["runtime"] as? String) ?? "claude")
                 .trimmingCharacters(in: .whitespaces)

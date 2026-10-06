@@ -111,6 +111,29 @@ class WorkspaceLayer(unittest.TestCase):
             self._load()
         self.assertIn(str(self.ws.resolve() / "sutando.config.local.json"), str(cm.exception))
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a chmod 000 file")
+    def test_unreadable_layer_raises_naming_the_file(self):
+        layer = self.ws / "sutando.config.local.json"
+        self._write(layer, {"core": {"effort": "max"}})
+        layer.chmod(0)
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                self._load()
+        finally:
+            layer.chmod(0o600)
+        self.assertIn(f"cannot read {self.ws.resolve() / 'sutando.config.local.json'}", str(cm.exception))
+
+    def test_unknown_key_is_reported_against_the_workspace_file(self):
+        self._write(self.ws / "sutando.config.local.json", {"vualt": {}})
+        _, err = self._load()
+        self.assertIn(f"{self.ws.resolve() / 'sutando.config.local.json'} has top-level keys", err)
+        self.assertNotIn(f"{self.repo / 'sutando.config.json'} has top-level keys", err)
+
+    def test_repo_dir_in_the_layer_is_the_repo_root(self):
+        self._write(self.ws / "sutando.config.local.json", {"vault": {"remote_url": "${REPO_DIR}/x"}})
+        cfg, _ = self._load()
+        self.assertEqual(cfg["vault"]["remote_url"], f"{self.repo}/x")
+
     def test_scalar_block_in_layer_is_rejected_like_repo_local(self):
         self._write(self.ws / "sutando.config.local.json", '{"vault": "nope"}')
         with self.assertRaises(RuntimeError) as cm:

@@ -25,8 +25,8 @@ Dicts deep-merge; arrays REPLACE wholesale (not unioned). This matches the
 `.example` file pattern documented in the docstrings — users override only
 the keys they want.
 
-`${REPO_DIR}` in any string value expands to the directory containing the
-config file (== git toplevel for a sane checkout). Other ${VAR}s are not
+`${REPO_DIR}` in any string value expands to the repo root (the checkout
+holding `sutando.config.json`), in the workspace layer too. Other ${VAR}s are not
 expanded; this is config, not shell.
 
 Comment convention: any top- or nested-level key whose name starts with `_`
@@ -175,7 +175,10 @@ def _load_json(path: Path) -> Dict[str, Any]:
     """
     if not path.is_file():
         return {}
-    text = path.read_text(encoding="utf-8").strip()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        raise RuntimeError(f"sutando config: cannot read {path}: {e.strerror or e}") from e
     if not text:
         return {}
     try:
@@ -276,25 +279,26 @@ def _color_warn(msg: str) -> str:
     return msg
 
 
-def _warn_unknown_top_level_keys(cfg: Dict[str, Any], path: Path) -> None:
-    """Emit a one-time stderr warning if the resolved config has top-level
+def _warn_unknown_top_level_keys(sources: "list[tuple[Path, Dict[str, Any]]]") -> None:
+    """Emit a one-time stderr warning naming each config file that has top-level
     keys the loader doesn't recognize. Helps catch typos like `workspce`
     while leaving experimental keys harmlessly ignored. Per Mini's #8.
     """
     global _UNKNOWN_KEYS_WARN_PRINTED
     if _UNKNOWN_KEYS_WARN_PRINTED:
         return
-    extras = sorted(k for k in cfg if k not in _KNOWN_TOP_LEVEL_KEYS)
-    if not extras:
-        return
-    _UNKNOWN_KEYS_WARN_PRINTED = True
-    print(
-        f"sutando config: {path} has top-level keys the loader does not read: "
-        f"{', '.join(repr(k) for k in extras)}. Known keys: "
-        f"{sorted(_KNOWN_TOP_LEVEL_KEYS)!r}. Typo? Or experimental key — "
-        f"the loader will ignore it either way.",
-        file=sys.stderr,
-    )
+    for path, cfg in sources:
+        extras = sorted(k for k in cfg if k not in _KNOWN_TOP_LEVEL_KEYS)
+        if not extras:
+            continue
+        _UNKNOWN_KEYS_WARN_PRINTED = True
+        print(
+            f"sutando config: {path} has top-level keys the loader does not read: "
+            f"{', '.join(repr(k) for k in extras)}. Known keys: "
+            f"{sorted(_KNOWN_TOP_LEVEL_KEYS)!r}. Typo? Or experimental key — "
+            f"the loader will ignore it either way.",
+            file=sys.stderr,
+        )
 
 
 def _warn_progress_stream_type(val: Any) -> None:
@@ -364,6 +368,10 @@ def _workspace_from(cfg: Dict[str, Any], root: Optional[Path]) -> Path:
     return (root / _HARDCODED_WORKSPACE_DEFAULT_REL).resolve()
 
 
+def _workspace_layer_path(repo_cfg: Dict[str, Any], root: Path) -> Path:
+    return _workspace_from(repo_cfg, root) / _LOCAL_FILENAME
+
+
 def _load_workspace_layer(repo_cfg: Dict[str, Any], root: Path) -> Dict[str, Any]:
     """`<workspace>/sutando.config.local.json`, minus any `workspace` key.
 
@@ -371,7 +379,7 @@ def _load_workspace_layer(repo_cfg: Dict[str, Any], root: Path) -> Dict[str, Any
     resolves to the repo root would name the repo-local file again: read it once.
     """
     global _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED
-    path = _workspace_from(repo_cfg, root) / _LOCAL_FILENAME
+    path = _workspace_layer_path(repo_cfg, root)
     if path.resolve() == (root / _LOCAL_FILENAME).resolve():
         return {}
     layer = _load_json(path)
@@ -423,7 +431,11 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 
     _CACHE = expanded
     _CACHE_REPO_ROOT = root
-    _warn_unknown_top_level_keys(expanded, root / _CONFIG_FILENAME)
+    _warn_unknown_top_level_keys([
+        (root / _CONFIG_FILENAME, defaults),
+        (root / _LOCAL_FILENAME, overrides),
+        (_workspace_layer_path(repo_cfg, root), workspace_layer),
+    ])
     return expanded
 
 

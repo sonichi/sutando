@@ -6,7 +6,7 @@
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -79,6 +79,39 @@ describe('workspace config layer (TS twin)', () => {
 	it('malformed layer throws naming the file', () => {
 		write(join(ws, 'sutando.config.local.json'), '{"vault": ');
 		assert.throws(() => loadConfig(repo), /durable-workspace\/sutando\.config\.local\.json|workspace\/sutando\.config\.local\.json/);
+	});
+
+	it('unreadable layer throws naming the file', { skip: process.getuid?.() === 0 }, () => {
+		const layer = join(ws, 'sutando.config.local.json');
+		write(layer, { core: { effort: 'max' } });
+		chmodSync(layer, 0);
+		try {
+			assert.throws(() => loadConfig(repo), (e: Error) => e.message.startsWith(`sutando config: cannot read ${join(repo, 'workspace', 'sutando.config.local.json')}:`));
+		} finally {
+			chmodSync(layer, 0o600);
+		}
+	});
+
+	it('an unknown key is reported against the workspace file', () => {
+		write(join(ws, 'sutando.config.local.json'), { vualt: {} });
+		const orig = process.stderr.write.bind(process.stderr);
+		let err = '';
+		process.stderr.write = ((chunk: string | Uint8Array) => {
+			err += String(chunk);
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			loadConfig(repo);
+		} finally {
+			process.stderr.write = orig;
+		}
+		assert.ok(err.includes(`${join(repo, 'workspace', 'sutando.config.local.json')} has top-level keys`), err);
+		assert.ok(!err.includes(`${join(repo, 'sutando.config.json')} has top-level keys`), err);
+	});
+
+	it('${REPO_DIR} in the layer is the repo root', () => {
+		write(join(ws, 'sutando.config.local.json'), { vault: { remote_url: '${REPO_DIR}/x' } });
+		assert.equal((loadConfig(repo).vault as { remote_url: string }).remote_url, `${repo}/x`);
 	});
 
 	it('scalar block in the layer is rejected like repo-local', () => {
