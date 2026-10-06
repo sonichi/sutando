@@ -27,6 +27,7 @@ from urllib.error import URLError
 _SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
 _MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
@@ -888,7 +889,7 @@ def main():
     # suppresses any `[channel:]` redirect at the bridge, so this can never be
     # posted to a shared channel (result_markers.parse_markers). The marker is
     # stripped before delivery/voice, so the owner never sees it.
-    result_file.write_text(f"[dm-only]\n{narrative}")
+    publish_text(result_file, f"[dm-only]\n{narrative}")
     print(f"  → {result_file.name}")
 
     # Mark as done today

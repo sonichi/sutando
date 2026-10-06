@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, publishResultFile } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -678,7 +678,6 @@ export const cancelTaskTool: ToolDefinition = {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
 			const tasksDir = join(WORKSPACE_DIR, 'tasks');
-			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
 			// list mode: return id + preview, no cancel
@@ -750,7 +749,7 @@ export const cancelTaskTool: ToolDefinition = {
 			}
 
 			// Touch a cancelled result for the web UI's cancel icon (best-effort).
-			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
+			try { publishResultFile(`${targetId}.txt`, 'Cancelled.'); } catch { /* ignore */ }
 
 			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
 			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };

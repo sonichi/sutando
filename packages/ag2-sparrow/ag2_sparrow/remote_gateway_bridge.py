@@ -313,6 +313,7 @@ from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
+from .result_publish import publish_staged as _publish_staged_whole, stage_text as _stage_text
 from .dedup_recovery import plan_dedup_recovery
 from . import pool_record
 from .send_allowlist import is_path_sendable
@@ -672,34 +673,20 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
 
 
 def _stage_durable(path: Path, text: str) -> "Path | None":
-    """Write `text` to a sibling temp file and fsync it; None when nothing
+    """Stage `text` beside `path` through the shared publisher; None when nothing
     reached the disk. Staging is separate from publishing because a sidecar the
     published file refers to has to commit in between."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-INVOCATION, not per-PID: the poll loop and the outbound worker both
-        # publish through here, and a shared temp name lets one rename the other's bytes.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return tmp
+        return _stage_text(path, text)
     except Exception as exc:  # noqa: BLE001
         _log(f"durable stage failed for {path.name} ({exc})")
         return None
 
 
 def _publish_staged(tmp: Path, path: Path) -> bool:
-    """Rename a staged file into place and fsync the directory where supported."""
+    """Rename a staged file into place through the shared publisher."""
     try:
-        os.replace(tmp, path)
-        if os.name != "nt":
-            dfd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+        _publish_staged_whole(tmp, path)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({exc})")

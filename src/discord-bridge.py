@@ -163,6 +163,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -6063,12 +6064,9 @@ async def poll_dm_fallback():
                         )
                     # Either non-owner or unresolved-channel path: rewrite the
                     # result file with the marker stripped so the dm-result.py
-                    # subprocess (below) DMs clean text. Atomic-ish write —
-                    # the only other consumer of results/ at this point is
-                    # voice-agent's task-bridge, which is read-only and would
-                    # tolerate an intermediate marker-vs-clean view.
+                    # subprocess (below) DMs clean text.
                     try:
-                        f.write_text(clean_body + ("\n" if not clean_body.endswith("\n") else ""), encoding="utf-8")
+                        publish_text(f, clean_body + ("\n" if not clean_body.endswith("\n") else ""))
                     except OSError as e:
                         print(f"  [dm-fallback channel-redirect] write-back failed on {f.name}: {e}", flush=True)
 

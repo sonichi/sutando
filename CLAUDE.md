@@ -191,6 +191,8 @@ EOF
 mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
                          # matches a name without `.txt` (pathlib `*` sees dotfiles)
 ```
+Equivalent, and the same publisher every in-repo writer uses: `python3 src/result_publish.py "$_out" <<EOF … EOF`
+(body on stdin; staged beside the target, fsynced, renamed whole).
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 

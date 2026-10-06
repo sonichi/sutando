@@ -13,10 +13,8 @@ Entry: src/check-pending-questions.py, or `pq.py remind`.
 """
 
 import hashlib
-import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -26,6 +24,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 from workspace_default import resolve_workspace
+from result_publish import publish_text
 from presenter_mode import presenter_mode_active
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently
 
@@ -194,7 +193,8 @@ def notify_voice(questions):
     ts = int(time.time() * 1000)
     path = RESULTS_DIR / f"question-{ts}.txt"
     titles = [q["title"] for q in questions]
-    path.write_text(
+    publish_text(
+        path,
         f"You have {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting for your answer: "
         + "; ".join(titles)
         + ". Check the Questions tab in the web UI."
@@ -219,17 +219,8 @@ def notify_discord_dm(questions):
     # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
-    # Appear at the deliverable name in one step, from a scratch name no other run
-    # can hold: a poll claims proactive-*.txt on sight and would DM a partial body.
-    fd, tmp_name = tempfile.mkstemp(dir=RESULTS_DIR, prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(lines))
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    # Appear at the deliverable name in one step: a poll claims proactive-*.txt on sight.
+    publish_text(path, "\n".join(lines))
     for old in superseded:
         old.unlink(missing_ok=True)
 
