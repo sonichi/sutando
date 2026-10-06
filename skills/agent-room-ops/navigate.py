@@ -79,6 +79,16 @@ class Refused(Exception):
         self.code = code
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is answered as its 3xx status, never followed: following re-sends the bearer."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+BEARER_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
 def _post(url, token, body=None, headers=None, method="POST"):
     h = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT, **(headers or {})}
     data = None
@@ -86,7 +96,7 @@ def _post(url, token, body=None, headers=None, method="POST"):
         data, h["Content-Type"] = json.dumps(body).encode("utf-8"), "application/json"
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+        with BEARER_OPENER.open(req, timeout=TIMEOUT_S) as resp:
             return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
     except urllib.error.HTTPError as exc:
         with exc:
@@ -102,6 +112,20 @@ def _json(raw):
         return None
 
 
+def _host(url):
+    return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+
+def same_site(url, relay_base):
+    """https on the relay's host or its site (the host minus its first label, when that
+    still has a dot): chat.ag2.space admits mcp.ag2.space, never another domain."""
+    relay = _host(relay_base)
+    parent = relay.split(".", 1)[1] if relay.count(".") >= 2 else relay
+    host = _host(url)
+    return urllib.parse.urlsplit(url).scheme == "https" and bool(host) and \
+        (host == relay or host == parent or host.endswith("." + parent))
+
+
 class Door:
     """One MCP session on the hosted Actions service, opened from the relay bearer."""
 
@@ -111,9 +135,11 @@ class Door:
         found = _json(raw) if status == 200 else None
         if not isinstance(found, dict) or not str(found.get("mcp_url", "")).startswith("https://"):
             raise Refused(f"MCP discovery refused ({status})", "NO_MCP")
-        relay_host = (urllib.parse.urlsplit(relay_base).hostname or "").lower()
+        if not same_site(str(found["mcp_url"]), relay_base):
+            raise Refused("the MCP URL is not on the relay's site; no token is sent there",
+                          "MCP_HOST")
         mint_url = str(found.get("mint_url") or "")
-        if (urllib.parse.urlsplit(mint_url).hostname or "").lower() != relay_host:
+        if _host(mint_url) != _host(relay_base):
             raise Refused("the mint URL is not on the relay's host; the bearer is not sent there",
                           "MINT_HOST")
         status, _, raw = post(mint_url, bearer, {})
@@ -461,9 +487,11 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
     if owner_dm is None:
         owner_dm = owner_dm_room(workspace, _gw.gateway()[0])
     with Ledger(workspace) as led:
+        stale = _take_due(led, now, window)
         d = decide(m, led.data, now, owner_dm, window)
         if d.kind == "skip":
-            return {"ok": True, "navigated": False, "skipped": d.why}
+            out = {"ok": True, "navigated": False, "skipped": d.why}
+            return _with_held(out, stale, workspace, owner_dm, door_factory)
         _remember(led.data, m.event_id, now)
         if d.kind == "hold":
             pending = led.data.get("pending")
@@ -477,12 +505,44 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
         led.data["last_nav_at"] = now
         led.data["pending"] = None
         led.save()
+    held = _deliver_held(stale, workspace, owner_dm, door_factory) if stale else None
     res = navigate(owner_dm, _arguments(m), door_factory)
     if not res["ok"]:
         _log(workspace, f"navigate refused for {m.event_id}: {res['reason']}")
         if is_dm_refusal(res):
             forget_owner_dm(workspace, owner_dm)
         res["dm_line"] = _fallback_line(m, res["reason"])
+    out = {**res, "navigated": res["ok"]}
+    return {**out, "held_delivered": held} if held else out
+
+
+def _take_due(led, now, window):
+    """A held mention whose window has passed: its detached flush never ran. Taken out
+    of the ledger (and saved) so exactly one caller delivers it."""
+    pending = led.data.get("pending")
+    if not isinstance(pending, dict) or now < float(led.data.get("last_nav_at") or 0) + window:
+        return None
+    led.data["pending"] = None
+    led.save()
+    return pending
+
+
+def _with_held(out, stale, workspace, owner_dm, door_factory):
+    held = _deliver_held(stale, workspace, owner_dm, door_factory) if stale else None
+    return {**out, "held_delivered": held} if held else out
+
+
+def _deliver_held(pending, workspace, owner_dm, door_factory, dm_writer=None):
+    """Navigate to a held mention; on refusal log, write the DM line, never retry."""
+    m = Mention(**{k: pending.get(k, "") for k in Mention.__dataclass_fields__})
+    if not owner_dm:
+        return {"ok": True, "navigated": False, "skipped": "no owner DM reading for this gateway"}
+    res = navigate(owner_dm, _arguments(m, int(pending.get("folded", 0))), door_factory)
+    if not res["ok"]:
+        _log(workspace, f"trailing navigate refused for {m.event_id}: {res['reason']}")
+        if is_dm_refusal(res):
+            forget_owner_dm(workspace, owner_dm)
+        (dm_writer or _write_dm_line)(workspace, _fallback_line(m, res["reason"]))
     return {**res, "navigated": res["ok"]}
 
 
@@ -503,17 +563,7 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
         led.data["pending"] = None
         led.data["last_nav_at"] = now
         led.save()
-    folded = int(pending.get("folded", 0))
-    m = Mention(**{k: pending.get(k, "") for k in Mention.__dataclass_fields__})
-    if not owner_dm:
-        return {"ok": True, "navigated": False, "skipped": "no owner DM reading for this gateway"}
-    res = navigate(owner_dm, _arguments(m, folded), door_factory)
-    if not res["ok"]:
-        _log(workspace, f"trailing navigate refused for {m.event_id}: {res['reason']}")
-        if is_dm_refusal(res):
-            forget_owner_dm(workspace, owner_dm)
-        (dm_writer or _write_dm_line)(workspace, _fallback_line(m, res["reason"]))
-    return {**res, "navigated": res["ok"]}
+    return _deliver_held(pending, workspace, owner_dm, door_factory, dm_writer)
 
 
 def _spawn_flush(at):

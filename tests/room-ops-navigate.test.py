@@ -91,7 +91,7 @@ class DoorCarriesTheInput(unittest.TestCase):
             sent.append((url, token, body))
             if url.endswith("/v1/mcp/discovery"):
                 return 200, {}, json.dumps({"mint_url": "https://hs.example/api/v1/mcp/agent-access-tokens",
-                                            "mcp_url": "https://mcp.example/mcp"}).encode()
+                                            "mcp_url": "https://mcp.hs.example/mcp"}).encode()
             if "agent-access-tokens" in url:
                 return 200, {}, b'{"access_token": "deleg"}'
             if body.get("method") == "tools/call":
@@ -113,7 +113,7 @@ class DoorCarriesTheInput(unittest.TestCase):
             "room_id": OWNER_DM, "action": "room.navigate", "arguments": args,
             "expected_action_revision": "r1", "expected_catalog_version": "c1",
             "operation_id": "nav-1"})
-        self.assertEqual({tok for url, tok, _ in sent if "mcp.example" in url}, {"deleg"},
+        self.assertEqual({tok for url, tok, _ in sent if "mcp.hs.example" in url}, {"deleg"},
                          "the relay bearer must never reach the MCP host")
 
     def test_mint_on_another_host_is_refused_before_the_bearer_goes_there(self):
@@ -122,7 +122,7 @@ class DoorCarriesTheInput(unittest.TestCase):
         def post(url, token, body=None, headers=None, method="POST"):
             sent.append(url)
             return 200, {}, json.dumps({"mint_url": "https://evil.example/mint",
-                                        "mcp_url": "https://mcp.example/mcp"}).encode()
+                                        "mcp_url": "https://mcp.hs.example/mcp"}).encode()
 
         with self.assertRaises(nav.Refused):
             nav.Door("https://hs.example/relay", "relay-bearer", post=post)
@@ -236,6 +236,17 @@ class AppliesTheRule(unittest.TestCase):
         self.mention("$c", 1500.0)          # navigates; the stale hold is dropped
         self.mention("$d", 1510.0)
         self.assertEqual(self.spawned, [1120.0, 1620.0])
+        self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$b", "$c"],
+                         "the stranded hold is shown before the next mention's navigate")
+
+    def test_a_stranded_hold_is_shown_even_when_the_next_mention_is_skipped(self):
+        self.mention("$a", 1000.0)
+        self.mention("$b", 1010.0)          # its flush never runs
+        out = self.mention("$a", 1500.0)    # a duplicate: skipped, but the hold is due
+        self.assertEqual(out["skipped"], "already navigated for this message")
+        self.assertTrue(out["held_delivered"]["navigated"])
+        self.assertEqual([c[2]["location"]["event_id"] for c in self.door.calls], ["$a", "$b"])
+        self.assertEqual(self.flush(1600.0)["skipped"], "nothing held", "delivered exactly once")
 
 
 AGENT, OWNER, GW = "@me.agent:hs", "@owner:hs", "https://hs.example/relay"
@@ -324,7 +335,7 @@ class Mcp:
         self.sent.append((url, token, body, headers))
         if url.endswith("/v1/mcp/discovery"):
             return 200, {}, json.dumps({"mint_url": "https://hs.example/mint",
-                                        "mcp_url": "https://mcp.example/mcp"}).encode()
+                                        "mcp_url": "https://mcp.hs.example/mcp"}).encode()
         if url.endswith("/mint"):
             return 200, {}, b'{"access_token": "deleg"}'
         if "id" not in body:
@@ -388,7 +399,7 @@ class DoorPaths(unittest.TestCase):
 
         def no_mint(url, token, body=None, headers=None, method="POST"):
             if url.endswith("discovery"):
-                return 200, {}, json.dumps({"mint_url": "https://hs.example/m", "mcp_url": "https://m/x"}).encode()
+                return 200, {}, json.dumps({"mint_url": "https://hs.example/m", "mcp_url": "https://mcp.hs.example/x"}).encode()
             return 401, {}, b"{}"
         with self.assertRaises(nav.Refused) as cm:
             nav.Door("https://hs.example/relay", "b", post=no_mint)
@@ -406,6 +417,31 @@ class DoorPaths(unittest.TestCase):
         with patch.object(nav._gw, "gateway", lambda: ("https://hs.example/relay", {"Authorization": "Bearer t"})), \
                 patch.object(nav, "Door", lambda base, bearer: (base, bearer)):
             self.assertEqual(nav.open_door(), ("https://hs.example/relay", "t"))
+
+
+class SiteChecks(unittest.TestCase):
+    def test_same_site(self):
+        relay = "https://chat.ag2.space/relay"
+        for url, want in (("https://mcp.ag2.space/mcp", True), ("https://chat.ag2.space/x", True),
+                          ("https://ag2.space/x", True), ("https://evil.example/mcp", False),
+                          ("https://ag2.space.evil.example/", False), ("http://mcp.ag2.space/", False),
+                          ("https:///nohost", False)):
+            self.assertEqual(nav.same_site(url, relay), want, url)
+        self.assertTrue(nav.same_site("https://mcp.hs.example/", "https://hs.example/relay"))
+        self.assertFalse(nav.same_site("https://other.example/", "https://hs.example/relay"))
+
+    def test_an_mcp_url_off_the_relay_site_gets_no_token(self):
+        sent = []
+
+        def post(url, token, body=None, headers=None, method="POST"):
+            sent.append(url)
+            return 200, {}, json.dumps({"mint_url": "https://hs.example/mint",
+                                        "mcp_url": "https://evil.example/mcp"}).encode()
+
+        with self.assertRaises(nav.Refused) as cm:
+            nav.Door("https://hs.example/relay", "bearer", post=post)
+        self.assertEqual(cm.exception.code, "MCP_HOST")
+        self.assertEqual(sent, ["https://hs.example/relay/v1/mcp/discovery"], "no mint, no MCP call")
 
 
 class Transport(unittest.TestCase):
@@ -439,6 +475,47 @@ class Transport(unittest.TestCase):
 
     def test_http_error_is_a_status(self):
         self.assertEqual(nav._post(self.base + "/no", "t", {"a": 1})[0], 403)
+
+    def test_a_redirect_to_another_origin_is_not_followed(self):
+        hits = []
+
+        class Elsewhere(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *a):
+                pass
+        other = HTTPServer(("127.0.0.1", 0), Elsewhere)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        target = f"http://127.0.0.1:{other.server_address[1]}/steal"
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(307 if self.command == "GET" else 302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *a):
+                pass
+        redir = HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=redir.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{redir.server_address[1]}"
+        try:
+            self.assertEqual(nav._post(base + "/v1/mcp/discovery", "SECRET", method="GET")[0], 307)
+            self.assertEqual(nav._post(base + "/mint", "SECRET", {})[0], 302)
+            with self.assertRaises(nav.Refused):
+                nav.Door(base + "/relay", "SECRET")
+        finally:
+            other.shutdown()
+            redir.shutdown()
+        self.assertEqual(hits, [], "the bearer never reached the redirect target")
 
     def test_unreachable_refuses(self):
         with self.assertRaises(nav.Refused) as cm:

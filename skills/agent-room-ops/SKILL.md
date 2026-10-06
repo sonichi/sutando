@@ -77,6 +77,9 @@ The call goes through the Actions door, not the room-ops gateway: the gateway
 bearer discovers the hosted MCP on its relay, mints a delegation there, and runs
 `room.action.execute` with `operation_id` derived from the target, so a repeated
 call is the same operation.
+Every request that carries a token refuses redirects (a 3xx is an answer, never
+followed), the mint must be on the relay's host and the MCP URL on the relay's site.
+A held mention whose trailing flush never ran is delivered by the next `mention` run.
 
 The owner DM is the room whose members are exactly {this agent, its owner} (owner
 from the gateway's `/v1/agents` row): the only room the Action accepts. The
