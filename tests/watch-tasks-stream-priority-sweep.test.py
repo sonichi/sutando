@@ -133,7 +133,8 @@ def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlo
     h = Harness()
     try:
         stub_py = h.tmp / "bin" / "stub-python3"
-        stub_py.write_text("#!/bin/sh\nexit 0\n")
+        # A broken helper interpreter; the event relay is a transport, not a helper, so it still streams.
+        stub_py.write_text(f'#!/bin/sh\ncase "$1" in *line_relay.py) exec {sys.executable} "$@" ;; esac\nexit 0\n')
         stub_py.chmod(0o755)
         h.task("task-a3.txt", "urgent", age_s=10)
         h.task("task-b3.txt", "low")
