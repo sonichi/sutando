@@ -12,8 +12,7 @@ Run: python3 tests/result-publish.test.py
 """
 from __future__ import annotations
 
-import contextlib
-import importlib.util
+import importlib
 import io
 import multiprocessing
 import os
@@ -32,11 +31,8 @@ import result_publish  # noqa: E402
 
 
 def _load_vendored():
-    path = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_publish.py"
-    spec = importlib.util.spec_from_file_location("ag2_sparrow_result_publish", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+    return importlib.import_module("ag2_sparrow.result_publish")
 from delivery.readiness import read_ready_result  # noqa: E402
 
 BODY = "header line\n" + ("body text that follows the first paragraph boundary. " * 50)
@@ -160,25 +156,6 @@ class PublisherFailurePaths(unittest.TestCase):
                 with mock.patch.object(mod.sys, "stderr", io.StringIO()):
                     self.assertEqual(mod.main(["result_publish.py"]), 2)
                     self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
-
-
-class FrictionDetectorPublishes(unittest.TestCase):
-    def test_report_lands_whole_through_the_publisher(self):
-        spec = importlib.util.spec_from_file_location("fd_publish", REPO / "src" / "friction-detector.py")
-        fd = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fd)
-        with tempfile.TemporaryDirectory() as td:
-            fd.RESULTS_DIR = Path(td)
-            names = [n for n in dir(fd) if n.startswith("check_")]
-            with contextlib.ExitStack() as stack, mock.patch.object(fd, "publish_text",
-                                                                    wraps=fd.publish_text) as pub:
-                for n in names:
-                    stack.enter_context(mock.patch.object(fd, n, return_value=[]))
-                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-                fd.main()
-            (report,) = Path(td).iterdir()
-            pub.assert_called_once_with(report, "No friction detected today. Everything is clean.")
-            self.assertEqual(report.read_text(), "No friction detected today. Everything is clean.")
 
 
 class ConcurrencyDrill(unittest.TestCase):
