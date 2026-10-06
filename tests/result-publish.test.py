@@ -12,6 +12,9 @@ Run: python3 tests/result-publish.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import multiprocessing
 import os
 import subprocess
@@ -20,11 +23,20 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 import result_publish  # noqa: E402
+
+
+def _load_vendored():
+    path = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_publish.py"
+    spec = importlib.util.spec_from_file_location("ag2_sparrow_result_publish", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 from delivery.readiness import read_ready_result  # noqa: E402
 
 BODY = "header line\n" + ("body text that follows the first paragraph boundary. " * 50)
@@ -115,6 +127,58 @@ class PublisherContract(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py")],
                               input="", text=True, capture_output=True)
         self.assertEqual(proc.returncode, 2)
+
+
+class PublisherFailurePaths(unittest.TestCase):
+    """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
+
+    MODULES = (result_publish, _load_vendored())
+
+    def test_failed_stage_leaves_no_staging_and_raises(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                with mock.patch.object(mod.os, "fsync", side_effect=OSError("disk full")):
+                    with self.assertRaises(OSError):
+                        mod.stage_text(Path(td) / "task-1.txt", BODY)
+                self.assertEqual(list(Path(td).iterdir()), [])
+
+    def test_failed_publish_removes_its_staging(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                with mock.patch.object(mod.os, "replace", side_effect=OSError("crash at publish")):
+                    with self.assertRaises(OSError):
+                        mod.publish_text(Path(td) / "task-1.txt", BODY)
+                self.assertEqual(list(Path(td).iterdir()), [])
+
+    def test_main_publishes_stdin_and_refuses_a_flag_or_no_path(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "proactive-1.txt"
+                with mock.patch.object(mod.sys, "stdin", io.StringIO(BODY)):
+                    self.assertEqual(mod.main(["result_publish.py", str(target)]), 0)
+                self.assertEqual(target.read_text(encoding="utf-8"), BODY)
+                with mock.patch.object(mod.sys, "stderr", io.StringIO()):
+                    self.assertEqual(mod.main(["result_publish.py"]), 2)
+                    self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
+
+
+class FrictionDetectorPublishes(unittest.TestCase):
+    def test_report_lands_whole_through_the_publisher(self):
+        spec = importlib.util.spec_from_file_location("fd_publish", REPO / "src" / "friction-detector.py")
+        fd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fd)
+        with tempfile.TemporaryDirectory() as td:
+            fd.RESULTS_DIR = Path(td)
+            names = [n for n in dir(fd) if n.startswith("check_")]
+            with contextlib.ExitStack() as stack, mock.patch.object(fd, "publish_text",
+                                                                    wraps=fd.publish_text) as pub:
+                for n in names:
+                    stack.enter_context(mock.patch.object(fd, n, return_value=[]))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                fd.main()
+            (report,) = Path(td).iterdir()
+            pub.assert_called_once_with(report, "No friction detected today. Everything is clean.")
+            self.assertEqual(report.read_text(), "No friction detected today. Everything is clean.")
 
 
 class ConcurrencyDrill(unittest.TestCase):

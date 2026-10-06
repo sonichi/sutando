@@ -96,6 +96,20 @@ class ContractTest(unittest.TestCase):
             self.assertEqual(p.stat().st_size, 2782)
             self.assertEqual(len(read_ready_result(p)), 2782)
 
+    def test_body_that_grows_during_the_read_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "x" * 207)
+            real_read = Path.read_text
+
+            def read_then_append(self_, *a, **kw):
+                text = real_read(self_, *a, **kw)
+                with open(self_, "a") as fh:
+                    fh.write("y" * 2575)
+                return text
+
+            with mock.patch.object(Path, "read_text", read_then_append):
+                self.assertIsNone(read_ready_result(p))
+
     def test_young_but_still_body_is_ready_after_one_hold(self):
         with tempfile.TemporaryDirectory() as td:
             p = self._write(td, "the answer")
