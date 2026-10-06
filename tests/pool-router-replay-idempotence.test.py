@@ -276,6 +276,56 @@ def scenario_unrelated_marker_leaves_replay_roster_free() -> None:
         check(f"roster {broken}: the handler's run settles (rc 0)", rc == 0, str(rc))
 
 
+def scenario_marker_is_judged_against_the_admitted_roster() -> None:
+    print("\nscenario: a marked claim beside a new task; the roster is deleted or replaced between classify and route")
+    import pool_route_handler as h
+    real_route = h.rt.route
+    for marked in (False, True):
+        for change in ("deleted", "replaced with workers: []"):
+            ws = workspace(A)
+            if marked:
+                side = ws / "deliveries" / "side-claims"
+                side.mkdir()
+                (side / pd.NON_EXCLUSIVE_MARKER).write_text("")
+                (side / "task-r.accepted").write_text("")
+
+            def changing_route(workspace_, task_dict, roster=None, **kw):
+                roster_file = ws / "state" / "roster.json"
+                if change == "deleted":
+                    roster_file.unlink()
+                else:
+                    roster_file.write_text(json.dumps({"version": 2, "workers": [], "bindings": {}}))
+                return real_route(workspace_, task_dict, roster, **kw)
+            h.rt.route = changing_route
+            try:
+                rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+            finally:
+                h.rt.route = real_route
+            label = f"{'marked claim' if marked else 'control'}, roster {change} after classify"
+            check(f"{label}: rc 0", rc == 0, str(rc))
+            check(f"{label}: the worker's sentinel is written",
+                  (ws / "deliveries" / A / "task-r.txt").exists(), str(sentinels(ws)))
+
+
+def scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker() -> None:
+    print("\nscenario: crash-residue sentinel in A's folder, which also carries a marker; roster is valid JSON, wrong shape")
+    import pool_route_handler as h
+    for workers, want, why in (({A: {"state": "live"}, B: {"state": "live"}}, h.MUST_HANDLE, "well-formed: a roster worker"),
+                               ([], h.MUST_HANDLE, "workers: [] is malformed, not an empty roster"),
+                               ({A: "live"}, h.MUST_HANDLE, "a non-object worker row is malformed")):
+        ws = workspace(A)
+        seed(ws, A, ".txt", None)
+        (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": workers, "bindings": {ROOM: A}}))
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+        check(f"marker in A's folder, {why}: MUST_HANDLE, not DECLINE", rc == want, str(rc))
+    ws = workspace(A)
+    seed(ws, A, ".txt", None)
+    (ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": [], "bindings": {}}))
+    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    check("control: same malformed roster, no marker: the committed sentinel settles it (rc 0)", rc == 0, str(rc))
+
+
 def scenario_handler_settles_by_the_routes_targets() -> None:
     print("\nscenario: the probe saw B bound and nothing committed; A commits INSIDE the run's window; the run settles on A")
     import pool_route_handler as h
@@ -516,6 +566,8 @@ def main() -> int:
     scenario_unreadable_and_malformed_evidence_refuse()
     scenario_commit_outlives_the_roster()
     scenario_unrelated_marker_leaves_replay_roster_free()
+    scenario_marker_is_judged_against_the_admitted_roster()
+    scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker()
     scenario_handler_settles_by_the_routes_targets()
     scenario_release_race_is_serialised_by_the_folder_lock()
     scenario_aliased_recipient_directory_refuses()

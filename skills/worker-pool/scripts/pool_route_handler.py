@@ -81,20 +81,23 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         return DECLINE, [], None
     # A replay follows the delivery already committed to a worker, whatever the
     # bindings say now; the roster still decides for a task nobody holds yet.
+    # One roster read for the whole run: the replay check below and the route both use it.
     try:
-        committed = rt.committed_recipient(workspace, task.get("id") or "")
+        raw, unreadable = pr._load_existing_roster_strict(workspace), False
+    except pr.RosterError:
+        raw, unreadable = None, True
+    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
+    try:
+        committed = rt.committed_recipient(workspace, task.get("id") or "", roster=roster)
     except rt.RouterRefused as e:      # a conflict, or evidence that cannot be read
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE, [], None
     if committed is not None and committed != pr.CORE:
-        return 0, [committed], None
-    try:
-        raw = pr._load_existing_roster_strict(workspace)
-    except pr.RosterError:
+        return 0, [committed], roster
+    if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
         return MUST_HANDLE, [], None
-    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
         return DECLINE, [], None
     try:

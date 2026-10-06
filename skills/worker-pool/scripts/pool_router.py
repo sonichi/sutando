@@ -72,7 +72,12 @@ class UnreadableEvidence(RouterRefused):
     """A sentinel, folder or record could not be READ: absent and unreadable are not the same."""
 
 
-def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None) -> list[str]:
+#: `roster=` default for holders/committed_recipient: read roster.json when a marker needs it.
+FROM_DISK = object()
+
+
+def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None,
+            roster=FROM_DISK) -> list[str]:
     """Every recipient folder holding a sentinel for `task_id`, under any suffix.
 
     Tri-state per name: regular is held, absent is not, anything else refuses
@@ -83,6 +88,9 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
     Which entries are recipients is the shared record policy's call
     (`pool_record.iter_recipients`): an alias raises there, before any read
     or lock here, so an alias never gains a lock.
+
+    A `.non-exclusive` marker is judged against `roster`: the snapshot the caller
+    admitted the task with (None = it had no readable roster), else roster.json.
     """
     root = pd.deliveries_dir(workspace, pr.CORE).parent
     try:
@@ -92,7 +100,7 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
     except OSError as e:
         raise UnreadableEvidence(f"{task_id}: cannot read the recipient folders under {root}: {e}") from e
     held = []
-    roster = None
+    snapshot = None if roster is FROM_DISK else (roster,)
     for name_ in names:
         folder = root / name_
         seams = _arbitration_seams or {}
@@ -121,11 +129,20 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
             if marker != "regular":
                 raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")
             # A marker may only mean "outside the roster": on a real recipient it would hide its deliveries.
-            roster = roster if roster is not None else pr.load_roster(workspace)
-            if roster is None:
+            if snapshot is None:
+                snapshot = (pr.load_roster(workspace),)
+            r = snapshot[0]
+            if r is None:
                 raise UnreadableEvidence(
                     f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
-            if not pr.unknown_targets(roster, [folder.name]):
+            try:
+                pr.validate_workers(r.get("workers") if isinstance(r, dict) else r)
+                if not isinstance(r, dict):
+                    raise pr.RosterError(f"roster must be an object, got {type(r).__name__}")
+            except pr.RosterError as e:
+                raise UnreadableEvidence(
+                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is malformed ({e}); refusing to decide") from e
+            if not pr.unknown_targets(r, [folder.name]):
                 raise UnreadableEvidence(
                     f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} marks roster recipient {folder.name!r}; refusing to decide")
         finally:
@@ -148,7 +165,8 @@ def attribution_state(workspace, task_id: str) -> tuple[str, str | None]:
     return ("worker", value) if pa.is_worker_id(value) else ("malformed", None)
 
 
-def committed_recipient(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None) -> str | None:
+def committed_recipient(workspace, task_id: str, _between_suffix_checks=None, _arbitration_seams=None,
+                        roster=FROM_DISK) -> str | None:
     """The recipient a delivery for `task_id` already committed to, or None.
 
     Attribution is the record; a sentinel in ANY recipient folder is the fact
@@ -163,7 +181,7 @@ def committed_recipient(workspace, task_id: str, _between_suffix_checks=None, _a
         raise UnreadableEvidence(f"{task_id}: attribution record unreadable; refusing to decide")
     if state == "malformed":
         raise ConflictingDelivery(f"{task_id}: attribution record present but malformed; refusing to decide")
-    held = holders(workspace, task_id, _between_suffix_checks, _arbitration_seams)
+    held = holders(workspace, task_id, _between_suffix_checks, _arbitration_seams, roster=roster)
     if len(held) > 1 or (worker is not None and held and held != [worker]):
         raise ConflictingDelivery(
             f"{task_id}: attribution={worker!r} sentinels in {held}; refusing to choose")
@@ -228,7 +246,8 @@ def route(workspace, task: dict, roster=None, _between_suffix_checks=None, _arbi
     # One per-task lock around the whole decision; the commit is resolved before
     # the roster is needed, so a replay finishes it even if the roster is gone.
     with task_arbitration(workspace, task_id):
-        committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams)
+        committed = committed_recipient(workspace, task_id, _between_suffix_checks, _arbitration_seams,
+                                        roster=roster if roster is not None else FROM_DISK)
         if committed is not None:
             targets, unknown, r = [committed], [], (roster if roster is not None else {})
         else:
