@@ -453,11 +453,13 @@ composer_matches_own_leftover() {
 # composer). Verifies empty afterward; a caller that got here already proved via
 # composer_matches_own_leftover that every one of these characters is this notifier's.
 clear_own_leftover() {
-  local raw="$1" n
-  n="$(composer_text "$raw" | "$NOTIFIER_PY" -c \
+  local filename="$1" raw="$2" n text
+  text="$(composer_text "$raw")"
+  n="$(printf '%s' "$text" | "$NOTIFIER_PY" -c \
     'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))))')"
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   [ "$n" -gt 0 ] || return 0
+  log_notifier "erasing $n char(s) recorded as $filename's own leftover, about to clear: $text"
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -N "$n" BSpace 2>/dev/null || return 1
   # A dewrapped read can undercount a real multi-line prompt's newlines (composer_text
   # joins rows with no separator); this is the backstop, not a second guess at the
@@ -559,7 +561,7 @@ deliver_prompt_grown() {
       if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
         log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
       elif composer_matches_own_leftover "$filename" "$incarnation" "$baseline_raw" \
-           && clear_own_leftover "$baseline_raw"; then
+           && clear_own_leftover "$filename" "$baseline_raw"; then
         log_notifier "composer held $filename's own garbled, non-boundary leftover from a failed chunk; cleared it, retyping from the start"
       else
         warn_if_capture_truncated "$baseline_raw" "$filename"
