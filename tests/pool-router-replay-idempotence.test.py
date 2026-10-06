@@ -254,6 +254,194 @@ def scenario_commit_outlives_the_roster() -> None:
     check("the handler's run settles (rc 0), judged by the route's committed target", rc == 0, str(rc))
 
 
+def scenario_unrelated_marker_leaves_replay_roster_free() -> None:
+    print("\nscenario: a marked claim folder holding only ANOTHER task's claim; the roster goes missing, then corrupt")
+    import pool_delivery as pd
+    import pool_route_handler as h
+    for broken in ("missing", "corrupt"):
+        ws = workspace(A)
+        rt.route(ws, task(ws))
+        side = ws / "deliveries" / "side-claims"
+        side.mkdir()
+        (side / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (side / "task-other.accepted").write_text("")
+        roster = ws / "state" / "roster.json"
+        if broken == "missing":
+            roster.unlink()
+        else:
+            roster.write_text("{not json")
+        code, targets, _ = h.classify(ws, task(ws))
+        check(f"roster {broken}: the probe accepts for A", (code, targets) == (0, [A]), str((code, targets)))
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+        check(f"roster {broken}: the handler's run settles (rc 0)", rc == 0, str(rc))
+
+
+def scenario_marker_is_judged_against_the_admitted_roster() -> None:
+    print("\nscenario: a marked claim beside a new task; the roster is deleted or replaced between classify and route")
+    import pool_route_handler as h
+    real_route = h.rt.route
+    for marked in (False, True):
+        for change in ("deleted", "replaced with workers: []"):
+            ws = workspace(A)
+            if marked:
+                side = ws / "deliveries" / "side-claims"
+                side.mkdir()
+                (side / pd.NON_EXCLUSIVE_MARKER).write_text("")
+                (side / "task-r.accepted").write_text("")
+
+            def changing_route(workspace_, task_dict, roster=None, **kw):
+                roster_file = ws / "state" / "roster.json"
+                if change == "deleted":
+                    roster_file.unlink()
+                else:
+                    roster_file.write_text(json.dumps({"version": 2, "workers": [], "bindings": {}}))
+                return real_route(workspace_, task_dict, roster, **kw)
+            h.rt.route = changing_route
+            try:
+                rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+            finally:
+                h.rt.route = real_route
+            label = f"{'marked claim' if marked else 'control'}, roster {change} after classify"
+            check(f"{label}: rc 0", rc == 0, str(rc))
+            check(f"{label}: the worker's sentinel is written",
+                  (ws / "deliveries" / A / "task-r.txt").exists(), str(sentinels(ws)))
+
+
+def scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker() -> None:
+    print("\nscenario: crash-residue sentinel in A's folder, which also carries a marker; roster is valid JSON, wrong shape")
+    import pool_route_handler as h
+    for workers, want, why in (({A: {"state": "live"}, B: {"state": "live"}}, h.MUST_HANDLE, "well-formed: a roster worker"),
+                               ([], h.MUST_HANDLE, "workers: [] is malformed, not an empty roster"),
+                               ({A: "live"}, h.MUST_HANDLE, "a non-object worker row is malformed"),
+                               (None, h.MUST_HANDLE, "workers: null is malformed, not an empty roster")):
+        ws = workspace(A)
+        seed(ws, A, ".txt", None)
+        (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": workers, "bindings": {ROOM: A}}))
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+        check(f"marker in A's folder, {why}: MUST_HANDLE, not DECLINE", rc == want, str(rc))
+    ws = workspace(A)
+    seed(ws, A, ".txt", None)
+    (ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": [], "bindings": {}}))
+    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    check("control: same malformed roster, no marker: the committed sentinel settles it (rc 0)", rc == 0, str(rc))
+
+
+def scenario_an_admitted_absent_roster_is_not_reread_by_route() -> None:
+    print("\nscenario: no roster, residue in A; classify admits the replay with no roster; then A gains a marker and a roster binds B")
+    import pool_route_handler as h
+    ws = workspace(A)
+    (ws / "state" / "roster.json").unlink()
+    seed(ws, A, ".txt", None)
+    real_route = h.rt.route
+
+    def changing_route(workspace_, task_dict, roster=rt.FROM_DISK, **kw):
+        (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        (ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 2, "workers": {B: {"state": "live"}}, "bindings": {ROOM: B}}))
+        return real_route(workspace_, task_dict, roster, **kw)
+    h.rt.route = changing_route
+    try:
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    finally:
+        h.rt.route = real_route
+    check("the run fails closed (MUST_HANDLE)", rc == h.MUST_HANDLE, str(rc))
+    check("...no sentinel was written for B", not any((ws / "deliveries" / B).glob("task-r*")), str(sentinels(ws)))
+    check("...and no attribution was written", not pa.attribution_path(ws, "task-r").exists())
+
+
+def _roster_reads(sequence):
+    """Patch the shared roster loader to answer `sequence` in turn; returns the read log."""
+    import pool_roster as pr_
+    real = pr_.load_roster
+    log: list = []
+
+    def fake(workspace):
+        log.append(len(log))
+        return json.loads(json.dumps(sequence[min(len(log) - 1, len(sequence) - 1)]))
+    pr_.load_roster = fake
+    return log, lambda: setattr(pr_, "load_roster", real)
+
+
+def scenario_pool_ask_decides_on_one_roster_snapshot() -> None:
+    print("\nscenario: pool_ask to A while A (marked) holds a claim; later roster reads would disagree")
+    import pool_ask as pk
+    ws = workspace(A)
+    (ws / "deliveries" / A).mkdir(parents=True, exist_ok=True)
+    (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    both = {"version": 1, "workers": {A: {"state": "live"}, B: {"state": "live"}}, "bindings": {}}
+    only_b = {"version": 2, "workers": {B: {"state": "live"}}, "bindings": {}}
+    real_route = pk.rt.route
+    seen: dict = {}
+
+    def claiming_route(workspace_, task_dict, *a, **kw):
+        seen["id"] = task_dict["id"]
+        (ws / "deliveries" / A / f"{task_dict['id']}.accepted").write_text("")
+        return real_route(workspace_, task_dict, *a, **kw)
+    log, restore = _roster_reads([both, only_b, both])
+    pk.rt.route = claiming_route
+    os.environ.pop("SUTANDO_INSTANCE_ID", None)
+    try:
+        out = pk.ask(ws, A, "q")
+        result = ("returned", out.get("route"))
+    except rt.RouterRefused as e:
+        result = ("refused", str(e))
+    finally:
+        pk.rt.route = real_route
+        restore()
+    tid = seen.get("id", "")
+    check("the whole ask reads the roster once", len(log) == 1, str(log))
+    check("the marked claim is refused, not adopted as a delivery", result[0] == "refused", str(result))
+    check("...no attribution to A", not pa.attribution_path(ws, tid).exists())
+    check("...no pending sentinel in A", not (ws / "deliveries" / A / f"{tid}.txt").exists())
+
+
+def scenario_omitted_roster_route_reads_once() -> None:
+    print("\nscenario: route() with the roster omitted; a marked outside claim holds the task; a second read would be workers: null")
+    ws = workspace(B)
+    side = ws / "deliveries" / "side-claims"
+    side.mkdir()
+    (side / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    (side / "task-r.accepted").write_text("")
+    good = {"version": 1, "workers": {A: {"state": "live"}, B: {"state": "live"}}, "bindings": {ROOM: B}}
+    log, restore = _roster_reads([good, {"version": 2, "workers": None, "bindings": {}}])
+    try:
+        out = rt.route(ws, task(ws))
+    except rt.RouterRefused as e:
+        out = {"error": repr(e)}
+    finally:
+        restore()
+    check("one roster read for the pass", len(log) == 1, str(log))
+    check("the task goes to the bound worker B on that snapshot", out.get("delivered") == [B] and out.get("redirected") == [], str(out))
+
+
+def scenario_never_deliver_into_a_marked_folder() -> None:
+    print("\nscenario: the delivery transition refuses any folder carrying a marker")
+    import pool_route_handler as h
+    ws = workspace(A)
+    (ws / "deliveries" / A).mkdir(parents=True, exist_ok=True)
+    (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+    rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+    check("new target A is marked: MUST_HANDLE", rc == h.MUST_HANDLE, str(rc))
+    check("...no sentinel written into A", not (ws / "deliveries" / A / "task-r.txt").exists(), str(sentinels(ws)))
+    check("...no attribution", not pa.attribution_path(ws, "task-r").exists())
+    for suffix in (".accepted", None):
+        ws = workspace(B)
+        (ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {B: {"state": "live"}}, "bindings": {ROOM: B}}))
+        (ws / "deliveries" / A).mkdir(parents=True, exist_ok=True)
+        (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
+        if suffix:
+            (ws / "deliveries" / A / f"task-r{suffix}").write_text("")
+        pa.attribution_dir(ws).mkdir(parents=True, exist_ok=True)
+        pa.attribution_path(ws, "task-r").write_text(A + "\n")
+        before = sentinels(ws)
+        rc = h.main(["--task-file", str(ws / "tasks" / "task-r.txt"), "--workspace", str(ws)])
+        label = f"attribution names marked A outside the roster, A {'holds a claim' if suffix else 'holds nothing'}"
+        check(f"{label}: MUST_HANDLE", rc == h.MUST_HANDLE, str(rc))
+        check(f"{label}: no sentinel created or adopted", sentinels(ws) == before, str(sentinels(ws)))
+
+
 def scenario_handler_settles_by_the_routes_targets() -> None:
     print("\nscenario: the probe saw B bound and nothing committed; A commits INSIDE the run's window; the run settles on A")
     import pool_route_handler as h
@@ -493,6 +681,13 @@ def main() -> int:
     scenario_every_arbitration_body_is_fd_relative()
     scenario_unreadable_and_malformed_evidence_refuse()
     scenario_commit_outlives_the_roster()
+    scenario_unrelated_marker_leaves_replay_roster_free()
+    scenario_marker_is_judged_against_the_admitted_roster()
+    scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker()
+    scenario_an_admitted_absent_roster_is_not_reread_by_route()
+    scenario_pool_ask_decides_on_one_roster_snapshot()
+    scenario_omitted_roster_route_reads_once()
+    scenario_never_deliver_into_a_marked_folder()
     scenario_handler_settles_by_the_routes_targets()
     scenario_release_race_is_serialised_by_the_folder_lock()
     scenario_aliased_recipient_directory_refuses()
