@@ -36,6 +36,12 @@ from pathlib import Path
 # conflate this import bootstrap with workspace-path resolution.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 try:
+    import room_message
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import room_message
+
+try:
     from policy.egress.unfurl import should_unfurl as _should_unfurl
 except ImportError:  # skill running without the core tree
     def _should_unfurl(_body: str) -> bool:
@@ -116,6 +122,9 @@ def _token(source: str, var: str) -> str:
 def _post(url: str, payload: dict, headers: dict, timeout: float = 10) -> bool:
     """POST JSON payload. Returns True on 2xx."""
     try:
+        if (urllib.parse.urlsplit(url).path.endswith("/v1/room")
+                and payload.get("op") in ("message", "edit")):
+            payload = room_message.room_message_payload(payload)
         data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers={
             "Content-Type": "application/json",

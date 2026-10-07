@@ -72,6 +72,8 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+from . import room_message
+
 # Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
 # publishes AAAA records, but some hosts have IPv6 black-holed at the network
 _DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
@@ -2151,6 +2153,9 @@ def _log(msg: str) -> None:
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
+    if (method == "POST" and urllib.parse.urlsplit(path).path == "/v1/room"
+            and isinstance(payload, dict) and payload.get("op") in ("message", "edit")):
+        payload = room_message.room_message_payload(payload)
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
