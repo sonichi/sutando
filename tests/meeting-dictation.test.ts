@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { GeminiLiveTranscribeSTTProvider, resamplePcm16, type WebSocketLike } from '../src/gemini-live-transcribe-stt.js';
-import { attachMeetingDictation, isMeetingExitPhrase } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, isMeetingExitPhrase } from '../src/meeting-dictation.js';
 
 class FakeSocket implements WebSocketLike {
 	readyState = 0;
@@ -221,5 +221,40 @@ describe('meeting dictation', () => {
 		assert.equal(t.exitedByVoice, 0);
 		await t.md.exit(); // idempotent
 		assert.equal(t.injected.length, 1);
+	});
+});
+
+describe('meeting entry gate', () => {
+	it('enters after the confirmation turn, not the tool-call turn', () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10_000, onFire: () => fired++ });
+		g.schedule();
+		g.noteTurnCompleted(); // turn that carried switch_mode
+		assert.equal(fired, 0);
+		g.noteTurnCompleted(); // "I have switched to meeting mode."
+		assert.equal(fired, 1);
+		g.noteTurnCompleted();
+		assert.equal(fired, 1, 'fires once');
+	});
+
+	it('falls back when no confirmation turn arrives', async () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
+		g.schedule();
+		g.noteTurnCompleted();
+		await tick(20);
+		assert.equal(fired, 1);
+	});
+
+	it('cancel (switching back before entry) prevents entering', async () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
+		g.schedule();
+		g.cancel();
+		g.noteTurnCompleted();
+		g.noteTurnCompleted();
+		await tick(20);
+		assert.equal(fired, 0);
+		assert.equal(g.pending, false);
 	});
 });

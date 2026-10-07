@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import { GeminiLiveTranscribeSTTProvider } from './gemini-live-transcribe-stt.js';
-import { attachMeetingDictation } from './meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -434,8 +434,10 @@ function getPendingToolCalls(toolName?: string) {
 let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
-const MEETING_ENTER_DELAY_MS = 1_500;
+// Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
+const meetingEntry = createMeetingEntryGate({ fallbackMs: 8_000, onFire: () => enterMeetingDictation() });
 function noteMeetingState(on: boolean) {
+	if (!on) meetingEntry.cancel();
 	meetingActive = on;
 	voiceWatchdogShadow.noteMeetingMode(on);
 	voiceRecoveryCoordinator?.noteMeetingMode(on);
@@ -535,8 +537,7 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			// Enter after this result is delivered: results sent while transcribing are held until exit.
-			setTimeout(enterMeetingDictation, MEETING_ENTER_DELAY_MS);
+			meetingEntry.schedule();
 			return { status: 'meeting_mode', transcribing: true };
 		}
 		await meetingDictation?.exit();
@@ -747,6 +748,7 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
+		meetingEntry.noteTurnCompleted();
 		// Clear narration speaking flag + capture what Gemini actually said
 		try {
 			const { narrationSpeakingRef, lastSpokenRef } = await import('./recording-state.js');
