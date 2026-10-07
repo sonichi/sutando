@@ -275,12 +275,12 @@ PS_REFUSED = "cannot read my own start time"
 
 
 def passes(wt: Watcher, line: str = HOLD) -> int:
-    """Held-retry passes so far: the watcher logs the hold reason once per pass."""
+    """Hold passes so far, the first hold included: the watcher logs the reason once per pass."""
     return wt.err.read_text().count(line)
 
 
 def expect_passes(wt: Watcher, n: int, line: str = HOLD) -> None:
-    check(f"the watcher re-asked the hold on {n} retry passes",
+    check(f"the watcher logged the hold on {n} passes",
           wait_for(lambda: passes(wt, line) >= n, 15.0), f"{passes(wt, line)} pass(es) logged")
 
 
@@ -798,6 +798,7 @@ def arm_dead_claim_met_by_own_dispatch_once() -> None:
             fh.write(str(task.resolve()) + "\n")
         check("held, with the reason logged", wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0),
               w2.err.read_text()[-300:])
+        # A dead claim is also re-asked per event, so this count can be met without the timer.
         expect_passes(w2, 3)
         check("zero announcements, the dead claim preserved (a handler's outcome is unknown)",
               w2.announced("task-i.txt") == 0 and claimed(w, "task-i.txt"), w2.out.read_text()[-300:])
