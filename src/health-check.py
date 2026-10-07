@@ -1072,6 +1072,10 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+# A core restart briefly removes .alive; a hold that outlives one is an outage, not a restart.
+CRON_HOLD_DOWN_AFTER_S = 300
+
+
 def check_cron_runner(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -1158,6 +1162,21 @@ def check_cron_runner(
             "name": name,
             "status": "down",
             "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
+        }
+    # A runner that ticks on time can still emit nothing: it holds every prompt-backed fire
+    # while the core heartbeat is missing, and records that hold here.
+    try:
+        hold = json.loads((workspace / "state" / "cron-runner-hold.json").read_text())
+    except (OSError, ValueError):
+        hold = None
+    if isinstance(hold, dict) and isinstance(hold.get("since"), (int, float)):
+        held_for = max(0, int(float(time.time() if now is None else now) - hold["since"]))
+        names = ", ".join(str(n) for n in hold.get("held", [])) or "due schedules"
+        return {
+            "name": name,
+            "status": "down" if held_for >= CRON_HOLD_DOWN_AFTER_S else "warn",
+            "detail": (f"cron-runner has held {names} for {held_for}s and emitted no task: "
+                       f"{hold.get('reason', 'core heartbeat not fresh')}"),
         }
     return {
         "name": name,
