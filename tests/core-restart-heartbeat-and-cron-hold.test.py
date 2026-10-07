@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -256,6 +257,141 @@ class HealthCheckReportsTheHold(unittest.TestCase):
             (ws / "state" / "cron-runner-hold.json").write_text(json.dumps(
                 {"since": 1000, "updated_at": 1000, "held": ["digest"], "reason": "r"}))
             self.assertEqual(health.check_cron_runner(ws, "test-host", "claude", ok, now=1030)["status"], "warn")
+
+
+def _cp(rc: int, out: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(["x"], rc, out, "")
+
+
+class EnsureInProcess(unittest.TestCase):
+    """The --ensure machinery called directly, with process I/O faked: nothing is spawned."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import core_heartbeat
+        self.ch = core_heartbeat
+        self.td = Path(tempfile.mkdtemp())
+        self._saved = {k: getattr(core_heartbeat, k) for k in (
+            "WORKSPACE", "_recorded_writer_pids", "running_writer_pids", "ensure_running", "_SCRIPT")}
+        core_heartbeat.WORKSPACE = self.td
+        core_heartbeat._recorded_writer_pids = lambda: []
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(self.ch, k, v)
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _fake_run(self, pgrep, args_by_pid):
+        def run(cmd, *a, **kw):
+            if cmd[0] == "pgrep":
+                if isinstance(pgrep, Exception):
+                    raise pgrep
+                return pgrep
+            pid = int(cmd[-1])
+            val = args_by_pid.get(pid, "")
+            if isinstance(val, Exception):
+                raise val
+            return _cp(0, val + "\n")
+        return run
+
+    def test_writer_argv_forms(self):
+        ch, s = self.ch, str(self.ch._SCRIPT)
+        self.assertTrue(ch._writer_argv(f"/usr/bin/python3 {s}"))
+        self.assertTrue(ch._writer_argv("/x/Python.app/Contents/MacOS/Python src/core_heartbeat.py"))
+        self.assertTrue(ch._writer_argv(f"python3 {s} --interval 5"))
+        self.assertFalse(ch._writer_argv(f"python3 {s} --ensure"))
+        self.assertFalse(ch._writer_argv("python3 -c 'core_heartbeat.py'"))
+        self.assertFalse(ch._writer_argv("bash src/core_heartbeat.py"))
+
+    def test_running_writer_pids_filters_candidates(self):
+        ch, s = self.ch, str(self.ch._SCRIPT)
+        ch._recorded_writer_pids = lambda: [1, 501]
+        args = {501: "python3 src/core_heartbeat.py", 502: f"python3 {s}", 503: f"python3 {s} --stop",
+                504: OSError("ps gone")}
+        pg = _cp(0, f"502\n503\n504\n{os.getpid()}\n")
+        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(pg, args)):
+            self.assertEqual(ch.running_writer_pids(), [501, 502])
+
+    def test_running_writer_pids_pgrep_outcomes(self):
+        ch = self.ch
+        ch._recorded_writer_pids = lambda: [601]
+        args = {601: "python3 src/core_heartbeat.py"}
+        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(_cp(1), args)):
+            self.assertEqual(ch.running_writer_pids(), [601])
+        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(OSError("no pgrep"), args)):
+            self.assertEqual(ch.running_writer_pids(), [601])
+        # A matched-but-silent pgrep is never read as "no writer".
+        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(_cp(0, ""), args)):
+            self.assertEqual(ch.running_writer_pids(), [0])
+
+    def test_ensure_adopts_an_existing_writer(self):
+        ch = self.ch
+        ch.running_writer_pids = lambda: [777]
+        with unittest.mock.patch.object(ch.subprocess, "Popen") as popen:
+            self.assertEqual(ch.ensure_running(self.td / "hb.log"), (False, 777))
+        popen.assert_not_called()
+        self.assertTrue((self.td / "state" / "locks" / "core-heartbeat-ensure.lock").exists())
+
+    def test_ensure_spawns_and_waits_for_the_child_argv(self):
+        ch = self.ch
+        answers = iter([[], [], [4242]])
+        ch.running_writer_pids = lambda: next(answers)
+        child = unittest.mock.Mock(pid=4242)
+        child.poll.return_value = None
+        with unittest.mock.patch.object(ch.subprocess, "Popen", return_value=child) as popen, \
+                unittest.mock.patch.object(ch.time, "sleep"):
+            self.assertEqual(ch.ensure_running(self.td / "hb.log"), (True, 4242))
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv, [sys.executable, str(ch._SCRIPT)])
+        self.assertTrue(popen.call_args[1]["start_new_session"])
+
+    def test_ensure_stops_waiting_for_a_child_that_exited(self):
+        ch = self.ch
+        ch.running_writer_pids = lambda: []
+        child = unittest.mock.Mock(pid=4343)
+        child.poll.return_value = 1
+        with unittest.mock.patch.object(ch.subprocess, "Popen", return_value=child):
+            self.assertEqual(ch.ensure_running(self.td / "hb.log"), (True, 4343))
+        child.poll.assert_called_once()
+
+    def test_main_ensure_reports_both_outcomes(self):
+        ch = self.ch
+        seen = []
+        for result, word in (((True, 11), "started writer"), ((False, 12), "writer already running")):
+            ch.ensure_running = lambda log, r=result: (seen.append(log), r)[1]
+            out = io.StringIO()
+            with unittest.mock.patch.object(sys, "stdout", out):
+                self.assertEqual(ch.main(["--ensure", "--log", str(self.td / "x.log")]), 0)
+            self.assertIn(word, out.getvalue())
+        self.assertEqual(seen, [self.td / "x.log"] * 2)
+
+    def test_run_forever_leaves_when_its_checkout_is_gone(self):
+        ch = self.ch
+        ch._SCRIPT = self.td / "removed" / "core_heartbeat.py"
+        old = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT), ch._alive_path,
+               ch._SHUTDOWN_REQUESTED)
+        ch._alive_path = lambda: self.td / "h.alive"
+        ch._SHUTDOWN_REQUESTED = False
+        try:
+            with unittest.mock.patch.object(ch, "core_pid") as core_pid:
+                self.assertEqual(ch.run_forever(interval=0.01), 0)
+            core_pid.assert_not_called()
+        finally:
+            signal.signal(signal.SIGTERM, old[0])
+            signal.signal(signal.SIGINT, old[1])
+            ch._alive_path, ch._SHUTDOWN_REQUESTED = old[2], old[3]
+
+
+class CronRunnerStaleReason(unittest.TestCase):
+    def test_a_stale_heartbeat_is_named_stale_with_its_age(self):
+        cr = _load("cron_runner_reason", REPO / "src" / "cron-runner.py")
+        with tempfile.TemporaryDirectory() as td:
+            cr.CORE_ALIVE_FILE = Path(td) / "h.alive"
+            self.assertIn("missing", cr._core_alive_reason(time.time()))
+            cr.CORE_ALIVE_FILE.write_text("{}")
+            os.utime(cr.CORE_ALIVE_FILE, (1000, 1000))
+            self.assertEqual(cr._core_alive_reason(1500),
+                             f"core heartbeat stale (500s old, limit {cr.CORE_ALIVE_MAX_AGE_SECONDS}s)")
 
 
 if __name__ == "__main__":
