@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Guard the observed CI log-scraping error, and surface evidence rules in context.
 
-This is a narrow command guard, not proof of general model accuracy. No network
-calls or user-data writes occur here. Wrapper/variable bypasses remain possible.
+This is a narrow command guard, not proof of general model accuracy. PostToolUse may read GitHub; no user-data writes occur here. Wrapper/variable bypasses remain possible.
 """
 import json
 import re

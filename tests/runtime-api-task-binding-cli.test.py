@@ -71,6 +71,23 @@ class TaskBindingTests(fixture.TransportTests):
         self.assertEqual(rc, 0, row)
         self.assertEqual(len(self.sent), 1)
 
+    def test_completed_record_with_missing_or_invalid_fingerprint_cannot_replay(self):
+        params = {'taskId': 'fixture-task-A', 'action': 'message.send',
+                  'resource': {'roomId': '!isolated:fixture'},
+                  'input': {'body': 'isolated canonical message'}}
+        for index, fingerprint in enumerate((None, 'invalid-persisted-fingerprint')):
+            key = 'invalid-fingerprint-' + str(index)
+            record = self.srv.store.create(
+                'capability', 'capability.execute', 'fixture-daemon', params,
+                task_id=params['taskId'], idempotency_key=key, fingerprint=fingerprint)
+            self.srv.store.transition(record['requestId'], 'completed',
+                                      result={'executed': True, 'eventId': '$old-fixture'})
+            rc, row = self.execute('unused', 'fixture-task-A', key=key)
+            self.assertNotEqual(rc, 0, row)
+            self.assertIn('per-execution', row['error'])
+            self.assertEqual(self.srv.store.get(record['requestId'])['status'], 'completed')
+        self.assertEqual(self.sent, [])
+
     def test_legacy_completed_record_replays_only_its_original_task(self):
         params = {'taskId': 'fixture-task-A', 'action': 'message.send',
                   'resource': {'roomId': '!isolated:fixture'},
