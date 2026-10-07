@@ -120,6 +120,39 @@ output.write_text(json.dumps({'schema':1,'proposals':[row]}))
         time.sleep(1.2)
         self.assertFalse(late.exists())
 
+    def test_cancellation_during_process_creation_is_not_lost(self):
+        import signal
+        import time
+        self.call('missing')
+        self.configure_readback('same')
+        manifest = self.root / 'manifest.json'
+        value = json.loads(manifest.read_text())
+        value['config']['document_readback_argv'] = [sys.executable, str(self.readback)]
+        manifest.write_text(json.dumps(value))
+        late = self.root / 'creation-late'
+        pidfile = self.root / 'creation.pid'
+        self.consumer.write_text("import pathlib,time;time.sleep(1);pathlib.Path(" + repr(str(late)) + ").write_text('late');time.sleep(20)")
+        wrapper = self.root / 'cancel-during-popen.py'
+        wrapper.write_text("import os,signal,sys,pathlib\nsys.path.insert(0," + repr(str(ENTRY.parent)) + ")\nimport dispatch_collection as dispatch\noriginal=dispatch.subprocess.Popen\ndef create(*args,**kwargs):\n p=original(*args,**kwargs)\n if kwargs.get('start_new_session'):\n  pathlib.Path(" + repr(str(pidfile)) + ").write_text(str(p.pid))\n  os.kill(os.getpid(),signal.SIGTERM)\n return p\ndispatch.subprocess.Popen=create\nsys.exit(dispatch.main())\n")
+        result = subprocess.run([sys.executable, str(wrapper), '--config', str(manifest),
+                                 '--directory', str(self.state)], capture_output=True, text=True, timeout=10)
+        pid = int(pidfile.read_text())
+        def cleanup():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(cleanup)
+        state = json.loads((self.state / 'dispatch-state.json').read_text())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(state['error'], 'InterruptedError')
+        self.assertIn('document_readbacks_after', state)
+        time.sleep(1.2)
+        self.assertFalse(late.exists(), 'cancellation during Popen allowed a late write')
+        self.consumer.write_text('import sys;sys.exit(0)')
+        _, next_state = self.call('missing')
+        self.assertEqual(next_state['phase'], 'consumer_exited')
+
     def test_exited_consumer_cannot_leave_background_writer(self):
         import time
         late = self.root / 'exit-late'
