@@ -57,6 +57,33 @@ class HistoryTests(unittest.TestCase):
         got = collect_window(["r"], lambda *args: {"messages": [event(1), event(15), event(25)]}, 10, 20)
         self.assertEqual([m["event_id"] for m in got["rooms"][0]["messages"]], ["15"])
 
+    def test_cutoff_timestamp_ties_continue_to_next_page(self):
+        calls = []
+
+        def fetch(room, cursor):
+            calls.append(cursor)
+            if cursor is None:
+                return {"messages": [event("first", 10)], "cursor": "next"}
+            return {"messages": [event("second", 10), event("older", 9)], "cursor": "unused"}
+
+        got = collect_window(["r"], fetch, 10, 20)
+        self.assertTrue(got["ok"])
+        self.assertEqual(calls, [None, "next"])
+        self.assertEqual([m["event_id"] for m in got["rooms"][0]["messages"]], ["first", "second"])
+
+    def test_cutoff_timestamp_ties_at_budget_are_incomplete(self):
+        got = collect_window(["r"], lambda *args: {"messages": [event("edge", 10)], "cursor": "next"}, 10, 20, pages=1)
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["rooms"][0]["coverage"], "page_budget_exhausted")
+
+    def test_declined_page_is_not_end_of_history(self):
+        for denial in ({"ok": False}, {"error": "private detail"}):
+            page = {"messages": [], "cursor": None, **denial}
+            got = collect_window(["r"], lambda *args: page, 10, 20)
+            self.assertFalse(got["ok"])
+            self.assertFalse(got["rooms"][0]["covered_available_history"])
+            self.assertNotIn("private detail", json.dumps(got))
+
     def test_timeout_is_unknown_not_quiet(self):
         def fetch(*args):
             raise TimeoutError("private detail")

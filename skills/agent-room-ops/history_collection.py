@@ -19,6 +19,9 @@ def collect_window(room_ids, fetch, since_ms, until_ms, pages=20):
                 if not isinstance(page, dict) or not isinstance(page.get("messages"), list):
                     row["errors"].append("malformed page")
                     break
+                if page.get("ok") is False or page.get("error"):
+                    row["errors"].append("page declined")
+                    break
                 times = []
                 for message in page["messages"]:
                     if not isinstance(message, dict) or not isinstance(message.get("ts"), (int, float)) or isinstance(message.get("ts"), bool) or not math.isfinite(message["ts"]) or not isinstance(message.get("event_id"), str) or not message["event_id"]:
@@ -30,7 +33,7 @@ def collect_window(room_ids, fetch, since_ms, until_ms, pages=20):
                     if since_ms <= ts <= until_ms and key not in seen:
                         row["messages"].append(message)
                         seen.add(key)
-                if times and min(times) <= since_ms:
+                if times and min(times) < since_ms:
                     row["coverage"] = "reached_cutoff"
                     break
                 cursor = page.get("cursor")

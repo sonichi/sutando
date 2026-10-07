@@ -58,4 +58,3 @@ def capture_inventory(config):
         except Exception as exc:
             observations[key] = {'readback': 'unknown', 'error': type(exc).__name__}
     return observations
-

@@ -74,4 +74,3 @@ def propose(directory, receipt_path, proposal, store_identity):
         state['candidates'][candidate_id] = row
         _atomic(path, _encode(state))
     return row
-
