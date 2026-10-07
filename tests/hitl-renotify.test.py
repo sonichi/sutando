@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.projector import pending_ids, project  # noqa: E402
 
-from hitl.schema import Action, HumanRequirement, WIRE_FIELD  # noqa: E402
+from hitl import renotify  # noqa: E402
+from hitl.schema import STATUS_CANCELLED, Action, HumanRequirement, WIRE_FIELD  # noqa: E402
 
 ROOM = "!room:ag2.space"
 T0 = 1_000_000.0
@@ -156,6 +157,24 @@ class RenotifyTests(unittest.TestCase):
         self.mgr.resolve(req.id)
         self.assertEqual([p["op"] for p in self.drive()], ["message"])
         self.assertEqual(self.drive(), [])
+
+    def test_a_block_longer_than_a_day_reads_in_days(self):
+        req = self.mgr.create(blocking())
+        self.assertIn("after 1d 2h", renotify.body(renotify.REMINDER, req, T0 + 26 * HOUR))
+
+    def test_an_unprojected_revision_waits_for_its_edit(self):
+        req = blocking()
+        req.revision = 3
+        self.assertIsNone(renotify.due(req, {"event_id": "$e", "revision": 2}, T0 + 7 * HOUR))
+
+    def test_a_cancelled_card_gets_neither_reminder_nor_recovery(self):
+        req = blocking()
+        req.status = STATUS_CANCELLED
+        self.assertIsNone(renotify.due(req, {"event_id": "$e", "revision": 1}, T0 + 7 * HOUR))
+
+    def test_a_notice_for_a_deleted_record_is_a_no_op(self):
+        self.mgr.record_notice("hitl-missing", {"recovered": True})
+        self.assertIsNone(self.mgr.store.load("hitl-missing"))
 
 
 if __name__ == "__main__":
