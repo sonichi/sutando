@@ -144,7 +144,8 @@ sys.exit(1)
 KEY_MOCK = "#!/bin/bash\nprintf '%s' \"${GEMINI_API_KEY:-<unset>}\" >\"$MOCK_OUT\"\n"
 
 
-def run_vault_case(tmp: Path, name: str, provider: bool, env_key: str | None, vault_has: bool) -> tuple[int, str, str, str]:
+def run_vault_case(tmp: Path, name: str, provider: bool, env_key: str | None, vault_has: bool,
+                    settings_json: str | None = None) -> tuple[int, str, str, str]:
     tree = tmp / f"tree_{name}"
     (tree / "skills" / "agy" / "scripts").mkdir(parents=True)
     (tree / "skills" / "secret-vault").mkdir(parents=True)
@@ -154,7 +155,10 @@ def run_vault_case(tmp: Path, name: str, provider: bool, env_key: str | None, va
     home = tmp / f"home_{name}"
     settings = home / ".gemini" / "antigravity-cli" / "settings.json"
     settings.parent.mkdir(parents=True)
-    settings.write_text('{"modelProvider": "gemini"}' if provider else "{}")
+    if settings_json is not None:
+        settings.write_text(settings_json)
+    else:
+        settings.write_text('{"modelProvider": "gemini"}' if provider else "{}")
     bin_dir = tmp / f"bin_{name}"
     bin_dir.mkdir()
     agy = bin_dir / "agy"
@@ -198,6 +202,17 @@ def test_no_vault_outside_gemini_mode(tmp: Path) -> None:
     assert calls == "", f"vault consulted outside Gemini-key mode: {calls!r}"
 
 
+def test_no_vault_on_nested_gemini_provider(tmp: Path) -> None:
+    # A nested or inactive "modelProvider": "gemini" must not trigger the vault
+    # read when the top-level provider is something else (sonichi/sutando#4994).
+    rc, out, seen, calls = run_vault_case(
+        tmp, "nested", provider=False, env_key=None, vault_has=True,
+        settings_json='{"modelProvider":"antigravity","inactive":{"modelProvider":"gemini"}}',
+    )
+    assert rc == 0 and seen == "<unset>", (rc, seen, out)
+    assert calls == "", f"vault consulted for a non-top-level modelProvider: {calls!r}"
+
+
 def main() -> None:
     assert SCRIPT.exists(), f"missing: {SCRIPT}"
     with tempfile.TemporaryDirectory() as raw:
@@ -213,6 +228,7 @@ def main() -> None:
             test_env_key_wins,
             test_vault_miss_not_fatal,
             test_no_vault_outside_gemini_mode,
+            test_no_vault_on_nested_gemini_provider,
         ):
             fn(tmp)
             print(f"PASS {fn.__name__}")

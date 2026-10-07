@@ -45,6 +45,22 @@ require_arg() {
   [[ -n "$value" ]] || fail "missing value for $flag"
 }
 
+# A substring grep over the whole settings file matches a nested or inactive
+# "modelProvider": "gemini" too, so this checks only the top-level key.
+settings_top_level_provider_is_gemini() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(data, dict) and data.get("modelProvider") == "gemini" else 1)
+' "$f" 2>/dev/null
+}
+
 CHECK=0
 MODEL=""
 APPROVAL_MODE="plan"
@@ -132,7 +148,7 @@ if [[ "$CHECK" -eq 1 ]]; then
     # agy's Gemini-API-key path needs BOTH the settings.json provider AND the env var --
     # the env var alone does nothing, which is easy to miss, so check both explicitly.
     SETTINGS_FILE="${HOME}/.gemini/antigravity-cli/settings.json"
-    if [[ -f "$SETTINGS_FILE" ]] && grep -q '"modelProvider"[[:space:]]*:[[:space:]]*"gemini"' "$SETTINGS_FILE" 2>/dev/null; then
+    if settings_top_level_provider_is_gemini "$SETTINGS_FILE"; then
       echo "settings: modelProvider=gemini set in $SETTINGS_FILE"
     else
       echo "settings: modelProvider=gemini NOT set in $SETTINGS_FILE -- GEMINI_API_KEY alone will not authenticate agy"
@@ -165,7 +181,7 @@ PROMPT="${PROMPT_ARGS[*]-}"
 
 if [[ "$BACKEND" == "agy" ]]; then
   # agy's Gemini-key mode reads the key only from its env; the owner keeps it in the vault, not a file.
-  if [[ -z "${GEMINI_API_KEY:-}" ]] && grep -q '"modelProvider"[[:space:]]*:[[:space:]]*"gemini"' "${HOME}/.gemini/antigravity-cli/settings.json" 2>/dev/null; then
+  if [[ -z "${GEMINI_API_KEY:-}" ]] && settings_top_level_provider_is_gemini "${HOME}/.gemini/antigravity-cli/settings.json"; then
     vault_cli="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/../../secret-vault/secret-vault.py"
     if [[ -f "$vault_cli" ]] && vault_key="$(python3 "$vault_cli" get GEMINI_API_KEY 2>/dev/null)" && [[ -n "$vault_key" ]]; then
       export GEMINI_API_KEY="$vault_key"
