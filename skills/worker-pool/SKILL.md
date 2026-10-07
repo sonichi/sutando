@@ -142,6 +142,30 @@ Add `--json` for `"me": true`. Built from the roster
 `state/pool-advertisement.json`'s `profile_workers` map carries only `label`
 and (when known) `runtime`, never `display_label` or a self-marker.
 
+## A collaborator's picker request waits for the owner
+
+An owner's add/pin/unpin from the worker picker applies as before. A sender
+whose ATTESTED headers say `access_tier: team` + `collaborator: true` gets
+neither the change nor silence: the route handler parks the parsed command in
+`state/picker-requests.json`, asks the owner through `scripts/ask-owner.py`
+(the question names the request id), and answers the collaborator's task
+in-room that the owner was asked. Any other non-owner tier is refused in-room.
+
+When the owner answers, run exactly one of:
+
+```bash
+python3 skills/worker-pool/scripts/worker_picker_commands.py approve <id> --workspace "$WS"
+python3 skills/worker-pool/scripts/worker_picker_commands.py decline <id> --workspace "$WS"
+```
+
+`approve` applies the parked pin/unpin itself; for an add it prints `next`,
+the owner's add for the core to run. Either verb tells the collaborator in the
+room through the task-progress skill and prints `posted`; a `NOT posted` line
+means post `notice` there yourself. Then resolve the pending question
+(`src/pending_questions_reader.py resolve <ask-id>`). `pending` lists what is
+still waiting; `request --task-file F` parks a collaborator task the handler
+never saw (an install with no route handler published).
+
 ## Talking to the other instances (core ↔ worker)
 
 You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)
